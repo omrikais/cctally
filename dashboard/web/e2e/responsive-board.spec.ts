@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
+import { fulfilJson } from './utils';
 
 // #293 S1 — the durable responsive-board contract (the smoke test only checks
 // that a grid appears). Sweeps the critical widths asserting the JS-driven
@@ -21,6 +22,159 @@ const MODE_AT: Array<{ w: number; mode: 'stack' | 'intermediate' | 'bento' }> = 
   { w: 1200, mode: 'bento' },
   { w: 1440, mode: 'bento' },
 ];
+
+const HEADER_CONTAINMENT_WIDTHS = [320, 390, 1200, 1250, 1300, 1330, 1340, 1440] as const;
+
+// #762 — the fixture's healthy Projects title is too short to reach the
+// desktop min-content failure. Keep the real server and all of its other
+// envelope data, but deliver one deliberately degraded Projects domain so the
+// browser exercises the title + status-chip flex pressure that the issue
+// measured. The one-shot EventSource prevents a live server tick from
+// replacing the routed envelope before geometry is read.
+async function serveDegradedProjects(page: Page) {
+  await page.addInitScript(() => {
+    class StableEventSource {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSED = 2;
+      readonly CONNECTING = 0;
+      readonly OPEN = 1;
+      readonly CLOSED = 2;
+      readonly url: string;
+      readonly withCredentials = false;
+      readyState = 1;
+      private readonly listeners = new Map<string, Array<(event: MessageEvent) => void>>();
+
+      constructor(url: string | URL) {
+        this.url = String(url);
+        if (!this.url.includes('/api/events')) return;
+        void fetch('/api/data')
+          .then((response) => response.json())
+          .then((payload) => {
+            const event = new MessageEvent('update', { data: JSON.stringify(payload) });
+            for (const listener of this.listeners.get('update') ?? []) listener(event);
+          })
+          .catch((error) => { console.error(`fixture delivery failed: ${error}`); });
+      }
+
+      addEventListener(type: string, listener: (event: MessageEvent) => void) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      removeEventListener(type: string, listener: (event: MessageEvent) => void) {
+        this.listeners.set(
+          type,
+          (this.listeners.get(type) ?? []).filter((candidate) => candidate !== listener),
+        );
+      }
+
+      dispatchEvent() { return true; }
+      close() { this.readyState = StableEventSource.CLOSED; }
+    }
+    Object.defineProperty(window, 'SharedWorker', { configurable: true, value: undefined });
+    Object.defineProperty(window, 'EventSource', { configurable: true, value: StableEventSource });
+  });
+  await page.route('**/api/data', async (route) => {
+    const response = await route.fetch();
+    const envelope = await response.json() as Record<string, any>;
+    const codex = envelope.sources?.codex;
+    if (codex?.data == null) throw new Error('fixture has no Codex source data');
+    codex.availability = 'partial';
+    codex.data.projects = null;
+    codex.warnings = [{
+      code: 'projects_unavailable',
+      domain: 'projects',
+      message: 'Projects are unavailable while the source is degraded.',
+    }];
+    await fulfilJson(route, response, envelope);
+  });
+}
+
+async function selectCodex(page: Page) {
+  const codex = page.locator('.source-seg[data-source="codex"]');
+  await expect(codex).toBeVisible();
+  await codex.click();
+  await expect(codex).toHaveClass(/is-active/);
+}
+
+async function panelHeaderGeometries(page: Page) {
+  return page.locator('.panel-header-actions').evaluateAll((clusters) => clusters.map((cluster) => {
+    const panel = cluster.closest<HTMLElement>('.panel');
+    if (panel == null) throw new Error('header action cluster has no panel ancestor');
+    const panelRect = panel.getBoundingClientRect();
+    const clusterRect = cluster.getBoundingClientRect();
+    return {
+      panelId: panel.id,
+      panel: { left: panelRect.left, right: panelRect.right },
+      cluster: { left: clusterRect.left, right: clusterRect.right },
+      children: Array.from(cluster.children).map((child) => {
+        const rect = (child as HTMLElement).getBoundingClientRect();
+        return {
+          tag: child.tagName,
+          className: (child as HTMLElement).className,
+          left: rect.left,
+          right: rect.right,
+          rendered: rect.width > 0 || rect.height > 0,
+        };
+      }),
+    };
+  }));
+}
+
+test('#762 — degraded Projects title keeps every header action in its cluster and panel', async ({ page }) => {
+  await serveDegradedProjects(page);
+
+  for (const width of HEADER_CONTAINMENT_WIDTHS) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/');
+    await selectCodex(page);
+
+    const heading = page.locator('#panel-projects .panel-header h2');
+    await expect(heading).toHaveText('Projects (unavailable)');
+    await expect(page.getByRole('heading', { name: 'Projects (unavailable)' })).toHaveCount(1);
+
+    const geometries = await panelHeaderGeometries(page);
+    expect(geometries.length).toBeGreaterThan(0);
+    for (const geometry of geometries) {
+      expect(geometry.cluster.left, `${geometry.panelId} cluster left at ${width}px`)
+        .toBeGreaterThanOrEqual(geometry.panel.left - 1);
+      expect(geometry.cluster.right, `${geometry.panelId} cluster right at ${width}px`)
+        .toBeLessThanOrEqual(geometry.panel.right + 1);
+      const renderedChildren = geometry.children.filter((child) => child.rendered);
+      expect(renderedChildren.length, `${geometry.panelId} rendered action children at ${width}px`)
+        .toBeGreaterThan(0);
+      for (const child of renderedChildren) {
+        expect(child.left, `${geometry.panelId} ${child.tag} ${child.className} left at ${width}px`)
+          .toBeGreaterThanOrEqual(geometry.cluster.left - 1);
+        expect(child.right, `${geometry.panelId} ${child.tag} ${child.className} right in cluster at ${width}px`)
+          .toBeLessThanOrEqual(geometry.cluster.right + 1);
+        expect(child.left, `${geometry.panelId} ${child.tag} ${child.className} left in panel at ${width}px`)
+          .toBeGreaterThanOrEqual(geometry.panel.left - 1);
+        expect(child.right, `${geometry.panelId} ${child.tag} ${child.className} right in panel at ${width}px`)
+          .toBeLessThanOrEqual(geometry.panel.right + 1);
+      }
+    }
+    const titleStyle = await heading.evaluate((node) => {
+      const style = getComputedStyle(node);
+      return {
+        overflow: style.overflow,
+        textOverflow: style.textOverflow,
+        whiteSpace: style.whiteSpace,
+        text: node.textContent,
+      };
+    });
+    expect(titleStyle.text).toBe('Projects (unavailable)');
+    if (width > 640) {
+      expect(titleStyle.overflow).toBe('hidden');
+      expect(titleStyle.textOverflow).toBe('ellipsis');
+      expect(titleStyle.whiteSpace).toBe('nowrap');
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth))
+      .toBeLessThanOrEqual(width);
+  }
+});
 
 for (const { w, mode } of MODE_AT) {
   test(`board mode is ${mode} and no x-overflow at ${w}px`, async ({ page }) => {

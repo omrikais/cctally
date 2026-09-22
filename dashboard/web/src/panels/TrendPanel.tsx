@@ -108,7 +108,7 @@ function TrendSection({
           >
             <Sparkline data={data} />
           </div>
-          <div className="trend-spark-legend">
+          <div className="trend-spark-legend" data-card-region-ignore>
             <span>older</span>
             <span className="line"></span>
             <span>▶ newer</span>
@@ -229,7 +229,7 @@ export function TrendPanel() {
                 data-provider-section={section.source}
                 aria-labelledby={`trend-panel-${section.source}-heading`}
               >
-                <div className="source-provider-head provider-composition-head">
+                <div className="source-provider-head provider-composition-head" data-card-region-ignore>
                   {/* #556 S4 F8 — see WeeklyPanel. */}
                   <h3 className="sr-only" id={`trend-panel-${section.source}-heading`}>
                     {section.label} $ per 1% trend

@@ -947,6 +947,7 @@ def test_blocks_panel_serves_a_frozen_block_the_facts_the_modal_serves(
     assert body["facts_source"] == "retained", body.get("facts_source")
     row = next(r for r in view.rows if r.start_at == _FROZEN_START)
     assert abs(row.cost_usd - _FROZEN_COST) < 1e-9, row.cost_usd
+    assert row.facts_source == "retained"
     assert abs(row.cost_usd - body["cost_usd"]) < 1e-9
     assert sorted(m["model"] for m in row.models) == sorted(
         m["model"] for m in body["models"]

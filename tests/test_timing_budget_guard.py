@@ -197,6 +197,7 @@ POSITIONAL_ONLY_BUDGET_CALLEES = frozenset({"settimeout", "select"})
 #: a callee the estate uses and this file does not classify fails the guard by
 #: name, so a new blocking helper cannot be dropped in silence.
 BLOCKING_CALLEES = {
+    "result": "`Future.result` waits for a worker result or its timeout",
     "run": "`subprocess.run` waits for the child to exit",
     "wait": "`Popen.wait`, `Event.wait` and `Condition.wait` all block",
     "wait_for": "`asyncio.wait_for` and `Condition.wait_for` block",
@@ -324,8 +325,8 @@ RECORDED = {
         "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
     ("tests/test_doctor_gather.py",
      "test_gather_rollup_probe_does_not_wait_on_exclusive_db_lock",
-     "elapsed-ceiling", 2.0): (
-        "keep — a fail-fast claim: the alternative behaviour is blocking until a lock is released, so the ceiling separates bounded from unbounded rather than fast from slow"),
+     "elapsed-ceiling", 4.9): (
+        "keep — a fail-fast claim below SQLite's inherited five-second wait; the outer timer also includes a fresh interpreter, CLI import and full doctor gather"),
     ("tests/test_rebuild_heal.py",
      "test_admission_rolls_back_promptly_when_occurrence_event_cannot_persist",
      "elapsed-ceiling", 1.0): (
@@ -1710,11 +1711,10 @@ def _tracked(pattern) -> list:
     return [REPO / rel for rel in proc.stdout.split("\0") if rel]
 
 
-#: The aggregate, held for the process. Two cases call `python_findings`, and
-#: nothing they do changes the tree between calls, so recomputing it made the
-#: guard scan the whole estate twice over. It is a per-process cache and the
-#: parallel leg does not guarantee both consumers share a worker, so it
-#: removes a repeated scan rather than guaranteeing a single one.
+#: The aggregate, held for callers that explicitly request the complete estate.
+#: The enforcement cases below use bounded shards because xdist can schedule
+#: them on separate workers, where a process-local full-estate cache cannot
+#: prevent each worker from paying the complete scan cost.
 _PYTHON_FINDINGS_CACHE = None
 
 
@@ -1729,8 +1729,8 @@ def python_findings() -> list:
 
     A copy is returned so a caller cannot mutate the cache. The cache binds
     per PROCESS, not per session: `bin/cctally-test-all` runs pytest under
-    xdist's default `--dist load`, so the consumers below can be handed to
-    different workers and each pays its own scan there. Driving a bounded
+    xdist's default `--dist load`, so enforcement is sharded below rather than
+    relying on unrelated cases landing on the same worker. Driving a bounded
     sample is what `_scan_python_findings` is for; no caller resets this
     global, and none should.
     """
@@ -2032,6 +2032,28 @@ def shell_findings() -> list:
     return out
 
 
+# Sixteen keeps each AST-heavy policy case comfortably below the suite's
+# fixed 120-second per-test cap even when all ten xdist workers are busy.
+PYTHON_SCAN_SHARDS = 16
+
+
+def _python_estate() -> list:
+    return sorted(path for path in _tracked("tests/*.py") if path.exists())
+
+
+def _python_scan_shards() -> tuple:
+    estate = _python_estate()
+    return tuple(tuple(estate[index::PYTHON_SCAN_SHARDS])
+                 for index in range(PYTHON_SCAN_SHARDS))
+
+
+def _assert_no_unrecorded_python_findings(paths) -> None:
+    findings = [f for f in _scan_python_findings(paths) if f.key not in RECORDED]
+    assert not findings, "\n".join(
+        "%s:%d [%s] %s" % (f.path, f.lineno, f.kind, f.detail) for f in findings
+    )
+
+
 def test_the_cap_is_the_one_the_suite_applies():
     """The literal above must equal the one `bin/cctally-test-all` passes.
 
@@ -2048,10 +2070,20 @@ def test_the_cap_is_the_one_the_suite_applies():
 
 
 def test_no_pytest_file_carries_an_unreachable_or_load_sensitive_budget():
-    findings = [f for f in python_findings() if f.key not in RECORDED]
-    assert not findings, "\n".join(
-        "%s:%d [%s] %s" % (f.path, f.lineno, f.kind, f.detail) for f in findings
-    )
+    """Shard zero plus the partition proof retain the original test identity."""
+    estate = _python_estate()
+    shards = _python_scan_shards()
+    flattened = [path for shard in shards for path in shard]
+    assert len(flattened) == len(set(flattened)) == len(estate)
+    assert set(flattened) == set(estate)
+    assert all(shards), "a timing-budget scan shard is vacuous"
+    _assert_no_unrecorded_python_findings(shards[0])
+
+
+@pytest.mark.parametrize("shard_index", range(1, PYTHON_SCAN_SHARDS))
+def test_no_additional_pytest_file_carries_a_bad_timing_budget(shard_index):
+    """The remaining bounded shards complete the closed estate scan."""
+    _assert_no_unrecorded_python_findings(_python_scan_shards()[shard_index])
 
 
 def test_every_recorded_finding_still_exists():
@@ -2060,7 +2092,10 @@ def test_every_recorded_finding_still_exists():
     An entry that matches nothing is an excuse for a test that no longer needs
     one, and leaving it there lets the next real finding hide behind it.
     """
-    present = {f.key for f in python_findings()} | {f.key for f in shell_findings()}
+    recorded_paths = sorted({REPO / key[0] for key in RECORDED})
+    assert all(path.exists() for path in recorded_paths)
+    present = ({f.key for f in _scan_python_findings(recorded_paths)}
+               | {f.key for f in shell_findings()})
     stale = sorted(
         key for key in list(RECORDED) + list(RECORDED_SHELL) if key not in present
     )
@@ -2194,23 +2229,11 @@ def test_a_composed_sum_that_exactly_fills_the_cap_is_reported():
     assert [f for f in leaves_room if f.kind == "composed"] == [], leaves_room
 
 
-def test_the_composed_threshold_is_not_parked_on_a_sum():
-    """The twin of `test_the_floor_is_not_parked_on_a_budget_value`.
-
-    The composed comparison is a strict `>` on `total + headroom`, so a
-    function whose budgets sum to exactly `CAP_SECONDS - headroom` is exempt.
-    A threshold parked on a sum the estate actually writes would read as clean
-    on the very function it was written to name, and nothing in the guard could
-    tell that apart from a genuinely clean tree.
-
-    The measured distribution of composed sums steps 105.0, 120.0, 135.0, so
-    111.0 sits in an empty band. This check is what keeps it there.
-    """
+def _assert_composed_threshold_not_parked(paths) -> None:
+    """Check one exact estate shard for a composed sum at the threshold."""
     threshold = CAP_SECONDS - COMPOSED_HEADROOM_SECONDS
     parked, examined = {}, 0
-    for path in _tracked("tests/*.py"):
-        if not path.exists():
-            continue
+    for path in paths:
         relative = str(path.relative_to(REPO))
         text = path.read_text(encoding="utf-8")
         tree = ast.parse(text)
@@ -2256,19 +2279,29 @@ def test_the_composed_threshold_is_not_parked_on_a_sum():
                 total = sum(b.seconds for b in segment if b.seconds)
                 if total == threshold:
                     parked.setdefault(relative, []).append(segment[0].lineno)
-    # Non-vacuity, for the same reason the floor's twin carries one: this check
-    # passes by finding nothing, which is also what it would do if the walk
-    # returned no multi-budget segment at all. Seventy-two were measured when
-    # this was written.
-    assert examined > 50, (
-        "only %d multi-budget segments were examined across the estate, which "
-        "is too few for this check to have seen the distribution" % examined)
+    assert examined > 0, "the shard contains no multi-budget segment"
     assert not parked, (
         "these composed sums sit at exactly CAP_SECONDS - "
         "COMPOSED_HEADROOM_SECONDS (%g), and the rule compares with a strict "
         "`>`, so every one of them is exempt from the rule written to catch "
         "them. Move the headroom so the threshold sits in a gap: %r"
         % (threshold, parked))
+
+
+def test_the_composed_threshold_is_not_parked_on_a_sum():
+    """The twin of `test_the_floor_is_not_parked_on_a_budget_value`.
+
+    The composed comparison is a strict `>` on `total + headroom`, so a
+    function whose budgets sum to exactly `CAP_SECONDS - headroom` is exempt.
+    A threshold parked on a sum the estate actually writes would read as clean
+    on the very function it was written to name, and nothing in the guard could
+    tell that apart from a genuinely clean tree.
+
+    The measured distribution of composed sums steps 105.0, 120.0, 135.0, so
+    111.0 sits in an empty band. This original identity checks shard zero; the
+    parameterized cases below check every remaining shard under xdist.
+    """
+    _assert_composed_threshold_not_parked(_python_scan_shards()[0])
 
 
 def test_a_try_body_continues_the_path_and_an_except_does_not():
@@ -2642,19 +2675,10 @@ def test_a_budget_inside_a_lambda_is_not_summed_with_its_writer():
     assert _kinds(over) == ["over-cap"], over
 
 
-def test_every_callee_carrying_a_budget_keyword_is_classified():
-    """Closed world, so the allowlist cannot go silently blind.
-
-    An allowlist skips whatever it does not name, and a guard that skips a new
-    blocking helper reports "clean" identically to a guard with nothing to
-    report. This is what makes the allowlist safe to keep: every callee in the
-    estate that carries a budget keyword must be named blocking, named
-    non-blocking, or resolvable as a wait inside its own module.
-    """
+def _assert_budget_keyword_callees_classified(paths, *, require_nonempty=False) -> None:
+    """Check one exact estate shard for unclassified budget-keyword calls."""
     unclassified, examined = {}, 0
-    for path in _tracked("tests/*.py"):
-        if not path.exists():
-            continue
+    for path in paths:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         blocking = _blocking_names(tree)
         for node in ast.walk(tree):
@@ -2668,12 +2692,26 @@ def test_every_callee_carrying_a_budget_keyword_is_classified():
                 continue
             unclassified.setdefault(
                 callee, "%s:%d" % (path.relative_to(REPO), node.lineno))
-    assert examined, "the scan found no budget keywords at all, so it proves nothing"
+    if require_nonempty:
+        assert examined, (
+            "the scan found no budget keywords at all, so it proves nothing")
     assert not unclassified, (
         "these callees carry a budget keyword and are classified neither way; "
         "add each to BLOCKING_CALLEES or to NON_BLOCKING_CALLEES with the "
         "reason: %r" % (unclassified,)
     )
+
+
+def test_every_callee_carrying_a_budget_keyword_is_classified():
+    """Closed world, so the allowlist cannot go silently blind.
+
+    An allowlist skips whatever it does not name, and a guard that skips a new
+    blocking helper reports "clean" identically to a guard with nothing to
+    report. This original identity checks shard zero; the parameterized cases
+    below complete the estate under xdist.
+    """
+    _assert_budget_keyword_callees_classified(
+        _python_scan_shards()[0], require_nonempty=True)
 
 
 def test_an_unresolvable_budget_must_be_annotated():
@@ -2722,6 +2760,25 @@ def test_a_budget_below_the_load_safe_floor_is_reported():
     assert reasoned == [], reasoned
 
 
+def _assert_floor_not_parked(paths) -> None:
+    """Check one exact estate shard for a budget parked on the floor."""
+    parked, examined = {}, 0
+    for path in paths:
+        relative = str(path.relative_to(REPO))
+        text = path.read_text(encoding="utf-8")
+        for finding in _collect_raw_budgets(relative, text):
+            examined += 1
+            if finding.seconds == LOAD_SAFE_BACKSTOP_SECONDS:
+                parked.setdefault(relative, []).append(finding.lineno)
+    assert examined > 0, "the shard contains no blocking budget"
+    assert not parked, (
+        "these budgets sit at exactly LOAD_SAFE_BACKSTOP_SECONDS (%g), and the "
+        "under-load-floor rule compares with a strict `<`, so every one of "
+        "them is exempt from the rule written to catch them. Move the floor "
+        "into a gap in the distribution: %r"
+        % (LOAD_SAFE_BACKSTOP_SECONDS, parked))
+
+
 def test_the_floor_is_not_parked_on_a_budget_value():
     """A floor equal to a budget the estate writes reports none of them.
 
@@ -2732,9 +2789,8 @@ def test_the_floor_is_not_parked_on_a_budget_value():
     tree full of exactly the class it names, and nothing in the guard could
     tell that apart from a tree that was genuinely clean.
 
-    So the floor must sit in a GAP. This is the check that keeps it there, and
-    it is deliberately mechanical: the previous floor's docstring already
-    explained that the number was measured, and the number was still parked.
+    So the floor must sit in a GAP. This original identity checks shard zero;
+    the parameterized cases below check every remaining shard under xdist.
     """
     # A budget written inside a lambda is a budget. `_collect_raw_budgets`
     # walks lambda bodies for that reason, and this scaffold pins it: without
@@ -2749,29 +2805,16 @@ def test_the_floor_is_not_parked_on_a_budget_value():
     assert [b.seconds for b in in_a_lambda] == [LOAD_SAFE_BACKSTOP_SECONDS], \
         in_a_lambda
 
-    parked, examined = {}, 0
-    for path in _tracked("tests/*.py"):
-        if not path.exists():
-            continue
-        relative = str(path.relative_to(REPO))
-        text = path.read_text(encoding="utf-8")
-        for finding in _collect_raw_budgets(relative, text):
-            examined += 1
-            if finding.seconds == LOAD_SAFE_BACKSTOP_SECONDS:
-                parked.setdefault(
-                    relative, []).append(finding.lineno)
-    # Non-vacuity. This check passes by finding nothing, which is also what it
-    # would do if the raw collector returned nothing at all — the same failure
-    # shape as the parked floor it exists to catch.
-    assert examined > 100, (
-        "the raw collector found %d budgets across the estate, which is too "
-        "few for this check to have examined the distribution" % examined)
-    assert not parked, (
-        "these budgets sit at exactly LOAD_SAFE_BACKSTOP_SECONDS (%g), and the "
-        "under-load-floor rule compares with a strict `<`, so every one of "
-        "them is exempt from the rule written to catch them. Move the floor "
-        "into a gap in the distribution: %r"
-        % (LOAD_SAFE_BACKSTOP_SECONDS, parked))
+    _assert_floor_not_parked(_python_scan_shards()[0])
+
+
+@pytest.mark.parametrize("shard_index", range(1, PYTHON_SCAN_SHARDS))
+def test_remaining_timing_thresholds_sit_in_estate_gaps(shard_index):
+    """Complete the three estate-wide timing checks in bounded shards."""
+    paths = _python_scan_shards()[shard_index]
+    _assert_composed_threshold_not_parked(paths)
+    _assert_floor_not_parked(paths)
+    _assert_budget_keyword_callees_classified(paths)
 
 
 def test_the_floor_covers_the_failure_that_was_measured():

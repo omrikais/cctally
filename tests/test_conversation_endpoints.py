@@ -380,6 +380,15 @@ def test_conversation_outline_route(tmp_path, monkeypatch):
         status, _ = _get(port, "/api/conversation/does-not-exist/outline")
         assert status == 404
 
+        # The progressive preflight is used inside Session detail even when a
+        # cost-only session has no retained transcript. Ordinary absence must
+        # not create a failed browser resource request; the legacy URL retains
+        # its 404 contract for other clients.
+        status, body = _get(
+            port, "/api/conversation/does-not-exist/outline?progressive=1")
+        assert status == 200, (status, body)
+        assert json.loads(body) == {"status": "not_found"}
+
         # Privacy gate reused verbatim: LAN hostname + expose=False → 403.
         status, _ = _get(port, "/api/conversation/s1/outline",
                          host="machine.local:8789")

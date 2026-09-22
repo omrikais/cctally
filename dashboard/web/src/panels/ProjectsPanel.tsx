@@ -45,6 +45,13 @@ import { DegradedChip } from './sourcePanel';
 
 const TOP_N = 5;
 
+// #846 M2. The one new dashboard string, carried as the client's own copy.
+// The server keeps the whole warning-code vocabulary; this panel keys on the
+// TYPED physical-source state instead, because a warning code says which
+// domain complained and the carrier says what the build established.
+const CODEX_METADATA_RETRY_NOTE =
+  'Project metadata could not be read for this build; it will retry on the next refresh.';
+
 // #294 S5 — source-aware wrapper. Claude = legacy leaderboard (unchanged);
 // Codex = native qualified-attribution table; All = provider sections
 // (identical labels across providers stay distinct rows — different keys).
@@ -54,6 +61,13 @@ export function ProjectsPanel() {
   const projected = presentationProjects(env, activeSource);
   const rows = projected.state === 'available' ? projected.rows : [];
   const isUnavailable = projected.state === 'unavailable';
+  // #846 §4.8 — NEVER on the warning code. Emptiness of the Codex rows is a
+  // server invariant (§4.6 rule 1) and is tested on the server, so it is not
+  // part of this selector: the panel discloses the state, it does not infer it.
+  const codexMetadataTransient =
+    env?.sources?.codex?.metadata_health?.state === 'transient_read_failure';
+  const disclosesCodexMetadata =
+    codexMetadataTransient && (activeSource === 'codex' || activeSource === 'all');
   // §3.7 — a withheld aggregate is its OWN state, distinct from both "no
   // activity" and "restart the dashboard". Rendering it as either would report
   // a range problem as emptiness or as a broken instance.
@@ -274,17 +288,36 @@ export function ProjectsPanel() {
           hydrating ? (
             <PanelSkeleton />
           ) : (
-            <div className="panel-empty">
-              {activeSource === 'claude'
-                ? 'No project activity yet this week.'
-                : rangeSpan == null
-                  ? 'No project activity in this window.'
-                  : `No project activity in ${rangeSpan}.`}
+            <div className="panel-empty" data-codex-metadata-transient={
+              disclosesCodexMetadata ? 'true' : undefined
+            }>
+              {/* On the Codex tab the transient state REPLACES the generic
+                  empty sentence; on All it becomes the empty-body sentence
+                  only when no provider has rows, which is this branch. The
+                  Claude tab never reaches it. */}
+              {disclosesCodexMetadata
+                ? CODEX_METADATA_RETRY_NOTE
+                : activeSource === 'claude'
+                  ? 'No project activity yet this week.'
+                  : rangeSpan == null
+                    ? 'No project activity in this window.'
+                    : `No project activity in ${rangeSpan}.`}
             </div>
           )
         ) : (
           <>
-            <div className="projects-legend">% = {metricName}</div>
+            {/* All tab, with Claude rows still ranked: the state renders as an
+                inline panel-body notice BESIDE them rather than replacing the
+                ranking, because the Claude half of the ranking is intact. */}
+            {disclosesCodexMetadata ? (
+              <div
+                className="panel-range-note projects-metadata-note"
+                data-codex-metadata-transient="true"
+              >
+                {CODEX_METADATA_RETRY_NOTE}
+              </div>
+            ) : null}
+            <div className="projects-legend" data-card-region-ignore>% = {metricName}</div>
             {top.map((r) => {
               const widthPct = (r.cost / leaderCost) * 100;
               const barStyle = { '--w': `${widthPct}%` } as CSSProperties;
@@ -328,6 +361,7 @@ export function ProjectsPanel() {
                     className="projects-row is-static"
                     data-project-key={r.key}
                     data-drillable="false"
+                    data-card-region-ignore
                     title={`${r.label} — no detail view is available for this project in this range`}
                   >
                     {body}
@@ -374,6 +408,7 @@ export function ProjectsPanel() {
               <div
                 className="projects-row tail"
                 aria-label={`${tail.length} more projects`}
+                data-card-region-ignore
               >
                 <span className="name muted">+{tail.length} more</span>
                 <div

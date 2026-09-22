@@ -238,7 +238,7 @@ describe('SourceStatusChip (§6.8)', () => {
     const chip = screen.getByTestId('source-status-chip');
     expect(chip).toHaveTextContent('Projects partial');
     expect(chip.querySelector('.source-status-label--full')).toHaveTextContent('Projects partial');
-    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Partial');
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Projects partial');
     expect(chip).toHaveAttribute('title', '47 Codex accounting rows lack project metadata; rebuild the cache.');
     expect(chip).toHaveAttribute('aria-label', expect.stringContaining('47 Codex accounting rows'));
   });
@@ -254,7 +254,8 @@ describe('SourceStatusChip (§6.8)', () => {
     ['budget', 'Budget unavailable'],
     ['forensics', 'Forensics unavailable'],
     ['alerts', 'Alerts unavailable'],
-  ])('keeps an explicit Unavailable state in the compact %s warning', (domain, fullLabel) => {
+    ['accounts', 'Accounts unavailable'],
+  ])('names the %s domain and unavailable state in compact copy', (domain, fullLabel) => {
     updateSnapshot(
       envWith((b) => {
         b.sources.codex = {
@@ -273,7 +274,7 @@ describe('SourceStatusChip (§6.8)', () => {
 
     const chip = screen.getByTestId('source-status-chip');
     expect(chip.querySelector('.source-status-label--full')).toHaveTextContent(fullLabel);
-    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent('Unavailable');
+    expect(chip.querySelector('.source-status-label--compact')).toHaveTextContent(fullLabel);
     expect(chip).toHaveAttribute('aria-label', `codex source status: ${fullLabel}.`);
   });
 

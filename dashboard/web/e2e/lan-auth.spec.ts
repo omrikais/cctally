@@ -49,7 +49,9 @@ async function waitForLanBanner(
     let output = '';
     const timeout = setTimeout(
       () => reject(new Error(`LAN dashboard banner timed out:\n${output}`)),
-      20_000,
+      // The second dashboard starts against the populated e2e fixture store;
+      // a loaded remote runner can take longer than the default test deadline.
+      90_000,
     );
     const inspect = (chunk: Buffer) => {
       output += chunk.toString('utf8');
@@ -90,6 +92,7 @@ test('wildcard dashboard authenticates Fetch and both SSE streams per run', asyn
   page,
   request,
 }) => {
+  test.setTimeout(120_000);
   const env = isolatedEnv();
   const manifest = loadManifest();
 

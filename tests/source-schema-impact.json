@@ -7,6 +7,7 @@
       "dashboard/web/src/modals/CacheReportModal.test.tsx",
       "dashboard/web/src/panels/CacheReportPanel.test.tsx",
       "dashboard/web/src/panels/MonthlyPanel.test.tsx",
+      "dashboard/web/src/panels/ProjectsPanel.tsx",
       "dashboard/web/src/store/metadataHealth.test.ts",
       "dashboard/web/src/store/sse.visibility.test.ts",
       "dashboard/web/src/test-utils/sourceEnvelope.ts",

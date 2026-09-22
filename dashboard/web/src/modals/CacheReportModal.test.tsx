@@ -639,6 +639,10 @@ describe('<CacheReportModal /> empty + loading states', () => {
 
 describe('<CacheReportModal /> integration (panel click -> modal open)', () => {
   it('panel click opens the cache-report modal with the spotlight section', async () => {
+    // App lazy-loads ModalRoot. Prime that module explicitly so this test
+    // measures the panel/store integration instead of depending on another
+    // test having warmed the module cache first.
+    await import('./ModalRoot');
     updateSnapshot(envelopeWith(makeCacheReport()));
     render(<App />);
     // Locate the Cache Report panel via its role/name. The panel
@@ -691,14 +695,15 @@ describe('<CacheReportModal /> integration (panel click -> modal open)', () => {
     expect(screen.getByText(/75%/)).toBeInTheDocument();
   });
 
-  it('CLOSE_MODAL closes the modal without resetting the snapshot', () => {
+  it('CLOSE_MODAL closes the modal without resetting the snapshot', async () => {
+    await import('./ModalRoot');
     updateSnapshot(envelopeWith(makeCacheReport()));
     render(<App />);
     act(() => {
       dispatch({ type: 'OPEN_MODAL', kind: 'cache-report' });
     });
     expect(
-      screen.getByRole('dialog', { name: /cache report/i }),
+      await screen.findByRole('dialog', { name: /cache report/i }),
     ).toBeInTheDocument();
     act(() => {
       dispatch({ type: 'CLOSE_MODAL' });

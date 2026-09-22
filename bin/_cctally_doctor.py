@@ -1810,9 +1810,15 @@ def _doctor_gather_state_impl(
                     if row:
                         codex_entries_count = int(row[0]) if row[0] is not None else 0
                         if row[1]:
-                            codex_last_entry_at = parse_iso_datetime(
-                                row[1], "codex_session_entries.timestamp_utc",
-                            ).astimezone(dt.timezone.utc)
+                            try:
+                                codex_last_entry_at = parse_iso_datetime(
+                                    row[1], "codex_session_entries.timestamp_utc",
+                                ).astimezone(dt.timezone.utc)
+                            except ValueError:
+                                # A malformed newest row cannot establish cache
+                                # freshness. Continue to the all-history health
+                                # partition so doctor can count the bad row.
+                                codex_last_entry_at = None
                     try:
                         row = conn.execute(
                             "SELECT COUNT(*) FROM quota_window_snapshots "
@@ -1839,7 +1845,13 @@ def _doctor_gather_state_impl(
                             "qualified_rows": health.qualified_rows,
                             "missing_conversation_key_rows": health.missing_conversation_key_rows,
                             "missing_thread_join_rows": health.missing_thread_join_rows,
+                            "undecodable_metadata_rows": (
+                                health.undecodable_metadata_rows),
                         }
+                        if health.malformed_accounting_rows:
+                            codex_project_metadata_health[
+                                "malformed_accounting_rows"] = (
+                                    health.malformed_accounting_rows)
                     except Exception as exc:
                         codex_project_metadata_error = type(exc).__name__
                 except sqlite3.OperationalError as exc:

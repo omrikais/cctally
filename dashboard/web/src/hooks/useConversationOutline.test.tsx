@@ -43,6 +43,111 @@ function bumpTick(rerender: () => void, tag: string) {
 }
 
 describe('useConversationOutline', () => {
+  it('hydrates a valid progressive outline without WebCrypto digest support (#833)', async () => {
+    vi.stubGlobal('crypto', { subtle: undefined });
+    const full = outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } });
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const encoded = btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      const body = url.includes('/outline-transfer/')
+        ? {
+            offset: 0, next_offset: bytes.length, total: bytes.length,
+            sha256: sha256(bytes), done: true, chunk: encoded,
+          }
+        : { progressive: 1, transfer: { token: 'opaque', chunk_size: 196608 } };
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.outline?.stats.cost_usd).toBe(2));
+    expect(result.current.error).toBeNull();
+  });
+
+  it('rejects a corrupt progressive outline without WebCrypto digest support (#833)', async () => {
+    vi.stubGlobal('crypto', { subtle: undefined });
+    const full = outline('s');
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const tampered = bytes.slice();
+    const costNeedle = new TextEncoder().encode('"cost_usd":0');
+    let costOffset = -1;
+    for (let i = 0; i <= tampered.length - costNeedle.length; i += 1) {
+      if (costNeedle.every((byte, j) => tampered[i + j] === byte)) {
+        costOffset = i + costNeedle.length - 1;
+        break;
+      }
+    }
+    expect(costOffset).toBeGreaterThanOrEqual(0);
+    tampered[costOffset] = '1'.charCodeAt(0);
+    const encoded = btoa(Array.from(tampered, (byte) => String.fromCharCode(byte)).join(''));
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation((rawUrl: string) => {
+      const url = String(rawUrl);
+      const body = url.includes('/outline-transfer/')
+        ? {
+            offset: 0, next_offset: tampered.length, total: tampered.length,
+            sha256: sha256(bytes), done: true, chunk: encoded,
+          }
+        : { progressive: 1, transfer: { token: 'opaque', chunk_size: 196608 } };
+      return Promise.resolve({ ok: true, status: 200, json: async () => body } as Response);
+    });
+
+    const { result } = renderHook(() => useConversationOutline('s'));
+    await waitFor(() => expect(result.current.error).toBe("Couldn't load the outline."));
+    expect(result.current.outline).toBeNull();
+  });
+
+  it('does not publish a progressive outline when the session switches during fallback hashing (#833)', async () => {
+    vi.stubGlobal('crypto', { subtle: undefined });
+    const full = outline('s', { filler: 'a'.repeat(2 * 1024 * 1024) });
+    const bytes = new TextEncoder().encode(JSON.stringify(full));
+    const encoded = btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join(''));
+    let timerRan = false;
+    let outlinePublishedBeforeAbort = false;
+    let readOutline: () => ReturnType<typeof useConversationOutline>['outline'] = () => null;
+
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(
+      (rawUrl: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(rawUrl);
+        if (init?.method === 'DELETE') {
+          return Promise.resolve({ ok: true, status: 204 } as Response);
+        }
+        if (url.includes('/outline-transfer/')) {
+          setTimeout(() => {
+            timerRan = true;
+            outlinePublishedBeforeAbort = readOutline() !== null;
+            act(() => rerender({ sid: null }));
+          }, 0);
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({
+              offset: 0, next_offset: bytes.length, total: bytes.length,
+              sha256: sha256(bytes), done: true, chunk: encoded,
+            }),
+          } as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            progressive: 1,
+            transfer: { token: 'opaque', chunk_size: 196608 },
+          }),
+        } as Response);
+      },
+    );
+
+    const { result, rerender, unmount } = renderHook(
+      ({ sid }) => useConversationOutline(sid),
+      { initialProps: { sid: 's' as string | null } },
+    );
+    readOutline = () => result.current.outline;
+    await waitFor(() => expect(timerRan).toBe(true));
+    expect(outlinePublishedBeforeAbort).toBe(false);
+    expect(result.current.outline).toBeNull();
+    unmount();
+  });
+
   it('keeps the outline loading while hydrating the exact bounded transfer (#682)', async () => {
     const full = outline('s', { stats: { ...outline('s').stats, cost_usd: 2 } });
     const bytes = new TextEncoder().encode(JSON.stringify(full));
@@ -143,6 +248,40 @@ describe('useConversationOutline', () => {
     await waitFor(() => expect(result.current.outline?.session_id).toBe('s'));
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversation/s/outline');
     expect(result.current.error).toBeNull();
+  });
+
+  it('treats a progressive no-transcript answer as absence without requesting a transfer', async () => {
+    mockOnce({ status: 'not_found' });
+    const { result } = renderHook(() => useConversationOutline('cost-only'));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.outline).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('recognizes a legacy missing-transcript 404 but does not conceal a server fault', async () => {
+    mockOnce({}, 404);
+    const { result, rerender } = renderHook(({ sid }) => useConversationOutline(sid), {
+      initialProps: { sid: 'old-server' },
+    });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.error).toBeNull();
+    mockOnce({}, 500);
+    rerender({ sid: 'broken-server' });
+    await waitFor(() => expect(result.current.error).toBe("Couldn't load the outline."));
+  });
+
+  it.each([
+    ['bare', 'maintenance', 'busy with maintenance'],
+    ['qualified', 'schema_behind', 'behind this version'],
+  ])('classifies a %s 200 degraded outline as %s without parsing an empty outline', async (kind, reason, message) => {
+    mockOnce({ status: 'degraded', degraded_reason: reason });
+    const ref = kind === 'qualified' ? { source: 'codex' as const, key: 'v1.codex-1' } : 'bare-1';
+    const { result } = renderHook(() => useConversationOutline(ref));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.outline).toBeNull();
+    expect(result.current.degraded).toMatchObject({ reason, message: expect.stringContaining(message) });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
 
   it('qualified Codex outline loads totals without a redundant detail request (#477)', async () => {

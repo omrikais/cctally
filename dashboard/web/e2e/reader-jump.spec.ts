@@ -94,15 +94,28 @@ test('a transient drain request failure backs off and still lands the linked tur
 });
 
 test('a persistent drain failure stops after three attempts with a distinct visible state (#480)', async ({ page, browser }, testInfo) => {
-  test.setTimeout(30_000);
-  const exercise = async (targetPage: Page, screenshotName: string): Promise<number> => {
+  test.setTimeout(90_000);
+  const exercise = async (targetPage: Page, screenshotName: string, retryInput: 'keyboard' | 'touch'): Promise<number> => {
     let attempts = 0;
+    const edges: string[] = [];
+    let allowRecovery = false;
+    // Hold the first outline response beyond the 750ms paging-arm fallback.
+    // The linked jump is still pending, but Virtuoso may report startReached;
+    // that must not send a separate request before the jump's three attempts.
+    let firstOutline = true;
+    await targetPage.route(/\/api\/conversation\/.*outline/, async (route) => {
+      if (firstOutline) await new Promise((resolve) => setTimeout(resolve, 1000));
+      firstOutline = false;
+      await route.continue();
+    });
     await targetPage.route(/\/api\/conversation\/.*before=/, async (route) => {
       attempts += 1;
+      edges.push(new URL(route.request().url()).searchParams.get('before') ?? '');
+      if (attempts === 3) await new Promise((resolve) => setTimeout(resolve, 300));
       // Let current main escape after six failures so the RED run terminates
       // without exhausting memory. The fixed reader must stop after attempt 3 and
       // therefore never reach this rescue path.
-      if (attempts <= 6) {
+      if (!allowRecovery && attempts <= 6) {
         await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"persistent"}' });
         return;
       }
@@ -116,14 +129,34 @@ test('a persistent drain failure stops after three attempts with a distinct visi
     await expect(failure).toBeVisible({ timeout: 5_000 });
     await expect(failure).toContainText('Could not finish loading the linked message.');
     await targetPage.screenshot({ path: testInfo.outputPath(screenshotName), fullPage: true });
-    return attempts;
+    await targetPage.waitForTimeout(250);
+    expect(edges, 'the failed drain retries the SAME edge').toEqual(['1401', '1401', '1401']);
+    const terminalAttempts = attempts;
+
+    // Virtuoso reports each loaded edge once. A failed reverse request leaves
+    // that edge unchanged, so a visible Retry action must let the reader resume
+    // the LINKED jump deliberately instead of waiting for another edge event.
+    allowRecovery = true;
+    const retry = targetPage.getByRole('button', { name: 'Retry linked message' });
+    if (retryInput === 'touch') {
+      const box = await retry.boundingBox();
+      expect(box?.width, 'phone Retry touch width').toBeGreaterThanOrEqual(44);
+      expect(box?.height, 'phone Retry touch height').toBeGreaterThanOrEqual(44);
+      await retry.tap();
+    } else { await retry.focus(); await targetPage.keyboard.press('Enter'); }
+    await expect.poll(() => attempts, 'Retry starts a new linked jump').toBeGreaterThan(terminalAttempts);
+    await expect(targetPage.locator(uuidSel(m.jump_target_uuid))).toBeVisible({ timeout: 15_000 });
+    await settleScroller(targetPage, READER_BODY, { anchorSel: uuidSel(m.jump_target_uuid) });
+    expect(await turnVisibleInReader(targetPage, m.jump_target_uuid), 'Retry lands the linked turn').toBe(true);
+    await expect(failure).toHaveCount(0);
+    return terminalAttempts;
   };
 
-  expect(await exercise(page, 'persistent-drain-desktop.png')).toBe(3);
+  expect(await exercise(page, 'persistent-drain-desktop.png', 'keyboard')).toBe(3);
 
-  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const mobile = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
   try {
-    expect(await exercise(await mobile.newPage(), 'persistent-drain-mobile.png')).toBe(3);
+    expect(await exercise(await mobile.newPage(), 'persistent-drain-mobile.png', 'touch')).toBe(3);
   } finally {
     await mobile.close();
   }

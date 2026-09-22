@@ -144,14 +144,6 @@ def _boot(ns, tmp_path, monkeypatch, *, bind="127.0.0.1", expose=False,
     HandlerCls.cctally_expose_transcripts = expose
     HandlerCls.no_sync = no_sync
 
-    # #630 S2: a live-tail handler idles for `_LIVE_TAIL_KEEPALIVE` seconds
-    # between writes, and a write is the only thing that discovers the client
-    # has gone. At the shipped 15 s that made every abandoned handler outlive
-    # its test; at 1 s it exits within about two seconds of `s.close()`, which
-    # is what lets `stop()` reap it inside the presence backstop.
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 1.0)
-
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
     # #630 S2: `socketserver.ThreadingTCPServer` sets `daemon_threads = False`
     # as its class default, so `start()` sets the flag on this instance and
@@ -386,10 +378,14 @@ def test_events_passive_under_no_sync(tmp_path, monkeypatch):
 def test_events_emits_ready_when_active(tmp_path, monkeypatch):
     """#278 Theme B: an ACTIVE (non-passive) live-tail stream emits a one-time
     ``event: ready`` at the top of the loop so the client can distinguish real
-    server liveness from a merely-open socket."""
+    server liveness from a merely-open socket. Closing the peer must also reap
+    that stream without waiting for the next 15-second keep-alive write."""
     ns = load_script()
     srv, _projects, _jsonl = _boot(ns, tmp_path, monkeypatch,
                                    bind="127.0.0.1", expose=False)
+    conv = sys.modules["_cctally_dashboard_conversation"]
+    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 60.0)
+    monkeypatch.setattr(conv, "_LIVE_TAIL_POLL_INTERVAL", 0.05)
     try:
         port = srv.server_address[1]
         s = _open_sse(port, "/api/conversation/s1/events")
@@ -398,7 +394,18 @@ def test_events_emits_ready_when_active(tmp_path, monkeypatch):
             assert frame.startswith("event: ready")
         finally:
             s.close()
+        deadline = time.monotonic() + 1.0
+        while any(thread.is_alive() for thread in srv._threads):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        assert not any(thread.is_alive() for thread in srv._threads), (
+            "a closed live-tail peer retained its handler until the next "
+            "keep-alive write")
     finally:
+        # Keep cleanup bounded if the peer-close regression returns, so this
+        # assertion cannot strand the worker until its 60-second keep-alive.
+        monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 0.05)
         stop(srv, srv._test_thread)
 
 

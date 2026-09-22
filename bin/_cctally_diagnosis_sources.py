@@ -40,10 +40,12 @@ import json
 import os
 import pickle
 import re
+import signal
 import shlex
 import sqlite3
 import sys
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -70,6 +72,14 @@ UTC = dt.timezone.utc
 # Read-only connections still contend with a live writer's WAL, so they get a
 # bounded wait rather than an immediate `database is locked`.
 READ_BUSY_TIMEOUT_MS = 4000
+
+# A provider read can lose its component-local coherence check to the writer
+# that is publishing the next generation. Retry the whole provider build a
+# small number of times while a monotonic admission budget remains. The
+# `_establish` retry remains deliberately narrower: it still rereads one
+# component once and refuses a second divergence within that build.
+DIAGNOSIS_RETRY_MAX_ATTEMPTS = 3
+DIAGNOSIS_RETRY_DEADLINE_SECONDS = 1.0
 
 _STORE_PATHS = {
     "cache": "CACHE_DB_PATH",
@@ -1045,28 +1055,22 @@ def _compiled_codex_pricer(model: str, speed: str):
                reasoning_output_tokens: int) -> float:
         del reasoning_output_tokens
         non_cached_input = max(0, input_tokens - cached_input_tokens)
+        long_context = input_tokens > threshold
         if non_cached_input <= 0 or not input_rate:
             input_cost = 0.0
-        elif non_cached_input > threshold and input_tier is not None:
-            input_cost = (threshold * input_rate
-                          + (non_cached_input - threshold) * input_tier)
         else:
-            input_cost = non_cached_input * input_rate
+            input_cost = non_cached_input * (
+                input_tier if long_context and input_tier is not None else input_rate)
         if cached_input_tokens <= 0 or not cache_rate:
             cached_input_cost = 0.0
-        elif cached_input_tokens > threshold and cache_tier is not None:
-            cached_input_cost = (
-                threshold * cache_rate
-                + (cached_input_tokens - threshold) * cache_tier)
         else:
-            cached_input_cost = cached_input_tokens * cache_rate
+            cached_input_cost = cached_input_tokens * (
+                cache_tier if long_context and cache_tier is not None else cache_rate)
         if output_tokens <= 0 or not output_rate:
             output_cost = 0.0
-        elif output_tokens > threshold and output_tier is not None:
-            output_cost = (threshold * output_rate
-                           + (output_tokens - threshold) * output_tier)
         else:
-            output_cost = output_tokens * output_rate
+            output_cost = output_tokens * (
+                output_tier if long_context and output_tier is not None else output_rate)
         base = input_cost + cached_input_cost + output_cost
         if speed == "fast":
             base *= multiplier
@@ -4345,11 +4349,43 @@ def build_provider_diagnosis(scope: DiagnosisScope, *,
         )
 
 
+def _build_provider_with_retry(scope: DiagnosisScope, *,
+                               transcripts_visible: bool
+                               ) -> kernel.ProviderResult:
+    """Build one provider, admitting only bounded fresh retries.
+
+    A `generation_incoherent` result means the provider's read crossed two
+    writes during one attempt. Restarting the provider build is safe because
+    every attempt owns fresh read-only connections and facts. Other typed
+    establishment failures and unexpected exceptions retain their existing
+    handling at the caller; they are never converted into retries.
+    """
+    deadline = time.monotonic() + DIAGNOSIS_RETRY_DEADLINE_SECONDS
+    for attempt in range(DIAGNOSIS_RETRY_MAX_ATTEMPTS):
+        try:
+            return build_provider_diagnosis(
+                scope, transcripts_visible=transcripts_visible)
+        except EstablishmentFailure as exc:
+            if exc.code != EstablishmentError.GENERATION_INCOHERENT.value:
+                raise
+            if attempt + 1 >= DIAGNOSIS_RETRY_MAX_ATTEMPTS:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            # Give an in-flight writer a chance to finish before reopening
+            # every store. Normal coherent reads pay no delay.
+            time.sleep(min(0.1 * (attempt + 1), remaining))
+            if time.monotonic() >= deadline:
+                raise
+    raise AssertionError("provider diagnosis retry loop did not return")
+
+
 def _build_provider_task(args) -> kernel.ProviderResult:
     """Pickle-safe provider build for the independent `all` branches."""
     scope, transcripts_visible = args
     try:
-        result = build_provider_diagnosis(
+        result = _build_provider_with_retry(
             scope, transcripts_visible=transcripts_visible)
     except EstablishmentFailure as exc:
         if exc.code != EstablishmentError.STORE_UNAVAILABLE.value:
@@ -4419,6 +4455,136 @@ def _spawn_worker_init(cctally_path: str,
         setattr(_cctally_core, name, pathlib.Path(raw))
 
 
+_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS = 0.5
+
+
+def _bounded_process_entry(result_path: str, task, args,
+                           initializer, initargs) -> None:
+    """Run one pickle-safe task in its own killable process group."""
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            # The parent still terminates this process directly if the group
+            # was not established. No descendants exist before this point.
+            pass
+    try:
+        if initializer is not None:
+            initializer(*initargs)
+        payload = ("ok", task(*args))
+    except EstablishmentFailure as exc:
+        payload = ("establishment", exc.code, exc.message)
+    except BaseException as exc:
+        payload = ("unexpected", type(exc).__name__, str(exc))
+    with open(result_path, "wb") as stream:
+        pickle.dump(payload, stream, protocol=5)
+
+
+def _terminate_process_group(process) -> None:
+    """Terminate and reap one bounded worker plus any provider descendants."""
+    grouped = False
+    if process.pid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            grouped = True
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+    if process.is_alive() and not grouped:
+        process.terminate()
+    process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+    if grouped and process.pid is not None:
+        try:
+            # The leader may have exited on SIGTERM while a provider child
+            # ignored it. The process group remains addressable until every
+            # descendant is gone, so always finish the group with SIGKILL.
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+    elif process.is_alive():
+        process.kill()
+    process.join(_DIAGNOSIS_PROCESS_TERMINATE_GRACE_SECONDS)
+
+
+def _run_process_with_deadline(task, args, *, timeout_seconds: float,
+                               initializer=None, initargs=()):
+    """Run TASK in a one-shot process and forcibly retire it at the deadline."""
+    import multiprocessing
+    import tempfile
+
+    if timeout_seconds <= 0:
+        raise TimeoutError("diagnosis process deadline expired")
+    methods = multiprocessing.get_all_start_methods()
+    method = "forkserver" if "forkserver" in methods else "spawn"
+    context = multiprocessing.get_context(method)
+    fd, result_path = tempfile.mkstemp(prefix="cctally-diagnosis-")
+    os.close(fd)
+    process = context.Process(
+        target=_bounded_process_entry,
+        args=(result_path, task, args, initializer, initargs),
+        name="cctally-diagnosis-process",
+    )
+    try:
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            _terminate_process_group(process)
+            raise TimeoutError("diagnosis process deadline expired")
+        if process.exitcode != 0:
+            raise RuntimeError(
+                f"diagnosis process exited {process.exitcode}")
+        try:
+            with open(result_path, "rb") as stream:
+                payload = pickle.load(stream)
+        except (EOFError, OSError, pickle.PickleError) as exc:
+            raise RuntimeError("diagnosis process returned no result") from exc
+    finally:
+        if process.is_alive():
+            _terminate_process_group(process)
+        try:
+            os.unlink(result_path)
+        except FileNotFoundError:
+            pass
+        process.close()
+    if payload[0] == "ok":
+        return payload[1]
+    if payload[0] == "establishment":
+        raise EstablishmentFailure(payload[1], payload[2])
+    raise RuntimeError(f"{payload[1]}: {payload[2]}")
+
+
+def _build_diagnosis_process_task(scope: DiagnosisScope,
+                                  measured_at: dt.datetime | None,
+                                  transcripts_visible: bool):
+    return build_diagnosis(
+        scope, measured_at=measured_at,
+        transcripts_visible=transcripts_visible,
+    )
+
+
+def build_diagnosis_bounded(scope: DiagnosisScope, *,
+                            measured_at: dt.datetime | None = None,
+                            transcripts_visible: bool,
+                            timeout_seconds: float) -> kernel.DiagnosisReport:
+    """Build one dashboard diagnosis in a process retired at TIMEOUT_SECONDS."""
+    c = _cctally()
+    paths = {
+        name: str(getattr(_cctally_core, name))
+        for name in ("CACHE_DB_PATH", "DB_PATH",
+                     "CONVERSATIONS_DB_PATH", "CONFIG_PATH")
+    }
+    return _run_process_with_deadline(
+        _build_diagnosis_process_task,
+        (scope, measured_at, transcripts_visible),
+        timeout_seconds=timeout_seconds,
+        initializer=_spawn_worker_init,
+        initargs=(str(c.__file__), paths),
+    )
+
+
 def _build_isolated_provider(args):
     """Run one provider in a portable, one-shot safe process worker."""
     import concurrent.futures
@@ -4467,7 +4633,7 @@ def build_diagnosis(scope: DiagnosisScope,
             label=scope.label,
         )
         try:
-            return build_provider_diagnosis(
+            return _build_provider_with_retry(
                 provider_scope, transcripts_visible=transcripts_visible)
         except EstablishmentFailure as exc:
             # A store that cannot be OPENED withholds its provider rather than

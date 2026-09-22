@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { _resetForTests, dispatch, getState } from './store';
+import { _resetForTests, dispatch, getState, selectConvAnonRefusal } from './store';
+import { conversationRefKey } from '../types/conversation';
 import { clearReadingPositions, loadReadingPos } from './readingPosition';
 import { clearRailPrefs } from './conversationRailPrefs';
 import { clearBookmarks, loadBookmarks, toggleBookmark } from './bookmarks';
@@ -571,5 +572,89 @@ describe('convBookmarks store slice (#217 S6 F4)', () => {
     expect(loadBookmarks('other-sess').other1.note).toBe('n');
     expect(getState().convBookmarks).toEqual({});             // still untouched
     clearBookmarks();
+  });
+});
+
+// #850 §4.9 / A25 — the per-conversation anonymized-refusal record.
+//
+// The record is INDEPENDENT per conversation. A single record, replaced by
+// every 409, let a late 409 for a conversation that was no longer selected
+// erase the selected conversation's active refusal, and a reducer-based clear
+// had to enumerate every branch that changes the selection — five of them. The
+// record here is keyed by the conversation ref, set by a 409 for THAT
+// conversation and deleted only by a 2xx for it; no selection change clears it,
+// so its visibility depends on which conversation is selected and never on the
+// branch that selected it.
+describe('conversation anonymized-refusal records', () => {
+  const A = { source: 'codex' as const, key: 'v1.aaa' };
+  const B = { source: 'codex' as const, key: 'v1.bbb' };
+  const MESSAGE_A = 'Anonymized copy is unavailable: 1 Codex project path(s) '
+    + 'could not be read. Run cctally cache-sync --source codex --rebuild.';
+  const MESSAGE_B = 'Anonymized copy is unavailable: 2 Codex project path(s) '
+    + 'could not be read. Run cctally cache-sync --source codex --rebuild.';
+
+  const refuse = (ref: typeof A, message: string) =>
+    dispatch({ type: 'SET_CONV_ANON_REFUSAL', conversationRef: ref, refused: true, message });
+  const clear = (ref: typeof A) =>
+    dispatch({ type: 'SET_CONV_ANON_REFUSAL', conversationRef: ref, refused: false });
+
+  it('starts empty and yields nothing without a selection', () => {
+    expect(getState().convAnonRefusals).toEqual({});
+    expect(selectConvAnonRefusal()).toBeNull();
+  });
+
+  it('shows the selected conversation its own record and no other', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: A });
+    refuse(A, MESSAGE_A);
+    expect(selectConvAnonRefusal()).toBe(MESSAGE_A);
+    // A genuine switch shows no refusal on the other conversation, through
+    // either rail branch — and does NOT clear A's record.
+    dispatch({ type: 'SELECT_CONVERSATION', conversationRef: B });
+    expect(selectConvAnonRefusal()).toBeNull();
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: B });
+    expect(selectConvAnonRefusal()).toBeNull();
+  });
+
+  it('a late response for A never changes B, refused or not', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: A });
+    dispatch({ type: 'SELECT_CONVERSATION', conversationRef: B });
+    // A 409 for A that resolves after the switch leaves B unrefused.
+    refuse(A, MESSAGE_A);
+    expect(selectConvAnonRefusal()).toBeNull();
+    // A 409 for A that resolves while B holds a refusal leaves B's in place.
+    refuse(B, MESSAGE_B);
+    refuse(A, MESSAGE_A);
+    expect(selectConvAnonRefusal()).toBe(MESSAGE_B);
+    // And a 2xx for A does not clear B's.
+    clear(A);
+    expect(selectConvAnonRefusal()).toBe(MESSAGE_B);
+    expect(getState().convAnonRefusals[conversationRefKey(A)]).toBeUndefined();
+  });
+
+  it('a record set while another conversation was selected returns on reselection', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: B });
+    refuse(A, MESSAGE_A);
+    for (const action of [
+      { type: 'SELECT_CONVERSATION', conversationRef: A } as const,
+      { type: 'OPEN_CONVERSATION', conversationRef: A } as const,
+      // The compare anchor selection, exactly as hash routing dispatches it.
+      { type: 'OPEN_COMPARE', aRef: A, bRef: B } as const,
+    ]) {
+      dispatch({ type: 'SELECT_CONVERSATION', conversationRef: B });
+      expect(selectConvAnonRefusal()).toBeNull();
+      dispatch(action);
+      expect(selectConvAnonRefusal()).toBe(MESSAGE_A);
+    }
+    clear(A);
+    expect(selectConvAnonRefusal()).toBeNull();
+  });
+
+  it('SET_ACCOUNT_FOCUS and SET_VIEW do not clear a record either', () => {
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: A });
+    refuse(A, MESSAGE_A);
+    dispatch({ type: 'SET_VIEW', view: 'dashboard' });
+    dispatch({ type: 'SET_VIEW', view: 'conversations' });
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: A });
+    expect(selectConvAnonRefusal()).toBe(MESSAGE_A);
   });
 });

@@ -12,6 +12,11 @@ const OK_FIXTURE = JSON.parse(readFileSync(
   'utf8',
 )) as Record<string, any>;
 
+const CODEX_FIXTURE = JSON.parse(readFileSync(
+  new URL('../../../tests/fixtures/dashboard/codex-account-fallback/golden-data.json', import.meta.url),
+  'utf8',
+)) as Record<string, any>;
+
 const WARNING_DOMAINS = [
   ['hero', 'Hero unavailable'],
   ['daily', 'Daily unavailable'],
@@ -23,6 +28,7 @@ const WARNING_DOMAINS = [
   ['budget', 'Budget unavailable'],
   ['forensics', 'Forensics unavailable'],
   ['alerts', 'Alerts unavailable'],
+  ['accounts', 'Accounts unavailable'],
 ] as const;
 
 async function freezeEventStream(page: Page) {
@@ -125,6 +131,25 @@ async function serveFixture(page: Page, fixture: Record<string, any>) {
   });
 }
 
+async function serveStaleCodexFixture(page: Page) {
+  await freezeEventStream(page);
+  await page.route('**/api/data', async (route) => {
+    const response = await route.fetch();
+    const live = await response.json() as Record<string, any>;
+    const fixture = materializeFixture(CODEX_FIXTURE, live);
+    // Use the same undecorated Codex hero shape as the browser baseline so
+    // the canonical support freshness value is present alongside the stale
+    // quota observation.
+    delete fixture.sources?.codex?.data?.accounts;
+    delete fixture.sources?.codex?.data?.account_scopes;
+    const staleAt = new Date(Date.now() - (57 * 24 * 60 * 60 * 1000 + 23 * 60 * 60 * 1000)).toISOString();
+    for (const row of fixture.sources?.codex?.data?.hero?.quota?.active ?? []) {
+      row.captured_at = staleAt;
+    }
+    await fulfilJson(route, response, fixture);
+  });
+}
+
 test('#561 — the 320px Claude usage zone contains both metric blocks', async ({ page }) => {
   await serveFixture(page, OK_FIXTURE);
   await page.setViewportSize({ width: 320, height: 900 });
@@ -188,7 +213,87 @@ for (const viewport of [
   });
 }
 
-test('#563 — every 390px domain warning keeps a visible state word', async ({ page }) => {
+for (const phoneCase of [
+  { label: 'All', source: 'all' as const, serve: serveDecoratedFixture },
+  { label: 'Codex', source: 'codex' as const, serve: (page: Page) => serveFixture(page, CODEX_FIXTURE) },
+]) {
+  for (const width of [390, 320] as const) {
+    test(`#757 — ${phoneCase.label} account cards expose the next card at ${width}px`, async ({ page }) => {
+      await phoneCase.serve(page);
+      await page.setViewportSize({ width, height: 844 });
+      await page.goto('/');
+      await selectSource(page, phoneCase.source);
+
+      const rail = page.getByTestId('account-hero-cards');
+      const cards = page.getByTestId('account-hero-card');
+      const cue = page.getByTestId('account-hero-scroll-cue');
+      await expect(cards).toHaveCount(3);
+      await expect(cue).toBeVisible();
+      await expect(cue).toContainText('Swipe for more');
+
+      const initial = await rail.evaluate((node) => {
+        const railRect = node.getBoundingClientRect();
+        const allCards = node.querySelectorAll<HTMLElement>('.account-hero-card');
+        const first = allCards.item(0)?.getBoundingClientRect();
+        const second = allCards.item(1)?.getBoundingClientRect();
+        return {
+          clientWidth: node.clientWidth,
+          scrollWidth: node.scrollWidth,
+          railLeft: railRect.left,
+          railRight: railRect.right,
+          firstLeft: first?.left ?? 0,
+          firstRight: first?.right ?? 0,
+          secondLeft: second?.left ?? 0,
+          secondRight: second?.right ?? 0,
+        };
+      });
+      expect(initial.scrollWidth).toBeGreaterThan(initial.clientWidth);
+      expect(initial.firstLeft).toBeGreaterThanOrEqual(initial.railLeft - 1);
+      expect(initial.firstRight).toBeLessThanOrEqual(initial.railRight + 1);
+      expect(initial.secondLeft).toBeLessThan(initial.railRight);
+      expect(initial.secondRight).toBeGreaterThan(initial.railRight);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth))
+        .toBeLessThanOrEqual(width);
+
+      await rail.evaluate((node) => { node.scrollLeft = node.scrollWidth; });
+      await expect.poll(() => rail.evaluate((node) => {
+        const railRect = node.getBoundingClientRect();
+        const allCards = node.querySelectorAll<HTMLElement>('.account-hero-card');
+        const last = allCards.item(allCards.length - 1);
+        if (last == null) return false;
+        const lastRect = last.getBoundingClientRect();
+        return lastRect.left >= railRect.left - 1 && lastRect.right <= railRect.right + 1;
+      })).toBe(true);
+      await expect(cue).toBeHidden();
+    });
+  }
+}
+
+test('#816 — a long stale snapshot stays inside the 390px support zone', async ({ page }) => {
+  await serveStaleCodexFixture(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectSource(page, 'codex');
+
+  const freshness = page.locator('.hero-support .sup-fresh');
+  await expect(freshness).toHaveText('⚠ stale · 57d 23h ago');
+  const geometry = await freshness.evaluate((node) => {
+    const support = node.closest('.hero-support')?.getBoundingClientRect();
+    const rect = node.getBoundingClientRect();
+    return {
+      clientWidth: (node as HTMLElement).clientWidth,
+      scrollWidth: (node as HTMLElement).scrollWidth,
+      right: rect.right,
+      supportRight: support?.right ?? 0,
+    };
+  });
+  expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth + 1);
+  expect(geometry.right).toBeLessThanOrEqual(geometry.supportRight + 1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth))
+    .toBeLessThanOrEqual(390);
+});
+
+test('#831 — every 390px domain warning visibly names its domain and state', async ({ page }) => {
   await freezeEventStream(page);
   await page.setViewportSize({ width: 390, height: 844 });
   let activeWarning: (typeof WARNING_DOMAINS)[number] = WARNING_DOMAINS[0];
@@ -216,7 +321,7 @@ test('#563 — every 390px domain warning keeps a visible state word', async ({ 
     await expect(chip.locator('.source-status-label--full')).toBeHidden();
     await expect(chip.locator('.source-status-label--full')).toHaveText(warning[1]);
     await expect(chip.locator('.source-status-label--compact')).toBeVisible();
-    await expect(chip.locator('.source-status-label--compact')).toHaveText('Unavailable');
+    await expect(chip.locator('.source-status-label--compact')).toHaveText(warning[1]);
     const geometry = await chip.evaluate((node) => ({
       clientWidth: node.clientWidth,
       scrollWidth: node.scrollWidth,

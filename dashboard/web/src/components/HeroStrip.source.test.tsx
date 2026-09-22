@@ -760,7 +760,7 @@ describe('HeroStrip — All combined tiles (§6.1)', () => {
 describe('HeroStrip — region heading (§5)', () => {
   it.each([
     ['all', 'Combined usage summary'],
-    ['claude', 'Claude week usage summary'],
+    ['claude', 'Claude cycle usage summary'],
     ['codex', 'Codex cycle usage summary'],
   ] as const)('names the %s region and gives it a level-2 heading', (source, name) => {
     updateSnapshot(envWith());
@@ -775,10 +775,10 @@ describe('HeroStrip — region heading (§5)', () => {
   });
 });
 
-describe('HeroStrip — Claude unchanged (default source)', () => {
-  it('keeps the subscription-week vocabulary under Claude', () => {
+describe('HeroStrip — Claude cycle vocabulary (default source)', () => {
+  it('keeps the subscription-cycle vocabulary under Claude', () => {
     updateSnapshot(envWith());
     render(<HeroStrip />);
-    expect(screen.getByText(/SPENT THIS WEEK/)).toBeInTheDocument();
+    expect(screen.getByText(/SPENT THIS CYCLE/)).toBeInTheDocument();
   });
 });

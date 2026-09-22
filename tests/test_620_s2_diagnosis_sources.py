@@ -805,6 +805,108 @@ def test_build_diagnosis_returns_one_result_per_provider(claude_store):
     assert [r.source for r in report.results] == ["claude", "codex"]
 
 
+def test_build_diagnosis_retries_a_generation_failure_as_a_fresh_build(
+        monkeypatch):
+    """A transient incoherence must restart the whole provider read."""
+    sources = _sources()
+    calls = []
+
+    def _provider(scope, *, transcripts_visible):
+        assert transcripts_visible is True
+        calls.append(scope.source)
+        if len(calls) == 1:
+            raise sources.EstablishmentFailure(
+                "generation_incoherent", "the store moved")
+        return f"{scope.source}:ok"
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    monkeypatch.setattr(
+        sources.kernel, "build_report",
+        lambda measured_at, window, results: list(results),
+    )
+
+    assert sources.build_diagnosis(
+        _scope(), transcripts_visible=True
+    ) == ["claude:ok"]
+    assert calls == ["claude", "claude"]
+
+
+def test_generation_retry_is_bounded_by_the_monotonic_admission_deadline(
+        monkeypatch):
+    """Persistent movement cannot turn one request into an unbounded loop."""
+    sources = _sources()
+    calls = []
+
+    class _Clock:
+        def __init__(self):
+            self.calls = 0
+            self.sleeps = []
+
+        def monotonic(self):
+            self.calls += 1
+            # Admit one retry after a short wait, then expire the budget
+            # before a third attempt can begin.
+            return (0.0 if self.calls == 1 else
+                    0.25 if self.calls == 2 else
+                    0.35 if self.calls == 3 else 2.0)
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    clock = _Clock()
+    monkeypatch.setattr(sources, "time", clock, raising=False)
+
+    def _provider(scope, *, transcripts_visible):
+        calls.append(scope.source)
+        raise sources.EstablishmentFailure(
+            "generation_incoherent", "the store keeps moving")
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    with pytest.raises(sources.EstablishmentFailure) as exc:
+        sources.build_diagnosis(_scope(), transcripts_visible=True)
+
+    assert exc.value.code == "generation_incoherent"
+    assert calls == ["claude", "claude"]
+    assert clock.sleeps == [0.1]
+
+
+def test_generation_retry_does_not_retry_other_establishment_failures(
+        monkeypatch):
+    sources = _sources()
+    calls = []
+
+    def _provider(scope, *, transcripts_visible):
+        calls.append(scope.source)
+        raise sources.EstablishmentFailure("account_unresolved", "unknown")
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    with pytest.raises(sources.EstablishmentFailure) as exc:
+        sources.build_diagnosis(_scope(), transcripts_visible=True)
+
+    assert exc.value.code == "account_unresolved"
+    assert calls == ["claude"]
+
+
+def test_the_codex_worker_retries_a_generation_failure(
+        monkeypatch):
+    """The isolated source=all worker uses the same retry boundary."""
+    sources = _sources()
+    calls = []
+
+    def _provider(scope, *, transcripts_visible):
+        assert scope.source == "codex"
+        calls.append(scope.source)
+        if len(calls) == 1:
+            raise sources.EstablishmentFailure(
+                "generation_incoherent", "the store moved")
+        return "codex:ok"
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    assert sources._build_provider_task((_scope(source="codex"), True)) == (
+        "codex:ok")
+    assert calls == ["codex", "codex"]
+
+
 def test_all_builds_independent_providers_concurrently_in_stable_order(
         monkeypatch):
     """The combined latency budget is not the sum of two read-only folds."""

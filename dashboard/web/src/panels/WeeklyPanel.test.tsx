@@ -126,6 +126,16 @@ describe('<WeeklyPanel /> (#264 S2)', () => {
     expect(getState().openModal).toBe('weekly');
   });
 
+  it('keeps model legends inert while the card body still opens', () => {
+    const { container } = render(<WeeklyPanel />);
+    const legend = container.querySelector('.model-legend') as HTMLElement;
+    expect(legend).toBeTruthy();
+    fireEvent.click(legend);
+    expect(getState().openModal).toBeNull();
+    fireEvent.click(container.querySelector('#panel-weekly') as HTMLElement);
+    expect(getState().openModal).toBe('weekly');
+  });
+
   it('the ShareIcon dispatches openShareModal("weekly")', () => {
     render(<WeeklyPanel />);
     fireEvent.click(screen.getByRole('button', { name: /Share Weekly report/i }));

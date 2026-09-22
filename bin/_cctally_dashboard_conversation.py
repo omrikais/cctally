@@ -47,6 +47,7 @@ import collections
 import dataclasses
 import hashlib
 import secrets
+import select
 import threading
 import time
 
@@ -115,10 +116,16 @@ _OUTLINE_TRANSFER_ITEM_CAP = 32 * 1024 * 1024
 _OUTLINE_TRANSFER_TOTAL_CAP = 64 * 1024 * 1024
 _OUTLINE_TRANSFER_COUNT_CAP = 128
 _OUTLINE_TRANSFER_TTL = 120.0
+_OUTLINE_TRANSFER_REQUEST_DEADLINE = 15.0
+_OUTLINE_TRANSFER_MAX_WAITERS = 32
+_OUTLINE_TRANSFER_MAX_WAITERS_PER_TOKEN = 16
+_OUTLINE_TRANSFER_MAX_PRODUCERS = 2
 _OUTLINE_TRANSFERS = collections.OrderedDict()
 _OUTLINE_TRANSFERS_BYTES = 0
 _OUTLINE_TRANSFERS_EVICTIONS = 0
 _OUTLINE_TRANSFERS_FALLBACKS = 0
+_OUTLINE_TRANSFERS_WAITERS = 0
+_OUTLINE_TRANSFERS_PRODUCERS = 0
 _OUTLINE_TRANSFERS_LOCK = threading.Lock()
 
 
@@ -129,6 +136,10 @@ class _OutlineTransferRecord:
     payload: bytes | None = None
     digest: str | None = None
     state: str = "pending"
+    waiters: int = 0
+    deadline: float | None = None
+    failure_status: int | None = None
+    failure_body: dict | None = None
     cancelled: threading.Event = dataclasses.field(default_factory=threading.Event)
     ready: threading.Event = dataclasses.field(default_factory=threading.Event)
 
@@ -148,6 +159,8 @@ def outline_transfer_cache_stats():
             "maxEntries": _OUTLINE_TRANSFER_COUNT_CAP,
             "evictionCount": int(_OUTLINE_TRANSFERS_EVICTIONS),
             "fallbackCount": int(_OUTLINE_TRANSFERS_FALLBACKS),
+            "admittedWaiters": int(_OUTLINE_TRANSFERS_WAITERS),
+            "activeProducers": int(_OUTLINE_TRANSFERS_PRODUCERS),
         }
 
 
@@ -191,8 +204,9 @@ def _store_outline_transfer(builder):
     return {"token": token, "chunk_size": _OUTLINE_TRANSFER_CHUNK}
 
 
-def _claim_outline_transfer(token):
+def _claim_outline_transfer(token, *, admit=False):
     """Atomically claim a pending builder or join its in-flight generation."""
+    global _OUTLINE_TRANSFERS_WAITERS, _OUTLINE_TRANSFERS_PRODUCERS
     now = time.monotonic()
     with _OUTLINE_TRANSFERS_LOCK:
         _prune_outline_transfers_locked(now)
@@ -202,10 +216,47 @@ def _claim_outline_transfer(token):
         _OUTLINE_TRANSFERS.move_to_end(token)
         if record.payload is not None:
             return "ready", record, None
+        if admit:
+            if (_OUTLINE_TRANSFERS_WAITERS >= _OUTLINE_TRANSFER_MAX_WAITERS
+                    or record.waiters >= _OUTLINE_TRANSFER_MAX_WAITERS_PER_TOKEN
+                    or (record.state == "pending" and
+                        _OUTLINE_TRANSFERS_PRODUCERS >=
+                        _OUTLINE_TRANSFER_MAX_PRODUCERS)):
+                return "busy", record, None
+            record.waiters += 1
+            _OUTLINE_TRANSFERS_WAITERS += 1
         if record.state == "pending":
             record.state = "building"
+            if admit:
+                record.deadline = min(
+                    now + _OUTLINE_TRANSFER_REQUEST_DEADLINE,
+                    record.created + _OUTLINE_TRANSFER_TTL,
+                )
+                _OUTLINE_TRANSFERS_PRODUCERS += 1
             return "build", record, record.builder
         return "wait", record, None
+
+
+def _release_outline_transfer_waiter(token, record):
+    """An abandoned last reader cancels its producer without releasing its slot."""
+    global _OUTLINE_TRANSFERS_WAITERS
+    with _OUTLINE_TRANSFERS_LOCK:
+        record.waiters -= 1
+        _OUTLINE_TRANSFERS_WAITERS -= 1
+        if (record.waiters == 0 and record.state == "building"
+                and _OUTLINE_TRANSFERS.get(token) is record):
+            _drop_outline_transfer_locked(token)
+
+
+def _finish_outline_transfer_failure(token, record, status, body):
+    """Publish one failure to admitted readers and retire only this generation."""
+    with _OUTLINE_TRANSFERS_LOCK:
+        if _OUTLINE_TRANSFERS.get(token) is not record:
+            return False
+        record.failure_status = status
+        record.failure_body = body
+        _drop_outline_transfer_locked(token)
+        return True
 
 
 def _outline_transfer_builder(token):
@@ -225,6 +276,9 @@ def _materialize_outline_transfer(token, payload, *, claim=None):
         with _OUTLINE_TRANSFERS_LOCK:
             current = _OUTLINE_TRANSFERS.get(token)
             if current is not None and (claim is None or current is claim):
+                current.failure_status = 413
+                current.failure_body = {
+                    "error": "outline exceeds progressive transfer limit"}
                 _drop_outline_transfer_locked(token)
                 _OUTLINE_TRANSFERS_FALLBACKS += 1
         return "too_large"
@@ -266,6 +320,9 @@ def _materialize_outline_transfer(token, payload, *, claim=None):
                 None,
             )
             if victim is None:
+                record.failure_status = 413
+                record.failure_body = {
+                    "error": "outline exceeds progressive transfer limit"}
                 _drop_outline_transfer_locked(token)
                 _OUTLINE_TRANSFERS_FALLBACKS += 1
                 return "too_large"
@@ -292,6 +349,9 @@ def _reject_outline_transfer_too_large(token, *, claim) -> bool:
         current = _OUTLINE_TRANSFERS.get(token)
         if current is None or current is not claim:
             return False
+        current.failure_status = 413
+        current.failure_body = {
+            "error": "outline exceeds progressive transfer limit"}
         _drop_outline_transfer_locked(token)
         _OUTLINE_TRANSFERS_FALLBACKS += 1
         return True
@@ -1186,7 +1246,9 @@ def _run_conversation_events_stream(
     if passive:
         # Frozen-data contract: no ingest, no emit. Keep-alive only.
         while True:
-            _time.sleep(_LIVE_TAIL_KEEPALIVE)
+            if _request_peer_gone(
+                    handler, timeout=_LIVE_TAIL_KEEPALIVE):
+                return
             handler.wfile.write(b": keep-alive\n\n")
             handler.wfile.flush()
 
@@ -1221,7 +1283,8 @@ def _run_conversation_events_stream(
     idle = 0.0
     cycles = 0
     while True:
-        _time.sleep(_LIVE_TAIL_POLL_INTERVAL)
+        if _request_peer_gone(handler, timeout=_LIVE_TAIL_POLL_INTERVAL):
+            return
         cycles += 1
         changed = watch.changed_paths(files, seen)
         if changed:
@@ -1793,7 +1856,8 @@ def _handle_get_conversation_payload_impl(handler, path: str) -> None:
 
 def _handle_get_conversation_outline_impl(handler, path: str) -> None:
     """``GET /api/conversation/<sid>/outline`` — full-session skeleton +
-    session stats (#177 S5). Same fail-closed privacy gate; unknown id → 404.
+    session stats (#177 S5). Same fail-closed privacy gate; unknown id → 404
+    for the legacy form, typed absence on the progressive preflight.
     """
     if not handler._require_transcripts_allowed():
         return
@@ -1859,7 +1923,7 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
         if not ok:
             return
         if not exists:
-            handler.send_error(404, "conversation not found")
+            handler._respond_json(200, {"status": "not_found"})
             return
 
         def _build_bare(transfer_handler, cancelled):
@@ -1892,6 +1956,99 @@ def _handle_get_conversation_outline_impl(handler, path: str) -> None:
     handler._respond_json(200, body)
 
 
+class _OutlineTransferBuildHandler:
+    """Give a producer read access to its request without writing its socket."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.response = None
+
+    def __getattr__(self, name):
+        return getattr(self._handler, name)
+
+    def _respond_json(self, status, body):
+        self.response = (status, body)
+
+
+def _produce_outline_transfer(token, record, builder, handler):
+    """Build off the request thread; the producer slot lasts until real exit."""
+    global _OUTLINE_TRANSFERS_PRODUCERS
+    proxy = _OutlineTransferBuildHandler(handler)
+    try:
+        try:
+            ok, full_body = builder(proxy, record.cancelled.is_set)
+            if record.cancelled.is_set():
+                return
+            if ok is None or full_body is None and ok:
+                _finish_outline_transfer_failure(
+                    token, record, 410,
+                    {"error": "outline transfer expired"})
+                return
+            if not ok:
+                status, body = proxy.response or (
+                    500, {"error": "outline transfer failed"})
+                _finish_outline_transfer_failure(token, record, status, body)
+                return
+            payload = encode_dashboard_json_bytes_capped(
+                full_body, max_bytes=_OUTLINE_TRANSFER_ITEM_CAP)
+            if payload is None:
+                _reject_outline_transfer_too_large(token, claim=record)
+            else:
+                _materialize_outline_transfer(token, payload, claim=record)
+        except Exception as exc:  # noqa: BLE001
+            handler.log_error("outline transfer build failed: %r", exc)
+            _finish_outline_transfer_failure(
+                token, record, 500, {"error": "outline transfer failed"})
+    finally:
+        with _OUTLINE_TRANSFERS_LOCK:
+            _OUTLINE_TRANSFERS_PRODUCERS -= 1
+
+
+def _request_peer_gone(handler, *, timeout=0.0):
+    """Detect a closed request socket while no response is being written."""
+    conn = getattr(handler, "connection", None)
+    if conn is None:
+        return False
+    try:
+        if not select.select([conn], [], [], timeout)[0]:
+            return False
+        return not conn.recv(
+            1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+    except (OSError, ValueError):
+        return True
+
+
+def _wait_outline_transfer(handler, token, record):
+    """Wait only to the shared build deadline, waking for expiry/disconnect."""
+    while True:
+        if _request_peer_gone(handler):
+            return False
+        if record.ready.is_set():
+            if record.failure_status is not None:
+                handler._respond_json(
+                    record.failure_status, record.failure_body)
+                return False
+            if record.cancelled.is_set() or record.payload is None:
+                handler._respond_json(
+                    410, {"error": "outline transfer expired"})
+                return False
+            return True
+        now = time.monotonic()
+        if now - record.created > _OUTLINE_TRANSFER_TTL:
+            _cancel_outline_transfer(token, claim=record)
+            handler._respond_json(410, {"error": "outline transfer expired"})
+            return False
+        if now >= record.deadline:
+            _finish_outline_transfer_failure(
+                token, record, 504,
+                {"error": "outline transfer timed out"})
+            handler._respond_json(
+                record.failure_status or 410,
+                record.failure_body or {"error": "outline transfer expired"})
+            return False
+        record.ready.wait(min(0.05, record.deadline - now))
+
+
 def _handle_get_conversation_outline_transfer_impl(handler, path: str) -> None:
     """Serve one bounded chunk from an opaque, immutable outline transfer."""
     if not handler._require_transcripts_allowed():
@@ -1910,42 +2067,33 @@ def _handle_get_conversation_outline_transfer_impl(handler, path: str) -> None:
         return
     else:
         offset = int(values[0])
-    claim = _claim_outline_transfer(token)
+    claim = _claim_outline_transfer(token, admit=True)
     if claim is None:
         handler._respond_json(410, {"error": "outline transfer expired"})
         return
     action, record, builder = claim
+    if action == "busy":
+        handler._respond_json(503, {"error": "outline transfer busy"})
+        return
     if action == "build":
-        ok, full_body = builder(handler, record.cancelled.is_set)
-        if ok is None:
-            handler._respond_json(410, {"error": "outline transfer expired"})
-            return
-        if not ok:
-            _cancel_outline_transfer(token, claim=record)
-            return
-        if full_body is None:
-            _cancel_outline_transfer(token, claim=record)
-            handler._respond_json(410, {"error": "outline transfer expired"})
-            return
-        payload = encode_dashboard_json_bytes_capped(
-            full_body, max_bytes=_OUTLINE_TRANSFER_ITEM_CAP)
-        if payload is None:
-            _reject_outline_transfer_too_large(token, claim=record)
-            state = "too_large"
-        else:
-            state = _materialize_outline_transfer(token, payload, claim=record)
-        if state == "too_large":
-            handler._respond_json(
-                413, {"error": "outline exceeds progressive transfer limit"})
-            return
-        if state == "expired":
-            handler._respond_json(410, {"error": "outline transfer expired"})
-            return
-    elif action == "wait":
-        record.ready.wait(_OUTLINE_TRANSFER_TTL)
-        if record.cancelled.is_set() or record.payload is None:
-            handler._respond_json(410, {"error": "outline transfer expired"})
-            return
+        try:
+            threading.Thread(
+                target=_produce_outline_transfer,
+                args=(token, record, builder, handler),
+                name="cctally-outline-build", daemon=True,
+            ).start()
+        except RuntimeError:
+            with _OUTLINE_TRANSFERS_LOCK:
+                global _OUTLINE_TRANSFERS_PRODUCERS
+                _OUTLINE_TRANSFERS_PRODUCERS -= 1
+            _finish_outline_transfer_failure(
+                token, record, 503, {"error": "outline transfer busy"})
+    if action != "ready":
+        try:
+            if not _wait_outline_transfer(handler, token, record):
+                return
+        finally:
+            _release_outline_transfer_waiter(token, record)
     try:
         body = _read_outline_transfer(token, offset)
     except ValueError:
@@ -2004,6 +2152,33 @@ def _handle_get_conversation_prompts_impl(handler, path: str) -> None:
 
 _CONV_EXPORT_SCOPES = ("all", "prompts", "chat", "recipe")
 
+#: The #850 M5 fail-closed body, shared by `/export?anonymize=1` and
+#: `/anon-map`. Both routes answer HTTP 409 with it while any Codex thread
+#: `cwd` is undecodable: a path the store cannot supply as a scrub token can
+#: appear in any transcript, so neither route may hand back bytes or a token
+#: map that only looks scrubbed.
+_ANON_UNAVAILABLE_STATUS = "anonymization_unavailable"
+_ANON_UNAVAILABLE_REMEDY = "cctally cache-sync --source codex --rebuild"
+
+
+def _anon_unavailable_body(undecodable_cwd_rows: int) -> dict:
+    return {
+        "status": _ANON_UNAVAILABLE_STATUS,
+        "undecodable_cwd_rows": int(undecodable_cwd_rows),
+        "remedy": _ANON_UNAVAILABLE_REMEDY,
+    }
+
+
+def _anon_ambiguous_body(ambiguous_cwd_rows: int) -> dict:
+    """Typed refusal for a scoped path whose account ownership is unproven."""
+    return {
+        "status": _ANON_UNAVAILABLE_STATUS,
+        "ambiguous_cwd_rows": int(ambiguous_cwd_rows),
+        "reason": "ambiguous_account_provenance",
+        "remedy": "use a raw export or omit the account scope",
+    }
+
+
 def _handle_get_conversation_export_impl(handler, path: str) -> None:
     """``GET /api/conversation/<sid>/export?scope=<all|prompts|chat|recipe>``
     — whole-session Markdown (issue #217 S5 F1/F5).
@@ -2061,15 +2236,23 @@ def _handle_get_conversation_export_impl(handler, path: str) -> None:
             cq = handler._conversation_query()
             anon = sys.modules["cctally"]._load_sibling("_lib_conversation_anon")
             srcs = {cref.source} if cref else set()
-            plan = cq.build_anon_plan_for_sources(
+            result = cq.build_anon_plan_for_sources(
                 conn, home_dir=_os.path.expanduser("~"), sources=srcs)
-            return {**env, "markdown": anon.scrub_text(env["markdown"], plan)}
+            if result.undecodable_cwd_rows:
+                return _anon_unavailable_body(result.undecodable_cwd_rows)
+            if result.ambiguous_cwd_rows:
+                return _anon_ambiguous_body(result.ambiguous_cwd_rows)
+            return {**env,
+                    "markdown": anon.scrub_text(env["markdown"], result.plan)}
 
         ok, env = handler._run_conversation_query(
             _q_kernel, "/api/conversation/export")
         if not ok:
             return
         status = (env or {}).get("status")
+        if status == _ANON_UNAVAILABLE_STATUS:
+            handler._respond_json(409, env)
+            return
         if status == "ok":
             data = env["markdown"].encode("utf-8")
             handler.send_response(200)
@@ -2151,13 +2334,21 @@ def _handle_get_conversation_anon_map_impl(handler, path: str) -> None:
                 exists = cq.conversation_exists(conn, cref.native_key)
             if not exists:
                 return None
-            plan = cq.build_anon_plan_for_sources(
+            result = cq.build_anon_plan_for_sources(
                 conn, home_dir=_os.path.expanduser("~"), sources={cref.source})
-            return anon.plan_to_wire(plan)
+            if result.undecodable_cwd_rows:
+                return _anon_unavailable_body(result.undecodable_cwd_rows)
+            if result.ambiguous_cwd_rows:
+                return _anon_ambiguous_body(result.ambiguous_cwd_rows)
+            return anon.plan_to_wire(result.plan)
 
         ok, body = handler._run_conversation_query(
             _q_kernel, "/api/conversation/anon-map")
         if not ok:
+            return
+        if isinstance(body, dict) and body.get(
+                "status") == _ANON_UNAVAILABLE_STATUS:
+            handler._respond_json(409, body)
             return
         if body is None:
             handler._respond_json(

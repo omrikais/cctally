@@ -11,6 +11,7 @@ bypass is the hazard this session exists to close.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import gzip
 import importlib.util
 import json
@@ -2575,31 +2576,27 @@ def test_concurrent_runs_do_not_lose_each_other_s_retention_state(tmp_path):
     holed store, and the runs it removed can never be rediscovered.
     """
     workers = 4
-    est = _estate(tmp_path)
     root = tmp_path / "ev"
     now = int(time.time())
     for i in range(12):
         _seed_run(root, f"old{i}", started=now - 60 * (12 - i))
-    procs = [
-        subprocess.Popen(
-            [str(est / "bin" / "cctally-test-all")],
-            env=_env(
-                tmp_path,
-                {
-                    "CCTALLY_TEST_EVIDENCE_ROOT": str(root),
-                    "CCTALLY_TEST_RUN_ID": f"concurrent-{i}",
-                    "CCTALLY_TEST_EVIDENCE_MAX_BYTES": "1000000",
-                },
-            ),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+    current_runs = [f"concurrent-{i}" for i in range(workers)]
+    for i, run_id in enumerate(current_runs):
+        _seed_run(root, run_id, started=now + i)
+
+    # Exercise the aggregator's exact embedded retention bridge concurrently,
+    # without wrapping every contender in another complete shell + pytest run.
+    # The bridge owns the retention lock and state merge; unrelated nested-suite
+    # startup made this proof collide with the outer xdist timeout under load.
+    def retain(run_id):
+        return _embedded_retention(
+            root,
+            run_id,
+            {"EV_MAX_BYTES": "1000000", "EV_MAX_AGE_DAYS": "3650"},
         )
-        for i in range(workers)
-    ]
-    results = [(p.wait(timeout=110), p.communicate()) for p in procs]
-    for rc, (out, err) in results:
-        assert rc == 0, out + err
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(retain, current_runs))
 
     record = _retention(root)
     # Every pass is counted exactly once. Without the lock the last writer

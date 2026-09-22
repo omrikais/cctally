@@ -127,16 +127,16 @@ def _resolve_forecast_now(as_of: str | None) -> dt.datetime:
     return _command_as_of()
 
 
-def _shape_week_samples(rows, *, include_held: bool) -> list:
+def _shape_week_samples(rows, *, include_held: bool,
+                        include_account: bool = False) -> list:
     """Turn snapshot rows into the sample tuples `_fetch_current_week_snapshots`
     returns. Both of that function's row-fetch legs go through here so the two
     cannot drift on the tuple width.
 
     `rows` are `(captured_at_utc, weekly_percent, five_hour_percent,
-    weekly_observation_held)`. The held flag is appended to the sample only
-    when the caller asked for held rows, because a caller that excluded them
-    has nothing to tell apart and the three-element shape is what every
-    existing consumer unpacks.
+    weekly_observation_held[, account_key])`. The held flag is appended only
+    for a held-inclusive read, and the account only for an explicit identity
+    read. Existing consumers keep the historical three- or four-field shape.
     """
     out = []
     for row in rows:
@@ -147,13 +147,16 @@ def _shape_week_samples(rows, *, include_held: bool) -> list:
         )
         if include_held:
             sample = sample + (int(row[3] or 0),)
+        if include_account:
+            sample = sample + (row[4],)
         out.append(sample)
     return out
 
 
 def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime,
                                   *, account_key: "str | None" = None,
-                                  include_held: bool = False):
+                                  include_held: bool = False,
+                                  include_account: bool = False):
     """Return (week_start_at, week_end_at, list[(captured_at, percent, five_hr)])
     for the subscription week containing `now_utc`, or None if no snapshot
     exists for the current week.
@@ -199,6 +202,10 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         five-hour axis takes the newest sample, a caller reading the weekly
         axis takes the newest sample whose flag is 0, and neither can mistake
         a carried-forward weekly value for an observed one.
+
+    ``include_account`` appends the physical account key after the held flag
+    for the multi-account Current Week card only. The default wire-independent
+    sample shape and merged forecast/cost reads remain unchanged.
     """
     # #341: optional account scoping — same predicate on every leg so the whole
     # window resolution stays consistent (a real key or the `unattributed`
@@ -209,6 +216,10 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     # `include_held=True` is a pure superset of the default read rather than a
     # read that can also resolve a different week.
     _held_pred = "" if include_held else " AND weekly_observation_held = 0"
+    # The TUI's multi-account card needs the physical owner of the sample it
+    # actually displays. Keep the historical sample shape for every other read.
+    _owner_column = ", account_key" if include_account else ""
+    _sample_order = " ASC, id ASC" if include_account else " ASC"
     candidates = conn.execute(
         "SELECT week_start_at, week_end_at, week_start_date, MAX(captured_at_utc) AS latest_cap "
         "FROM weekly_usage_snapshots "
@@ -255,13 +266,14 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         week_end_at = dt.datetime.combine(we_date + dt.timedelta(days=1), dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
         rows = conn.execute(
             "SELECT captured_at_utc, weekly_percent, five_hour_percent, "
-            "       weekly_observation_held "
+            "       weekly_observation_held" + _owner_column + " "
             "FROM weekly_usage_snapshots "
             "WHERE week_start_date = ?" + _acct_pred + _held_pred +
-            " ORDER BY captured_at_utc ASC",
+            " ORDER BY captured_at_utc" + _sample_order,
             (drow[0],) + _acct_p,
         ).fetchall()
-        samples = _shape_week_samples(rows, include_held=include_held)
+        samples = _shape_week_samples(rows, include_held=include_held,
+                                      include_account=include_account)
         samples = [s for s in samples if s[0] <= now_utc]
         return week_start_at, week_end_at, samples
     row = chosen
@@ -283,15 +295,16 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     placeholders = ",".join("?" * len(matching_texts))
     rows = conn.execute(
         f"SELECT captured_at_utc, weekly_percent, five_hour_percent, "
-        f"       weekly_observation_held "
+        f"       weekly_observation_held{_owner_column} "
         f"FROM weekly_usage_snapshots "
         f"WHERE (week_start_at IN ({placeholders}) "
         f"       OR (week_start_at IS NULL AND week_start_date = ?))"
         f"{_acct_pred}{_held_pred} "
-        f"ORDER BY captured_at_utc ASC",
+        f"ORDER BY captured_at_utc{_sample_order}",
         tuple(matching_texts) + (chosen_date,) + _acct_p,
     ).fetchall()
-    samples = _shape_week_samples(rows, include_held=include_held)
+    samples = _shape_week_samples(rows, include_held=include_held,
+                                  include_account=include_account)
     samples = [s for s in samples if s[0] <= now_utc]
     return week_start_at, week_end_at, samples
 

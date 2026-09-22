@@ -129,7 +129,7 @@ for (const viewport of MATRIX) {
     await expect(chip).toHaveAttribute('aria-label', /lack project metadata/);
     if (viewport.width <= 640) {
       await expect(chip.locator('.source-status-label--compact')).toBeVisible();
-      await expect(chip.locator('.source-status-label--compact')).toHaveText('Partial');
+      await expect(chip.locator('.source-status-label--compact')).toHaveText('Projects partial');
       await expect(chip.locator('.source-status-label--full')).toBeHidden();
     } else {
       await expect(chip.locator('.source-status-label--full')).toBeVisible();

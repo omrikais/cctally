@@ -3,7 +3,7 @@ import { dispatch, getState, subscribeStore } from '../store/store';
 import { openShareModal } from '../store/shareSlice';
 import { useDisplayTz } from '../hooks/useDisplayTz';
 import { Modal } from './Modal';
-import { BlockTimeline } from './BlockTimeline';
+import { BlockTimeline, RETAINED_FACTS_NOTE_ID } from './BlockTimeline';
 import { ShareIcon } from '../components/ShareIcon';
 import { ZoneTag } from '../components/ZoneTag';
 import { fmt, roundIsoToTenMinutes, type FmtCtx } from '../lib/fmt';
@@ -152,6 +152,14 @@ function BlockContent({
 }: {
   detail: BlockDetail; generatedAt: string; ctx: FmtCtx;
 }) {
+  // The note describes the retained headline/token facts, independently of
+  // whether the block is currently active. Active retained blocks can expose
+  // computed projection detail beside those frozen figures, so the note is
+  // deliberately not attached to the whole hero or modal.
+  const retainedFactsNoteId = detail.facts_source === 'retained'
+    ? RETAINED_FACTS_NOTE_ID
+    : undefined;
+
   return (
     <div className="modal-content">
       <div className="m-chipstrip">
@@ -172,7 +180,12 @@ function BlockContent({
       </div>
 
       <div className={'m-hero ' + (detail.is_active ? 'cols-4' : 'cols-3')}>
-        <div className="m-kv kv-cost">
+        <div
+          className="m-kv kv-cost"
+          role="group"
+          aria-label={`Total cost: ${fmt.usd2(detail.cost_usd)}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#dollar" />
           </svg>
@@ -190,7 +203,12 @@ function BlockContent({
             <div className="lbl">Elapsed</div>
           </div>
         </div>
-        <div className="m-kv">
+        <div
+          className="m-kv"
+          role="group"
+          aria-label={`Total tokens: ${detail.total_tokens.toLocaleString('en-US')}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <svg className="icon" aria-hidden="true">
             <use href="/static/icons.svg#hash" />
           </svg>
@@ -230,24 +248,49 @@ function BlockContent({
         Tokens
       </h3>
       <div className="msess-tok-grid mblock-tok-grid">
-        <div className="msess-tok-tile">
+        <div
+          className="msess-tok-tile"
+          role="group"
+          aria-label={`Input: ${detail.input_tokens.toLocaleString('en-US')}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <div className="lbl">Input</div>
           <div className="n">{detail.input_tokens.toLocaleString('en-US')}</div>
         </div>
-        <div className="msess-tok-tile">
+        <div
+          className="msess-tok-tile"
+          role="group"
+          aria-label={`Output: ${detail.output_tokens.toLocaleString('en-US')}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <div className="lbl">Output</div>
           <div className="n">{detail.output_tokens.toLocaleString('en-US')}</div>
         </div>
-        <div className="msess-tok-tile">
+        <div
+          className="msess-tok-tile"
+          role="group"
+          aria-label={`Cache create: ${detail.cache_creation_tokens.toLocaleString('en-US')}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <div className="lbl">Cache create</div>
           <div className="n">{detail.cache_creation_tokens.toLocaleString('en-US')}</div>
         </div>
-        <div className="msess-tok-tile">
+        <div
+          className="msess-tok-tile"
+          role="group"
+          aria-label={`Cache read: ${detail.cache_read_tokens.toLocaleString('en-US')}`}
+          aria-describedby={retainedFactsNoteId}
+        >
           <div className="lbl">Cache read</div>
           <div className="n">{detail.cache_read_tokens.toLocaleString('en-US')}</div>
         </div>
         {detail.cache_hit_pct != null ? (
-          <div className="msess-tok-tile cache-hit">
+          <div
+            className="msess-tok-tile cache-hit"
+            role="group"
+            aria-label={`Cache hit %: ${detail.cache_hit_pct.toFixed(1)}%`}
+            aria-describedby={retainedFactsNoteId}
+          >
             <div className="lbl">Cache hit %</div>
             <div className="n">{detail.cache_hit_pct.toFixed(1)}%</div>
             <div className="bar">

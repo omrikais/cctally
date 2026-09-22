@@ -46,6 +46,81 @@ async function activeSection(page: Page): Promise<string | null> {
 }
 
 test.describe('#513 S2 — the settings surface in a real browser', () => {
+  test('an active alert physically suppresses the onboarding toast at 390px', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.route('**/api/alerts/test', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          dispatch: 'queued',
+          alert: {
+            id: 'weekly:2026-04-21:90',
+            axis: 'weekly',
+            threshold: 90,
+            crossed_at: '2026-04-23T12:00:00Z',
+            alerted_at: '2026-04-23T12:00:00Z',
+            context: {
+              week_start_date: '2026-04-21',
+              cumulative_cost_usd: 12.34,
+            },
+          },
+        }),
+      });
+    });
+
+    await openSettings(page);
+    const onboarding = page.locator('.onboarding-toast');
+    await expect(onboarding).toBeVisible();
+    await page.getByRole('button', { name: 'Alerts', exact: true }).click();
+    await page.getByRole('button', { name: 'Send test alert', exact: true }).click();
+
+    const alert = page.locator('.toast--alert');
+    await expect(alert).toBeVisible();
+    await expect(onboarding).toHaveCount(1);
+    const geometry = await page.evaluate(() => {
+      const onboarding = document.querySelector<HTMLElement>('.onboarding-toast')!;
+      const alert = document.querySelector<HTMLElement>('.toast--alert')!;
+      const follow = alert.querySelector<HTMLElement>('.toast--alert-follow')!;
+      const onboardingRect = onboarding.getBoundingClientRect();
+      const alertRect = alert.getBoundingClientRect();
+      const followRect = follow.getBoundingClientRect();
+      const style = getComputedStyle(onboarding);
+      return {
+        hidden: onboarding.hidden,
+        display: style.display,
+        onboardingArea: onboardingRect.width * onboardingRect.height,
+        overlapWidth: Math.max(
+          0,
+          Math.min(onboardingRect.right, alertRect.right)
+            - Math.max(onboardingRect.left, alertRect.left),
+        ),
+        overlapHeight: Math.max(
+          0,
+          Math.min(onboardingRect.bottom, alertRect.bottom)
+            - Math.max(onboardingRect.top, alertRect.top),
+        ),
+        followArea: followRect.width * followRect.height,
+        followDisabled: follow.matches(':disabled'),
+        followWithinAlert:
+          followRect.top >= alertRect.top
+          && followRect.right <= alertRect.right
+          && followRect.bottom <= alertRect.bottom,
+      };
+    });
+
+    // The node stays mounted so OnboardingToast's original eight-second
+    // effect remains alive; only presentation leaves the layout.
+    expect(geometry.hidden).toBe(true);
+    expect(geometry.display).toBe('none');
+    expect(geometry.onboardingArea).toBe(0);
+    expect(geometry.overlapWidth).toBe(0);
+    expect(geometry.overlapHeight).toBe(0);
+    expect(geometry.followArea).toBeGreaterThan(0);
+    expect(geometry.followDisabled).toBe(false);
+    expect(geometry.followWithinAlert).toBe(true);
+  });
+
   test('the rail is a column at 1440 and a horizontal strip at 390', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await openSettings(page);

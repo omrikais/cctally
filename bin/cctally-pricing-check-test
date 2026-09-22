@@ -80,7 +80,7 @@ REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 # generically by tests/test_pricing_check.py::
 # test_no_suppression_expires_before_the_pricing_snapshot_date, and the cutover
 # itself is asserted in tests/test_codex_56_pricing.py.
-PINNED_AS_OF="2026-09-05T00:00:00Z"
+PINNED_AS_OF="2026-09-23T00:00:00Z"
 
 SNAPSHOT_DATE=$(sed -n \
     's/^PRICING_SNAPSHOT_DATE[[:space:]]*=[[:space:]]*"\([0-9-]*\)".*/\1/p' \

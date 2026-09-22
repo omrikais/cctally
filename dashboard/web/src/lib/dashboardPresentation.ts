@@ -496,7 +496,7 @@ export function presentationDailyRows(
   if (claudeRows == null || codexDaily == null) return ROWS_ABSENT;
   const canonicalShape = claudeRows;
   const merged = new Map<string, DailyPanelRow>();
-  for (const row of [...claudeRows, ...codexRows]) {
+  for (const row of [...claudeRows, ...codexRows].filter(hasDailyActivity)) {
     const old = merged.get(row.date);
     if (!old) {
       merged.set(row.date, { ...row, models: [...row.models] });
@@ -560,6 +560,10 @@ export interface DailyProviderLegs {
   codex: DailyPanelRow | null;
 }
 
+function hasDailyActivity(row: DailyPanelRow): boolean {
+  return row.cost_usd !== 0 || row.total_tokens !== 0 || row.models.length !== 0;
+}
+
 export function presentationDailyLegs(
   env: Envelope | null,
   date: string | null | undefined,
@@ -572,8 +576,8 @@ export function presentationDailyLegs(
     .map(codexDailyRow)
     .find((row) => row.date === date) ?? null;
   return {
-    claude: claude == null ? null : { ...claude, source: 'claude' },
-    codex,
+    claude: claude != null && hasDailyActivity(claude) ? { ...claude, source: 'claude' } : null,
+    codex: codex != null && hasDailyActivity(codex) ? codex : null,
   };
 }
 
@@ -1117,7 +1121,17 @@ function codexBlock(row: CodexQuotaBlockRow): BlockPresentationRow {
 export function presentationBlocks(env: Envelope | null, selection: DashboardSelection): BlockPresentationRow[] {
   const providers = presentationProviders(env, selection);
   const claudeRows = (selection === 'claude' ? env?.blocks?.rows : providers.claude?.quota.blocks) ?? [];
-  const claude = claudeRows.map((row, index) => ({ ...row, key: 'key' in row && typeof row.key === 'string' ? row.key : `claude:${row.start_at}:${index}`, source: 'claude' as const, value: row.cost_usd, valueLabel: `$${row.cost_usd.toFixed(2)}` }));
+  const claude = claudeRows.map((row, index) => ({
+    ...row,
+    key: 'key' in row && typeof row.key === 'string' ? row.key : `claude:${row.start_at}:${index}`,
+    source: 'claude' as const,
+    // Keep the provenance decision attached to the same row whose totals the
+    // adapter serves. Legacy envelopes without the additive key are computed,
+    // never optimistically labelled retained.
+    facts_source: row.facts_source ?? 'computed',
+    value: row.cost_usd,
+    valueLabel: `$${row.cost_usd.toFixed(2)}`,
+  }));
   const codex = (providers.codex?.quota.blocks ?? [])
     .filter((row) => row.window_minutes === 300)
     .map(codexBlock);

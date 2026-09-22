@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { getState, subscribeStore } from '../store/store';
 import { useSnapshot } from '../hooks/useSnapshot';
 import { humanizeDuration } from '../lib/syncFreshness';
@@ -135,6 +135,8 @@ export function AccountHeroCards() {
   const scope = useAccountScope();
   const activeSource = useSyncExternalStore(subscribeStore, () => getState().activeSource);
   const focusState = useSyncExternalStore(subscribeStore, () => getState().accountFocus);
+  const railRef = useRef<HTMLDivElement>(null);
+  const [showScrollCue, setShowScrollCue] = useState(false);
   // The combined tab has no account chip and no provider context, so it shows
   // every decorated physical provider unfocused and labels each group.
   const combined = activeSource === 'all';
@@ -146,6 +148,36 @@ export function AccountHeroCards() {
     const accounts = sourceAccounts(entry);
     return accounts == null ? [] : [{ source, accounts }];
   });
+
+  // The cue belongs to the rail's actual scroll state. A fixed hint would lie
+  // after the last card, while measuring only once would miss a source/focus
+  // change that replaces a short row with one that still has more cards.
+  const visibleAccountKeys = groups.flatMap((group) => {
+    const groupFocused = resolveViewAccountFocus(env, activeSource, group.source, focusState);
+    const visible = combined || groupFocused == null
+      ? group.accounts
+      : group.accounts.filter((card) => card.accountKey === groupFocused);
+    return visible.map((card) => `${group.source}:${card.accountKey}`);
+  }).join('|');
+  useEffect(() => {
+    const rail = railRef.current;
+    if (rail == null) return;
+    const update = () => {
+      const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+      setShowScrollCue(maxScrollLeft > 1 && rail.scrollLeft < maxScrollLeft - 1);
+    };
+    update();
+    rail.addEventListener('scroll', update, { passive: true });
+    window.addEventListener('resize', update);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+    observer?.observe(rail);
+    return () => {
+      rail.removeEventListener('scroll', update);
+      window.removeEventListener('resize', update);
+      observer?.disconnect();
+    };
+  }, [activeSource, combined, visibleAccountKeys]);
+
   if (groups.length === 0) return null; // <=1 real account everywhere → no cards.
 
   // A focus stored for the Codex TAB must never narrow the combined tab: the
@@ -172,7 +204,12 @@ export function AccountHeroCards() {
     : null;
 
   return (
-    <div className="account-hero-cards" data-testid="account-hero-cards">
+    <div
+      ref={railRef}
+      className="account-hero-cards"
+      data-testid="account-hero-cards"
+      data-scroll-cue={showScrollCue ? 'visible' : 'hidden'}
+    >
       {groups.map((group) => {
         const groupFocused = resolveViewAccountFocus(
           env, activeSource, group.source, focusState,
@@ -214,6 +251,13 @@ export function AccountHeroCards() {
           {emptyNote}
         </p>
       )}
+      <span
+        className="account-hero-scroll-cue"
+        data-testid="account-hero-scroll-cue"
+        aria-hidden={!showScrollCue}
+      >
+        Swipe for more →
+      </span>
     </div>
   );
 }

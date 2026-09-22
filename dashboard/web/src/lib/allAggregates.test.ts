@@ -248,6 +248,26 @@ describe('the merged All daily row (§6.1, §6.2, §6.3)', () => {
     expect(legs.claude).toBeNull();
     expect(legs.codex).toBeNull();
   });
+
+  it('treats a zero Claude calendar row as absent on a Codex-only day', () => {
+    const env = withDay();
+    env.sources!.claude.data!.periods.daily_aggregate!.rows[0] = {
+      ...env.sources!.claude.data!.periods.daily_aggregate!.rows[0],
+      cost_usd: 0, input_tokens: 0, output_tokens: 0,
+      cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 0,
+      models: [],
+    };
+
+    const result = presentationDailyRows(env, 'all');
+    if (result.state !== 'available') throw new Error('expected available');
+    const day = result.rows.find((row) => row.date === '2026-04-24')!;
+    expect(day.source).toBe('codex');
+    expect(day.models.map((model) => model.model)).toEqual(['gpt-5']);
+
+    const legs = presentationDailyLegs(env, '2026-04-24');
+    expect(legs.claude).toBeNull();
+    expect(legs.codex?.cost_usd).toBeCloseTo(12, 9);
+  });
 });
 
 // #556 S2 §6.4 — blocks interleave chronologically.

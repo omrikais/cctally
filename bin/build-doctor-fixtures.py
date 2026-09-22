@@ -930,7 +930,17 @@ def _ensure_empty_codex_project_metadata_schema(conn) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS codex_conversation_threads (
             conversation_key TEXT NOT NULL,
-            source_root_key TEXT NOT NULL
+            source_root_key TEXT NOT NULL,
+            -- #845 §4.3: the decode inventory reads these four columns off the
+            -- threads table on every health read, so a fixture that omits them
+            -- makes `load_codex_project_metadata_health` raise
+            -- `OperationalError: no such column` and doctor reports a metadata
+            -- FAIL for a store shape no real cache has. The real schema in
+            -- `bin/_cctally_db.py` carries all four.
+            native_thread_id TEXT,
+            last_seen_utc TEXT,
+            cwd TEXT,
+            git_json TEXT
         )
     """)
 

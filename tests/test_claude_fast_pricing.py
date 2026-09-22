@@ -54,6 +54,7 @@ def _cost(model: str, speed):
 @pytest.mark.parametrize(
     ("model", "multiplier"),
     [
+        ("claude-opus-5-5", 2.0),
         ("claude-opus-5", 2.0),
         ("anthropic/claude-opus-4-8", 2.0),
         ("claude-opus-4-7", 6.0),

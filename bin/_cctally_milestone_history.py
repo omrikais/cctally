@@ -320,7 +320,42 @@ def _claude_cycle_rows(conn: sqlite3.Connection, ref) -> list:
     ).fetchall()
 
 
-def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
+def _five_hour_detail_revision(conn, start_iso, end_iso) -> tuple[int, ...]:
+    """Append-only 5h child revision for one cycle's intersecting blocks.
+
+    The detail cache uses the index stamp. Weekly crossing counts do not move
+    when another account records a 5h credit or crossing in an existing block.
+    These child tables insert new ids for those events; count and max id also
+    notice deletions and replacement rows without hashing an unbounded ledger.
+    """
+    if not start_iso or not end_iso:
+        return (0, 0, 0, 0, 0, 0)
+    interval = (
+        "unixepoch(b.block_start_at) < unixepoch(?) "
+        "AND unixepoch(b.five_hour_resets_at) > unixepoch(?)"
+    )
+    bounds = (end_iso, start_iso)
+    blocks = conn.execute(
+        "SELECT COUNT(*), MAX(b.id) FROM five_hour_blocks b "
+        f"WHERE {interval}", bounds,
+    ).fetchone()
+    milestones = conn.execute(
+        "SELECT COUNT(*), MAX(m.id) FROM five_hour_blocks b "
+        "JOIN five_hour_milestones m ON m.block_id = b.id "
+        f"WHERE {interval}", bounds,
+    ).fetchone()
+    credits = conn.execute(
+        "SELECT COUNT(*), MAX(e.id) FROM five_hour_blocks b "
+        "JOIN five_hour_reset_events e "
+        "ON e.account_key = b.account_key "
+        "AND e.five_hour_window_key = b.five_hour_window_key "
+        f"WHERE {interval}", bounds,
+    ).fetchone()
+    return tuple(int(value or 0) for row in (blocks, milestones, credits)
+                 for value in row)
+
+
+def _index_entry(conn, ref, current_cycle_key, tz, *, decorated=False) -> dict:
     rows = _claude_cycle_rows(conn, ref)
     milestone_count = len(rows)
     segment_count = 1 if rows else 0
@@ -329,6 +364,11 @@ def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
     end_z = _to_iso_z(ref.week_end_at)
     block_count = _count_blocks(conn, start_z, end_z)
     key = _claude_cycle_key(ref)
+    # R8: leave the <=1-real-account stamp byte-identical. On a decorated
+    # provider the fetched block list contains multiple account-owned rows,
+    # so its cache identity also needs their child-ledger revision.
+    block_revision = (
+        _five_hour_detail_revision(conn, start_z, end_z) if decorated else ())
 
     # #750 S4 §5.3. A CURRENT single-segment cycle neither fetches its detail
     # nor uses one that arrives, so a gap in the LIVE cycle would stay
@@ -356,7 +396,8 @@ def _index_entry(conn, ref, current_cycle_key, tz) -> dict:
         "segment_count": segment_count,
         "has_observation_gap": has_gap,
         "detail_stamp": _mh.compute_detail_stamp(
-            key, milestone_count, block_count, segment_count, max_captured
+            key, milestone_count, block_count, segment_count, max_captured,
+            *block_revision,
         ),
     }
 
@@ -377,7 +418,12 @@ def build_claude_week_index(conn: sqlite3.Connection) -> list:
     )
     current_cycle_key = _claude_cycle_key(current_ref) if current_ref else None
     tz = _resolve_display_tz()
-    entries = [_index_entry(conn, ref, current_cycle_key, tz) for ref in refs]
+    import _cctally_account
+    decorated = _cctally_account.provider_is_decorated(conn, "claude")
+    entries = [
+        _index_entry(conn, ref, current_cycle_key, tz, decorated=decorated)
+        for ref in refs
+    ]
     entries.sort(key=lambda e: e["start_at_utc"] or "", reverse=True)
     return entries
 
@@ -443,14 +489,17 @@ def _shape_observation_gap_runs(disclosure, rows) -> list:
     return out
 
 
-def _load_block_credits(conn: sqlite3.Connection, window_key: int) -> list:
+def _load_block_credits(
+    conn: sqlite3.Connection, window_key: int, account_key: str,
+) -> list:
     """5h in-place credit rows for a block, ascending by effective time —
     same wire shape as the envelope's ``five_hour_block.credits``."""
     rows = conn.execute(
         "SELECT effective_reset_at_utc, prior_percent, post_percent "
-        "FROM five_hour_reset_events WHERE five_hour_window_key = ? "
+        "FROM five_hour_reset_events "
+        "WHERE five_hour_window_key = ? AND account_key = ? "
         "ORDER BY effective_reset_at_utc ASC",
-        (int(window_key),),
+        (int(window_key), account_key),
     ).fetchall()
     return [
         {
@@ -470,6 +519,8 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
     if not start_iso or not end_iso:
         return []
     c = _cctally()
+    import _cctally_account
+    decorated = _cctally_account.provider_is_decorated(conn, "claude")
     # #834 S1 (#836): `id` is selected so each block's milestones are loaded by
     # the PRECISE selector. This route used to select blocks account-blind and
     # then pass a bare `five_hour_window_key` to the milestone read, while block
@@ -477,13 +528,13 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
     # window's per-account blocks each rendered EVERY account's milestones. `id`
     # stays internal: it is not added to the published `blocks[]` shape.
     rows = conn.execute(
-        "SELECT id, five_hour_window_key, block_start_at, five_hour_resets_at, "
+        "SELECT id, account_key, five_hour_window_key, block_start_at, five_hour_resets_at, "
         "       final_five_hour_percent, total_cost_usd, "
         "       crossed_seven_day_reset, is_closed "
         "FROM five_hour_blocks "
         "WHERE unixepoch(block_start_at) < unixepoch(?) "
         "  AND unixepoch(five_hour_resets_at) > unixepoch(?) "
-        "ORDER BY unixepoch(block_start_at) ASC, five_hour_window_key ASC",
+        "ORDER BY unixepoch(block_start_at) ASC, five_hour_window_key ASC, id ASC",
         (end_iso, start_iso),
     ).fetchall()
     out: list = []
@@ -502,7 +553,12 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
                 "is_closed": bool(b["is_closed"]),
                 "milestones": c._tui_build_five_hour_milestones(
                     conn, wk, block_id=int(b["id"])),
-                "credits": _load_block_credits(conn, wk),
+                "credits": _load_block_credits(conn, wk, b["account_key"]),
+                **({
+                    "account_key": b["account_key"],
+                    "account_label": _cctally_account.display_account_label(
+                        conn, b["account_key"]),
+                } if decorated else {}),
             }
         )
     return out

@@ -2,10 +2,10 @@ import type React from 'react';
 
 // #293 S4 — the single double-fire guard for card-region pointer clicks.
 // A bento card <section role="region"> keeps a body-click convenience where it
-// has one today, but a click that originates inside an interactive control (or
-// the aria-hidden drag grip, tagged data-card-region-ignore) must NOT also open
-// the panel modal. Pure leaf — mirrors lib/boardLayout.ts / lib/summaryWindow.ts
-// (zero side effects, no store import).
+// has one today, but a click inside an interactive control or explicitly inert
+// explanatory content must not open the panel modal. The same ignore marker is
+// used for the drag grip, legends, aggregate tails and provider section labels.
+// Pure leaf — no store import.
 const INTERACTIVE_SELECTOR =
   'button, a, input, select, textarea, [role="button"], [data-card-region-ignore]';
 

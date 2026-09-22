@@ -172,12 +172,16 @@ def _select_current_block_for_envelope(
     *,
     current_used_pct: "float | None",
     now_utc: "dt.datetime",
+    account_key: "str | None" = None,
 ) -> "dict | None":
     """Select the current 5h block for the dashboard's current_week envelope.
 
     Selection rule (spec §4.1): pick the row from ``five_hour_blocks`` whose
     ``five_hour_window_key`` matches the latest ``weekly_usage_snapshots``
-    row's ``five_hour_window_key``. Returns None when no row matches —
+    row's ``five_hour_window_key``. When ``account_key`` names the account
+    whose weekly percentage is displayed, all physical reads here use it;
+    a multi-account caller without that identity receives no block. Returns
+    None when no row matches —
     binding to the latest snapshot's key (rather than highest
     ``block_start_at``) prevents the panel's "current 5h session" copy from
     surfacing stale closed blocks.
@@ -236,12 +240,21 @@ def _select_current_block_for_envelope(
         SELECT five_hour_window_key, week_start_at
           FROM weekly_usage_snapshots
          WHERE captured_at_utc <= ?
+           AND (? IS NULL OR account_key = ?)
          ORDER BY captured_at_utc DESC, id DESC
          LIMIT 1
         """,
-        (_iso_z(now_utc),),
+        (_iso_z(now_utc), account_key, account_key),
     ).fetchone()
     if snap is None or snap["five_hour_window_key"] is None:
+        return None
+
+    # The account supplied by `_tui_build_current_week` is the owner of the
+    # displayed weekly percentage. On a decorated multi-account store the
+    # absence of that identity is not permission to select an arbitrary block.
+    import _cctally_account
+    if account_key is None and _cctally_account.provider_is_decorated(
+            conn, "claude"):
         return None
 
     # #834 S1 (#836): `id` and `account_key` are selected so the live
@@ -249,21 +262,12 @@ def _select_current_block_for_envelope(
     # is `(account_key, five_hour_window_key)`, and the milestone read used to
     # filter on the window key alone, so one physical window's per-account blocks
     # all showed every account's milestones. Both land on the returned dict under
-    # a leading underscore and `_five_hour_block_wire` strips them before
-    # publication, so the envelope's wire shape is unchanged — and no account key
-    # reaches a client that #341's R8 rule says must see no account decoration at
-    # all on a single-account install.
+    # a leading underscore. `_five_hour_block_wire` strips the selectors and
+    # publishes the account identity only above #341's R8 decoration threshold.
     #
-    # `ORDER BY id ASC LIMIT 1` (#834 S1 Gate A R6): block uniqueness is
-    # `(account_key, five_hour_window_key)`, so two accounts observing one physical
-    # window own two rows here and this query had no order and no limit — SQLite
-    # decided which one `fetchone()` returned, and since #836 `_block_id` inherits
-    # that decision and it also decides whose milestones the live route loads. The
-    # order is `id` because that is what the current plan already yields: the
-    # `UNIQUE` index leads on `account_key`, so it is unusable for this predicate
-    # and SQLite scans the table in rowid order. Stating it therefore changes
-    # nothing about WHICH ACCOUNT IS SERVED, which is a product decision filed as
-    # #839 and deliberately not taken here.
+    # Account-qualified selection binds the block and its downstream milestone
+    # read to the displayed weekly account; the unqualified order remains the
+    # historical <=1-real-account fallback for published byte stability.
     # #834 S1 (#835) Gate A R8: `first_observed_at_utc` and `five_hour_resets_at`
     # are selected because the credit-aware read below needs them — they are the
     # START axis's capture instant and its fallback. `seven_day_pct_at_block_end`
@@ -286,14 +290,16 @@ def _select_current_block_for_envelope(
                first_observed_at_utc, last_observed_at_utc,
                seven_day_pct_at_block_start,
                crossed_seven_day_reset
-          FROM five_hour_blocks
+         FROM five_hour_blocks
          WHERE five_hour_window_key = ?
+           AND (? IS NULL OR account_key = ?)
            AND is_closed = 0
            AND five_hour_resets_at > ?
          ORDER BY id ASC
          LIMIT 1
         """,
-        (snap["five_hour_window_key"], _iso_z(now_utc)),
+        (snap["five_hour_window_key"], account_key, account_key,
+         _iso_z(now_utc)),
     ).fetchone()
     if block is None:
         return None
@@ -337,8 +343,9 @@ def _select_current_block_for_envelope(
         post = conn.execute(
             """
             SELECT weekly_percent
-              FROM weekly_usage_snapshots
+             FROM weekly_usage_snapshots
              WHERE week_start_at = ?
+               AND (? IS NULL OR account_key = ?)
                AND weekly_observation_held = 0
                AND unixepoch(captured_at_utc) >= unixepoch(?)
                AND unixepoch(captured_at_utc) <= unixepoch(?)
@@ -347,6 +354,7 @@ def _select_current_block_for_envelope(
             """,
             (
                 snap["week_start_at"],
+                account_key, account_key,
                 block["block_start_at"],
                 _iso_z(now_utc),
             ),
@@ -370,9 +378,10 @@ def _select_current_block_for_envelope(
         SELECT effective_reset_at_utc, prior_percent, post_percent
           FROM five_hour_reset_events
          WHERE five_hour_window_key = ?
+           AND (? IS NULL OR account_key = ?)
          ORDER BY effective_reset_at_utc ASC
         """,
-        (int(block["five_hour_window_key"]),),
+        (int(block["five_hour_window_key"]), account_key, account_key),
     ).fetchall()
     credits = [
         {
@@ -397,26 +406,28 @@ def _select_current_block_for_envelope(
         # `_five_hour_block_wire` before publication. See the block SELECT above.
         "_block_id":                    int(block["id"]),
         "_account_key":                 block["account_key"],
+        "_account_decorated":           _cctally_account.provider_is_decorated(
+            conn, "claude"),
     }
 
 
-#: The internal selector fields `_select_current_block_for_envelope` carries for
-#: the live milestone read. They are NOT part of the published envelope: a rowid
-#: is meaningless to a client, and an account key would be account decoration on
-#: a surface #341's R8 rule keeps undecorated below two real accounts.
-_INTERNAL_BLOCK_KEYS = ("_block_id", "_account_key")
+#: The selector fields retained for downstream reads. A rowid is meaningless to
+#: a client; the account key is published only when #341's R8 gate permits
+#: account decoration (more than one real Claude account).
+_INTERNAL_BLOCK_KEYS = ("_block_id", "_account_key", "_account_decorated")
 
 
 def _five_hour_block_wire(block: "dict | None") -> "dict | None":
-    """Drop the internal selector fields from a current-week block dict.
+    """Publish the current block with R8-gated account identity.
 
-    #834 S1 (#836). Called at the ONE publication site so the envelope's
-    `current_week.five_hour_block` shape is byte-unchanged. A pure function over a
-    copy — the caller's dict keeps its selectors, because the live milestone read
-    runs off the same object."""
+    Single-account output keeps the historical six-key shape. The caller's
+    dict retains its selectors for the live milestone read."""
     if not isinstance(block, dict):
         return block
-    return {k: v for k, v in block.items() if k not in _INTERNAL_BLOCK_KEYS}
+    wire = {k: v for k, v in block.items() if k not in _INTERNAL_BLOCK_KEYS}
+    if block.get("_account_decorated"):
+        wire["account_key"] = block["_account_key"]
+    return wire
 
 
 # === Alerts-envelope per-axis row-mappers (Task F) =========================
@@ -1886,7 +1897,7 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         }
 
     def _blocks_row_to_dict(r: "BlocksPanelRow") -> dict:
-        return {
+        row = {
             "start_at":  r.start_at,
             "end_at":    r.end_at,
             "anchor":    r.anchor,
@@ -1895,6 +1906,11 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             "models":    list(r.models),
             "label":     r.label,
         }
+        # Additive only for retained rows: the client treats absence as
+        # computed, preserving the pre-existing computed-row wire shape.
+        if r.facts_source == "retained":
+            row["facts_source"] = "retained"
+        return row
 
     def _daily_row_to_dict(r: "DailyPanelRow") -> dict:
         # #556 S2 §6.3a: one owner for the daily row wire shape. The All-only

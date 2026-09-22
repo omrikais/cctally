@@ -188,7 +188,7 @@ def _limit_key(slot: str, minutes: int) -> str:
 
 def _seed_store(ns, tmp_path, monkeypatch, *, decoy_observations=1_200,
                 requested_observations=40, distractor_entries=3_000,
-                metadata_incomplete=False):
+                metadata_incomplete=False, malformed_rows=False):
     """A single-root Codex store carrying substantial IN-RANGE distractors.
 
     The existing route regression's hundred thousand distractor rows are two
@@ -356,6 +356,27 @@ def _seed_store(ns, tmp_path, monkeypatch, *, decoy_observations=1_200,
                 for index in range(decoy_observations)
             ),
         )
+
+        if malformed_rows:
+            # #845 7.1 / A17. One accounting row the ACCOUNTING-WINDOW health
+            # read and the one-year probe both count, so the generation is
+            # `malformed_row_partial` and its partial fold runs. An empty
+            # conversation key is the one shape both aggregates already count
+            # today, which is what lets this measurement predate the #846
+            # change it exists to bound.
+            cache.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                "input_tokens, cached_input_tokens, output_tokens, "
+                "reasoning_output_tokens, total_tokens, source_root_key, "
+                "conversation_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(target[3]), 99_000,
+                    _iso(NOW - dt.timedelta(days=2)),
+                    "malformed-session", "gpt-5", 100, 10, 20, 5, 130,
+                    str(root_key), "",
+                ),
+            )
 
         ns["_cctally_cache"]._bump_codex_physical_mutation_seq(cache)
         cache.commit()
@@ -1620,20 +1641,31 @@ def test_a_transient_read_failure_degrades_the_project_route_and_says_so(
     would be told to rebuild a Codex cache that is not the problem.
 
     What it pins now is the transient state end to end — the typed carrier,
-    the null row count, the retry wording on the route, and the refusal to
-    reuse the degraded generation. Clearing at the next healthy publish is
-    pinned in `tests/test_828_metadata_probe.py`, which owns its store's
-    lifetime and can rebuild over it.
+    the null row count, the EMPTY project rows and the refusal to reuse the
+    degraded generation. Clearing at the next healthy publish is pinned in
+    `tests/test_828_metadata_probe.py`, which owns its store's lifetime and can
+    rebuild over it.
+
+    RETARGETED AGAIN by #846 §4.6 rule 1, which states the change to this
+    S2-pinned behavior plainly. This test used to assert that the transient
+    generation still published rows through the partial fold, which it could do
+    only because its fixture monkeypatches `load_qualified_codex_entries` alone
+    and the real conversation-metadata read supplied the identities. A
+    generation whose metadata legs failed has established nothing about the
+    rows, so it now publishes none of them and the project route answers
+    `source_resource_not_found`. The detail-disclosure assertions moved to the
+    malformed generation, which is A3.
     """
     import _lib_dashboard_sources as lds
 
     ns = load_script()
     dashboard = sys.modules["_cctally_dashboard"]
+    sources = sys.modules["_cctally_dashboard_sources"]
     _root_key, codex = _seed_store(
         ns, tmp_path, monkeypatch, metadata_incomplete=True)
     snap = _snapshot(ns, codex)
-    rows = codex.data["projects"]["rows"]
-    assert rows, "the partial generation published no project row"
+    assert codex.data["projects"]["rows"] == (), (
+        "a transient generation must publish no Codex project row")
 
     assert codex.metadata_health == {
         "state": "transient_read_failure",
@@ -1643,16 +1675,16 @@ def test_a_transient_read_failure_degrades_the_project_route_and_says_so(
     assert dashboard._codex_generation_metadata_state(snap) == (
         "transient_read_failure")
 
-    detail = dashboard.build_source_detail(
-        snapshot=snap, source="codex", resource="project",
-        key=str(rows[0]["key"]),
-    )
-    assert detail["metadata_availability"] == "partial"
-    assert detail["metadata_reason"] == (
-        "This build could not check project metadata health; it will retry on "
-        "the next refresh."
-    )
-    assert detail["key"] == rows[0]["key"]
+    # A key that the healthy generation DOES publish is not reachable through
+    # this one, because the frozen bundle carries no row to admit.
+    _root_key, healthy = _seed_store(ns, tmp_path / "healthy", monkeypatch)
+    healthy_rows = healthy.data["projects"]["rows"]
+    assert healthy_rows, "the healthy control published no project row"
+    with pytest.raises(sources.SourceResourceNotFound):
+        dashboard.build_source_detail(
+            snapshot=snap, source="codex", resource="project",
+            key=str(healthy_rows[0]["key"]),
+        )
 
     # The SOURCE WARNING has to draw the same distinction the route note
     # already draws. Its message was derived from `health.incomplete_rows`
@@ -1741,3 +1773,509 @@ def test_a_healthy_generation_still_discloses_a_failed_live_project_read(
     assert detail["metadata_availability"] == "partial"
     assert detail["metadata_reason"] == expected_reason
     assert detail["key"] == row["key"]
+
+
+# ── #845/#846 §7.1 — the block measurement that precedes the #846 change ────
+
+#: The measured count of `quota.blocks` a healthy generation publishes over the
+#: §7.1 store. Taken from the executed measurement of 2026-09-16 on this tree,
+#: recorded in the A0 commit body; it is an oracle, never recomputed here.
+_SEVEN_ONE_BLOCK_COUNT = 2
+
+
+def test_845_a_degraded_generation_publishes_the_same_quota_blocks(
+    tmp_path, monkeypatch,
+):
+    """Spec §7.1 / A17. #846 claims a degraded build empties `quota.blocks`.
+
+    `_quota_wire` reads `quota_window_blocks` and the supplied accounting
+    entries only; it never consults project metadata. This measures that on
+    THIS tree rather than assuming it, over a store seeded with a 300-minute
+    quota block, and pins the measured count as a hard-coded oracle.
+
+    Expected to pass before and after the #846 change: the malformed arm is
+    reached through an entry with an empty conversation key, a shape the
+    accounting-window health read and the one-year probe already counted before
+    this session, and the transient arm is reached through the real capture's
+    `QualifiedMetadataUnavailable` handler.
+    """
+    ns = load_script()
+    _root_key, healthy = _seed_store(ns, tmp_path, monkeypatch)
+    assert healthy.metadata_health["state"] == "healthy"
+
+    _root_key, malformed = _seed_store(
+        ns, tmp_path / "malformed", monkeypatch, malformed_rows=True)
+    assert malformed.metadata_health["state"] == "malformed_row_partial"
+
+    _root_key, transient = _seed_store(
+        ns, tmp_path / "transient", monkeypatch, metadata_incomplete=True)
+    assert transient.metadata_health["state"] == "transient_read_failure"
+
+    measured = (
+        len(healthy.data["quota"]["blocks"]),
+        len(malformed.data["quota"]["blocks"]),
+        len(transient.data["quota"]["blocks"]),
+    )
+    assert measured == (
+        _SEVEN_ONE_BLOCK_COUNT, _SEVEN_ONE_BLOCK_COUNT, _SEVEN_ONE_BLOCK_COUNT
+    ), (
+        "a malformed and a transient generation must both publish the healthy "
+        "generation's blocks"
+    )
+
+
+# ── #845 A7 — the inventory replaces the quadratic join ────────────────────
+
+
+def _inventory_store():
+    """A minimal store carrying only the two tables the inventory reads."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE codex_conversation_threads ("
+        " conversation_key TEXT PRIMARY KEY, source_root_key TEXT,"
+        " native_thread_id TEXT, last_seen_utc TEXT, cwd TEXT, git_json TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE codex_session_files ("
+        " path TEXT PRIMARY KEY, source_root_key TEXT,"
+        " last_native_thread_id TEXT)"
+    )
+    return conn
+
+
+def test_845_the_inventory_reads_each_table_once_and_issues_no_per_file_query():
+    """A7. The retired statement joined `codex_session_files` to
+    `codex_conversation_threads` for every file row, so on a one-root machine
+    every file rescanned all 2,646 threads. A row count cannot see that, so
+    this counts the STATEMENTS that reach each table."""
+    analytics = sys.modules["_cctally_source_analytics"]
+    conn = _inventory_store()
+    try:
+        for index in range(20):
+            conn.execute(
+                "INSERT INTO codex_conversation_threads VALUES (?,?,?,?,?,?)",
+                (f"conv-{index}", "root", f"native-{index}",
+                 f"2026-07-0{index % 9 + 1}T00:00:00+00:00",
+                 f"/repo/{index}", None),
+            )
+        for index in range(30):
+            conn.execute(
+                "INSERT INTO codex_session_files VALUES (?,?,?)",
+                (f"/rollouts/{index}.jsonl", "root", f"native-{index % 20}"),
+            )
+        conn.commit()
+
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        inventory = analytics.load_codex_thread_metadata_inventory(conn)
+        conn.set_trace_callback(None)
+
+        threads = [s for s in statements if "codex_conversation_threads" in s
+                   and "sqlite_master" not in s]
+        files = [s for s in statements if "codex_session_files" in s
+                 and "sqlite_master" not in s and not s.startswith("PRAGMA")]
+        assert len(threads) == 1, threads
+        assert len(files) == 1, files
+        assert len(inventory.inherited_by_path) == 30
+        assert inventory.undecodable_direct == frozenset()
+        assert inventory.undecodable_inherited == frozenset()
+    finally:
+        conn.close()
+
+
+def test_845_the_linear_alias_map_preserves_the_sql_winner():
+    """A5. Two candidate inherited rows of different `last_seen_utc`, and one
+    NULL beside one non-NULL. SQLite sorts NULL FIRST ascending, so a NULL
+    `last_seen_utc` sorts LAST under the retired statement's
+    `ORDER BY last_seen_utc DESC, conversation_key DESC`, and the qualifier
+    kept the FIRST row. Regression row for #845, not a RED proof."""
+    analytics = sys.modules["_cctally_source_analytics"]
+    conn = _inventory_store()
+    try:
+        conn.executemany(
+            "INSERT INTO codex_conversation_threads VALUES (?,?,?,?,?,?)",
+            [
+                ("older", "root", "shared", "2026-07-01T00:00:00+00:00",
+                 "/repo/older", None),
+                ("newer", "root", "shared", "2026-07-09T00:00:00+00:00",
+                 "/repo/newer", None),
+                ("null-a", "root", "nulls", None, "/repo/null-a", None),
+                ("null-b", "root", "nulls", None, "/repo/null-b", None),
+                ("stored", "root", "nulls", "2026-01-01T00:00:00+00:00",
+                 "/repo/stored", None),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO codex_session_files VALUES (?,?,?)",
+            [("/rollouts/shared.jsonl", "root", "shared"),
+             ("/rollouts/nulls.jsonl", "root", "nulls")],
+        )
+        conn.commit()
+        inventory = analytics.load_codex_thread_metadata_inventory(conn)
+    finally:
+        conn.close()
+
+    assert inventory.inherited_winner_by_path[("root", "/rollouts/shared.jsonl")] == (
+        "root", "newer")
+    assert inventory.inherited_by_path[("root", "/rollouts/shared.jsonl")].cwd == (
+        "/repo/newer")
+    # A stored timestamp beats both NULLs, whatever their conversation keys.
+    assert inventory.inherited_winner_by_path[("root", "/rollouts/nulls.jsonl")] == (
+        "root", "stored")
+    assert inventory.inherited_by_path[("root", "/rollouts/nulls.jsonl")].cwd == (
+        "/repo/stored")
+
+
+# ── #845 A3 — the partial generation over six shapes ───────────────────────
+
+from test_dashboard_source_read_model import (  # noqa: E402
+    _cache_root_key,
+    _install_active_native_cycle,
+    _seeded_context,
+)
+from test_dashboard_accounts_wire import _seed_codex_accounts  # noqa: E402
+
+A3_BAD = b"/synthetic/\xffundecodable"
+A3_ACCOUNT_X = "x" * 32
+A3_ACCOUNT_Y = "y" * 32
+
+
+def _a3_thread(cache, *, key, root, native, path, cwd=None, git_json=None):
+    cache.execute(
+        "INSERT INTO codex_conversation_threads "
+        "(conversation_key, source_root_key, native_thread_id, root_thread_id,"
+        " source_path, cwd, git_json, first_seen_utc, last_seen_utc) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (key, root, native, native, path, cwd, git_json,
+         _iso(NOW - dt.timedelta(days=10)), _iso(NOW)),
+    )
+
+
+def _a3_alias(cache, *, root, path, native):
+    cache.execute(
+        "INSERT INTO codex_session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,"
+        " source_root_key, last_native_thread_id) VALUES (?,0,0,0,?,?,?)",
+        (path, _iso(NOW), root, native),
+    )
+
+
+def _a3_entry(cache, *, root, path, key, offset, account_key=None):
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        "input_tokens, cached_input_tokens, output_tokens, "
+        "reasoning_output_tokens, total_tokens, source_root_key, "
+        "conversation_key, account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (path, offset, _iso(NOW - dt.timedelta(hours=3)), f"session-{offset}",
+         "gpt-5", 100, 10, 20, 5, 130, root, key, account_key),
+    )
+
+
+@pytest.fixture
+def a3_store(tmp_path, monkeypatch):
+    """One healthy project plus the six shapes A3 names, all in window."""
+    ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    root = _cache_root_key(cache)
+    paths = {
+        name: f"/synthetic/a3/{name}.jsonl"
+        for name in ("healthy", "e1", "e2", "inherited", "emptykey",
+                     "nojoin", "shared")
+    }
+    _a3_thread(cache, key="a3-healthy", root=root, native="n-healthy",
+               path=paths["healthy"], cwd="/synthetic/project-healthy")
+    _a3_entry(cache, root=root, path=paths["healthy"], key="a3-healthy",
+              offset=20_001)
+
+    # 1. E1 — undecodable direct `cwd` beside a VALID `git_json`, so revision
+    #    4's map would have published it as a Git project.
+    _a3_thread(cache, key="a3-e1", root=root, native="n-e1", path=paths["e1"],
+               cwd=None, git_json='{"repository":"fixture"}')
+    cache.execute(
+        "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+        "WHERE conversation_key = 'a3-e1'", (A3_BAD,))
+    _a3_entry(cache, root=root, path=paths["e1"], key="a3-e1", offset=20_002)
+
+    # 2. E2 — empty direct metadata whose path's alias winner is undecodable.
+    _a3_thread(cache, key="a3-bad-alias", root=root, native="n-bad-alias",
+               path="/synthetic/a3/bad-alias.jsonl", cwd=None)
+    cache.execute(
+        "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+        "WHERE conversation_key = 'a3-bad-alias'", (A3_BAD,))
+    _a3_thread(cache, key="a3-e2", root=root, native="n-e2", path=paths["e2"],
+               cwd="", git_json="")
+    _a3_alias(cache, root=root, path=paths["e2"], native="n-bad-alias")
+    _a3_entry(cache, root=root, path=paths["e2"], key="a3-e2", offset=20_003)
+
+    # 3. Healthy through inheritance — empty direct metadata, valid winner.
+    _a3_thread(cache, key="a3-good-alias", root=root, native="n-good-alias",
+               path="/synthetic/a3/good-alias.jsonl",
+               cwd="/synthetic/project-inherited")
+    _a3_thread(cache, key="a3-inherited", root=root, native="n-inherited",
+               path=paths["inherited"], cwd="", git_json="")
+    _a3_alias(cache, root=root, path=paths["inherited"], native="n-good-alias")
+    _a3_entry(cache, root=root, path=paths["inherited"], key="a3-inherited",
+              offset=20_004)
+
+    # 4. An EMPTY conversation key on a path whose alias winner is valid. The
+    #    reader refuses it and the aggregate counts it; the map must not
+    #    attribute it through that winner.
+    _a3_alias(cache, root=root, path=paths["emptykey"], native="n-good-alias")
+    _a3_entry(cache, root=root, path=paths["emptykey"], key="", offset=20_005)
+
+    # 5. A nonempty key with neither a thread row nor an alias winner.
+    _a3_entry(cache, root=root, path=paths["nojoin"], key="a3-missing",
+              offset=20_006)
+
+    # 6. One rollout path hosting a healthy conversation owned by account X
+    #    and an E1 conversation owned by account Y.
+    _a3_thread(cache, key="a3-shared-healthy", root=root,
+               native="n-shared-healthy", path=paths["shared"],
+               cwd="/synthetic/project-shared")
+    _a3_thread(cache, key="a3-shared-bad", root=root, native="n-shared-bad",
+               path=paths["shared"], cwd=None)
+    cache.execute(
+        "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+        "WHERE conversation_key = 'a3-shared-bad'", (A3_BAD,))
+    _a3_entry(cache, root=root, path=paths["shared"], key="a3-shared-healthy",
+              offset=20_007, account_key=A3_ACCOUNT_X)
+    _a3_entry(cache, root=root, path=paths["shared"], key="a3-shared-bad",
+              offset=20_008, account_key=A3_ACCOUNT_Y)
+    cache.commit()
+
+    _seed_codex_accounts(stats, [
+        {"account_key": A3_ACCOUNT_X, "natural_id": "x", "email": "x@example",
+         "label": "X", "plan_type": "pro"},
+        {"account_key": A3_ACCOUNT_Y, "natural_id": "y", "email": "y@example",
+         "label": "Y", "plan_type": "pro"},
+    ])
+    _install_active_native_cycle(
+        monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=root)
+    try:
+        yield ns, cache, stats, root, paths
+    finally:
+        cache.close()
+        stats.close()
+
+
+def _a3_state(cache, stats):
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    from test_dashboard_source_read_model import START as READ_MODEL_START
+
+    return source_module.build_codex_source_state(
+        source_module.DashboardReadContext(
+            cache_conn=cache, stats_conn=stats, range_start=READ_MODEL_START,
+            now_utc=NOW, display_tz_name="UTC",
+        ),
+        data_version="a3-v1",
+    )
+
+
+def test_845_a3_the_partial_generation_publishes_every_surviving_project(
+    a3_store,
+):
+    """A3. Every other real project row is published under its healthy key,
+    the affected and refused entries are excluded on every consumer of the
+    map, and the project route works.
+
+    It fails under revision 4's map, which attributes the E1 entry as a Git
+    project; under any path-keyed map, which cannot decide the shared path;
+    under direct-only attribution, which drops the inherited project; and under
+    revision 8's map, which attributes the empty-key entry through its alias
+    winner and files the missing-join entry as `(unassigned)`.
+    """
+    _ns, cache, stats, _root, paths = a3_store
+    state = _a3_state(cache, stats)
+
+    assert state.metadata_health["state"] == "malformed_row_partial"
+    labels = sorted(row["label"] for row in state.data["projects"]["rows"])
+    # `project-red` is the base corpus `_seeded_context` ingests.
+    assert labels == [
+        "project-healthy", "project-inherited", "project-red",
+        "project-shared",
+    ], labels
+    published = repr(state.data["projects"]["rows"])
+    assert "Git project" not in published
+    assert "(unassigned)" not in published
+
+    # The session rows of every path that carries an unattributed identity.
+    by_path = {
+        row["key"]: row for row in state.data["sessions"]["rows"]
+    }
+    assert by_path, "the partial generation published no session rows"
+    null_project_rows = [
+        row for row in state.data["sessions"]["rows"]
+        if row["project"] is None
+    ]
+    # Exactly the five affected paths: the E1 conversation's, the E2 one's,
+    # the empty-key entry's, the missing-join entry's, and the shared path,
+    # whose single project field cannot represent one healthy and one
+    # malformed conversation at once. Every other path keeps the path map's
+    # answer, which is why a healthy path's session row is unchanged.
+    assert len(null_project_rows) == 5, [
+        row["key"] for row in null_project_rows]
+    assert all(row["project_key"] is None for row in null_project_rows)
+    # A session row reading `(unassigned)` is a real answer for a thread with
+    # no metadata, not a decode failure, so its presence is not a violation;
+    # what matters is that no AFFECTED path carries a project at all.
+
+    # The account children. The shared rollout path hosts a healthy
+    # conversation owned by X and an E1 conversation owned by Y, so a
+    # path-keyed decision could not tell them apart; each child computes the
+    # unattributed set over its OWN partition.
+    scopes = state.data["account_scopes"]
+    assert set(scopes) == {A3_ACCOUNT_X, A3_ACCOUNT_Y, "unattributed"}, sorted(
+        scopes)
+    child_labels = {
+        key: sorted(row["label"] for row in child["projects"]["rows"])
+        for key, child in scopes.items()
+    }
+    assert child_labels[A3_ACCOUNT_X] == ["project-shared"]
+    assert child_labels[A3_ACCOUNT_Y] == []
+    assert child_labels["unattributed"] == [
+        "project-healthy", "project-inherited", "project-red"]
+    for key, child in scopes.items():
+        published_child = repr(child["projects"]["rows"])
+        assert "Git project" not in published_child, key
+        assert "(unassigned)" not in published_child, key
+
+    # X and Y own one entry each, both on the shared rollout path, so each
+    # child publishes exactly one session row and the two rows describe the
+    # SAME path under different owners. A session row's single project field
+    # cannot represent a path that hosts one healthy and one malformed
+    # conversation, so the decision has to be per child.
+    x_rows = scopes[A3_ACCOUNT_X]["sessions"]["rows"]
+    y_rows = scopes[A3_ACCOUNT_Y]["sessions"]["rows"]
+    assert len(x_rows) == 1 and len(y_rows) == 1, (x_rows, y_rows)
+    assert x_rows[0]["key"] == y_rows[0]["key"], "both must be the shared path"
+    assert x_rows[0]["project"] == "project-shared"
+    assert x_rows[0]["project_key"] is not None
+    assert y_rows[0]["project"] is None
+    assert y_rows[0]["project_key"] is None
+
+    # Cache-report's project fold. Every affected and refused entry lands in
+    # the fold's own `(unknown)` bucket; no Git, inherited, path-derived or
+    # `(unassigned)` bucket is minted for one.
+    by_project = sorted(
+        row["key"] for row in state.data["cache_report"]["by_project"])
+    assert by_project == [
+        "(unknown)", "project-healthy", "project-inherited", "project-red",
+        "project-shared",
+    ], by_project
+
+
+def test_845_a3_the_two_refused_entries_are_counted_by_their_own_reasons(
+    a3_store,
+):
+    """The map, the counter and the reader agree: the same two refusals, in
+    the same order, before the predicate."""
+    _ns, cache, _stats, _root, _paths = a3_store
+    analytics = sys.modules["_cctally_source_analytics"]
+    health = analytics.load_codex_project_metadata_health(cache_conn=cache)
+    # The EXACT seeded counts, not a floor. `>= 1` passes for a build that
+    # files every one of the eight seeded entries under a single reason, which
+    # is the disagreement between the map, the counter and the reader this row
+    # exists to refuse.
+    assert health.total_rows == 9
+    assert health.missing_conversation_key_rows == 1, "the empty-key entry"
+    assert health.missing_thread_join_rows == 1, "the no-thread, no-alias entry"
+    # E1, E2 and the shared path's E1 conversation.
+    assert health.undecodable_metadata_rows == 3
+    assert health.qualified_rows == 4
+
+
+def test_845_a3_the_project_route_reaches_every_surviving_key(a3_store):
+    """`source_detail_lookup` resolves every published key, and the detail
+    discloses the MALFORMED reason rather than the transient retry sentence."""
+    ns, cache, stats, _root, _paths = a3_store
+    dashboard = sys.modules["_cctally_dashboard"]
+    state = _a3_state(cache, stats)
+    snap = _snapshot(ns, state)
+    rows = state.data["projects"]["rows"]
+    assert rows
+    for row in rows:
+        detail = dashboard.build_source_detail(
+            snapshot=snap, source="codex", resource="project",
+            key=str(row["key"]),
+        )
+        assert detail["metadata_availability"] == "partial"
+        assert detail["metadata_reason"] == (
+            "Project metadata is unavailable for this item.")
+
+
+# ── #845 §4.3 — ONE inventory read per build ───────────────────────────────
+#
+# Section 4.3 states one inventory read per build. The health counter, the
+# probe counter, the qualified reader and — in a partial generation — the
+# identity map each loaded the whole thread-and-alias inventory for
+# themselves, so a build paid the 2,646-row thread pass three or four times
+# over. A row count cannot see that, so this counts the STATEMENTS that carry
+# the inventory's own text.
+
+_INVENTORY_THREAD_MARKER = (
+    "SELECT conversation_key, source_root_key, native_thread_id, last_seen_utc")
+_INVENTORY_ALIAS_MARKER = (
+    "SELECT files.source_root_key, files.path, files.last_native_thread_id")
+
+
+def _inventory_statement_counts(statements):
+    threads = [s for s in statements if _INVENTORY_THREAD_MARKER in s]
+    aliases = [s for s in statements if _INVENTORY_ALIAS_MARKER in s]
+    return threads, aliases
+
+
+def test_845_the_partial_build_reads_the_inventory_exactly_once(a3_store):
+    """A partial generation runs every consumer: both counters, the qualified
+    reader (whose deterministic refusal is what makes the generation partial)
+    and the identity map. One inventory read serves all four."""
+    _ns, cache, stats, _root, _paths = a3_store
+    statements: list[str] = []
+    cache.set_trace_callback(statements.append)
+    try:
+        state = _a3_state(cache, stats)
+    finally:
+        cache.set_trace_callback(None)
+
+    assert state.metadata_health["state"] == "malformed_row_partial"
+    threads, aliases = _inventory_statement_counts(statements)
+    assert len(threads) == 1, threads
+    assert len(aliases) == 1, aliases
+
+
+def test_845_the_healthy_build_reads_the_inventory_exactly_once(
+    tmp_path, monkeypatch,
+):
+    """A healthy generation runs both counters and the qualified reader, which
+    loaded the inventory three times between them. It builds no identity map,
+    so one read is still the whole cost."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    from test_dashboard_source_read_model import START as READ_MODEL_START
+
+    root = _cache_root_key(cache)
+    _install_active_native_cycle(
+        monkeypatch, source_module, reset=NOW + dt.timedelta(days=2), root=root)
+    try:
+        statements: list[str] = []
+        cache.set_trace_callback(statements.append)
+        try:
+            state = source_module.build_codex_source_state(
+                source_module.DashboardReadContext(
+                    cache_conn=cache, stats_conn=stats,
+                    range_start=READ_MODEL_START, now_utc=NOW,
+                    display_tz_name="UTC",
+                ),
+                data_version="f8-healthy",
+            )
+        finally:
+            cache.set_trace_callback(None)
+        assert state.metadata_health["state"] == "healthy"
+        threads, aliases = _inventory_statement_counts(statements)
+        assert len(threads) == 1, threads
+        assert len(aliases) == 1, aliases
+    finally:
+        cache.close()
+        stats.close()

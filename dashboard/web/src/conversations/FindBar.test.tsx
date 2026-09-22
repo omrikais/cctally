@@ -209,6 +209,15 @@ describe('FindBar', () => {
     expect(document.querySelector('.conv-findbar-count')!.textContent).toContain('0 / 0');
   });
 
+  it('surfaces a typed degraded find notice instead of a generic failure', async () => {
+    mockFind({ status: 'degraded', degraded_reason: 'legacy_bridge_pending' });
+    render(<FindBar sessionId="s1" onClose={() => {}} onTermsChange={() => {}} />);
+    const input = screen.getByLabelText(/find in conversation/i) as HTMLInputElement;
+    await typeNeedle(input, 'needle');
+    expect(document.querySelector('.conv-findbar')!.textContent).toContain('cctally cache-sync');
+    expect(document.querySelector('.conv-findbar')!.textContent!.toLowerCase()).not.toContain('find failed');
+  });
+
   it('reports the debounced needle up via onTermsChange (for prose marks)', async () => {
     mockFind({ anchors: [], total: 0 });
     const onTermsChange = vi.fn();

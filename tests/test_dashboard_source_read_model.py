@@ -5,6 +5,8 @@ import dataclasses
 import datetime as dt
 import pathlib
 import sqlite3
+
+import _lib_snapshot_cache
 import shutil
 import sys
 from collections.abc import Mapping
@@ -193,6 +195,20 @@ def test_codex_cache_report_computes_savings_and_breakdowns_from_native_counters
     assert report["fourteen_day_efficiency_ratio"] is None
     assert report["by_project"][0]["key"] == "cctally-dev"
     assert report["by_model"][0]["key"] == "gpt-5"
+
+    long_entry = SimpleNamespace(**vars(entry))
+    long_entry.model = "gpt-6-luna"
+    long_entry.input_tokens = 300_000
+    long_entry.cached_input_tokens = 20_000
+    long_entry.total_tokens = 300_010
+    long_report = source_module._codex_cache_report_wire(
+        (long_entry,), metadata={}, now_utc=NOW,
+        display_tz_name="UTC", speed="standard",
+    )
+    long_measured = next(row for row in long_report["days"] if row["observed"])
+    assert long_measured["saved_usd"] == pytest.approx(
+        20_000 * (0.20e-6 - 0.02e-6)
+    )
 
 
 def test_codex_cache_report_uses_canonical_fast_multiplier_for_auto_review(
@@ -1844,7 +1860,7 @@ def test_codex_session_name_stays_private_normalized_and_out_of_source_rows(
         state_db.close()
 
     try:
-        metadata = source_module._codex_conversation_metadata(cache)
+        metadata = source_module._codex_conversation_metadata(cache).metadata
         assert expected_title in {
             row["title"] for row in metadata.values()
         }, metadata
@@ -1916,7 +1932,7 @@ def test_codex_session_start_comes_from_accounting_not_rebuild_observation(
         )
         cache.commit()
 
-        metadata = source_module._codex_conversation_metadata(cache)
+        metadata = source_module._codex_conversation_metadata(cache).metadata
 
         assert metadata[(root_key, source_path)]["started_at"] == expected_started_at
         assert metadata[(root_key, mcp_path)]["started_at"] == mcp_started_at
@@ -1976,7 +1992,7 @@ def test_codex_subagent_accounting_inherits_root_task_and_project_metadata(
             cache_conn=cache, start=START, end=NOW + dt.timedelta(microseconds=1),
         )
         assert health.incomplete_rows == 0
-        metadata = source_module._codex_conversation_metadata(cache)
+        metadata = source_module._codex_conversation_metadata(cache).metadata
         inherited = metadata[(str(root_key), child_path)]
         assert inherited["title"] == "Inherited root task name"
         assert inherited["project_label"] == "project-red"
@@ -2166,11 +2182,14 @@ def test_partial_projects_disambiguate_duplicate_labels_without_identity_leaks()
             output_tokens=12, reasoning_output_tokens=3, total_tokens=42,
         ),
     )
+    # #845 §4.4: the fold looks entries up by ACCOUNTING IDENTITY, the
+    # `(source_root_key, conversation_key or "", source_path)` triple, because
+    # one rollout path can host a healthy conversation and a malformed one.
     metadata = {
-        ("root-secret-a", "/Users/secret/personal/repo/rollout-a.jsonl"): {
+        ("root-secret-a", "", "/Users/secret/personal/repo/rollout-a.jsonl"): {
             "project_key": "project:" + "a" * 24, "project_label": "repo", "title": "A",
         },
-        ("root-secret-b", "/Users/secret/work/repo/rollout-b.jsonl"): {
+        ("root-secret-b", "", "/Users/secret/work/repo/rollout-b.jsonl"): {
             "project_key": "project:" + "b" * 24, "project_label": "repo", "title": "B",
         },
     }
@@ -2239,7 +2258,16 @@ def test_incomplete_codex_metadata_keeps_nonproject_dashboard_data(
         assert state.freshness == "fresh"
         assert state.data["hero"]["cycle"]["window_minutes"] == 10_080
         assert state.data["hero"]["total_tokens"] >= 0
-        assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+        # #845 §4.4. An entry with an empty conversation key is REFUSED by the
+        # accounting-identity map, exactly as `_require_joined_metadata`
+        # refuses it and exactly as the health aggregate counts it under
+        # `missing_conversation_key_rows`. Attributing it through its path's
+        # alias winner would publish a project for a row the reader refuses.
+        # The `all-unqualified` case strips every key, so no entry survives to
+        # carry a project; the other two strip one row beside healthy ones.
+        assert [row["label"] for row in state.data["projects"]["rows"]] == (
+            [] if metadata_kind == "all-unqualified" else ["project-red"]
+        )
 
         # A deterministically unqualifiable row inside the accounting window is
         # the ONE state whose remedy IS the cache rebuild, so this message must
@@ -2419,7 +2447,18 @@ def test_complete_metadata_defensively_falls_back_once_when_qualified_read_fails
         )
         assert "0 Codex accounting row(s)" not in state.warnings[0].message
         assert "--rebuild" not in state.warnings[0].message
-        assert [row["label"] for row in state.data["projects"]["rows"]] == ["project-red"]
+        # #846 §4.6 rule 1 CHANGED this expectation again, and states the
+        # change plainly: a transient generation publishes NO Codex project
+        # rows on any path. A build whose own metadata read raised has
+        # established nothing about the rows, so publishing them through the
+        # partial fold showed a ranking the read never qualified. The route's
+        # disclosure moves to the malformed generation, which is the
+        # reproducible degraded state.
+        assert state.data["projects"]["rows"] == ()
+        assert state.metadata_health == {
+            "state": "transient_read_failure", "incomplete_rows": None,
+            "retryable": True,
+        }
     finally:
         cache.close()
         stats.close()
@@ -3504,7 +3543,12 @@ def test_codex_source_builder_loads_quota_and_projects_once_from_context(
         assert physical_signatures is None
         return observations
 
-    def projects_from_context(start, end, *, speed, sync, group="git-root", cache_conn=None):
+    def projects_from_context(
+        start, end, *, speed, sync, group="git-root", cache_conn=None,
+        inventory=None,
+    ):
+        # §4.3: the build hands the reader its ONE inventory.
+        assert inventory is not None
         assert start == START
         assert end == NOW + dt.timedelta(microseconds=1)
         assert speed == "standard"
@@ -5804,3 +5848,218 @@ def test_two_live_in_memory_stores_have_distinct_identities():
     finally:
         first.close()
         second.close()
+
+
+# === #846 §4.6 — the combined verdict over four metadata legs ==============
+
+
+_A9_LEGS = ("accounting_health", "detail_probe", "qualified_accounting",
+            "conversation_metadata")
+
+
+def _a9_force_leg_failure(monkeypatch, source_module, leg):
+    """Make exactly one metadata leg raise a genuine `sqlite3.Error`."""
+    analytics = sys.modules["_cctally_source_analytics"]
+
+    def _raise(*_args, **_kwargs):
+        raise sqlite3.OperationalError(f"{leg} is unavailable")
+
+    if leg == "accounting_health":
+        monkeypatch.setattr(
+            source_module, "load_codex_project_metadata_health", _raise)
+    elif leg == "detail_probe":
+        monkeypatch.setattr(
+            source_module, "probe_codex_detail_metadata_health", _raise)
+    elif leg == "qualified_accounting":
+        monkeypatch.setattr(
+            source_module, "load_qualified_codex_entries",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                analytics.QualifiedMetadataUnavailable("read failed")),
+        )
+    else:
+        original = source_module._codex_conversation_metadata
+
+        def _failed(*args, **kwargs):
+            # The real read still runs, so the fixture fails the leg over a
+            # store whose read would otherwise have SUCCEEDED. Asserting that
+            # is what keeps a genuine failure of this read from being masked by
+            # the forced one.
+            assert original(*args, **kwargs).error is None
+            return source_module._CodexConversationMetadataRead(
+                {}, {}, sqlite3.OperationalError("conversation metadata"))
+
+        monkeypatch.setattr(
+            source_module, "_codex_conversation_metadata", _failed)
+
+
+@pytest.mark.parametrize("leg", _A9_LEGS)
+def test_846_a9_any_failed_metadata_leg_publishes_a_transient_generation(
+    tmp_path, monkeypatch, leg,
+):
+    """A9's builder half. Each of the four legs in turn: the carrier is
+    `transient_read_failure`, `failed_legs` names the leg, the project rows are
+    empty on the parent, and the chip carries the retry sentence rather than
+    the rebuild remedy."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        _a9_force_leg_failure(monkeypatch, source_module, leg)
+        # The handler is attached to the dashboard logger itself rather than
+        # through `caplog`: `_lib_log.get_logger` configures that logger on
+        # FIRST use in the process, and the configuration it installs is not
+        # observable through the root logger's handlers.
+        import logging as _logging
+        import _lib_log
+
+        captured: list[str] = []
+
+        class _Collect(_logging.Handler):
+            def emit(self, record):
+                captured.append(record.getMessage())
+
+        logger = _lib_log.get_logger("dashboard")
+        handler = _Collect()
+        logger.addHandler(handler)
+        try:
+            state = source_module.build_codex_source_state(
+                DashboardReadContext(
+                    cache_conn=cache, stats_conn=stats, range_start=START,
+                    now_utc=NOW, display_tz_name="UTC",
+                ),
+                data_version=f"a9-{leg}-v1",
+            )
+        finally:
+            logger.removeHandler(handler)
+        assert state.metadata_health == {
+            "state": "transient_read_failure", "incomplete_rows": None,
+            "retryable": True,
+        }, leg
+        assert state.data["projects"]["rows"] == (), leg
+        assert state.availability == "partial"
+        metadata_warnings = [
+            warning for warning in state.warnings
+            if warning.code == "codex_metadata_incomplete"
+        ]
+        assert len(metadata_warnings) == 1, leg
+        assert metadata_warnings[0].message == (
+            "Codex project metadata could not be read for this build; it will "
+            "retry on the next refresh."
+        )
+        assert "--rebuild" not in metadata_warnings[0].message
+        # ONE line, naming the sorted failed legs and their exception classes.
+        lines = [
+            message for message in captured
+            if "Codex metadata legs failed" in message
+        ]
+        assert len(lines) == 1, lines
+        assert leg in lines[0], lines[0]
+
+        # The degraded generation is never handed back unexamined.
+        import _lib_dashboard_sources as lds
+
+        assert lds.reuse_coherent_source_state(
+            state, data_version=state.data_version) is None
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_846_a11_the_accounting_health_leg_no_longer_escapes(
+    tmp_path, monkeypatch,
+):
+    """A11's first half. `load_codex_project_metadata_health` had no local
+    classification `try`, so a SQLite failure there reached
+    `capture_codex_source_state`'s broad handler and failed the provider
+    outright rather than degrading it."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        _a9_force_leg_failure(monkeypatch, source_module, "accounting_health")
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="a11-v1",
+        )
+        assert state.metadata_health["state"] == "transient_read_failure"
+        assert state.availability == "partial"
+        assert state.data is not None
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_846_a11_a_failing_alias_pragma_propagates(tmp_path, monkeypatch):
+    """A11's second half. `_supports_native_file_aliases` answered `False`
+    both for an old schema and for a failed PRAGMA, so a failed read silently
+    narrowed the inherited alias population instead of degrading the build."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    analytics = sys.modules["_cctally_source_analytics"]
+    try:
+        class _PragmaFails:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                if "PRAGMA table_info(codex_session_files)" in sql:
+                    raise sqlite3.OperationalError("pragma failed")
+                return self._inner.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with pytest.raises(sqlite3.OperationalError):
+            analytics._supports_native_file_aliases(_PragmaFails(cache))
+    finally:
+        cache.close()
+        stats.close()
+
+
+def test_846_a10_a_failed_metadata_read_is_not_an_empty_store(
+    tmp_path, monkeypatch,
+):
+    """A10. Asserting the map is empty is true in both cases, which is why
+    that assertion could not have caught this."""
+    _ns, cache, stats = _seeded_context(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        cache.execute("DELETE FROM codex_conversation_threads")
+        cache.execute("DELETE FROM codex_session_files")
+        cache.commit()
+        empty = source_module._codex_conversation_metadata(cache)
+        assert empty.metadata == {}
+        assert empty.by_accounting_identity == {}
+        assert empty.error is None
+
+        _a9_force_leg_failure(
+            monkeypatch, source_module, "conversation_metadata")
+        state = source_module.build_codex_source_state(
+            DashboardReadContext(
+                cache_conn=cache, stats_conn=stats, range_start=START,
+                now_utc=NOW, display_tz_name="UTC",
+            ),
+            data_version="a10-v1",
+        )
+        assert state.metadata_health["state"] == "transient_read_failure"
+        # Sessions still publish their cache-only accounting rows, without
+        # private titles or metadata-derived project fields ...
+        assert all(
+            row["project"] is None for row in state.data["sessions"]["rows"]
+        )
+        # ... and cache-report publishes totals, days and models with an EMPTY
+        # `by_project` rather than converting every entry to `(unknown)`.
+        assert state.data["cache_report"]["by_project"] == ()
+        assert state.data["cache_report"]["days"] is not None
+    finally:
+        cache.close()
+        stats.close()
+
+
+# A13 is verified in `tests/test_846_tui_metadata_ticks.py`. The builder-only
+# form that stood here did not satisfy the row: A13's "Not satisfied by" column
+# excludes a builder-only test, it covered the transient sequence alone, and it
+# called `_tui_reset_partial_retry_state()` immediately before its single
+# retention call, so no key was ever armed and "the armed retry key is cleared"
+# was never observed. Both sequences now run through real `_tui_build_source_bundle`
+# ticks with a key armed before the recovery tick.

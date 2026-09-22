@@ -247,6 +247,28 @@ afterEach(() => {
 });
 
 describe('ConversationReader', () => {
+  it('renders a maintenance detail as a named retryable state', async () => {
+    const ref = { source: 'claude' as const, key: 'v1.deep-link-maintenance' };
+    dispatch({ type: 'OPEN_CONVERSATION', conversationRef: ref, jump: { conversation_ref: ref, session_id: ref.key, uuid: 'anchor' } });
+    mockFetchOnce({ status: 'degraded', degraded_reason: 'maintenance' });
+
+    const { container } = render(<ConversationReader conversationRef={ref} />);
+    await waitFor(() => expect(container.querySelector('[data-testid="conv-reader-degraded"]')).not.toBeNull());
+    expect(container.querySelector('[data-degraded-reason="maintenance"]')).not.toBeNull();
+    expect(screen.getByText(/conversation store is busy with maintenance/i)).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Retry' })).not.toBeNull();
+  });
+
+  it('renders schema-behind detail without offering an ineffective retry', async () => {
+    const ref = { source: 'claude' as const, key: 'v1.deep-link-schema' };
+    mockFetchOnce({ status: 'degraded', degraded_reason: 'schema_behind' });
+
+    const { container } = render(<ConversationReader conversationRef={ref} />);
+    await waitFor(() => expect(container.querySelector('[data-testid="conv-reader-degraded"]')).not.toBeNull());
+    expect(screen.getByText(/conversation store is behind this version/i)).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+
   it('renders the header and groups parallel subagents into separate threads', async () => {
     mockFetchOnce(detail([
       makeItem({ uuid: 'h1' }),
@@ -1104,9 +1126,23 @@ describe('ConversationReader', () => {
 
     // Filter popover CLOSED → End jumps to the final anchor (lands + flashes).
     act(() => { dispatch({ type: 'SET_CONV_FILTERS_OPEN', open: false }); });
+    mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'last-uuid' })], null, 'last-uuid'));
     await act(async () => { fireEvent.keyDown(document, { key: 'End' }); for (let i = 0; i < 8; i++) await Promise.resolve(); });
     await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')!.classList.contains('conv-item--jumped')).toBe(true));
     expect(getState().convPinnedUuid).toBe('last-uuid');
+  });
+
+  it('End does not dispatch a stale-anchor jump when the latest detail read is degraded', async () => {
+    mockFetchOnce(detailWithAnchor([makeItem({ uuid: 'h1' }), makeItem({ uuid: 'last-uuid' })], null, 'last-uuid'));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 's' });
+    installGlobalKeydown();
+    const { container } = render(<ConversationReader sessionId="s" />);
+    await waitFor(() => expect(container.querySelector('[data-uuid="last-uuid"]')).not.toBeNull());
+    mockFetchOnce({ status: 'degraded', degraded_reason: 'maintenance', items: [] });
+    await act(async () => { fireEvent.keyDown(document, { key: 'End' }); await Promise.resolve(); await Promise.resolve(); });
+    await waitFor(() => expect(container.querySelector('[data-testid="conv-reader-degraded"]')).not.toBeNull());
+    expect(getState().conversationJump).toBeNull();
+    expect(getState().convPinnedUuid).toBeNull();
   });
 });
 

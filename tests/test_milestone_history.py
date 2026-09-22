@@ -1767,3 +1767,124 @@ def test_836_one_window_two_accounts_do_not_share_milestones(ns):
         assert [m["percent_threshold"] for m in by_final[9.0]["milestones"]] == [2]
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("insertion_order", [("acct-alice", "acct-bob"),
+                                           ("acct-bob", "acct-alice")])
+def test_839_same_window_history_keeps_each_accounts_credit_and_identity(
+    ns, insertion_order,
+):
+    """Both physical row orders must preserve each block's own credit and owner."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        for account, label in (("acct-alice", "Alice"), ("acct-bob", "Bob")):
+            conn.execute(
+                "INSERT INTO accounts (account_key, provider, natural_id, label) "
+                "VALUES (?, 'claude', ?, ?)", (account, account, label))
+        resets = "2026-05-16T05:00:00+00:00"
+        start = "2026-05-16T00:00:00+00:00"
+        wk = ns["_canonical_5h_window_key"](int(dt.datetime.fromisoformat(resets).timestamp()))
+        by_account = {"acct-alice": (5.0, 1, 4.0), "acct-bob": (9.0, 2, 17.0)}
+        for account in insertion_order:
+            final, threshold, credit = by_account[account]
+            block_id = _seed_account_block(
+                conn, window_key=wk, block_start_at=start,
+                five_hour_resets_at=resets, account_key=account,
+                final_five_hour_percent=final)
+            _seed_account_5h_milestone(
+                conn, block_id=block_id, window_key=wk,
+                percent_threshold=threshold,
+                captured_at_utc="2026-05-16T01:00:00+00:00",
+                account_key=account)
+            conn.execute(
+                "INSERT INTO five_hour_reset_events "
+                "(detected_at_utc, five_hour_window_key, prior_percent, "
+                " post_percent, effective_reset_at_utc, account_key) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("2026-05-16T02:00:00+00:00", wk, 1.0, 1.0 + credit,
+                 "2026-05-16T02:00:00+00:00", account))
+        conn.commit()
+
+        blocks = mh._build_blocks(conn, WK_A_START, WK_A_END)
+        assert len(blocks) == 2
+        assert {b["account_key"]: (
+            b["account_label"],
+            [m["percent_threshold"] for m in b["milestones"]],
+            [credit["delta_pp"] for credit in b["credits"]],
+        ) for b in blocks} == {
+            "acct-alice": ("Alice", [1], [4.0]),
+            "acct-bob": ("Bob", [2], [17.0]),
+        }
+    finally:
+        conn.close()
+
+
+def test_839_single_account_history_keeps_legacy_block_wire(ns):
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO accounts (account_key, provider, natural_id) "
+            "VALUES ('acct-alice', 'claude', 'acct-alice')")
+        _seed_account_block(
+            conn, window_key=5155, block_start_at="2026-05-16T00:00:00+00:00",
+            five_hour_resets_at="2026-05-16T05:00:00+00:00",
+            account_key="acct-alice", final_five_hour_percent=5.0)
+        conn.commit()
+        block, = mh._build_blocks(conn, WK_A_START, WK_A_END)
+        assert "account_key" not in block
+        assert "account_label" not in block
+    finally:
+        conn.close()
+
+
+def test_839_decorated_detail_stamp_moves_for_other_account_5h_changes(ns):
+    """The client must refetch when an account-owned credit or crossing arrives."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        for account in ("acct-alice", "acct-bob"):
+            conn.execute(
+                "INSERT INTO accounts (account_key, provider, natural_id) "
+                "VALUES (?, 'claude', ?)", (account, account))
+        _seed_usage(
+            conn, captured_at_utc="2026-05-16T00:00:00+00:00",
+            week_start_date="2026-05-15", week_start_at=WK_A_START,
+            week_end_at=WK_A_END, weekly_percent=23.0)
+        conn.execute(
+            "UPDATE weekly_usage_snapshots SET account_key='acct-bob' "
+            "WHERE week_start_date='2026-05-15'")
+        reset = "2026-05-16T05:00:00+00:00"
+        start = "2026-05-16T00:00:00+00:00"
+        wk = ns["_canonical_5h_window_key"](int(dt.datetime.fromisoformat(reset).timestamp()))
+        alice = _seed_account_block(
+            conn, window_key=wk, block_start_at=start,
+            five_hour_resets_at=reset, account_key="acct-alice",
+            final_five_hour_percent=5.0)
+        _seed_account_block(
+            conn, window_key=wk, block_start_at=start,
+            five_hour_resets_at=reset, account_key="acct-bob",
+            final_five_hour_percent=19.0)
+        conn.commit()
+        stamp = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, five_hour_window_key, prior_percent, "
+            " post_percent, effective_reset_at_utc, account_key) "
+            "VALUES (?, ?, 1, 5, ?, 'acct-alice')",
+            ("2026-05-16T02:00:00+00:00", wk,
+             "2026-05-16T02:00:00+00:00"))
+        conn.commit()
+        credit_stamp = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+        assert credit_stamp != stamp
+
+        _seed_account_5h_milestone(
+            conn, block_id=alice, window_key=wk,
+            percent_threshold=4, captured_at_utc="2026-05-16T03:00:00+00:00",
+            account_key="acct-alice")
+        conn.commit()
+        assert mh.build_claude_week_index(conn)[0]["detail_stamp"] != credit_stamp
+    finally:
+        conn.close()

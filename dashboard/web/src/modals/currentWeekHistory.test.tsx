@@ -76,6 +76,12 @@ const HISTORIC_CYCLE_PAYLOAD = {
   blocks: [],
 };
 
+const HISTORIC_EMPTY_CYCLE_PAYLOAD = {
+  ...HISTORIC_CYCLE_PAYLOAD,
+  segments: [],
+  blocks: [],
+};
+
 function mockFetch(payload: unknown) {
   const spy = vi.fn(async () => ({ ok: true, json: async () => payload }));
   global.fetch = spy as unknown as typeof fetch;
@@ -114,6 +120,52 @@ describe('fetch policy + reset-defined cycle wire', () => {
     await screen.findByText('Jul 16–Jul 18');
     expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Apost-reset');
     expect(screen.queryByText(/CREDIT/)).toBeNull();
+  });
+
+  it('uses cycle vocabulary for a historic cycle with no milestones', async () => {
+    const spy = mockFetch(HISTORIC_EMPTY_CYCLE_PAYLOAD);
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    expect(screen.getByText('No milestones recorded this cycle')).toBeTruthy();
+    expect(spy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Apost-reset');
+  });
+
+  it('uses cycle vocabulary when a historic cycle cannot load', async () => {
+    global.fetch = vi.fn(async () => ({ ok: false, json: async () => ({}) })) as unknown as typeof fetch;
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    expect(await screen.findByText(/Couldn’t load this cycle/)).toBeTruthy();
+    expect(screen.queryByText(/Couldn’t load this week/)).toBeNull();
+    // The history pill has moved, but the current envelope has not. No
+    // percentage, spend, reset, progress or count belongs to the failed cycle.
+    for (const id of ['mcw-bignum', 'mcw-spent', 'mcw-dpp', 'mcw-reset', 'mcw-pbar', 'mcw-ms-count']) {
+      expect(document.querySelector(`#${id}`)).toBeNull();
+    }
+  });
+
+  it('does not carry one fetched cycle into the next pending historic cycle', async () => {
+    let rejectOlder: ((error: Error) => void) | undefined;
+    global.fetch = vi.fn((url: string) => url.includes('pre-reset')
+      ? new Promise((_resolve, reject) => { rejectOlder = reject; })
+      : Promise.resolve({ ok: true, json: async () => HISTORIC_CYCLE_PAYLOAD })) as unknown as typeof fetch;
+    updateSnapshot(makeEnv(INDEX));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await screen.findByText('Jul 16–Jul 18');
+    expect(document.querySelector('#mcw-bignum')).toHaveTextContent('1.0%');
+
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Loading…')).toBeTruthy();
+    expect(document.querySelector('#mcw-bignum')).toBeNull();
+    expect(document.querySelector('#mcw-ms-count')).toBeNull();
+
+    await act(async () => { rejectOlder?.(new Error('unavailable')); });
+    expect(await screen.findByText(/Couldn’t load this cycle/)).toBeTruthy();
+    expect(document.querySelector('#mcw-bignum')).toBeNull();
   });
 
   it('does NOT fetch on mount for a single-segment current week', () => {
@@ -243,6 +295,157 @@ describe('current-period block navigator is immediately complete', () => {
     expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(false);
     expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(true);
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Claude account-owned five-hour navigation (#839)', () => {
+  const currentEntry = idxEntry('milestone_cycle:current', {
+    is_current: true, segment_count: 2, block_count: 2,
+  });
+  const makeBlock = (account: 'alice' | 'bob') => ({
+    five_hour_window_key: 901,
+    account_key: account,
+    account_label: account === 'alice' ? 'Alice' : 'Bob',
+    block_start_at: '2026-05-16T05:00:00Z',
+    five_hour_resets_at: '2026-05-16T10:00:00Z',
+    final_five_hour_percent: account === 'alice' ? 7 : 19,
+    total_cost_usd: 1,
+    crossed_seven_day_reset: false,
+    is_closed: false,
+    milestones: [{
+      percent_threshold: account === 'alice' ? 7 : 19,
+      reset_event_id: 0,
+      captured_at_utc: '2026-05-16T06:00:00Z',
+      block_cost_usd: 1,
+      marginal_cost_usd: 1,
+      seven_day_pct_at_crossing: 23,
+      effective_seven_day_pct_at_crossing: 23,
+    }],
+    credits: [{
+      effective_reset_at_utc: '2026-05-16T06:30:00Z',
+      prior_percent: 1,
+      post_percent: account === 'alice' ? 5 : 18,
+      delta_pp: account === 'alice' ? 4 : 17,
+    }],
+  });
+
+  it('retains the live block and stream while decorated history loads or fails', async () => {
+    let rejectDetail!: (error: Error) => void;
+    global.fetch = vi.fn(() => new Promise<Response>((_resolve, reject) => {
+      rejectDetail = reject;
+    })) as unknown as typeof fetch;
+    const env = makeEnv([idxEntry('milestone_cycle:current', {
+      is_current: true, segment_count: 1, block_count: 2,
+    })]);
+    env.current_week!.five_hour_block = {
+      five_hour_window_key: 901,
+      account_key: 'bob',
+      block_start_at: '2026-05-16T05:00:00Z',
+      seven_day_pct_at_block_start: 20,
+      seven_day_pct_delta_pp: 3,
+      crossed_seven_day_reset: false,
+      credits: makeBlock('bob').credits,
+    };
+    env.current_week!.five_hour_milestones = makeBlock('bob').milestones;
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Current block');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('19');
+    await act(async () => rejectDetail(new Error('detail unavailable')));
+    await waitFor(() => expect(screen.getByText(/Couldn’t load this cycle/)).toBeTruthy());
+    expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Current block');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('19');
+  });
+
+  it('fetches a decorated single-segment cycle before assuming the live block is last', async () => {
+    const entry = idxEntry('milestone_cycle:current', {
+      is_current: true, segment_count: 1, block_count: 2,
+    });
+    const fetchSpy = mockFetch({
+      source: 'claude', key: entry.key, label: 'May 15–22',
+      start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
+      is_current: true, detail_stamp: entry.detail_stamp,
+      segments: [], dividers: [], blocks: [makeBlock('bob'), makeBlock('alice')],
+    });
+    const env = makeEnv([entry]);
+    env.current_week!.five_hour_block = {
+      five_hour_window_key: 901,
+      account_key: 'bob',
+      block_start_at: '2026-05-16T05:00:00Z',
+      seven_day_pct_at_block_start: 20,
+      seven_day_pct_delta_pp: 3,
+      crossed_seven_day_reset: false,
+      credits: makeBlock('bob').credits,
+    };
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Block 1 of 2')).toBeTruthy();
+    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByLabelText('Newer block'));
+    await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy());
+  });
+
+  for (const order of [(['alice', 'bob'] as const), (['bob', 'alice'] as const)]) {
+    it(`selects and steps account-owned blocks inserted ${order.join(' then ')}`, async () => {
+      mockFetch({
+        source: 'claude', key: currentEntry.key, label: 'May 15–22',
+        start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
+        is_current: true, detail_stamp: currentEntry.detail_stamp,
+        segments: [], dividers: [], blocks: order.map(makeBlock),
+      });
+      const env = makeEnv([currentEntry]);
+      env.current_week!.five_hour_block = {
+        five_hour_window_key: 901,
+        account_key: 'bob',
+        block_start_at: '2026-05-16T05:00:00Z',
+        seven_day_pct_at_block_start: 20,
+        seven_day_pct_delta_pp: 3,
+        crossed_seven_day_reset: false,
+        credits: makeBlock('bob').credits,
+      };
+      env.current_week!.five_hour_milestones = makeBlock('bob').milestones;
+      updateSnapshot(env);
+      render(<CurrentWeekModal />);
+
+      await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
+      expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('17pp');
+      fireEvent.click(screen.getByLabelText(order[0] === 'alice' ? 'Older block' : 'Newer block'));
+      await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy());
+      const aliceTable = document.querySelector('#mcw-5h-table')!;
+      expect(aliceTable.textContent).toContain('+4pp');
+      expect(aliceTable.textContent).toContain('7');
+      expect(aliceTable.textContent).not.toContain('+17pp');
+      expect(aliceTable.textContent).not.toContain('19');
+    });
+  }
+
+  it('does not substitute an unqualified legacy live stream into a qualified block', async () => {
+    mockFetch({
+      source: 'claude', key: currentEntry.key, label: 'May 15–22',
+      start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
+      is_current: true, detail_stamp: currentEntry.detail_stamp,
+      segments: [], dividers: [], blocks: [makeBlock('bob')],
+    });
+    const env = makeEnv([currentEntry]);
+    env.current_week!.five_hour_block = {
+      five_hour_window_key: 901,
+      block_start_at: '2026-05-16T05:00:00Z',
+      seven_day_pct_at_block_start: 20,
+      seven_day_pct_delta_pp: 3,
+      crossed_seven_day_reset: false,
+      credits: [{ ...makeBlock('bob').credits[0], delta_pp: 88 }],
+    };
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+    await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).not.toContain('88pp');
   });
 });
 
@@ -759,6 +962,7 @@ describe('#620 S1 — a week with no recorded boundaries', () => {
     // range and the reset are absent, in the same voice the rest of #620 uses.
     const note = container.querySelector('.mcw-bounds-missing');
     expect(note).not.toBeNull();
+    expect(note).toHaveTextContent('This cycle’s exact start and reset were never recorded');
     expect((note?.textContent ?? '').toLowerCase()).toContain('reset');
 
     // `.mcw-mini` is a wrapping flex row of stat cells, so a paragraph placed

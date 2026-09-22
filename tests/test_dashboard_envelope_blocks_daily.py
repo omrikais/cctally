@@ -1,5 +1,6 @@
 """Golden-file freeze of the SSE envelope shape with blocks/daily keys."""
 import datetime as dt
+import dataclasses
 import json
 import pathlib
 import sys
@@ -217,6 +218,22 @@ def test_envelope_blocks_daily_keys_match_golden():
     # returns a 5-element list (raw, possibly duplicated).
     assert isinstance(env["daily"]["quantile_thresholds"], list)
     assert len(env["daily"]["quantile_thresholds"]) == 5
+
+    # The source-scoped Claude projection used under All must carry exactly
+    # the provenance that the legacy panel row publishes. A retained block
+    # can still be active by the pinned clock; neither branch may infer the
+    # row's provenance from that flag.
+    snap.blocks_panel[0] = dataclasses.replace(
+        snap.blocks_panel[0], facts_source="retained",
+    )
+    retained = ns["snapshot_to_envelope"](
+        snap,
+        now_utc=dt.datetime(2026, 4, 26, 12, 0, tzinfo=dt.timezone.utc),
+        monotonic_now=None,
+    )
+    assert retained["blocks"]["rows"][0]["facts_source"] == "retained"
+    claude_source = ns["_cctally_tui"]._tui_project_claude_source_data(retained)
+    assert claude_source["quota"]["blocks"][0]["facts_source"] == "retained"
 
 
 def test_envelope_quantile_thresholds_consistent_with_helper():

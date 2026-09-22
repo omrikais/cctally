@@ -69,6 +69,7 @@ import {
   sameConversationRef,
   type ConversationDetail,
   type ConversationItem,
+  type ConversationJump,
   type ConversationOutline,
   type ConversationRef,
   type OpenIntent,
@@ -356,7 +357,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     if (convPinnedUuidEarly) s.add(convPinnedUuidEarly);
     return s;
   }, [jumpUuidForSession, currentTurnUuidEarly, convPinnedUuidEarly]);
-  const { detail, loading, error, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, fetching, tailRevision, virtualFirstItemIndex } = useConversation(conversationRef, { outlineTurns: outline?.turns, outlinePositions: outline?.positionByKey, openIntent, protectedUuids, growthNonce, live });
+  const { detail, loading, error, degraded, retry, hasMore, hasPrev, openScrollIntent, lastOp, loadMore, loadPrev, loadToTarget, jumpToLatest: hookJumpToLatest, fetching, tailRevision, virtualFirstItemIndex } = useConversation(conversationRef, { outlineTurns: outline?.turns, outlinePositions: outline?.positionByKey, openIntent, protectedUuids, growthNonce, live });
   // #232 — the imperative Virtuoso handle (scrollToIndex for jumps / keyboard
   // nav / the "↓ N new" pill) and a live mirror of the firstItemIndex so
   // `itemContent`'s array-index math (`virtualIndex − firstItemIndex`) reads the
@@ -708,6 +709,9 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
   // can say so instead of falling silent. Reset when a new jump starts and when
   // the conversation identity changes; the user can also dismiss it.
   const [jumpFailure, setJumpFailure] = useState<'unresolved' | 'landing_failed' | 'load_failed' | null>(null);
+  // A failed drain clears the active store jump, but the visible Retry action
+  // needs its exact target and qualified address for a fresh user-initiated run.
+  const failedJumpRef = useRef<ConversationJump | null>(null);
   // #463 S1 — a give-up message is about ONE finished jump, so the next page
   // request retires it. The render used to hide it while `fetching` was true
   // instead, which made it vanish and return around every later page the user's
@@ -863,7 +867,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     if (!la) return;
     setJumpingLatest(true);
     try {
-      await hookJumpToLatest();
+      if (!await hookJumpToLatest()) return;
       atBottomRef.current = true;  // land at the bottom so live appends stick
       dispatch({
         type: 'OPEN_CONVERSATION',
@@ -1305,6 +1309,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     // #463 S1 — a fresh jump supersedes any previous give-up message. Setting the
     // state it already holds is a no-op re-render, so this is safe on a re-fire.
     setJumpFailure(null);
+    failedJumpRef.current = null;
     let cancelled = false;
     // #234 / #281 S5 A2 — this jump owns a fresh programmatic-run token. The walk
     // and the final landing run inside the async block below; `aborted()` after
@@ -1612,7 +1617,10 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         const outcome = await runJumpPipeline(runnerDeps);
         if (outcome === 'exhausted-cleared') setJumpFailure('unresolved');
         if (outcome === 'landing-failed') setJumpFailure('landing_failed');
-        if (outcome === 'load-failed') setJumpFailure('load_failed');
+        if (outcome === 'load-failed') {
+          failedJumpRef.current = jump;
+          setJumpFailure('load_failed');
+        }
       } finally {
         // Re-enable edge paging once the whole jump operation has run or bailed, but
         // ONLY if THIS run is still the current owner (a newer run that superseded
@@ -1707,6 +1715,7 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
     setNewCount(0);
     // #463 S1 — a give-up message belongs to the conversation that produced it.
     setJumpFailure(null);
+    failedJumpRef.current = null;
     // #217 S3 E2 / #281 S5 A3 — the open-precedence fold: an anchor/restore open
     // lands the user on a SPECIFIC turn (not the tail), so it must NOT force
     // atBottom (else a live append would yank the viewport to the bottom). A tail
@@ -3089,6 +3098,23 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
         <div className="conv-state-title">Loading conversation…</div></div>
     </div>
   );
+  if (degraded) return (
+    <div
+      className="conv-reader conv-reader--degraded"
+      role="status"
+      tabIndex={-1}
+      data-testid="conv-reader-degraded"
+      data-degraded-reason={degraded.reason}
+    >
+      <div className="conv-state">
+        <span className="conv-state-glyph" aria-hidden="true"><WarningIcon /></span>
+        <div className="conv-state-title">{degraded.message}</div>
+        {degraded.retryable && (
+          <button type="button" className="conv-rail-retry" onClick={retry}>Retry</button>
+        )}
+      </div>
+    </div>
+  );
   if (error) return (
     <div className="conv-reader conv-reader--error" tabIndex={-1}>
       <div className="conv-state"><span className="conv-state-glyph" aria-hidden="true"><WarningIcon /></span>
@@ -3517,8 +3543,20 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           <span className="conv-paging-label" role="status">Could not finish loading the linked message. Check your connection and try again.</span>
           <button
             type="button"
+            className="conv-paging-retry"
+            aria-label="Retry linked message"
+            onClick={() => {
+              const failed = failedJumpRef.current;
+              if (!failed) return;
+              failedJumpRef.current = null;
+              setJumpFailure(null);
+              dispatch({ type: 'OPEN_CONVERSATION', conversationRef, jump: failed });
+            }}
+          >Retry</button>
+          <button
+            type="button"
             className="conv-paging-dismiss"
-            onClick={() => setJumpFailure(null)}
+            onClick={() => { failedJumpRef.current = null; setJumpFailure(null); }}
             aria-label="Dismiss"
           >×</button>
         </div>
@@ -3545,11 +3583,15 @@ export function ConversationReader({ conversationRef: qualifiedRef, sessionId: l
           // jump landed OR the 750ms fallback) AND no programmatic run is in flight.
           // A genuine user scroll-to-edge happens only after settle, so real
           // reverse/forward paging is preserved.
-          if (!gates.shouldPage('start')) return;
+          // The 750ms fallback can arm paging before a deep-link's outline has
+          // hydrated and before its jump effect begins its programmatic run.
+          // A transient Virtuoso edge hit here would spend an extra failed
+          // request on the same cursor outside loadToTarget's retry budget.
+          if (activeJumpForSession || !gates.shouldPage('start')) return;
           doLoadPrevRef.current();
         }}
         endReached={() => {
-          if (!gates.shouldPage('end')) return;
+          if (activeJumpForSession || !gates.shouldPage('end')) return;
           void loadMore();
         }}
         // #281 S5 B1 (#285 FIX) — a truthy RAW `followOutput` prop (even this

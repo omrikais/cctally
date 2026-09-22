@@ -215,3 +215,65 @@ test('#616 — doctor remediation flags stay intact at 320px', async ({ page }, 
     expect(new Set(lineTops).size, `flag ${flag} must occupy one visual line`).toBe(1);
   }
 });
+
+test('#723 — long Doctor remediation identifiers stay readable at 320px', async ({ page }, testInfo) => {
+  await freezeEventStream(page);
+  await page.route('**/api/doctor', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        schema_version: 1,
+        generated_at: '2026-07-14T16:10:00Z',
+        cctally_version: 'test',
+        overall: { severity: 'warn', counts: { ok: 0, warn: 1, fail: 0 } },
+        categories: [{
+          id: 'database', title: 'Database', severity: 'warn',
+          counts: { ok: 0, warn: 1, fail: 0 },
+          checks: [{
+            id: 'db.metadata', title: 'Metadata', severity: 'warn',
+            summary: 'needs repair', details: {},
+            remediation: 'Inspect `conversation_sessions_backfill_pending` in cache_meta.',
+          }],
+        }],
+      }),
+    });
+  });
+  await page.setViewportSize({ width: 320, height: 900 });
+  await page.goto('/');
+  await page.keyboard.press('d');
+
+  const dialog = page.locator('.doctor-modal-card');
+  await expect(dialog).toBeVisible();
+  const remediation = dialog.locator('.doctor-modal__remediation');
+  await expect(remediation).toContainText('conversation_sessions_backfill_pending');
+  const geometry = await remediation.evaluate((element) => {
+    const paragraph = element as HTMLElement;
+    const category = paragraph.closest('.doctor-modal__category')!.getBoundingClientRect();
+    const token = 'conversation_sessions_backfill_pending';
+    const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const start = (node.textContent ?? '').indexOf(token);
+      if (start < 0) continue;
+      const range = document.createRange();
+      range.setStart(node, start);
+      range.setEnd(node, start + token.length);
+      return {
+        client: paragraph.clientWidth,
+        scroll: paragraph.scrollWidth,
+        categoryRight: category.right,
+        tokenRects: Array.from(range.getClientRects(), (rect) => ({ top: rect.top, right: rect.right })),
+      };
+    }
+    throw new Error('remediation token was not rendered in a text node');
+  });
+  expect(geometry.scroll).toBeLessThanOrEqual(geometry.client + 1);
+  expect(geometry.tokenRects.length, 'the unbroken token wraps across lines').toBeGreaterThan(1);
+  for (const rect of geometry.tokenRects) {
+    expect(rect.right, 'every token fragment stays within the clipped category').toBeLessThanOrEqual(geometry.categoryRight - 1);
+  }
+  await dialog.screenshot({ path: testInfo.outputPath('issue-723-320.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await dialog.screenshot({ path: testInfo.outputPath('issue-723-390.png') });
+});

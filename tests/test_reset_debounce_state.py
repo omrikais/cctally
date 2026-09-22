@@ -142,7 +142,8 @@ def _journal():
 # The two crash windows
 # --------------------------------------------------------------------------
 
-def test_a3_an_arm_side_crash_rolls_the_state_back_and_only_re_arms(ns):
+def test_a3_an_arm_side_crash_rolls_the_state_back_and_only_re_arms(
+        ns, monkeypatch):
     """The file marker survived the rollback and made the retry confirm a
     reset from ONE physical zero. The row rolls back with the cursor, so the
     retry re-arms and still fires nothing."""
@@ -152,6 +153,10 @@ def test_a3_an_arm_side_crash_rolls_the_state_back_and_only_re_arms(ns):
                    pct=14.0)
     jr = _journal()
 
+    # The crash and retry replay one physical observation. Pin its capture
+    # instant so a loaded runner crossing a wall-clock second cannot turn the
+    # retry into a genuinely later zero that correctly confirms the reset.
+    _pin_as_of(monkeypatch, 0)
     _record_crashing(ns, jr, _record_usage_args(percent=0.0,
                                                 resets_at=end_epoch))
     assert _state_rows(ns) == [], (

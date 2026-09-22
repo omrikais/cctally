@@ -35,6 +35,7 @@ import threading
 import pytest
 
 from conftest import load_script, redirect_paths
+from test_620_s2_diagnosis_route import _run_bounded_in_process
 from test_620_s2_diagnosis_sources import (  # reuse the seeded corpora
     WINDOW_END, WINDOW_START, _seed_claude, _seed_claude_blocks,
     _seed_codex_windows,
@@ -233,6 +234,7 @@ def test_a_denied_request_never_opens_the_conversations_store(
         return real(kind)
 
     monkeypatch.setattr(sources, "open_read_only", _spy)
+    _run_bounded_in_process(monkeypatch, sources)
     response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host=_DENIED_HOST)
     assert response.status == 200, response.body
@@ -350,6 +352,7 @@ def test_generation_incoherent_is_503_and_the_body_names_the_cause(
         return f"{component}:{counter['n']}"
 
     monkeypatch.setattr(sources, "_probe_component", _moving)
+    _run_bounded_in_process(monkeypatch, sources)
     response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host="127.0.0.1")
     assert response.status == 503, response.body

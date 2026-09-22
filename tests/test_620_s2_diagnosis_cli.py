@@ -1102,6 +1102,44 @@ def test_a_malformed_window_token_is_still_a_selector_error(rich_home,
     assert "explain:" in capsys.readouterr().err
 
 
+def test_explain_retries_transient_generation_incoherence(rich_home,
+                                                          monkeypatch):
+    """The CLI shares the adapter retry with the dashboard route."""
+    ns = load_script()
+    diagnosis = ns["_cctally_diagnosis"]
+    sources = ns["_load_sibling"]("_cctally_diagnosis_sources")
+    real_provider = sources.build_provider_diagnosis
+    calls = []
+
+    def _provider(scope, *, transcripts_visible):
+        calls.append(scope.source)
+        if len(calls) == 1:
+            raise sources.EstablishmentFailure(
+                "generation_incoherent", "the store moved")
+        return real_provider(scope, transcripts_visible=transcripts_visible)
+
+    monkeypatch.setattr(sources, "build_provider_diagnosis", _provider)
+    monkeypatch.setenv("HOME", str(rich_home))
+    monkeypatch.setenv("CCTALLY_DATA_DIR",
+                       str(rich_home / ".local" / "share" / "cctally"))
+    monkeypatch.setenv("CCTALLY_AS_OF",
+                       WINDOW_END.isoformat().replace("+00:00", "Z"))
+
+    class _Args:
+        source = "claude"
+        account = None
+        window = (f"{WINDOW_START.date().isoformat()}.."
+                  f"{WINDOW_END.date().isoformat()}")
+        speed = None
+        emit_json = False
+        json = False
+        reveal_projects = False
+        tz = None
+
+    assert diagnosis.cmd_explain(_Args()) == 0
+    assert calls == ["claude", "claude"]
+
+
 def test_a_generation_incoherence_reaches_the_command_as_exit_3(rich_home,
                                                                 monkeypatch):
     """The retry predicate is proved at the adapter; this proves the whole

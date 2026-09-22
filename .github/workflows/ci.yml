@@ -2,7 +2,7 @@ name: CI
 
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    - cron: '17 */12 * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -18,8 +18,8 @@ on:
     paths-ignore:
       - '**/*.md'
 
-# #630 S4 (F25). One superseded push no longer occupies the single self-hosted
-# runner while a newer commit waits behind it. Measured over 100 pushes, 15 were
+# #630 S4 (F25). One superseded push no longer occupies the single primary
+# cctally runner while a newer commit waits behind it. Measured over 100 pushes, 15 were
 # still running when a later push arrived, and the self-hosted occupancy lying
 # after the superseding push totalled 155 minutes over 10.4 days once the three
 # runner-stall runs are excluded — about 15 minutes a day.
@@ -46,13 +46,20 @@ jobs:
   # package.json are NOT stamps — they add published modules to the npm
   # `files` list, which changes the shipped artifact.
   #
-  # This job DEFAULTS TO RUNNING THE FULL PIPELINE. It is hosted, so a stamp
-  # costs the maintainer's runner nothing at all, and every dependent job's
+  # This job DEFAULTS TO RUNNING THE FULL PIPELINE. Every dependent job's
   # `if:` is written so a failure here still admits the job (see below) —
   # `needs:` alone would skip dependents on failure, which is the exact
   # inversion of this gate's purpose.
   release-stamp-gate:
-    runs-on: ubuntu-latest
+    # Keep the public-mirror classifier on GitHub's hosted sandbox. A private
+    # fork PR cannot reach this job (nor any other private executing job), so
+    # fork-authored merge code never runs on the maintainer's Mac.
+    if: >-
+      github.repository == 'omrikais/cctally' ||
+      (github.repository == 'omrikais/cctally-dev' &&
+       (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository))
+    runs-on: ${{ fromJSON(github.repository == 'omrikais/cctally-dev' && '["self-hosted","macOS","cctally"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     # Read-only, matching test-pr and doc-lint.yml. This job reads history and
     # writes one output; it needs no token scope beyond the checkout.
@@ -69,6 +76,7 @@ jobs:
           persist-credentials: false
       - id: classify
         run: |
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           python3 .github/scripts/classify_release_stamp.py \
             --repo . \
             --before "${{ github.event.before }}" \
@@ -86,7 +94,7 @@ jobs:
   # nothing.
   #
   # Guarded to the private repository. Without the guard it would run on every
-  # mirror push, which both wastes hosted minutes and changes the
+  # mirror push, which changes the
   # operator-selected public-push outcome — a public push must continue to run
   # the release classifier and nothing else.
   #
@@ -103,13 +111,13 @@ jobs:
     # the token. The guard therefore deliberately MIRRORS the one on
     # `test-macos`, this job's only consumer, which already refuses fork PRs:
     # a context that could never act on the discharge cannot reach the token
-    # either, and same-repository PR discharge is preserved at zero cost.
+    # either, and same-repository PR discharge is preserved.
     if: >-
       github.repository == 'omrikais/cctally-dev' &&
       (github.event_name == 'push' ||
        (github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, cctally]
     timeout-minutes: 5
     # Read-only repository receipts and completed full-verification jobs.
     permissions:
@@ -133,7 +141,7 @@ jobs:
           # No `set -x`: a trace would echo the authorization header.
           #
           # Errexit is NOT cleared, and deliberately so. GitHub's default shell
-          # for a Linux `run:` without `shell:` is `bash -e {0}`, and `set -uo
+          # for a `run:` without `shell:` is `bash -e {0}`, and `set -uo
           # pipefail` adds flags without removing `-e`, so an unhandled failure
           # here aborts the step. That is itself a fail-safe outcome: the job
           # then ends `result != 'success'`, which leaves the `test-macos`
@@ -141,6 +149,7 @@ jobs:
           # the `|| true` guards below exist so that a failed fetch, an absent
           # namespace and a malformed candidate end as an ordinary
           # `discharged=false` decision rather than as a job failure.
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           set -uo pipefail
           receipts="${RUNNER_TEMP:-/tmp}/receipts"
           mkdir -p "$receipts"
@@ -220,8 +229,8 @@ jobs:
        (github.event_name == 'pull_request' &&
         github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: [self-hosted, macOS, cctally]
-    # Real headroom over observed wall-clock (the full suite stays under
-    # ~10 min) so a hung test can't wedge this job for GitHub's default 6h
+    # Real headroom over recent observed wall-clock (~40 min) so a hung test
+    # cannot wedge this job for GitHub's default 6h
     # (#279 S7 W4).
     timeout-minutes: 60
     steps:

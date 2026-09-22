@@ -21,6 +21,7 @@ import http.client
 import json
 import sys
 import threading
+import time
 from dataclasses import replace
 
 import pytest
@@ -40,6 +41,27 @@ _WINDOW_QUERY = f"{_WINDOW}&tz=Etc%2FUTC"
 
 def _dash():
     return sys.modules["_cctally_dashboard"]
+
+
+def _run_bounded_in_process(monkeypatch, sources):
+    """Keep a parent-process fault injection visible to an HTTP route test."""
+    monkeypatch.setattr(
+        sources,
+        "build_diagnosis_bounded",
+        lambda scope, *, measured_at, transcripts_visible, timeout_seconds: (
+            sources.build_diagnosis(
+                scope,
+                measured_at=measured_at,
+                transcripts_visible=transcripts_visible,
+            )
+        ),
+    )
+
+
+def _nonterminating_diagnosis_worker():
+    """Pickle-safe stand-in for a diagnosis process that never returns."""
+    while True:
+        time.sleep(60)
 
 
 class _Response:
@@ -230,6 +252,195 @@ def test_process_wide_admission_serializes_distinct_scopes():
         assert second.result() == "second"
 
 
+def test_diagnosis_admission_bounds_same_and_cross_key_callers():
+    load_script()
+    dash = _dash()
+    admission = dash._DiagnosisAdmission(max_callers=3, max_per_key=2,
+                                         max_keys=2, deadline_seconds=1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocked():
+        entered.set()
+        assert release.wait(PRESENCE_BACKSTOP_SECONDS)
+        return "report"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        first = executor.submit(admission.run, ("a", True, False), _blocked)
+        assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        follower = executor.submit(admission.run, ("a", True, False), _blocked)
+        queued = executor.submit(admission.run, ("b", True, False), lambda: "b")
+        with admission._changed:
+            assert admission._changed.wait_for(
+                lambda: len(admission._flights) == 2
+                and admission._flights[("a", True, False)].callers == 2,
+                timeout=PRESENCE_BACKSTOP_SECONDS,
+            )
+        with pytest.raises(dash._DiagnosisOverloaded):
+            admission.run(("a", True, False), _blocked)
+        with pytest.raises(dash._DiagnosisOverloaded):
+            admission.run(("c", True, False), lambda: "c")
+        release.set()
+        assert first.result() == follower.result() == "report"
+        assert queued.result() == "b"
+
+
+def test_diagnosis_deadline_retires_stuck_producer_and_recovers():
+    load_script()
+    dash = _dash()
+    sources = sys.modules["cctally"]._load_sibling(
+        "_cctally_diagnosis_sources"
+    )
+    admission = dash._DiagnosisAdmission(max_callers=3, max_per_key=2,
+                                         max_keys=2, deadline_seconds=0.25)
+
+    def _bounded_stuck(remaining):
+        return sources._run_process_with_deadline(
+            _nonterminating_diagnosis_worker, (),
+            timeout_seconds=remaining,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            admission.run, ("a", True, False),
+            lambda: pytest.fail("unbounded build path ran"),
+            bounded_build=_bounded_stuck,
+        )
+        follower = executor.submit(
+            admission.run, ("a", True, False),
+            lambda: pytest.fail("coalesced caller built independently"),
+            bounded_build=_bounded_stuck,
+        )
+        with pytest.raises(dash._DiagnosisTimedOut):
+            first.result(timeout=PRESENCE_BACKSTOP_SECONDS)
+        with pytest.raises(dash._DiagnosisTimedOut):
+            follower.result(timeout=PRESENCE_BACKSTOP_SECONDS)
+
+    assert admission.run(
+        ("b", True, False), lambda: "recovered",
+        bounded_build=lambda _remaining: "recovered",
+    ) == "recovered"
+
+
+def test_failed_diagnosis_wakes_coalesced_callers_and_recovers():
+    load_script()
+    dash = _dash()
+    admission = dash._DiagnosisAdmission(deadline_seconds=5)
+    entered = threading.Event()
+    release = threading.Event()
+    builds = 0
+    failure_backstop = 20.0
+
+    def _fails():
+        nonlocal builds
+        builds += 1
+        entered.set()
+        assert release.wait(failure_backstop)
+        raise RuntimeError("synthetic producer failure")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(admission.run, ("a", True, False), _fails)
+        assert entered.wait(failure_backstop)
+        follower = executor.submit(admission.run, ("a", True, False), _fails)
+        with admission._changed:
+            assert admission._changed.wait_for(
+                lambda: admission._flights[("a", True, False)].callers == 2,
+                timeout=failure_backstop,
+            )
+        release.set()
+        with pytest.raises(RuntimeError, match="synthetic producer failure"):
+            first.result(timeout=failure_backstop)
+        with pytest.raises(RuntimeError, match="synthetic producer failure"):
+            follower.result(timeout=failure_backstop)
+    assert builds == 1
+    assert admission.run(("a", True, False), lambda: "recovered") == "recovered"
+
+
+def test_diagnosis_burst_over_64_caps_admitted_waiters_and_producers():
+    load_script()
+    dash = _dash()
+    admission = dash._DiagnosisAdmission(max_callers=24, max_per_key=16,
+                                         max_keys=8, deadline_seconds=5)
+    release = threading.Event()
+    launched = threading.Barrier(81)
+    counts = {"builds": 0, "overloaded": 0}
+    changed = threading.Condition()
+
+    def _build():
+        with changed:
+            counts["builds"] += 1
+            changed.notify_all()
+        assert release.wait(PRESENCE_BACKSTOP_SECONDS)
+        return "one report"
+
+    def _request():
+        launched.wait(PRESENCE_BACKSTOP_SECONDS)
+        try:
+            return admission.run(("same", True, False), _build)
+        except dash._DiagnosisOverloaded:
+            with changed:
+                counts["overloaded"] += 1
+                changed.notify_all()
+            return "overloaded"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+        futures = [executor.submit(_request) for _ in range(80)]
+        launched.wait(PRESENCE_BACKSTOP_SECONDS)
+        with changed:
+            assert changed.wait_for(
+                lambda: counts["overloaded"] == 64,
+                timeout=PRESENCE_BACKSTOP_SECONDS,
+            ), "the burst did not deterministically overload excess callers"
+            assert counts["builds"] == 1
+        with admission._changed:
+            assert admission._callers == 16
+            assert len(admission._flights) == 1
+        release.set()
+        results = [future.result() for future in futures]
+    assert results.count("one report") == 16
+    assert results.count("overloaded") == 64
+
+
+def test_diagnosis_route_maps_saturation_and_timeout_to_safe_503(
+    empty_server, monkeypatch,
+):
+    dash = _dash()
+    admission = dash._DiagnosisAdmission(max_callers=1, max_per_key=1,
+                                         max_keys=1, deadline_seconds=0.15)
+    monkeypatch.setattr(dash, "_DIAGNOSIS_ADMISSION", admission)
+    sources = sys.modules["cctally"]._load_sibling(
+        "_cctally_diagnosis_sources"
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    real_build = sources.build_diagnosis
+
+    def _stuck(*args, **kwargs):
+        entered.set()
+        release.wait(PRESENCE_BACKSTOP_SECONDS)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(sources, "build_diagnosis", _stuck)
+    _run_bounded_in_process(monkeypatch, sources)
+    path = f"/api/diagnosis?window={_WINDOW_QUERY}"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(empty_server.get, path)
+        assert entered.wait(PRESENCE_BACKSTOP_SECONDS)
+        overloaded = empty_server.get(path)
+        assert overloaded.status == 503
+        assert overloaded.json == {
+            "error": "diagnosis busy; retry shortly",
+            "code": "diagnosis_overloaded",
+        }
+        timed_out = first.result(timeout=PRESENCE_BACKSTOP_SECONDS)
+        assert timed_out.status == 503
+        assert timed_out.json == {
+            "error": "diagnosis timed out; retry shortly",
+            "code": "diagnosis_timeout",
+        }
+        release.set()
+
+
 def test_the_diagnosis_is_not_an_envelope_key(tmp_path, monkeypatch):
     """B8: the diagnosis is on-demand, never a per-tick envelope cost."""
     ns = load_script()
@@ -322,11 +533,36 @@ def test_an_unresolvable_week_anchor_is_400_not_500(rich_server, monkeypatch):
     assert response.json["code"] == "range_unresolved"
 
 
+def test_generation_incoherence_is_retried_before_the_route_answers(
+        rich_server, monkeypatch):
+    sources = load_script()["_load_sibling"]("_cctally_diagnosis_sources")
+    real_probe = sources._probe_component
+    stats_probes = []
+
+    def _probe(component, bundle):
+        if component == "stats":
+            stats_probes.append(component)
+            if len(stats_probes) <= 4:
+                return f"changing-{len(stats_probes)}"
+        return real_probe(component, bundle)
+
+    monkeypatch.setattr(sources, "_probe_component", _probe)
+    _run_bounded_in_process(monkeypatch, sources)
+    response = rich_server.get(
+        f"/api/diagnosis?source=codex&window={_WINDOW_QUERY}"
+    )
+
+    assert response.status == 200, response.body
+    assert len(stats_probes) >= 6
+    assert response.json["results"][0]["source"] == "codex"
+
+
 def test_generation_incoherent_is_503(rich_server, monkeypatch):
     sources = load_script()["_load_sibling"]("_cctally_diagnosis_sources")
     probes = iter(["a", "b", "b", "c"] * 40)
     monkeypatch.setattr(sources, "_probe_component",
                         lambda *_a, **_kw: next(probes))
+    _run_bounded_in_process(monkeypatch, sources)
     response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 503, response.body
     assert response.json["code"] == "generation_incoherent"
@@ -341,6 +577,7 @@ def test_an_unexpected_exception_is_500_and_never_a_healthy_200(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(sources, "build_diagnosis", _raises)
+    _run_bounded_in_process(monkeypatch, sources)
     response = rich_server.get(f"/api/diagnosis?window={_WINDOW_QUERY}")
     assert response.status == 500, response.body
     assert "no_contributor_detected" not in response.body
@@ -500,6 +737,7 @@ def test_concurrent_identical_diagnoses_share_one_process_wide_build(
                 active -= 1
 
     monkeypatch.setattr(sources, "build_diagnosis", _blocked_build)
+    _run_bounded_in_process(monkeypatch, sources)
     monkeypatch.setattr(_dash(), "_DIAGNOSIS_ADMISSION", admission)
     path = f"/api/diagnosis?window={_WINDOW_QUERY}&source=all"
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:

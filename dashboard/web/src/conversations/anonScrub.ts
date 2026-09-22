@@ -38,6 +38,70 @@ export function scrubText(text: string, plan: AnonWirePlan): string {
   return text;
 }
 
+// #850 §4.9 — the HTTP failure of an anonymized request, carrying its status
+// so a caller can tell the server's typed refusal from any other failure. Both
+// failure paths threw a bare message before, which left the 409 and a 500
+// indistinguishable and made the refusal disclosure impossible to render.
+export class AnonRequestError extends Error {
+  readonly status: number;
+  readonly undecodableCwdRows: number | null;
+  readonly ambiguousCwdRows: number | null;
+
+  constructor(status: number, undecodableCwdRows: number | null, ambiguousCwdRows: number | null) {
+    super(`anon request failed: ${status}`);
+    this.name = 'AnonRequestError';
+    this.status = status;
+    this.undecodableCwdRows = undecodableCwdRows;
+    this.ambiguousCwdRows = ambiguousCwdRows;
+  }
+}
+
+export const ANON_UNAVAILABLE_STATUS = 409;
+
+// The M5 viewer sentence, verbatim. The remedy is the rebuild that re-derives
+// every Codex thread's `cwd` from JSON, which is why it is the only remedy
+// named here.
+export function anonUnavailableMessage(error: AnonRequestError): string {
+  if (error.ambiguousCwdRows !== null) {
+    return (
+      `Anonymized copy is unavailable: ${error.ambiguousCwdRows} Codex project path(s) `
+      + 'cannot be safely attributed to this account. Use a raw export or omit the account scope.'
+    );
+  }
+  return (
+    `Anonymized copy is unavailable: ${error.undecodableCwdRows ?? 0} Codex project path(s) `
+    + 'could not be read. Run cctally cache-sync --source codex --rebuild.'
+  );
+}
+
+// Read the typed refusal body of a 409. A body that is missing or malformed
+// still refuses — the status alone is the decision — and reports no count.
+export async function anonRequestErrorFor(res: {
+  status: number; json?: () => Promise<unknown>;
+}): Promise<AnonRequestError> {
+  let rows: number | null = null;
+  let ambiguousRows: number | null = null;
+  if (res.status === ANON_UNAVAILABLE_STATUS && typeof res.json === 'function') {
+    try {
+      const body = (await res.json()) as {
+        undecodable_cwd_rows?: unknown;
+        ambiguous_cwd_rows?: unknown;
+        reason?: unknown;
+      };
+      if (typeof body?.undecodable_cwd_rows === 'number') {
+        rows = body.undecodable_cwd_rows;
+      }
+      if (body?.reason === 'ambiguous_account_provenance'
+          && typeof body.ambiguous_cwd_rows === 'number') {
+        ambiguousRows = body.ambiguous_cwd_rows;
+      }
+    } catch {
+      /* a malformed refusal body is still a refusal */
+    }
+  }
+  return new AnonRequestError(res.status, rows, ambiguousRows);
+}
+
 // Validate the wire shape before trusting it (fail-closed on malformed data).
 function assertWirePlan(w: unknown): AnonWirePlan {
   const o = w as AnonWirePlan;
@@ -47,11 +111,19 @@ function assertWirePlan(w: unknown): AnonWirePlan {
   return o;
 }
 
-// Per-session plan cache: one in-flight fetch shared by concurrent per-card
-// copies of the same session; a REJECTED fetch is evicted so a later click can
-// retry (never a permanently-cached failure). A session switch just fetches a
-// different key — the awaiting caller re-checks the current session before it
-// writes the clipboard (fail-closed against a stale response).
+// Per-session plan cache: one IN-FLIGHT fetch shared by concurrent per-card
+// copies of the same session. A session switch just fetches a different key —
+// the awaiting caller re-checks the current session before it writes the
+// clipboard (fail-closed against a stale response).
+//
+// #850 §4.9 — the cached promise is evicted when it SETTLES, fulfilled or
+// rejected, not only when it rejects. A plan fetched while the store was
+// healthy used to serve every later anonymized copy of the same conversation
+// for the life of the page, so a thread corrupted after one successful copy was
+// never observed and M5 was false for that page. Concurrent clicks during one
+// flight still share one fetch, and every later copy issues a new request and
+// observes the server's current decision, at the cost of one small GET per
+// copy click. No client state stands in for the server's decision.
 const planCache = new Map<string, Promise<AnonWirePlan>>();
 
 export function fetchAnonPlan(rawRef: ConversationRefInput): Promise<AnonWirePlan> {
@@ -61,14 +133,15 @@ export function fetchAnonPlan(rawRef: ConversationRefInput): Promise<AnonWirePla
   if (!p) {
     p = fetch(conversationEntityUrl(conversationRef, 'anon-map')).then(
       async (res) => {
-        if (!res.ok) throw new Error(`anon-map ${res.status}`);
+        if (!res.ok) throw await anonRequestErrorFor(res);
         return assertWirePlan(await res.json());
       },
     );
-    p.catch(() => {
-      // Evict only if this exact rejected promise is still the cached one.
+    const evict = () => {
+      // Evict only if this exact promise is still the cached one.
       if (planCache.get(cacheKey) === p) planCache.delete(cacheKey);
-    });
+    };
+    p.then(evict, evict);
     planCache.set(cacheKey, p);
   }
   return p;

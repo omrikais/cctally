@@ -32,6 +32,7 @@
         "anchor": "recorded",
         "cost_usd": 0.765,
         "end_at": "2026-04-15T10:00:00+00:00",
+        "facts_source": "retained",
         "is_active": false,
         "label": "05:00 Apr 15 UTC",
         "models": [
@@ -49,6 +50,7 @@
         "anchor": "recorded",
         "cost_usd": 2.835,
         "end_at": "2026-04-13T17:00:00+00:00",
+        "facts_source": "retained",
         "is_active": false,
         "label": "12:00 Apr 13 UTC",
         "models": [
@@ -2575,6 +2577,7 @@
               "anchor": "recorded",
               "cost_usd": 0.765,
               "end_at": "2026-04-15T10:00:00+00:00",
+              "facts_source": "retained",
               "is_active": false,
               "key": "block:keBa1kGXnfXw6nyQGc6e8aJijvk-1zKhNlAL8NGLvjU",
               "label": "05:00 Apr 15 UTC",
@@ -2594,6 +2597,7 @@
               "anchor": "recorded",
               "cost_usd": 2.835,
               "end_at": "2026-04-13T17:00:00+00:00",
+              "facts_source": "retained",
               "is_active": false,
               "key": "block:bh_ht3FGvQXWRDF984gqDbrXRz_9zqH9geYlqduBus0",
               "label": "12:00 Apr 13 UTC",

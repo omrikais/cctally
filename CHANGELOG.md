@@ -5,6 +5,52 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.110.0] - 2026-09-22
+
+### Added
+- Claude cost reports price `claude-opus-5-5` at its published input, output, cache and Fast-mode rates instead of showing $0 for new usage.
+- Codex cost reports price `gpt-6-luna` at its published Standard, long-context and Fast-mode rates, and resolve `gpt-daybreak-red-latest` to the current Cyber card.
+- Historical `gpt-5.5-cyber` Codex turns use their retained LiteLLM OpenAI-provider rate card instead of the legacy `gpt-5` fallback.
+- Codex reporting prices `gpt-6-sol` from OpenAI's published Standard, cached-input, long-context and Fast-mode rates instead of the legacy `gpt-5` fallback.
+- The dashboard's `Blocks` panel marks Claude rows whose cost and model figures come from the facts retained when the block closed, without recalculating those figures from the current cache.
+- Maintainers can turn latest full-backlog triage into a dependency-safe Codex execution plan and run automatically in two Sol/High worktree slots, with refresh-safe splitting, one resumable monitor, and no worker-created orchestration chain.
+
+### Fixed
+- Codex long-context requests above 272K input tokens now use OpenAI's higher input, cached-input and output rates for the entire request, including Fast-mode costs and dashboard cache savings.
+- The dashboard promptly releases a Conversation Viewer live-tail thread when its reader closes, instead of retaining each one until the next 15-second keep-alive.
+- The dashboard's Current Week modal reliably returns keyboard focus to the hero after Escape, even when a source-selector click is still pending under load.
+- The `Blocks` detail modal connects its retained-facts explanation to the cost and token figures for screen readers.
+- The `dashboard` fully hides its onboarding hint while an alert toast is active on a phone, so the alert action stays visible while the original onboarding timer continues.
+- `cctally db rederive` retains a weekly cost snapshot when replay names the same range instants with different UTC-offset spelling, so reviewed corrections do not rewrite unchanged cost facts.
+- `cctally db rederive` can apply an operator-reviewed weekly correction without carrying unrelated baseline drift. Version 2 manifests can preserve or release an accepted snapshot identity and pin both plan hashes before append.
+- `cctally db rederive` preserves closed five-hour costs and accepted snapshot references when current replay rules revisit the same retained evidence.
+- A Conversation Viewer link that waits for its outline now limits a failed page load to three requests, then shows the connection error with a Retry button for the linked message.
+- `cctally db rederive` now refuses a correction that would add a burst of matching weekly reset events, and its JSON preview breaks action counts out by event kind for inspection.
+- Dashboard diagnosis and conversation outlines now bound request surges and stalled reads. A timed-out diagnosis process is retired so later requests recover, and unchanged dashboard files revalidate without rereading or recompression.
+- The dashboard's `Current Week` five-hour block now follows the account that supplied the displayed weekly percentage. Its credits and crossings stay with that account when two accounts share a window, including while browsing older blocks.
+- The dashboard's Claude Session detail now shows cache rebuilds and cache savings over plain HTTP LAN access, including the healthy zero-rebuild state. Opening the same session over loopback and LAN shows the same verified outline.
+- Dashboard panel headings now shorten before their action buttons escape narrow cards, including when Projects data is unavailable.
+- The dashboard calls Claude's credited window a cycle in the hero and milestone modal. Its cost comparison names a comparable cycle, multi-account spend no longer implies one common cycle, and week-scoped panels keep their week labels.
+- The dashboard's phone-width account cards now show a swipe cue while more cards remain, and long snapshot ages stay readable inside the hero.
+- At phone widths where the dashboard source-status chip is shown, warning labels now name both the affected area and its state, such as `Accounts unavailable` or `Projects partial`.
+- The dashboard's `Send test alert` preview now shows the same account chip and dismiss hint as a real alert on single-account and multi-account installs.
+- Closing a dashboard modal now returns keyboard focus to its opener, and explanatory card text no longer opens a modal when clicked.
+- The dashboard's All-source Daily detail shows a single-provider day's model costs once, without an empty second provider row.
+- The dashboard's Projects modal presents its cycle window and chart scale as separate radio groups for screen readers.
+- Corrupt Codex token or timestamp values no longer empty the provider. Valid costs and projects remain visible while affected rows are skipped and counted, including rows in a budget period older than the detail view.
+- Long identifiers in Doctor remediation text now wrap inside the modal at narrow screen widths instead of being clipped.
+- One Codex conversation whose stored project path cannot be read no longer empties the whole Codex provider. Every other project is published from current data, and the affected rows are reported as withheld.
+- A Codex project path the store cannot read is counted and named in `cctally doctor`, under a third reason beside the missing key and missing thread join it already reports.
+- A refresh that could not read project metadata is replaced on the next refresh instead of being kept for up to two minutes.
+- A refresh whose project metadata could not be read states so in the Projects panel body, so an empty panel is no longer silent about why.
+- The Conversation Viewer opens a conversation whose stored project path cannot be read, showing no project instead of failing, and its spawned-agent links, raw export and live tail work again.
+- No conversation list, filter, search hit or outline shows a project for a conversation whose stored project path can no longer be read.
+- An anonymized transcript export refuses while any Codex project path cannot be read, rather than producing bytes that only look scrubbed. `cctally transcript export` exits 3 and the viewer says so; `--raw` is unaffected.
+- An account-scoped anonymized Codex transcript now scrubs project paths tied to that account. If path ownership is uncertain, export and the viewer's Anon copy refuse instead of claiming the copy is anonymous.
+- In the Conversation Viewer, a refused anonymized per-turn copy now shows a red X on the control, so a tap visibly reports that nothing was copied.
+- The dashboard's Session detail no longer logs a failed outline request when a transcript was not kept. The Conversation Viewer names a temporarily unavailable transcript store on deep links and while search results load.
+- `cctally explain` and the dashboard's Explain view retry a brief database change before reporting that the read could not complete.
+
 ## [1.109.0] - 2026-09-15
 
 ### Added

@@ -19,6 +19,8 @@ export interface ComparisonDiffProps {
   onToggleRow: (key: string) => void;
   promptsA: Record<string, string>; // uuid -> full text (partial/empty until loaded)
   promptsB: Record<string, string>;
+  promptNoticeA?: string;
+  promptNoticeB?: string;
   onOpenInReader: (side: 'a' | 'b', uuid: string) => void;
 }
 
@@ -36,7 +38,7 @@ function DivergenceBar() {
 }
 
 export function ComparisonDiff(props: ComparisonDiffProps) {
-  const { rows, wide, aTitle, bTitle, expandedKey, onToggleRow, promptsA, promptsB, onOpenInReader } = props;
+  const { rows, wide, aTitle, bTitle, expandedKey, onToggleRow, promptsA, promptsB, promptNoticeA, promptNoticeB, onOpenInReader } = props;
   let prevDivergence = false;
   return (
     <>
@@ -77,6 +79,8 @@ export function ComparisonDiff(props: ComparisonDiffProps) {
                 bUuid={row.b?.uuid ?? null}
                 aText={row.a ? promptsA[row.a.uuid] : undefined}
                 bText={row.b ? promptsB[row.b.uuid] : undefined}
+                aNotice={promptNoticeA}
+                bNotice={promptNoticeB}
                 onOpenInReader={onOpenInReader}
               />
             )}

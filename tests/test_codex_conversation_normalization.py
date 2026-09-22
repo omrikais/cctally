@@ -3896,7 +3896,13 @@ def test_browse_rollup_fast_path_is_constant_query_count(tmp_path, monkeypatch):
         assert env["page"]["total"] == 5
         assert len(env["rows"]) == 2
         selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
-        assert len(selects) <= 8, selects
+        # #850 raised this bound from 8 to 11: the request materializes its set
+        # of undecodable conversation keys once, which costs one scan of the raw
+        # threads table plus the two `sqlite_master` probes that resolve which
+        # schema holds it. All three are per REQUEST, so the N+1 this bound
+        # guards against — four SELECTs per conversation over five
+        # conversations — still fails it.
+        assert len(selects) <= 11, selects
     finally:
         conn.set_trace_callback(None)
         conn.close()
@@ -5255,10 +5261,11 @@ def test_anon_plan_for_sources_covers_codex_roots_cwds_labels(tmp_path, monkeypa
     conn = ns["open_cache_db"]()
     try:
         ns["sync_codex_cache"](conn)
-        plan = lcq.build_anon_plan_for_sources(
+        result = lcq.build_anon_plan_for_sources(
             conn, home_dir="/home/fixture-user", sources={"codex"})
+        assert result.undecodable_cwd_rows == 0
         secret_text = (CORPUS / "rollouts" / "secret-canary.jsonl").read_text()
-        scrubbed = anon.scrub_text(secret_text, plan)
+        scrubbed = anon.scrub_text(secret_text, result.plan)
         # the observed project root path + its display label are scrubbed.
         assert "/synthetic/root-a/project-red" not in scrubbed
         assert "project-red" not in scrubbed
@@ -7170,7 +7177,8 @@ def test_outline_memo_separates_independent_databases(tmp_path, monkeypatch):
         conn.commit()
         connections.append(conn)
 
-    def identity_envelope(conn, _conversation_key, *, effective_speed):
+    def identity_envelope(conn, _conversation_key, *, effective_speed,
+                          undecodable_keys=frozenset()):
         path = conn.execute(
             "SELECT file FROM pragma_database_list WHERE name='main'"
         ).fetchone()[0]
@@ -7211,7 +7219,8 @@ def test_outline_memo_misses_on_same_path_database_replacement(tmp_path, monkeyp
         conn.execute("INSERT INTO marker VALUES (?)", (marker,))
         conn.commit(); conn.close()
 
-    def envelope(conn, _conversation_key, *, effective_speed):
+    def envelope(conn, _conversation_key, *, effective_speed,
+                 undecodable_keys=frozenset()):
         return {"marker": conn.execute("SELECT value FROM marker").fetchone()[0]}
 
     make(live_path, "old")
@@ -8324,3 +8333,768 @@ def test_skill_link_is_cleaned_when_prompt_text_abuts_the_paren():
     # Still closed: a link that is not a SKILL.md target passes through.
     other = "[a link](https://example.test/page)and prose"
     assert clean_codex_title(other) == other
+
+
+# ── #850 §4.9 — the Conversation Viewer tolerates an undecodable thread ──────
+#
+# A thread's `cwd`/`git_json` are TEXT, and `sqlite3` raises
+# `OperationalError: Could not decode to UTF-8` on any statement that selects
+# one through the default factory. `_thread_facts` selected both columns bare
+# and `_rollup_fields` called it unconditionally, so opening the affected
+# conversation failed — and so did its spawn-child links, its raw export and
+# its live-tail stream, the last at stream setup.
+#
+# The three stored readers (`_stored_browse_facets`, `_stored_browse_page`,
+# `_search_title`) never touched the thread at all: they read the persisted
+# rollup, and the thread-update trigger advances only the accounting mutation
+# ledger, so a rollup materialized before a later corruption keeps its
+# attribution on every viewer surface. One frozen set of undecodable
+# conversation keys per request, read past any account-scoped TEMP view, is
+# what excludes them.
+
+_V850_BAD = b"/synthetic/\xffproject"
+_V850_ROOT = "v850-root"
+_V850_ROOT_PATH = "/synthetic/v850-root"
+_V850_ACCOUNT = "b" * 32
+_V850_SHARED_CWD = "/synthetic/v850-shared"
+_V850_KEEP_CWD = "/synthetic/v850-keep"
+_V850_CHILD_CWD = "/synthetic/v850-child"
+
+#: `(native_thread_id, parent_thread_id, cwd, git_json, corrupt_column, title,
+#:  text)` per conversation. `v850-a` and `v850-titled` share one project with
+#: `v850-b`, so excluding them is visible in the facet count; `v850-git` holds
+#: a valid `cwd` beside an undecodable `git_json` and must KEEP its
+#: attribution, because the viewer's attribution is direct-only and the
+#: resolver stops at a usable `cwd`.
+_V850_CONVERSATIONS = {
+    "v850-a": ("native-aa111111", None, _V850_SHARED_CWD, None, "cwd",
+               None, "alpha prose"),
+    "v850-b": ("native-bb222222", None, _V850_SHARED_CWD, None, None,
+               "Healthy conversation", "beta prose"),
+    "v850-titled": ("native-tt333333", None, _V850_SHARED_CWD, None, "cwd",
+                    "Corrupted titled conversation", "v850searchtoken prose"),
+    "v850-git": ("native-gg444444", None, _V850_KEEP_CWD, "{\"repository\":\"r\"}",
+                 "git_json", "Git metadata only", "gamma prose"),
+    "v850-child": ("native-cc555555", "native-aa111111", _V850_CHILD_CWD, None,
+                   None, "Child of the corrupted one", "delta prose"),
+    "v850-outline-child": ("native-oc666666", "native-bb222222", _V850_CHILD_CWD,
+                           None, None, None, "epsilon prose"),
+}
+
+
+def _v850_corrupt(cache, key, column):
+    cache.execute(
+        f"UPDATE codex_conversation_threads SET {column} = CAST(? AS TEXT) "
+        "WHERE conversation_key = ?", (_V850_BAD, key))
+    cache.commit()
+
+
+def _v850_store(tmp_path, monkeypatch):
+    """A conversations store whose rollups were materialized BEFORE corruption.
+
+    That order is the point: a thread corrupted after its rollup exists keeps
+    a stale attribution on every stored reader, and no write to the rollup
+    repairs it, because the thread-update trigger advances only the accounting
+    mutation ledger.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_cache as _cc
+
+    cache = ns["open_cache_db"]()
+    conversations = ns["open_conversations_db"]()
+    cache.execute(
+        "INSERT INTO codex_source_roots (source_root_key, canonical_root_path,"
+        " first_seen_utc, last_seen_utc) VALUES (?,?,?,?)",
+        (_V850_ROOT, _V850_ROOT_PATH, "2026-01-01T00:00:00+00:00",
+         "2026-09-01T00:00:00+00:00"),
+    )
+    for index, (key, spec) in enumerate(sorted(_V850_CONVERSATIONS.items())):
+        native, parent, cwd, git_json, _corrupt, title, text = spec
+        cache.execute(
+            "INSERT INTO codex_conversation_threads "
+            "(conversation_key, source_root_key, native_thread_id,"
+            " root_thread_id, parent_thread_id, source_path, cwd, git_json,"
+            " first_seen_utc, last_seen_utc) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (key, _V850_ROOT, native, native, parent,
+             f"{_V850_ROOT_PATH}/{key}.jsonl", cwd, git_json,
+             "2026-01-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00"),
+        )
+        conversations.execute(
+            _cc._CODEX_ACCOUNT_MSG_INSERT_SQL,
+            (key, _V850_ROOT, f"{_V850_ROOT_PATH}/{key}.jsonl", 1,
+             f"2026-09-0{index + 1}T00:00:00+00:00", None, None, "message",
+             "message", "response_item", "gpt-5", text, f"digest-{key}",
+             len(text), None, None, None, _V850_ACCOUNT),
+        )
+    cache.commit()
+    # The normalized corpus is authoritative only while the contract version is
+    # stamped and neither replay marker is armed; the real ingest sets both, and
+    # this fixture writes its rows directly.
+    conversations.execute(
+        "INSERT OR REPLACE INTO cache_meta(key,value) VALUES "
+        "('codex_conversation_contract_version', ?)",
+        (kern.CODEX_CONVERSATION_CONTRACT_VERSION,),
+    )
+    conversations.execute(
+        "DELETE FROM cache_meta WHERE key IN (?,?)",
+        (q.CODEX_CONTRACT_REBUILD_MARKER,
+         kern.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY),
+    )
+    conversations.commit()
+    _cc._recompute_codex_rollups(
+        conversations, sorted(_V850_CONVERSATIONS), advance_render_revision=True)
+    # The derived titles are prompt text; pin the ones the assertions read so a
+    # NULL title exposes the `_display_chain` fallback the project label owns.
+    for key, spec in _V850_CONVERSATIONS.items():
+        conversations.execute(
+            "UPDATE codex_conversation_rollups SET title = ? "
+            "WHERE conversation_key = ?", (spec[5], key))
+    # One file touch on the corrupted-but-titled conversation, so the `files`
+    # search kind reaches it.
+    message_id = conversations.execute(
+        "SELECT id FROM codex_conversation_messages WHERE conversation_key = ?",
+        ("v850-titled",)).fetchone()[0]
+    conversations.execute(
+        "INSERT INTO codex_conversation_file_touches "
+        "(message_id, conversation_key, source_path, file_path, tool) "
+        "VALUES (?,?,?,?,?)",
+        (message_id, "v850-titled", f"{_V850_ROOT_PATH}/v850-titled.jsonl",
+         "/synthetic/v850-touched-file.txt", "apply_patch"),
+    )
+    conversations.commit()
+    return ns, cache, conversations
+
+
+@pytest.fixture
+def v850_store(tmp_path, monkeypatch):
+    ns, cache, conversations = _v850_store(tmp_path, monkeypatch)
+    try:
+        yield ns, cache, conversations
+    finally:
+        conversations.close()
+        cache.close()
+
+
+def _v850_project_key(conversations, key):
+    row = conversations.execute(
+        "SELECT project_key FROM codex_conversation_rollups "
+        "WHERE conversation_key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def test_850_a26_no_viewer_surface_shows_a_later_corrupted_threads_attribution(
+    v850_store,
+):
+    """A26. Every stored reader excluded the corrupted conversations.
+
+    The rollups were materialized while every thread still read, so each
+    corrupted conversation carries a real persisted attribution that no write
+    repairs. Before this change the facets counted the shared project three
+    times, the filtered page returned three rows, the child inherited its
+    parent's project label and every search hit carried a stale label.
+    """
+    _ns, cache, conversations = v850_store
+    shared_key = _v850_project_key(conversations, "v850-b")
+    assert shared_key is not None
+    assert _v850_project_key(conversations, "v850-a") == shared_key, (
+        "precondition: the corrupted conversation shares the healthy one's "
+        "persisted project, so excluding it is observable in the count")
+    for key, spec in _V850_CONVERSATIONS.items():
+        if spec[4] == "cwd":
+            _v850_corrupt(cache, key, "cwd")
+
+    facets = q.list_codex_conversation_facets(conversations)
+    assert facets["status"] == "ok"
+    counts = {
+        facet["project_key"]: facet["count"]
+        for facet in facets["facets"]["projects"]
+    }
+    assert counts.get(shared_key) == 1, counts
+    # The `git_json`-only corruption is NOT a member: the viewer's attribution
+    # is direct-only and the resolver stops at the valid `cwd`.
+    assert counts.get(_v850_project_key(conversations, "v850-git")) == 1
+
+    page = q.list_codex_conversations(
+        conversations, effective_speed="standard", project_key=shared_key)
+    assert [row["conversation_key"] for row in page["rows"]] == ["v850-b"]
+    assert page["page"]["total"] == 1
+    # The corrupted key is not a usable cursor under that filter either: the
+    # cursor lookup carries the same exclusion, so the page restarts.
+    cursored = q.list_codex_conversations(
+        conversations, effective_speed="standard", project_key=shared_key,
+        cursor="v850-a")
+    assert [row["conversation_key"] for row in cursored["rows"]] == ["v850-b"]
+
+    unfiltered = {
+        row["conversation_key"]: row
+        for row in q.list_codex_conversations(
+            conversations, effective_speed="standard")["rows"]
+    }
+    assert unfiltered["v850-a"]["project_key"] is None
+    assert unfiltered["v850-a"]["project_label"] is None
+    assert unfiltered["v850-b"]["project_key"] == shared_key
+    assert unfiltered["v850-git"]["project_label"] == "v850-keep"
+    # A parent in the set contributes no label to its child's row. `v850-a`
+    # carries no title, so its display chain falls through to the label.
+    child_parent = unfiltered["v850-child"]["parent"]
+    assert child_parent["conversation_key"] == "v850-a"
+    assert child_parent["title"] == "native-a", child_parent
+
+    titles = q.search_codex_conversations(
+        conversations, "Corrupted titled", kind="title",
+        effective_speed="standard")
+    assert [hit["project_label"] for hit in titles["hits"]] == [None]
+    messages = q.search_codex_conversations(
+        conversations, "v850searchtoken", kind="all",
+        effective_speed="standard")
+    assert messages["hits"]
+    assert {hit["project_label"] for hit in messages["hits"]} == {None}
+    files = q.search_codex_conversations(
+        conversations, "v850-touched-file", kind="files",
+        effective_speed="standard")
+    assert files["hits"]
+    assert {hit["project_label"] for hit in files["hits"]} == {None}
+
+
+def test_850_a26_the_scoped_connection_excludes_the_same_keys(
+    v850_store, tmp_path, monkeypatch,
+):
+    """A26's scoped half. The scoped TEMP view over the threads table is empty,
+    so a per-row join would see no thread at all; the key set is read past it
+    through the qualified table name."""
+    ns, cache, conversations = v850_store
+    shared_key = _v850_project_key(conversations, "v850-b")
+    _v850_corrupt(cache, "v850-a", "cwd")
+    _v850_corrupt(cache, "v850-titled", "cwd")
+    import _cctally_cache as _cc
+
+    scoped = ns["open_conversations_db"]()
+    try:
+        _cc.scope_conversations_db_to_account(scoped, _V850_ACCOUNT)
+        assert scoped.execute(
+            "SELECT COUNT(*) FROM codex_conversation_threads"
+        ).fetchone()[0] == 0, "precondition: the scoped view hides every thread"
+        rows = {
+            row["conversation_key"]: row
+            for row in q.list_codex_conversations(
+                scoped, effective_speed="standard")["rows"]
+        }
+        assert rows["v850-a"]["project_key"] is None
+        assert rows["v850-b"]["project_key"] == shared_key
+        assert rows["v850-git"]["project_label"] == "v850-keep"
+        counts = {
+            facet["project_key"]: facet["count"]
+            for facet in q.list_codex_conversation_facets(
+                scoped)["facets"]["projects"]
+        }
+        assert counts.get(shared_key) == 1, counts
+    finally:
+        scoped.close()
+
+
+def test_850_a25_the_detail_opens_and_the_live_path_equals_the_stored_path(
+    v850_store,
+):
+    """A25's kernel half, unscoped. `_rollup_fields` called `_thread_facts`
+    unconditionally, even on the stored fast path, so opening the affected
+    conversation raised `OperationalError`."""
+    _ns, cache, conversations = v850_store
+    _v850_corrupt(cache, "v850-a", "cwd")
+
+    detail = q.get_codex_conversation(
+        conversations, "v850-a", effective_speed="standard")
+    assert detail["status"] == "ok"
+    assert detail["parent"] is None
+    stored = q._rollup_fields(
+        conversations, "v850-a",
+        undecodable_keys=q.undecodable_codex_conversation_keys(conversations))
+    assert stored["project_key"] is None and stored["project_label"] is None
+    # The live recompute must agree with the nulled stored path.
+    conversations.execute(
+        "DELETE FROM codex_conversation_rollups WHERE conversation_key='v850-a'")
+    live = q._rollup_fields(
+        conversations, "v850-a",
+        undecodable_keys=q.undecodable_codex_conversation_keys(conversations))
+    assert (live["project_key"], live["project_label"]) == (
+        stored["project_key"], stored["project_label"])
+
+    # A valid `cwd` beside an undecodable `git_json` keeps its attribution.
+    kept = q.get_codex_conversation(
+        conversations, "v850-git", effective_speed="standard")
+    assert kept["status"] == "ok"
+    assert q._rollup_fields(
+        conversations, "v850-git",
+        undecodable_keys=q.undecodable_codex_conversation_keys(conversations),
+    )["project_label"] == "v850-keep"
+
+
+def test_850_a26_the_outline_memo_cannot_serve_a_stale_child_summary(
+    v850_store, monkeypatch,
+):
+    """A26's memo arm. `_codex_outline_memo_key` keys on the rollup revision,
+    the event watermark and the accounting mutation sequence, and the
+    thread-update trigger advances that sequence only for a thread with an
+    accounting or alias path — so a message-only child's later corruption left
+    a warm key unchanged and the hit returned before `_outline_envelope` ran.
+    """
+    _ns, cache, conversations = v850_store
+    real = q._outline_envelope
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    q._codex_outline_memo_clear()
+    monkeypatch.setattr(q, "_outline_envelope", spy)
+    try:
+        warm = q.get_codex_conversation_outline(
+            conversations, "v850-b", effective_speed="standard")
+        child = next(c for c in warm["children"]
+                     if c["conversation_key"] == "v850-outline-child")
+        assert child["title"] == "v850-child", child
+        assert calls == [1]
+        again = q.get_codex_conversation_outline(
+            conversations, "v850-b", effective_speed="standard")
+        assert again == warm and calls == [1], "precondition: the memo is warm"
+
+        _v850_corrupt(cache, "v850-outline-child", "cwd")
+        after = q.get_codex_conversation_outline(
+            conversations, "v850-b", effective_speed="standard")
+        assert calls == [1, 1], "the memo must MISS on the new key set"
+        corrupted_child = next(
+            c for c in after["children"]
+            if c["conversation_key"] == "v850-outline-child")
+        assert corrupted_child["title"] != "v850-child", corrupted_child
+
+        cache.execute(
+            "UPDATE codex_conversation_threads SET cwd = ? "
+            "WHERE conversation_key = 'v850-outline-child'", (_V850_CHILD_CWD,))
+        cache.commit()
+        repaired = q.get_codex_conversation_outline(
+            conversations, "v850-b", effective_speed="standard")
+        # The corrupted generation's entry can never be served again, because
+        # its key carries the corrupted set's digest. The repair restores the
+        # pre-corruption digest, whose entry is still resident and is exactly
+        # the body the repair must produce, so the memo may serve it: what the
+        # digest guarantees is that no generation is served under another
+        # generation's key, and the attribution-derived field returns.
+        assert repaired == warm
+        assert next(
+            c for c in repaired["children"]
+            if c["conversation_key"] == "v850-outline-child")["title"] == (
+                "v850-child")
+    finally:
+        q._codex_outline_memo_clear()
+
+
+def _v850_raw_thread_passes(conn):
+    """A counter over the statements that read the RAW threads table.
+
+    The viewer's key set and the anonymization planner's fail-closed count are
+    the only two readers that qualify the table name, so a statement is one of
+    theirs exactly when it selects `CAST(cwd AS BLOB)` from a schema-qualified
+    `codex_conversation_threads`. `_thread_facts` keeps the unqualified name
+    and honors account scoping, so it is deliberately not counted.
+    """
+    seen = []
+
+    def trace(statement):
+        text = " ".join(str(statement).split())
+        if "CAST(cwd AS BLOB)" in text and (
+            "main.codex_conversation_threads" in text
+            or "cache_db.codex_conversation_threads" in text
+        ):
+            seen.append(text)
+
+    conn.set_trace_callback(trace)
+    return seen
+
+
+def test_850_a26_each_viewer_request_reads_the_raw_table_exactly_once(
+    v850_store,
+):
+    """A26's trace matrix. One decode pass per viewer request — never one per
+    row, never one per reader, and never none at all."""
+    _ns, cache, conversations = v850_store
+    _v850_corrupt(cache, "v850-a", "cwd")
+    seen = _v850_raw_thread_passes(conversations)
+    try:
+        requests = {
+            "stored browse with selected": lambda: q.list_codex_conversations(
+                conversations, effective_speed="standard", selected="v850-b"),
+            "facets only": lambda: q.list_codex_conversation_facets(
+                conversations),
+            "title search": lambda: q.search_codex_conversations(
+                conversations, "Corrupted", kind="title",
+                effective_speed="standard"),
+            "message search": lambda: q.search_codex_conversations(
+                conversations, "v850searchtoken", kind="all",
+                effective_speed="standard"),
+            "file search": lambda: q.search_codex_conversations(
+                conversations, "v850-touched-file", kind="files",
+                effective_speed="standard"),
+            "detail": lambda: q.get_codex_conversation(
+                conversations, "v850-a", effective_speed="standard"),
+            "outline": lambda: q.get_codex_conversation_outline(
+                conversations, "v850-b", effective_speed="standard"),
+            "raw export": lambda: q.get_codex_conversation_export(
+                conversations, "v850-a", effective_speed="standard"),
+        }
+        for name, call in requests.items():
+            q._codex_outline_memo_clear()
+            del seen[:]
+            call()
+            assert len(seen) == 1, (name, seen)
+
+        # An anonymized export performs TWO, and the second is accepted rather
+        # than removed: the dashboard route and the CLI both assemble the
+        # detail through `get_codex_conversation_export` — which materializes
+        # the viewer's set — and then run the planner's own raw pass, and
+        # coupling the planner to the viewer's set would be the alternative.
+        del seen[:]
+        q.get_codex_conversation_export(
+            conversations, "v850-a", effective_speed="standard")
+        lcq.build_anon_plan_for_sources(
+            conversations, home_dir="/home/v850-user", sources={"codex"})
+        assert len(seen) == 2, seen
+
+        # The no-rollup live browse is a separate branch and reads the set once
+        # as well.
+        conversations.execute("DELETE FROM codex_conversation_rollups")
+        del seen[:]
+        q.list_codex_conversations(conversations, effective_speed="standard")
+        assert len(seen) == 1, seen
+    finally:
+        conversations.set_trace_callback(None)
+
+
+def test_850_a26_the_scoped_request_reads_the_raw_table_the_same_way(
+    v850_store, tmp_path, monkeypatch,
+):
+    """A26's scoped trace arm. Account scoping installs an empty TEMP view over
+    the threads table, so the count of RAW passes must be unchanged: the set and
+    the planner's fail-closed count both reach the real rows through the
+    qualified name, and neither falls back to the view."""
+    ns, cache, _conversations = v850_store
+    _v850_corrupt(cache, "v850-a", "cwd")
+    import _cctally_cache as _cc
+
+    scoped = ns["open_conversations_db"]()
+    seen = _v850_raw_thread_passes(scoped)
+    try:
+        _cc.scope_conversations_db_to_account(scoped, _V850_ACCOUNT)
+        del seen[:]
+        q.list_codex_conversations(scoped, effective_speed="standard")
+        assert len(seen) == 1, seen
+        del seen[:]
+        q.get_codex_conversation_export(
+            scoped, "v850-a", effective_speed="standard")
+        lcq.build_anon_plan_for_sources(
+            scoped, home_dir="/home/v850-user", sources={"codex"})
+        assert len(seen) == 2, seen
+    finally:
+        scoped.set_trace_callback(None)
+        scoped.close()
+
+
+# ── #850 §4.9 — the three identity-only readers stop raising ────────────────
+
+
+def _v850_corpus(tmp_path, monkeypatch):
+    """The session-C corpus, with the parent thread's `cwd` made undecodable."""
+    scenarios = [
+        "session-c-secondary-tools", "session-c-child-proven",
+        "session-c-child-ambiguous-a", "session-c-child-ambiguous-b",
+    ]
+    ns, root, _rollouts = _stage_codex_provider(tmp_path, monkeypatch, scenarios)
+    conn = ns["open_cache_db"]()
+    ns["sync_codex_cache"](conn)
+    keys = dict(conn.execute(
+        "SELECT native_thread_id,conversation_key FROM codex_conversation_threads"))
+    parent_key = keys["cccccccc-cccc-4ccc-8ccc-cccccccccccc"]
+    child_key = keys["c1111111-1111-4111-8111-111111111111"]
+    # The reader's connection attaches the cache READ-ONLY, so the corruption
+    # is written through a writable cache connection of its own.
+    writer = load_script()["open_cache_db"]()
+    try:
+        writer.execute(
+            "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+            "WHERE conversation_key = ?", (_V850_BAD, parent_key))
+        writer.commit()
+    finally:
+        writer.close()
+    return ns, conn, root, parent_key, child_key
+
+
+def test_850_a25_the_identity_only_readers_work_on_a_corrupted_thread(
+    tmp_path, monkeypatch,
+):
+    """A25's identity-only arms. `_thread_facts` raised before any of its six
+    callers ran, so a corrupted conversation lost its spawn-child links, its
+    raw export, its live-tail file set and its discovery frontier — the last at
+    stream setup, before the first cycle. The helper leaves
+    `native_thread_id`, `source_root_key` and `parent_thread_id` untouched, so
+    all four succeed once the two metadata columns are decoded per field."""
+    import _cctally_dashboard_conversation as dconv
+
+    ns, conn, root, parent_key, child_key = _v850_corpus(tmp_path, monkeypatch)
+    try:
+        detail = q.get_codex_conversation(
+            conn, parent_key, effective_speed="standard", limit=0)
+        assert detail["status"] == "ok"
+        cards = [
+            block["detail"]["card"]
+            for item in detail["items"] for block in item["blocks"]
+            if (block.get("detail") or {}).get("card", {}).get(
+                "operation") == "spawn_agent"
+        ]
+        assert any(
+            card.get("child_conversation", {}).get("conversation_key")
+            == child_key for card in cards), cards
+
+        export = q.get_codex_conversation_export(
+            conn, parent_key, effective_speed="standard")
+        assert export["status"] == "ok" and export["markdown"]
+
+        paths = q.codex_conversation_source_paths(conn, parent_key)
+        assert paths, "the live-tail watch loop polls this file set"
+
+        walk_root = dconv._codex_walk_root_for_conversation(conn, parent_key)
+        assert walk_root == str(root / "sessions"), walk_root
+        step = dconv._make_codex_discovery_step(
+            None, conn, parent_key, q)
+        assert step is not None
+    finally:
+        conn.close()
+
+
+# ── #850 §4.9 / A22 — the scrub vocabulary survives an undecodable row ───────
+#
+# The Codex leg of `build_anon_plan_for_sources` scanned
+# `SELECT conversation_key, cwd FROM codex_conversation_threads` inside a loop
+# whose `except sqlite3.OperationalError: pass` swallowed the decode error MID
+# ITERATION, so every `cwd` after the bad row was silently missing from the
+# scrub vocabulary of every anonymized Codex export. A fixture whose bad row is
+# last cannot show it.
+
+_A22_PATHS = ("/synthetic/a22-first-project", "/synthetic/a22-third-project")
+
+
+def _a22_seed(cache):
+    cache.execute(
+        "INSERT INTO codex_source_roots (source_root_key, canonical_root_path,"
+        " first_seen_utc, last_seen_utc) VALUES (?,?,?,?)",
+        ("a22-root", "/synthetic/a22-root", "2026-01-01T00:00:00+00:00",
+         "2026-09-01T00:00:00+00:00"),
+    )
+    # Insertion order IS rowid order, so the undecodable row is second and two
+    # decodable paths straddle it.
+    rows = (
+        ("a22-first", _A22_PATHS[0]),
+        ("a22-bad", None),
+        ("a22-third", _A22_PATHS[1]),
+    )
+    for key, cwd in rows:
+        cache.execute(
+            "INSERT INTO codex_conversation_threads "
+            "(conversation_key, source_root_key, native_thread_id,"
+            " root_thread_id, source_path, cwd, git_json, first_seen_utc,"
+            " last_seen_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+            (key, "a22-root", f"native-{key}", f"native-{key}",
+             f"/synthetic/a22/{key}.jsonl", cwd, None,
+             "2026-01-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00"),
+        )
+    cache.execute(
+        "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+        "WHERE conversation_key = 'a22-bad'", (_V850_BAD,))
+    cache.commit()
+
+
+def test_850_a22_the_scrub_vocabulary_keeps_every_decodable_path(
+    tmp_path, monkeypatch,
+):
+    """A22, on both connection shapes.
+
+    The bare cache connection is the existing helper contract; the
+    conversations connection reaches the table through the attached cache, and
+    the fail-closed count must be read past an account-scoped TEMP view on
+    either — a hard-coded `cache_db.` prefix fails with `no such table` on the
+    bare one, which is why the reference is resolved at call time.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    try:
+        _a22_seed(cache)
+        conversations = ns["open_conversations_db"]()
+        try:
+            for shape, conn in (("bare cache", cache),
+                                ("attached cache", conversations)):
+                result = lcq.build_anon_plan_for_sources(
+                    conn, home_dir="/home/a22-user", sources={"codex"})
+                assert result.undecodable_cwd_rows == 1, shape
+                scrubbed = anon.scrub_text(
+                    " ".join(_A22_PATHS), result.plan)
+                for path in _A22_PATHS:
+                    assert path not in scrubbed, (shape, path, scrubbed)
+        finally:
+            conversations.close()
+    finally:
+        cache.close()
+
+
+# ── #850 §4.9 / M5 — a read FAILURE is not the answer "no undecodable row" ──
+#
+# Both fail-closed reads answered a `sqlite3.Error` with the healthy value —
+# zero undecodable rows, and the empty key set. A locked or malformed cache.db
+# therefore let the anonymized export proceed with a short scrub vocabulary,
+# and let the viewer publish attribution that the store could no longer
+# confirm. Only the ABSENT-table case is a legitimate zero, and that case
+# reaches the caller as `resolve_codex_threads_table`'s `RuntimeError`.
+
+
+class _RaisesOnStatement:
+    """A connection proxy whose ``execute`` raises for one statement.
+
+    Everything else is delegated, so the read under test is the only one that
+    fails and the caller's other statements behave exactly as they do against
+    the real connection.
+    """
+
+    def __init__(self, conn, matches, error):
+        self._conn = conn
+        self._matches = matches
+        self._error = error
+
+    def execute(self, sql, *args, **kwargs):
+        if self._matches(sql):
+            raise self._error
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _is_fail_closed_count_sql(sql: str) -> bool:
+    return sql.strip().startswith("SELECT CAST(cwd AS BLOB) AS cwd_blob")
+
+
+def _is_undecodable_keys_sql(sql: str) -> bool:
+    return "git_json_blob" in sql and "WHERE" not in sql
+
+
+def _is_threads_table_probe_sql(sql: str) -> bool:
+    return "sqlite_master" in sql
+
+
+def test_850_a_read_failure_during_resolution_refuses_both_reads(
+    tmp_path, monkeypatch,
+):
+    """A locked store fails the resolver's schema probe before it fails
+    either fail-closed statement. That probe used to answer ``False`` for a
+    ``sqlite3.Error``, so the resolver raised its absent-table
+    ``RuntimeError`` and both reads answered the healthy value: the planner
+    reported zero undecodable rows and the viewer published the pre-corruption
+    attribution. The failure now propagates from both.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    try:
+        _a22_seed(cache)
+        assert lcq.build_anon_plan_for_sources(
+            cache, home_dir="/home/a22-user", sources={"codex"},
+        ).undecodable_cwd_rows == 1
+        assert q.undecodable_codex_conversation_keys(cache)
+        locked = _RaisesOnStatement(
+            cache, _is_threads_table_probe_sql,
+            sqlite3.OperationalError("database is locked"))
+        with pytest.raises(sqlite3.OperationalError):
+            lcq.build_anon_plan_for_sources(
+                locked, home_dir="/home/a22-user", sources={"codex"})
+        with pytest.raises(sqlite3.OperationalError):
+            q.undecodable_codex_conversation_keys(locked)
+    finally:
+        cache.close()
+
+
+def test_850_fail_closed_count_propagates_a_read_failure(tmp_path, monkeypatch):
+    """The planner's fail-closed count must not report zero for a read it
+    could not perform. A locked cache.db used to hand `build_anon_plan_for_sources`
+    a `SourceAnonPlan` with `undecodable_cwd_rows == 0`, which every caller
+    reads as "nothing is undecodable" and proceeds to emit anonymized bytes.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    try:
+        _a22_seed(cache)
+        healthy = lcq.build_anon_plan_for_sources(
+            cache, home_dir="/home/a22-user", sources={"codex"})
+        assert healthy.undecodable_cwd_rows == 1
+        blocked = _RaisesOnStatement(
+            cache, _is_fail_closed_count_sql,
+            sqlite3.OperationalError("database is locked"))
+        with pytest.raises(sqlite3.OperationalError):
+            lcq.build_anon_plan_for_sources(
+                blocked, home_dir="/home/a22-user", sources={"codex"})
+    finally:
+        cache.close()
+
+
+def test_850_fail_closed_count_still_answers_zero_without_the_table(
+    tmp_path, monkeypatch,
+):
+    """The absent-table case stays a legitimate zero: a store with no Codex
+    threads table has no undecodable row, so an anonymized Claude export that
+    would otherwise have worked is not refused.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    bare = sqlite3.connect(":memory:")
+    try:
+        result = lcq.build_anon_plan_for_sources(
+            bare, home_dir="/home/a22-user", sources={"codex"})
+        assert result.undecodable_cwd_rows == 0
+    finally:
+        bare.close()
+
+
+def test_850_undecodable_key_set_propagates_a_read_failure(
+    tmp_path, monkeypatch,
+):
+    """The viewer's key set must not report "nothing is undecodable" for a read
+    it could not perform. Answering the empty set published each conversation's
+    PRE-CORRUPTION stored attribution on every viewer surface, which is exactly
+    the stale answer the set exists to withhold.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    cache = ns["open_cache_db"]()
+    try:
+        _a22_seed(cache)
+        assert q.undecodable_codex_conversation_keys(cache) == frozenset(
+            {"a22-bad"})
+        blocked = _RaisesOnStatement(
+            cache, _is_undecodable_keys_sql,
+            sqlite3.OperationalError("database is locked"))
+        with pytest.raises(sqlite3.OperationalError):
+            q.undecodable_codex_conversation_keys(blocked)
+    finally:
+        cache.close()
+
+
+def test_850_undecodable_key_set_still_answers_empty_without_the_table(
+    tmp_path, monkeypatch,
+):
+    """The absent-table case stays the empty set, so a reader that would
+    otherwise have worked is not failed by a store with no Codex threads."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    bare = sqlite3.connect(":memory:")
+    try:
+        assert q.undecodable_codex_conversation_keys(bare) == frozenset()
+    finally:
+        bare.close()

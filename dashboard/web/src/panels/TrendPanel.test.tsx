@@ -1,7 +1,7 @@
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { TrendPanel } from './TrendPanel';
-import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
+import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
 import {
   makeAllSourceEntry,
   makeClaudeSourceEntry,
@@ -242,6 +242,18 @@ describe('TrendPanel source seam — no Claude leak under Codex (#294 S5)', () =
     });
     const ids = [...container.querySelectorAll('h3[id]')].map((h) => h.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('keeps provider labels and chart legends inert while the card body still opens', () => {
+    updateSnapshot(trendLeakEnv());
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<TrendPanel />);
+    fireEvent.click(container.querySelector('.trend-provider-section .provider-composition-head') as HTMLElement);
+    expect(getState().openModal).toBeNull();
+    fireEvent.click(container.querySelector('.trend-spark-legend') as HTMLElement);
+    expect(getState().openModal).toBeNull();
+    fireEvent.click(container.querySelector('#panel-trend') as HTMLElement);
+    expect(getState().openModal).toBe('trend');
   });
 
   it('All mode renders provider-separated trend sections, never one combined series', () => {

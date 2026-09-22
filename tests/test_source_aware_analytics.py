@@ -141,7 +141,18 @@ def test_codex_project_metadata_health_partitions_bounded_rows():
         )
         assert health.incomplete_rows == 2
         selects = [trace for trace in traces if trace.lstrip().upper().startswith("SELECT")]
-        assert len(selects) == 1
+        # FOUR, not one, since #845 §4.3: the aggregate itself, the raw-table
+        # resolution over `sqlite_master`, and the decode inventory's two legs
+        # over the thread and file tables. The counting of undecodable rows
+        # stops there on a clean store, because both undecodable sets are empty
+        # and no per-identity query runs at all.
+        assert len(selects) == 4, selects
+        assert sum(
+            1 for trace in selects if "codex_session_entries" in trace
+        ) == 1, selects
+        assert not [
+            trace for trace in selects if "entries.id IN" in trace
+        ], selects
         with pytest.raises(dataclasses.FrozenInstanceError):
             health.total_rows = 99  # type: ignore[misc]
     finally:
@@ -217,15 +228,22 @@ def test_codex_project_metadata_health_accepts_pre_native_alias_schema():
             CREATE TABLE codex_session_entries (
                 timestamp_utc TEXT, source_root_key TEXT, conversation_key TEXT
             );
+            -- The four metadata columns §4.3's inventory reads are part of
+            -- the real schema in `bin/_cctally_db.py`; this fixture's point is
+            -- the PRE-NATIVE `codex_session_files` below, not a threads table
+            -- no cache generation ever had.
             CREATE TABLE codex_conversation_threads (
-                conversation_key TEXT, source_root_key TEXT
+                conversation_key TEXT, source_root_key TEXT,
+                native_thread_id TEXT, last_seen_utc TEXT,
+                cwd TEXT, git_json TEXT
             );
             CREATE TABLE codex_session_files (
                 path TEXT PRIMARY KEY, last_session_id TEXT
             );
             INSERT INTO codex_session_entries VALUES
                 ('2026-06-16T00:00:00+00:00', 'root-a', 'conversation-a');
-            INSERT INTO codex_conversation_threads VALUES
+            INSERT INTO codex_conversation_threads
+                (conversation_key, source_root_key) VALUES
                 ('conversation-a', 'root-a');
         """)
 
@@ -566,7 +584,12 @@ def test_qualified_scale_query_uses_composite_index_and_bounded_resolution(
     assert sum(row.total_tokens for row in rows) == expected_total_tokens
     assert abs(sum(row.cost_usd for row in rows) - expected_cost) <= 1e-9
     assert all("/synthetic/" not in row.project_label for row in rows)
-    assert len([statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]) <= 3
+    # Four, not three, since #845 §4.3: the accounting read, the raw-table
+    # resolution over `sqlite_master`, and the inventory's two legs over the
+    # thread and file tables. The retired inherited statement was one of the
+    # three, and it joined files to threads quadratically; the inventory reads
+    # each table once and joins them in Python.
+    assert len([statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]) <= 4
 
     plan = [row[-1] for row in traced.execute(
         "EXPLAIN QUERY PLAN " + _QUALIFIED_CODEX_ENTRIES_SQL,
@@ -1212,3 +1235,181 @@ def test_source_command_preserves_partial_accounting_when_only_qualified_metadat
     assert unavailable == source_analytics.unavailable_section(
         unavailable_key, source_analytics.QUALIFIED_METADATA_WARNING,
     )
+
+
+# === #845 A18 — the four CLI consumers over an undecodable metadata value ===
+
+#: TEXT holding bytes that are not valid UTF-8, the shape #845 reproduces.
+A18_BAD_BYTES = b"/Users/example/work/\xffproject"
+A18_ROOT = "a18-root"
+A18_ROOT_PATH = "/Users/example/.codex-a18"
+A18_HEALTHY_PATH = f"{A18_ROOT_PATH}/sessions/healthy.jsonl"
+A18_ALIAS_PATH = f"{A18_ROOT_PATH}/sessions/alias.jsonl"
+
+
+def _a18_entry(conn, *, path, offset, timestamp, conversation):
+    conn.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model, "
+        "input_tokens, cached_input_tokens, output_tokens, "
+        "reasoning_output_tokens, total_tokens, source_root_key, "
+        "conversation_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (path, offset, timestamp, "a18-session", "gpt-5", 100, 10, 20, 5, 130,
+         A18_ROOT, conversation),
+    )
+
+
+@pytest.fixture
+def a18_store(tmp_path, monkeypatch):
+    """One healthy project plus an ALIAS-REACHABLE undecodable ``cwd``.
+
+    The undecodable thread is the ``last_native_thread_id`` of a
+    ``codex_session_files`` row, so `origin/main`'s whole-table inherited join
+    reaches it however old the affected entries are. A direct-only old thread
+    would leave the qualified read untouched and the RED arm would pass
+    without the fix.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "provider"))
+    conn = ns["open_cache_db"]()
+    conn.execute(
+        "INSERT INTO codex_source_roots (source_root_key, canonical_root_path,"
+        " first_seen_utc, last_seen_utc) VALUES (?,?,?,?)",
+        (A18_ROOT, A18_ROOT_PATH, "2025-01-01T00:00:00+00:00",
+         "2026-06-22T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO codex_conversation_threads "
+        "(conversation_key, source_root_key, native_thread_id, root_thread_id,"
+        " source_path, cwd, git_json) VALUES (?,?,?,?,?,?,?)",
+        ("a18-healthy", A18_ROOT, "a18-healthy-thread", "a18-healthy-thread",
+         A18_HEALTHY_PATH, "/Users/example/work/healthy", None),
+    )
+    conn.execute(
+        "INSERT INTO codex_conversation_threads "
+        "(conversation_key, source_root_key, native_thread_id, root_thread_id,"
+        " source_path, cwd, git_json) VALUES (?,?,?,?,?,?,?)",
+        ("a18-bad", A18_ROOT, "a18-bad-thread", "a18-bad-thread",
+         A18_ALIAS_PATH, None, None),
+    )
+    conn.execute(
+        "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+        "WHERE conversation_key = 'a18-bad'", (A18_BAD_BYTES,),
+    )
+    conn.execute(
+        "INSERT INTO codex_session_files "
+        "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+        " source_root_key, last_native_thread_id) VALUES (?,0,0,0,?,?,?)",
+        (A18_ALIAS_PATH, "2026-06-22T00:00:00+00:00", A18_ROOT,
+         "a18-bad-thread"),
+    )
+    # One healthy entry in each of the two diff windows, so the unqualified
+    # fallback has a real population to compare and the withheld project
+    # comparison is a refusal rather than an emptiness.
+    _a18_entry(
+        conn, path=A18_HEALTHY_PATH, offset=1,
+        timestamp="2026-06-16T00:00:00+00:00", conversation="a18-healthy")
+    _a18_entry(
+        conn, path=A18_HEALTHY_PATH, offset=2,
+        timestamp="2026-06-22T12:00:00+00:00", conversation="a18-healthy")
+    conn.commit()
+    try:
+        yield ns, conn
+    finally:
+        conn.close()
+
+
+def _a18_seed_affected(conn, *, in_window):
+    """Entries on the undecodable thread, inside or outside the read window."""
+    _a18_entry(
+        conn, path=A18_ALIAS_PATH, offset=3,
+        timestamp=(
+            "2026-06-17T00:00:00+00:00" if in_window
+            else "2024-01-05T00:00:00+00:00"
+        ),
+        conversation="a18-bad",
+    )
+    conn.commit()
+
+
+#: The four consumers, their argument shape, and the section the §4.2 table
+#: says each one establishes or withholds when the value is IN window.
+_A18_COMMANDS = {
+    "cmd_source_project": (
+        # `_resolve_source_project_range` reads `range_start`/`range_end`, not
+        # `start`/`end`; supplying the wrong pair resolves the current
+        # subscription week and the fixture's rows fall outside it.
+        {"blocks": (), "range_start": START, "range_end": END, "as_of": END},
+        "unavailable", None,
+    ),
+    "cmd_source_diff": (
+        {
+            "window_a": source_analytics.AnalyticsWindow(
+                "A", "range", START, END),
+            "window_b": source_analytics.AnalyticsWindow(
+                "B", "range", END, END + dt.timedelta(days=1)),
+        },
+        "partial", "projects",
+    ),
+    "cmd_source_range_cost": (
+        {"start": START, "end": END, "project": ["project:" + "0" * 24]},
+        "unavailable", None,
+    ),
+    "cmd_source_cache_report": (
+        {"start": START, "end": END, "group_by": "date"},
+        "partial", "project-metadata",
+    ),
+}
+
+
+def _a18_run(command_name, extra, capsys):
+    args = SimpleNamespace(
+        json=True, speed="standard", offline=True,
+        _source_analytics_sync=False, **extra,
+    )
+    exit_code = getattr(source_commands, command_name)(args)
+    return exit_code, __import__("json").loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("command_name", sorted(_A18_COMMANDS))
+def test_845_a18_an_out_of_window_undecodable_value_leaves_every_consumer_intact(
+    a18_store, command_name, capsys,
+):
+    """A18's RED arm. An alias-reachable undecodable value outside the read
+    window must not withhold any consumer's project section."""
+    _ns, conn = a18_store
+    _a18_seed_affected(conn, in_window=False)
+    extra, _state, _section = _A18_COMMANDS[command_name]
+    exit_code, wire = _a18_run(command_name, extra, capsys)
+    assert exit_code == 0
+    assert wire["status"] in {"ok", "empty"}, wire["status"]
+    assert source_analytics.QUALIFIED_METADATA_WARNING.code not in repr(wire)
+
+
+@pytest.mark.parametrize("command_name", sorted(_A18_COMMANDS))
+def test_845_a18_an_in_window_undecodable_value_degrades_per_the_table(
+    a18_store, command_name, capsys,
+):
+    """The other half of §4.2's table: the deterministic refusal is the one
+    `_parse_timestamp` and the cost operands already produce, so each consumer
+    degrades exactly as it degrades for those."""
+    _ns, conn = a18_store
+    _a18_seed_affected(conn, in_window=True)
+    extra, expected_status, unavailable_key = _A18_COMMANDS[command_name]
+    # A18 asserts the SECTION STATES, not the exit code: an unavailable
+    # provider result is a staged exit by the CLI contract, and the exit code
+    # would pass on a consumer that withheld the wrong section.
+    _exit_code, wire = _a18_run(command_name, extra, capsys)
+    assert wire["status"] == expected_status
+    if unavailable_key is None:
+        assert wire["data"] is None
+        assert wire["warnings"][0]["code"] == (
+            source_analytics.QUALIFIED_METADATA_WARNING.code)
+    else:
+        sections = wire["data"]["sections"]
+        withheld = next(
+            section for section in sections if section["key"] == unavailable_key)
+        assert withheld == source_analytics.unavailable_section(
+            unavailable_key, source_analytics.QUALIFIED_METADATA_WARNING,
+        )

@@ -1676,7 +1676,12 @@ def _tui_build_current_week(
     Returns None when no current-week usage snapshot exists.
     """
     # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
-    fetched = _fetch_current_week_snapshots(conn, now_utc, include_held=True)
+    # Retain the owner of the exact non-held weekly sample this card displays,
+    # including when one real account coexists with unattributed history. R8
+    # controls decoration, not the physical population used for computation.
+    # Cost and forecast retain their existing merged semantics.
+    fetched = _fetch_current_week_snapshots(
+        conn, now_utc, include_held=True, include_account=True)
     if fetched is None:
         return None
     week_start_at, week_end_at, observations = fetched
@@ -1690,9 +1695,10 @@ def _tui_build_current_week(
     if not observations:
         return None
     # Held-inclusive sample shape: (captured_at_utc, weekly_percent,
-    # five_hour_percent, weekly_observation_held). That helper does not surface
-    # five_hour_resets_at, so do a targeted lookup below for the freshest
-    # non-NULL reset timestamp on the current week.
+    # five_hour_percent, weekly_observation_held[, account_key]). The optional
+    # account key identifies the displayed weekly sample on a decorated store.
+    # The helper does not surface five_hour_resets_at, so do a targeted lookup
+    # below for the freshest non-NULL reset timestamp on the current week.
     #
     # #769 S11 (#824). This card publishes BOTH axes, and the dashboard
     # envelope reads `used_pct` and `latest_snapshot_at` straight off it for
@@ -1707,7 +1713,11 @@ def _tui_build_current_week(
         return None
     latest = weekly_samples[-1]
     used_pct = float(latest[1])
-    five_hr_raw = observations[-1][2]
+    weekly_account = latest[4]
+    # Five-hour readings may be newer held observations, but must remain on
+    # the account that supplied the displayed weekly reading.
+    five_hour_samples = [s for s in observations if s[4] == weekly_account]
+    five_hr_raw = five_hour_samples[-1][2]
     five_hr_pct = float(five_hr_raw) if five_hr_raw is not None else None
     # #556 S1 §3.3: one walk yields both halves. The range is whatever
     # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
@@ -1753,8 +1763,9 @@ def _tui_build_current_week(
             f"SELECT five_hour_resets_at FROM weekly_usage_snapshots "
             f"WHERE week_start_at IN ({placeholders}) "
             f"  AND five_hour_resets_at IS NOT NULL "
+            f"  AND account_key = ? "
             f"ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            tuple(matching_ws_texts),
+            tuple(matching_ws_texts) + (weekly_account,),
         ).fetchone()
         if reset_row is not None:
             try:
@@ -1797,6 +1808,7 @@ def _tui_build_current_week(
         freshness_age=freshness_age,
         five_hour_block=_select_current_block_for_envelope(
             conn, current_used_pct=used_pct, now_utc=now_utc,
+            account_key=weekly_account,
         ),
         total_tokens=total_tokens,
     )
@@ -3553,6 +3565,20 @@ def _tui_retain_refused_partial(
             _PARTIAL_RETRY_STATE, provider=provider,
         )
         return False
+    # #846 §4.6. THE CARRIER DECIDES RETENTION, and it decides before the
+    # warnings are consulted. This leg derived the retry cause from
+    # `prior.warnings` alone, and a transient qualified-read failure publishes
+    # the warning code `codex_metadata_incomplete`, which the retry kernel
+    # normalizes to the retainable cause `metadata_incomplete` — so the second
+    # tick retained the transient generation for up to `PARTIAL_RETRY_INTERVAL`
+    # while the chip promised a retry that never came. No reuse or retention
+    # gate may retain a retryable carrier.
+    health = getattr(prior, "metadata_health", None)
+    if isinstance(health, Mapping) and bool(health.get("retryable")):
+        _PARTIAL_RETRY_STATE = clear_partial_retry(
+            _PARTIAL_RETRY_STATE, provider=provider,
+        )
+        return False
     if (
         prior.freshness != "fresh"
         or prior.data is None
@@ -4337,6 +4363,13 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
         # one by reading the path the first fix did not reach.
         health = state.metadata_health
         if health is not None and bool(health.get("retryable")):
+            # #846 §4.6: refuse AND clear any armed key, so the tick after the
+            # fault clears rebuilds rather than finding a key still inside its
+            # deadline.
+            global _PARTIAL_RETRY_STATE
+            _PARTIAL_RETRY_STATE = clear_partial_retry(
+                _PARTIAL_RETRY_STATE, provider=source,
+            )
             return False
     return True
 

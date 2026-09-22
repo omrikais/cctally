@@ -14,7 +14,11 @@ it('fetches and exposes projects', async () => {
   await waitFor(() => expect(result.current.projects).toHaveLength(1));
   expect(result.current.projects[0].project_label).toBe('projA');
   expect(result.current.projects[0].count).toBe(4);
-  expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain('/api/conversations/facets');
+  // #801: the browser intentionally uses the flat Claude facets contract.
+  // Qualified Claude facets retain project options while the rollup is pending,
+  // but project filtering cannot apply in that state.
+  expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0])
+    .toBe('/api/conversations/facets');
 });
 
 it('clears prior-account facets while the next account request is pending', async () => {
@@ -37,7 +41,8 @@ it('clears prior-account facets while the next account request is pending', asyn
   rerender({ accountKey: 'account-b' });
   await waitFor(() => expect(result.current.projects).toEqual([]));
   expect(result.current.models).toEqual([]);
-  expect(fetchMock.mock.calls[1][0]).toContain('account=account-b');
+  expect(fetchMock.mock.calls[1][0])
+    .toBe('/api/conversations/facets?account=account-b');
 });
 
 it('falls back to an empty list on a fetch error', async () => {

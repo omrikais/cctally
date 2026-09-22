@@ -993,6 +993,7 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
 .doctor-modal__remediation {
   color: var(--text-dim);
   font-style: italic;
+  overflow-wrap: anywhere;
 }
 .doctor-modal__flag {
   display: inline-block;
@@ -1219,6 +1220,20 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   font-family: var(--font-mono);
 }
 .panel-header h2 .sub { color: var(--text-dim); font-weight: 500; margin-left: 6px; }
+
+/* #762 — title content is the yielding side of a header. The wrapper around
+   icon + heading + an optional degraded chip used to keep its automatic
+   min-content width above 640px, so the right-side action cluster could be
+   laid out past the panel even though the document itself did not scroll.
+   Keep the complete heading in the DOM/accessibility tree, but let its
+   visible line yield with an ellipsis while the action cluster stays intact. */
+.panel-header > div:first-child { min-width: 0; }
+.panel-header h2 {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .panel-body { flex: 1 1 auto; }
 /* #247 S1 — one overflow rule. Long data cards (Sessions) cap their body and
@@ -3910,6 +3925,18 @@ mark.current {
   border: 1px solid var(--border-soft); background: var(--panel-bg-2);
   color: var(--text-dim); font-size: var(--fs-eyebrow); font-weight: 600;
 }
+/* #798 — a compact, visible cue for a Claude row whose displayed totals come
+   from the same unambiguous retained-facts decision as its model children.
+   It is intentionally neutral: "Retained" identifies the headline evidence
+   without suggesting that a live projection continues from it. */
+.blocks-row .label .blocks-facts-chip {
+  flex: none; white-space: nowrap;
+  padding: 1px 5px; border-radius: var(--radius-pill);
+  border: 1px solid color-mix(in srgb, var(--accent-cyan) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-cyan) 12%, transparent);
+  color: var(--accent-cyan); font-size: var(--fs-eyebrow); font-weight: 700;
+  letter-spacing: 0.03em; text-transform: uppercase;
+}
 
 /* #424 — pooled native-week owners. Match the merged 5-hour row's quiet
    account qualifier while allowing two colliding owners to wrap safely. */
@@ -4425,6 +4452,9 @@ mark.current {
   max-width: 320px;
   z-index: 1000;
 }
+/* #855 — author display rules outrank the user-agent [hidden] rule. Keep the
+   mounted node/timer contract from #207 D8 while removing its physical box. */
+.onboarding-toast[hidden] { display: none; }
 .onboarding-toast-msg { flex: 1; line-height: 1.35; }
 .onboarding-toast-dismiss {
   background: transparent;
@@ -5544,6 +5574,14 @@ mark.current {
      the narrowest widths, where "$/1% vs last week" exceeds an 88px cell. */
   .hero-support .sup-v { white-space: nowrap; }
   .hero-support .sup-l { white-space: normal; overflow-wrap: anywhere; }
+  /* #816 — a long stale age is a status value, not a single token. Let it
+     wrap inside its support cell so the warning stays readable without
+     widening the hero or creating document-level horizontal overflow. */
+  .hero-support .sup-fresh {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
 
   /* #293 S1 (MOBILE-2) — sanctioned secondary lever (spec §3c): tighten ONLY the
      dashboard, unscrolled topbar's inter-row gap so the first board card clears
@@ -5583,6 +5621,23 @@ mark.current {
     overflow-y: auto;
     scrollbar-gutter: stable;
   }
+  /* A retained cue adds one more badge to the phone-width row. Give the
+     timestamp its own line and keep the cost in a separate grid column, so
+     neither the active badge nor the amount can overlap when space is tight. */
+  .blocks-row--retained .meta {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: 8px;
+    align-items: start;
+  }
+  .blocks-row--retained .label {
+    flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .blocks-row--retained .blocks-time {
+    flex: 1 1 100%;
+    order: 1;
+  }
   /* #264 S1: the desktop bento's per-row fixed heights only apply in the
      @media(min-width:900px) block; below that each `.bento-row` is a 1-col
      stack of content-height cards, and `.dash-grid .panel { min-height: 0 }`
@@ -5603,6 +5658,15 @@ mark.current {
     white-space: nowrap;
   }
   .panel-header h2 .sub { font-size: var(--fs-eyebrow); }
+  /* #852: a partial Codex chip otherwise takes the title's last 64px while
+     the three project actions keep their 120px floor. Give the title a full
+     header row and let its count use a second line on narrow phones. */
+  #panel-projects > .panel-header { flex-wrap: wrap; row-gap: 6px; }
+  #panel-projects > .panel-header > div:first-child { flex: 1 1 100%; }
+  #panel-projects > .panel-header h2 .sub {
+    display: block;
+    margin-left: 0;
+  }
   .panel-header .icon,
   .panel-header .chip { flex-shrink: 0; }
   .panel-header .chip { white-space: nowrap; }
@@ -7129,6 +7193,8 @@ mark.current {
   display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
   padding: 4px 0;
 }
+/* Keep each independent radio group in the existing pill-level flex flow. */
+.projects-controls .projects-control-group { display: contents; }
 .projects-controls .pill {
   padding: 3px 10px; border-radius: var(--radius-pill); border: 1px solid var(--border-soft);
   font-size: 11.5px; color: var(--text-dim); cursor: pointer;
@@ -7181,6 +7247,9 @@ mark.current {
 /* #620 S1 D1 — the merged-fold statement. Same treatment on the panel and in
    the modal, so the two surfaces state one rule in one voice. */
 .projects-merged-note { color: var(--text-faint); }
+/* #846 M2 — the Codex metadata retry notice on the All tab, rendered
+   beside the Claude rows rather than replacing the ranking. */
+.projects-metadata-note { color: var(--text-faint); max-width: 68ch; line-height: 1.45; }
 .panel-range-note.projects-merged-note { max-width: 68ch; line-height: 1.45; }
 
 .projects-trend { margin: 8px 0; }
@@ -8355,6 +8424,7 @@ mark.current {
   flex-wrap: wrap;
   gap: var(--space-3);
   margin-top: var(--space-3);
+  position: relative;
   /* #562 — this is the row UNDER the three hero zones, so it owns the full
      hero width. Without an explicit placement the grid auto-placed it in the
      first 1fr phone cell (186px at 390px), forcing every 200px card to stack. */
@@ -8458,6 +8528,14 @@ mark.current {
   font-style: italic;
 }
 
+/* #757 — the phone rail remains directly touch/trackpad scrollable, while its
+   affordance sits above the edge of the content instead of becoming another
+   flex item or adding to the rail's scroll width. It is toggled by the
+   component only while cards remain offscreen. */
+.account-hero-scroll-cue {
+  display: none;
+}
+
 /* #561 — the canonical Claude/Codex usage pair cannot share the 150px phone
    content box at 320px: the 110px primary track left 4px for the 5h metric and
    the grid itself overflowed by 15px. Stack only on the narrowest phones; the
@@ -8500,6 +8578,27 @@ mark.current {
     scroll-snap-align: start;
   }
   .account-hero-caption { white-space: nowrap; }
+  .account-hero-scroll-cue {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    z-index: 1;
+    display: none;
+    align-items: center;
+    padding: 3px 6px;
+    border: 1px solid color-mix(in srgb, var(--accent-blue) 45%, var(--border-soft));
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--panel-bg-2) 90%, transparent);
+    color: var(--accent-blue);
+    font-size: var(--fs-eyebrow);
+    font-weight: 700;
+    line-height: 1.2;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .account-hero-cards[data-scroll-cue="visible"] .account-hero-scroll-cue {
+    display: inline-flex;
+  }
 }
 
 /* Active-source status chip (§6.8) — distinct from the global SyncChip. Reuses
@@ -8848,9 +8947,17 @@ mark.current {
 }
 
 @media (max-width: 640px) {
-  .source-status-chip { max-width: 42vw; }
+  .source-status-chip {
+    max-width: 42vw;
+    white-space: normal;
+    text-overflow: clip;
+  }
   .source-status-label--full { display: none; }
-  .source-status-label--compact { display: inline; }
+  .source-status-label--compact {
+    display: inline;
+    min-width: 0;
+    line-height: 1.2;
+  }
   .panel-body--source-native,
   .source-provider-body {
     max-height: 360px;
@@ -9656,7 +9763,8 @@ mark.current {
 .conv-export-menu {
   position: absolute;
   top: calc(100% + 4px);
-  right: 0;
+  /* The reader clips overflow. Grow into its content, not across the left rail. */
+  left: 0;
   z-index: 30;
   min-width: 220px;
   padding: var(--space-1);
@@ -10992,7 +11100,8 @@ mark.current {
 /* ---- Empty / loading / selection states (#161 F3) ---------------- */
 .conv-reader--empty,
 .conv-reader--loading,
-.conv-reader--error { align-items: center; justify-content: center; }
+.conv-reader--error,
+.conv-reader--degraded { align-items: center; justify-content: center; }
 .conv-state { text-align: center; padding: var(--space-5); max-width: 360px; }
 .conv-state-glyph { opacity: 0.55; display: block; margin-bottom: var(--space-3); line-height: 0; }
 .conv-state-glyph .conv-ico { width: 30px; height: 30px; vertical-align: 0; }
@@ -11061,6 +11170,19 @@ mark.current {
 .conv-paging-indicator--failed {
   color: var(--text);
   border-color: var(--accent-amber);
+}
+.conv-paging-retry {
+  border: 0; background: none; cursor: pointer;
+  padding: 2px 4px;
+  font: inherit; color: var(--text);
+  text-decoration: underline;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+.conv-paging-retry:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--radius-xs);
 }
 .conv-paging-dismiss {
   border: 0; background: none; cursor: pointer;
@@ -12701,6 +12823,11 @@ mark.current {
    hint); a fail-closed error flashes the error color instead of writing raw. */
 .conv-copy-btn-anon { color: var(--accent-blue); }
 .conv-copy-btn-error { color: var(--accent-red, #e5534b); }
+.conv-copy-btn.conv-copy-btn-anon-unavailable {
+  color: var(--accent-red);
+  border-color: color-mix(in srgb, var(--accent-red) 50%, transparent);
+  background: color-mix(in srgb, var(--accent-red) 14%, transparent);
+}
 /* Per-turn message-text copy: hover/focus/keyboard-cursor revealed. */
 .conv-item-actions {
   display: flex;
@@ -12712,7 +12839,8 @@ mark.current {
 }
 .conv-item:hover .conv-item-actions,
 .conv-item:focus-within .conv-item-actions,
-.conv-item--focused .conv-item-actions { opacity: 1; }
+.conv-item--focused .conv-item-actions,
+.conv-item-actions:has(.conv-copy-btn-anon-unavailable) { opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .conv-item-actions { transition: none; }
 }
@@ -13636,7 +13764,11 @@ mark.current {
   }
   /* #217 S5 §4 — export controls honor the same tap-target floor. */
   #root .conv-export-toggle { min-height: 44px; }
-  #root .conv-export-menu { min-width: min(280px, 90vw); }
+  #root .conv-export-menu {
+    min-width: min(280px, 90vw);
+    left: auto;
+    right: 0;
+  }
   #root .conv-export-action { min-height: 44px; }
   /* #217 S5 E4 — the focus "▾ More" menu controls honor the same floor. */
   #root .conv-focus-more-toggle { min-height: 44px; }
@@ -13695,6 +13827,15 @@ mark.current {
      60px: a 2px overlap, and the pill's z-index 5 paints over the indicator's 3.
      Raise the indicator here so the gap at 390px matches the desktop one. */
   #root .conv-paging-indicator { bottom: 70px; }
+  /* Keep the connection error readable beside two reachable touch controls. */
+  #root .conv-paging-indicator--failed { width: calc(100% - 32px); box-sizing: border-box; }
+  #root .conv-paging-indicator--failed .conv-paging-label { min-width: 0; flex: 1; }
+  #root .conv-paging-retry,
+  #root .conv-paging-dismiss {
+    min-width: 44px; min-height: 44px;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 auto;
+  }
   #root .conv-hidden-run { min-height: 44px; }
   #root .conv-loadfull-btn { min-height: 44px; }
   #root .conv-native-raw-btn,

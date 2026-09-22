@@ -3922,7 +3922,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             five_hour_percent, as_of=None, commit=True,
                             ctx=None, account_key=_lib_accounts.UNATTRIBUTED,
                             origin_observation_id=None, capture_at=None,
-                            source=None):
+                            source=None, hold_weekly_axis=False):
     """Detect + record weekly and 5h reset/credit artifacts for one usage
     observation (extracted from ``cmd_record_usage``; DB journal redesign
     §5.2.3).
@@ -3986,6 +3986,10 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
       one value. The weekly branch does not read it: extending source-local
       confirmation to the weekly path would delay the immediate 63-to-0 reset
       that #755 exists to stop delaying.
+    - ``hold_weekly_axis`` (default ``False``): scratch replay's explicit
+      reviewed observation hold. It bypasses weekly reset/credit detection
+      while still running the independent five-hour detector below. Live
+      callers retain the default.
     """
     c = _cctally()
     now_utc = _as_of_or_command(as_of)
@@ -4025,7 +4029,7 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
             "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
             (account_key,),
         ).fetchone()
-        if prior and prior["week_end_at"] and cur_end_canon:
+        if not hold_weekly_axis and prior and prior["week_end_at"] and cur_end_canon:
             prior_end_canon = _canonicalize_optional_iso(
                 prior["week_end_at"], "record.prior"
             )
@@ -7265,6 +7269,13 @@ def _pipeline_claude_usage(ctx, rec):
     if "resets_at" not in payload or "weekly_percent" not in payload:
         return
 
+    # The exact raw observation id is reviewed outside this pipeline. A hold
+    # can only be supplied on scratch replay; live ingest has no event sink.
+    hold_weekly_axis = (
+        ctx.event_sink is not None
+        and rec.get("id") in ctx.held_weekly_observation_ids
+    )
+
     c = _cctally()
     conn = ctx.conn
     # `as_of` is the record's `at` (= `_command_as_of()` at capture, CCTALLY_AS_OF
@@ -7326,6 +7337,20 @@ def _pipeline_claude_usage(ctx, rec):
         except (ValueError, TypeError) as exc:
             eprint(f"[ingest] 5h window-key derivation failed: {exc}")
 
+    import _cctally_journal as jr
+    reviewed_weekly_basis = None
+    if hold_weekly_axis:
+        reviewed_weekly_basis = (
+            ctx.reviewed_weekly_basis_by_account.get(account_key)
+            or jr._latest_weekly_basis(conn, account_key)
+        )
+        if reviewed_weekly_basis is None:
+            import _lib_rederive
+            raise _lib_rederive.RederiveConflict(
+                "reviewed weekly hold has no accepted account basis: "
+                f"{rec['id']}"
+            )
+
     # 1. Reset/credit detection (fold into the cycle txn; Design B suppression).
     c.detect_reset_and_credit(
         conn,
@@ -7350,11 +7375,11 @@ def _pipeline_claude_usage(ctx, rec):
         # #769 S2 §3: the contributor discriminator for five-hour credit
         # confirmation. `payload.source`, never `rec["src"]`.
         source=source,
+        hold_weekly_axis=hold_weekly_axis,
     )
 
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the
     #    snapshot_accept evt (so replay never re-derives it — spec §5.3).
-    import _cctally_journal as jr
     fold = jr._usage_snapshot_fold_decision(conn, {
         "week_start_date": week_start_date,
         "week_start_at": week_start_at,
@@ -7363,10 +7388,11 @@ def _pipeline_claude_usage(ctx, rec):
         "five_hour_percent": five_hour_percent,
         "five_hour_window_key": five_hour_window_key,
         "account_key": account_key,
-    })
-    # #769 S11 (#824). `weekly_held` says the incoming weekly reading
-    # CONTRADICTS the stored one and the weekly axis is held at the stored
-    # maximum; `wrote_row` says whether this tick materialized a snapshot at
+    }, force_weekly_hold=hold_weekly_axis,
+       reviewed_weekly_basis=reviewed_weekly_basis)
+    # #769 S11 (#824). `weekly_held` says the weekly axis is held at the
+    # accepted basis (an ordinary lower clamp or an explicit scratch hold);
+    # `wrote_row` says whether this tick materialized a snapshot at
     # all. They are independent now: a held tick DOES write a row when its
     # five-hour axis carries evidence, and that row is the only place the
     # evidence survives, because `db rebuild` reconstructs open blocks from
@@ -7453,12 +7479,25 @@ def _pipeline_claude_usage(ctx, rec):
         if rowid is None:
             return
         saved["id"] = rowid
+        if ctx.event_sink is not None and not weekly_held:
+            # Keep the most recent accepted weekly source across scratch
+            # records. A later five-hour credit may suppress its snapshot
+            # row, but that independent effect must not erase the reviewed
+            # weekly basis for another held observation.
+            basis = jr._latest_weekly_basis(conn, account_key)
+            if basis is not None:
+                ctx.reviewed_weekly_basis_by_account[account_key] = basis
     else:
+        saved_week_start_date = (
+            fold.weekly.basis.week_start_date
+            if weekly_held and fold.weekly.basis is not None
+            else week_start_date
+        )
         latest = conn.execute(
             "SELECT * FROM weekly_usage_snapshots WHERE week_start_date = ? "
             "  AND account_key = ? "
             "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            (week_start_date, account_key),
+            (saved_week_start_date, account_key),
         ).fetchone()
         if latest is None:
             return  # nothing recorded yet -> nothing to derive against
@@ -7472,10 +7511,9 @@ def _pipeline_claude_usage(ctx, rec):
     #    crosses a $ threshold still derives it.
     #    The one exception is a HELD weekly axis. A no-change tick AGREES with
     #    the stored row, so re-deriving against it is the self-heal; a held
-    #    weekly axis means the incoming 7d percent is strictly BELOW the
-    #    reset-aware in-window maximum,
-    #    so the observation CONTRADICTS `saved` and a weekly milestone derived
-    #    from `saved`'s higher percent records a crossing the meter says did not
+    #    weekly axis means the observation's 7d value was not accepted,
+    #    so it CONTRADICTS `saved` and a weekly milestone derived
+    #    from `saved`'s carried percent can record a crossing the meter did not
     #    happen. That is how the 2026-09-01 incident fabricated a 13% milestone
     #    in a fresh post-credit epoch from a stale pre-credit replica, and
     #    because milestones are forward-only within an epoch that row forecloses

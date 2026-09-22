@@ -107,18 +107,11 @@ function conciseWarningLabel(domain: string | undefined, code?: string): string 
 function compactStatusLabel(label: string): string {
   if (label === 'no successful snapshot yet') return 'No snapshot';
   if (label === 'Source degraded' || label === 'degraded') return 'Degraded';
-  // #563 — the phone-only form must retain the STATE word. The active
-  // source and the full tooltip/accessibility label already carry the subject,
-  // while colour alone cannot disclose partial/unavailable state on touch.
-  if (label === 'Projects partial') return 'Partial';
-  // #556 S1 §4.5 — the compact form keeps the STATE word. The retired
-  // 'Combined stale' -> 'Combined' mapping dropped it, leaving colour as the
-  // only carrier of the state at 390px, where both spans are `aria-hidden` and
-  // the `title` is unreachable by touch. Dropping the subject instead keeps the
-  // chip honest: it sits on the All selection, where the subject is not in
-  // doubt. The ten `WARNING_DOMAIN_LABELS` now take the same state-first path
-  // below, fixing that defect across every warning domain (#563).
+  // #831 — source selection identifies the provider, not the warning domain.
+  // Keep both the domain and state visible on touch screens; the phone chip
+  // wraps the words when necessary. This retains #563's explicit state word.
+  if (label === 'Projects partial' || label.endsWith(' unavailable')) return label;
+  // The combined figure is the one subject already visible in the All hero.
   if (label === 'Combined withheld') return 'Withheld';
-  if (label.endsWith(' unavailable')) return 'Unavailable';
   return label;
 }

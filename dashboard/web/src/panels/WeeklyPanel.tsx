@@ -181,7 +181,7 @@ export function WeeklyPanel() {
                 data-provider-section={group.source}
                 aria-labelledby={`weekly-panel-${group.source}-heading`}
               >
-                <div className="source-provider-head provider-composition-head">
+                <div className="source-provider-head provider-composition-head" data-card-region-ignore>
                   {/* #556 S4 F8 — the section is named by a real heading rather
                       than a competing `aria-label` string. Visually hidden, and
                       absolutely positioned, so it is out of flow and the head's

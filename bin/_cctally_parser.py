@@ -3176,6 +3176,11 @@ def _build_db_parser(subparsers, name, *, help_text, xref=None):
         help="Append the correction batch and rebuild stats.db (default: preview)",
     )
     db_rederive.add_argument(
+        "--reviewed-weekly-decisions",
+        metavar="PATH",
+        help="Review exact Claude weekly observations from a pinned manifest",
+    )
+    db_rederive.add_argument(
         "--json",
         action="store_true",
         help="Emit schemaVersion 1 JSON to stdout",

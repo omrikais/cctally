@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent } from '@testing-library/react';
 import { HeroStrip } from './HeroStrip';
-import { _resetForTests, updateSnapshot, getState } from '../store/store';
+import { _resetForTests, updateSnapshot, getState, dispatch } from '../store/store';
+import { ModalRoot } from '../modals/ModalRoot';
 import type { Envelope } from '../types/envelope';
 
 // Minimal-but-valid envelope with the header + current_week fields the hero
@@ -54,7 +55,7 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     const { container } = render(<HeroStrip />);
     const usage = container.querySelector('.hero-usage') as HTMLElement;
     expect(usage).not.toBeNull();
-    expect(usage.textContent).toContain('WEEK USAGE');
+    expect(usage.textContent).toContain('CYCLE USAGE');
     expect(usage.textContent).toContain('wk Jun 30');
     expect(usage.textContent).toContain('11.0%');
   });
@@ -76,7 +77,7 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     const { container } = render(<HeroStrip />);
     const spent = container.querySelector('.hero-spent') as HTMLElement;
     expect(spent).not.toBeNull();
-    expect(spent.textContent).toContain('SPENT THIS WEEK');
+    expect(spent.textContent).toContain('SPENT THIS CYCLE');
     expect((container.querySelector('.hs-big') as HTMLElement).textContent).toBe('$14.20');
     // $/1% sub keeps 2dp.
     expect(spent.textContent).toContain('$23.40');
@@ -92,11 +93,20 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     expect(val?.textContent).toContain('31%');
   });
 
-  it('support zone: renders the vs-last-week and Snapshot rows', () => {
+  it('support zone: renders the vs-last-cycle and Snapshot rows', () => {
     const { container } = render(<HeroStrip />);
     const support = container.querySelector('.hero-support') as HTMLElement;
-    expect(support.textContent).toContain('$/1% vs last week');
+    expect(support.textContent).toContain('$/1% vs comparable cycle');
     expect(support.textContent).toContain('Snapshot');
+  });
+
+  it('names the Claude cycle in the visual and screen-reader hero labels', () => {
+    const { container } = render(<HeroStrip />);
+    const hero = container.querySelector('.hero-strip') as HTMLElement;
+    const spent = container.querySelector('.hero-spent') as HTMLElement;
+    expect(hero).toHaveAttribute('aria-label', 'Claude cycle usage summary');
+    expect(container.querySelector('h2.sr-only')).toHaveTextContent('Claude cycle usage summary');
+    expect(spent).toHaveAttribute('aria-label', 'Spent this cycle');
   });
 
   it('renders a freshness chip from current_week.freshness', () => {
@@ -177,6 +187,15 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
     expect(getState().openModal).toBe('current-week');
   });
 
+  it('restores focus to the hero region after a nested body click opens its modal', () => {
+    const { container } = render(<><HeroStrip /><ModalRoot /></>);
+    const hero = container.querySelector('.hero-strip') as HTMLElement;
+    fireEvent.click(hero.querySelector('.hs-big') as HTMLElement);
+    expect(getState().openModal).toBe('current-week');
+    act(() => dispatch({ type: 'CLOSE_MODAL' }));
+    expect(document.activeElement).toBe(hero);
+  });
+
   it('opens the Current Week modal on Enter / Space', () => {
     const { container } = render(<HeroStrip />);
     const hero = container.querySelector('.hero-strip') as HTMLElement;
@@ -202,10 +221,10 @@ describe('<HeroStrip /> (#264 S1 — 3 zones)', () => {
   });
 });
 
-// The "vs last week" $/1% delta (#207 B1) — icon-only direction + color + aria,
+// The "vs comparable cycle" $/1% delta (#207 B1) — icon-only direction + color + aria,
 // never a duplicated text arrow. Full direction coverage lives here; the row
 // keeps its `data-metric="vs-last-week"` hook across the #264 3-zone rebuild.
-describe('<HeroStrip /> vs last week metric (#207 B1)', () => {
+describe('<HeroStrip /> vs comparable cycle metric (#207 B1)', () => {
   function metricFor(d: number | null): HTMLElement | null {
     const env = heroEnvelope();
     env.header.vs_last_week_delta = d;
@@ -259,6 +278,8 @@ describe('<HeroStrip /> vs last week metric (#207 B1)', () => {
     expect(cell.querySelector('use')?.getAttribute('href')).toContain('#trending-down');
     expect(cell.querySelector('svg')?.getAttribute('style')).toContain('--accent-green');
     expect(cell.getAttribute('aria-label')?.toLowerCase()).toContain('down');
+    expect(cell.getAttribute('aria-label')).toBe('$/1% down $0.12 versus nearest comparable cycle');
+    expect(cell.textContent).toContain('$/1% vs comparable cycle');
     expect(cell.textContent).toContain('$0.12');
   });
 

@@ -2083,6 +2083,8 @@ def _run_pending_migrations(
                 db_label, db_version=cur_version, max_known=len(registry),
             )
     if cur_version == len(registry):
+        if db_label == "conversations.db":
+            _ensure_codex_session_meta_provenance_index(conn)
         # When the registry is currently empty (today's cache.db case),
         # still leave the schema_migrations table behind so a later
         # transition to len(registry) >= 1 can distinguish populated
@@ -2123,6 +2125,9 @@ def _run_pending_migrations(
         raise ProdMigrationRefused(
             db_label, _first_pending_migration_name(conn, registry, cur_version)
         )
+
+    if db_label == "conversations.db":
+        _ensure_codex_session_meta_provenance_index(conn)
 
     # Track whether schema_migrations existed before this open so we can
     # detect the fresh-install path. After bootstrap, even a "first time
@@ -5473,6 +5478,45 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
     _apply_codex_find_projection_schema(conn)
     _apply_conversation_generation_schema(conn)
     _apply_codex_conversation_source_identity(conn)
+
+
+def _ensure_codex_session_meta_provenance_index(
+    conn: sqlite3.Connection,
+) -> bool:
+    """Ensure the account-scoped anonymization provenance index exists.
+
+    ``codex_conversation_events`` is an append-only physical log and can be
+    much larger than the normalized transcript.  The scoped anonymizer reads
+    only ``session_meta`` payloads, so an index restricted to that record type
+    makes the read proportional to the retained provenance rows rather than
+    every event.  This is an idempotent, data-free schema ensure run by the
+    conversations dispatcher on both its fast and pending paths; keeping the
+    helper here also gives the schema migration layer one stable delivery
+    point for fresh and already-current stores.
+
+    A pre-conversations store may not have the event table yet.  That is a
+    valid no-op; the schema apply creates it before the dispatcher runs.
+    Other SQLite errors propagate so a damaged store cannot silently fall back
+    to a full physical-event scan.
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='codex_conversation_events'"
+    ).fetchone() is None:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='index' AND name='idx_codex_events_session_meta_provenance'"
+    ).fetchone() is not None:
+        return True
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_events_session_meta_provenance "
+        "ON codex_conversation_events("
+        "source_root_key, account_key, conversation_key, payload_json) "
+        "WHERE record_type='session_meta'"
+    )
+    conn.commit()
+    return True
 
 
 #: `cache_meta` keys the stamp backfill uses. The cursor is the durable resume

@@ -1486,6 +1486,10 @@ def test_consecutive_credits_with_idle_between(ns, tmp_path):
             five_hour_window_key=window_key,
             baseline_pct=5.0,
             pending_low_pct=0.0,
+            # Keep Credit 2's arming slot after the seeded Credit 1 slot.
+            # The module-level default can be older than Credit 1 when
+            # this test runs late in the full pytest phase.
+            pending_at_utc=now_utc.isoformat(timespec="seconds"),
         )
         conn.commit()
     finally:

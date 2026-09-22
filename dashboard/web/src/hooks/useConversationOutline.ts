@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchJson, isAbortError } from '../lib/fetchJson';
+import { fetchJson, HttpError, isAbortError } from '../lib/fetchJson';
 import { useSnapshot } from './useSnapshot';
 import { revalToken } from '../lib/revalToken';
-import { conversationEntityUrl } from '../lib/conversationTransport';
+import { conversationDegradedNotice, conversationDegradedReason, conversationEntityUrl, type ConversationDegradedNotice } from '../lib/conversationTransport';
 import { adaptQualifiedOutline, ConversationNormalizationPending } from '../lib/conversationAdapters';
+import { sha256Hex } from '../lib/sha256';
 import {
   conversationRefKey,
   isQualifiedConversationRef,
@@ -35,6 +36,15 @@ type TransferChunk = {
   chunk: string;
 };
 
+class ConversationOutlineDegraded extends Error {
+  constructor(readonly reason: string) { super('Conversation outline store degraded'); }
+}
+
+function assertOutlineAvailable(body: unknown): void {
+  const reason = conversationDegradedReason(body);
+  if (reason) throw new ConversationOutlineDegraded(reason);
+}
+
 function isProgressiveOutline<T>(body: T | ProgressiveOutline<T>): body is ProgressiveOutline<T> {
   return typeof body === 'object' && body !== null
     && (body as { progressive?: unknown }).progressive === 1;
@@ -45,16 +55,6 @@ function decodeBase64(value: string): Uint8Array {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return bytes;
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  // WebCrypto's BufferSource excludes SharedArrayBuffer in the pinned DOM
-  // types. Copy into an owned ArrayBuffer so both browser bytes and the
-  // compile-time contract are unambiguous.
-  const owned = new Uint8Array(bytes.byteLength);
-  owned.set(bytes);
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', owned.buffer);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function throwIfAborted(signal: AbortSignal) {
@@ -104,7 +104,7 @@ async function hydrateOutlineTransfer<T>(
     let offset = 0;
     for (const part of parts) { all.set(part, offset); offset += part.length; }
     if (sha256 === undefined || !/^[0-9a-f]{64}$/.test(sha256)
-        || await sha256Hex(all) !== sha256) {
+        || await sha256Hex(all, signal) !== sha256) {
       throw new Error('Invalid outline digest');
     }
     return JSON.parse(new TextDecoder().decode(all)) as T;
@@ -146,6 +146,8 @@ export function useConversationOutline(
   const [outline, setOutline] = useState<ConversationOutline | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
+  const [notFound, setNotFound] = useState(false);
   const identityRef = useRef(identityKey);
   const conversationRefRef = useRef<ConversationRef | null>(conversationRef);
   const outlineRef = useRef<ConversationOutline | null>(null);
@@ -178,6 +180,7 @@ export function useConversationOutline(
           controller.signal,
         );
         if (!ownsRequest()) return;
+        assertOutlineAvailable(raw);
         const progressive = isProgressiveOutline(raw);
         const summaryRaw = progressive ? raw.summary : raw;
         let body: ConversationOutline;
@@ -185,18 +188,20 @@ export function useConversationOutline(
           body = adaptQualifiedOutline(ref, summaryRaw);
           if (!ownsRequest()) return;
           outlineRef.current = body;
-          setOutline(body); setError(null); setLoading(false);
+          setOutline(body); setError(null); setDegraded(null); setNotFound(false); setLoading(false);
         }
 
         const fullRaw = progressive
           ? await hydrateOutlineTransfer<RawQualified>(raw.transfer, controller.signal)
           : summaryRaw as RawQualified;
+        assertOutlineAvailable(fullRaw);
         const rawPrompts = ref.source === 'claude'
           ? await fetchJson<{ prompts?: { item_key: string; text: string }[] }>(
               conversationEntityUrl(ref, 'prompts'),
               controller.signal,
             )
           : null;
+        assertOutlineAvailable(rawPrompts);
         body = adaptQualifiedOutline(
           ref,
           fullRaw,
@@ -205,13 +210,19 @@ export function useConversationOutline(
         );
         if (!ownsRequest()) return;
         outlineRef.current = body;
-        setOutline(body); setError(null); setLoading(false);
+        setOutline(body); setError(null); setDegraded(null); setNotFound(false); setLoading(false);
       } else {
-        const raw = await fetchJson<ConversationOutline | ProgressiveOutline<ConversationOutline>>(
+        const raw = await fetchJson<ConversationOutline | ProgressiveOutline<ConversationOutline> | { status: 'not_found' }>(
           outlineUrl,
           controller.signal,
         );
         if (!ownsRequest()) return;
+        assertOutlineAvailable(raw);
+        if ('status' in raw && raw.status === 'not_found') {
+          outlineRef.current = null;
+          setOutline(null); setError(null); setDegraded(null); setNotFound(true); setLoading(false);
+          return;
+        }
         const progressive = isProgressiveOutline(raw);
         let body: ConversationOutline;
         if (progressive) {
@@ -219,15 +230,16 @@ export function useConversationOutline(
             body = raw.summary;
             if (!ownsRequest()) return;
             outlineRef.current = body;
-            setOutline(body); setError(null); setLoading(false);
+            setOutline(body); setError(null); setDegraded(null); setNotFound(false); setLoading(false);
           }
           body = await hydrateOutlineTransfer<ConversationOutline>(raw.transfer, controller.signal);
+          assertOutlineAvailable(body);
         } else {
-          body = raw;
+          body = raw as ConversationOutline;
         }
         if (!ownsRequest()) return;
         outlineRef.current = body;
-        setOutline(body); setError(null); setLoading(false);
+        setOutline(body); setError(null); setDegraded(null); setNotFound(false); setLoading(false);
       }
     } catch (e) {
       // A session switch aborts the obsolete progressive transfer. Only a
@@ -235,6 +247,19 @@ export function useConversationOutline(
       // banner; aborts and stale generations are silent.
       if (isAbortError(e)) return;
       if (!ownsRequest()) return;
+      if (e instanceof ConversationOutlineDegraded) {
+        outlineRef.current = null;
+        setOutline(null); setError(null); setDegraded(conversationDegradedNotice(e.reason)); setNotFound(false); setLoading(false);
+        return;
+      }
+      if (!isQualifiedConversationRef(ref) && e instanceof HttpError && e.status === 404) {
+        // Older servers still use a 404 for an absent progressive preflight.
+        // A non-404 failure remains visible as an actual outline error.
+        outlineRef.current = null;
+        setOutline(null); setError(null); setDegraded(null); setNotFound(true); setLoading(false);
+        return;
+      }
+      setDegraded(null);
       setError(e instanceof ConversationNormalizationPending
         ? 'Conversation indexing is still finishing.'
         : "Couldn't load the outline."); setLoading(false);
@@ -258,7 +283,7 @@ export function useConversationOutline(
     // new request's flags, while aborting stops obsolete progressive chunks.
     fetchingRef.current = false;
     pendingRef.current = false;
-    setOutline(null); setError(null);
+    setOutline(null); setError(null); setDegraded(null); setNotFound(false);
     if (!conversationRef) { setLoading(false); return; }
     setLoading(true);
     void refetch();
@@ -296,5 +321,5 @@ export function useConversationOutline(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [growthNonce]);
 
-  return { outline, loading, error };
+  return { outline, loading, error, degraded, notFound };
 }

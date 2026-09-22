@@ -12,6 +12,52 @@ interface ActiveTrap {
 // topmost overlay won.
 const activeTraps: ActiveTrap[] = [];
 
+// A pointer click on a card's descriptive body does not focus the region: it
+// has role=region and no tab stop. Capture the opening click before React's
+// handler dispatches OPEN_MODAL, then restore to that card's real Expand button.
+// Explicit controls and focusable data rows restore to themselves. This also
+// covers modal openers outside cards without requiring each caller to thread a
+// trigger id through every modal implementation.
+interface OpeningClick {
+  trigger: HTMLElement | null;
+  panelKind: string | null;
+}
+let openingClick: OpeningClick | null = null;
+let openingClickSequence = 0;
+
+if (typeof document !== 'undefined') {
+  document.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const panel = target.closest<HTMLElement>('[data-panel-kind]');
+    const control = target.closest<HTMLElement>(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [role="button"][tabindex]:not([tabindex="-1"])',
+    );
+    openingClick = {
+      trigger: control ?? panel?.querySelector<HTMLElement>('.panel-expand:not([disabled])')
+        ?? target.closest<HTMLElement>('[data-hero-strip][tabindex]') ?? null,
+      panelKind: panel?.getAttribute('data-panel-kind') ?? null,
+    };
+    const sequence = ++openingClickSequence;
+    // The candidate belongs only to this activation, never a later hotkey or
+    // programmatic open. Store subscribers mount modal effects synchronously.
+    setTimeout(() => {
+      if (sequence === openingClickSequence) openingClick = null;
+    }, 0);
+  }, true);
+}
+
+function panelExpand(kind: string | null): HTMLElement | null {
+  if (!kind) return null;
+  const panel = Array.from(document.querySelectorAll<HTMLElement>('[data-panel-kind]'))
+    .find((element) => element.getAttribute('data-panel-kind') === kind);
+  return panel?.querySelector<HTMLElement>('.panel-expand:not([disabled])') ?? null;
+}
+
+function canRestoreFocus(element: HTMLElement | null): element is HTMLElement {
+  return !!element && document.contains(element) && !element.hasAttribute('disabled') && !isHidden(element);
+}
+
 const FOCUSABLE_SELECTOR = [
   'a[href]',
   'button:not([disabled])',
@@ -61,7 +107,7 @@ export interface UseModalFocusOptions {
   active: boolean;
   /** Is this surface the topmost focus-managed layer (drives the Tab-trap). Default true. */
   trapEnabled?: boolean;
-  /** Optional id of the trigger to restore to; falls back to document.activeElement at open. */
+  /** Optional durable id of the trigger to restore to; falls back to the opening click or active element. */
   triggerId?: string;
   /**
    * Where to move focus on open. Default `'first'` focuses the first focusable
@@ -93,9 +139,14 @@ export function useModalFocus(
   // so suspending under a higher layer never triggers a spurious restore.
   useEffect(() => {
     if (!active) return;
+    const clicked = openingClick;
+    openingClick = null;
     const trigger =
       (triggerId ? document.getElementById(triggerId) : null) ??
+      clicked?.trigger ??
       (document.activeElement as HTMLElement | null);
+    const triggerElementId = trigger?.id || null;
+    const panelKind = clicked?.panelKind ?? trigger?.closest('[data-panel-kind]')?.getAttribute('data-panel-kind') ?? null;
     const container = containerRef.current;
     if (container) {
       if (initialFocus === 'container') {
@@ -116,8 +167,14 @@ export function useModalFocus(
       }
     }
     return () => {
-      if (trigger && typeof trigger.focus === 'function' && document.contains(trigger)) {
-        trigger.focus();
+      const restore = [
+        triggerId ? document.getElementById(triggerId) : null,
+        trigger,
+        triggerElementId ? document.getElementById(triggerElementId) : null,
+        panelExpand(panelKind),
+      ].find(canRestoreFocus);
+      if (restore) {
+        restore.focus();
       } else {
         const activeEl = document.activeElement as HTMLElement | null;
         if (activeEl && typeof activeEl.blur === 'function') activeEl.blur();

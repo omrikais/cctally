@@ -192,6 +192,7 @@ Data
         qualified_rows: 0
         missing_conversation_key_rows: 0
         missing_thread_join_rows: 0
+        undecodable_metadata_rows: 0
         incomplete_rows: 0
   ✓ Codex orphan pruning     no refused prune
       details:

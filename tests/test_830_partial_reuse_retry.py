@@ -7,6 +7,7 @@ instants, so nothing here reads a wall clock and no test is time-dependent.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 import pytest
@@ -574,3 +575,79 @@ def test_830_idle_reuse_admits_a_bundle_with_no_carrier_at_all():
     """
     tui, bundle = _idle_bundle(None)
     assert tui._tui_source_bundle_can_idle(bundle) is True
+
+
+# === #846 A14 — the retry kernel is never consulted for a retryable carrier ==
+
+
+def test_846_a14_the_carrier_refuses_before_the_retry_kernel_is_consulted():
+    """A14. A transient generation publishes the warning code
+    `codex_metadata_incomplete`, which `bin/_lib_source_retry.py` normalizes to
+    the retainable cause `metadata_incomplete`; the second tick therefore
+    retained the transient generation for up to `PARTIAL_RETRY_INTERVAL` while
+    the chip promised a retry that never came.
+
+    `_tui_retain_refused_partial` now consults the CARRIER first, so
+    `plan_partial_retry` is never reached for such a generation. The kernel
+    itself is unchanged, which is what the rest of this module pins."""
+    import _cctally_tui as tui
+
+    prior = lds.SourceDashboardState(
+        source="codex",
+        availability="partial",
+        freshness="fresh",
+        warnings=(
+            lds.SourceDashboardWarning(
+                "codex_metadata_incomplete",
+                "Codex project metadata could not be read for this build; it "
+                "will retry on the next refresh.",
+                "projects",
+            ),
+        ),
+        data_version="retain-v1",
+        last_success_at=None,
+        capabilities={},
+        data={"hero": {}},
+        metadata_health=lds.build_metadata_health("transient_read_failure"),
+    )
+    consulted: list[object] = []
+    original = tui.plan_partial_retry
+
+    def _record(*args, **kwargs):
+        consulted.append(kwargs)
+        return original(*args, **kwargs)
+
+    tui.plan_partial_retry = _record
+    tui._tui_reset_partial_retry_state()
+    try:
+        retained = tui._tui_retain_refused_partial(
+            prior, provider="codex",
+            now_utc=dt.datetime(2026, 9, 13, 12, tzinfo=UTC),
+            data_version="retain-v1",
+        )
+    finally:
+        tui.plan_partial_retry = original
+    assert retained is False
+    assert consulted == [], (
+        "the retry kernel was consulted for a retryable carrier, so the "
+        "transient generation can still be retained for up to the retry "
+        "interval")
+
+    # The counterexample: a MALFORMED partial is still the kernel's business,
+    # because its cause is deterministic and throttling a repeat is correct.
+    malformed = dataclasses.replace(
+        prior,
+        metadata_health=lds.build_metadata_health(
+            "malformed_row_partial", incomplete_rows=1),
+    )
+    tui.plan_partial_retry = _record
+    tui._tui_reset_partial_retry_state()
+    try:
+        tui._tui_retain_refused_partial(
+            malformed, provider="codex",
+            now_utc=dt.datetime(2026, 9, 13, 12, tzinfo=UTC),
+            data_version="retain-v1",
+        )
+    finally:
+        tui.plan_partial_retry = original
+    assert consulted, "the kernel must still decide a deterministic partial"

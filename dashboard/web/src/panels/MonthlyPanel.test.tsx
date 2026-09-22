@@ -4,7 +4,7 @@
 // (whole-section click AND the ⤢ ExpandButton), and its ShareIcon dispatches
 // openShareModal('monthly').
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MonthlyPanel } from './MonthlyPanel';
 import { _resetForTests, dispatch, getState, updateSnapshot } from '../store/store';
@@ -107,6 +107,22 @@ describe('<MonthlyPanel /> (#264 S2)', () => {
     dispatch({ type: 'CLOSE_MODAL' });
     fireEvent.click(screen.getByRole('button', { name: 'Open Monthly' }));
     expect(getState().openModal).toBe('monthly');
+  });
+
+  it('keeps All provider section labels inert while a card-body click still opens', () => {
+    updateSnapshot({ ...baseEnvelope(), ...makeSourceEnvelope() } as unknown as Envelope);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    try {
+      const { container } = render(<MonthlyPanel />);
+      const heading = container.querySelector('.monthly-provider-section .provider-composition-head') as HTMLElement;
+      expect(heading).toBeTruthy();
+      fireEvent.click(heading);
+      expect(getState().openModal).toBeNull();
+      fireEvent.click(container.querySelector('#panel-monthly') as HTMLElement);
+      expect(getState().openModal).toBe('monthly');
+    } finally {
+      act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' }));
+    }
   });
 
   it('the ShareIcon dispatches openShareModal("monthly")', () => {

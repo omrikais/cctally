@@ -76,6 +76,11 @@ export function PeriodDetailCard({
     periodNoun ?? (variant === 'weekly' ? 'week' :
     variant === 'monthly' ? 'month' : 'day');
   const weeklyWindowLabel = windowLabel ?? 'Subscription window';
+  // Claude's legacy daily row may have no source even under All. The detail
+  // legs identify a one-provider day without changing the retained row.
+  const singleProvider = providerLegs?.claude && !providerLegs.codex ? 'claude'
+    : providerLegs?.codex && !providerLegs.claude ? 'codex' : null;
+  const visibleSource = singleProvider ?? (row.source !== 'all' ? row.source : null);
   // "Today" for daily; "Now" for weekly/monthly. Only rendered when
   // is_current is true (today's date / current week / current month).
   const currentLabel = variant === 'daily' ? 'Today' : 'Now';
@@ -83,12 +88,12 @@ export function PeriodDetailCard({
     <div className={`detail-card ${accentClass}`}>
       <div className="head">
         <div className="big">
-          {row.source != null && row.source !== 'all' && (
+          {visibleSource != null && (
             <span
-              className={`source-chip source-chip--${row.source}`}
-              data-period-source={row.source}
+              className={`source-chip source-chip--${visibleSource}`}
+              data-period-source={visibleSource}
             >
-              {row.source === 'claude' ? 'Claude' : 'Codex'}
+              {visibleSource === 'claude' ? 'Claude' : 'Codex'}
             </span>
           )}
           {row.label}
@@ -108,7 +113,11 @@ export function PeriodDetailCard({
         </div>
       )}
       <ModelCostBars rows={row.models.map((m) => ({ model: m.model, cost_usd: m.cost_usd, label: m.display }))} />
-      {providerLegs && <DailyProviderLegs legs={providerLegs} />}
+      {/* A single-provider day keeps its native model rows under All. Its
+          source chip and cost bars already give the complete breakdown;
+          rendering the legs would repeat every model chip and add an empty
+          sibling. A merged day has no model rows and needs both legs. */}
+      {providerLegs && !singleProvider && <DailyProviderLegs legs={providerLegs} />}
 
       <div className="tokens-row">
         {row.codex_tokens ? (

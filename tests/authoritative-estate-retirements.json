@@ -1573,6 +1573,192 @@
           "to": "tests/test_stats_connector_inventory_778.py::test_every_custom_connector_forwards_the_cache_option[_cctally_journal.py:_open_publication_connection:lambda:1]"
         }
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0159",
+      "predecessorDigest": "94d437e8358d4657e6d0c1ea9c95b0f9298254b4f65fcaf06272288d90399647",
+      "profile": "public",
+      "reason": "#846 A13 required the recovery sequences to be driven through real TUI ticks, and the row's \"Not satisfied by\" column excludes a builder-only test. This node was builder-only, covered the transient sequence alone and called `_tui_reset_partial_retry_state()` immediately before its single retention call, so no retry key was ever armed and \"the armed retry key is cleared\" was never observed. Its coverage is replaced, and widened, by tests/test_846_tui_metadata_ticks.py::test_846_a13_healthy_transient_healthy_through_the_tick and ::test_846_a13_healthy_malformed_healthy_through_the_tick, which drive both sequences through `_tui_build_source_bundle` with a key armed before the recovery tick. No assertion left the estate.",
+      "rows": [
+        "tests/test_dashboard_source_read_model.py::test_846_a13_recovery_is_complete_and_the_next_publish_rebuilds"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0163",
+      "predecessorDigest": "51095e2a257e3f608b6172ad41cc6010527645bb0f34b704e915f0863501a8bb",
+      "profile": "public",
+      "reason": "#852 changes the old asserted behavior: a refused token operand no longer fails the Codex provider outright. The replacement parametrized test_852_malformed_accounting_row_is_counted_and_good_project_survives covers both capture and direct publication with retained valid project cost, exact nonretryable count, reader/probe agreement, and malformed token and timestamp shapes. Retaining the old node would require asserting the defect again, so its identity is retired rather than relabeled.",
+      "rows": [
+        "tests/test_828_metadata_probe.py::test_845_a20_an_unusable_token_operand_still_fails_the_provider_outright"
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "renamed",
+      "id": "R-0165",
+      "predecessorDigest": "e79d8eb500917d78ef2f42b4a3b35cad19324b2fca43cdb235abba48abdc8e98",
+      "profile": "public",
+      "reason": "#831 strengthens the existing compact warning checks: the browser case now requires the visible warning domain as well as state, and the ten existing component cases assert both words instead of only Unavailable. Each old node has a direct successor with the same domain and stronger copy assertion; the new accounts case is additional coverage.",
+      "renames": [
+        {
+          "from": "playwright::chromium::issues-561-563-mobile-hero.spec.ts::#563 \u2014 every 390px domain warning keeps a visible state word",
+          "to": "playwright::chromium::issues-561-563-mobile-hero.spec.ts::#831 \u2014 every 390px domain warning visibly names its domain and state"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact alerts warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the alerts domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact budget warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the budget domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact daily warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the daily domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact forensics warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the forensics domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact hero warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the hero domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact monthly warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the monthly domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact projects warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the projects domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact quota warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the quota domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact sessions warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the sessions domain and unavailable state in compact copy"
+        },
+        {
+          "from": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact weekly warning",
+          "to": "vitest::src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the weekly domain and unavailable state in compact copy"
+        }
+      ]
+    },
+    {
+      "axis": "frontendTests",
+      "cause": "renamed",
+      "id": "R-0167",
+      "predecessorDigest": "aa50337f98f431ce885078c261b1adf567b0e5d2363d3be5978ef50f8ba13534",
+      "profile": "public",
+      "reason": "#773 changes Claude's visible period from a week to a billing cycle. The eight prior test identities are renamed to assert the truthful cycle and comparable-cycle copy; each successor retains or strengthens the same rendering and delta behavior, including null operands and direction. None of these checks is removed.",
+      "renames": [
+        {
+          "from": "vitest::src/components/HeroStrip.source.test.tsx::HeroStrip \u2014 Claude unchanged (default source) > keeps the subscription-week vocabulary under Claude",
+          "to": "vitest::src/components/HeroStrip.source.test.tsx::HeroStrip \u2014 Claude cycle vocabulary (default source) > keeps the subscription-cycle vocabulary under Claude"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > support zone: renders the vs-last-week and Snapshot rows",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > support zone: renders the vs-last-cycle and Snapshot rows"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > renders NO delta when the rate operand is absent",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > renders NO delta when the rate operand is absent"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > still renders the delta when the rate IS present \u2014 the guard is not a blanket",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > still renders the delta when the rate IS present \u2014 the guard is not a blanket"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > renders an em-dash value (no icon) when the delta is null",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > renders an em-dash value (no icon) when the delta is null"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > cheaper (negative) \u2192 green + trending-down",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > cheaper (negative) \u2192 green + trending-down"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > costlier (positive) \u2192 red + trending-up",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > costlier (positive) \u2192 red + trending-up"
+        },
+        {
+          "from": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > flat (|\u0394| < 0.02) \u2192 dim + minus",
+          "to": "vitest::src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > flat (|\u0394| < 0.02) \u2192 dim + minus"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0169",
+      "predecessorDigest": "ee32a067376dd068aa687e5a65d7d9d74756411f7fa7bc5506d503610c075ea0",
+      "profile": "public",
+      "reason": "The CI migration makes the receipt gate self-hosted in the private repository while preserving a hosted public classifier. The prior test names promised that the receipt gate was hosted and that the release classifier was globally unguarded; those claims are no longer true. Their successors retain the job-existence and public-classifier checks, and the new routing tests assert the private, public, and fork destinations. No test coverage was retired.",
+      "renames": [
+        {
+          "from": "tests/test_ci_receipt_gate.py::test_the_receipt_gate_job_exists_and_is_hosted",
+          "to": "tests/test_ci_receipt_gate.py::test_the_receipt_gate_job_exists"
+        },
+        {
+          "from": "tests/test_ci_receipt_gate.py::test_the_release_classifier_stays_deliberately_unguarded",
+          "to": "tests/test_ci_receipt_gate.py::test_the_release_classifier_keeps_the_public_mirror_but_refuses_private_forks"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0171",
+      "predecessorDigest": "fded8cd5bf2ee6a178adf9514eedec66ed918f60e4700787ca3f81f2482e9c5d",
+      "profile": "public",
+      "reason": "The diagnosis deadline regression was renamed because this correction reverses the behavior it pinned: a nonterminating producer is now forcibly retired and a later diagnosis recovers through the same sole slot. The successor retains the same deadline, coalesced-waiter and recovery coverage while asserting the corrected producer lifetime; no coverage was removed.",
+      "renames": [
+        {
+          "from": "tests/test_620_s2_diagnosis_route.py::test_diagnosis_deadline_releases_waiters_but_not_stuck_producer_slot",
+          "to": "tests/test_620_s2_diagnosis_route.py::test_diagnosis_deadline_retires_stuck_producer_and_recovers"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0173",
+      "predecessorDigest": "9637dcdd6ec9e548ddcf255eb1ef50bf374cacbe7d28b072f6042b875f5d570b",
+      "profile": "public",
+      "reason": "OpenAI applies its above-272K rates to the full qualifying request, so the Sol long-context regression now expects the corrected standard and Fast totals rather than the old per-axis band totals. Adding Opus 5.5 to the current-generation vendor-rate cases shifts Sonnet 5's generated parameter ordinal by one. The three successor nodes keep or strengthen the same assertions; no coverage was removed.",
+      "renames": [
+        {
+          "from": "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[fast-1.752]",
+          "to": "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[fast-3.08]"
+        },
+        {
+          "from": "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[standard-0.876]",
+          "to": "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[standard-1.54]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates7]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0175",
+      "predecessorDigest": "a4beeeeeb38bd66931f6c35ded11ca439c1415c69e876ddbc8445ce804d7f25d",
+      "profile": "public",
+      "reason": "The merge also compares the resulting estate to the updated main parent at f541356, not only to the pricing branch. Main recorded Sonnet 5 at generated parameter ordinal rates7; adding Opus 5.5 ahead of it shifts the same vendor-rate case to rates8. The assertion and model remain present, so this declaration binds the rename to main's distinct predecessor digest without retiring coverage.",
+      "renames": [
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates7]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]"
+        }
+      ]
     }
   ],
   "schemaVersion": 1

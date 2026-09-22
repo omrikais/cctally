@@ -1485,19 +1485,33 @@ def _check_data_codex_project_metadata(s: DoctorState) -> CheckResult:
     qualified_rows = int(health.get("qualified_rows", 0))
     missing_key_rows = int(health.get("missing_conversation_key_rows", 0))
     missing_join_rows = int(health.get("missing_thread_join_rows", 0))
-    incomplete_rows = missing_key_rows + missing_join_rows
+    # #845 §4.3: a third reason, counted all-history like the other two. The
+    # key is additive, so an older consumer reading this JSON keeps working.
+    undecodable_rows = int(health.get("undecodable_metadata_rows", 0))
+    malformed_accounting_rows = int(
+        health.get("malformed_accounting_rows", 0))
+    incomplete_rows = (
+        missing_key_rows + missing_join_rows + undecodable_rows
+        + malformed_accounting_rows)
     details = {
         "total_rows": total_rows,
         "qualified_rows": qualified_rows,
         "missing_conversation_key_rows": missing_key_rows,
         "missing_thread_join_rows": missing_join_rows,
+        "undecodable_metadata_rows": undecodable_rows,
         "incomplete_rows": incomplete_rows,
     }
+    if malformed_accounting_rows:
+        details["malformed_accounting_rows"] = malformed_accounting_rows
     if incomplete_rows:
         return CheckResult(
             id="data.codex_project_metadata", title="Codex project metadata",
             severity="warn",
-            summary=f"{incomplete_rows} accounting row(s) need metadata repair",
+            summary=(
+                f"{incomplete_rows} accounting row(s) need repair"
+                if malformed_accounting_rows else
+                f"{incomplete_rows} accounting row(s) need metadata repair"
+            ),
             remediation="Run `cctally cache-sync --source codex --rebuild`.",
             details=details,
         )

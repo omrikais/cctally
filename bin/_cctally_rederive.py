@@ -62,6 +62,9 @@ class RederivePreview:
     # #374: the quarantined same-revision groups this plan will resolve by
     # forcing a revision advance. Additive; empty on a clean journal.
     journal_conflicts: tuple = ()
+    reviewed_decision_id: "str | None" = None
+    baseline_plan: "_lib_rederive.RederivePlan | None" = None
+    baseline_plan_guard: "dict | None" = None
 
 
 @dataclass(frozen=True)
@@ -259,9 +262,405 @@ def _rederivable_raw_records(records: list[dict]) -> list[dict]:
             continue
         kind = (record.get("payload") or {}).get("kind")
         if kind in {"weekly_credit_floor", "account_observe",
-                    "account_label", "accounts_cutover", "sync_week"}:
+                    "account_label", "accounts_cutover", "sync_week",
+                    "claude_weekly_observation_decision"}:
             out.append(record)
     return out
+
+
+_REVIEWED_WEEKLY_KIND = "claude_weekly_observation_decision"
+_REVIEWED_MANIFEST_KEYS_V1 = frozenset({
+    "schemaVersion", "journalHighWater", "journalPrefixHash",
+    "reviewedAt", "reason", "decisions",
+})
+_REVIEWED_MANIFEST_KEYS_V2 = frozenset({
+    "schemaVersion", "journalHighWater", "journalPrefixHash",
+    "reviewedAt", "reason", "weeklyAxisDecisions",
+    "snapshotIdentityDecisions",
+})
+_REVIEWED_MANIFEST_EXPECTATION_KEYS = frozenset({
+    "expectedBaselinePlanHash", "expectedDecisionPlanHash",
+})
+_REVIEWED_OP_EXPECTATION_KEYS = frozenset({
+    "expected_baseline_plan_hash", "expected_decision_plan_hash",
+})
+_REVIEWED_OP_KEYS_V1 = frozenset({
+    "kind", "schema_version", "journal_high_water",
+    "journal_prefix_hash", "reason", "decisions",
+}) | _REVIEWED_OP_EXPECTATION_KEYS
+_REVIEWED_OP_KEYS_V2 = frozenset({
+    "kind", "schema_version", "journal_high_water",
+    "journal_prefix_hash", "reason", "weekly_axis_decisions",
+    "snapshot_identity_decisions",
+}) | _REVIEWED_OP_EXPECTATION_KEYS
+
+
+def _reviewed_weekly_op_from_manifest(path) -> dict:
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise _lib_rederive.RederiveConflict(
+            f"invalid reviewed weekly decision manifest: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision manifest has unexpected fields"
+        )
+    version = manifest.get("schemaVersion")
+    expected_keys = (
+        _REVIEWED_MANIFEST_KEYS_V1 if version == 1
+        else _REVIEWED_MANIFEST_KEYS_V2 if version == 2
+        else None
+    )
+    actual_keys = set(manifest)
+    if (expected_keys is None
+            or actual_keys not in (
+                expected_keys,
+                expected_keys | _REVIEWED_MANIFEST_EXPECTATION_KEYS,
+            )):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision manifest requires schemaVersion 1 or 2"
+        )
+    for key in _REVIEWED_MANIFEST_EXPECTATION_KEYS & actual_keys:
+        value = manifest[key]
+        if (not isinstance(value, str) or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in value[7:])):
+            raise _lib_rederive.RederiveConflict(
+                f"reviewed weekly decision manifest has invalid {key}"
+            )
+    hw = manifest["journalHighWater"]
+    if (not isinstance(hw, dict) or set(hw) != {"segment", "offset"}
+            or not isinstance(hw["segment"], str) or not hw["segment"]
+            or type(hw["offset"]) is not int or hw["offset"] < 0):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision manifest has invalid journalHighWater"
+        )
+    digest = manifest["journalPrefixHash"]
+    if (not isinstance(digest, str) or len(digest) != 71
+            or not digest.startswith("sha256:")
+            or any(ch not in "0123456789abcdef" for ch in digest[7:])):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision manifest has invalid journalPrefixHash"
+        )
+    reviewed_at = manifest["reviewedAt"]
+    if not isinstance(reviewed_at, str):
+        raise _lib_rederive.RederiveConflict("reviewedAt must be UTC ISO-Z")
+    try:
+        parsed = dt.datetime.fromisoformat(reviewed_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _lib_rederive.RederiveConflict(
+            "reviewedAt must be UTC ISO-Z"
+        ) from exc
+    if (parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0)
+            or parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
+            != reviewed_at):
+        raise _lib_rederive.RederiveConflict("reviewedAt must be UTC ISO-Z")
+    reason = manifest["reason"]
+    if not isinstance(reason, str) or not reason.strip() or reason != reason.strip():
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision reason must be nonempty"
+        )
+    decisions = (
+        manifest["decisions"] if version == 1
+        else manifest["weeklyAxisDecisions"]
+    )
+    identity_decisions = (
+        [] if version == 1 else manifest["snapshotIdentityDecisions"]
+    )
+    if (not isinstance(decisions, list)
+            or not isinstance(identity_decisions, list)
+            or not decisions and not identity_decisions):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decisions must select at least one decision"
+        )
+    seen = set()
+    normalized = []
+    for item in decisions:
+        if (not isinstance(item, dict)
+                or set(item) != {"observationId", "disposition"}
+                or not isinstance(item["observationId"], str)
+                or not item["observationId"]
+                or item["disposition"] not in ("hold", "accept")):
+            raise _lib_rederive.RederiveConflict(
+                "reviewed weekly decision entry is malformed"
+            )
+        obs_id = item["observationId"]
+        if obs_id in seen:
+            raise _lib_rederive.RederiveConflict(
+                f"duplicate reviewed weekly observation: {obs_id}"
+            )
+        seen.add(obs_id)
+        normalized.append({
+            "observationId": obs_id,
+            "disposition": item["disposition"],
+        })
+    identity_ids = set()
+    normalized_identity = []
+    for item in identity_decisions:
+        if (not isinstance(item, dict)
+                or set(item) != {
+                    "acceptedObservationId", "replayObservationId",
+                    "disposition",
+                }
+                or not all(
+                    isinstance(item[key], str) and item[key]
+                    for key in (
+                        "acceptedObservationId", "replayObservationId",
+                    )
+                )
+                or item["disposition"] not in ("preserve", "rederive")
+                or item["acceptedObservationId"] == item["replayObservationId"]
+                or item["acceptedObservationId"] in identity_ids
+                or item["replayObservationId"] in identity_ids):
+            raise _lib_rederive.RederiveConflict(
+                "snapshot identity decision is malformed, repeated, or ambiguous"
+            )
+        identity_ids.update((
+            item["acceptedObservationId"], item["replayObservationId"],
+        ))
+        normalized_identity.append(dict(item))
+    payload = {
+        "kind": _REVIEWED_WEEKLY_KIND,
+        "schema_version": version,
+        "journal_high_water": dict(hw),
+        "journal_prefix_hash": digest,
+        "reason": reason,
+    }
+    if version == 1:
+        payload["decisions"] = sorted(
+            normalized, key=lambda item: item["observationId"])
+    else:
+        payload["weekly_axis_decisions"] = sorted(
+            normalized, key=lambda item: item["observationId"])
+        payload["snapshot_identity_decisions"] = sorted(
+            normalized_identity,
+            key=lambda item: (
+                item["acceptedObservationId"], item["replayObservationId"],
+            ),
+        )
+    if _REVIEWED_MANIFEST_EXPECTATION_KEYS <= actual_keys:
+        payload.update({
+            "expected_baseline_plan_hash": (
+                manifest["expectedBaselinePlanHash"]
+            ),
+            "expected_decision_plan_hash": (
+                manifest["expectedDecisionPlanHash"]
+            ),
+        })
+    op = _lib_journal.make_op(
+        at=reviewed_at,
+        src="rederive",
+        payload=payload,
+    )
+    if len(_lib_journal.encode_line(op)) > _journal._MAX_LINE_BYTES:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision exceeds journal line limit"
+        )
+    return op
+
+
+def _reviewed_weekly_expected_hashes(path, *, required: bool):
+    """Read plan pins that a successful apply also writes into its op."""
+    try:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise _lib_rederive.RederiveConflict(
+            f"invalid reviewed weekly decision manifest: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision manifest has unexpected fields"
+        )
+    version = manifest.get("schemaVersion")
+    if version not in (1, 2):
+        return None
+    present = _REVIEWED_MANIFEST_EXPECTATION_KEYS & set(manifest)
+    if not present:
+        if required:
+            raise _lib_rederive.RederiveConflict(
+                f"schemaVersion {version} apply requires "
+                "expectedBaselinePlanHash and expectedDecisionPlanHash "
+                "from a reviewed preview"
+            )
+        return None
+    if present != _REVIEWED_MANIFEST_EXPECTATION_KEYS:
+        raise _lib_rederive.RederiveConflict(
+            f"schemaVersion {version} apply requires both reviewed plan hashes"
+        )
+    for key in present:
+        value = manifest[key]
+        if (not isinstance(value, str) or len(value) != 71
+                or not value.startswith("sha256:")
+                or any(ch not in "0123456789abcdef" for ch in value[7:])):
+            raise _lib_rederive.RederiveConflict(
+                f"reviewed weekly decision manifest has invalid {key}"
+            )
+    return (
+        manifest["expectedBaselinePlanHash"],
+        manifest["expectedDecisionPlanHash"],
+    )
+
+
+def _reviewed_op_expected_hashes(record, *, required: bool):
+    payload = record.get("payload") or {}
+    present = _REVIEWED_OP_EXPECTATION_KEYS & set(payload)
+    if not present:
+        if required:
+            raise _lib_rederive.RederiveConflict(
+                "retained reviewed weekly decision lacks durable plan hashes"
+            )
+        return None
+    if present != _REVIEWED_OP_EXPECTATION_KEYS:
+        raise _lib_rederive.RederiveConflict(
+            "retained reviewed weekly decision has incomplete plan hashes"
+        )
+    values = (
+        payload["expected_baseline_plan_hash"],
+        payload["expected_decision_plan_hash"],
+    )
+    if any(
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(ch not in "0123456789abcdef" for ch in value[7:])
+        for value in values
+    ):
+        raise _lib_rederive.RederiveConflict(
+            "retained reviewed weekly decision has invalid plan hashes"
+        )
+    return values
+
+
+def _reviewed_weekly_state(records):
+    raw_ids = {
+        record.get("id") for record in records
+        if record.get("t") == "obs"
+        and record.get("provider") == "claude"
+        and record.get("src") in _record._CLAUDE_OBS_SRCS
+        and "weekly_percent" in (record.get("payload") or {})
+        and "resets_at" in (record.get("payload") or {})
+    }
+    effective = {}
+    ops = []
+    for record in records:
+        if (record.get("t") != "op" or
+                (record.get("payload") or {}).get("kind") != _REVIEWED_WEEKLY_KIND):
+            continue
+        payload = record["payload"]
+        version = payload.get("schema_version")
+        decisions = (
+            payload.get("decisions") if version == 1
+            else payload.get("weekly_axis_decisions") if version == 2
+            else None
+        )
+        identity_decisions = (
+            [] if version == 1 else payload.get("snapshot_identity_decisions")
+        )
+        if (not isinstance(decisions, list)
+                or not isinstance(identity_decisions, list)
+                or not decisions and not identity_decisions):
+            raise _lib_rederive.RederiveConflict(
+                "malformed retained reviewed weekly decision op"
+            )
+        seen = set()
+        for item in decisions:
+            if (not isinstance(item, dict)
+                    or set(item) != {"observationId", "disposition"}
+                    or not isinstance(item["observationId"], str)
+                    or item["disposition"] not in ("hold", "accept")):
+                raise _lib_rederive.RederiveConflict(
+                    "malformed retained reviewed weekly decision entry"
+                )
+            obs_id = item["observationId"]
+            if obs_id not in raw_ids or obs_id in seen:
+                raise _lib_rederive.RederiveConflict(
+                    f"unknown or duplicate reviewed weekly observation: {obs_id}"
+                )
+            seen.add(obs_id)
+            effective[obs_id] = item["disposition"]
+        identity_ids = set()
+        for item in identity_decisions:
+            if (not isinstance(item, dict)
+                    or set(item) != {
+                        "acceptedObservationId", "replayObservationId",
+                        "disposition",
+                    }
+                    or not all(
+                        isinstance(item.get(key), str) and item[key]
+                        for key in (
+                            "acceptedObservationId", "replayObservationId",
+                        )
+                    )
+                    or item.get("disposition") not in (
+                        "preserve", "rederive",
+                    )
+                    or item["acceptedObservationId"]
+                    == item["replayObservationId"]
+                    or item["acceptedObservationId"] in identity_ids
+                    or item["replayObservationId"] in identity_ids):
+                raise _lib_rederive.RederiveConflict(
+                    "malformed retained snapshot identity decision"
+                )
+            identity_ids.update((
+                item["acceptedObservationId"], item["replayObservationId"],
+            ))
+        ops.append(record)
+    identity_effective = {}
+    for op in ops:
+        payload = op["payload"]
+        for item in payload.get("snapshot_identity_decisions", []):
+            identity_effective[
+                (item["acceptedObservationId"], item["replayObservationId"])
+            ] = item["disposition"]
+    return (frozenset(
+        obs_id for obs_id, disposition in effective.items()
+        if disposition == "hold"
+    ), frozenset(
+        obs_id for obs_id, disposition in effective.items()
+        if disposition == "accept"
+    ), tuple(
+        pair for pair, disposition in identity_effective.items()
+        if disposition == "preserve"
+    ), ops)
+
+
+def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
+    """Verify an operator decision against the bytes before its journal line."""
+    payload = record.get("payload")
+    if (not isinstance(payload, dict)
+            or payload.get("kind") != _REVIEWED_WEEKLY_KIND):
+        return
+    bound = payload.get("journal_high_water")
+    version = payload.get("schema_version")
+    expected_keys = (
+        _REVIEWED_OP_KEYS_V1 if version == 1
+        else _REVIEWED_OP_KEYS_V2 if version == 2
+        else None
+    )
+    if (expected_keys is None or set(payload) != expected_keys
+            or not isinstance(bound, dict)
+            or set(bound) != {"segment", "offset"}
+            or type(bound.get("segment")) is not str
+            or type(bound.get("offset")) is not int
+            or not isinstance(payload.get("journal_prefix_hash"), str)
+            or not isinstance(payload.get("reason"), str)
+            or not payload["reason"].strip()
+            or record != _lib_journal.make_op(
+                at=record.get("at"), src=record.get("src"), payload=payload,
+            )):
+        raise _lib_rederive.RederiveConflict(
+            "malformed retained reviewed weekly decision op"
+        )
+    _reviewed_op_expected_hashes(record, required=True)
+    expected = (bound["segment"], bound["offset"])
+    if prior_high_water != expected or hasher.digest_at(expected) != (
+        payload["journal_prefix_hash"]
+    ):
+        raise _lib_rederive.RederiveConflict(
+            "retained reviewed weekly decision prefix does not match its "
+            "preceding journal bytes"
+        )
 
 
 def _normalize_legacy_accounts(records: list[dict]) -> None:
@@ -291,7 +690,8 @@ def _normalize_legacy_accounts(records: list[dict]) -> None:
 
 
 def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
-                           scratch_dir: Path) -> list[dict]:
+                           scratch_dir: Path, *,
+                           held_weekly_observation_ids=frozenset()) -> list[dict]:
     # #386: this replays the whole ingest pipeline into a PRIVATE scratch index
     # and is reached from `db rederive`'s PREVIEW, which takes no locks by
     # design (its contract is zero persistent writes to the live family). The
@@ -304,12 +704,31 @@ def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
     scratch_path = scratch_dir / "stats.rederive.db"
     with _cctally_store.stats_write_scope("rederive-derive"):
         return _derive_desired_events_into(
-            records, cache_conn, str(scratch_path))
+            records, cache_conn, str(scratch_path),
+            held_weekly_observation_ids=held_weekly_observation_ids)
 
 
-def _derive_desired_events_into(records, cache_conn, scratch_path) -> list[dict]:
+def _derive_desired_events_into(
+    records, cache_conn, scratch_path, *,
+    held_weekly_observation_ids=frozenset(),
+) -> list[dict]:
+    raw_records = _rederivable_raw_records(records)
+    held_ids = frozenset(held_weekly_observation_ids)
+    valid_ids = {
+        record.get("id") for record in raw_records
+        if record.get("t") == "obs"
+        and "weekly_percent" in (record.get("payload") or {})
+        and "resets_at" in (record.get("payload") or {})
+    }
+    unknown_ids = held_ids - valid_ids
+    if unknown_ids:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly hold names no Claude raw observation: "
+            + ", ".join(sorted(unknown_ids))
+        )
     conn = _cctally_core.open_db(_target_path=str(scratch_path))
     events: list[dict] = []
+    reviewed_weekly_basis_by_account = {}
     hooks = (
         _journal._pipeline_op_fold,
         _record._pipeline_claude_usage,
@@ -318,13 +737,16 @@ def _derive_desired_events_into(records, cache_conn, scratch_path) -> list[dict]
     )
     try:
         with _scratch_read_adapters(cache_conn):
-            for record in _rederivable_raw_records(records):
+            for record in raw_records:
                 ctx = _journal.IngestContext(
                     conn=conn,
                     batch=[record],
                     config={},
                     event_sink=events,
                     projection_writes=False,
+                    held_weekly_observation_ids=held_ids,
+                    reviewed_weekly_basis_by_account=(
+                        reviewed_weekly_basis_by_account),
                 )
                 conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -365,6 +787,7 @@ def plan_claude_usage(
     cache_conn: sqlite3.Connection,
     journal_high_water: "tuple[str, int] | None",
     protocol_prefix_evidence=(),
+    enforce_guard=True,
 ):
     """Produce a deterministic Task-A-compatible plan without durable writes.
 
@@ -389,10 +812,33 @@ def plan_claude_usage(
     raw_records = _rederivable_raw_records(records)
     _validate_cache_rows(cache_conn, raw_records)
     cache_fingerprint = _cache_fingerprint(cache_conn)
-    config_fingerprint = _fingerprint({
+    held_ids, _accepted_ids, identity_pairs, reviewed_ops = (
+        _reviewed_weekly_state(records)
+    )
+    config_basis = {
         "historicalConfig": "not-retained",
         "projectionPolicy": "retire-and-rematerialize",
-    })
+    }
+    if reviewed_ops:
+        config_basis["reviewedWeeklyDecisionOps"] = []
+        for op in reviewed_ops:
+            # Durable plan pins authenticate this derived plan. Feeding them
+            # back into its own config fingerprint would make the plan hash
+            # self-referential, so planning uses the decision's pin-free
+            # logical identity while the complete journal record remains
+            # content-addressed and validates the pins on recovery.
+            payload = {
+                key: value for key, value in op["payload"].items()
+                if key not in _REVIEWED_OP_EXPECTATION_KEYS
+            }
+            logical = _lib_journal.make_op(
+                at=op["at"], src=op["src"], payload=payload,
+            )
+            config_basis["reviewedWeeklyDecisionOps"].append({
+                "id": logical["id"], "at": logical["at"],
+                "payload": logical["payload"],
+            })
+    config_fingerprint = _fingerprint(config_basis)
     selection = _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=protocol_prefix_evidence,
@@ -410,7 +856,10 @@ def plan_claude_usage(
             "journal contains tainted correction batch(es): " + summary
         )
     with tempfile.TemporaryDirectory(prefix="cctally-rederive-") as tmp:
-        desired = _derive_desired_events(records, cache_conn, Path(tmp))
+        desired = _derive_desired_events(
+            records, cache_conn, Path(tmp),
+            held_weekly_observation_ids=held_ids,
+        )
     # #426: the scratch replay only sees RETAINED sources, so it can never
     # reproduce the pre-cutover rows the journal exported as `b:<table>:<rowid>`
     # evt lines. Hold them out of the diff instead of retiring them. Evidence is
@@ -431,6 +880,10 @@ def plan_claude_usage(
         config_fingerprint=config_fingerprint,
         preserved_events=preserved.values(),
         conflicted_event_ids=owned_conflicted_event_ids(selection),
+        raw_observations=raw_records,
+        snapshot_identity_decisions=identity_pairs,
+        reviewed_weekly_hold_ids=held_ids,
+        enforce_guard=enforce_guard,
     )
 
 
@@ -503,6 +956,9 @@ def read_rederive_journal_prefix(
             prior_high_water = record_end
             continue
         if record.get("t") == "op":
+            _validate_retained_reviewed_op(
+                record, prior_high_water, hasher,
+            )
             _journal._capture_protocol_prefix_evidence(
                 record,
                 prior_high_water,
@@ -643,6 +1099,7 @@ def _preview_from_snapshot(
     family: str,
     *,
     journal_high_water: "tuple[str, int] | None" = None,
+    reviewed_op: "dict | None" = None,
 ) -> RederivePreview:
     if family != _lib_rederive.FAMILY:
         raise _lib_rederive.RederiveConflict(
@@ -656,18 +1113,116 @@ def _preview_from_snapshot(
         records, high_water, record_ends, protocol_evidence = (
             read_rederive_journal_prefix(journal_high_water)
         )
-    with _open_cache_read_view() as cache:
-        plan = plan_claude_usage(
-            records,
-            cache_conn=cache,
-            journal_high_water=high_water,
-            protocol_prefix_evidence=protocol_evidence,
-        )
-
+    planning_records = records
+    baseline_records = None
+    decision_op = reviewed_op
+    decision_from_journal = False
+    decision_batch_completed = False
+    retained_decision = None
+    retained_decision_index = None
+    if reviewed_op is not None:
+        bound = reviewed_op["payload"]["journal_high_water"]
+        expected = (bound["segment"], bound["offset"])
+        if high_water != expected:
+            raise _lib_rederive.RederiveConflict(
+                "reviewed weekly decision journalHighWater drifted"
+            )
+        if _journal.journal_prefix_hash(high_water) != (
+            reviewed_op["payload"]["journal_prefix_hash"]
+        ):
+            raise _lib_rederive.RederiveConflict(
+                "reviewed weekly decision journalPrefixHash drifted"
+            )
+        planning_records = [*records, reviewed_op]
+        baseline_records = records
+    else:
+        decision_indexes = [
+            index for index, record in enumerate(records)
+            if record.get("t") == "op"
+            and (record.get("payload") or {}).get("kind")
+            == _REVIEWED_WEEKLY_KIND
+        ]
+        if decision_indexes:
+            index = decision_indexes[-1]
+            retained_decision = records[index]
+            retained_decision_index = index
     selection = _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=protocol_evidence,
     )
+    if retained_decision is not None:
+        suffix = records[retained_decision_index + 1:]
+        first = suffix[0] if suffix else None
+        completed_decision_batch = (
+            first is not None
+            and first.get("t") == "correction_batch"
+            and first.get("phase") == "begin"
+            and first.get("family") == family
+            and first.get("id") in selection.completed_batches
+        )
+        correction_only_suffix = all(
+            record.get("t") in {"correction", "correction_batch"}
+            for record in suffix
+        )
+        if correction_only_suffix:
+            decision_op = retained_decision
+            decision_from_journal = not completed_decision_batch
+            decision_batch_completed = completed_decision_batch
+            baseline_records = [
+                *records[:retained_decision_index],
+                *records[retained_decision_index + 1:],
+            ]
+        elif not completed_decision_batch:
+            raise _lib_rederive.RederiveConflict(
+                "unfinished reviewed weekly decision has new journal records "
+                "after it; review a fresh manifest"
+            )
+    current_events = {
+        event_id: selected.record
+        for event_id, selected in selection.by_id.items()
+        if selected.status == "active" and selected.record is not None
+    }
+    plan_high_water = high_water
+    if decision_op is not None and not decision_batch_completed:
+        bound = decision_op["payload"]["journal_high_water"]
+        plan_high_water = (bound["segment"], bound["offset"])
+    baseline_plan = None
+    baseline_plan_guard = None
+    with _open_cache_read_view() as cache:
+        if decision_op is None:
+            plan = plan_claude_usage(
+                planning_records,
+                cache_conn=cache,
+                journal_high_water=high_water,
+                protocol_prefix_evidence=protocol_evidence,
+            )
+        else:
+            baseline_plan = plan_claude_usage(
+                baseline_records,
+                cache_conn=cache,
+                journal_high_water=plan_high_water,
+                protocol_prefix_evidence=protocol_evidence,
+                enforce_guard=False,
+            )
+            baseline_plan_guard = _lib_rederive.week_reset_add_burst_guard(
+                baseline_plan)
+            reviewed_plan = plan_claude_usage(
+                planning_records,
+                cache_conn=cache,
+                journal_high_water=plan_high_water,
+                protocol_prefix_evidence=protocol_evidence,
+                enforce_guard=False,
+            )
+            _held_ids, accepted_ids, _identity_pairs, _reviewed_ops = (
+                _reviewed_weekly_state(planning_records)
+            )
+            plan = _lib_rederive.causal_delta_plan(
+                baseline_plan, reviewed_plan,
+                current_events=current_events,
+                authorized_week_reset_origins=accepted_ids,
+            )
+            _lib_rederive.enforce_week_reset_add_burst_guard(plan)
+
     batch_id = _batch_id_for_plan(plan)
     generated_at = _iso_now()
     incomplete = False
@@ -695,7 +1250,7 @@ def _preview_from_snapshot(
         conflict for conflict in selection.conflicts
         if conflict.event_id in owned_conflicts
     )
-    return RederivePreview(
+    preview = RederivePreview(
         journal_conflicts=journal_conflicts,
         plan=plan,
         records=tuple(records),
@@ -707,7 +1262,18 @@ def _preview_from_snapshot(
         latest_completed_batch=latest_id,
         latest_completed_high_water=latest_high_water,
         recovery_required=recovery_required,
+        reviewed_decision_id=(
+            None if decision_op is None else decision_op["id"]),
+        baseline_plan=baseline_plan,
+        baseline_plan_guard=baseline_plan_guard,
     )
+    if decision_op is not None and not decision_batch_completed:
+        expected_hashes = _reviewed_op_expected_hashes(
+            decision_op, required=decision_from_journal,
+        )
+        if expected_hashes is not None:
+            _assert_reviewed_plan_hashes(preview, expected_hashes)
+    return preview
 
 
 @contextlib.contextmanager
@@ -891,12 +1457,13 @@ def preview_db_rederive(
     family: str,
     *,
     lock_timeout: float = _REDERIVE_LOCK_TIMEOUT_SECONDS,
+    reviewed_op: "dict | None" = None,
 ) -> RederivePreview:
     # Preview has a literal zero-persistent-write contract. A fixed append-only
     # journal prefix and a read-only SQLite transaction are stable inputs
     # without creating any coordination files.
     del lock_timeout
-    return _preview_from_snapshot(family)
+    return _preview_from_snapshot(family, reviewed_op=reviewed_op)
 
 
 def _stats_has_batch(batch_id: str) -> bool:
@@ -928,13 +1495,214 @@ def _call_crash_hook(stage: str) -> None:
         os.kill(os.getpid(), signal.SIGKILL)
 
 
+def _reviewed_op_is_exact_retry(preview: RederivePreview, op: dict) -> bool:
+    bound = op["payload"]["journal_high_water"]
+    expected = (bound["segment"], bound["offset"])
+    if _journal.journal_prefix_hash(expected) != (
+        op["payload"]["journal_prefix_hash"]
+    ):
+        return False
+    matches = [
+        index for index, record in enumerate(preview.records)
+        if record.get("t") == "op" and record.get("id") == op["id"]
+    ]
+    if len(matches) != 1:
+        return False
+    index = matches[0]
+    return preview.records[index] == op and (
+        preview.record_ends[index - 1] if index else None
+    ) == expected
+
+
+def _reviewed_op_needs_materialization(preview: RederivePreview) -> bool:
+    last_index = None
+    for index, record in enumerate(preview.records):
+        if (record.get("t") == "op" and
+                (record.get("payload") or {}).get("kind") == _REVIEWED_WEEKLY_KIND):
+            last_index = index
+    if last_index is None:
+        return False
+    try:
+        with _open_sqlite_snapshot(
+            _cctally_core.DB_PATH, prefix="cctally-rederive-stats-",
+        ) as conn:
+            row = conn.execute(
+                "SELECT segment, offset FROM journal_cursor WHERE id=1"
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        row = None
+    if row is None:
+        return True
+    cursor = (str(row[0]), int(row[1]))
+    if cursor == preview.journal_high_water:
+        return False
+    try:
+        return preview.record_ends.index(cursor) < last_index
+    except ValueError:
+        return True
+
+
+def _refuse_earlier_baseline_actions(
+    family: str, preview: RederivePreview, reviewed_op: dict,
+) -> None:
+    """Keep pre-existing corrections outside the exact decision's history.
+
+    A reviewed weekly decision can remove a reset-burst guard without causing
+    older rederive drift. Such drift must be resolved separately before the
+    reviewed operation is appended; it is not part of the operator's selected
+    observations. The baseline plan may itself trip the burst guard, but that
+    exception still carries its complete proposed action set.
+    """
+    selected_ids = {
+        item["observationId"]
+        for item in reviewed_op["payload"]["decisions"]
+    }
+    selected_at = [
+        dt.datetime.fromisoformat(record["at"].replace("Z", "+00:00"))
+        for record in preview.records
+        if record.get("t") == "obs" and record.get("id") in selected_ids
+    ]
+    if len(selected_at) != len(selected_ids):
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision has unknown selected observations"
+        )
+    first_selected_at = min(selected_at)
+    try:
+        baseline = _preview_from_snapshot(family)
+        baseline_plan = baseline.plan
+    except _lib_rederive.RederivePlanGuardConflict as exc:
+        baseline_plan = exc.plan
+    baseline_actions = {
+        action.event_id: action.payload_hash
+        for action in baseline_plan.actions
+    }
+    unchanged_earlier = [
+        action for action in preview.plan.actions
+        if action.disposition != "add"
+        and baseline_actions.get(action.event_id) == action.payload_hash
+        and dt.datetime.fromisoformat(action.at.replace("Z", "+00:00"))
+        < first_selected_at
+    ]
+    if unchanged_earlier:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly correction contains pre-existing actions "
+            "earlier than its selected observations; resolve baseline "
+            "rederive drift first"
+        )
+
+
+def _assert_reviewed_plan_hashes(preview, expected_plan_hashes) -> None:
+    if expected_plan_hashes is None:
+        return
+    if preview.baseline_plan is None:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision has no baseline plan to verify"
+        )
+    expected_baseline, expected_decision = expected_plan_hashes
+    if preview.baseline_plan.plan_hash != expected_baseline:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly baseline plan hash drifted: expected "
+            f"{expected_baseline}, got {preview.baseline_plan.plan_hash}"
+        )
+    if preview.plan.plan_hash != expected_decision:
+        raise _lib_rederive.RederiveConflict(
+            "reviewed weekly decision plan hash drifted: expected "
+            f"{expected_decision}, got {preview.plan.plan_hash}"
+        )
+
+
 def apply_db_rederive(
     family: str,
     *,
     lock_timeout: float = _REDERIVE_LOCK_TIMEOUT_SECONDS,
+    reviewed_op: "dict | None" = None,
+    expected_plan_hashes: "tuple[str, str] | None" = None,
 ) -> RederiveCommandResult:
     with _rederive_locks(apply=True, timeout=lock_timeout):
-        preview = _preview_from_snapshot(family)
+        appended_reviewed_op = False
+        if reviewed_op is not None:
+            durable_hashes = _reviewed_op_expected_hashes(
+                reviewed_op, required=True,
+            )
+            if expected_plan_hashes != durable_hashes:
+                raise _lib_rederive.RederiveConflict(
+                    "reviewed weekly apply hashes do not match its durable op"
+                )
+        if reviewed_op is None:
+            preview = _preview_from_snapshot(family)
+            report_preview = preview
+        else:
+            try:
+                report_preview = _preview_from_snapshot(
+                    family, reviewed_op=reviewed_op)
+            except _lib_rederive.RederiveConflict as exc:
+                if "journalHighWater drifted" not in str(exc):
+                    raise
+                preview = _preview_from_snapshot(family)
+                if not _reviewed_op_is_exact_retry(preview, reviewed_op):
+                    raise exc
+                bound = reviewed_op["payload"]["journal_high_water"]
+                original = _preview_from_snapshot(
+                    family,
+                    journal_high_water=(bound["segment"], bound["offset"]),
+                    reviewed_op=reviewed_op,
+                )
+                op_index = next(
+                    index for index, record in enumerate(preview.records)
+                    if record.get("t") == "op"
+                    and record.get("id") == reviewed_op["id"]
+                )
+                if any(
+                    not (
+                        (record.get("t") == "correction_batch"
+                         and record.get("id") == original.batch_id)
+                        or (record.get("t") == "correction"
+                            and record.get("batch") == original.batch_id)
+                    )
+                    for record in preview.records[op_index + 1:]
+                ):
+                    raise _lib_rederive.RederiveConflict(
+                        "reviewed weekly decision retry has new journal records "
+                        "after its decision; review a fresh manifest"
+                    )
+                original_actions = original.plan.to_correction_actions()
+                current_actions = preview.plan.to_correction_actions()
+                if current_actions != original_actions and not (
+                    not current_actions
+                    and original.batch_id is not None
+                    and preview.latest_completed_batch == original.batch_id
+                ):
+                    raise _lib_rederive.RederiveConflict(
+                        "reviewed weekly decision retry changed correction "
+                        "actions"
+                    )
+                report_preview = original
+                _assert_reviewed_plan_hashes(
+                    report_preview, expected_plan_hashes)
+            else:
+                _assert_reviewed_plan_hashes(
+                    report_preview, expected_plan_hashes)
+                try:
+                    op_high_water = _journal.append_records(
+                        [reviewed_op],
+                        expected_high_water=report_preview.journal_high_water,
+                    )
+                except Exception as exc:
+                    raise RederiveApplyError(
+                        "reviewed decision append", report_preview,
+                        report_preview.batch_id, exc,
+                    ) from exc
+                appended_reviewed_op = True
+                _call_crash_hook("after-reviewed-decision-op")
+                preview = _preview_from_snapshot(
+                    family, journal_high_water=op_high_water)
+                if (preview.plan.to_correction_actions()
+                        != report_preview.plan.to_correction_actions()):
+                    raise RederiveApplyError(
+                        "reviewed decision revalidation", report_preview,
+                        report_preview.batch_id,
+                        "scratch actions changed after decision append",
+                    )
         plan = preview.plan
         recovering_prior = (
             preview.latest_completed_batch is not None
@@ -981,7 +1749,7 @@ def apply_db_rederive(
                 else "applied"
             )
             return RederiveCommandResult(
-                preview=preview,
+                preview=report_preview,
                 status=status,
                 batch_id=preview.batch_id,
                 rebuild=result,
@@ -1010,13 +1778,31 @@ def apply_db_rederive(
                     "stats recovery", preview, latest, exc
                 ) from exc
             return RederiveCommandResult(
-                preview=preview,
+                preview=report_preview,
                 status="recovered",
                 batch_id=latest,
                 rebuild=result,
             )
+        if appended_reviewed_op or _reviewed_op_needs_materialization(preview):
+            try:
+                result = _journal.rebuild_stats_index(
+                    context=_journal.RebuildContext(trigger="rederive-recovery"),
+                    high_water=preview.journal_high_water,
+                    update_quota_cache=False,
+                )
+            except Exception as exc:
+                raise RederiveApplyError(
+                    "reviewed decision materialization", report_preview,
+                    latest, exc,
+                ) from exc
+            return RederiveCommandResult(
+                preview=report_preview,
+                status="applied" if appended_reviewed_op else "recovered",
+                batch_id=latest,
+                rebuild=result,
+            )
         return RederiveCommandResult(
-            preview=preview,
+            preview=report_preview,
             status="no-op",
             batch_id=latest,
             rebuild=None,
@@ -1052,8 +1838,11 @@ def _command_payload(
     errors=(),
     family: str = _lib_rederive.FAMILY,
     journal_high_water=None,
+    guarded_plan: "_lib_rederive.RederivePlan | None" = None,
+    plan_guard=None,
+    reviewed_decision_id=None,
 ):
-    plan = None if preview is None else preview.plan
+    plan = guarded_plan if preview is None else preview.plan
     counts = (
         {"retain": 0, "supersede": 0, "tombstone": 0, "add": 0}
         if plan is None else dict(plan.counts)
@@ -1069,6 +1858,14 @@ def _command_payload(
         "batchId": batch_id,
         "planHash": None if plan is None else plan.plan_hash,
         "actionCounts": counts,
+        "actionCountsByEventKind": (
+            {
+                kind: {name: 0 for name in counts}
+                for kind in sorted(_lib_rederive._EVT_CLASSIFICATIONS)
+            }
+            if plan is None else plan.action_counts_by_event_kind
+        ),
+        "planGuard": plan_guard,
         # #426: how many owned events the plan held OUT of the diff because no
         # retained source can re-derive them (pre-cutover exported history).
         "preservedEventCount": 0 if plan is None else plan.preserved_event_count,
@@ -1086,6 +1883,14 @@ def _command_payload(
         "rebuild": _rebuild_dict(rebuild),
         "noOp": status == "no-op",
     }
+    if reviewed_decision_id is not None:
+        body["reviewedWeeklyDecisionId"] = reviewed_decision_id
+    if preview is not None and preview.baseline_plan is not None:
+        body["baselinePlanHash"] = preview.baseline_plan.plan_hash
+        body["baselineActionCounts"] = dict(preview.baseline_plan.counts)
+        body["baselinePlanGuard"] = preview.baseline_plan_guard
+        body["decisionPlanHash"] = preview.plan.plan_hash
+        body["decisionActionCounts"] = dict(preview.plan.counts)
     return _lib_json_envelope.stamp_schema_version(body, version=1)
 
 
@@ -1111,10 +1916,16 @@ def _emit_command_payload(payload: dict, *, as_json: bool) -> None:
                 f"{actions} correction action(s); no changes written."
             )
     elif status == "applied":
-        print(
-            f"cctally: applied {payload['family']} correction batch "
-            f"{payload['batchId']} and rebuilt stats.db."
-        )
+        if payload["batchId"] is None:
+            print(
+                f"cctally: applied {payload['family']} reviewed decision "
+                "and rebuilt stats.db."
+            )
+        else:
+            print(
+                f"cctally: applied {payload['family']} correction batch "
+                f"{payload['batchId']} and rebuilt stats.db."
+            )
     elif status == "recovered":
         print(
             f"cctally: recovered {payload['family']} correction batch "
@@ -1124,6 +1935,30 @@ def _emit_command_payload(payload: dict, *, as_json: bool) -> None:
         print(
             f"cctally: {payload['family']} is already current; "
             "no correction batch was appended."
+        )
+    if "baselinePlanHash" in payload:
+        def _counts_text(counts):
+            return ", ".join(
+                f"{name}={counts[name]}"
+                for name in ("retain", "supersede", "tombstone", "add")
+            )
+        print(f"baseline plan {payload['baselinePlanHash']}")
+        print(
+            "baseline action counts: "
+            + _counts_text(payload["baselineActionCounts"])
+        )
+        if payload.get("baselinePlanGuard") is not None:
+            print(
+                "baseline plan guard: "
+                + json.dumps(
+                    payload["baselinePlanGuard"],
+                    sort_keys=True, separators=(",", ":"),
+                )
+            )
+        print(f"decision plan {payload['decisionPlanHash']}")
+        print(
+            "decision action counts: "
+            + _counts_text(payload["decisionActionCounts"])
         )
 
 
@@ -1179,19 +2014,37 @@ def cmd_db_rederive(args) -> int:
                 print(f"cctally: db rederive: {message}", file=sys.stderr)
             return 2
     try:
+        reviewed_path = getattr(args, "reviewed_weekly_decisions", None)
+        reviewed_op = (
+            None if reviewed_path is None
+            else _reviewed_weekly_op_from_manifest(reviewed_path)
+        )
+        expected_plan_hashes = (
+            None if reviewed_path is None
+            else _reviewed_weekly_expected_hashes(
+                reviewed_path, required=apply,
+            )
+        )
         if apply:
-            result = apply_db_rederive(family)
+            result = apply_db_rederive(
+                family,
+                reviewed_op=reviewed_op,
+                expected_plan_hashes=expected_plan_hashes,
+            )
             payload = _command_payload(
                 status=result.status,
                 preview=result.preview,
                 batch_id=result.batch_id,
                 rebuild=result.rebuild,
+                reviewed_decision_id=(
+                    None if reviewed_op is None else reviewed_op["id"]),
             )
         else:
-            preview = preview_db_rederive(family)
+            preview = preview_db_rederive(family, reviewed_op=reviewed_op)
             status = (
                 "preview"
-                if preview.plan.actions or preview.recovery_required
+                if reviewed_op is not None or preview.plan.actions
+                or preview.recovery_required
                 else "no-op"
             )
             payload = _command_payload(
@@ -1202,6 +2055,7 @@ def cmd_db_rederive(args) -> int:
                     if status == "no-op" or preview.recovery_required
                     else preview.batch_id
                 ),
+                reviewed_decision_id=preview.reviewed_decision_id,
             )
     except _lib_rederive.RederiveDataGap as exc:
         payload = _command_payload(
@@ -1214,6 +2068,21 @@ def cmd_db_rederive(args) -> int:
             _emit_command_payload(payload, as_json=True)
         else:
             print(f"cctally: db rederive missing source: {exc}", file=sys.stderr)
+        return 2
+    except _lib_rederive.RederivePlanGuardConflict as exc:
+        payload = _command_payload(
+            status="conflict",
+            family=family,
+            journal_high_water=exc.plan.journal_high_water,
+            batch_id=_batch_id_for_plan(exc.plan),
+            guarded_plan=exc.plan,
+            plan_guard=exc.plan_guard,
+            conflicts=(str(exc),),
+        )
+        if as_json:
+            _emit_command_payload(payload, as_json=True)
+        else:
+            print(f"cctally: db rederive conflict: {exc}", file=sys.stderr)
         return 2
     except (_lib_rederive.RederiveConflict,
             _lib_journal.JournalProtocolError) as exc:

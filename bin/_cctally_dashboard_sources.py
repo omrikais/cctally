@@ -29,13 +29,20 @@ from _cctally_quota import (
     load_codex_quota_projection_certificate,
 )
 from _cctally_source_analytics import (
+    CodexProjectMetadataHealth,
+    CodexThreadMetadataInventory,
     QualifiedMetadataUnavailable,
     RootedCodexAccountingEntry,
     has_cached_codex_accounting_entries,
     load_cached_rooted_codex_accounting_entries,
     load_codex_project_metadata_health,
+    load_codex_thread_metadata_inventory,
     load_qualified_codex_entries,
     probe_codex_detail_metadata_health,
+)
+from _lib_codex_metadata import (
+    codex_metadata_is_malformed,
+    decode_codex_project_metadata,
 )
 import _lib_log
 import _lib_accounts
@@ -2351,6 +2358,8 @@ def _codex_cache_report_wire(
     entries: Iterable[object],
     *,
     metadata: Mapping[tuple[str, str], Mapping[str, object]],
+    by_accounting_identity: "Mapping[tuple[str, str, str], Mapping[str, object]] | None" = None,
+    withhold_projects: bool = False,
     now_utc: dt.datetime,
     display_tz_name: str | None,
     speed: str,
@@ -2376,15 +2385,14 @@ def _codex_cache_report_wire(
     cutoff = now_utc - dt.timedelta(days=window_days)
     bucket_tz = crk._resolve_bucket_tz(display_tz)
 
-    def _tiered_cost(tokens: int, pricing: Mapping[str, object], base: str, above: str) -> float:
+    def _tiered_cost(tokens: int, long_context: bool,
+                     pricing: Mapping[str, object], base: str, above: str) -> float:
         if tokens <= 0:
             return 0.0
         base_rate = float(pricing.get(base, 0.0) or 0.0)
         above_rate = pricing.get(above)
-        threshold = int(c.CODEX_TIERED_THRESHOLD)
-        if tokens > threshold and above_rate is not None:
-            return threshold * base_rate + (tokens - threshold) * float(above_rate)
-        return tokens * base_rate
+        rate = float(above_rate) if long_context and above_rate is not None else base_rate
+        return tokens * rate
 
     def _wrap_entry(entry: object) -> object | None:
         timestamp = getattr(entry, "timestamp", None)
@@ -2394,23 +2402,34 @@ def _codex_cache_report_wire(
         input_tokens = int(getattr(entry, "input_tokens", 0))
         cached_tokens = min(input_tokens, int(getattr(entry, "cached_input_tokens", 0)))
         uncached_tokens = max(0, input_tokens - cached_tokens)
+        long_context = input_tokens > int(c.CODEX_TIERED_THRESHOLD)
         pricing, _is_fallback = c._resolve_codex_pricing(model)
         pricing = pricing or {}
         uncached_counterfactual = _tiered_cost(
-            cached_tokens, pricing,
+            cached_tokens, long_context, pricing,
             "input_cost_per_token", "input_cost_per_token_above_272k_tokens",
         )
         cached_actual = _tiered_cost(
-            cached_tokens, pricing,
+            cached_tokens, long_context, pricing,
             "cache_read_input_token_cost", "cache_read_input_token_cost_above_272k_tokens",
         )
         multiplier = c._codex_fast_multiplier(model) if speed == "fast" else 1.0
         saved = max(0.0, uncached_counterfactual - cached_actual) * multiplier
-        identity = (
-            str(getattr(entry, "source_root_key", "") or ""),
-            str(getattr(entry, "source_path", "") or ""),
-        )
-        item_metadata = metadata.get(identity) or {}
+        # #845 §4.4: in the partial generation the lookup is by accounting
+        # identity, so one rollout path hosting a healthy and a malformed
+        # conversation does not publish one decision for both. An entry the
+        # identity map leaves unattributed lands in this fold's existing
+        # `(unknown)` bucket, which is its not-attributed bucket rather than a
+        # project.
+        if by_accounting_identity is not None:
+            item_metadata = by_accounting_identity.get(
+                _codex_accounting_identity(entry)) or {}
+        else:
+            identity = (
+                str(getattr(entry, "source_root_key", "") or ""),
+                str(getattr(entry, "source_path", "") or ""),
+            )
+            item_metadata = metadata.get(identity) or {}
         project = (
             str(getattr(entry, "project_label", "") or "").strip()
             or str(item_metadata.get("project_label") or "").strip()
@@ -2776,6 +2795,12 @@ def _codex_cache_report_wire(
 
         by_project = _finish_breakdown("project")
         by_model = _finish_breakdown("model")
+    if withhold_projects:
+        # #845 §4.5. The conversation-metadata read failed, so no entry has a
+        # project identity at all. Publishing an empty collection says that;
+        # converting every entry to `(unknown)` would report a bucket the
+        # reader cannot distinguish from a real absence of attribution.
+        by_project = ()
     seven = days[:7]
     saved_total = stable_sum(float(row["saved_usd"]) for row in days)
     wasted_total = stable_sum(float(row["wasted_usd"]) for row in days)
@@ -2844,9 +2869,127 @@ _CODEX_FILE_ALIAS_SQL = (
 )
 
 
+@dataclass(frozen=True)
+class _CodexConversationMetadataRead:
+    """The typed result of the conversation-metadata read (#845 §4.5).
+
+    ``metadata`` is the legacy path map, keyed ``(source_root_key,
+    source_path)`` and built exactly as it was. ``by_accounting_identity`` is
+    the per-conversation map of §4.4, keyed ``(source_root_key,
+    conversation_key or "", source_path)`` and materialized only for the
+    partial generation. ``error`` distinguishes a store with no Codex
+    conversations, which returns two empty maps and ``None``, from a read that
+    failed, which returns two empty maps and the exception: without it the two
+    were byte-identical afterwards and the second published as the first.
+    """
+
+    metadata: "Mapping[tuple[str, str], Mapping[str, object]]"
+    by_accounting_identity: "Mapping[tuple[str, str, str], Mapping[str, object]]"
+    error: "BaseException | None" = None
+
+
+def _codex_accounting_identity(entry: object) -> tuple[str, str, str]:
+    """The identity map's key for one accounting entry, with no fallback.
+
+    The exact key for every entry: a sentinel fallback between this key and
+    the path-keyed one would silently attribute a refused entry through a
+    neighbour that shares its path.
+    """
+    return (
+        str(getattr(entry, "source_root_key", "") or ""),
+        str(getattr(entry, "conversation_key", "") or ""),
+        str(getattr(entry, "source_path", "") or ""),
+    )
+
+
+def _codex_identity_map(
+    cache_conn: sqlite3.Connection,
+    accounting_entries: "Iterable[object]",
+    inventory: "CodexThreadMetadataInventory | None" = None,
+) -> dict[tuple[str, str, str], dict[str, object]]:
+    """Decide project attribution per accounting identity (§4.4).
+
+    The decision order is the qualified reader's, so the map, the counter and
+    the reader agree on every rooted entry. First the reader's two refusals,
+    which precede any metadata: an empty ``conversation_key``, whatever its
+    path's alias winner holds, and a nonempty key with neither a thread row nor
+    an alias winner. A refused item carries ``None`` for both fields; no
+    resolver is called and the predicate is not consulted.
+
+    Every other entry is classified through ``codex_metadata_is_malformed``
+    with its direct row and its path's inherited winner, and a malformed one
+    carries ``None`` for both fields too. Otherwise the entry is attributed
+    exactly as the qualified reader would attribute it: the merged fields
+    ``cwd = direct.cwd or inherited.cwd`` and ``git_json = direct.git_json or
+    inherited.git_json``, with the same ``inherited`` operand the decision
+    used. An alias-only identity therefore attributes through the inventory's
+    ordering-only winner rather than through the path map's native-id
+    inheritance, so an unrelated malformed row can never relabel or remove a
+    healthy project row.
+
+    The reader's first refusal, an empty ``source_root_key``, is not mirrored
+    here: the rooted loader raises for such a row before any entry reaches this
+    map (§4.6 rule 3).
+    """
+    from _cctally_cache import _codex_conversation_project_attribution
+
+    if inventory is None:
+        inventory = load_codex_thread_metadata_inventory(cache_conn)
+    decided: dict[tuple[str, str, str], dict[str, object]] = {}
+    for entry in accounting_entries:
+        identity = _codex_accounting_identity(entry)
+        if identity in decided:
+            continue
+        root_key, conversation_key, source_path = identity
+        direct = inventory.direct_by_conversation.get((root_key, conversation_key))
+        inherited = inventory.inherited_by_path.get((root_key, source_path))
+        refused = not conversation_key or (direct is None and inherited is None)
+        if refused or codex_metadata_is_malformed(
+            direct if conversation_key else None, inherited,
+        ):
+            decided[identity] = {"project_key": None, "project_label": None}
+            continue
+        cwd = (direct.cwd if direct is not None else None) or (
+            inherited.cwd if inherited is not None else None)
+        git_json = (direct.git_json if direct is not None else None) or (
+            inherited.git_json if inherited is not None else None)
+        project_key, project_label = _codex_conversation_project_attribution(
+            root_key, cwd, git_json)
+        decided[identity] = {
+            "project_key": project_key, "project_label": project_label,
+        }
+    return decided
+
+
+def codex_unattributed_paths(
+    accounting_entries: "Iterable[object]",
+    by_accounting_identity: "Mapping[tuple[str, str, str], Mapping[str, object]]",
+) -> "frozenset[tuple[str, str]]":
+    """The ``(root, path)`` set whose session rows must publish NULL projects.
+
+    Computed per caller from the entries that built THAT session view — the
+    parent over every fallback entry, each account child over its own
+    partition — so a child whose entries carry no unattributed identity on a
+    shared path keeps that path's session project while a child whose entries
+    do receives NULL. A session row's single project field cannot represent a
+    mixed path.
+    """
+    unattributed: set[tuple[str, str]] = set()
+    for entry in accounting_entries:
+        identity = _codex_accounting_identity(entry)
+        item = by_accounting_identity.get(identity)
+        if item is None or not item.get("project_key"):
+            unattributed.add((identity[0], identity[2]))
+    return frozenset(unattributed)
+
+
 def _codex_conversation_metadata(
     cache_conn: sqlite3.Connection,
-) -> dict[tuple[str, str], dict[str, object]]:
+    *,
+    accounting_entries: "Iterable[object]" = (),
+    build_identity_map: bool = False,
+    inventory: "CodexThreadMetadataInventory | None" = None,
+) -> _CodexConversationMetadataRead:
     """Read task short names and cached project metadata by rooted rollout.
 
     ``state_5.sqlite.threads.title`` is Codex's persisted user-facing task name.
@@ -2866,7 +3009,9 @@ def _codex_conversation_metadata(
             ") "
             "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
             "e.session_id AS accounting_session_id, "
-            "t.cwd, t.git_json, a.started_at, t.last_seen_utc "
+            "CAST(t.cwd AS BLOB) AS cwd_blob, "
+            "CAST(t.git_json AS BLOB) AS git_json_blob, "
+            "a.started_at, t.last_seen_utc "
             "FROM codex_conversation_threads AS t "
             "LEFT JOIN accounting AS a "
             "ON a.source_root_key=t.source_root_key AND a.source_path=t.source_path "
@@ -2874,15 +3019,27 @@ def _codex_conversation_metadata(
             "ORDER BY t.last_seen_utc DESC, t.conversation_key DESC"
         ))
         from _cctally_cache import _codex_conversation_project_attribution
+
+        def _attribution(root_key, cwd_blob, git_json_blob):
+            # #845 §4.1. The two columns arrive as BLOBs; a thread whose
+            # resolver path reaches an undecodable field carries no attribution
+            # at all rather than the `(unassigned)` its decoded `None` fields
+            # would otherwise produce.
+            decoded = decode_codex_project_metadata(cwd_blob, git_json_blob)
+            if codex_metadata_is_malformed(decoded, None):
+                return (None, None)
+            return _codex_conversation_project_attribution(
+                root_key, decoded.cwd, decoded.git_json)
+
         rows = tuple(
             (
                 root_key, source_path, native_thread_id, accounting_session_id,
-                *_codex_conversation_project_attribution(root_key, cwd, git_json),
+                *_attribution(root_key, cwd_blob, git_json_blob),
                 first_seen_at,
             )
             for (
                 root_key, source_path, native_thread_id, accounting_session_id,
-                cwd, git_json, first_seen_at, _last_seen_at,
+                cwd_blob, git_json_blob, first_seen_at, _last_seen_at,
             ) in core_rows
         )
         file_aliases = tuple(cache_conn.execute(_CODEX_FILE_ALIAS_SQL))
@@ -2981,9 +3138,16 @@ def _codex_conversation_metadata(
                 "project_label": (inherited or {}).get("project_label"),
                 "started_at": started_at or (inherited or {}).get("started_at"),
             }
-    except sqlite3.Error:
-        return {}
-    return metadata
+    except sqlite3.Error as exc:
+        return _CodexConversationMetadataRead({}, {}, exc)
+    by_identity: dict[tuple[str, str, str], dict[str, object]] = {}
+    if build_identity_map:
+        try:
+            by_identity = _codex_identity_map(
+                cache_conn, accounting_entries, inventory)
+        except sqlite3.Error as exc:
+            return _CodexConversationMetadataRead({}, {}, exc)
+    return _CodexConversationMetadataRead(metadata, by_identity, None)
 
 
 def _session_wire(
@@ -2991,7 +3155,17 @@ def _session_wire(
     *,
     metadata: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
     private_labels: dict[str, str] | None = None,
+    unattributed_paths: "frozenset[tuple[str, str]]" = frozenset(),
 ) -> dict[str, object]:
+    """Fold one session view; ``unattributed_paths`` nulls a row's project.
+
+    #845 §4.4: a row's project fields are NULL exactly when its
+    ``(source_root_key, source_path)`` is in that set, because the row's single
+    project field cannot represent a path that hosts one healthy and one
+    malformed conversation. Otherwise they come from the path map as they do
+    today, so a healthy path's session row is unchanged in the partial
+    generation. Titles and ``started_at`` always come from the path map.
+    """
     rows = []
     for row in view.rows:
         # The Codex session aggregator intentionally splits equal relative
@@ -3023,7 +3197,15 @@ def _session_wire(
             if row_metadata and row_metadata.get("title") is not None
             else None
         )
-        project = str(row_metadata.get("project_label") or "").strip() if row_metadata else ""
+        unattributed = (
+            str(row.codex_root or ""), str(row.session_id_path),
+        ) in unattributed_paths
+        project = (
+            ""
+            if unattributed
+            else str(row_metadata.get("project_label") or "").strip()
+            if row_metadata else ""
+        )
         started_at = row_metadata.get("started_at") if row_metadata else None
         duration_min = None
         if isinstance(started_at, str):
@@ -3041,7 +3223,10 @@ def _session_wire(
             "key": key,
             "source": "codex",
             "project": project or None,
-            "project_key": row_metadata.get("project_key") if row_metadata else None,
+            "project_key": (
+                None if unattributed
+                else row_metadata.get("project_key") if row_metadata else None
+            ),
             "started_at": started_at,
             "duration_min": duration_min,
             "last_activity": row.last_activity.astimezone(UTC).isoformat(),
@@ -4645,21 +4830,22 @@ def _cached_projects_wire(
 
 def _partial_projects_wire(
     entries: Iterable[object],
-    metadata: Mapping[tuple[str, str], Mapping[str, object]],
+    by_accounting_identity: "Mapping[tuple[str, str, str], Mapping[str, object]]",
 ) -> dict[str, object]:
     """Aggregate the qualified subset when older accounting metadata is mixed.
 
-    Rows without a cached conversation/project identity are omitted and remain
-    covered by the Projects-domain warning. Valid projects stay visible; their
-    totals never include an unqualified accounting row.
+    #845 §4.4: the lookup is by ACCOUNTING IDENTITY, not by path. One rollout
+    path can host a healthy conversation and a malformed one, and a path-keyed
+    map would publish one decision for both. An entry the identity map leaves
+    unattributed — refused or malformed — carries a ``None`` item and is
+    omitted here, where the Projects-domain warning covers it. Every other
+    entry keeps the project key the healthy fold publishes for it.
     """
     groups: dict[tuple[str, str], dict[str, object]] = {}
     for entry in entries:
-        identity = (
-            str(getattr(entry, "source_root_key", "") or ""),
-            str(getattr(entry, "source_path", "") or ""),
-        )
-        row_metadata = metadata.get(identity)
+        accounting_identity = _codex_accounting_identity(entry)
+        identity = (accounting_identity[0], accounting_identity[2])
+        row_metadata = by_accounting_identity.get(accounting_identity)
         project_key = str(row_metadata.get("project_key") or "").strip() if row_metadata else ""
         project_label = str(row_metadata.get("project_label") or "").strip() if row_metadata else ""
         if not project_key or not project_label:
@@ -5723,6 +5909,17 @@ def _codex_account_scopes_wire(
     accounting_end: dt.datetime,
     metadata_incomplete: bool,
     conversation_metadata: Mapping[tuple[str, str], Mapping[str, object]],
+    #: #845 §4.4/§4.5. The per-conversation decisions of the partial
+    #: generation, and whether the conversation-metadata read itself failed.
+    #: Both default to the healthy shape so a direct caller that has neither
+    #: keeps today's behaviour.
+    conversation_identity_metadata: "Mapping[tuple[str, str, str], Mapping[str, object]]" = (
+        MappingProxyType({})),
+    conversation_metadata_failed: bool = False,
+    #: §4.6 rule 1: a transient generation publishes NO Codex project rows on
+    #: any child either, so a focused account cannot show rows the parent is
+    #: withholding.
+    metadata_transient: bool = False,
     alerts: Iterable[Mapping[str, object]],
     budget_milestones: Iterable[Mapping[str, object]],
     projected_budget_milestones: Iterable[Mapping[str, object]],
@@ -5883,9 +6080,19 @@ def _codex_account_scopes_wire(
             "sessions": _session_wire(
                 sessions_view, metadata=conversation_metadata,
                 private_labels=private_session_labels,
+                # Each child computes the set over its OWN partition, so a
+                # child whose entries carry no unattributed identity on a
+                # shared path keeps that path's session project.
+                unattributed_paths=(
+                    codex_unattributed_paths(
+                        rows, conversation_identity_metadata)
+                    if metadata_incomplete else frozenset()
+                ),
             ),
             "projects": (
-                _partial_projects_wire(rows, conversation_metadata)
+                _partial_projects_wire((), {})
+                if metadata_transient
+                else _partial_projects_wire(rows, conversation_identity_metadata)
                 if metadata_incomplete else _cached_projects_wire(
                     context, account_observations, rows,
                     changed_old=changed_old_rows_by_account.get(key, ()),
@@ -5897,7 +6104,12 @@ def _codex_account_scopes_wire(
                 )
             ),
             "cache_report": _codex_cache_report_wire(
-                rows, metadata=conversation_metadata, now_utc=context.now_utc,
+                rows, metadata=conversation_metadata,
+                by_accounting_identity=(
+                    conversation_identity_metadata if metadata_incomplete
+                    else None),
+                withhold_projects=conversation_metadata_failed,
+                now_utc=context.now_utc,
                 display_tz_name=context.display_tz_name, speed=context.speed,
                 anomaly_threshold_pp=context.cache_report_anomaly_threshold_pp,
                 cache_key=("account", key),
@@ -7213,6 +7425,12 @@ class _CodexAccountingCapture:
     #: row that is deterministically unqualifiable and for a read that failed,
     #: and those want different explanations and different remedies.
     metadata_read_failed: bool = False
+    #: #845/#846 §4.6. The fixed internal vocabulary of metadata legs that
+    #: failed with a genuine `sqlite3.Error` or a `transient=True` refusal:
+    #: `accounting_health`, `detail_probe`, `qualified_accounting`,
+    #: `fallback_accounting`, `conversation_metadata`. Nothing is added to the wire; the combined
+    #: verdict is derived from this tuple.
+    failed_legs: tuple[str, ...] = ()
     #: The name of the population THIS capture read, taken from the accounting
     #: result rather than re-read from `_lib_snapshot_cache`'s module global at
     #: fold time. The global is process-wide, so a concurrent share render's
@@ -7225,44 +7443,63 @@ class _CodexAccountingCapture:
     population_signature: tuple | None = None
 
 
-#: The detail routes' horizon: one year ending at the generation instant. It
-#: is stated here because the probe has to use the EXACT window both routes
-#: read (`_cctally_dashboard._codex_detail_context`), not a convenient
-#: approximation of it.
+#: The detail routes' horizon: one year ending at the generation instant. The
+#: carrier probe covers its union with the accounting window, which may begin
+#: earlier for a configured budget.
 CODEX_DETAIL_HORIZON = dt.timedelta(days=365)
 
 
-def _probe_codex_detail_metadata_health(
+def _codex_build_metadata_inventory(
+    cache_conn: sqlite3.Connection,
+) -> "CodexThreadMetadataInventory | None":
+    """The ONE thread-and-alias inventory this build's consumers share (§4.3).
+
+    The health counter, the detail probe's counter, the qualified reader and
+    the identity map each used to load it for themselves, so a build paid the
+    whole-table thread pass three or four times over. They now receive this
+    one.
+
+    A read failure answers ``None`` rather than raising. Each consumer then
+    loads the inventory itself and fails inside its OWN classification `try`,
+    exactly as it did before this call existed, so the set of failed legs
+    §4.6 rule 1 composes is unchanged by the sharing.
+    """
+    try:
+        return load_codex_thread_metadata_inventory(cache_conn)
+    except (sqlite3.Error, RuntimeError):
+        return None
+
+
+def _probe_codex_detail_metadata_health_leg(
     context: DashboardReadContext,
-) -> "Mapping[str, object]":
-    """Run the ONE detail-horizon metadata probe this generation carries.
+    inventory: "CodexThreadMetadataInventory | None" = None,
+    accounting_start: dt.datetime | None = None,
+    accounting_end: dt.datetime | None = None,
+) -> "tuple[Mapping[str, object], BaseException | None]":
+    """The probe leg, with its failure REPORTED rather than absorbed.
 
-    #834 S2 (#828). Neither detail route queries independently and no
-    ingest-maintained marker is introduced: the generation is built once, this
-    runs inside it, and both routes read the frozen result.
-
-    A bare SQLite error here is a failure of the READ, not a property of the
-    rows, so it publishes `transient_read_failure` — the build could not check
-    metadata health and will retry on the next refresh. Telling the reader to
-    rebuild the cache would name a remedy for a problem they do not have.
+    #846 §4.6: a failure here is one of four legs the combined verdict weighs,
+    so the exception is handed back instead of being turned into a carrier on
+    the spot. The published carrier for the failed case is the same
+    `transient_read_failure` this leg published on its own before.
     """
     try:
         probe = probe_codex_detail_metadata_health(
             cache_conn=context.cache_conn,
-            start=context.now_utc - CODEX_DETAIL_HORIZON,
-            end=context.now_utc,
+            start=min(context.now_utc - CODEX_DETAIL_HORIZON, accounting_start)
+            if accounting_start is not None
+            else context.now_utc - CODEX_DETAIL_HORIZON,
+            end=max(context.now_utc, accounting_end)
+            if accounting_end is not None else context.now_utc,
+            inventory=inventory,
         )
-    except (sqlite3.Error, RuntimeError):
-        _lib_log.get_logger("dashboard").warning(
-            "Codex detail metadata probe failed; publishing a retryable "
-            "transient health result for this generation"
-        )
-        return build_metadata_health("transient_read_failure")
+    except (sqlite3.Error, RuntimeError) as exc:
+        return build_metadata_health("transient_read_failure"), exc
     if probe.incomplete_rows > 0:
         return build_metadata_health(
             "malformed_row_partial", incomplete_rows=probe.incomplete_rows,
-        )
-    return build_metadata_health("healthy")
+        ), None
+    return build_metadata_health("healthy"), None
 
 
 def _capture_codex_accounting(
@@ -7273,10 +7510,13 @@ def _capture_codex_accounting(
     active_roots: tuple[str, ...],
     path_scope: object,
     incomplete_rows: int,
+    failed_legs: tuple[str, ...] = (),
+    leg_errors: "list[tuple[str, BaseException]] | None" = None,
+    inventory: "CodexThreadMetadataInventory | None" = None,
 ) -> _CodexAccountingCapture:
     """Read the incremental accounting carrier without folding public views.
 
-    #834 S2 (#828, #829): the caller passes the probe's ROW COUNT rather than
+    #834 S2 (#828, #829): the caller passes the health read's ROW COUNT rather than
     a boolean, because the typed health result this capture returns has to
     report the count a malformed-row partial measured, and a boolean has
     already thrown it away.
@@ -7292,7 +7532,29 @@ def _capture_codex_accounting(
     changed_old: tuple[object, ...] = ()
     changed_new: tuple[object, ...] = ()
     population_signature: tuple | None = None
-    if not metadata_incomplete:
+
+    def fallback_entries() -> tuple[object, ...]:
+        nonlocal metadata_read_failed, failed_legs
+        try:
+            return load_cached_rooted_codex_accounting_entries(
+                accounting_start, accounting_end, speed=context.speed,
+                cache_conn=context.cache_conn,
+            )
+        except QualifiedMetadataUnavailable as exc:
+            # A failed SQLite read has no trustworthy rows. Keep the typed
+            # transient carrier; deterministic identity refusals retain their
+            # existing fail-loud path.
+            if not isinstance(exc.__cause__, sqlite3.Error):
+                raise
+            metadata_read_failed = True
+            failed_legs = (*failed_legs, "fallback_accounting")
+            if leg_errors is not None:
+                leg_errors.append(("fallback_accounting", exc))
+            return ()
+    # §4.6 rule 1: the qualified read is skipped when a leg before it has
+    # already failed. Its result could not be published anyway, and issuing it
+    # over a store whose metadata legs are failing only costs the tick.
+    if not metadata_incomplete and not failed_legs:
         try:
             cached_accounting = _lib_snapshot_cache.build_cached_codex_accounting(
                 cache_conn=context.cache_conn,
@@ -7310,6 +7572,7 @@ def _capture_codex_accounting(
                     speed=context.speed,
                     sync=False,
                     cache_conn=context.cache_conn,
+                    inventory=inventory,
                 ),
                 load_paths=lambda identities: load_qualified_codex_entries(
                     accounting_start,
@@ -7318,6 +7581,7 @@ def _capture_codex_accounting(
                     sync=False,
                     cache_conn=context.cache_conn,
                     source_identities=identities,
+                    inventory=inventory,
                 ),
                 path_of=lambda entry: (
                     str(entry.source_root_key), str(entry.source_path),
@@ -7350,13 +7614,12 @@ def _capture_codex_accounting(
             # class over a superset of this window, so its count is the
             # measured answer and this exception carries none.
             metadata_read_failed = getattr(exc, "transient", True)
+            if metadata_read_failed:
+                failed_legs = (*failed_legs, "qualified_accounting")
+                if leg_errors is not None:
+                    leg_errors.append(("qualified_accounting", exc))
             _lib_snapshot_cache.reset_codex_accounting_cache_state()
-            entries = load_cached_rooted_codex_accounting_entries(
-                accounting_start,
-                accounting_end,
-                speed=context.speed,
-                cache_conn=context.cache_conn,
-            )
+            entries = fallback_entries()
             dirty_accounts = tuple(sorted({
                 str(getattr(entry, "account_key", "") or
                     _lib_accounts.UNATTRIBUTED)
@@ -7364,12 +7627,7 @@ def _capture_codex_accounting(
             }))
     else:
         _lib_snapshot_cache.reset_codex_accounting_cache_state()
-        entries = load_cached_rooted_codex_accounting_entries(
-            accounting_start,
-            accounting_end,
-            speed=context.speed,
-            cache_conn=context.cache_conn,
-        )
+        entries = fallback_entries()
         dirty_accounts = tuple(sorted({
             str(getattr(entry, "account_key", "") or
                 _lib_accounts.UNATTRIBUTED)
@@ -7383,6 +7641,7 @@ def _capture_codex_accounting(
         entries=tuple(entries),
         metadata_incomplete=metadata_incomplete,
         metadata_read_failed=metadata_read_failed,
+        failed_legs=failed_legs,
         population_signature=(
             None if metadata_incomplete else population_signature),
     )
@@ -7483,7 +7742,10 @@ class CodexSourceCapture:
     accounting: _CodexAccountingCapture
     accounting_exists: bool
     accounting_exists_error: Exception | None
-    conversation_metadata: Mapping
+    #: #845 §4.5: the typed result, not a bare map. An empty store and a
+    #: failed read produce identical maps, and the composition of §4.6 needs to
+    #: tell them apart.
+    conversation_metadata: "_CodexConversationMetadataRead"
     #: #819: the count OR the exception, never a boolean that cannot tell them
     #: apart. `AccountRegistryReading` states why, and the build threads this
     #: one object into both the decoration gate and the published
@@ -7632,12 +7894,35 @@ def capture_codex_source_state(
             else:
                 accounting_start = min(accounting_start, budget_start)
         with _lib_perf.phase("source.accounting"):
-            health = load_codex_project_metadata_health(
-                cache_conn=context.cache_conn,
-                start=accounting_start,
-                end=accounting_end,
-            )
-            detail_metadata_health = _probe_codex_detail_metadata_health(context)
+            leg_errors: "list[tuple[str, BaseException]]" = []
+            failed_legs: tuple[str, ...] = ()
+            inventory = _codex_build_metadata_inventory(context.cache_conn)
+            # §4.6, the first taxonomy hole. `load_codex_project_metadata_health`
+            # had no local classification `try`, so a SQLite failure here
+            # propagated to the broad handler below and failed the provider
+            # outright. It is a leg now.
+            try:
+                health = load_codex_project_metadata_health(
+                    cache_conn=context.cache_conn,
+                    start=accounting_start,
+                    end=accounting_end,
+                    inventory=inventory,
+                )
+            except sqlite3.Error as exc:
+                failed_legs = (*failed_legs, "accounting_health")
+                leg_errors.append(("accounting_health", exc))
+                health = CodexProjectMetadataHealth(
+                    total_rows=0, qualified_rows=0,
+                    missing_conversation_key_rows=0,
+                    missing_thread_join_rows=0,
+                    undecodable_metadata_rows=0,
+                )
+            detail_metadata_health, probe_error = (
+                _probe_codex_detail_metadata_health_leg(
+                    context, inventory, accounting_start, accounting_end))
+            if probe_error is not None:
+                failed_legs = (*failed_legs, "detail_probe")
+                leg_errors.append(("detail_probe", probe_error))
             accounting = _capture_codex_accounting(
                 context,
                 accounting_start=accounting_start,
@@ -7645,6 +7930,9 @@ def capture_codex_source_state(
                 active_roots=active_roots,
                 path_scope=path_scope,
                 incomplete_rows=health.incomplete_rows,
+                failed_legs=failed_legs,
+                leg_errors=leg_errors,
+                inventory=inventory,
             )
         try:
             accounting_exists = has_cached_codex_accounting_entries(
@@ -7656,8 +7944,35 @@ def capture_codex_source_state(
             # value, then defer it until the build knows that branch is live.
             accounting_exists = False
             accounting_exists_error = exc
-        conversation_metadata = MappingProxyType(
-            _codex_conversation_metadata(context.cache_conn))
+        conversation_metadata = _codex_conversation_metadata(
+            context.cache_conn,
+            inventory=inventory,
+            accounting_entries=accounting.entries,
+            # §4.4: the identity map's trigger is the accounting-window gate,
+            # not the carrier. It is consulted exactly when the qualified read
+            # was skipped and the partial fold runs, and a healthy generation
+            # never consults it.
+            build_identity_map=accounting.metadata_incomplete,
+        )
+        if conversation_metadata.error is not None:
+            accounting = replace(
+                accounting,
+                failed_legs=(*accounting.failed_legs, "conversation_metadata"),
+            )
+            leg_errors.append(
+                ("conversation_metadata", conversation_metadata.error))
+        if accounting.failed_legs:
+            # ONE server-side line naming the sorted failed legs and their
+            # exception classes, so a transient generation can be diagnosed
+            # without guessing which read raised.
+            _lib_log.get_logger("dashboard").warning(
+                "Codex metadata legs failed (%s); publishing a retryable "
+                "transient health result for this generation",
+                ", ".join(
+                    f"{leg}:{type(error).__name__}"
+                    for leg, error in sorted(leg_errors, key=lambda pair: pair[0])
+                ),
+            )
         with _lib_perf.phase("source.accounts"):
             account_registry = read_account_registry(
                 context.stats_conn, "codex")
@@ -7931,38 +8246,100 @@ def _build_codex_source_state(
             _warn_codex_budget_window_once("accounting_range")
         else:
             accounting_start = min(accounting_start, budget_start)
-    health = (
-        capture.health
-        if capture is not None
-        else load_codex_project_metadata_health(
-            cache_conn=context.cache_conn,
-            start=accounting_start,
-            end=accounting_end,
-        )
-    )
-    detail_metadata_health = (
-        capture.detail_metadata_health
-        if capture is not None
-        else _probe_codex_detail_metadata_health(context)
-    )
-    accounting_capture = (
-        capture.accounting
-        if capture is not None
-        else _capture_codex_accounting(
+    builder_leg_errors: "list[tuple[str, BaseException]]" = []
+    builder_failed_legs: tuple[str, ...] = ()
+    builder_inventory: "CodexThreadMetadataInventory | None" = None
+    if capture is not None:
+        health = capture.health
+        detail_metadata_health = capture.detail_metadata_health
+        accounting_capture = capture.accounting
+    else:
+        builder_inventory = _codex_build_metadata_inventory(context.cache_conn)
+        try:
+            health = load_codex_project_metadata_health(
+                cache_conn=context.cache_conn,
+                start=accounting_start,
+                end=accounting_end,
+                inventory=builder_inventory,
+            )
+        except sqlite3.Error as exc:
+            builder_failed_legs = (*builder_failed_legs, "accounting_health")
+            builder_leg_errors.append(("accounting_health", exc))
+            health = CodexProjectMetadataHealth(
+                total_rows=0, qualified_rows=0,
+                missing_conversation_key_rows=0, missing_thread_join_rows=0,
+                undecodable_metadata_rows=0,
+            )
+        detail_metadata_health, builder_probe_error = (
+            _probe_codex_detail_metadata_health_leg(
+                context, builder_inventory, accounting_start, accounting_end))
+        if builder_probe_error is not None:
+            builder_failed_legs = (*builder_failed_legs, "detail_probe")
+            builder_leg_errors.append(("detail_probe", builder_probe_error))
+        accounting_capture = _capture_codex_accounting(
             context,
             accounting_start=accounting_start,
             accounting_end=accounting_end,
             active_roots=active_roots,
             path_scope=path_scope,
             incomplete_rows=health.incomplete_rows,
+            failed_legs=builder_failed_legs,
+            leg_errors=builder_leg_errors,
+            inventory=builder_inventory,
         )
-    )
     qualified_entries = accounting_capture.qualified_entries
     accounting_dirty_accounts = accounting_capture.dirty_accounts
     accounting_changed_old = accounting_capture.changed_old
     accounting_changed_new = accounting_capture.changed_new
     accounting_entries = accounting_capture.entries
     metadata_incomplete = accounting_capture.metadata_incomplete
+
+    conversation_metadata_read = (
+        capture.conversation_metadata
+        if capture is not None
+        else _codex_conversation_metadata(
+            context.cache_conn,
+            inventory=builder_inventory,
+            accounting_entries=accounting_entries,
+            build_identity_map=metadata_incomplete,
+        )
+    )
+    # Restored with the typed result of §4.5: this map used to be handed
+    # to the folds as a `MappingProxyType`, and the read now returns a
+    # dataclass whose `metadata` member is the same dict, so the
+    # read-only view moves here, where both the captured and the
+    # capture-less path consume it.
+    conversation_metadata = MappingProxyType(
+        conversation_metadata_read.metadata)
+    conversation_identity_metadata = (
+        conversation_metadata_read.by_accounting_identity)
+    conversation_metadata_failed = conversation_metadata_read.error is not None
+    # §4.6 rule 1. A transient generation is one where ANY metadata leg failed
+    # with a genuine `sqlite3.Error` or a `transient=True` refusal. It
+    # publishes no Codex project rows anywhere, says so on the chip, and is
+    # never retained by a reuse or retention gate, so the next tick rebuilds.
+    codex_failed_legs = tuple(accounting_capture.failed_legs)
+    if conversation_metadata_failed and (
+        "conversation_metadata" not in codex_failed_legs
+    ):
+        codex_failed_legs = (*codex_failed_legs, "conversation_metadata")
+        builder_leg_errors.append(
+            ("conversation_metadata", conversation_metadata_read.error))
+    if capture is None and codex_failed_legs:
+        # The capture path emits this line itself; on the direct builder path
+        # it is emitted here, once, naming the sorted failed legs and their
+        # exception classes.
+        _lib_log.get_logger("dashboard").warning(
+            "Codex metadata legs failed (%s); publishing a retryable "
+            "transient health result for this generation",
+            ", ".join(
+                f"{leg}:{type(error).__name__}"
+                for leg, error in sorted(
+                    builder_leg_errors, key=lambda pair: pair[0])
+            ) or ", ".join(sorted(codex_failed_legs)),
+        )
+    metadata_transient = bool(codex_failed_legs)
+
     # Derived HERE rather than beside `health`, because `metadata_incomplete`
     # is reassigned on the line above and the message has to answer for the
     # state that is actually published. Computed early, a transient read
@@ -7992,7 +8369,10 @@ def _build_codex_source_state(
     metadata_warning_message = (
         "Codex project metadata could not be read for this build; it will "
         "retry on the next refresh."
-        if accounting_capture.metadata_read_failed
+        if metadata_transient
+        else f"{health.incomplete_rows} Codex accounting row(s) could not be "
+        "used; run `cctally cache-sync --source codex --rebuild`."
+        if health.malformed_accounting_rows > 0
         else f"{health.incomplete_rows} Codex accounting row(s) lack project "
         "metadata; run `cctally cache-sync --source codex --rebuild`."
         if health.incomplete_rows > 0
@@ -8267,14 +8647,12 @@ def _build_codex_source_state(
         context, budget_entries, cost_events=budget_cost_events,
     )
     configured_budget = configured_budget_domain["status"]
-    conversation_metadata = (
-        capture.conversation_metadata
-        if capture is not None
-        else _codex_conversation_metadata(context.cache_conn)
-    )
     cache_report = _codex_cache_report_wire(
         visible_accounting_entries,
         metadata=conversation_metadata,
+        by_accounting_identity=(
+            conversation_identity_metadata if metadata_incomplete else None),
+        withhold_projects=conversation_metadata_failed,
         now_utc=context.now_utc,
         display_tz_name=context.display_tz_name,
         speed=context.speed,
@@ -8285,7 +8663,13 @@ def _build_codex_source_state(
         semantic_signature=period_signature,
     )
     projects = (
-        _partial_projects_wire(visible_accounting_entries, conversation_metadata)
+        # §4.6 rule 1: empty on the parent and on every account child. A
+        # generation whose metadata legs failed has established nothing about
+        # the rows, so publishing any of them would be a guess.
+        _partial_projects_wire((), {})
+        if metadata_transient
+        else _partial_projects_wire(
+            visible_accounting_entries, conversation_identity_metadata)
         if metadata_incomplete else _cached_projects_wire(
             context,
             quota_observations,
@@ -8307,6 +8691,12 @@ def _build_codex_source_state(
         sessions,
         metadata=conversation_metadata,
         private_labels=private_session_labels,
+        # §4.4: computed from the entries that built THIS view.
+        unattributed_paths=(
+            codex_unattributed_paths(
+                visible_accounting_entries, conversation_identity_metadata)
+            if metadata_incomplete else frozenset()
+        ),
     )
     # #819: an unreadable account registry makes this build PARTIAL. The
     # source itself is intact — every non-account domain below is built from
@@ -8330,7 +8720,8 @@ def _build_codex_source_state(
     # would publish a scope naming two accounts beside a `data` carrying none.
     availability = (
         "partial"
-        if metadata_incomplete or hero_failure or account_registry.error is not None
+        if metadata_incomplete or metadata_transient or hero_failure
+        or account_registry.error is not None
         else ("ok" if (entries or quota_blocks or budget_rows) else "empty")
     )
     hero_input = None if hero_failure else sum(entry.input_tokens for entry in cycle_entries)
@@ -8339,7 +8730,7 @@ def _build_codex_source_state(
     hero_reasoning = None if hero_failure else sum(entry.reasoning_output_tokens for entry in cycle_entries)
     hero_total = None if hero_failure else sum(entry.total_tokens for entry in cycle_entries)
     warnings: list[SourceDashboardWarning] = []
-    if metadata_incomplete:
+    if metadata_incomplete or metadata_transient:
         warnings.append(SourceDashboardWarning(
             "codex_metadata_incomplete",
             metadata_warning_message,
@@ -8499,6 +8890,9 @@ def _build_codex_source_state(
                 accounting_end=accounting_end,
                 metadata_incomplete=metadata_incomplete,
                 conversation_metadata=conversation_metadata,
+                conversation_identity_metadata=conversation_identity_metadata,
+                conversation_metadata_failed=conversation_metadata_failed,
+                metadata_transient=metadata_transient,
                 alerts=alerts,
                 budget_milestones=budget_rows,
                 projected_budget_milestones=projected_budget_rows,
@@ -8878,7 +9272,7 @@ def _build_codex_source_state(
         # health as unknown on a store whose probe read fine.
         metadata_health=(
             build_metadata_health("transient_read_failure")
-            if accounting_capture.metadata_read_failed
+            if metadata_transient
             else detail_metadata_health
         ),
     )

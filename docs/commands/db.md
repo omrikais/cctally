@@ -11,7 +11,7 @@ cctally db status [--json]
 cctally db skip <migration-name> [--reason "<text>"]
 cctally db unskip <migration-name>
 cctally db rebuild --db stats [--json]
-cctally db rederive --family claude-usage [--yes] [--json]
+cctally db rederive --family claude-usage [--reviewed-weekly-decisions PATH] [--yes] [--json]
 cctally db journal-repair [--violation <fingerprint> ...] [--yes] [--json]
 cctally db recover --db cache [--yes]   # --db stats is retired (see below)
 cctally db repair --db stats --yes
@@ -261,7 +261,7 @@ includes the reviewed prefix fields. Keys evolve additively.
 locked-prefix revalidation, malformed-protocol, or prod-guard refusal; `3`
 lock, append, live-handle, or rebuild failure.
 
-## `cctally db rederive --family claude-usage [--yes]`
+## `cctally db rederive --family claude-usage [--reviewed-weekly-decisions PATH] [--yes]`
 
 Re-runs the closed Claude-usage derivation family over retained raw Claude
 observations and operator records using the current code, then compares that
@@ -276,11 +276,121 @@ replacing `stats.db`, writing config/HWM files, refreshing a provider, or
 dispatching alerts. Add `--yes` to append one manifest-checked correction batch
 and atomically rebuild the disposable stats index.
 
+The assembled plan has a fail-closed weekly-reset guard. It groups only new
+(`add`) `week_reset` events with all three values present by exact
+`(account_key, new_week_end_at, observed_pre_credit_pct)`. More than two
+additions in one group refuse both preview and the locked `--yes` apply before
+any journal append, with exit 2. Two distinct in-place reset events remain
+admissible. There is no bypass flag. The guard contains a known re-derivation
+burst hazard; it does not repair historical data or prove that every plan below
+the limit is correct. Review the refused plan and its retained source before
+any separate recovery action.
+
 ```
 cctally db rederive --family claude-usage
 cctally db rederive --family claude-usage --json
 cctally db rederive --family claude-usage --yes
 ```
+
+### Reviewed weekly observations
+
+`--reviewed-weekly-decisions PATH` supplies an operator's exact historical
+decision for Claude raw observation IDs. It holds only the weekly axis;
+five-hour credit detection and block derivation still run. An `accept` entry
+explicitly supersedes an earlier `hold` for the same ID. Latest journal order
+wins. No value, source, cadence, or reset-count rule chooses IDs automatically,
+and the weekly-reset burst guard still refuses ambiguous plans.
+
+If a held observation already anchors a retained five-hour or weekly milestone,
+the reviewed graph keeps the milestone's whole historical payload. Any newly
+derived milestone also closes its accepted usage/cost snapshot references with
+the currently selected events or the matching reviewed dependency actions, so
+one batch cannot add the milestone while omitting or tombstoning its
+dependencies. A missing or unfamiliar dependency refuses. An identical
+pre-existing missing reference remains outside the correction. An
+explicit `accept` also authorizes one otherwise baseline-identical `week_reset`
+action only when that action names the accepted raw observation as its exact
+origin. It cannot admit another reset or any other baseline action.
+
+The UTF-8 JSON manifest has either the legacy v1 shape:
+
+```json
+{
+  "schemaVersion": 1,
+  "journalHighWater": {"segment": "observations-2026-07.jsonl", "offset": 12345},
+  "journalPrefixHash": "sha256:<64 lowercase hex digits>",
+  "reviewedAt": "2026-07-25T13:00:00Z",
+  "reason": "Reviewed the named raw captures",
+  "decisions": [
+    {"observationId": "o:<exact raw ID>", "disposition": "hold"}
+  ]
+}
+```
+
+or the v2 shape used when a review also preserves or releases an exact
+accepted/replay snapshot identity:
+
+```json
+{
+  "schemaVersion": 2,
+  "journalHighWater": {"segment": "observations-2026-08.jsonl", "offset": 12345},
+  "journalPrefixHash": "sha256:<64 lowercase hex digits>",
+  "reviewedAt": "2026-09-19T08:00:00Z",
+  "reason": "Reviewed the named weekly axes and snapshot identity",
+  "weeklyAxisDecisions": [
+    {"observationId": "o:<exact raw ID>", "disposition": "hold"}
+  ],
+  "snapshotIdentityDecisions": [
+    {
+      "acceptedObservationId": "o:<retained accepted raw ID>",
+      "replayObservationId": "o:<current replay candidate raw ID>",
+      "disposition": "preserve"
+    }
+  ]
+}
+```
+
+The snapshot pair is still subject to the automatic account, window, weekly
+axis, dependency, and uniqueness checks. `preserve` permits only the otherwise
+ambiguous intervening-observation case. A later prefix-bound `rederive`
+decision for the same pair releases that exception and restores automatic
+identity selection.
+
+Capture `journalHighWater` and `journalPrefixHash` from the same reviewed
+journal prefix. The command checks both again before appending. Unknown IDs,
+duplicate decisions, a missing accepted weekly basis, and prefix drift refuse
+with exit 2. Preview includes the decision in `planHash` and writes no durable
+decision. For a reviewed manifest, preview reports both the ordinary
+`baselinePlanHash` and the operator-caused `decisionPlanHash`, with their
+action counts and any baseline guard. The decision plan contains only actions
+whose target differs between the same-prefix baseline and reviewed graphs;
+identical baseline drift is disclosed but excluded from the correction batch.
+
+Before applying either manifest version, copy both preview hashes into the
+manifest as `expectedBaselinePlanHash` and `expectedDecisionPlanHash`. The
+unpinned preview reports a provisional decision ID; adding the pins changes
+the content-addressed durable decision ID, so preview the pinned manifest when
+the final ID is needed. The pins do not change either plan hash because the
+planner excludes them from its logical decision fingerprint. With `--yes`, the
+command rechecks both hashes while holding the apply lock set, before any
+journal append, then stores the pins in one deterministic
+`claude_weekly_observation_decision` op, appends its dependent correction batch,
+and rebuilds. `reviewedWeeklyDecisionId` in JSON names the op. A completed op
+left by a crash can be finished with plain
+`db rederive --family claude-usage --yes`; unfinished recovery rechecks the
+durable hashes before appending corrections. Retrying the same manifest does
+not append a second op when only its own
+correction batch follows it. If new observations or other journal records
+arrive after the op, the manifest retry refuses instead of changing the
+reviewed correction actions. Use a fresh review for a changed journal prefix.
+Review both the baseline disclosure and the complete causal decision graph
+before using `--yes`.
+
+To undo a mistaken hold, review a fresh prefix and submit a later `accept`
+entry for that exact ID. To undo a snapshot identity preservation, submit a
+later v2 `rederive` entry for that exact pair.
+The journal line size limit also applies to the whole decision op; oversized
+manifests refuse before append.
 
 The apply path:
 
@@ -288,7 +398,9 @@ The apply path:
    writer in the established total order.
 2. Plans against one journal high-water and one stable read-only cache view.
 3. Revalidates that high-water while holding the journal leaf lock, then
-   appends the whole ordered batch without interleaving.
+   appends the whole ordered batch without interleaving. A reviewed decision
+   first appends its op under the same lock set, replans from that durable op,
+   and appends the matching batch.
 4. Rebuilds only through the batch commit high-water. A raw observation
    appended afterward remains unread for the next normal ingest cycle.
 
@@ -324,6 +436,15 @@ only be destructive. `preservedEventCount` in the JSON reports how many events a
 plan protected. Everything the retained observations do cover still diffs
 normally, so an obsolete derivation still retires.
 
+**Closed five-hour facts and accepted snapshot identities stay frozen.** A
+closed block keeps its journaled token, cost, model and project totals when
+replay reaches the same closure evidence; equivalent timezone spellings of the
+same block boundary do not make a new fact. Replay also keeps an already
+accepted snapshot and its milestone references when exact retained raw
+observations prove that a newer held-row rule only selected the preceding
+candidate for the same crossing. A changed boundary, reading or unknown
+dependency remains an explicit correction in the preview.
+
 If an earlier `claude-usage` batch already retired that history — a
 `db rederive --yes` before this fix dropped every pre-cutover weekly usage and
 cost snapshot, collapsing a 12-week `$/1%` trend to the weeks since the cutover
@@ -335,16 +456,30 @@ own re-derivation is a deliberate retirement and is left alone.
 | Flag | Description |
 | --- | --- |
 | `--family claude-usage` | **Required.** The only supported family in this release. |
+| `--reviewed-weekly-decisions PATH` | Preview or apply the exact, prefix-bound weekly observation manifest above. |
 | `--yes` | Apply the previewed plan, or finish recovery of a completed batch. Without it, the command is read-only. |
 | `--json` | Emit a stamped `schemaVersion: 1` object. |
 
 JSON always includes `status`, `family`, `journalHighWater`, `batchId`,
-`planHash`, `actionCounts`, `preservedEventCount`, `conflicts`,
+`planHash`, `actionCounts`, `actionCountsByEventKind`, `planGuard`,
+`preservedEventCount`, `conflicts`,
 `journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and
 retained-source errors preserve the already-captured `journalHighWater`.
 `status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`,
 `missing-source`, or `failed`. New optional keys may be added without a schema
 version bump.
+`reviewedWeeklyDecisionId` is present when this invocation supplied a manifest.
+
+`actionCountsByEventKind` breaks the planner-owned `retain`, `supersede`,
+`tombstone`, and `add` dispositions out for every classified event kind, with
+zero values when absent (including `five_hour_credit`). Provider-owned events
+outside this family remain excluded, as they are from `actionCounts`. On a
+weekly-reset burst, `status` is `conflict` and
+`planGuard` is `{code: "week-reset-add-burst", limit: 2, violations: [...]}`.
+Each sorted violation reports `accountKey`, `newWeekEndAt`,
+`observedPreCreditPct`, and `addCount`. The conflict retains the assembled
+`planHash`, `batchId`, and action counts; `rebuild` is `null` and `noOp` is
+`false`. Other outcomes have `planGuard: null`.
 
 `conflicts` is a list of **command-validation failure messages** (unsupported
 family, the prod guard, a structural journal protocol error).
@@ -363,8 +498,9 @@ it does not mutate the target data.
 ### Exit codes
 
 `0` preview, apply, recovery, or no-op; `2` unsupported input, a journal
-protocol conflict, missing retained source data, or the production guard; `3`
-lock contention, cache/SQLite I/O, append, or rebuild failure.
+protocol conflict, weekly-reset add burst, missing retained source data, or
+the production guard; `3` lock contention, cache/SQLite I/O, append, or
+rebuild failure.
 
 ## `cctally db recover --db cache [--yes]`
 

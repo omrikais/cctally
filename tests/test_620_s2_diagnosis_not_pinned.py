@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import pytest
 
 from conftest import load_script, redirect_paths
-from test_620_s2_diagnosis_route import _boot
+from test_620_s2_diagnosis_route import _boot, _run_bounded_in_process
 from test_620_s2_diagnosis_sources import (
     WINDOW_END, WINDOW_START, _seed_claude, _seed_claude_blocks,
 )
@@ -184,6 +184,10 @@ def test_the_route_reads_after_the_snapshot_transaction_has_ended(seeded,
     """
     seen: list[_Observed] = []
     _instrument_store_reads(seeded, monkeypatch, seen)
+    _run_bounded_in_process(
+        monkeypatch,
+        seeded["_load_sibling"]("_cctally_diagnosis_sources"),
+    )
     _build_authoritative_snapshot(seeded)
     assert any(q.owner == "cache" and q.while_pinned for q in seen), (
         "non-vacuity: the build never held its cache pin")

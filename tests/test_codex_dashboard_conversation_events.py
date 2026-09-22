@@ -76,13 +76,6 @@ def _wire_handler(ns, monkeypatch, *, no_sync=False, expose=False,
     HandlerCls.cctally_expose_transcripts = expose
     HandlerCls.no_sync = no_sync
     import socketserver
-    # #630 S2: see the twin comment in tests/test_dashboard_conversation_events.py.
-    # A 1 s keep-alive is what lets an abandoned live-tail handler discover the
-    # closed client; `start()` installs the holder that lets `stop()` name and
-    # join it.
-    conv = sys.modules["_cctally_dashboard_conversation"]
-    monkeypatch.setattr(conv, "_LIVE_TAIL_KEEPALIVE", 1.0)
-
     srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), HandlerCls)
     srv.handle_error = lambda request, client_address: None
     srv._test_thread = start(srv)

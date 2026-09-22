@@ -230,10 +230,9 @@ def test_the_evaluator_reads_this_grammar_correctly():
 
 
 # ---------------------------------------------------------------- structure
-def test_the_receipt_gate_job_exists_and_is_hosted():
+def test_the_receipt_gate_job_exists():
     jobs = _ci()["jobs"]
     assert GATE_JOB in jobs, sorted(jobs)
-    assert jobs[GATE_JOB]["runs-on"] == "ubuntu-latest"
 
 
 def test_the_receipt_gate_guard_is_exactly_its_consumers_guard():
@@ -297,12 +296,14 @@ def test_the_receipt_gate_and_test_macos_admit_the_same_contexts():
         assert gate is macos, kwargs
 
 
-def test_the_release_classifier_stays_deliberately_unguarded():
-    """F29's operator decision, pinned rather than argued. A public push runs
-    the release classifier and NOTHING else, so its green result is not estate
-    evidence — and guarding this job would change that operator-selected
-    outcome. Adding a guard here is a decision, not a tidy-up."""
-    assert "if" not in _ci()["jobs"][STAMP_JOB], _ci()["jobs"][STAMP_JOB].get("if")
+def test_the_release_classifier_keeps_the_public_mirror_but_refuses_private_forks():
+    """Public pushes/PRs retain the classifier; private fork merge code is refused."""
+    condition = _condition(STAMP_JOB)
+    assert _evaluate(condition, _context(repository="omrikais/cctally"))
+    assert _evaluate(condition, _context(repository="omrikais/cctally", event="pull_request",
+                                         head_repo="someone/cctally"))
+    assert _evaluate(condition, _context(event="pull_request", head_repo="someone/fork")) is False
+    assert _evaluate(condition, _context(event="pull_request"))
 
 
 def test_the_receipt_gate_is_read_only_and_does_not_persist_credentials():

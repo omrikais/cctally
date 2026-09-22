@@ -1,9 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useCopy } from './useCopy';
 import { nextRovingIndex } from './menuKeyboard';
 import { useOutsideDismiss } from './useOutsideDismiss';
+import {
+  ANON_UNAVAILABLE_STATUS,
+  AnonRequestError,
+  anonRequestErrorFor,
+  anonUnavailableMessage,
+} from './anonScrub';
+import { dispatch, selectConvAnonRefusal, subscribeStore } from '../store/store';
 import { conversationEntityUrl } from '../lib/conversationTransport';
-import { conversationRefKey, normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
+import { conversationRefKey, normalizeConversationRef, type ConversationRef, type ConversationRefInput } from '../types/conversation';
 
 // #217 S5 §4 (F1/F5) — the reader-header "Export ▾" menu. Lists the four
 // Markdown export scopes, each with a Copy (clipboard) and a Download (.md
@@ -56,7 +63,9 @@ function exportUrl(conversationRef: ConversationRefInput, scope: Scope, anon: bo
 
 async function fetchExport(conversationRef: ConversationRefInput, scope: Scope, anon: boolean): Promise<string> {
   const res = await fetch(exportUrl(conversationRef, scope, anon));
-  if (!res.ok) throw new Error(`export failed: ${res.status}`);
+  // #850 §4.9 — the failure carries the HTTP status, so the caller can tell the
+  // server's typed anonymization refusal from any other failure.
+  if (!res.ok) throw await anonRequestErrorFor(res);
   return res.text();
 }
 
@@ -131,6 +140,36 @@ export function ExportMenu({
     [],
   );
   const { copy } = useCopy();
+  // #850 §4.9 — the last server decision this page observed for the SELECTED
+  // conversation. Disclosure only: every activation below asks the server.
+  const refusal = useSyncExternalStore(subscribeStore, () => selectConvAnonRefusal());
+  const anonRefusal = anonMode ? refusal : null;
+
+  // Every anonymized action records the server's decision for the conversation
+  // captured when the request was ISSUED, so a response that resolves after a
+  // switch lands on the conversation it was made for and on no other.
+  const recordAnonDecision = useCallback(
+    (forConversation: ConversationRef, err: unknown) => {
+      if (!anonMode) return;
+      if (err === null) {
+        dispatch({
+          type: 'SET_CONV_ANON_REFUSAL',
+          conversationRef: forConversation,
+          refused: false,
+        });
+        return;
+      }
+      if (err instanceof AnonRequestError && err.status === ANON_UNAVAILABLE_STATUS) {
+        dispatch({
+          type: 'SET_CONV_ANON_REFUSAL',
+          conversationRef: forConversation,
+          refused: true,
+          message: anonUnavailableMessage(err),
+        });
+      }
+    },
+    [anonMode],
+  );
 
   // The reader is not keyed by session, so an open menu would otherwise persist
   // across a session switch; close it when the conversation changes.
@@ -203,33 +242,39 @@ export function ExportMenu({
   const doCopy = useCallback(
     async (scope: Scope) => {
       const key = `${scope}:copy`;
+      const forConversation = conversationRef;
       setBusy(key);
       try {
-        const text = await fetchExport(conversationRef, scope, anonMode);
+        const text = await fetchExport(forConversation, scope, anonMode);
+        recordAnonDecision(forConversation, null);
         copy(text);
-      } catch {
+      } catch (err) {
         /* swallow — a failed export leaves the clipboard untouched */
+        recordAnonDecision(forConversation, err);
       } finally {
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [identityKey, copy, anonMode],
+    [identityKey, copy, anonMode, recordAnonDecision],
   );
 
   const doDownload = useCallback(
     async (scope: Scope) => {
       const key = `${scope}:download`;
+      const forConversation = conversationRef;
       setBusy(key);
       try {
-        const text = await fetchExport(conversationRef, scope, anonMode);
+        const text = await fetchExport(forConversation, scope, anonMode);
+        recordAnonDecision(forConversation, null);
         triggerDownload(exportFilename(title, sessionId, scope, anonMode), text);
-      } catch {
+      } catch (err) {
         /* swallow */
+        recordAnonDecision(forConversation, err);
       } finally {
         if (mountedRef.current) setBusy((b) => (b === key ? null : b));
       }
     },
-    [identityKey, title, anonMode],
+    [identityKey, title, anonMode, recordAnonDecision],
   );
 
   return (
@@ -262,8 +307,13 @@ export function ExportMenu({
           onKeyDown={onMenuKeyDown}
         >
           {anonMode && (
-            <div className="conv-export-anon-note" role="none">
-              Anonymized — project paths, home, username &amp; known secrets redacted
+            <div
+              className={`conv-export-anon-note${anonRefusal ? ' conv-export-anon-unavailable' : ''}`}
+              role="none"
+              data-anon-unavailable={anonRefusal ? '1' : undefined}
+            >
+              {anonRefusal
+                ?? 'Anonymized — project paths, home, username & known secrets redacted'}
             </div>
           )}
           {scopes.map(({ scope, label }, rowIdx) => {

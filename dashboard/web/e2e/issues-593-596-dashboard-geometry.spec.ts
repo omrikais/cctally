@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 import { fulfilJson } from './utils';
 
@@ -14,6 +14,11 @@ const COMBINED_FIXTURE = JSON.parse(readFileSync(
 
 const OK_FIXTURE = JSON.parse(readFileSync(
   new URL('../../../tests/fixtures/dashboard/ok/golden-data.json', import.meta.url),
+  'utf8',
+)) as Record<string, any>;
+
+const CREDITED_FIXTURE = JSON.parse(readFileSync(
+  new URL('../../../tests/fixtures/dashboard/credited-week/golden-data.json', import.meta.url),
   'utf8',
 )) as Record<string, any>;
 
@@ -112,6 +117,110 @@ async function selectSource(page: Page, source: 'claude' | 'codex' | 'all') {
   await segment.click();
   await expect(segment).toHaveClass(/is-active/);
 }
+
+for (const width of [390, 1440]) {
+  test(`#773 — a credited Claude billing cycle is named as a cycle at ${width}px`, async ({ page }) => {
+    const screenshotDir = 'e2e/.runtime/issue-773-evidence';
+    mkdirSync(screenshotDir, { recursive: true });
+    await serveFixture(page, CREDITED_FIXTURE, (envelope) => {
+      envelope.header.vs_last_week_delta = 0.05;
+    });
+    await page.route('**/api/milestones/claude/week/**', async (route) => {
+      const entry = CREDITED_FIXTURE.current_week.week_index[1];
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          source: 'claude', key: entry.key, label: entry.label,
+          start_at_utc: entry.start_at_utc, end_at_utc: entry.end_at_utc,
+          is_current: false, detail_stamp: entry.detail_stamp,
+          segments: [], dividers: [], blocks: [],
+        }),
+      });
+    });
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/');
+    await selectSource(page, 'claude');
+
+    const hero = page.locator('[data-hero-strip]');
+    await expect(hero).toHaveAttribute('aria-label', 'Claude cycle usage summary');
+    await expect(hero.locator('.hero-usage .hu-block:first-child .hu-label'))
+      .toContainText('CYCLE USAGE · Apr 16–Apr 20');
+    await expect(hero.locator('.hs-label')).toHaveText('SPENT THIS CYCLE');
+    await expect(hero.locator('.hero-spent')).toHaveAttribute('aria-label', 'Spent this cycle');
+    await expect(hero.locator('[data-metric="vs-last-week"] .sup-l'))
+      .toHaveText('$/1% vs comparable cycle');
+    await expect(hero.locator('[data-metric="vs-last-week"]'))
+      .toHaveAttribute('aria-label', '$/1% up $0.05 versus nearest comparable cycle');
+    // These two rankings are genuinely bounded to the subscription week,
+    // unlike the reset-defined hero and milestone navigator.
+    await expect(page.locator('#panel-projects .panel-header h2')).toContainText('this week');
+    await expect(page.locator('#panel-blocks .panel-range-note')).toHaveText('5h · current week');
+    await hero.screenshot({ path: `${screenshotDir}/${width}-credited-hero.png` });
+
+    await hero.click();
+    const modal = page.getByRole('dialog', { name: 'Current Cycle — per-percent milestones' });
+    await expect(modal).toBeVisible();
+    await expect(modal.locator('#mcw-week-pill')).toHaveText('Apr 16–Apr 20');
+    await modal.screenshot({ path: `${screenshotDir}/${width}-current-cycle.png` });
+    await modal.getByRole('button', { name: 'Older cycle' }).click();
+    const historic = page.getByRole('dialog', { name: 'Cycle — per-percent milestones' });
+    await expect(historic).toBeVisible();
+    await expect(historic.locator('#mcw-week-pill')).toHaveText('Apr 13–Apr 16');
+    await expect(historic.locator('#mcw-empty')).toHaveText('No milestones recorded this cycle');
+    await historic.screenshot({ path: `${screenshotDir}/${width}-prior-cycle.png` });
+  });
+}
+
+test('#773 — independently bounded Claude account spend does not claim one current cycle', async ({ page }) => {
+  mkdirSync('e2e/.runtime/issue-773-evidence', { recursive: true });
+  await serveFixture(page, CREDITED_FIXTURE, (envelope) => {
+    const base = {
+      plan: 'max', active: true, weeklyPercent: 30, fiveHourPercent: null,
+      resetsAt: '2026-04-20T14:00:00Z', inputTokens: 0, cachedInputTokens: 0,
+      outputTokens: 0, reasoningOutputTokens: 0, totalTokens: 0,
+    };
+    envelope.sources.claude.data.accounts = [
+      { ...base, accountKey: 'a'.repeat(32), label: 'work', spendUsd: 1.04,
+        spendWindow: { kind: 'subscription-week', startAt: '2026-04-16T09:00:00Z', endAt: '2026-04-20T14:00:00Z' } },
+      { ...base, accountKey: 'b'.repeat(32), label: 'personal', spendUsd: 2.10,
+        spendWindow: { kind: 'subscription-week', startAt: '2026-04-13T14:00:00Z', endAt: '2026-04-16T09:00:00Z' } },
+    ];
+  });
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/');
+  await selectSource(page, 'claude');
+  const hero = page.locator('[data-hero-strip]');
+  await expect(hero.locator('.hs-label')).toHaveText('SPENT · ACCOUNT CYCLES');
+  await expect(hero.locator('.hero-spent')).toHaveAttribute('aria-label', 'Spent across latest account cycles');
+  await hero.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-merged-account-hero.png' });
+  await page.getByRole('radio', { name: /personal/ }).click();
+  await expect(hero.locator('.hs-label')).toHaveText('SPENT · ACCOUNT CYCLE');
+  await expect(hero.locator('.hero-spent')).toHaveAttribute('aria-label', 'Spent over latest account cycle');
+  await hero.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-focused-account-hero.png' });
+});
+
+test('#773 — failed historic detail does not borrow current-cycle figures', async ({ page }) => {
+  mkdirSync('e2e/.runtime/issue-773-evidence', { recursive: true });
+  await serveFixture(page, CREDITED_FIXTURE);
+  await page.route('**/api/milestones/claude/week/**', async (route) => {
+    await route.fulfill({ status: 503, contentType: 'application/json', body: '{"code":"unavailable"}' });
+  });
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.goto('/');
+  await selectSource(page, 'claude');
+  await page.locator('[data-hero-strip]').click();
+  const current = page.getByRole('dialog', { name: 'Current Cycle — per-percent milestones' });
+  await expect(current.locator('#mcw-bignum')).toContainText('30.0%');
+  await current.getByRole('button', { name: 'Older cycle' }).click();
+  const historic = page.getByRole('dialog', { name: 'Cycle — per-percent milestones' });
+  await expect(historic.locator('#mcw-week-pill')).toHaveText('Apr 13–Apr 16');
+  await expect(historic.locator('#mcw-error')).toContainText('Couldn’t load this cycle');
+  for (const id of ['mcw-bignum', 'mcw-spent', 'mcw-dpp', 'mcw-reset', 'mcw-pbar', 'mcw-ms-count']) {
+    await expect(historic.locator(`#${id}`)).toHaveCount(0);
+  }
+  await historic.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-prior-cycle-error.png' });
+});
 
 const LARGE_AMOUNT_CASES = [
   {

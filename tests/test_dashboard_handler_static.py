@@ -3,6 +3,7 @@ import gzip
 import http.client
 import threading
 import time
+import pathlib
 
 from conftest import load_script
 
@@ -115,6 +116,81 @@ def test_dashboard_shell_stays_mutable_and_revalidates():
         assert revalidated_body == b""
         assert revalidated_headers["ETag"] == headers["ETag"]
         assert revalidated_headers["Cache-Control"] == "no-cache"
+    finally:
+        stop(srv, thread)
+
+
+def test_warm_shell_304_skips_read_and_gzip_then_changed_build_invalidates(
+    tmp_path, monkeypatch,
+):
+    shell = tmp_path / "dashboard.html"
+    shell.write_bytes(b"<html>build one</html>")
+    ns, srv, thread, port = _dashboard_server()
+    ns["DashboardHTTPHandler"].static_dir = tmp_path
+    real_read = pathlib.Path.read_bytes
+    real_compress = gzip.compress
+    counts = {"read": 0, "gzip": 0}
+
+    def counted_read(path):
+        if path == shell:
+            counts["read"] += 1
+        return real_read(path)
+
+    def counted_compress(*args, **kwargs):
+        counts["gzip"] += 1
+        return real_compress(*args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", counted_read)
+    monkeypatch.setattr(gzip, "compress", counted_compress)
+    try:
+        path_headers = {"Accept-Encoding": "gzip"}
+        status, first, body = _request(port, "/", headers=path_headers)
+        assert status == 200
+        assert gzip.decompress(body) == b"<html>build one</html>"
+        assert counts == {"read": 1, "gzip": 1}
+
+        status, warm, body = _request(port, "/", headers={
+            **path_headers, "If-None-Match": first["ETag"],
+        })
+        assert status == 304 and body == b""
+        assert warm["ETag"] == first["ETag"]
+        assert warm["Vary"] == "Accept-Encoding"
+        assert counts == {"read": 1, "gzip": 1}
+
+        # A warm 200 still needs the actual bytes; this cache holds validators,
+        # not potentially stale response bodies.
+        status, repeated, body = _request(port, "/", headers=path_headers)
+        assert status == 200 and gzip.decompress(body) == b"<html>build one</html>"
+        assert repeated["ETag"] == first["ETag"]
+        assert counts == {"read": 2, "gzip": 2}
+
+        status, identity, body = _request(port, "/", headers={
+            "Accept-Encoding": "gzip;q=0", "If-None-Match": first["ETag"],
+        })
+        assert status == 200 and body == b"<html>build one</html>"
+        assert identity["ETag"] != first["ETag"]
+        assert identity["Vary"] == "Accept-Encoding"
+        assert counts == {"read": 3, "gzip": 2}
+        status, _, body = _request(port, "/", headers={
+            "Accept-Encoding": "gzip;q=0", "If-None-Match": identity["ETag"],
+        })
+        assert status == 304 and body == b""
+        assert counts == {"read": 3, "gzip": 2}
+
+        shell.write_bytes(b"<html>build two</html>")
+        status, changed, body = _request(port, "/", headers={
+            **path_headers, "If-None-Match": first["ETag"],
+        })
+        assert status == 200
+        assert gzip.decompress(body) == b"<html>build two</html>"
+        assert changed["ETag"] != first["ETag"]
+        assert counts == {"read": 4, "gzip": 3}
+        print({"case": "shell-revalidation", "readCalls": counts["read"],
+               "gzipCalls": counts["gzip"], "warmGzip304ReadCalls": 0,
+               "warmGzip304CompressCalls": 0,
+               "warmIdentity304ReadCalls": 0,
+               "warmIdentity304CompressCalls": 0,
+               "changedBuildStatus": 200})
     finally:
         stop(srv, thread)
 

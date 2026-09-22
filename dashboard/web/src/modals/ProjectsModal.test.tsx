@@ -306,13 +306,16 @@ describe('<ProjectsModal />', () => {
     expect(screen.getByRole('radio', { name: '8 cycles' })).toHaveAttribute('aria-checked', 'false');
     // The unit the bare numbers count, visibly...
     expect(screen.getByText('cycles')).toBeInTheDocument();
-    // ...and in the accessibility tree, where the visible span cannot reach:
-    // it is a non-radio child of the radiogroup and is tied to nothing, so a
-    // screen-reader user would otherwise hear four bare numbers. Each radio's
-    // own name carries the unit. The GROUP is not named for it, because this
-    // radiogroup also holds `share %` and `$ absolute`, which count no cycles.
-    expect(screen.getByRole('radiogroup', { name: 'Window' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'share %' })).toBeInTheDocument();
+    // Window and Y-axis are independent choices. Each radio belongs to its
+    // own named group, and each group has exactly one checked option.
+    const windowGroup = screen.getByRole('radiogroup', { name: 'Window' });
+    const axisGroup = screen.getByRole('radiogroup', { name: 'Y-axis' });
+    expect(windowGroup.querySelectorAll('[role="radio"]')).toHaveLength(4);
+    expect(windowGroup.querySelectorAll('[role="radio"][aria-checked="true"]')).toHaveLength(1);
+    expect(axisGroup.querySelectorAll('[role="radio"]')).toHaveLength(2);
+    expect(axisGroup.querySelectorAll('[role="radio"][aria-checked="true"]')).toHaveLength(1);
+    expect(axisGroup).toContainElement(screen.getByRole('radio', { name: 'share %' }));
+    expect(axisGroup).toContainElement(screen.getByRole('radio', { name: '$ absolute' }));
     expect(screen.getByText('cycles')).toHaveAttribute('aria-hidden', 'true');
   });
 

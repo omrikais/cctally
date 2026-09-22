@@ -360,9 +360,9 @@ it('keeps Current Week bound to the source captured when it opened', () => {
 
   const { container } = render(<CurrentWeekModal />);
 
-  expect(container.textContent).toContain('Current Week — per-percent milestones');
+  expect(container.textContent).toContain('Current Cycle — per-percent milestones');
   expect(container.querySelector('.modal-current-week')?.getAttribute('data-source')).toBe('claude');
-  expect(container.textContent).not.toContain('Current Cycle — per-percent milestones');
+  expect(container.textContent).not.toContain('Current Week — per-percent milestones');
 });
 
 it('keeps Current Week sharing bound to the source captured when it opened', () => {

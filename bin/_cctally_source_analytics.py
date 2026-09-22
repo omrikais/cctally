@@ -21,6 +21,12 @@ from _cctally_core import (
 )
 from _cctally_cache import _codex_provider_roots
 import _lib_accounts
+from _lib_codex_metadata import (
+    DecodedCodexProjectMetadata,
+    codex_metadata_is_malformed,
+    decode_codex_project_metadata,
+    resolve_codex_threads_table,
+)
 from _lib_quota import build_blocks
 from _lib_pricing import _calculate_codex_entry_cost
 from _cctally_quota import load_codex_quota_observations
@@ -76,10 +82,21 @@ class CodexProjectMetadataHealth:
     qualified_rows: int
     missing_conversation_key_rows: int
     missing_thread_join_rows: int
+    #: #845 §4.3. Entries whose project metadata is present but undecodable,
+    #: counted over THIS population and net of whatever this population's
+    #: aggregate already counted for another reason.
+    undecodable_metadata_rows: int = 0
+    #: Rows with a refused timestamp or token operand, net of key/join reasons.
+    malformed_accounting_rows: int = 0
 
     @property
     def incomplete_rows(self) -> int:
-        return self.missing_conversation_key_rows + self.missing_thread_join_rows
+        return (
+            self.missing_conversation_key_rows
+            + self.missing_thread_join_rows
+            + self.undecodable_metadata_rows
+            + self.malformed_accounting_rows
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,6 +118,11 @@ class RootedCodexAccountingEntry:
     # reserved ``unattributed`` sentinel). Carried so the per-account hero cards
     # can scope spend without a second query shape.
     account_key: str = _lib_accounts.UNATTRIBUTED
+    # #845 §4.4: the per-conversation identity the accounting-identity map is
+    # keyed by. A path-keyed map cannot carry a per-conversation decision,
+    # because one rollout path may host a healthy and a malformed conversation
+    # at once and one decision would be wrong for one of them.
+    conversation_key: str = ""
 
 
 _OPAQUE_PROJECT_KEY_RE = re.compile(r"^project:[0-9a-f]{24}$")
@@ -112,7 +134,9 @@ _QUALIFIED_CODEX_ENTRIES_SQL = """
            entries.conversation_key, entries.model, entries.account_key,
            entries.input_tokens, entries.cached_input_tokens,
            entries.output_tokens, entries.reasoning_output_tokens,
-           entries.total_tokens, threads.cwd, threads.git_json,
+           entries.total_tokens,
+           CAST(threads.cwd AS BLOB) AS cwd_blob,
+           CAST(threads.git_json AS BLOB) AS git_json_blob,
            threads.conversation_key AS joined_conversation_key,
            threads.source_root_key AS joined_source_root_key,
            entries.id AS cache_entry_id
@@ -143,30 +167,163 @@ def _qualified_codex_path_entries_sql(identity_count: int) -> str:
     )
 
 
-_INHERITED_CODEX_PROJECT_METADATA_SQL = """
-    SELECT files.source_root_key, files.path, inherited.cwd, inherited.git_json
+#: The thread leg of the decode inventory (§4.3 item 1). ``{threads}`` is the
+#: raw table reference ``resolve_codex_threads_table`` supplies at call time, so
+#: a conversations connection reads the attached cache rather than failing, and
+#: an account-scoped TEMP view over the unqualified name cannot hide the rows.
+#: Measured on the production store: 2,646 rows, 2.2 ms.
+_CODEX_THREAD_INVENTORY_SQL = """
+    SELECT conversation_key, source_root_key, native_thread_id, last_seen_utc,
+           CAST(cwd AS BLOB) AS cwd_blob,
+           CAST(git_json AS BLOB) AS git_json_blob
+      FROM {threads}
+"""
+
+#: The alias leg (§4.3 item 2). Issued only when this cache generation carries
+#: ``last_native_thread_id``. Measured: 2,986 rows, millisecond-scale.
+_CODEX_FILE_ALIAS_INVENTORY_SQL = """
+    SELECT files.source_root_key, files.path, files.last_native_thread_id
       FROM codex_session_files AS files
-      JOIN codex_conversation_threads AS inherited
-        ON inherited.source_root_key = files.source_root_key
-       AND inherited.native_thread_id = files.last_native_thread_id
      WHERE files.last_native_thread_id IS NOT NULL
        AND files.last_native_thread_id != ''
-     ORDER BY inherited.last_seen_utc DESC, inherited.conversation_key DESC
 """
 
 
-def _inherited_codex_path_metadata_sql(identity_count: int) -> str:
-    """Constrain inherited file-alias metadata to dirty physical paths."""
+def _codex_alias_inventory_sql(identity_count: int) -> str:
+    """Constrain the alias leg to dirty physical paths."""
     if identity_count < 1:
         raise ValueError("identity_count must be positive")
     predicates = " OR ".join(
         "(files.source_root_key = ? AND files.path = ?)"
         for _ in range(identity_count)
     )
-    return _INHERITED_CODEX_PROJECT_METADATA_SQL.replace(
+    return _CODEX_FILE_ALIAS_INVENTORY_SQL.replace(
         "     WHERE files.last_native_thread_id IS NOT NULL",
         f"     WHERE ({predicates})\n"
         "       AND files.last_native_thread_id IS NOT NULL",
+    )
+
+
+def _alias_winner_sort_key(last_seen_utc: object, conversation_key: object) -> tuple:
+    """Reproduce ``ORDER BY last_seen_utc DESC, conversation_key DESC``.
+
+    The retired statement ordered its joined rows that way and the qualifier
+    kept the FIRST row per ``(source_root_key, path)``, so the winner is the
+    maximum under this key. SQLite sorts NULL FIRST ascending, hence LAST
+    descending, so a NULL ``last_seen_utc`` loses to every stored value; the
+    leading flag is what reproduces that, and ``max`` is what reproduces
+    "first row wins".
+    """
+    has_last_seen = 0 if last_seen_utc is None else 1
+    return (
+        has_last_seen,
+        "" if last_seen_utc is None else str(last_seen_utc),
+        str(conversation_key or ""),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class CodexThreadMetadataInventory:
+    """One linear pass over the thread and alias tables (§4.3).
+
+    This replaces the SQL join in the retired
+    ``_INHERITED_CODEX_PROJECT_METADATA_SQL``, whose plan on the current schema
+    is ``SCAN files`` then ``SEARCH inherited USING INDEX
+    idx_codex_threads_source_root``: on a one-root machine every file row
+    rescans all 2,646 threads and the statement costs 1,362 ms. No index is
+    added, because a new index needs a real cache migration, which M4 excludes.
+
+    ``undecodable_direct`` and ``undecodable_inherited`` are what make the
+    counting of §4.3 zero-cost on a clean store: both are empty, so no
+    per-identity query runs at all.
+    """
+
+    direct_by_conversation: "dict[tuple[str, str], DecodedCodexProjectMetadata]"
+    inherited_by_path: "dict[tuple[str, str], DecodedCodexProjectMetadata]"
+    inherited_winner_by_path: "dict[tuple[str, str], tuple[str, str]]"
+    undecodable_direct: "frozenset[tuple[str, str]]"
+    undecodable_inherited: "frozenset[tuple[str, str]]"
+
+
+def load_codex_thread_metadata_inventory(
+    conn, *, paths: "Iterable[tuple[str, str]] | None" = None,
+) -> CodexThreadMetadataInventory:
+    """Read the thread and alias tables once each and decode every row.
+
+    ``paths`` bounds only the ALIAS leg, to the ``(source_root_key, path)``
+    identities a delta-resumed read actually asked for. The thread leg stays
+    whole-table because the alias winner for any path can be any thread sharing
+    its ``last_native_thread_id``.
+    """
+    threads_table = resolve_codex_threads_table(conn)
+    direct_by_conversation: "dict[tuple[str, str], DecodedCodexProjectMetadata]" = {}
+    candidates_by_native: "dict[tuple[str, str], tuple]" = {}
+    undecodable_direct: "set[tuple[str, str]]" = set()
+    for row in conn.execute(
+        _CODEX_THREAD_INVENTORY_SQL.format(threads=threads_table)
+    ):
+        (
+            conversation_key, root_key, native_thread_id, last_seen_utc,
+            cwd_blob, git_json_blob,
+        ) = row
+        identity = (str(root_key or ""), str(conversation_key or ""))
+        decoded = decode_codex_project_metadata(cwd_blob, git_json_blob)
+        if all(identity):
+            direct_by_conversation[identity] = decoded
+            if decoded.undecodable_fields:
+                undecodable_direct.add(identity)
+        native_identity = (identity[0], str(native_thread_id or ""))
+        if not all(native_identity):
+            continue
+        sort_key = _alias_winner_sort_key(last_seen_utc, conversation_key)
+        current = candidates_by_native.get(native_identity)
+        if current is None or sort_key > current[0]:
+            candidates_by_native[native_identity] = (
+                sort_key, str(conversation_key or ""), decoded,
+            )
+
+    inherited_by_path: "dict[tuple[str, str], DecodedCodexProjectMetadata]" = {}
+    inherited_winner_by_path: "dict[tuple[str, str], tuple[str, str]]" = {}
+    undecodable_inherited: "set[tuple[str, str]]" = set()
+    if _supports_native_file_aliases(conn):
+        identities = (
+            None if paths is None
+            else tuple(sorted({
+                (str(root), str(path)) for root, path in paths
+                if str(root) and str(path)
+            }))
+        )
+        if identities is not None and not identities:
+            alias_rows: tuple = ()
+        else:
+            alias_rows = tuple(conn.execute(
+                _CODEX_FILE_ALIAS_INVENTORY_SQL if identities is None
+                else _codex_alias_inventory_sql(len(identities)),
+                tuple(
+                    value for identity in (identities or ()) for value in identity
+                ),
+            ))
+        for root_key, path, native_thread_id in alias_rows:
+            identity = (str(root_key or ""), str(path or ""))
+            if not all(identity):
+                continue
+            winner = candidates_by_native.get(
+                (identity[0], str(native_thread_id or "")))
+            if winner is None:
+                continue
+            _sort_key, winning_conversation, decoded = winner
+            inherited_by_path[identity] = decoded
+            inherited_winner_by_path[identity] = (
+                identity[0], winning_conversation)
+            if decoded.undecodable_fields:
+                undecodable_inherited.add(identity)
+
+    return CodexThreadMetadataInventory(
+        direct_by_conversation=direct_by_conversation,
+        inherited_by_path=inherited_by_path,
+        inherited_winner_by_path=inherited_winner_by_path,
+        undecodable_direct=frozenset(undecodable_direct),
+        undecodable_inherited=frozenset(undecodable_inherited),
     )
 
 
@@ -193,7 +350,7 @@ _CODEX_ACCOUNTING_ENTRIES_SQL = """
 _ROOTED_CODEX_ACCOUNTING_ENTRIES_SQL = """
     SELECT timestamp_utc, session_id, source_path, source_root_key, model,
            input_tokens, cached_input_tokens, output_tokens,
-           reasoning_output_tokens, total_tokens, account_key
+           reasoning_output_tokens, total_tokens, account_key, conversation_key
       FROM codex_session_entries INDEXED BY idx_codex_entries_ts_root_conversation
      WHERE timestamp_utc >= ?
        AND timestamp_utc < ?
@@ -221,7 +378,26 @@ _CODEX_PROJECT_METADATA_HEALTH_SQL = """
             WHERE files.path = entries.source_path
               AND files.source_root_key = entries.source_root_key
            )
-          THEN 1 ELSE 0 END), 0) AS missing_thread_join_rows
+          THEN 1 ELSE 0 END), 0) AS missing_thread_join_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NOT NULL
+           AND entries.conversation_key != ''
+           AND NOT (
+             threads.conversation_key IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM codex_session_files AS files
+               JOIN codex_conversation_threads AS inherited
+                 ON inherited.source_root_key = entries.source_root_key
+                AND inherited.native_thread_id = files.last_native_thread_id
+              WHERE files.path = entries.source_path
+                AND files.source_root_key = entries.source_root_key
+             )
+           )
+           AND codex_accounting_row_usable(
+             entries.timestamp_utc, entries.input_tokens,
+             entries.cached_input_tokens, entries.output_tokens,
+             entries.reasoning_output_tokens, entries.total_tokens) = 0
+          THEN 1 ELSE 0 END), 0) AS malformed_accounting_rows
       FROM codex_session_entries AS entries
       LEFT JOIN codex_conversation_threads AS threads
         ON threads.conversation_key = entries.conversation_key
@@ -232,6 +408,37 @@ _CODEX_PROJECT_METADATA_HEALTH_SQL = """
 
 
 _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL = """
+    SELECT
+      COUNT(*) AS total_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NULL OR entries.conversation_key = ''
+          THEN 1 ELSE 0 END), 0) AS missing_conversation_key_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NOT NULL
+           AND entries.conversation_key != ''
+           AND threads.conversation_key IS NULL
+          THEN 1 ELSE 0 END), 0) AS missing_thread_join_rows,
+      COALESCE(SUM(CASE
+          WHEN entries.conversation_key IS NOT NULL
+           AND entries.conversation_key != ''
+           AND threads.conversation_key IS NOT NULL
+           AND codex_accounting_row_usable(
+             entries.timestamp_utc, entries.input_tokens,
+             entries.cached_input_tokens, entries.output_tokens,
+             entries.reasoning_output_tokens, entries.total_tokens) = 0
+          THEN 1 ELSE 0 END), 0) AS malformed_accounting_rows
+      FROM codex_session_entries AS entries
+      LEFT JOIN codex_conversation_threads AS threads
+        ON threads.conversation_key = entries.conversation_key
+       AND threads.source_root_key = entries.source_root_key
+     WHERE (? IS NULL OR entries.timestamp_utc >= ?)
+       AND (? IS NULL OR entries.timestamp_utc < ?)
+"""
+
+
+# A pre-native-alias cache may also predate the accounting operand columns.
+# Doctor must still report its metadata partition instead of failing the read.
+_CODEX_PROJECT_METADATA_HEALTH_PRE_OPERAND_SQL = """
     SELECT
       COUNT(*) AS total_rows,
       COALESCE(SUM(CASE
@@ -253,63 +460,52 @@ _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL = """
 
 # === #834 S2 (#828) — the bounded detail-horizon metadata probe ============
 #
-# `_CODEX_PROJECT_METADATA_HEALTH_SQL` above counts two qualification failures
-# and the qualified reader rejects more: it parses the timestamp at
-# `_parse_timestamp` and the integer token operands inside
-# `_calculate_codex_entry_cost`, raising `QualifiedMetadataUnavailable` on
-# either. A row with intact joins and a malformed timestamp was therefore
-# counted healthy by that SQL and refused by the reader.
+# `_CODEX_PROJECT_METADATA_HEALTH_SQL` above counts key, join and accounting
+# operand failures. The detail probe answers the larger read horizon.
 #
 # The horizon is the other half. The generation's accounting window is roughly
 # thirty calendar days while both detail routes read a YEAR, so a malformed row
 # aged thirty-one to three hundred and sixty-five days set no flag at all and
 # the page rendered in full with that row's cost silently absent.
 #
-# TWO LIMITS, stated rather than hidden. First, this probe and the qualified
+# ONE LIMIT, stated rather than hidden. This probe and the qualified
 # reader share the same TEXT range bounds, so a timestamp malformed enough to
 # sort outside the window is invisible to BOTH — such a row also contributes to
 # no figure and reaches no route, so the two agree about it by construction.
-# Second, the text-integer test below strips the signed-digit character set
-# from the left, which admits a pathological interior form such as `1-2` that
-# `int()` would refuse. Neither writer in this repository produces either
-# shape, and both errors are in the direction of counting fewer rows, never of
-# degrading a page that would have rendered.
+# The operand predicate below calls the reader's own timestamp and integer
+# parsers, so SQLite's looser datetime and signed-digit grammars cannot turn a
+# refused row into a healthy probe result.
 
 #: The five integer operands the qualified reader parses. `total_tokens` is
-#: included even though its `int()` sits OUTSIDE the reader's `try`, so a
-#: malformed value there escapes as a bare `ValueError` rather than as
-#: `QualifiedMetadataUnavailable`. It is still a row the reader cannot turn
-#: into an entry, which is what this probe counts.
+#: included in the same translated conversion as the other four operands.
 _CODEX_TOKEN_OPERANDS = (
     "input_tokens", "cached_input_tokens", "output_tokens",
     "reasoning_output_tokens", "total_tokens",
 )
 
 
-def _unusable_integer_predicate(column: str) -> str:
-    """SQL for one token operand that ``int()`` would refuse."""
-    qualified = f"entries.{column}"
-    return (
-        f"(typeof({qualified}) IN ('null', 'blob')"
-        f" OR (typeof({qualified}) = 'text'"
-        f" AND ({qualified} = ''"
-        f" OR ltrim({qualified}, '+-0123456789') != '')))"
+def _codex_accounting_row_usable(*values: object) -> int:
+    """Use the reader's exact parsers for the six stored accounting values."""
+    try:
+        _parse_timestamp(values[0])
+        for value in values[1:]:
+            int(value)
+    except (QualifiedMetadataUnavailable, TypeError, ValueError, OverflowError):
+        return 0
+    return 1
+
+
+_CODEX_ACCOUNTING_ROW_USABLE_SQL = (
+    "codex_accounting_row_usable(entries.timestamp_utc, "
+    + ", ".join(f"entries.{column}" for column in _CODEX_TOKEN_OPERANDS)
+    + ")"
+)
+
+
+def _register_codex_accounting_probe(cache_conn: sqlite3.Connection) -> None:
+    cache_conn.create_function(
+        "codex_accounting_row_usable", 6, _codex_accounting_row_usable,
     )
-
-
-#: A timestamp the qualified reader can turn into an aware UTC instant.
-#: `datetime()` returns NULL for anything SQLite cannot parse, and the offset
-#: test is what rejects a naive value — `dt.datetime.fromisoformat` yields a
-#: naive object for those and `_parse_timestamp` raises on it.
-_CODEX_AWARE_TIMESTAMP_SQL = """(
-        entries.timestamp_utc IS NOT NULL
-        AND datetime(entries.timestamp_utc) IS NOT NULL
-        AND (
-            entries.timestamp_utc LIKE '%Z'
-            OR entries.timestamp_utc GLOB '*[+-][0-9][0-9]:[0-9][0-9]'
-            OR entries.timestamp_utc GLOB '*[+-][0-9][0-9][0-9][0-9]'
-        )
-    )"""
 
 _CODEX_DETAIL_PROBE_JOIN_SQL = """
         entries.conversation_key IS NOT NULL
@@ -332,12 +528,10 @@ _CODEX_DETAIL_PROBE_JOIN_LEGACY_SQL = """
 
 def _codex_detail_metadata_probe_sql(cache_conn: sqlite3.Connection) -> str:
     """Compose the probe over whichever thread-alias shape this cache carries."""
+    _register_codex_accounting_probe(cache_conn)
     join_predicate = (
         _CODEX_DETAIL_PROBE_JOIN_SQL if _supports_native_file_aliases(cache_conn)
         else _CODEX_DETAIL_PROBE_JOIN_LEGACY_SQL
-    )
-    token_predicate = "\n           OR ".join(
-        _unusable_integer_predicate(column) for column in _CODEX_TOKEN_OPERANDS
     )
     # Direct non-null bounds, never the nullable `(? IS NULL OR ...)` form the
     # unbounded doctor helper needs: that form is opaque to the query planner,
@@ -349,8 +543,7 @@ def _codex_detail_metadata_probe_sql(cache_conn: sqlite3.Connection) -> str:
            entries.conversation_key IS NULL OR entries.conversation_key = ''
            OR ({join_predicate}
         )
-           OR NOT {_CODEX_AWARE_TIMESTAMP_SQL}
-           OR {token_predicate}
+           OR {_CODEX_ACCOUNTING_ROW_USABLE_SQL} = 0
         THEN 1 ELSE 0 END), 0) AS unqualifiable_rows
       FROM codex_session_entries AS entries
            INDEXED BY idx_codex_entries_ts_root_conversation
@@ -360,6 +553,186 @@ def _codex_detail_metadata_probe_sql(cache_conn: sqlite3.Connection) -> str:
      WHERE entries.timestamp_utc >= ?
        AND entries.timestamp_utc < ?
 """
+
+
+#: How many affected ids one overlap statement carries. The subtraction runs
+#: over the ids the per-identity queries already returned, so the chunk bounds
+#: the SQL text rather than the work.
+_OVERLAP_ID_CHUNK = 400
+
+#: One query per undecodable identity, never a disjunction over all of them: a
+#: multi-identity `OR` predicate makes SQLite abandon the index and scan the
+#: table, which is why `load_codex_quota_observations` shards too.
+_UNDECODABLE_DIRECT_ENTRIES_SQL = """
+    SELECT entries.id, entries.source_path, entries.conversation_key
+      FROM codex_session_entries AS entries
+           INDEXED BY idx_codex_entries_conversation
+     WHERE entries.source_root_key = ?
+       AND entries.conversation_key = ?
+"""
+
+_UNDECODABLE_INHERITED_ENTRIES_SQL = """
+    SELECT entries.id, entries.source_path, entries.conversation_key
+      FROM codex_session_entries AS entries
+           INDEXED BY idx_codex_entries_root_path
+     WHERE entries.source_root_key = ?
+       AND entries.source_path = ?
+"""
+
+_BOUNDED_ENTRIES_PREDICATE = """
+       AND entries.timestamp_utc >= ?
+       AND entries.timestamp_utc < ?
+"""
+
+
+def _undecodable_entries_sql(base: str, *, bounded: bool) -> str:
+    return base + (_BOUNDED_ENTRIES_PREDICATE if bounded else "")
+
+
+def _codex_population_reason_sql(
+    cache_conn: sqlite3.Connection, *, include_probe_reasons: bool,
+) -> str:
+    """This population's OWN reason predicate, reproduced not re-implemented.
+
+    The aggregates count a missing conversation key, a missing thread join,
+    and a refused accounting operand. A row with undecodable metadata and a
+    bad timestamp is already counted by the operand branch, so it is
+    subtracted from the undecodable count for each population.
+
+    The reason semantics — the shared accounting parser, the alias
+    ``NOT EXISTS`` — are never re-implemented in Python: the predicate text
+    here is the same text the aggregates evaluate.
+    """
+    join_predicate = (
+        _CODEX_DETAIL_PROBE_JOIN_SQL if _supports_native_file_aliases(cache_conn)
+        else _CODEX_DETAIL_PROBE_JOIN_LEGACY_SQL
+    )
+    reasons = [
+        "(entries.conversation_key IS NULL OR entries.conversation_key = '')",
+        f"({join_predicate})",
+    ]
+    if include_probe_reasons:
+        _register_codex_accounting_probe(cache_conn)
+        reasons.append(f"{_CODEX_ACCOUNTING_ROW_USABLE_SQL} = 0")
+    return "\n           OR ".join(reasons)
+
+
+def _codex_overlap_sql(
+    cache_conn: sqlite3.Connection, *, include_probe_reasons: bool,
+    bounded: bool, chunk_size: int,
+) -> str:
+    """The population's complete caller shape, over one chunk of ids.
+
+    The callers' reason predicates are not standalone expressions: they
+    reference the ``threads`` join alias and the inherited-alias ``NOT
+    EXISTS``, so this statement reproduces the aggregate's own ``LEFT JOIN``
+    and its own time bounds rather than evaluating the predicate in isolation.
+    """
+    placeholders = ",".join("?" for _ in range(chunk_size))
+    bounds = _BOUNDED_ENTRIES_PREDICATE if bounded else ""
+    return f"""
+    SELECT entries.id
+      FROM codex_session_entries AS entries
+      LEFT JOIN codex_conversation_threads AS threads
+        ON threads.conversation_key = entries.conversation_key
+       AND threads.source_root_key = entries.source_root_key
+     WHERE entries.id IN ({placeholders}){bounds}
+       AND ({_codex_population_reason_sql(
+           cache_conn, include_probe_reasons=include_probe_reasons)})
+"""
+
+
+def count_undecodable_codex_metadata_rows(
+    cache_conn: sqlite3.Connection,
+    *,
+    bound_start: "str | None",
+    bound_end: "str | None",
+    include_probe_reasons: bool,
+    inventory: "CodexThreadMetadataInventory | None" = None,
+) -> int:
+    """Entries this population must count for undecodable project metadata.
+
+    Zero-cost on a clean store: both undecodable sets are empty, so no
+    per-identity query runs at all and this returns before touching the
+    entries table.
+
+    The affected ids are unioned across the direct and inherited identities,
+    and a second bounded query per population returns the subset that
+    population's aggregate already counted for another reason; the decode count
+    is the union minus that subset, so no entry is counted twice.
+    """
+    if inventory is None:
+        inventory = load_codex_thread_metadata_inventory(cache_conn)
+    if not inventory.undecodable_direct and not inventory.undecodable_inherited:
+        return 0
+    bounded = bound_start is not None and bound_end is not None
+    bounds: tuple = (bound_start, bound_end) if bounded else ()
+
+    affected: set[int] = set()
+    seeks = (
+        (_UNDECODABLE_DIRECT_ENTRIES_SQL, inventory.undecodable_direct),
+        (_UNDECODABLE_INHERITED_ENTRIES_SQL, inventory.undecodable_inherited),
+    )
+    for base_sql, identities in seeks:
+        if not identities:
+            continue
+        sql = _undecodable_entries_sql(base_sql, bounded=bounded)
+        for root_key, second in sorted(identities):
+            for entry_id, source_path, conversation_key in cache_conn.execute(
+                sql, (root_key, second, *bounds),
+            ):
+                direct = inventory.direct_by_conversation.get(
+                    (str(root_key), str(conversation_key or "")))
+                inherited = inventory.inherited_by_path.get(
+                    (str(root_key), str(source_path or "")))
+                if codex_metadata_is_malformed(direct, inherited):
+                    affected.add(int(entry_id))
+    if not affected:
+        return 0
+
+    already_counted: set[int] = set()
+    ordered = sorted(affected)
+    for offset in range(0, len(ordered), _OVERLAP_ID_CHUNK):
+        chunk = ordered[offset:offset + _OVERLAP_ID_CHUNK]
+        sql = _codex_overlap_sql(
+            cache_conn, include_probe_reasons=include_probe_reasons,
+            bounded=bounded, chunk_size=len(chunk),
+        )
+        already_counted.update(
+            int(row[0]) for row in cache_conn.execute(sql, (*chunk, *bounds))
+        )
+    return len(affected - already_counted)
+
+
+def explain_undecodable_codex_overlap(
+    cache_conn: sqlite3.Connection,
+    *,
+    include_probe_reasons: bool,
+    bounded: bool,
+    chunk_size: int = 1,
+) -> "tuple[str, ...]":
+    """The overlap statement's query plan, so a test can prove it seeks."""
+    sql = _codex_overlap_sql(
+        cache_conn, include_probe_reasons=include_probe_reasons,
+        bounded=bounded, chunk_size=chunk_size,
+    )
+    params = tuple(range(chunk_size)) + ((("", "")) if bounded else ())
+    rows = cache_conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    return tuple(str(row[-1]) for row in rows)
+
+
+def explain_undecodable_codex_identity_seek(
+    cache_conn: sqlite3.Connection, *, inherited: bool, bounded: bool,
+) -> "tuple[str, ...]":
+    """One per-identity counting query's plan, so a test can prove it seeks."""
+    sql = _undecodable_entries_sql(
+        _UNDECODABLE_INHERITED_ENTRIES_SQL if inherited
+        else _UNDECODABLE_DIRECT_ENTRIES_SQL,
+        bounded=bounded,
+    )
+    params = ("", "") + (("", "") if bounded else ())
+    rows = cache_conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    return tuple(str(row[-1]) for row in rows)
 
 
 def _probe_bounds(start: dt.datetime, end: dt.datetime) -> tuple[str, str]:
@@ -377,6 +750,7 @@ def probe_codex_detail_metadata_health(
     cache_conn: sqlite3.Connection,
     start: dt.datetime,
     end: dt.datetime,
+    inventory: "CodexThreadMetadataInventory | None" = None,
 ) -> CodexProjectMetadataHealth:
     """Count rows in ``[start, end)`` the qualified reader would refuse.
 
@@ -393,6 +767,7 @@ def probe_codex_detail_metadata_health(
     caller reads.
     """
     bound_start, bound_end = _probe_bounds(start, end)
+    _register_codex_accounting_probe(cache_conn)
     row = cache_conn.execute(
         _codex_detail_metadata_probe_sql(cache_conn), (bound_start, bound_end),
     ).fetchone()
@@ -404,11 +779,21 @@ def probe_codex_detail_metadata_health(
         raise RuntimeError("Codex detail metadata probe returned invalid counts") from exc
     if total_rows < 0 or unqualifiable_rows < 0 or unqualifiable_rows > total_rows:
         raise RuntimeError("Codex detail metadata probe partition is invalid")
+    undecodable_rows = count_undecodable_codex_metadata_rows(
+        cache_conn,
+        bound_start=bound_start,
+        bound_end=bound_end,
+        include_probe_reasons=True,
+        inventory=inventory,
+    )
+    if unqualifiable_rows + undecodable_rows > total_rows:
+        raise RuntimeError("Codex detail metadata probe partition is invalid")
     return CodexProjectMetadataHealth(
         total_rows=total_rows,
-        qualified_rows=total_rows - unqualifiable_rows,
+        qualified_rows=total_rows - unqualifiable_rows - undecodable_rows,
         missing_conversation_key_rows=unqualifiable_rows,
         missing_thread_join_rows=0,
+        undecodable_metadata_rows=undecodable_rows,
     )
 
 
@@ -428,11 +813,18 @@ def explain_codex_detail_metadata_probe(
 
 
 def _supports_native_file_aliases(cache_conn: sqlite3.Connection) -> bool:
-    """Return whether this cache generation can link child files to a root task."""
-    try:
-        columns = cache_conn.execute("PRAGMA table_info(codex_session_files)").fetchall()
-    except sqlite3.Error:
-        return False
+    """Return whether this cache generation can link child files to a root task.
+
+    #846 §4.6, the second taxonomy hole. This used to answer ``False`` both
+    when the PRAGMA succeeded and the column was absent, and when the PRAGMA
+    itself failed. The two are different facts: the first is an old schema and
+    the second is a failed read, and answering "old schema" for a failed read
+    silently dropped the inherited alias population from every caller. A
+    ``sqlite3.Error`` now propagates, and the combined verdict of §4.6 turns it
+    into a transient generation rather than a quietly narrower one.
+    """
+    columns = cache_conn.execute(
+        "PRAGMA table_info(codex_session_files)").fetchall()
     return any(len(row) > 1 and row[1] == "last_native_thread_id" for row in columns)
 
 
@@ -471,6 +863,7 @@ def load_codex_project_metadata_health(
     cache_conn: sqlite3.Connection,
     start: dt.datetime | None = None,
     end: dt.datetime | None = None,
+    inventory: "CodexThreadMetadataInventory | None" = None,
 ) -> CodexProjectMetadataHealth:
     """Classify retained Codex accounting in one root-qualified SQL read.
 
@@ -485,19 +878,48 @@ def load_codex_project_metadata_health(
     if start is not None and end is not None and start > end:
         raise ValueError("start must not be after end")
 
+    entry_columns = {
+        str(row[1]) for row in cache_conn.execute(
+            "PRAGMA table_info(codex_session_entries)")
+    }
+    has_operands = set(_CODEX_TOKEN_OPERANDS).issubset(entry_columns)
+    if has_operands:
+        _register_codex_accounting_probe(cache_conn)
+    native_aliases = _supports_native_file_aliases(cache_conn)
+    if has_operands:
+        sql = (_CODEX_PROJECT_METADATA_HEALTH_SQL if native_aliases
+               else _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL)
+    else:
+        sql = _CODEX_PROJECT_METADATA_HEALTH_PRE_OPERAND_SQL
     row = cache_conn.execute(
-        (_CODEX_PROJECT_METADATA_HEALTH_SQL if _supports_native_file_aliases(cache_conn)
-         else _CODEX_PROJECT_METADATA_HEALTH_LEGACY_SQL),
+        sql,
         (bound_start, bound_start, bound_end, bound_end),
     ).fetchone()
-    if row is None or len(row) != 3:
+    if row is None or len(row) != (4 if has_operands else 3):
         raise RuntimeError("Codex project metadata health query returned no partition")
     try:
-        total_rows, missing_key_rows, missing_join_rows = (int(value) for value in row)
+        counts = tuple(int(value) for value in row)
+        total_rows, missing_key_rows, missing_join_rows = counts[:3]
+        malformed_rows = counts[3] if has_operands else 0
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Codex project metadata health query returned invalid counts") from exc
-    qualified_rows = total_rows - missing_key_rows - missing_join_rows
-    values = (total_rows, qualified_rows, missing_key_rows, missing_join_rows)
+    # #845 §4.3. The same partition over the same population, with a third
+    # reason. Doctor's all-history call omits both timestamp predicates, which
+    # is exactly the nullable-bound shape this function already answers for.
+    undecodable_rows = count_undecodable_codex_metadata_rows(
+        cache_conn,
+        bound_start=bound_start,
+        bound_end=bound_end,
+        include_probe_reasons=has_operands,
+        inventory=inventory,
+    )
+    qualified_rows = (
+        total_rows - missing_key_rows - missing_join_rows
+        - malformed_rows - undecodable_rows)
+    values = (
+        total_rows, qualified_rows, missing_key_rows, missing_join_rows,
+        undecodable_rows, malformed_rows,
+    )
     if any(value < 0 for value in values) or total_rows != sum(values[1:]):
         raise RuntimeError("Codex project metadata health partition is invalid")
     return CodexProjectMetadataHealth(
@@ -505,6 +927,8 @@ def load_codex_project_metadata_health(
         qualified_rows=qualified_rows,
         missing_conversation_key_rows=missing_key_rows,
         missing_thread_join_rows=missing_join_rows,
+        undecodable_metadata_rows=undecodable_rows,
+        malformed_accounting_rows=malformed_rows,
     )
 
 
@@ -569,11 +993,17 @@ def load_cached_rooted_codex_accounting_entries(
 
     result: list[RootedCodexAccountingEntry] = []
     for row in rows:
+        # A corrupt operand cannot contribute cost or tokens. The generation's
+        # bounded probes count this physical row once; keep every other row.
+        if not _codex_accounting_row_usable(
+            row[0], row[5], row[6], row[7], row[8], row[9],
+        ):
+            continue
         try:
             (
                 timestamp_raw, session_id_raw, source_path_raw, source_root_key_raw,
                 model_raw, input_raw, cached_input_raw, output_raw, reasoning_raw,
-                total_raw, account_key_raw,
+                total_raw, account_key_raw, conversation_key_raw,
             ) = row
             source_path = source_path_raw if isinstance(source_path_raw, str) else ""
             source_root_key = source_root_key_raw if isinstance(source_root_key_raw, str) else ""
@@ -612,6 +1042,10 @@ def load_cached_rooted_codex_accounting_entries(
             total_tokens=total_tokens,
             cost_usd=cost_usd,
             account_key=entry_account_key,
+            conversation_key=(
+                conversation_key_raw
+                if isinstance(conversation_key_raw, str) else ""
+            ),
         ))
     return tuple(result)
 
@@ -747,6 +1181,7 @@ def load_qualified_codex_entries(
     group: str = "git-root",
     cache_conn: sqlite3.Connection | None = None,
     source_identities: Iterable[tuple[str, str]] | None = None,
+    inventory: "CodexThreadMetadataInventory | None" = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """Load exactly one bounded, root-qualified Codex accounting read.
 
@@ -803,19 +1238,15 @@ def load_qualified_codex_entries(
             *(value for identity in (identities or ()) for value in identity),
         )
         rows = tuple(conn.execute(sql, params))
-        inherited_metadata: dict[tuple[str, str], sqlite3.Row] = {}
-        if _supports_native_file_aliases(conn):
-            inherited_sql = (
-                _INHERITED_CODEX_PROJECT_METADATA_SQL if identities is None
-                else _inherited_codex_path_metadata_sql(len(identities))
-            )
-            inherited_params = tuple(
-                value for identity in (identities or ()) for value in identity
-            )
-            for inherited in conn.execute(inherited_sql, inherited_params):
-                identity = (str(inherited["source_root_key"] or ""), str(inherited["path"] or ""))
-                if all(identity):
-                    inherited_metadata.setdefault(identity, inherited)
+        # §4.3: one inventory read per build. The caller supplies the build's
+        # own inventory when it has one; its alias leg is unbounded, which is a
+        # SUPERSET of the `paths=identities` leg this read would have loaded,
+        # and every lookup below is by identity, so the wider map answers each
+        # row identically.
+        inherited_metadata = (
+            load_codex_thread_metadata_inventory(conn, paths=identities)
+            if inventory is None else inventory
+        ).inherited_by_path
     except sqlite3.Error as exc:
         raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable") from exc
     finally:
@@ -855,15 +1286,34 @@ def _qualify_codex_rows(
                 or not isinstance(conversation_key, str) or not conversation_key
             ):
                 raise
-        cwd = row["cwd"] or (inherited["cwd"] if inherited is not None else None)
-        git_json = row["git_json"] or (
-            inherited["git_json"] if inherited is not None else None)
+        # #845 §4.1/§4.2. The two thread columns arrive as BLOBs and are
+        # decoded field by field, so one undecodable byte no longer fails the
+        # statement that selected it. An entry whose resolver path REACHES an
+        # undecodable field cannot be attributed, and this reader has no
+        # partial-result carrier, so it refuses the whole read — the same
+        # deterministic refusal `_parse_timestamp` and the cost operands
+        # already use. It does not skip the row.
+        direct = decode_codex_project_metadata(
+            row["cwd_blob"], row["git_json_blob"])
+        if codex_metadata_is_malformed(direct, inherited):
+            raise QualifiedMetadataUnavailable(
+                "Codex qualified project metadata is unavailable",
+                transient=False)
+        cwd = direct.cwd or (inherited.cwd if inherited is not None else None)
+        git_json = direct.git_json or (
+            inherited.git_json if inherited is not None else None)
         resolved_key, project_label = projects.resolve(cwd, git_json)
         try:
+            timestamp = _parse_timestamp(row["timestamp_utc"])
+            input_tokens = int(row["input_tokens"])
+            cached_input_tokens = int(row["cached_input_tokens"])
+            output_tokens = int(row["output_tokens"])
+            reasoning_output_tokens = int(row["reasoning_output_tokens"])
+            total_tokens = int(row["total_tokens"])
             cost_usd = c._calculate_codex_entry_cost(
-                str(row["model"]), int(row["input_tokens"]),
-                int(row["cached_input_tokens"]), int(row["output_tokens"]),
-                int(row["reasoning_output_tokens"]), speed=speed,
+                str(row["model"]), input_tokens,
+                cached_input_tokens, output_tokens,
+                reasoning_output_tokens, speed=speed,
             )
         except (TypeError, ValueError, OverflowError) as exc:
             # #834 S2 (#829): deterministic. A stored token operand `int()`
@@ -871,7 +1321,7 @@ def _qualify_codex_rows(
             raise QualifiedMetadataUnavailable(
                 "Codex qualified accounting is unavailable", transient=False) from exc
         result.append(QualifiedCodexEntry(
-            timestamp=_parse_timestamp(row["timestamp_utc"]),
+            timestamp=timestamp,
             session_id=str(row["session_id"] or ""),
             source_path=str(row["source_path"] or ""),
             source_root_key=root_key,
@@ -879,11 +1329,11 @@ def _qualify_codex_rows(
             project_key=opaque_project_key("codex", root_key, resolved_key),
             project_label=project_label,
             model=str(row["model"]),
-            input_tokens=int(row["input_tokens"]),
-            cached_input_tokens=int(row["cached_input_tokens"]),
-            output_tokens=int(row["output_tokens"]),
-            reasoning_output_tokens=int(row["reasoning_output_tokens"]),
-            total_tokens=int(row["total_tokens"]),
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            reasoning_output_tokens=reasoning_output_tokens,
+            total_tokens=total_tokens,
             cost_usd=cost_usd,
             # NULL ≡ unattributed — the cache-read rule (#416 §5.2). Carried,
             # never grouped; see the field's comment on `QualifiedCodexEntry`.
@@ -891,12 +1341,6 @@ def _qualify_codex_rows(
             cache_entry_id=int(row["cache_entry_id"]),
         ))
     return tuple(result)
-
-
-_CODEX_PROJECT_THREAD_METADATA_SQL = """
-    SELECT conversation_key, source_root_key, cwd, git_json
-      FROM codex_conversation_threads
-"""
 
 
 def _require_sql_replace(sql: str, marker: str, replacement: str) -> str:
@@ -974,25 +1418,6 @@ _ROOT_PATH_SCOPED_CODEX_ENTRIES_SQL = _require_sql_replace(
 )
 
 
-def _load_inherited_codex_metadata(conn) -> "dict[tuple[str, str], sqlite3.Row]":
-    """The file-alias metadata map, keyed by ``(source_root_key, path)``.
-
-    ``setdefault`` and not assignment: the statement orders by
-    ``inherited.last_seen_utc DESC, inherited.conversation_key DESC`` and the
-    qualifier keeps the FIRST row per identity, so a second writer for the same
-    path must not win.
-    """
-    inherited_metadata: "dict[tuple[str, str], sqlite3.Row]" = {}
-    if not _supports_native_file_aliases(conn):
-        return inherited_metadata
-    for inherited in conn.execute(_INHERITED_CODEX_PROJECT_METADATA_SQL):
-        identity = (
-            str(inherited["source_root_key"] or ""), str(inherited["path"] or ""))
-        if all(identity):
-            inherited_metadata.setdefault(identity, inherited)
-    return inherited_metadata
-
-
 def resolve_codex_project_scope(
     conn, matches_project_key, *, group: str = "git-root",
 ) -> "tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...], dict]":
@@ -1042,26 +1467,35 @@ def resolve_codex_project_scope(
         # Set here rather than assumed, so this resolver is usable on a plain
         # caller-owned connection as well as inside the scoped read.
         conn.row_factory = sqlite3.Row
-        conversations: list[tuple[str, str]] = []
-        for row in conn.execute(_CODEX_PROJECT_THREAD_METADATA_SQL):
-            root_key = str(row["source_root_key"] or "")
-            conversation_key = str(row["conversation_key"] or "")
-            if not root_key or not conversation_key:
-                continue
-            if matches_project_key(
-                projects.project_key(root_key, row["cwd"], row["git_json"])
-            ):
-                conversations.append((root_key, conversation_key))
-        inherited_metadata = _load_inherited_codex_metadata(conn)
+        inventory = load_codex_thread_metadata_inventory(conn)
     finally:
         conn.row_factory = previous_row_factory
+    conversations: list[tuple[str, str]] = []
+    for (root_key, conversation_key), direct in (
+        inventory.direct_by_conversation.items()
+    ):
+        # #845 §4.1. A thread whose own resolver path reaches an undecodable
+        # field resolves to nothing, so it can carry no request. Handing its
+        # decoded `None` fields to the resolver would answer `(unassigned)`
+        # and select the conversation for an unrelated request.
+        if codex_metadata_is_malformed(direct, None):
+            continue
+        if matches_project_key(
+            projects.project_key(root_key, direct.cwd, direct.git_json)
+        ):
+            conversations.append((root_key, conversation_key))
     paths: list[tuple[str, str]] = []
-    for (root_key, path), inherited in inherited_metadata.items():
+    for (root_key, path), inherited in inventory.inherited_by_path.items():
+        if codex_metadata_is_malformed(None, inherited):
+            continue
         if matches_project_key(projects.project_key(
-            root_key, inherited["cwd"], inherited["git_json"],
+            root_key, inherited.cwd, inherited.git_json,
         )):
             paths.append((root_key, path))
-    return tuple(sorted(set(conversations))), tuple(sorted(set(paths))), inherited_metadata
+    return (
+        tuple(sorted(set(conversations))), tuple(sorted(set(paths))),
+        inventory.inherited_by_path,
+    )
 
 
 def load_codex_project_scoped_entries(

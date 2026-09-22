@@ -31,7 +31,7 @@ jobs:
     # — it runs ONLY in the private repo. (Analogue of the self-hosted-runner
     # push-only guard in ci.yml.)
     if: github.repository == 'omrikais/cctally-dev'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, cctally]
     timeout-minutes: 15  # a network fetch + issue update; ample headroom (#279 S7 W4)
     env:
       # Pin gh's target repo so issue ops can never accidentally hit the
@@ -42,15 +42,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v6
-        with:
-          # bin/cctally hard-exits below 3.11 (__min_python_version__);
-          # ubuntu-latest's default python3 is older.
-          python-version: "3.13"
-
       - name: Run pricing-check (capture rc — exit 1 = drift, not failure)
         id: check
         run: |
+          # Use the same brew Python 3.13 as the private test lane, without
+          # replacing the runner's PATH (gh and the Actions toolchain remain).
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           # `pricing-check` exits 1 on the exact drift case this job exists
           # to handle, and an Actions `run:` step fails the job on any
           # nonzero exit. Capture stdout + rc WITHOUT aborting, then continue
@@ -70,4 +67,6 @@ jobs:
           printf '%s\n' "$OUT" > /tmp/pricing.json
 
       - name: Manage the pricing-drift issue
-        run: python3 .github/scripts/pricing_issue.py /tmp/pricing.json
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
+          python3 .github/scripts/pricing_issue.py /tmp/pricing.json

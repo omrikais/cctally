@@ -1104,6 +1104,169 @@ def test_scoped_claude_anon_map_excludes_other_account_file_path(
         stop(srv, srv._test_thread)
 
 
+def test_scoped_codex_anonymization_refuses_ambiguous_thread_cwd(
+        tmp_path, monkeypatch):
+    """A surviving B row does not prove a conversation-level CWD is B-owned."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=("modern-full",),
+        claude_sids=())
+    account_a = "a" * 32
+    account_b = "b" * 32
+    alice_path = "/Users/alice/account-a-project"
+    conversations = ns["open_conversations_db"]()
+    try:
+        key = keys["modern-full"]
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key=?",
+            (account_b,),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_events SET account_key=?",
+            (account_a,),
+        )
+        conversations.commit()
+    finally:
+        conversations.close()
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key=?", (alice_path, key),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+    try:
+        port = srv.server_address[1]
+        for suffix in ("/export?anonymize=1", "/anon-map"):
+            separator = "&" if "?" in suffix else "?"
+            path = _entity_path(key, suffix) + f"{separator}account={account_b}"
+            if suffix.startswith("/export"):
+                status, raw_body, content_type = _get(port, path)
+                body = json.loads(raw_body) if raw_body.startswith(b"{") else None
+            else:
+                status, body, content_type = _get_json(port, path)
+            assert status == 409, (suffix, status, body)
+            assert "application/json" in content_type
+            assert body["status"] == "anonymization_unavailable"
+            assert body["ambiguous_cwd_rows"] == 2  # CWD + provider root
+            assert body["reason"] == "ambiguous_account_provenance"
+            assert "undecodable_cwd_rows" not in body
+            assert "markdown" not in body
+            assert "tokens" not in body
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_scoped_codex_anonymization_uses_only_proven_account_paths(
+        tmp_path, monkeypatch):
+    """A proven A path is scrubbed while B's root never reaches A's map."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch,
+        codex_scenarios=("modern-full",),
+        claude_sids=())
+    account_a = "a" * 32
+    account_b = "b" * 32
+    key_a = keys["modern-full"]
+    alice_path = "/Users/alice/account-a-project"
+    bravo_path = "/Users/bravo/account-b-project"
+    conversations = ns["open_conversations_db"]()
+    try:
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key=? "
+            "WHERE conversation_key=?", (account_a, key_a),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key=? "
+            "WHERE id=(SELECT MAX(id) FROM codex_conversation_messages "
+            "WHERE conversation_key=?)", (account_b, key_a),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_events SET account_key=?",
+            (account_a,),
+        )
+        source_root_key = conversations.execute(
+            "SELECT source_root_key FROM codex_conversation_events "
+            "WHERE conversation_key=? LIMIT 1", (key_a,),
+        ).fetchone()[0]
+        conversations.execute(
+            "INSERT INTO codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,"
+            "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("account-a.jsonl", 0, source_root_key, key_a, "a-thread",
+             "a-thread", "session_meta",
+             json.dumps({"type": "session_meta", "payload": {
+                 "cwd": alice_path,
+             }}), account_a),
+        )
+        conversations.execute(
+            "INSERT INTO codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,"
+            "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("foreign.jsonl", 0, "foreign-root", "v1.foreign", "foreign",
+             "foreign", "session_meta",
+             json.dumps({"type": "session_meta", "payload": {
+                 "cwd": bravo_path,
+             }}), account_b),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET text=? "
+            "WHERE id=(SELECT MIN(id) FROM codex_conversation_messages "
+            "WHERE conversation_key=? AND account_key=?)",
+            (f"A says {alice_path}", key_a, account_a),
+        )
+        conversations.commit()
+    finally:
+        conversations.close()
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key=?", (alice_path, key_a),
+        )
+        cache.execute(
+            "UPDATE codex_source_roots SET canonical_root_path=? "
+            "WHERE source_root_key=(SELECT source_root_key FROM "
+            "codex_conversation_threads WHERE conversation_key=?)",
+            ("/Users/alice/provider-root", key_a),
+        )
+        cache.execute(
+            "INSERT INTO codex_source_roots "
+            "(source_root_key,canonical_root_path,first_seen_utc,last_seen_utc) "
+            "VALUES(?,?,?,?)",
+            ("foreign-root", "/Users/bravo/provider-root",
+             "2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"),
+        )
+        cache.commit()
+    finally:
+        cache.close()
+    try:
+        port = srv.server_address[1]
+        status, wire, _ctype = _get_json(
+            port, _entity_path(key_a, "/anon-map")
+            + f"?account={account_a}")
+        assert status == 200, wire
+        flat = json.dumps(wire)
+        assert alice_path in flat
+        assert "/Users/alice/provider-root" in flat
+        assert bravo_path not in flat
+        assert "/Users/bravo/provider-root" not in flat
+
+        status, body, _ctype = _get(
+            port, _entity_path(key_a, "/export")
+            + f"?anonymize=1&account={account_a}")
+        assert status == 200
+        assert alice_path.encode() not in body
+        assert bravo_path.encode() not in body
+        assert b"A says" in body
+    finally:
+        stop(srv, srv._test_thread)
+
+
 def test_anon_privacy_gate_secret_canary(tmp_path, monkeypatch):
     """The anonymization privacy gate — a qualified export of the secret-canary
     scrubs the documented secret patterns end to end (the
@@ -1511,5 +1674,140 @@ def test_s3_patch_card_paths_are_covered_by_the_anon_plan(tmp_path, monkeypatch)
             # The plan scrubs by longest-token replacement over known roots, so
             # the covering token is a prefix of the card path.
             assert any(path.startswith(token) for token in tokens), (path, sorted(tokens))
+    finally:
+        stop(srv, srv._test_thread)
+
+
+# ── #850 §4.9 — the two anonymized routes fail closed (A24, A25) ────────────
+
+_A850_BAD = b"/synthetic/\xffproject"
+_A850_ACCOUNT = "c" * 32
+_A850_REFUSAL = {
+    "status": "anonymization_unavailable",
+    "undecodable_cwd_rows": 1,
+    "remedy": "cctally cache-sync --source codex --rebuild",
+}
+
+
+def _a850_corrupt(ns, conversation_key):
+    """Make the thread's `cwd` undecodable and give the rows one owner.
+
+    The account stamp is what keeps the scoped arms non-vacuous: an
+    account-scoped request whose conversation is filtered out answers 404 for
+    a reason that has nothing to do with the refusal under test.
+    """
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+            "WHERE conversation_key = ?", (_A850_BAD, conversation_key))
+        cache.commit()
+    finally:
+        cache.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key = ?",
+            (_A850_ACCOUNT,))
+        conversations.commit()
+    finally:
+        conversations.close()
+
+
+def test_850_a24_both_anonymized_routes_refuse_with_the_typed_status(
+    tmp_path, monkeypatch,
+):
+    """A24. `/export?anonymize=1` and `/anon-map` answer 409 with the typed
+    body, scoped and unscoped; the raw export and the Claude key are
+    untouched. All four refusal arms fail today: the planner swallows the
+    decode error and hands back a plan whose vocabulary is silently short."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        codex_key = keys["modern-full"]
+        _a850_corrupt(ns, codex_key)
+        for suffix in ("/export?anonymize=1", "/anon-map"):
+            for account in ("", f"&account={_A850_ACCOUNT}"
+                            if "?" in suffix else f"?account={_A850_ACCOUNT}"):
+                path = _entity_path(codex_key, suffix) + account
+                status, body, _ctype = _get_json(port, path)
+                assert status == 409, (path, status, body)
+                assert body == _A850_REFUSAL, (path, body)
+
+        status, body, ctype = _get(port, _entity_path(codex_key, "/export"))
+        assert status == 200 and b"#" in body
+        assert "text/markdown" in ctype
+
+        claude = _claude_key("s1")
+        status, _body, _ctype = _get(
+            port, _entity_path(claude, "/export?anonymize=1"))
+        assert status == 200
+        status, body, _ctype = _get_json(port, _entity_path(claude, "/anon-map"))
+        assert status == 200 and body is not None
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_850_a25_the_detail_route_opens_the_affected_conversation(
+    tmp_path, monkeypatch,
+):
+    """A25's route arm. `_rollup_fields` called `_thread_facts` unconditionally,
+    so the detail route for a conversation whose thread carries an undecodable
+    `cwd` collapsed to a 500."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        codex_key = keys["modern-full"]
+        _a850_corrupt(ns, codex_key)
+        status, body, _ctype = _get_json(port, _entity_path(codex_key))
+        assert status == 200, body
+        assert body["status"] == "ok"
+        status, scoped, _ctype = _get_json(
+            port, _entity_path(codex_key) + f"?account={_A850_ACCOUNT}")
+        assert status == 200, scoped
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_850_both_anonymized_routes_refuse_when_the_count_read_fails(
+    tmp_path, monkeypatch,
+):
+    """M5 is fail-closed on BOTH routes. The planner's count answered a
+    `sqlite3.Error` with zero, so `/export?anonymize=1` handed back a
+    transcript and `/anon-map` handed back a token map, each built from a scrub
+    vocabulary the store had never established. Neither may emit anything now:
+    the error reaches `_run_conversation_query`'s handler and is answered as a
+    typed JSON error on a non-2xx status.
+    """
+    ns = load_script()
+    srv, _root, keys, _r = _boot(ns, tmp_path, monkeypatch)
+    try:
+        port = srv.server_address[1]
+        codex_key = keys["modern-full"]
+        # The raw-table reference is resolved at call time; pointing it at a
+        # table that is not there makes the count statement raise
+        # `OperationalError: no such table`. The viewer's own key set binds the
+        # resolver at import time, so only the planner leg fails.
+        import _lib_codex_metadata as metadata
+        monkeypatch.setattr(
+            metadata, "resolve_codex_threads_table",
+            lambda conn: "main.codex_conversation_threads_absent")
+
+        for suffix in ("/export?anonymize=1", "/anon-map"):
+            path = _entity_path(codex_key, suffix)
+            status, body, ctype = _get_json(port, path)
+            assert status == 500, (path, status, body)
+            assert "application/json" in (ctype or ""), (path, ctype)
+            assert "no such table" in body["error"], (path, body)
+            assert "markdown" not in body, (path, body)
+            assert "tokens" not in body, (path, body)
+
+        # The raw export is not part of the anonymized contract and is
+        # unaffected: it never reaches the planner.
+        status, body, ctype = _get(port, _entity_path(codex_key, "/export"))
+        assert status == 200 and b"#" in body
+        assert "text/markdown" in ctype
     finally:
         stop(srv, srv._test_thread)

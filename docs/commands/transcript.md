@@ -149,9 +149,27 @@ Anonymization is **best-effort over known tokens; review before sharing.** The t
 - `0` — success (including a search with zero hits, and a Codex search whose normalization is still pending).
 - `1` — unknown conversation on `transcript export` (either source), or a Codex export whose normalization is still pending (a `transcript: …` message is printed to stderr).
 - `2` — usage / validation error: a bad flag, an unknown `--scope`/`--kind`, a malformed `--date-from`/`--date-to`, an explicit `--speed` on a non-Codex ref, a non-default `--scope` on a Codex export, or a Codex-incompatible `--offset` / `--cursor` / filter flag.
-- `3` — `--account` was requested but the attribution cache is unavailable.
+- `3` — `--account` was requested but the attribution cache is unavailable, or the anonymized export cannot be produced because a Codex project path cannot be read or safely attributed to the selected account.
 
 See [`docs/cli-contract.md`](../cli-contract.md) for the repo-wide exit-code taxonomy and JSON envelope conventions.
+
+### The anonymized export fails closed on an unreadable Codex project path (#850)
+
+Codex stores a conversation's working directory as `codex_conversation_threads.cwd`, and a value whose bytes are not valid UTF-8 cannot be decoded into a scrub token. While any Codex thread's `cwd` is undecodable, every anonymized export whose plan includes the Codex leg refuses rather than emitting bytes that only look scrubbed, because a path the store cannot supply as a token can appear in any transcript, not only in the conversation that owns the bad row. The command prints
+
+```
+transcript: anonymized export is unavailable: N Codex project path(s) could not be read; run cctally cache-sync --source codex --rebuild
+```
+
+to stderr, writes nothing, and exits 3. The rebuild is a real remedy: `cache-sync --source codex --rebuild` clears the derived Codex rows and re-derives every `cwd` from the rollout JSON as a Python string or NULL.
+
+`--raw` escapes the refusal, `transcript search` is unaffected, and an anonymized export of a Claude conversation is unaffected, because its plan carries no Codex leg. The count is read over the raw threads table, so an `--account`-scoped export refuses on the same condition an unscoped one does.
+
+### Account-scoped Codex project paths
+
+An account-scoped export uses Codex project paths only when the stored physical records establish that they belong to the selected account. A conversation may switch accounts within one rollout file, so its thread-level working directory alone does not establish that ownership. If the path needed to anonymize a scoped copy cannot be safely attributed, the command exits 3 without writing a partial export. The dashboard's anonymized export and per-item Anon copy refuse on the same condition; the browser's `anon-map` never receives an unproven path token. Raw export remains available when you need to inspect the original transcript privately.
+
+For ambiguous ownership the CLI reports the number of affected path rows and suggests `--raw` or omitting `--account`. The two dashboard routes answer HTTP 409 with `status: "anonymization_unavailable"`, `reason: "ambiguous_account_provenance"`, and no Markdown or token map. A store read error also aborts the copy instead of returning an incomplete plan.
 
 ## Implementation
 

@@ -165,6 +165,65 @@ describe('BlockModal frozen-block evidence disclosure (#769 S2)', () => {
     expect(note.textContent).toContain('totals $3.00');
   });
 
+  it('associates one retained-facts note with every retained figure, including an active block', async () => {
+    serve({
+      ...BLOCK_DETAIL,
+      is_active: true,
+      entries_count: 7,
+      cost_usd: 41.5,
+      total_tokens: 12_150_000,
+      input_tokens: 7_000_000,
+      output_tokens: 900_000,
+      cache_creation_tokens: 250_000,
+      cache_read_tokens: 4_000_000,
+      cache_hit_pct: 4_000_000 / (7_000_000 + 250_000 + 4_000_000) * 100,
+      facts_source: 'retained',
+      samples: [
+        { t: '2026-04-20T10:30:00Z', cum: 6.0 },
+        { t: '2026-04-20T11:15:00Z', cum: 9.0 },
+        { t: '2026-04-20T12:00:00Z', cum: 13.0 },
+        { t: '2026-04-20T13:45:00Z', cum: 18.6 },
+      ],
+    });
+    render(<BlockModal />);
+
+    const note = await screen.findByText(/retained when this block closed/);
+    expect(note).toHaveAttribute('id', 'block-retained-facts-note');
+
+    const noteId = note.id;
+    const figures = [
+      ['Total cost: $41.50', '.kv-cost'],
+      ['Total tokens: 12,150,000', '.m-hero .m-kv:nth-of-type(3)'],
+      ['Input: 7,000,000', '.msess-tok-tile:nth-of-type(1)'],
+      ['Output: 900,000', '.msess-tok-tile:nth-of-type(2)'],
+      ['Cache create: 250,000', '.msess-tok-tile:nth-of-type(3)'],
+      ['Cache read: 4,000,000', '.msess-tok-tile:nth-of-type(4)'],
+      ['Cache hit %: 35.6%', '.msess-tok-tile.cache-hit'],
+    ] as const;
+
+    for (const [accessibleName, selector] of figures) {
+      const figure = screen.getByRole('group', { name: accessibleName });
+      expect(figure.matches(selector)).toBe(true);
+      expect(figure).toHaveAttribute('aria-describedby', noteId);
+      expect(figure).toHaveAccessibleDescription(note.textContent ?? '');
+    }
+
+    // The active block's projection remains computed detail, not retained
+    // facts, so it must not inherit the retained-facts qualification.
+    const projection = screen.getByText(/Projected ·/).closest('.m-kv');
+    expect(projection).not.toBeNull();
+    expect(projection).not.toHaveAttribute('aria-describedby');
+  });
+
+  it('does not point computed figures at a retained-facts note', async () => {
+    serve({ ...BLOCK_DETAIL, facts_source: 'computed' });
+    render(<BlockModal />);
+
+    await screen.findByText('Total cost');
+    expect(document.getElementById('block-retained-facts-note')).toBeNull();
+    expect(document.querySelectorAll('[aria-describedby]')).toHaveLength(0);
+  });
+
   it('keeps the computed empty state, and adds no note, when nothing is retained', async () => {
     serve({ ...FROZEN, facts_source: 'computed', cost_usd: 0, entries_count: 0 });
     render(<BlockModal />);

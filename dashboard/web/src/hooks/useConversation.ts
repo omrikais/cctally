@@ -5,8 +5,8 @@ import { revalToken } from '../lib/revalToken';
 import { buildOutlineTargets, resolveTurnIndex } from '../conversations/outlineNavigation';
 import { planTrim } from '../conversations/windowedCap';
 import { VIRTUAL_INDEX_BASE, applyFirstItemDelta } from '../conversations/virtuosoFirstIndex';
-import { conversationEntityUrl } from '../lib/conversationTransport';
-import { adaptQualifiedDetail, ConversationNormalizationPending } from '../lib/conversationAdapters';
+import { conversationDegradedNotice, conversationDegradedReason, conversationEntityUrl, type ConversationDegradedNotice } from '../lib/conversationTransport';
+import { adaptQualifiedDetail, ConversationDegraded, ConversationNormalizationPending } from '../lib/conversationAdapters';
 import {
   conversationRefKey,
   isQualifiedConversationRef,
@@ -97,6 +97,11 @@ export interface UseConversation {
   detail: ConversationDetail | null;
   loading: boolean;
   error: string | null;
+  // A 200 typed store failure is distinct from a missing conversation and from
+  // normalization_pending. The reader can offer a retry only when rereading
+  // the same route may plausibly recover it.
+  degraded: ConversationDegradedNotice | null;
+  retry: () => void;
   // BOTTOM edge: more forward pages exist (also the live-tail gate).
   hasMore: boolean;
   // TOP edge (#217 S3 E2): more reverse pages exist.
@@ -120,7 +125,7 @@ export interface UseConversation {
   // signals a real prepend (NOT a count compare, which a far-trim defeats).
   loadPrev: () => Promise<WindowOp | null>;
   loadToTarget: (uuid: string) => Promise<LoadToTargetResult>;
-  jumpToLatest: () => Promise<void>;
+  jumpToLatest: () => Promise<boolean>;
   // #463 S1 (#448) — a page request is in flight with rows already mounted. The
   // reader shows a paging indicator INSIDE the scroller for it, so a reverse
   // page or a drain is visibly in progress rather than silently pending.
@@ -213,6 +218,8 @@ async function fetchConversationDetail(
   signal?: AbortSignal,
 ): Promise<ConversationDetail> {
   const body = await fetchJson<ConversationDetail | Parameters<typeof adaptQualifiedDetail>[1]>(url, signal);
+  const degradedReason = conversationDegradedReason(body);
+  if (degradedReason != null) throw new ConversationDegraded(degradedReason);
   return isQualifiedConversationRef(ref)
     ? adaptQualifiedDetail(ref, body as Parameters<typeof adaptQualifiedDetail>[1])
     : body as ConversationDetail;
@@ -240,6 +247,8 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   const detail = windowState.detail;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
   const [openScrollIntent, setOpenScrollIntent] = useState<'top' | 'bottom' | null>(null);
   // #228 S3 B3 — the latest window-mutation metadata + its monotonic source.
   // `opRevRef` is the single monotonic counter (a ref so concurrent emits in one
@@ -349,17 +358,25 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
     // atomically), so setDetailSynced is no longer a dependency.
   }, [emitOp]);
 
+  const retry = useCallback(() => {
+    if (!sessionId) return;
+    setError(null);
+    setDegraded(null);
+    setLoading(true);
+    setReloadNonce((nonce) => nonce + 1);
+  }, [sessionId]);
+
   // ── Initial fetch (hook-owned, precedence-correct — Codex P1) ──────────────
   useEffect(() => {
     sessionRef.current = sessionId;
     conversationRefRef.current = conversationRef;
     if (!sessionId) {
-      setDetailSynced(null); setLoadedSessionId(null); setLoading(false); setError(null);
+      setDetailSynced(null); setLoadedSessionId(null); setLoading(false); setError(null); setDegraded(null);
       nextAfterRef.current = null; prevBeforeRef.current = null; setHasPrev(false);
       setOpenScrollIntent(null);
       return;
     }
-    setLoading(true); setError(null); setDetailSynced(null);
+    setLoading(true); setError(null); setDegraded(null); setDetailSynced(null);
     nextAfterRef.current = null; prevBeforeRef.current = null; setHasPrev(false);
     setOpenScrollIntent(null);
     const ctl = new AbortController();
@@ -378,7 +395,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
 
     fetchConversationDetail(conversationRef!, firstUrl, ctl.signal)
       .then((body) => {
-        if (sessionRef.current !== sessionId) return;  // session changed mid-fetch
+        if (ctl.signal.aborted || sessionRef.current !== sessionId) return;  // stale request
         applyWindow(body);
         setLoadedSessionId(sessionId);
         setLoading(false);
@@ -396,18 +413,24 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
         // after this resolves.
       })
       .catch((e) => {
-        if (isAbortError(e)) return;
+        if (isAbortError(e) || ctl.signal.aborted || sessionRef.current !== sessionId) return;
         if (e instanceof HttpError && e.status === 404) { setError('Conversation not found.'); setLoading(false); return; }
+        if (e instanceof ConversationDegraded) {
+          setDegraded(conversationDegradedNotice(e.reason));
+          setError(null);
+          setLoading(false);
+          return;
+        }
         setError(e instanceof ConversationNormalizationPending
           ? 'Conversation indexing is still finishing.'
           : "Couldn't load the conversation."); setLoading(false);
       });
     return () => ctl.abort();
-    // sessionId + the intent KIND/uuid only — NOT generated_at (immutable
+    // sessionId + the intent KIND/uuid + an explicit retry nonce — NOT generated_at (immutable
     // transcript). A changed intent for the SAME session would re-fetch; in
     // practice the reader sets the intent once per session open.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, openIntent?.kind, openIntent && 'uuid' in openIntent ? openIntent.uuid : null, setDetailSynced, applyWindow]);
+  }, [sessionId, openIntent?.kind, openIntent && 'uuid' in openIntent ? openIntent.uuid : null, reloadNonce, setDetailSynced, applyWindow]);
 
   // ── Forward paging (bottom edge) ───────────────────────────────────────────
   // #228 S3 B3 — resolves to the append's WindowOp (addedBottom = the count this
@@ -425,7 +448,11 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       let body: ConversationDetail;
       try {
         body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, after }));
-      } catch {
+      } catch (e) {
+        if (e instanceof ConversationDegraded && sessionRef.current === sid) {
+          setDegraded(conversationDegradedNotice(e.reason));
+          setError(null);
+        }
         return PAGE_FETCH_FAILED;
       }
       if (sessionRef.current !== sid) return null;  // session changed mid-fetch — drop this stale page
@@ -471,7 +498,11 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
       let body: ConversationDetail;
       try {
         body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { limit: PAGE, before }));
-      } catch {
+      } catch (e) {
+        if (e instanceof ConversationDegraded && sessionRef.current === sid) {
+          setDegraded(conversationDegradedNotice(e.reason));
+          setError(null);
+        }
         return PAGE_FETCH_FAILED;
       }
       if (sessionRef.current !== sid) return null;
@@ -827,15 +858,20 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   const jumpToLatest = useCallback(async () => {
     const sid = sessionRef.current;
     const ref = conversationRefRef.current;
-    if (sid == null || ref == null) return;
+    if (sid == null || ref == null) return false;
     let body: ConversationDetail;
     try {
       body = await fetchConversationDetail(ref, conversationEntityUrl(ref, 'detail', { tail: 1, limit: PAGE }));
-    } catch {
-      return;
+    } catch (e) {
+      if (e instanceof ConversationDegraded && sessionRef.current === sid) {
+        setDegraded(conversationDegradedNotice(e.reason));
+        setError(null);
+      }
+      return false;
     }
-    if (sessionRef.current !== sid) return;
+    if (sessionRef.current !== sid) return false;
     applyWindow(body);
+    return true;
   }, [applyWindow]);
 
   // #183 — derive (don't sync) the cross-session reset: only surface `detail`
@@ -843,7 +879,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   // detail is never exposed under a newer sessionId during the transient.
   const detailMatches = detail != null && loadedSessionId === sessionId;
   const exposedDetail = detailMatches ? detail : null;
-  const exposedLoading = sessionId != null && !detailMatches && error == null ? true : loading;
+  const exposedLoading = sessionId != null && !detailMatches && error == null && degraded == null ? true : loading;
 
   // BOTTOM edge → hasMore + the live-tail gate. (Codex P1: the top edge plays no
   // part here, so a `before` prepend never makes the reader look "not at tail".)
@@ -875,7 +911,11 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
             after: cursor ?? undefined,
           });
           body = await fetchConversationDetail(ref, q);
-        } catch {
+        } catch (e) {
+          if (e instanceof ConversationDegraded && sessionRef.current === sid) {
+            setDegraded(conversationDegradedNotice(e.reason));
+            setError(null);
+          }
           break;                                                        // transient blip — keep what we have
         }
         if (sessionRef.current !== sid) return;                         // session switched mid-fetch
@@ -1074,7 +1114,7 @@ export function useConversation(rawRef: ConversationRefInput | null, opts: UseCo
   }, [lastOp?.rev]);
 
   return {
-    detail: exposedDetail, loading: exposedLoading, error,
+    detail: exposedDetail, loading: exposedLoading, error, degraded, retry,
     hasMore, hasPrev, prevBefore, openScrollIntent,
     lastOp,
     loadMore, loadPrev, loadToTarget, jumpToLatest,

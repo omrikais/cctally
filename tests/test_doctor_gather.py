@@ -230,6 +230,9 @@ def test_gather_codex_project_metadata_is_all_history_and_identity_safe(tmp_path
         "qualified_rows": 1,
         "missing_conversation_key_rows": 1,
         "missing_thread_join_rows": 0,
+        # #845 §4.3: the third reason, carried out of the gather so the check
+        # can sum it. Zero here, because this store holds no undecodable value.
+        "undecodable_metadata_rows": 0,
     }
     assert state["codex_project_metadata_error"] is None
 
@@ -331,7 +334,11 @@ def test_gather_rollup_probe_does_not_wait_on_exclusive_db_lock(tmp_path):
         started = time.monotonic()
         state = _run_gather(tmp_path)
         elapsed = time.monotonic() - started
-        assert elapsed < 2.0, f"doctor transcript probe blocked for {elapsed:.2f}s"
+        # This timer includes a fresh interpreter, the CLI import, and the full
+        # doctor gather. Keep the ceiling below SQLite's inherited 5s default so
+        # the lock regression still fails without treating unrelated startup
+        # contention as transcript-probe latency.
+        assert elapsed < 4.9, f"doctor transcript probe blocked for {elapsed:.2f}s"
         assert state["conv_sessions_rollup_count"] is None
         assert state["conv_messages_distinct_sessions"] is None
     finally:

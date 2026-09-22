@@ -70,6 +70,7 @@ export function FindBar({
     mode,
     loading,
     error,
+    degraded,
     step,
   } = useConversationFind(
     conversationRef, needle, { regex, case: caseSensitive, tailRevision });
@@ -259,6 +260,9 @@ export function FindBar({
         <span className="conv-findbar-kind">{current.match_kinds.join(' ')}</span>
       )}
       {mode === 'like' && !error && <span className="conv-findbar-hint">basic search</span>}
+      {degraded && (
+        <span className="conv-findbar-hint" role="alert">{degraded.message}</span>
+      )}
       {/* #217 S4 — an invalid-regex 400 surfaces as a role="alert" hint
           (announced); reuses the hint styling. The hook already maps every
           failure to its user-facing wording ('invalid regex' / 'find failed'),

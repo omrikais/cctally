@@ -211,6 +211,11 @@ class BlocksPanelRow:
     cost_usd: float
     models: list[dict[str, Any]]   # ModelCostRow shape, sorted desc by cost
     label: str             # "HH:MM MMM DD" in local tz, e.g. "14:00 Apr 26"
+    # Which evidence supplied the displayed cost and model totals. The
+    # dashboard adapter upgrades this to ``retained`` only when the same
+    # unambiguous retained-facts decision replaces the row totals; absent
+    # retained facts stay ``computed`` (including partial/inconsistent facts).
+    facts_source: str = "computed"
 
 
 @dataclass

@@ -68,7 +68,7 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-09-05"
+PRICING_SNAPSHOT_DATE = "2026-09-23"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -401,13 +401,17 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   page on 2026-09-02. Anthropic's /v1/models lists claude-fable-5-1, so
 #   until now real Fable 5.1 usage was priced at zero with only a warning. 1M
 #   context at standard pricing, so NO above-200k tier.
+#   2026-09-22: added claude-opus-5-5 at Anthropic's published $4/$20 per
+#   MTok, $5 five-minute cache write, $0.20 cache read, and 2x fast rate.
+#   Its 1M context uses standard rates throughout. The pricing fingerprint
+#   advances to 2026-09-23 because another revision already used 2026-09-22.
 # Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
 # 2x for a 1-hour write. Both WRITE multipliers are documented as applying
 # consistently across all supported models, so the 1h rate is DERIVED from
 # input_cost_per_token rather than stored per-model — a model added later
 # cannot silently miss it (#195). Cache READS are NOT uniform and are NOT
 # derived: they are 0.1x base input on most models but 0.025x on Claude Fable
-# 5.1 and Claude Mythos 5.1, so the read rate stays stored per-model in
+# 5.1 and Claude Mythos 5.1 and 0.05x on Claude Opus 5.5, so the read rate stays stored per-model in
 # `cache_read_input_token_cost`, which represents a model-specific rate.
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 
@@ -598,6 +602,13 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_creation_input_token_cost": 6.25e-06,
         "cache_read_input_token_cost": 5e-07,
     },
+    "claude-opus-5-5": {
+        # Source: https://platform.claude.com/docs/en/models/opus-5-5/overview
+        "input_cost_per_token": 4e-06,
+        "output_cost_per_token": 2e-05,
+        "cache_creation_input_token_cost": 5e-06,
+        "cache_read_input_token_cost": 2e-07,
+    },
     "claude-sonnet-4-20250514": {
         "input_cost_per_token": 3e-06,
         "output_cost_per_token": 1.5e-05,
@@ -646,7 +657,7 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
 # deliberately have no fallback multiplier: only a retained authoritative
 # `usage.speed == "fast"` row on one of these exact model IDs is premium-priced.
 # The 4.6/4.7 entries are historical retention rules; current new fast requests
-# are supported only on Opus 5 and Opus 4.8.
+# are supported only on Opus 5.5, Opus 5 and Opus 4.8.
 CLAUDE_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
     "claude-opus-4-6": 6.0,
     "claude-opus-4-6-20260205": 6.0,
@@ -654,6 +665,7 @@ CLAUDE_FAST_MULTIPLIER_OVERRIDES: dict[str, float] = {
     "claude-opus-4-7-20260416": 6.0,
     "claude-opus-4-8": 2.0,
     "claude-opus-5": 2.0,
+    "claude-opus-5-5": 2.0,
 }
 
 
@@ -680,12 +692,13 @@ _unknown_model_warnings: set[str] = set()
 # Codex (OpenAI) API pricing snapshot:
 # - Source: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
 # - Captured: 2026-07-19 — the last FULL Codex sync. PRICING_SNAPSHOT_DATE has
-#   since moved for five targeted syncs (2026-07-24, the Claude-side opus-5
+#   since moved for six targeted syncs (2026-07-24, the Claude-side opus-5
 #   sync; 2026-07-31, the gpt-5.6-terra/-luna correction logged below;
-#   2026-08-13, the Claude-side Sonnet/Mythos sync above; and 2026-08-25, the
-#   gpt-5.6-cyber addition logged below; and 2026-09-05, the gpt-6-astra
-#   addition logged below). Codex values outside those three Codex corrections
-#   were NOT re-verified on those days.
+#   2026-08-13, the Claude-side Sonnet/Mythos sync above; 2026-08-25, the
+#   gpt-5.6-cyber addition logged below; 2026-09-05, the gpt-6-astra
+#   addition; and 2026-09-22, the gpt-6-sol addition logged below). Codex
+#   values outside those four Codex corrections were NOT re-verified on those
+#   days.
 # - As of the 2026-07-19 sync this carries every openai-provider
 #   gpt-5* model the LiteLLM snapshot lists, so `pricing-check`'s scope finds
 #   nothing missing. Models absent from this table still fall back to `gpt-5`
@@ -729,6 +742,19 @@ _unknown_model_warnings: set[str] = set()
 #   tokens use the published $20.00 / $2.00 / $75.00 long-context card, and
 #   Fast mode is 2x the applicable rates. Verified against OpenAI's model page
 #   and the live LiteLLM snapshot; max_input_tokens is 922,000.
+#   2026-09-22: added gpt-6-sol at OpenAI's published Standard $2.00 input /
+#   $0.20 cached input / $10.00 output per MTok. Prompts above 272,000 input
+#   tokens use $4.00 / $0.40 / $15.00; Fast mode is 2x the applicable rates.
+#   Verified against OpenAI's model and pricing pages and the live LiteLLM
+#   openai-provider card; max_input_tokens is 922,000.
+#   2026-09-22: added gpt-6-luna at OpenAI's published Standard $0.10 input /
+#   $0.01 cached input / $0.50 output per MTok; above 272K, $0.20 / $0.02 /
+#   $0.75. Fast mode is 2x. OpenAI documents the Daybreak Red alias as the
+#   existing gpt-5.6-cyber card.
+#   2026-09-23: adopted LiteLLM's historical gpt-5.5-cyber OpenAI-provider
+#   card at $12.50 input / $1.25 cached input / $75.00 output per MTok.
+#   The current OpenAI table lists its 5.6 successor instead. LiteLLM does
+#   not publish an above-272K rate for 5.5 Cyber, so do not infer that tier.
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -857,6 +883,13 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
     },
     # No cache_creation field: the Codex cost kernel never reads one, so
     # carrying LiteLLM's would only give `diff_pricing` a value to compare.
+    "gpt-5.5-cyber": {
+        # Historical OpenAI-provider card retained by LiteLLM; unlike the
+        # 5.6 successor, no long-context fields are published for this ID.
+        "input_cost_per_token": 1.25e-05,
+        "cache_read_input_token_cost": 1.25e-06,
+        "output_cost_per_token": 7.5e-05,
+    },
     "gpt-5.6-cyber": {
         "input_cost_per_token": 1.25e-05,
         "cache_read_input_token_cost": 1.25e-06,
@@ -875,6 +908,26 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "input_cost_per_token_above_272k_tokens": 2e-05,
         "cache_read_input_token_cost_above_272k_tokens": 2e-06,
         "output_cost_per_token_above_272k_tokens": 7.5e-05,
+    },
+    "gpt-6-sol": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6-sol
+        # Standard $2.00/M input, $0.20/M cached input, $10.00/M output;
+        # above 272K input, rates are 2x input/cache and 1.5x output.
+        "input_cost_per_token": 2e-06,
+        "cache_read_input_token_cost": 2e-07,
+        "output_cost_per_token": 1e-05,
+        "input_cost_per_token_above_272k_tokens": 4e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 4e-07,
+        "output_cost_per_token_above_272k_tokens": 1.5e-05,
+    },
+    "gpt-6-luna": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6-luna
+        "input_cost_per_token": 1e-07,
+        "cache_read_input_token_cost": 1e-08,
+        "output_cost_per_token": 5e-07,
+        "input_cost_per_token_above_272k_tokens": 2e-07,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-08,
+        "output_cost_per_token_above_272k_tokens": 7.5e-07,
     },
     # ── Issue #123: full gpt-5.x LiteLLM sync (2026-05-30 snapshot) ──
     # Exact model_prices_and_context_window.json values for every
@@ -1072,6 +1125,7 @@ CODEX_MODEL_ALIASES: dict[str, str] = {
     "codex-auto-review": "gpt-5.5",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-daybreak-blue-latest": "gpt-5.6-sol",
+    "gpt-daybreak-red-latest": "gpt-5.6-cyber",
 }
 
 # Per-model fast-tier price multipliers, ported from ryoppippi/ccusage
@@ -1332,8 +1386,9 @@ def _calculate_codex_entry_cost(
     The reasoning_output_tokens parameter is accepted for API stability but
     not used directly — its contribution is already billed inside output_tokens.
 
-    Above-272k tier applied per-turn when the corresponding _above_272k_tokens
-    key is present in the pricing entry.
+    A request with more than 272k inclusive input tokens uses the long-context
+    rates for its entire request, including cached input and output. The
+    corresponding _above_272k_tokens key must be present in the pricing entry.
     """
     del reasoning_output_tokens  # already billed inside output_tokens
     pricing, is_fallback = _resolve_codex_pricing(model)
@@ -1345,6 +1400,8 @@ def _calculate_codex_entry_cost(
     if is_fallback:
         _warn_unknown_codex_model(model)  # one-shot per unique model name
 
+    long_context = input_tokens > current_pricing_snapshot().tier_thresholds["codex"]
+
     def _tiered(tokens: int, base_key: str, tiered_key: str) -> float:
         if tokens <= 0:
             return 0.0
@@ -1352,10 +1409,8 @@ def _calculate_codex_entry_cost(
         if not base_rate:
             return 0.0
         tiered_rate = pricing.get(tiered_key)
-        threshold = current_pricing_snapshot().tier_thresholds["codex"]
-        if tokens > threshold and tiered_rate is not None:
-            return threshold * base_rate + (tokens - threshold) * tiered_rate
-        return tokens * base_rate
+        rate = tiered_rate if long_context and tiered_rate is not None else base_rate
+        return tokens * rate
 
     non_cached_input = max(0, input_tokens - cached_input_tokens)
 

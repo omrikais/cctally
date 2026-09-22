@@ -9,6 +9,7 @@ import { heroFreshnessLabel } from '../lib/heroFreshness';
 import { cardRegionClick } from '../lib/cardRegion';
 import { joinCodexQuotaLabels } from '../lib/sourceRows';
 import { combinedHeading, combinedPresentation, warningForDomain } from '../lib/sourceGating';
+import { trendVocabulary } from '../lib/trendVocabulary';
 import { resolveSourceView } from '../store/sourceView';
 import { useAccountScope } from '../hooks/useScopedSnapshot';
 import { sourceAccounts } from '../store/accountFocus';
@@ -48,6 +49,11 @@ export const CODEX_STALE_CYCLE_NOTE =
 // framing is the correct one, so the modal reads this.
 export const CODEX_HERO_RECONCILING_NOTE =
   'The quota projection is reconciling. This is the last figure that was coherent.';
+
+// Current Week uses this durable opener identity when restoring focus. The
+// shared modal hook's transient pointer candidate may still belong to an
+// earlier source-switch click when the keyboard opens the hero under load.
+export const CURRENT_WEEK_HERO_TRIGGER_ID = 'current-week-hero-trigger';
 
 // #769 S6 / #753 browser QA P2 — the VISIBLE short form of the sentence above.
 // The full sentence reached only a `title` on a non-interactive element, which
@@ -147,7 +153,7 @@ export function joinHeroNotes(...notes: Array<string | null>): string | null {
 // so a screen-reader user landing on the region learns that before the numbers.
 const HERO_REGION_NAME: Record<DashboardSelection, string> = {
   all: 'Combined usage summary',
-  claude: 'Claude week usage summary',
+  claude: 'Claude cycle usage summary',
   codex: 'Codex cycle usage summary',
 };
 
@@ -170,7 +176,7 @@ function HeroSpendFigure({
 }
 
 // #769 S6 / #753 (D5). An explicit state, not a formatted blank: `fmt.usd0`
-// renders an em dash for null, and beside a `SPENT THIS WEEK` label an em dash
+// renders an em dash for null, and beside a default period label an em dash
 // reads as "nothing spent". `is-blank` is the same dim treatment the drill
 // figure already uses for an absent value, so no new visual vocabulary is
 // introduced.
@@ -228,6 +234,7 @@ export function HeroStrip() {
   return (
     <section
       ref={heroRef}
+      id={CURRENT_WEEK_HERO_TRIGGER_ID}
       className="hero-strip"
       role="region"
       tabIndex={0}
@@ -290,6 +297,7 @@ function SharedHero({
       ? null
       : accounts?.find((card) => card.accountKey === claudeScope.requestedKey) ?? null;
     const perAccount = accounts != null && focusedCard == null;
+    const allAccountPeriodsKnown = accounts?.every((card) => card.spendWindow != null) ?? false;
     const focusedResetInSec = remainingSeconds(focusedCard?.resetsAt, nowMs);
     const mergedSpendUsd = accounts?.reduce((sum, card) => sum + card.spendUsd, 0) ?? null;
     return (
@@ -318,7 +326,7 @@ function SharedHero({
         // #661 S2 section 10.1 — the shared Claude/All branch brought into
         // line with the Codex branch below, which has always guarded its
         // delta on a non-null rate. Without this the hero could render a
-        // week-over-week comparison on a screen whose `$ / 1%` slot reads a
+        // prior-cycle comparison on a screen whose `$ / 1%` slot reads a
         // dash, because the two values came from two computations with no
         // guard between them. The envelope now couples them too; this is the
         // client half, and it holds even against an older server whose
@@ -332,6 +340,22 @@ function SharedHero({
         ctx={ctx}
         verdict={accounts == null ? verdict : null}
         heroLabel={heroLabel}
+        period="cycle"
+        // The decorated sum takes each account's latest cost row independently;
+        // their cycle bounds need not coincide, and a malformed row can retain
+        // cost with no known bounds. A focused row is likewise the latest
+        // retained account cycle, not necessarily the current quota cycle.
+        // Only the undecorated current_week figure means "this cycle".
+        spentLabel={perAccount
+          ? allAccountPeriodsKnown ? 'SPENT · ACCOUNT CYCLES' : 'SPENT · ACCOUNT TOTAL'
+          : focusedCard != null
+            ? focusedCard.spendWindow == null ? 'SPENT · ACCOUNT' : 'SPENT · ACCOUNT CYCLE'
+            : undefined}
+        spentLabelSpoken={perAccount
+          ? allAccountPeriodsKnown ? 'Spent across latest account cycles' : 'Sum of available account costs'
+          : focusedCard != null
+            ? focusedCard.spendWindow == null ? 'Spent for selected account' : 'Spent over latest account cycle'
+            : undefined}
         showFiveHour={!perAccount && (focusedCard?.fiveHourPercent != null || accounts == null)}
         perAccountNote={perAccount ? 'per account' : null}
         withheldUsedPct={focusedCard != null && focusedCard.weeklyPercent == null}
@@ -448,8 +472,8 @@ function SharedHero({
     // aggregate figure is the sum of every card, so it takes a note whenever ANY
     // published card was totalled over the bounded window. Under focus the
     // figure is that one account's card, so the disclosure belongs in the spend
-    // label, which otherwise reads a flat "SPENT THIS WEEK" over a total that
-    // does not cover a week.
+    // label, which otherwise reads a flat period claim over a total that does
+    // not cover that period.
     const spendWindowNote = perAccount
       ? codexSpendWindowNote(sourceAccounts(codexEntry))
       : null;
@@ -933,8 +957,9 @@ function CanonicalHero({
   spentNote = null,
   spentNoteLabel = null,
   spentNoteCompactLabel = null,
-  spentLabel = 'SPENT THIS WEEK',
-  spentLabelSpoken = DEFAULT_SPENT_LABEL_SPOKEN,
+  period = 'week',
+  spentLabel,
+  spentLabelSpoken,
   perAccountNote = null,
   withheldUsedPct = false,
 }: {
@@ -975,11 +1000,12 @@ function CanonicalHero({
   // accessible explanation of what is loading or how totals will change.
   spentNoteCompactLabel?: string | null;
   // #564 — the spend zone's own period claim. It defaults to the week because
-  // that is what a cycle-bounded hero covers; a focused account whose card was
+  // that is what a week-bounded hero covers; a focused account whose card was
   // totalled over the bounded fallback overrides it with the window it actually
   // covers. Two props because the visible label is upper case, which several
   // screen readers spell out letter by letter, so the spoken form is supplied
   // separately rather than derived from the display string.
+  period?: 'week' | 'cycle';
   spentLabel?: string;
   spentLabelSpoken?: string;
   // #416 D6 — set when the headline percentage/reset are deliberately BLANK
@@ -994,9 +1020,22 @@ function CanonicalHero({
   // slots have their own focused answers.
   withheldUsedPct?: boolean;
 }) {
+  const periodUnit = period === 'cycle' ? trendVocabulary('claude').unit : 'week';
+  const periodTitle = periodUnit.toUpperCase();
+  // The Claude operand is the nearest completed row in the SAME reset
+  // domain, not necessarily the immediately preceding credited cycle.
+  const previousPeriod = period === 'cycle' ? 'comparable cycle' : 'last week';
+  const resolvedSpentLabel = spentLabel ?? `SPENT THIS ${periodTitle}`;
+  const resolvedSpentLabelSpoken = spentLabelSpoken ?? (
+    period === 'cycle' ? `Spent this ${periodUnit}` : DEFAULT_SPENT_LABEL_SPOKEN
+  );
+  const comparisonLabel = `$/1% vs ${previousPeriod}`;
+  const comparisonSpoken = period === 'cycle'
+    ? 'versus nearest comparable cycle'
+    : `versus ${previousPeriod}`;
   // #416 QA P2-D — a bare em-dash reads as missing data, not as a deliberate
   // blank. The reset slot already carried the caption; `Forecast @ reset`,
-  // `$/1% vs last week` and `$/1% used` did not, so the QA gate's honest read
+  // the comparison row and `$/1% used` did not, so the QA gate's honest read
   // was that those three looked broken. One shared pointer, one vocabulary
   // (the italic `per account` span the reset slot already uses).
   const perAccountValue = perAccountNote == null ? null : (
@@ -1013,7 +1052,7 @@ function CanonicalHero({
       <div className="hero-zone hero-usage">
         <div className="hu-block">
           <div className="hu-label">
-            WEEK USAGE
+            {periodTitle} USAGE
             {weekLabel ? <span className="hu-week"> · {weekLabel}</span> : null}
           </div>
           {/* #416 QA P3-C — a bare em-dash at KPI weight in full-brightness
@@ -1076,13 +1115,13 @@ function CanonicalHero({
         // announced whether or not a note accompanies it.
         aria-label={((): string | undefined => {
           const note = unavailableReason ?? spentNote;
-          if (note) return `${spentLabelSpoken}. ${note}`;
-          return spentLabelSpoken === DEFAULT_SPENT_LABEL_SPOKEN
+          if (note) return `${resolvedSpentLabelSpoken}. ${note}`;
+          return resolvedSpentLabelSpoken === DEFAULT_SPENT_LABEL_SPOKEN
             ? undefined
-            : spentLabelSpoken;
+            : resolvedSpentLabelSpoken;
         })()}
       >
-        <div className="hs-label">{spentLabel}</div>
+        <div className="hs-label">{resolvedSpentLabel}</div>
         {spendState === 'pending'
           ? <HeroPendingFigure />
           : <HeroSpendFigure amount={spentUsd} />}
@@ -1141,7 +1180,7 @@ function CanonicalHero({
           if (d == null) {
             return (
               <div className="sup-row" data-metric="vs-last-week">
-                <span className="sup-l">$/1% vs last week</span>
+                <span className="sup-l">{comparisonLabel}</span>
                 <span className="sup-v">{perAccountValue ?? '—'}</span>
               </div>
             );
@@ -1155,11 +1194,11 @@ function CanonicalHero({
           const dirWord = flat ? 'flat' : good ? 'down' : 'up';
           const mag = fmt.usd2(Math.abs(d));
           const aria = flat
-            ? '$/1% flat versus last week'
-            : `$/1% ${dirWord} ${mag} versus last week`;
+            ? `$/1% flat ${comparisonSpoken}`
+            : `$/1% ${dirWord} ${mag} ${comparisonSpoken}`;
           return (
             <div className="sup-row" data-metric="vs-last-week" aria-label={aria}>
-              <span className="sup-l">$/1% vs last week</span>
+              <span className="sup-l">{comparisonLabel}</span>
               <span className="sup-v">
                 <svg className="icon" aria-hidden="true" style={{ color }}>
                   <use href={`/static/icons.svg#${icon}`} />

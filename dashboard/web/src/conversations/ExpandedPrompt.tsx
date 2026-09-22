@@ -13,21 +13,25 @@ export function ExpandedPrompt({
   bUuid,
   aText,
   bText,
+  aNotice,
+  bNotice,
   onOpenInReader,
 }: {
   aUuid: string | null;
   bUuid: string | null;
   aText: string | undefined;
   bText: string | undefined;
+  aNotice?: string;
+  bNotice?: string;
   onOpenInReader: (side: 'a' | 'b', uuid: string) => void;
 }) {
   return (
     <div className="conv-cmp-expand">
       {aUuid && (
-        <Side side="a" uuid={aUuid} text={aText} onOpenInReader={onOpenInReader} />
+        <Side side="a" uuid={aUuid} text={aText} notice={aNotice} onOpenInReader={onOpenInReader} />
       )}
       {bUuid && (
-        <Side side="b" uuid={bUuid} text={bText} onOpenInReader={onOpenInReader} />
+        <Side side="b" uuid={bUuid} text={bText} notice={bNotice} onOpenInReader={onOpenInReader} />
       )}
     </div>
   );
@@ -37,11 +41,13 @@ function Side({
   side,
   uuid,
   text,
+  notice,
   onOpenInReader,
 }: {
   side: 'a' | 'b';
   uuid: string;
   text: string | undefined;
+  notice?: string;
   onOpenInReader: (side: 'a' | 'b', uuid: string) => void;
 }) {
   const sideLabel = side === 'a' ? 'A' : 'B';
@@ -51,7 +57,9 @@ function Side({
           side this text belongs to once the column header has scrolled away. */}
       <span className={`conv-cmp-expand-chip conv-cmp-expand-chip--${side}`} aria-hidden="true">{sideLabel}</span>
       <div className="conv-cmp-expand-body">
-        {text === undefined ? (
+        {notice ? (
+          <span className="conv-cmp-expand-loading" role="status">{notice}</span>
+        ) : text === undefined ? (
           <span className="conv-cmp-expand-loading">loading…</span>
         ) : (
           <pre className="conv-cmp-expand-text">{text}</pre>

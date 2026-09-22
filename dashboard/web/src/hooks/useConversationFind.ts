@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchJson, isAbortError, HttpError } from '../lib/fetchJson';
 import { useDebouncedValue } from './useDebouncedValue';
-import { conversationEntityUrl } from '../lib/conversationTransport';
+import {
+  conversationDegradedNotice,
+  conversationDegradedReason,
+  conversationEntityUrl,
+  type ConversationDegradedNotice,
+} from '../lib/conversationTransport';
 import { adaptQualifiedFind } from '../lib/conversationAdapters';
 import {
   conversationRefKey,
@@ -30,6 +35,7 @@ export interface UseConversationFind {
   mode: 'fts' | 'like' | 'regex' | 'literal' | null;
   loading: boolean;
   error: string | null;
+  degraded: ConversationDegradedNotice | null;
   step: (delta: number) => FindTarget | null | Promise<FindTarget | null>;
 }
 
@@ -43,6 +49,17 @@ const DEBOUNCE_MS = 200;
 
 function isExact(result: ConversationFindResult | null): result is OccurrenceFindResult {
   return result != null && 'semantics' in result && result.semantics === 'occurrence';
+}
+
+class ConversationFindDegraded extends Error {
+  readonly notice: ConversationDegradedNotice;
+
+  constructor(reason: string) {
+    const notice = conversationDegradedNotice(reason);
+    super(notice.message);
+    this.name = 'ConversationFindDegraded';
+    this.notice = notice;
+  }
 }
 
 export function useConversationFind(
@@ -61,7 +78,9 @@ export function useConversationFind(
   const [selectedOffset, setSelectedOffset] = useState(0);
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
   const ctlRef = useRef<AbortController | null>(null);
+  const edgeCtlRef = useRef<AbortController | null>(null);
   const edgeRef = useRef<Promise<FindTarget | null> | null>(null);
   const selectedIdRef = useRef<string | null>(null);
   const committedSearchKeyRef = useRef<string | null>(null);
@@ -115,26 +134,36 @@ export function useConversationFind(
           }
         : {}),
     });
-    return decode(await fetchJson<unknown>(url, signal));
+    const raw = await fetchJson<unknown>(url, signal);
+    // A 200 degraded response has the route's empty shape, not a find result.
+    // Check before decoding so bare reads do not throw on a missing `anchors`
+    // array and qualified reads do not turn maintenance into an empty legacy
+    // page. The same guard covers every cursor/around request.
+    const degradedReason = conversationDegradedReason(raw);
+    if (degradedReason != null) throw new ConversationFindDegraded(degradedReason);
+    return decode(raw);
   }, [identityKey, debouncedQ, regex, caseSensitive, decode]);
 
   useEffect(() => {
     if (!q) {
       ctlRef.current?.abort();
+      edgeCtlRef.current?.abort();
       setResult(null);
       setSelectedOffset(0);
       selectedIdRef.current = null;
       committedSearchKeyRef.current = null;
       setError(null);
+      setDegraded(null);
       setFetching(false);
     }
-    return () => { ctlRef.current?.abort(); };
+    return () => { ctlRef.current?.abort(); edgeCtlRef.current?.abort(); };
   }, [q]);
 
   useEffect(() => {
     if (!debouncedQ) { setFetching(false); return; }
     const ctl = new AbortController();
     ctlRef.current?.abort();
+    edgeCtlRef.current?.abort();
     ctlRef.current = ctl;
     edgeRef.current = null;
     setFetching(true);
@@ -146,14 +175,26 @@ export function useConversationFind(
         if (ctl.signal.aborted) return;
         commit(next);
         committedSearchKeyRef.current = searchKey;
+        setDegraded(null);
         setError(null);
         setFetching(false);
       })
       .catch((e) => {
-        if (isAbortError(e)) return;
+        if (isAbortError(e) || ctl.signal.aborted || ctlRef.current !== ctl) return;
+        if (e instanceof ConversationFindDegraded) {
+          setResult(null);
+          setSelectedOffset(0);
+          selectedIdRef.current = null;
+          committedSearchKeyRef.current = null;
+          setDegraded(e.notice);
+          setError(null);
+          setFetching(false);
+          return;
+        }
         setResult(null);
         selectedIdRef.current = null;
         committedSearchKeyRef.current = null;
+        setDegraded(null);
         setError(e instanceof HttpError && e.status === 400 ? 'invalid regex' : 'find failed');
         setFetching(false);
       });
@@ -184,6 +225,8 @@ export function useConversationFind(
       return selected;
     }
     if (edgeRef.current) return edgeRef.current;
+    const edgeCtl = new AbortController();
+    edgeCtlRef.current = edgeCtl;
     const forward = delta > 0;
     const cursor = forward ? result.page.next_cursor : result.page.previous_cursor;
     const direction = forward ? 'next' as const : 'previous' as const;
@@ -191,10 +234,13 @@ export function useConversationFind(
       try {
         let next: ConversationFindResult;
         try {
-          next = await request({ cursor: cursor ?? undefined, direction });
+          next = await request({ cursor: cursor ?? undefined, direction, signal: edgeCtl.signal });
+          if (edgeCtl.signal.aborted) return null;
         } catch (e) {
+          if (edgeCtl.signal.aborted) return null;
           if (!(e instanceof HttpError) || e.status !== 409) throw e;
-          next = await request({ around: selectedIdRef.current ?? undefined });
+          next = await request({ around: selectedIdRef.current ?? undefined, signal: edgeCtl.signal });
+          if (edgeCtl.signal.aborted) return null;
           if (isExact(next) && !next.selection_stale) {
             const reconciledAt = next.page.occurrences.findIndex(
               (occurrence) => occurrence.occurrence_id === selectedIdRef.current,
@@ -205,6 +251,7 @@ export function useConversationFind(
               setSelectedOffset(steppedAt);
               const selected = next.page.occurrences[steppedAt];
               selectedIdRef.current = selected.occurrence_id;
+              setDegraded(null);
               setError(null);
               return selected;
             }
@@ -212,23 +259,41 @@ export function useConversationFind(
               ? next.page.next_cursor
               : next.page.previous_cursor;
             if (reconciledAt >= 0 && reconciledCursor) {
-              next = await request({ cursor: reconciledCursor, direction });
+              next = await request({ cursor: reconciledCursor, direction, signal: edgeCtl.signal });
+              if (edgeCtl.signal.aborted) return null;
             }
           }
         }
-        if (!isExact(next)) return commit(next);
+        if (!isExact(next)) {
+          setDegraded(null);
+          return commit(next);
+        }
         setResult(next);
         const offset = forward ? 0 : Math.max(0, next.page.occurrences.length - 1);
         setSelectedOffset(offset);
         const selected = next.page.occurrences[offset] ?? null;
         selectedIdRef.current = selected?.occurrence_id ?? null;
+        setDegraded(null);
         setError(null);
         return selected;
       } catch (e) {
-        if (!isAbortError(e)) setError('find failed');
+        if (isAbortError(e) || edgeCtl.signal.aborted || edgeCtlRef.current !== edgeCtl) return null;
+        if (e instanceof ConversationFindDegraded) {
+          // Keep the current page mounted while a cursor request is refused:
+          // the user can still see/navigate the matches already loaded, and
+          // the typed notice explains why the next page is unavailable.
+          setDegraded(e.notice);
+          setError(null);
+        } else {
+          setDegraded(null);
+          setError('find failed');
+        }
         return null;
       } finally {
-        edgeRef.current = null;
+        if (edgeCtlRef.current === edgeCtl) {
+          edgeCtlRef.current = null;
+          edgeRef.current = null;
+        }
       }
     })();
     edgeRef.current = pending;
@@ -259,6 +324,7 @@ export function useConversationFind(
     mode: result?.mode ?? null,
     loading,
     error,
+    degraded,
     step,
   };
 }

@@ -10,7 +10,7 @@ export function ModelLegend({ models }: { models: LegendInput[] }) {
   const { items, more } = modelLegend(models);
   if (items.length === 0) return null;
   return (
-    <div className="model-legend" role="presentation">
+    <div className="model-legend" role="presentation" data-card-region-ignore>
       {items.map((it) => (
         <span className="ms-leg" key={it.model}>
           <span className={`ms-dot ${it.chip}`} style={modelChipStyle(it.model)} aria-hidden="true" />

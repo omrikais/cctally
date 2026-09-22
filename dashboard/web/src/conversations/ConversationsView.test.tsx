@@ -526,6 +526,23 @@ describe('Conversations workspace integration', () => {
     localStorage.removeItem('cctally.conv.outlineOpen');
   });
 
+  it.each([
+    { body: { status: 'degraded', degraded_reason: 'schema_behind' }, status: 200, expected: /behind this version of cctally/i, state: 'schema behind' },
+    { body: { status: 'not_found' }, status: 200, expected: /no retained transcript/i, state: 'not found' },
+    { body: { error: 'broken' }, status: 500, expected: /couldn't load the outline/i, state: 'HTTP failure' },
+  ] as const)('9b: a completed $state outline read surfaces its truthful state in the reader panel', async ({ body, status, expected }) => {
+    const original = globalThis.fetch;
+    globalThis.fetch = vi.fn((url: RequestInfo | URL, options?: RequestInit) => String(url).includes('/outline')
+      ? Promise.resolve({ ok: status < 400, status, json: async () => body } as Response)
+      : original(url, options));
+    localStorage.setItem('cctally.conv.outlineOpen', 'true');
+    updateSnapshot(baseEnvelope(true));
+    dispatch({ type: 'OPEN_CONVERSATION', sessionId: 'sess-1' });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole('navigation', { name: 'Session outline' })).toHaveTextContent(expected));
+    expect(screen.getByRole('navigation', { name: 'Session outline' })).not.toHaveTextContent('Loading outline…');
+  });
+
   it('10: the o key toggles the outline column off and back on', async () => {
     localStorage.setItem('cctally.conv.outlineOpen', 'true');
     updateSnapshot(baseEnvelope(true));

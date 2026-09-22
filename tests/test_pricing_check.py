@@ -74,6 +74,7 @@ _CURRENT_GENERATION_RATES = {
     "claude-mythos-5-1": (1e-05, 5e-05,   1.25e-05, 2.5e-07),
     "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
+    "claude-opus-5-5":  (4e-06,  2e-05,   5e-06,    2e-07),
     "claude-sonnet-5":  (2e-06,  1e-05,   2.5e-06,  2e-07),
 }
 
@@ -118,6 +119,7 @@ def test_historical_models_retain_vendor_rates(model, rates):
 
 
 @pytest.mark.parametrize("model,expected", [
+    ("claude-opus-5-5", 37.20),
     ("claude-sonnet-5", 18.70),
     ("claude-mythos-5", 93.50),
     ("claude-mythos-preview", 233.75),

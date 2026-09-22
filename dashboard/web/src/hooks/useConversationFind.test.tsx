@@ -72,6 +72,37 @@ describe('useConversationFind', () => {
     expect(result.current.truncated).toBe(false);
   });
 
+  it.each([
+    { reason: 'maintenance', ref: 's1', shape: 'bare' },
+    { reason: 'maintenance', ref: codexRef, shape: 'qualified' },
+    { reason: 'schema_behind', ref: 's1', shape: 'bare' },
+    { reason: 'schema_behind', ref: codexRef, shape: 'qualified' },
+    { reason: 'legacy_bridge_pending', ref: 's1', shape: 'bare' },
+    { reason: 'legacy_bridge_pending', ref: codexRef, shape: 'qualified' },
+  ] as const)('surfaces a 200 $reason envelope as degraded for $shape find reads', async ({ reason, ref }) => {
+    mockFetchOnce({ matches: [], total: 0, status: 'degraded', degraded_reason: reason });
+    const { result } = renderHook(() => useConversationFind(ref, 'needle'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(result.current.degraded).toMatchObject({ reason });
+    expect(result.current.error).toBeNull();
+    expect(result.current.anchors).toEqual([]);
+    expect(result.current.total).toBe(0);
+  });
+
+  it('keeps qualified normalization-pending find behavior distinct from degraded', async () => {
+    mockFetchOnce({ status: 'normalization_pending', conversation_key: 'v1.codex-pending' });
+    const { result } = renderHook(() => useConversationFind(codexRef, 'needle'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(result.current.degraded).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.anchors).toEqual([]);
+    expect(result.current.total).toBe(0);
+  });
+
   it('builds the find URL from the session id + needle (encoded)', async () => {
     mockFetchOnce(result1);
     renderHook(() => useConversationFind('s 1/x', 'a b'));
@@ -221,6 +252,45 @@ describe('useConversationFind', () => {
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[1][0] as string;
     expect(url).toContain('cursor=ofc1.next');
     expect(url).toContain('direction=next');
+  });
+
+  it('preserves the current exact page when a paginated find response is degraded', async () => {
+    mockFetchOnce({
+      ...exactResult,
+      total: 2,
+      page: { ...exactResult.page, occurrences: [exactResult.page.occurrences[0]] },
+    });
+    const { result } = renderHook(() => useConversationFind(codexRef, 'hit'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    mockFetchOnce({ matches: [], total: 0, status: 'degraded', degraded_reason: 'maintenance' });
+    let selected: Awaited<ReturnType<typeof result.current.step>> = null;
+    await act(async () => { selected = await result.current.step(1); });
+
+    expect(selected).toBeNull();
+    expect(result.current.semantics).toBe('occurrence');
+    expect(result.current.selected?.uuid).toBe('item-a');
+    expect(result.current.degraded).toMatchObject({ reason: 'maintenance' });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('does not install a stale cursor degradation after the query changes', async () => {
+    mockFetchOnce({ ...exactResult, page: { ...exactResult.page, occurrences: [exactResult.page.occurrences[0]] } });
+    let resolveEdge!: (response: Response) => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveEdge = resolve; }));
+    const { result, rerender } = renderHook(({ q }) => useConversationFind(codexRef, q), { initialProps: { q: 'hit' } });
+    await act(async () => { vi.advanceTimersByTime(250); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { void result.current.step(1); await Promise.resolve(); });
+    mockFetchOnce({ ...exactResult, query_id: 'new-query', page: { ...exactResult.page, occurrences: [exactResult.page.occurrences[1]] } });
+    rerender({ q: 'new' });
+    await act(async () => { vi.advanceTimersByTime(250); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => {
+      resolveEdge({ ok: true, status: 200, json: async () => ({ status: 'degraded', degraded_reason: 'maintenance' }) } as Response);
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(result.current.degraded).toBeNull();
+    expect(result.current.selected?.uuid).toBe('item-b');
   });
 
   it('completes the requested step after reconciling a stale page cursor', async () => {

@@ -1070,6 +1070,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_codex_hooks.py",
     "bin/_lib_codex_js_scan.py",
     "bin/_lib_codex_landmarks.py",
+    "bin/_lib_codex_metadata.py",
     "bin/_lib_codex_pools.py",
     "bin/_lib_codex_reasoning_headings.py",
     "bin/_lib_codex_segments.py",

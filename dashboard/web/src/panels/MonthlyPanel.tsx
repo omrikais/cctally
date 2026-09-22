@@ -169,7 +169,7 @@ export function MonthlyPanel() {
                 data-provider-section={group.source}
                 aria-labelledby={`monthly-panel-${group.source}-heading`}
               >
-                <div className="source-provider-head provider-composition-head">
+                <div className="source-provider-head provider-composition-head" data-card-region-ignore>
                   {/* #556 S4 F8 — see WeeklyPanel: named by a real heading, not
                       a competing `aria-label`; sr-only, so nothing moves. */}
                   <h3 className="sr-only" id={`monthly-panel-${group.source}-heading`}>

@@ -375,6 +375,9 @@ def test_every_stats_reporting_surface_is_classified(env):
             "the guarded opener itself; it raises to its callers",
         ("_cctally_dashboard.py", "_debug_stats_fault"):
             "the attribution constructor itself; its callers are classified",
+        ("_cctally_dashboard.py", "_handle_post_alerts_test"):
+            "a synthetic toast rehearsal; a failed read leaves the preview "
+            "undecorated and reports no stats fault or heal",
     }
 
     found: dict[tuple[str, str], set[str]] = {}

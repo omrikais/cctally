@@ -116,6 +116,18 @@ def _cmd_transcript_export(args) -> int:
     return 0
 
 
+#: The M5 refusal, verbatim. Exit 3 is the code `docs/commands/transcript.md`
+#: already uses for an attribution cache that cannot be established.
+_ANON_UNAVAILABLE_MSG = (
+    "transcript: anonymized export is unavailable: {count} Codex project "
+    "path(s) could not be read; run cctally cache-sync --source codex --rebuild"
+)
+_ANON_AMBIGUOUS_MSG = (
+    "transcript: anonymized export is unavailable: {count} Codex project "
+    "path(s) have ambiguous account provenance; use --raw or omit --account"
+)
+
+
 def _cmd_transcript_export_qualified(
         c, args, session_id, scope, raw, output, speed_arg) -> int:
     """Qualified (``v1.``) export via the neutral dispatch layer (§4.1). Anonymized
@@ -157,10 +169,23 @@ def _cmd_transcript_export_qualified(
         if not raw:
             cq = c._load_sibling("_lib_conversation_query")
             anon = c._load_sibling("_lib_conversation_anon")
-            plan = cq.build_anon_plan_for_sources(
+            result = cq.build_anon_plan_for_sources(
                 conn, home_dir=os.path.expanduser("~"),
                 sources={cref.source})
-            md = anon.scrub_text(md, plan)
+            # #850 M5. A Codex project path the store cannot read cannot become
+            # a scrub token, and such a path can appear in ANY transcript, so
+            # the anonymized export refuses while any of them is undecodable
+            # rather than emitting bytes that only look scrubbed. `--raw` and
+            # `search` escape, and a Claude-only plan never reaches this.
+            if result.undecodable_cwd_rows:
+                eprint(_ANON_UNAVAILABLE_MSG.format(
+                    count=result.undecodable_cwd_rows))
+                return 3
+            if result.ambiguous_cwd_rows:
+                eprint(_ANON_AMBIGUOUS_MSG.format(
+                    count=result.ambiguous_cwd_rows))
+                return 3
+            md = anon.scrub_text(md, result.plan)
     finally:
         conn.close()
 

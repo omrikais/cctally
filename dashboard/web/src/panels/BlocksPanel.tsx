@@ -59,15 +59,19 @@ function Row({
 }) {
   const fillPct = maxCost > 0 ? (r.value / maxCost) * 100 : 0;
   const open = () => openBlockDetail(r);
+  const retained = r.facts_source === 'retained';
+  const factsAccessibleHint = retained
+    ? ' — retained totals from block close'
+    : '';
   return (
     <div
-      className="blocks-row"
+      className={retained ? 'blocks-row blocks-row--retained' : 'blocks-row'}
       role="button"
       tabIndex={0}
       aria-label={
         accountLabel == null
-          ? `Open detail for block starting ${r.label} [${zone}]`
-          : `Open detail for ${accountLabel} block starting ${r.label} [${zone}]`
+          ? `Open detail for block starting ${r.label} [${zone}]${factsAccessibleHint}`
+          : `Open detail for ${accountLabel} block starting ${r.label} [${zone}]${factsAccessibleHint}`
       }
       onClick={open}
       onKeyDown={(e) => {
@@ -95,10 +99,20 @@ function Row({
               {accountLabel}
             </span>
           )}
+          {retained && (
+            <span
+              className="blocks-facts-chip"
+              data-testid="block-facts-chip"
+              title="Totals retained at block close"
+              aria-label="Totals retained at block close"
+            >
+              Retained
+            </span>
+          )}
           {r.anchor === 'heuristic' && (
             <span className="anchor-marker" aria-label="approximate start">~</span>
           )}
-          {r.label}{' '}<ZoneTag tz={zone} />
+          <span className="blocks-time">{r.label}{' '}<ZoneTag tz={zone} /></span>
           {r.is_active && <span className="pill-active">Active</span>}
         </span>
         <span className="cost">{r.valueLabel}</span>

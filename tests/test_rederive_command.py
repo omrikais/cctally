@@ -204,6 +204,750 @@ def test_parser_registers_preview_first_rederive_surface(cctally_module):
     assert unsupported.family == "future-family"
 
 
+def test_reviewed_weekly_decision_command_is_durable_and_idempotent(
+    tmp_path, monkeypatch, capsys,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_journal as journal
+    import _lib_rederive as lib_rederive
+
+    records = []
+    for minute, (weekly, end_day) in enumerate(
+        ((60, 27), (10, 28), (60, 27), (10, 28), (60, 27), (10, 28))
+    ):
+        captured = f"2026-07-25T12:{minute:02d}:00Z"
+        payload = dict(_raw_obs(journal)["payload"])
+        payload.update({
+            "captured_at": captured,
+            "weekly_percent": weekly,
+            "resets_at": int(dt.datetime(
+                2026, 7, end_day, tzinfo=dt.timezone.utc).timestamp()),
+            "five_hour_percent": 20 + minute,
+            "five_hour_resets_at": "2026-07-25T16:00:00Z",
+        })
+        records.append(journal.make_obs(
+            at=captured, src="record-usage", provider="claude",
+            account="acct-a", payload=payload,
+        ))
+    runtime.append_records(
+        records, now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    manifest = {
+        "schemaVersion": 2,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-07-25T13:00:00Z",
+        "reason": "Reviewed stale replica captures against retained evidence",
+        "weeklyAxisDecisions": [
+            {"observationId": record["id"], "disposition": "hold"}
+            for record in records[2:]
+        ],
+        "snapshotIdentityDecisions": [],
+    }
+    path = tmp_path / "reviewed-decisions.json"
+    path.write_text(json.dumps(manifest))
+    cache = mod.open_cache_db()
+    stable_cache_fingerprint = rederive._cache_fingerprint(cache)
+    cache.close()
+    parser = mod.build_parser()
+    preview_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(path), "--json",
+    ])
+    assert not (mod.APP_DIR / "logs").exists()
+    before = _persistent_tree(mod.APP_DIR)
+    assert mod.cmd_db_rederive(preview_args) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["status"] == "preview"
+    assert preview["planHash"]
+    assert preview["baselinePlanHash"]
+    assert preview["baselineActionCounts"]
+    assert sum(
+        preview["baselineActionCounts"][name]
+        for name in ("supersede", "tombstone", "add")
+    ) > sum(
+        preview["decisionActionCounts"][name]
+        for name in ("supersede", "tombstone", "add")
+    )
+    assert preview["reviewedWeeklyDecisionId"]
+    assert _persistent_tree(mod.APP_DIR) == before
+
+    text_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(path),
+    ])
+    assert mod.cmd_db_rederive(text_args) == 0
+    text_preview = capsys.readouterr().out
+    assert f"baseline plan {preview['baselinePlanHash']}" in text_preview
+    assert f"decision plan {preview['decisionPlanHash']}" in text_preview
+    assert "baseline action counts:" in text_preview
+    assert "decision action counts:" in text_preview
+
+    alternate = dict(manifest, reason="Different operator evidence review")
+    alternate_path = tmp_path / "alternate-review.json"
+    alternate_path.write_text(json.dumps(alternate))
+    alternate_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(alternate_path), "--json",
+    ])
+    assert mod.cmd_db_rederive(alternate_args) == 0
+    assert json.loads(capsys.readouterr().out)["planHash"] != preview["planHash"]
+    assert _persistent_tree(mod.APP_DIR) == before
+
+    apply_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(path), "--yes", "--json",
+    ])
+    assert mod.cmd_db_rederive(apply_args) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused["status"] == "conflict"
+    assert "expectedBaselinePlanHash" in refused["conflicts"][0]
+    assert _persistent_tree(mod.APP_DIR) == before
+
+    legacy_path = tmp_path / "legacy-reviewed-decisions.json"
+    legacy_path.write_text(json.dumps({
+        "schemaVersion": 1,
+        "journalHighWater": manifest["journalHighWater"],
+        "journalPrefixHash": manifest["journalPrefixHash"],
+        "reviewedAt": manifest["reviewedAt"],
+        "reason": manifest["reason"],
+        "decisions": manifest["weeklyAxisDecisions"],
+    }))
+    with pytest.raises(
+        lib_rederive.RederiveConflict,
+        match="schemaVersion 1 apply requires expectedBaselinePlanHash",
+    ):
+        rederive._reviewed_weekly_expected_hashes(
+            legacy_path, required=True,
+        )
+
+    manifest.update({
+        "expectedBaselinePlanHash": "sha256:" + "0" * 64,
+        "expectedDecisionPlanHash": preview["decisionPlanHash"],
+    })
+    path.write_text(json.dumps(manifest))
+    stable_journal = _journal_bytes(mod)
+    stable_stats = mod.DB_PATH.read_bytes() if mod.DB_PATH.exists() else None
+    assert mod.cmd_db_rederive(apply_args) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused["status"] == "conflict"
+    assert "baseline plan hash drifted" in refused["conflicts"][0]
+    assert _journal_bytes(mod) == stable_journal
+    assert (mod.DB_PATH.read_bytes() if mod.DB_PATH.exists() else None) == stable_stats
+    cache = mod.open_cache_db()
+    assert rederive._cache_fingerprint(cache) == stable_cache_fingerprint
+    cache.close()
+
+    manifest["expectedBaselinePlanHash"] = preview["baselinePlanHash"]
+    manifest["expectedDecisionPlanHash"] = "sha256:" + "0" * 64
+    path.write_text(json.dumps(manifest))
+    assert mod.cmd_db_rederive(apply_args) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert "decision plan hash drifted" in refused["conflicts"][0]
+    assert _journal_bytes(mod) == stable_journal
+    cache = mod.open_cache_db()
+    assert rederive._cache_fingerprint(cache) == stable_cache_fingerprint
+    cache.close()
+
+    manifest["expectedDecisionPlanHash"] = preview["decisionPlanHash"]
+    path.write_text(json.dumps(manifest))
+    assert mod.cmd_db_rederive(preview_args) == 0
+    pinned_preview = json.loads(capsys.readouterr().out)
+    assert pinned_preview["baselinePlanHash"] == preview["baselinePlanHash"]
+    assert pinned_preview["decisionPlanHash"] == preview["decisionPlanHash"]
+    assert (pinned_preview["reviewedWeeklyDecisionId"]
+            != preview["reviewedWeeklyDecisionId"])
+    assert mod.cmd_db_rederive(apply_args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["status"] == "applied"
+    assert (applied["reviewedWeeklyDecisionId"]
+            == pinned_preview["reviewedWeeklyDecisionId"])
+    assert applied["planHash"] == preview["planHash"]
+    assert applied["batchId"] == preview["batchId"]
+    after = mod.read_rederive_journal_prefix()[0]
+    assert {
+        record["id"] for record in after
+        if record.get("t") == "correction_batch"
+    } == {preview["batchId"]}
+    assert sum(
+        record.get("t") == "correction"
+        and record.get("batch") == preview["batchId"]
+        for record in after
+    ) == sum(
+        preview["decisionActionCounts"][name]
+        for name in ("supersede", "tombstone", "add")
+    )
+    assert sum(
+        record.get("t") == "op"
+        and (record.get("payload") or {}).get("kind")
+        == "claude_weekly_observation_decision"
+        for record in after
+    ) == 1
+    stable = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(_args(yes=True)) == 0
+    plain_retry = json.loads(capsys.readouterr().out)
+    assert plain_retry["status"] == "no-op", {
+        key: plain_retry[key] for key in (
+            "status", "batchId", "planHash", "actionCounts",
+            "actionCountsByEventKind",
+        )
+    }
+    assert _journal_bytes(mod) == stable
+    assert mod.cmd_db_rederive(apply_args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "no-op"
+    assert _journal_bytes(mod) == stable
+
+    independent = tmp_path / "reviewed-rebuild.db"
+    runtime.rebuild_stats_index(
+        context=runtime.RebuildContext(trigger="test-fixture"),
+        target_path=independent,
+    )
+    assert _logical_dump(mod.DB_PATH) == _logical_dump(independent)
+
+    later_high_water = runtime.journal_high_water()
+    accept_manifest = {
+        **{
+            key: value for key, value in manifest.items()
+            if key not in {
+                "expectedBaselinePlanHash", "expectedDecisionPlanHash",
+            }
+        },
+        "journalHighWater": {
+            "segment": later_high_water[0], "offset": later_high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(later_high_water),
+        "reviewedAt": "2026-07-25T14:00:00Z",
+        "reason": "Reviewed first pair as genuine later readings",
+        "weeklyAxisDecisions": [
+            {"observationId": record["id"], "disposition": "accept"}
+            for record in records[2:4]
+        ],
+    }
+    accept_path = tmp_path / "accept-review.json"
+    accept_path.write_text(json.dumps(accept_manifest))
+    accept_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(accept_path), "--yes", "--json",
+    ])
+    accept_preview_args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(accept_path), "--json",
+    ])
+    assert mod.cmd_db_rederive(accept_preview_args) == 0
+    accept_preview = json.loads(capsys.readouterr().out)
+    accept_manifest.update({
+        "expectedBaselinePlanHash": accept_preview["baselinePlanHash"],
+        "expectedDecisionPlanHash": accept_preview["decisionPlanHash"],
+    })
+    accept_path.write_text(json.dumps(accept_manifest))
+    assert mod.cmd_db_rederive(accept_args) == 0
+    accepted = json.loads(capsys.readouterr().out)
+    assert accepted["status"] == "applied"
+    assert accepted["decisionActionCounts"]["add"] == 1
+    conn = mod.open_db()
+    try:
+        # The operator delta adds the newly authorized reset. Any reset shared
+        # by the baseline and reviewed desired graphs remains baseline drift.
+        assert conn.execute("SELECT COUNT(*) FROM week_reset_events").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_reviewed_weekly_completed_op_recovers_with_plain_rederive(
+    tmp_path, monkeypatch, capsys,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_journal as journal
+
+    first = _raw_obs(journal)
+    later_payload = dict(first["payload"])
+    later_payload.update({
+        "captured_at": "2026-07-25T12:01:00Z",
+        "weekly_percent": 5.0,
+        "five_hour_percent": 21.0,
+        "five_hour_resets_at": "2026-07-25T16:00:00Z",
+    })
+    later = journal.make_obs(
+        at="2026-07-25T12:01:00Z", src="record-usage",
+        provider="claude", account="acct-a", payload=later_payload,
+    )
+    runtime.append_records(
+        [first, later],
+        now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    manifest = {
+        "schemaVersion": 2,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-07-25T13:00:00Z",
+        "reason": "Reviewed one stale low capture",
+        "weeklyAxisDecisions": [{
+            "observationId": later["id"], "disposition": "hold",
+        }],
+        "snapshotIdentityDecisions": [],
+    }
+    path = tmp_path / "crash-review.json"
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    pre = rederive.preview_db_rederive("claude-usage", reviewed_op=op)
+    expected_hashes = (pre.baseline_plan.plan_hash, pre.plan.plan_hash)
+    manifest.update({
+        "expectedBaselinePlanHash": expected_hashes[0],
+        "expectedDecisionPlanHash": expected_hashes[1],
+    })
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    assert op["payload"]["expected_baseline_plan_hash"] == expected_hashes[0]
+    assert op["payload"]["expected_decision_plan_hash"] == expected_hashes[1]
+    pre = rederive.preview_db_rederive("claude-usage", reviewed_op=op)
+
+    def crash(stage):
+        if stage == "after-reviewed-decision-op":
+            raise RuntimeError("simulated crash after durable op")
+
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", crash)
+    with pytest.raises(RuntimeError, match="durable op"):
+        rederive.apply_db_rederive(
+            "claude-usage", reviewed_op=op,
+            expected_plan_hashes=expected_hashes,
+        )
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", None)
+    after_op = mod.read_rederive_journal_prefix()[0]
+    assert after_op[-1] == op
+    assert not any(record.get("t") == "correction_batch" for record in after_op)
+
+    cache = mod.open_cache_db()
+    cache.execute(
+        "INSERT INTO session_entries "
+        "(source_path, line_offset, timestamp_utc, model, input_tokens, "
+        " output_tokens, cache_create_tokens, cache_read_tokens, "
+        " cache_create_1h_tokens, account_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "/tmp/claude/projects/repo/session.jsonl", 1,
+            "2026-07-25T11:30:00+00:00", "claude-3-5-sonnet-20241022",
+            1000, 1000, 0, 0, 0, "acct-a",
+        ),
+    )
+    cache.commit()
+    cache.close()
+    journal_before_refusal = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(_args(yes=True)) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert "plan hash drifted" in refused["conflicts"][0]
+    assert _journal_bytes(mod) == journal_before_refusal
+
+    cache = mod.open_cache_db()
+    cache.execute(
+        "DELETE FROM session_entries WHERE source_path=? AND line_offset=1",
+        ("/tmp/claude/projects/repo/session.jsonl",),
+    )
+    cache.commit()
+    assert rederive._cache_fingerprint(cache) == pre.plan.cache_fingerprint
+    cache.close()
+
+    assert mod.cmd_db_rederive(_args(yes=True)) == 0
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["status"] == "recovered"
+    assert recovered["batchId"] == pre.batch_id
+    after = mod.read_rederive_journal_prefix()[0]
+    assert sum(record == op for record in after) == 1
+    stable = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(_args(yes=True)) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "no-op"
+    assert _journal_bytes(mod) == stable
+
+
+def test_reviewed_weekly_retry_refuses_new_observations_after_decision(
+    tmp_path, monkeypatch,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_journal as journal
+
+    first = _raw_obs(journal)
+    stale_payload = dict(first["payload"])
+    stale_payload.update({
+        "captured_at": "2026-07-25T12:01:00Z",
+        "weekly_percent": 5.0,
+        "five_hour_percent": 21.0,
+    })
+    stale = journal.make_obs(
+        at="2026-07-25T12:01:00Z", src="record-usage",
+        provider="claude", account="acct-a", payload=stale_payload,
+    )
+    runtime.append_records(
+        [first, stale],
+        now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    manifest = {
+        "schemaVersion": 1,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-07-25T13:00:00Z",
+        "reason": "Reviewed stale capture",
+        "decisions": [{
+            "observationId": stale["id"], "disposition": "hold",
+        }],
+    }
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    preview = rederive.preview_db_rederive("claude-usage", reviewed_op=op)
+    expected_hashes = (
+        preview.baseline_plan.plan_hash, preview.plan.plan_hash,
+    )
+    manifest.update({
+        "expectedBaselinePlanHash": expected_hashes[0],
+        "expectedDecisionPlanHash": expected_hashes[1],
+    })
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+
+    def crash(stage):
+        if stage == "after-reviewed-decision-op":
+            raise RuntimeError("simulated crash after durable op")
+
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", crash)
+    with pytest.raises(RuntimeError, match="durable op"):
+        rederive.apply_db_rederive(
+            "claude-usage", reviewed_op=op,
+            expected_plan_hashes=expected_hashes,
+        )
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", None)
+
+    later_payload = dict(first["payload"])
+    later_payload.update({
+        "captured_at": "2026-07-25T12:02:00Z",
+        "weekly_percent": 7.0,
+        "five_hour_percent": 22.0,
+    })
+    later = journal.make_obs(
+        at="2026-07-25T12:02:00Z", src="record-usage",
+        provider="claude", account="acct-a", payload=later_payload,
+    )
+    runtime.append_records([later])
+    stable = _journal_bytes(mod)
+    with pytest.raises(rederive._lib_rederive.RederiveConflict,
+                       match="new journal records"):
+        rederive.apply_db_rederive(
+            "claude-usage", reviewed_op=op,
+            expected_plan_hashes=expected_hashes,
+        )
+    assert _journal_bytes(mod) == stable
+
+
+def test_reviewed_weekly_apply_excludes_unrelated_baseline_corrections(
+    tmp_path, monkeypatch,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    first, _wrong_events = _seed_wrong_journal(mod)
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_journal as journal
+
+    payload = dict(first["payload"])
+    payload.update({
+        "captured_at": "2026-07-25T12:01:00Z",
+        "weekly_percent": 5.0,
+    })
+    later = journal.make_obs(
+        at="2026-07-25T12:01:00Z", src="record-usage",
+        provider="claude", account="acct-a", payload=payload,
+    )
+    runtime.append_records(
+        [later], now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    manifest = {
+        "schemaVersion": 1,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-07-25T13:00:00Z",
+        "reason": "Reviewed later weekly reading",
+        "decisions": [{
+            "observationId": later["id"], "disposition": "hold",
+        }],
+    }
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    preview = rederive.preview_db_rederive("claude-usage", reviewed_op=op)
+    assert any(action.at < later["at"]
+               for action in preview.baseline_plan.actions)
+    assert not any(action.at < later["at"] for action in preview.plan.actions)
+    assert preview.baseline_plan.plan_hash != preview.plan.plan_hash
+    expected_hashes = (
+        preview.baseline_plan.plan_hash, preview.plan.plan_hash,
+    )
+    manifest.update({
+        "expectedBaselinePlanHash": expected_hashes[0],
+        "expectedDecisionPlanHash": expected_hashes[1],
+    })
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+
+    result = rederive.apply_db_rederive(
+        "claude-usage", reviewed_op=op,
+        expected_plan_hashes=expected_hashes,
+    )
+    assert result.status == "applied"
+    records = mod.read_rederive_journal_prefix()[0]
+    decision_actions = [
+        record for record in records
+        if record.get("t") == "correction"
+        and record.get("batch") == result.batch_id
+    ]
+    assert not any(record["at"] < later["at"] for record in decision_actions)
+
+
+def test_reviewed_weekly_manifest_rejects_bad_ids_and_prefix_drift(
+    tmp_path, monkeypatch, capsys,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    obs = _raw_obs(journal)
+    runtime.append_records(
+        [obs], now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    base = {
+        "schemaVersion": 1,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-07-25T13:00:00Z",
+        "reason": "Reviewed exact capture",
+        "decisions": [{"observationId": obs["id"], "disposition": "hold"}],
+    }
+    path = tmp_path / "invalid-review.json"
+    parser = mod.build_parser()
+    args = parser.parse_args([
+        "db", "rederive", "--family", "claude-usage",
+        "--reviewed-weekly-decisions", str(path), "--json",
+    ])
+    for changed, expected in (
+        ({"reason": ""}, "reason"),
+        ({"decisions": base["decisions"] * 2}, "duplicate"),
+        ({"decisions": [{"observationId": "o:absent", "disposition": "hold"}]},
+         "unknown"),
+        ({"journalPrefixHash": "sha256:" + "0" * 64}, "PrefixHash"),
+    ):
+        path.write_text(json.dumps(dict(base, **changed)))
+        before = _journal_bytes(mod)
+        assert mod.cmd_db_rederive(args) == 2
+        response = json.loads(capsys.readouterr().out)
+        assert response["status"] == "conflict"
+        assert expected in response["conflicts"][0]
+        assert _journal_bytes(mod) == before
+
+    path.write_text(json.dumps(base))
+    before = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(args) == 2
+    response = json.loads(capsys.readouterr().out)
+    assert "accepted account basis" in response["conflicts"][0]
+    assert _journal_bytes(mod) == before
+
+    runtime.append_records(
+        [journal.make_op(
+            at="2026-07-25T13:01:00Z", src="fixture",
+            payload={"kind": "sync_week"},
+        )],
+        now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    before = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(args) == 2
+    response = json.loads(capsys.readouterr().out)
+    assert "journalHighWater drifted" in response["conflicts"][0]
+    assert _journal_bytes(mod) == before
+
+    path.unlink()
+    assert mod.cmd_db_rederive(args) == 3
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "failed"
+    assert "No such file" in response["errors"][0]
+    assert _journal_bytes(mod) == before
+
+
+def test_reviewed_weekly_v2_manifest_records_exact_identity_pair(
+    tmp_path,
+):
+    import _cctally_rederive as rederive
+
+    accepted = "o:b8db6f3413ca6dd0"
+    replay = "o:f1c3e45eafe02d65"
+    manifest = {
+        "schemaVersion": 2,
+        "journalHighWater": {
+            "segment": "observations-2026-08.jsonl", "offset": 1234,
+        },
+        "journalPrefixHash": "sha256:" + "a" * 64,
+        "reviewedAt": "2026-09-19T00:00:00Z",
+        "reason": "Reviewed exact August snapshot identity",
+        "weeklyAxisDecisions": [],
+        "snapshotIdentityDecisions": [{
+            "acceptedObservationId": accepted,
+            "replayObservationId": replay,
+            "disposition": "preserve",
+        }],
+    }
+    path = tmp_path / "review-v2.json"
+    path.write_text(json.dumps(manifest))
+    reviewed = rederive._reviewed_weekly_op_from_manifest(path)
+    assert reviewed["payload"]["schema_version"] == 2
+    assert reviewed["payload"]["snapshot_identity_decisions"] == [{
+        "acceptedObservationId": accepted,
+        "replayObservationId": replay,
+        "disposition": "preserve",
+    }]
+
+    for decisions in (
+        [{"acceptedObservationId": accepted,
+          "replayObservationId": accepted,
+          "disposition": "preserve"}],
+        [
+            {"acceptedObservationId": accepted,
+             "replayObservationId": replay,
+             "disposition": "preserve"},
+            {"acceptedObservationId": accepted,
+             "replayObservationId": "o:other",
+             "disposition": "preserve"},
+        ],
+        [{"acceptedObservationId": accepted,
+          "replayObservationId": replay,
+          "disposition": "unexpected"}],
+    ):
+        path.write_text(json.dumps({
+            **manifest, "snapshotIdentityDecisions": decisions,
+        }))
+        with pytest.raises(rederive._lib_rederive.RederiveConflict,
+                           match="malformed, repeated, or ambiguous"):
+            rederive._reviewed_weekly_op_from_manifest(path)
+
+    reverse_manifest = {
+        **manifest,
+        "reviewedAt": "2026-09-19T00:01:00Z",
+        "reason": "Restore automatic replay identity",
+        "snapshotIdentityDecisions": [{
+            "acceptedObservationId": accepted,
+            "replayObservationId": replay,
+            "disposition": "rederive",
+        }],
+    }
+    path.write_text(json.dumps(reverse_manifest))
+    reversed_op = rederive._reviewed_weekly_op_from_manifest(path)
+    held, accepted_ids, identity_pairs, ops = rederive._reviewed_weekly_state([
+        reviewed, reversed_op,
+    ])
+    assert held == frozenset()
+    assert accepted_ids == frozenset()
+    assert identity_pairs == ()
+    assert ops == [reviewed, reversed_op]
+
+
+def test_reviewed_weekly_large_manifest_checks_encoded_line_limit(tmp_path):
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_journal as journal
+    import _lib_rederive
+
+    manifest = {
+        "schemaVersion": 1,
+        "journalHighWater": {
+            "segment": "observations-2026-09.jsonl", "offset": 12345,
+        },
+        "journalPrefixHash": "sha256:" + "a" * 64,
+        "reviewedAt": "2026-09-05T05:00:00Z",
+        "reason": "Reviewed one stale high replay interval",
+        "decisions": [
+            {"observationId": f"o:{index:016x}", "disposition": "hold"}
+            for index in range(942)
+        ],
+    }
+    path = tmp_path / "large-review.json"
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    assert len(journal.encode_line(op)) <= runtime._MAX_LINE_BYTES
+    manifest["decisions"].extend(
+        {"observationId": f"o:{index:016x}", "disposition": "hold"}
+        for index in range(942, 1300)
+    )
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(_lib_rederive.RederiveConflict,
+                       match="journal line limit"):
+        rederive._reviewed_weekly_op_from_manifest(path)
+
+
+def test_retained_reviewed_weekly_op_requires_its_exact_preceding_prefix(
+    tmp_path, monkeypatch, capsys,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    first = _raw_obs(journal)
+    later_payload = dict(first["payload"])
+    later_payload.update({
+        "captured_at": "2026-07-25T12:01:00Z",
+        "weekly_percent": 5.0,
+    })
+    later = journal.make_obs(
+        at="2026-07-25T12:01:00Z", src="record-usage",
+        provider="claude", account="acct-a", payload=later_payload,
+    )
+    runtime.append_records(
+        [first, later],
+        now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    high_water = runtime.journal_high_water()
+    bad = journal.make_op(
+        at="2026-07-25T13:00:00Z", src="rederive",
+        payload={
+            "kind": "claude_weekly_observation_decision",
+            "schema_version": 1,
+            "journal_high_water": {
+                "segment": high_water[0], "offset": high_water[1],
+            },
+            "journal_prefix_hash": "sha256:" + "0" * 64,
+            "reason": "Reviewed a stale low reading",
+            "decisions": [{
+                "observationId": later["id"], "disposition": "hold",
+            }],
+        },
+    )
+    runtime.append_records(
+        [bad], now_utc=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    )
+    assert mod.cmd_db_rederive(_args()) == 2
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "conflict"
+    assert "retained reviewed weekly" in response["conflicts"][0]
+
+
 def test_preview_is_write_free_apply_converges_and_second_apply_is_noop(
     tmp_path, monkeypatch, capsys
 ):
@@ -269,6 +1013,59 @@ def test_preview_is_write_free_apply_converges_and_second_apply_is_noop(
         target_path=independent,
     )
     assert _logical_dump(mod.DB_PATH) == _logical_dump(independent)
+
+
+def test_week_reset_add_burst_refuses_preview_and_apply_before_append(
+    tmp_path, monkeypatch, capsys,
+):
+    mod = _isolated(tmp_path, monkeypatch)
+    _seed_cache(mod)
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    base_payload = dict(_raw_obs(journal)["payload"])
+    for minute, weekly in enumerate((60.0, 10.0, 60.0, 10.0, 60.0, 10.0)):
+        captured = f"2026-07-25T12:{minute:02d}:00Z"
+        payload = dict(base_payload)
+        payload["captured_at"] = captured
+        payload["weekly_percent"] = weekly
+        runtime.append_record(journal.make_obs(
+            at=captured,
+            src="record-usage",
+            provider="claude",
+            account="acct-a",
+            payload=payload,
+        ))
+    monkeypatch.setattr(runtime, "rebuild_stats_index", lambda **kwargs: pytest.fail(
+        "rebuild reached after a guarded plan"
+    ))
+    journal_before = _journal_bytes(mod)
+
+    for yes in (False, True):
+        assert mod.cmd_db_rederive(_args(yes=yes)) == 2
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schemaVersion"] == 1
+        assert payload["status"] == "conflict"
+        assert payload["planGuard"] == {
+            "code": "week-reset-add-burst",
+            "limit": 2,
+            "violations": [{
+                "accountKey": "acct-a",
+                "newWeekEndAt": "2026-07-27T00:00:00+00:00",
+                "observedPreCreditPct": 60.0,
+                "addCount": 3,
+            }],
+        }
+        assert payload["actionCounts"]["add"] >= 3
+        assert payload["actionCountsByEventKind"]["week_reset"]["add"] == 3
+        assert payload["actionCountsByEventKind"]["five_hour_credit"] == {
+            "retain": 0, "supersede": 0, "tombstone": 0, "add": 0,
+        }
+        assert payload["planHash"].startswith("sha256:")
+        assert payload["batchId"].startswith("rederive:claude-usage:")
+        assert payload["rebuild"] is None
+        assert payload["noOp"] is False
+        assert _journal_bytes(mod) == journal_before
 
 
 def _cutover_manifests(app_dir) -> list:
@@ -1257,7 +2054,14 @@ def test_s5_rederive_plan_is_byte_identical_to_the_frozen_cli_baseline(
         check=False,
     )
     assert run.returncode == 0, run.stderr
-    assert json.loads(run.stdout) == S5_CLEAN_BASELINE
+    payload = json.loads(run.stdout)
+    assert payload.pop("planGuard") is None
+    by_kind = payload.pop("actionCountsByEventKind")
+    assert sum(counts["add"] for counts in by_kind.values()) == 6
+    assert by_kind["five_hour_credit"] == {
+        "retain": 0, "supersede": 0, "tombstone": 0, "add": 0,
+    }
+    assert payload == S5_CLEAN_BASELINE
 
 
 def test_s5_rederive_refuses_the_tainted_prefix_identically(
@@ -1268,7 +2072,12 @@ def test_s5_rederive_refuses_the_tainted_prefix_identically(
     mod, _opened, _built, _S5 = _s5_module(
         tmp_path, monkeypatch, S5.build_tainted)
     assert mod.cmd_db_rederive(_args()) == 2
-    assert json.loads(capsys.readouterr().out) == S5_TAINTED_BASELINE
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.pop("planGuard") is None
+    by_kind = payload.pop("actionCountsByEventKind")
+    assert all(all(value == 0 for value in counts.values())
+               for counts in by_kind.values())
+    assert payload == S5_TAINTED_BASELINE
 
 
 def test_a_rederive_preview_opens_each_segment_exactly_once(

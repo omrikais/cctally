@@ -168,6 +168,41 @@ describe('useConversation', () => {
     expect(result.current.hasMore).toBe(false);
   });
 
+  it('reports typed store degradation from a later detail page rather than silently failing', async () => {
+    mockOnce(detail([it1], 1));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+    mockOnce({ status: 'degraded', degraded_reason: 'schema_behind', items: [] });
+    await act(async () => { await result.current.loadMore(); });
+    expect(result.current.degraded).toMatchObject({ reason: 'schema_behind' });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('reports typed degradation from a tail refresh while retaining the already-read page', async () => {
+    mockOnce(detail([it1], null));
+    const { result, rerender } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+    mockOnce({ status: 'degraded', degraded_reason: 'maintenance', items: [] });
+    await act(async () => { bumpTick(rerender, 't1'); await Promise.resolve(); });
+    await waitFor(() => expect(result.current.degraded?.reason).toBe('maintenance'));
+    expect(result.current.detail?.items).toHaveLength(1);
+  });
+
+  it('does not show a stale degraded detail response after the conversation changes', async () => {
+    let resolveOld!: (response: Response) => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveOld = resolve; }));
+    mockOnce(detail([it2], null, { session_id: 'new' }));
+    const { result, rerender } = renderHook(({ sid }) => useConversation(sid), { initialProps: { sid: 'old' } });
+    rerender({ sid: 'new' });
+    await waitFor(() => expect(result.current.detail?.session_id).toBe('new'));
+    await act(async () => {
+      resolveOld({ ok: true, status: 200, json: async () => ({ status: 'degraded', degraded_reason: 'maintenance' }) } as Response);
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(result.current.detail?.session_id).toBe('new');
+    expect(result.current.degraded).toBeNull();
+  });
+
   it('exposes a monotonic tailRevision bumped on each successful pollTail merge — including an overlap-window mutation that does NOT change items.length (#217 S4 / I-1.6 Codex P1)', async () => {
     // Page 1: it1+it2 fully paged.
     mockOnce(detail([it1, it2], null, { cost_usd: 1 }));
@@ -487,6 +522,37 @@ describe('useConversation', () => {
     await waitFor(() => expect(result.current.error).toBe('Conversation not found.'));
     expect(result.current.detail).toBeNull();
     expect(result.current.loading).toBe(false);
+  });
+
+  it('surfaces a degraded qualified detail as an actionable state', async () => {
+    mockOnce({
+      status: 'degraded', conversation_key: 'v1.codex-deep-link',
+      degraded_reason: 'maintenance',
+    });
+    const { result } = renderHook(() => useConversation({ source: 'codex', key: 'v1.codex-deep-link' }));
+
+    await waitFor(() => expect(result.current.degraded).not.toBeNull());
+    expect(result.current.detail).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.loading).toBe(false);
+    expect(result.current.degraded).toMatchObject({ reason: 'maintenance', retryable: true });
+    expect(result.current.degraded!.message).toContain('maintenance');
+  });
+
+  it('retries a recoverable degraded detail and clears the notice on success', async () => {
+    mockOnce({ status: 'degraded', conversation_key: 'v1.retry', degraded_reason: 'maintenance' });
+    const { result } = renderHook(() => useConversation({ source: 'codex', key: 'v1.retry' }));
+    await waitFor(() => expect(result.current.degraded).not.toBeNull());
+
+    mockOnce({
+      status: 'ok', conversation_key: 'v1.retry', title: 'Recovered',
+      items: [], page: { total: 0, returned: 0, before: null, after: null, has_before: false, has_after: false },
+      children: [], parent: null, total_cost_usd: 0, unattributed_cost_usd: 0,
+    });
+    await act(async () => { result.current.retry(); });
+    await waitFor(() => expect(result.current.detail?.title).toBe('Recovered'));
+    expect(result.current.degraded).toBeNull();
+    expect(result.current.error).toBeNull();
   });
 
   // #217 S3 E2 — loadToTarget (replaces loadUntil + loadToEnd) forward-paging.
@@ -1111,6 +1177,17 @@ describe('useConversation — bidirectional windowed pager (#217 S3 E2)', () => 
     expect(lastUrl()).not.toContain('after=');
     // Landed at the bottom with live-tail eligible.
     expect(result.current.hasMore).toBe(false);
+  });
+
+  it('refuses a Latest jump when the tail read is degraded', async () => {
+    mockOnce(pageDetail([it1], { next_after: null, has_more: false, prev_before: null, has_prev: false }));
+    const { result } = renderHook(() => useConversation('s'));
+    await waitFor(() => expect(result.current.detail?.items).toHaveLength(1));
+    mockOnce({ status: 'degraded', degraded_reason: 'schema_behind' });
+    let jumped = true;
+    await act(async () => { jumped = await result.current.jumpToLatest(); });
+    expect(jumped).toBe(false);
+    expect(result.current.degraded).toMatchObject({ reason: 'schema_behind' });
   });
 
   it('preserves the overlap-race disambiguation across edges (a loadToTarget mid-load awaits the in-flight load)', async () => {

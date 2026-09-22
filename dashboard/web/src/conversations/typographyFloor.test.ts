@@ -28,7 +28,20 @@ export function stripCssComments(css: string): string {
 export function extractRules(cssRaw: string): CssRule[] {
   const css = stripCssComments(cssRaw);
   const rules: CssRule[] = [];
-  const lineAt = (idx: number) => cssRaw.slice(0, idx).split('\n').length;
+  const lineStarts = [0];
+  for (let i = 0; i < cssRaw.length; i++) {
+    if (cssRaw[i] === '\n') lineStarts.push(i + 1);
+  }
+  const lineAt = (idx: number) => {
+    let low = 0;
+    let high = lineStarts.length;
+    while (low < high) {
+      const mid = low + Math.floor((high - low) / 2);
+      if (lineStarts[mid] <= idx) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  };
   function walk(start: number, end: number): void {
     let i = start;
     let headStart = start;
@@ -119,5 +132,24 @@ describe('conversation-viewer typography floor (#304 S3)', () => {
     expect(v.some((x) => x.includes('--mystery-token'))).toBe(true);             // unknown token fails loud
     expect(v.some((x) => x.startsWith('.conv-d'))).toBe(false);                  // safe token passes
     expect(v).toHaveLength(4);
+
+    // Complexity guard: line lookup must not rescan the stylesheet prefix for
+    // every rule. One prefix slice is the first selector body; a per-rule
+    // `slice(0, idx)` implementation makes this grow with the rule count.
+    const manyRules = Array.from(
+      { length: 64 }, (_, i) => `.conv-${i} { font-size: 11px; }`,
+    ).join('\n');
+    const originalSlice = String.prototype.slice;
+    let prefixSlices = 0;
+    String.prototype.slice = function patchedSlice(start?: number, end?: number): string {
+      if (start === 0 && typeof end === 'number') prefixSlices += 1;
+      return originalSlice.call(this, start, end);
+    };
+    try {
+      expect(extractRules(manyRules)).toHaveLength(64);
+    } finally {
+      String.prototype.slice = originalSlice;
+    }
+    expect(prefixSlices).toBeLessThanOrEqual(1);
   });
 });

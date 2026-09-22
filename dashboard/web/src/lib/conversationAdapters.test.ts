@@ -93,6 +93,21 @@ describe('qualified Codex conversation adapters', () => {
     expect(detail.provider_meta).toMatchObject({ source: 'codex', unattributed_cost_usd: 0 });
   });
 
+  it('keeps a degraded detail envelope typed with its store reason', () => {
+    let thrown: unknown;
+    try {
+      adaptQualifiedDetail(ref, {
+        status: 'degraded', conversation_key: ref.key, degraded_reason: 'schema_behind',
+      } as Parameters<typeof adaptQualifiedDetail>[1]);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).toMatchObject({ reason: 'schema_behind' });
+    expect((thrown as Error).message).toContain('behind');
+  });
+
   it('adapts card-ready Codex terminal and patch records without wrapper noise or duplicate lifecycle prose', () => {
     const detail = adaptQualifiedDetail(ref, {
       status: 'ok', conversation_key: ref.key, title: 'Session B cards',

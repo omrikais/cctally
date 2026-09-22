@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { PeriodDetailCard } from './PeriodDetailCard';
-import type { PeriodRow, ModelCostRow } from '../types/envelope';
+import type { DailyPanelRow, PeriodRow, ModelCostRow } from '../types/envelope';
 
 const models: ModelCostRow[] = [
   { model: 'claude-opus-4-8', display: 'opus-4-8', chip: 'opus', cost_usd: 10, cost_pct: 66.7 },
@@ -83,6 +83,38 @@ describe('PeriodDetailCard', () => {
     render(<PeriodDetailCard row={periodRow({ label: '04-26' })} variant="daily" accentClass="accent-indigo" />);
     expect(document.querySelectorAll('.drill-bar-row')).toHaveLength(2);
     expect(screen.queryByText('Used %')).toBeNull();
+  });
+
+  it('shows one-provider All daily models once with their per-model costs and provider', () => {
+    // The All adapter keeps a single provider row's models when the other
+    // provider has no activity on this date. A legacy Claude row can carry
+    // no source; the resolved legs still identify its provider.
+    const claude: DailyPanelRow = {
+      source: 'claude', date: '2026-04-16', label: '04-16', cost_usd: 15,
+      is_today: true, intensity_bucket: 5, models,
+      input_tokens: 40, output_tokens: 30, cache_creation_tokens: 20,
+      cache_read_tokens: 10, total_tokens: 100, cache_hit_pct: null,
+    };
+    render(
+      <PeriodDetailCard
+        row={periodRow({ label: '04-16' })}
+        variant="daily"
+        accentClass="accent-indigo"
+        providerLegs={{ claude, codex: null }}
+      />,
+    );
+
+    const bars = document.querySelectorAll('.drill-bar-row');
+    expect(bars).toHaveLength(2);
+    expect(bars[0]).toHaveTextContent('opus-4-8');
+    expect(bars[0]).toHaveTextContent('$10.00');
+    expect(bars[1]).toHaveTextContent('haiku-4-5');
+    expect(bars[1]).toHaveTextContent('$5.00');
+    expect(screen.getAllByText('opus-4-8')).toHaveLength(1);
+    expect(screen.getAllByText('haiku-4-5')).toHaveLength(1);
+    expect(screen.getAllByText('Claude')).toHaveLength(1);
+    expect(screen.queryByTestId('daily-provider-legs')).toBeNull();
+    expect(screen.queryByText('No activity')).toBeNull();
   });
 
   it('renders Codex native Input, Cached input, Output, Reasoning, and Total distinctly', () => {

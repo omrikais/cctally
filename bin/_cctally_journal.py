@@ -1415,6 +1415,9 @@ class IngestContext:
     # writes while still exercising the same SQLite derivation/fold code.
     event_sink: "list | None" = None
     projection_writes: bool = True
+    # Operator-reviewed scratch replay only. Normal ingest leaves this empty.
+    held_weekly_observation_ids: frozenset[str] = field(default_factory=frozenset)
+    reviewed_weekly_basis_by_account: dict = field(default_factory=dict)
     # #374 write boundary: emissions WITHHELD this cycle because they would have
     # violated the same-revision rule. Each entry is a `DroppedConflict`; the row
     # was converged from the already-journaled effective event instead.
@@ -3424,7 +3427,8 @@ def _now_iso() -> str:
 #: the reset-aware in-window maximum, so it IS the week's evidence.
 #: ``WEEKLY_HELD_CLAMP`` — it is strictly below that maximum, so the weekly axis
 #: is held at the maximum and the incoming value is recorded only as the raw
-#: reading. A held weekly value is never fresh weekly evidence.
+#: reading. On reviewed scratch replay, an exact observation id can also hold
+#: a reading above the basis; either way it is not fresh weekly evidence.
 WEEKLY_OBSERVED = "observed"
 WEEKLY_HELD_CLAMP = "held_clamp"
 
@@ -3467,6 +3471,30 @@ class WeeklyBasis:
     week_end_date: "str | None"
     week_start_at: "str | None"
     week_end_at: "str | None"
+
+
+def _latest_weekly_basis(conn, account_key, *, week_start_date=None):
+    """Return accepted weekly evidence before a later axis may delete rows."""
+    sql = (
+        "SELECT id, captured_at_utc, weekly_percent, week_start_date, "
+        "       week_end_date, week_start_at, week_end_at "
+        "FROM weekly_usage_snapshots "
+        "WHERE account_key = ? AND weekly_observation_held = 0 "
+    )
+    args = (account_key,)
+    if week_start_date is not None:
+        sql += "AND week_start_date = ? "
+        args += (week_start_date,)
+    row = conn.execute(
+        sql + "ORDER BY captured_at_utc DESC, id DESC LIMIT 1", args,
+    ).fetchone()
+    if row is None:
+        return None
+    return WeeklyBasis(
+        snapshot_id=int(row[0]), captured_at_utc=str(row[1]),
+        weekly_percent=float(row[2]), week_start_date=row[3],
+        week_end_date=row[4], week_start_at=row[5], week_end_at=row[6],
+    )
 
 
 @dataclass(frozen=True)
@@ -3514,7 +3542,9 @@ class UsageSnapshotFoldResult:
     snapshot_action: str
 
 
-def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
+def _usage_snapshot_fold_decision(
+    conn, payload, *, force_weekly_hold=False, reviewed_weekly_basis=None,
+) -> UsageSnapshotFoldResult:
     """The apply-time accept/hold/skip decision for a Claude rate-limit obs —
     the predicate ported from `cmd_record_usage`'s insert guard
     (bin/_cctally_record.py), made at fold time (spec §4.5 / §5.3).
@@ -3535,9 +3565,9 @@ def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
     The clamp/hold distinction is what `_pipeline_claude_usage` gates the weekly
     milestone on, and the reason it must survive: a dedup skip AGREES with the
     stored row, so re-running the derivation chokepoints against it heals a
-    killed tick; a clamp CONTRADICTS it, so deriving a weekly milestone from the
-    higher stored value fabricates a crossing (the 2026-09-01 incident, a
-    fabricated 13% milestone, and milestones are forward-only within an epoch).
+    killed tick; a hold CONTRADICTS it, so deriving a weekly milestone from the
+    carried value fabricates a crossing (the 2026-09-01 incident, a fabricated
+    13% milestone, and milestones are forward-only within an epoch).
 
     Every value returned is derived from the same `conn` state and payload, so
     the whole result is exactly as replay-deterministic as the boolean it
@@ -3573,30 +3603,24 @@ def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
         (week_start_date, account_key, clamp_floor_iso),
     ).fetchone()
     max_v = max_row[0] if max_row else None
-    weekly_held = _lib_record.hwm_clamp_applies(weekly_percent, max_v)
-    weekly_effective = float(max_v) if weekly_held else weekly_percent
+    weekly_held = force_weekly_hold or _lib_record.hwm_clamp_applies(
+        weekly_percent, max_v)
 
     basis = None
     if weekly_held:
-        basis_row = conn.execute(
-            "SELECT id, captured_at_utc, weekly_percent, week_start_date, "
-            "       week_end_date, week_start_at, week_end_at "
-            "FROM weekly_usage_snapshots "
-            "WHERE week_start_date = ? AND account_key = ? "
-            "  AND weekly_observation_held = 0 "
-            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            (week_start_date, account_key),
-        ).fetchone()
-        if basis_row is not None:
-            basis = WeeklyBasis(
-                snapshot_id=int(basis_row[0]),
-                captured_at_utc=str(basis_row[1]),
-                weekly_percent=float(basis_row[2]),
-                week_start_date=basis_row[3],
-                week_end_date=basis_row[4],
-                week_start_at=basis_row[5],
-                week_end_at=basis_row[6],
-            )
+        # A reviewed hold may carry an old raw boundary. Its basis is selected
+        # before reset/credit detection because five-hour credit can delete
+        # that very row while preserving the held observation's 5h effect.
+        basis = (
+            reviewed_weekly_basis if force_weekly_hold
+            else _latest_weekly_basis(
+                conn, account_key, week_start_date=week_start_date)
+        )
+    weekly_effective = (
+        basis.weekly_percent if force_weekly_hold and basis is not None
+        else float(max_v) if weekly_held and max_v is not None
+        else weekly_percent
+    )
 
     weekly = WeeklyFold(
         raw_pct=weekly_percent,
@@ -3636,12 +3660,16 @@ def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
     # it would make the next held tick look like new five-hour evidence and
     # write a duplicate row every tick. Its weekly value is by construction a
     # copy of the basis's, so including it changes no weekly comparison.
+    last_week_start_date = (
+        basis.week_start_date if force_weekly_hold and basis is not None
+        else week_start_date
+    )
     last = conn.execute(
         "SELECT weekly_percent, five_hour_percent, five_hour_window_key "
         "FROM weekly_usage_snapshots "
         "WHERE week_start_date = ? AND account_key = ? "
         "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-        (week_start_date, account_key),
+        (last_week_start_date, account_key),
     ).fetchone()
     last_5h = last[1] if last is not None else None
     last_window_key = last[2] if last is not None else None
@@ -3673,11 +3701,9 @@ def _usage_snapshot_fold_decision(conn, payload) -> UsageSnapshotFoldResult:
 
     # ── The materialized outcome ───────────────────────────────────────────
     if weekly_held:
-        # The weekly axis carries nothing new by definition — its value is the
-        # stored maximum. Only the five-hour axis can justify a row, and it can
-        # only justify a HELD one. A clamp with no basis cannot be materialized
-        # at all (no boundary to copy), so it degrades to a skip rather than
-        # writing a row with a fabricated week.
+        # The weekly axis carries nothing new. An ordinary clamp writes only
+        # for five-hour evidence, including on an explicit reviewed hold.
+        # A held row also needs an accepted basis boundary to carry forward.
         if five_hour_unchanged or basis is None:
             action = SNAPSHOT_SKIP_NO_CHANGE
         else:
@@ -3913,6 +3939,7 @@ _EVT_KIND_PROVIDER = {
 # planner raises `RederiveConflict` on every run.
 _ACCOUNTS_MACHINERY_KINDS = frozenset(
     ("account_observe", "account_label", "accounts_cutover",
+     "claude_weekly_observation_decision",
      "codex_file_account",
      "codex_window_attribution", "codex_window_attribution_retract"))
 

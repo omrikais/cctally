@@ -39,6 +39,7 @@ def test_codex_project_metadata_is_ok_when_empty_or_all_qualified():
         "qualified_rows": 2,
         "missing_conversation_key_rows": 0,
         "missing_thread_join_rows": 0,
+        "undecodable_metadata_rows": 0,
         "incomplete_rows": 0,
     }
 
@@ -57,7 +58,8 @@ def test_codex_project_metadata_warns_with_all_history_counts_and_safe_details()
     assert result.details["incomplete_rows"] == 3
     assert set(result.details) == {
         "total_rows", "qualified_rows", "missing_conversation_key_rows",
-        "missing_thread_join_rows", "incomplete_rows",
+        "missing_thread_join_rows", "undecodable_metadata_rows",
+        "incomplete_rows",
     }
     assert "cache-sync --source codex --rebuild" in (result.remediation or "")
 
@@ -80,3 +82,38 @@ def test_codex_project_metadata_is_registered_after_codex_cache():
     )
     ids = [check_id for check_id, _fn in data_checks]
     assert ids.index("data.codex_project_metadata") == ids.index("data.codex_cache") + 1
+
+
+# === #845 A21 — the third reason, counted all history ======================
+
+
+def test_845_undecodable_rows_are_a_third_reason_in_the_sum():
+    """#845 §4.3. `incomplete_rows` is the sum of THREE reasons now, and the
+    new key is additive so an older consumer of this JSON keeps working."""
+    result = doctor._check_data_codex_project_metadata(_state(
+        codex_project_metadata_health={
+            "total_rows": 10,
+            "qualified_rows": 6,
+            "missing_conversation_key_rows": 2,
+            "missing_thread_join_rows": 1,
+            "undecodable_metadata_rows": 1,
+        },
+    ))
+    assert result.severity == "warn"
+    assert result.details["undecodable_metadata_rows"] == 1
+    assert result.details["incomplete_rows"] == 4
+    assert result.summary == "4 accounting row(s) need metadata repair"
+    assert "cache-sync --source codex --rebuild" in (result.remediation or "")
+
+
+def test_845_a_health_result_without_the_new_key_still_reads():
+    """A gather from an older binary, or a hand-built fixture, has no third
+    reason; the check must not raise on its absence."""
+    result = doctor._check_data_codex_project_metadata(_state(
+        codex_project_metadata_health={
+            "total_rows": 1, "qualified_rows": 1,
+            "missing_conversation_key_rows": 0, "missing_thread_join_rows": 0,
+        },
+    ))
+    assert result.severity == "ok"
+    assert result.details["undecodable_metadata_rows"] == 0

@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
-import { conversationEntityUrl } from '../lib/conversationTransport';
+import {
+  conversationDegradedNotice,
+  conversationDegradedReason,
+  conversationEntityUrl,
+  type ConversationDegradedNotice,
+} from '../lib/conversationTransport';
 import { adaptQualifiedPrompts } from '../lib/conversationAdapters';
 import { conversationRefKey, isQualifiedConversationRef, normalizeConversationRef, type ConversationRefInput } from '../types/conversation';
 
@@ -17,6 +22,7 @@ export interface PromptsResult {
   byUuid: Record<string, string> | null;
   loading: boolean;
   error: string | null;
+  degraded: ConversationDegradedNotice | null;
 }
 
 export function useConversationPrompts(rawRef: ConversationRefInput | null, active: boolean): PromptsResult {
@@ -25,6 +31,7 @@ export function useConversationPrompts(rawRef: ConversationRefInput | null, acti
   const [byUuid, setByUuid] = useState<Record<string, string> | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState<ConversationDegradedNotice | null>(null);
   const loadedFor = useRef<string | null>(null);
 
   // A session switch invalidates the cache: drop the stale map + reset the
@@ -34,6 +41,7 @@ export function useConversationPrompts(rawRef: ConversationRefInput | null, acti
     loadedFor.current = null;
     setByUuid(null);
     setError(null);
+    setDegraded(null);
   }, [identityKey]);
 
   useEffect(() => {
@@ -46,7 +54,20 @@ export function useConversationPrompts(rawRef: ConversationRefInput | null, acti
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((raw: { prompts: PromptEntry[] } | Parameters<typeof adaptQualifiedPrompts>[0]) => {
+      .then((raw: unknown) => {
+        if (ctl.signal.aborted) return;
+        // A read route can answer HTTP 200 with a typed degraded envelope. It
+        // carries the route's empty shape, not the normal prompts payload;
+        // classify it before either branch reads `prompts` so a store refusal
+        // never becomes a TypeError (bare) or a false empty success (qualified).
+        const degradedReason = conversationDegradedReason(raw);
+        if (degradedReason != null) {
+          setByUuid(null);
+          setDegraded(conversationDegradedNotice(degradedReason));
+          setError(null);
+          return;
+        }
+        setDegraded(null);
         const data = isQualifiedConversationRef(conversationRef)
           ? adaptQualifiedPrompts(raw as Parameters<typeof adaptQualifiedPrompts>[0])
           : raw as { prompts: PromptEntry[] };
@@ -56,13 +77,14 @@ export function useConversationPrompts(rawRef: ConversationRefInput | null, acti
         loadedFor.current = identityKey;
       })
       .catch((e: unknown) => {
-        if (e instanceof DOMException && e.name === 'AbortError') return;
+        if (ctl.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
+        setDegraded(null);
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
       })
-      .finally(() => setLoading(false));
+      .finally(() => { if (!ctl.signal.aborted) setLoading(false); });
     return () => ctl.abort();
   }, [active, identityKey]);
 
-  return { byUuid, loading, error };
+  return { byUuid, loading, error, degraded };
 }

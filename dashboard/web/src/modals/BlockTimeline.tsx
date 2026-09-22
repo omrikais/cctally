@@ -10,6 +10,11 @@ const VB_W = 720;
 const VB_H = 180;
 const PAD = { left: 46, right: 20, top: 18, bottom: 20 } as const;
 
+// Shared by the timeline note and the retained figures that it qualifies.
+// Keep this DOM id stable so assistive-technology relationships survive
+// rerenders while the block receives SSE updates.
+export const RETAINED_FACTS_NOTE_ID = 'block-retained-facts-note';
+
 function fmtUsdAxis(usd: number): string {
   if (usd === 0) return '$0';
   if (usd < 10) return '$' + usd.toFixed(2);
@@ -183,8 +188,8 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
         ) : null}
       </svg>
       {retained ? (
-        <p className="mblock-timeline-note">
-          The figures above are the facts retained when this block closed.{' '}
+        <p className="mblock-timeline-note" id={RETAINED_FACTS_NOTE_ID}>
+          The headline and token figures are facts retained when this block closed.{' '}
           {detail.samples.length === 0
             ? 'Its entries are no longer in the local cache, so there is no '
               + 'trajectory to draw.'

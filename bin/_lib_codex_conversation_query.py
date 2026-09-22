@@ -47,6 +47,11 @@ from _lib_codex_find_projection import (
     regex_ranges,
     slice_range_to_leaves,
 )
+from _lib_codex_metadata import (
+    codex_metadata_is_malformed,
+    decode_codex_project_metadata,
+    resolve_codex_threads_table,
+)
 from _lib_codex_title_clean import clean_codex_title
 from _lib_conversation import _strip_ansi
 from _lib_conversation_query import (
@@ -1451,23 +1456,113 @@ def _conversation_total_cost(conn: sqlite3.Connection, conversation_key: str, ef
 # ── rollup fields (dual-branch: stored fast path vs live recompute) ───────────
 
 
+#: The request-scoped set of conversations whose project metadata cannot be
+#: read. It is read from the RAW threads table, past any account-scoped TEMP
+#: view, and exposes nothing but key membership; attribution values keep coming
+#: from the scoped rollup.
+_UNDECODABLE_THREAD_KEYS_SQL = """
+    SELECT conversation_key,
+           CAST(cwd AS BLOB) AS cwd_blob,
+           CAST(git_json AS BLOB) AS git_json_blob
+      FROM {threads}
+"""
+
+#: `_thread_facts` keeps the UNQUALIFIED table name on purpose: it is a reader
+#: that must honor account scoping, so an account-scoped request sees the empty
+#: TEMP view exactly as it does today. Only the two columns change, to BLOBs.
+_THREAD_FACTS_SQL = (
+    "SELECT native_thread_id, root_thread_id, parent_thread_id, source_root_key, "
+    "CAST(cwd AS BLOB) AS cwd_blob, CAST(git_json AS BLOB) AS git_json_blob "
+    "FROM codex_conversation_threads WHERE conversation_key = ?"
+)
+
+
+def undecodable_codex_conversation_keys(
+    conn: sqlite3.Connection,
+) -> "frozenset[str]":
+    """Conversations whose project metadata the store cannot read (§4.9).
+
+    ONE frozen set per viewer request, materialized at the entry point and
+    threaded through the whole call graph; no reader performs its own check.
+    Membership is ``codex_metadata_is_malformed(direct, None)`` over the
+    thread's own two fields — an undecodable ``cwd``, or an absent or empty
+    ``cwd`` beside an undecodable ``git_json``. A valid ``cwd`` beside an
+    undecodable ``git_json`` is NOT a member, because the viewer's attribution
+    is direct-only through ``_codex_conversation_project_attribution``, which
+    stops at a usable ``cwd``; the rollup writer, the stored path, the live
+    path and this set therefore share one predicate.
+
+    The read goes to the RAW table ``resolve_codex_threads_table`` names, so an
+    account-scoped request observes the same membership as an unscoped one,
+    while attribution values keep coming from the scoped rollup. A store with
+    no threads table at all has no undecodable conversation, so it answers the
+    empty set rather than failing a reader that would otherwise have worked;
+    that case reaches here as ``resolve_codex_threads_table``'s
+    ``RuntimeError``, and it is the ONLY failure this answers with the empty
+    set.
+
+    A ``sqlite3.Error`` is a read the store could not perform, not the answer
+    "nothing is undecodable", so it propagates. Answering the empty set for one
+    would republish each conversation's PRE-CORRUPTION stored attribution on
+    every viewer surface, which is exactly the stale answer this set exists to
+    withhold.
+    """
+    try:
+        threads = resolve_codex_threads_table(conn)
+    except RuntimeError:
+        return frozenset()
+    rows = conn.execute(_UNDECODABLE_THREAD_KEYS_SQL.format(threads=threads))
+    keys = set()
+    for conversation_key, cwd_blob, git_json_blob in rows:
+        if not conversation_key:
+            continue
+        direct = decode_codex_project_metadata(cwd_blob, git_json_blob)
+        if codex_metadata_is_malformed(direct, None):
+            keys.add(str(conversation_key))
+    return frozenset(keys)
+
+
 def _thread_facts(conn: sqlite3.Connection, conversation_key: str):
-    """``(native, root, parent, source_root_key, cwd, git_json)`` for a
-    conversation's thread, or ``None`` (no thread row / not-yet-linked)."""
-    return conn.execute(
-        "SELECT native_thread_id, root_thread_id, parent_thread_id, source_root_key, "
-        "cwd, git_json FROM codex_conversation_threads WHERE conversation_key = ?",
-        (conversation_key,),
-    ).fetchone()
+    """``(native, root, parent, source_root_key, cwd, git_json, malformed)``
+    for a conversation's thread, or ``None`` (no thread row / not-yet-linked).
+
+    The two metadata columns arrive as BLOBs and are decoded FIELD BY FIELD, so
+    one undecodable byte no longer raises ``OperationalError`` for the whole
+    statement and the three identity-only callers — the spawn-child link, the
+    live-tail file set and the discovery frontier's walk root — keep working on
+    a corrupted conversation. An undecodable field reads as ``None`` and the
+    seventh member carries the direct-only malformed predicate, which is the
+    same verdict ``_recompute_codex_rollups`` persists NULL attribution for.
+    """
+    row = conn.execute(_THREAD_FACTS_SQL, (conversation_key,)).fetchone()
+    if row is None:
+        return None
+    native, root, parent, source_root_key, cwd_blob, git_json_blob = row
+    direct = decode_codex_project_metadata(cwd_blob, git_json_blob)
+    return (
+        native, root, parent, source_root_key, direct.cwd, direct.git_json,
+        codex_metadata_is_malformed(direct, None),
+    )
 
 
-def _rollup_fields(conn: sqlite3.Connection, conversation_key: str, rows: list | None = None):
+def _rollup_fields(
+    conn: sqlite3.Connection, conversation_key: str, rows: list | None = None,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+):
     """Rollup fields for a conversation — the stored rollup row when present
     (fast path), else a LIVE recompute that reproduces ``_recompute_codex_rollups``
     EXACTLY (§3.2 / §6.1): same kernel helpers (``rollup_item_count``,
     ``derive_title``), same min/max/sorted, and the SAME
     ``_codex_conversation_project_attribution`` the writer uses. Returns ``None``
-    when the conversation has no normalized rows."""
+    when the conversation has no normalized rows.
+
+    ``undecodable_keys`` is the request's set (§4.9). A member's attribution is
+    nulled on the stored fast path, which issues no query of its own, and the
+    live branch never calls the attribution resolver for one. The thread-update
+    trigger advances only the accounting mutation ledger, so a rollup
+    materialized before a later corruption would otherwise keep that stale
+    attribution on every viewer surface with no write to repair it.
+    """
     stored = conn.execute(
         "SELECT item_count, started_utc, last_activity_utc, project_key, project_label, "
         "models_json, title, parent_thread_id, source_root_key "
@@ -1476,9 +1571,12 @@ def _rollup_fields(conn: sqlite3.Connection, conversation_key: str, rows: list |
     ).fetchone()
     thread = _thread_facts(conn, conversation_key)
     native = thread[0] if thread else None
+    excluded = conversation_key in undecodable_keys
     if stored is not None:
         item_count, started, last, project_key, project_label, models_json, title, parent, srk = stored
         models = json.loads(models_json) if models_json else []
+        if excluded:
+            project_key = project_label = None
         return {
             "item_count": item_count, "started": started, "last": last,
             "project_key": project_key, "project_label": project_label,
@@ -1498,13 +1596,21 @@ def _rollup_fields(conn: sqlite3.Connection, conversation_key: str, rows: list |
     models = sorted({r.model for r in rows if r.model})
     source_root_key = rows[0].source_root_key
     cwd = git_json = parent = None
+    malformed = False
     if thread is not None:
-        native, _root, parent, thread_root, cwd, git_json = thread
+        native, _root, parent, thread_root, cwd, git_json, malformed = thread
         if thread_root:
             source_root_key = thread_root
-    from _cctally_cache import _codex_conversation_project_attribution
-    project_key, project_label = _codex_conversation_project_attribution(
-        source_root_key, cwd, git_json)
+    if excluded or malformed:
+        # Mirrors `_recompute_codex_rollups` exactly: a thread whose metadata
+        # the store cannot read is NULL, never `(unassigned)`. `(unassigned)`
+        # is a real answer for a thread with no metadata, and publishing it
+        # here would be a wrong answer every later read prefers.
+        project_key = project_label = None
+    else:
+        from _cctally_cache import _codex_conversation_project_attribution
+        project_key, project_label = _codex_conversation_project_attribution(
+            source_root_key, cwd, git_json)
     return {
         "item_count": item_count, "started": started, "last": last,
         "project_key": project_key, "project_label": project_label,
@@ -1534,20 +1640,28 @@ def _display_chain(fields: dict) -> str:
             or _short_native(fields.get("native_thread_id")) or "")
 
 
-def _conversation_display_title(conn: sqlite3.Connection, conversation_key: str, rows: list | None = None) -> str:
-    fields = _rollup_fields(conn, conversation_key, rows=rows)
+def _conversation_display_title(
+    conn: sqlite3.Connection, conversation_key: str, rows: list | None = None,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> str:
+    fields = _rollup_fields(
+        conn, conversation_key, rows=rows, undecodable_keys=undecodable_keys)
     if fields is None:
         return ""
     return _display_chain(fields)
 
 
-def _conversation_hit_fields(conn: sqlite3.Connection, conversation_key: str):
+def _conversation_hit_fields(
+    conn: sqlite3.Connection, conversation_key: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+):
     """``(title, last_activity_utc, project_label)`` for a search hit's conversation
     (§3.7). ONE ``_rollup_fields`` resolution (stored fast path or the identical
     live recompute), so the neutral search hit carries the conversation-level
     last-activity time (explicitly NOT the matched row's own timestamp) and a
     nullable project label without a per-row lookup."""
-    fields = _rollup_fields(conn, conversation_key)
+    fields = _rollup_fields(
+        conn, conversation_key, undecodable_keys=undecodable_keys)
     if fields is None:
         return "", None, None
     return _display_chain(fields), fields.get("last"), fields.get("project_label")
@@ -1556,8 +1670,12 @@ def _conversation_hit_fields(conn: sqlite3.Connection, conversation_key: str):
 # ── threading (§5.5) ──────────────────────────────────────────────────────────
 
 
-def _child_summary(conn: sqlite3.Connection, conversation_key: str, effective_speed: str) -> dict:
-    fields = _rollup_fields(conn, conversation_key)
+def _child_summary(
+    conn: sqlite3.Connection, conversation_key: str, effective_speed: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> dict:
+    fields = _rollup_fields(
+        conn, conversation_key, undecodable_keys=undecodable_keys)
     return {
         "conversation_key": conversation_key,
         "title": _display_chain(fields) if fields else "",
@@ -1568,15 +1686,19 @@ def _child_summary(conn: sqlite3.Connection, conversation_key: str, effective_sp
     }
 
 
-def _children_of(conn: sqlite3.Connection, conversation_key: str, effective_speed: str) -> list[dict]:
+def _children_of(
+    conn: sqlite3.Connection, conversation_key: str, effective_speed: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> list[dict]:
     """Same-root threads whose ``parent_thread_id`` equals this thread's native
     id (§5.5). Never a filename inference — metadata only."""
     thread = _thread_facts(conn, conversation_key)
     if thread is None:
         return []
-    native, _root, _parent, source_root_key, _cwd, _git = thread
+    native, _root, _parent, source_root_key, _cwd, _git, _malformed = thread
     children = [
-        _child_summary(conn, child_ck, effective_speed)
+        _child_summary(conn, child_ck, effective_speed,
+                       undecodable_keys=undecodable_keys)
         for (child_ck,) in conn.execute(
             "SELECT conversation_key FROM codex_conversation_threads "
             "WHERE source_root_key = ? AND parent_thread_id = ? AND conversation_key != ?",
@@ -1587,7 +1709,10 @@ def _children_of(conn: sqlite3.Connection, conversation_key: str, effective_spee
     return children
 
 
-def _parent_of(conn: sqlite3.Connection, conversation_key: str):
+def _parent_of(
+    conn: sqlite3.Connection, conversation_key: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+):
     """Parent pointer (§5.5): the same-root thread whose native id equals this
     thread's ``parent_thread_id``. A root (parent == self, or absent) has none;
     a fork whose parent is not ingested also returns ``None`` (no key to point
@@ -1595,7 +1720,7 @@ def _parent_of(conn: sqlite3.Connection, conversation_key: str):
     thread = _thread_facts(conn, conversation_key)
     if thread is None:
         return None
-    native, _root, parent, source_root_key, _cwd, _git = thread
+    native, _root, parent, source_root_key, _cwd, _git, _malformed = thread
     if not parent or parent == native:
         return None
     prow = conn.execute(
@@ -1606,7 +1731,11 @@ def _parent_of(conn: sqlite3.Connection, conversation_key: str):
     if prow is None:
         return None
     parent_ck = prow[0]
-    return {"conversation_key": parent_ck, "title": _conversation_display_title(conn, parent_ck)}
+    return {
+        "conversation_key": parent_ck,
+        "title": _conversation_display_title(
+            conn, parent_ck, undecodable_keys=undecodable_keys),
+    }
 
 
 def _consistent_meta_value(direct, nested):
@@ -1655,7 +1784,7 @@ def _spawn_child_link(
     thread = _thread_facts(conn, conversation_key)
     if thread is None:
         return None
-    native, _root, _parent, source_root_key, _cwd, _git = thread
+    native, _root, _parent, source_root_key, _cwd, _git, _malformed = thread
     if not native or not source_root_key:
         return None
     matches: dict[str, list[dict]] = {}
@@ -1741,7 +1870,7 @@ def codex_conversation_source_paths(
     keys = [conversation_key]
     thread = _thread_facts(conn, conversation_key)
     if thread is not None:
-        native, _root, _parent, source_root_key, _cwd, _git = thread
+        native, _root, _parent, source_root_key, _cwd, _git, _malformed = thread
         if native is not None:
             keys.extend(
                 child_ck
@@ -2211,6 +2340,7 @@ def get_codex_conversation(
     rows, detail_bytes = _load_conversation_index_rows(conn, conversation_key)
     if not rows:
         return {"status": "not_found", "conversation_key": conversation_key}
+    undecodable_keys = undecodable_codex_conversation_keys(conn)
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(
         kept, fold_patch_completions=not legacy_export)
@@ -2334,12 +2464,16 @@ def get_codex_conversation(
         # fallback inside _rollup_fields derives the title from it. Passing None
         # keeps the stored fast path unchanged and lets the rare no-rollup case
         # do its own wide read rather than titling the conversation "".
-        "title": _conversation_display_title(conn, conversation_key),
+        "title": _conversation_display_title(
+            conn, conversation_key, undecodable_keys=undecodable_keys),
         "items": page_items,
         "page": page,
         "session_index": session_index,
-        "children": _children_of(conn, conversation_key, effective_speed),
-        "parent": _parent_of(conn, conversation_key),
+        "children": _children_of(
+            conn, conversation_key, effective_speed,
+            undecodable_keys=undecodable_keys),
+        "parent": _parent_of(
+            conn, conversation_key, undecodable_keys=undecodable_keys),
         "total_cost_usd": total,
         "unattributed_cost_usd": unattributed_cost,
         "tokens": _tokens_union(conv_tokens),
@@ -2705,7 +2839,9 @@ def codex_conversation_cache_stats():
     return MappingProxyType(outline)
 
 
-def _codex_outline_memo_key(conn, conversation_key, effective_speed):
+def _codex_outline_memo_key(
+    conn, conversation_key, effective_speed, undecodable_keys=frozenset(),
+):
     if not codex_normalization_authoritative(conn):
         _codex_outline_memo_clear()
         return None
@@ -2752,6 +2888,16 @@ def _codex_outline_memo_key(conn, conversation_key, effective_speed):
         seq_row = None
     accounting_revision = int(seq_row[0]) if seq_row else 0
 
+    # #850 §4.9. The three revisions above are writer-owned, and the
+    # thread-update trigger advances the accounting one only for a thread with
+    # an accounting or alias path — so a message-only child's later corruption,
+    # or its repair, would leave a warm key unchanged and the hit would return
+    # before `_outline_envelope` ran. The digest of the request's set is what
+    # makes both directions miss.
+    undecodable_digest = hashlib.sha256(
+        "\0".join(sorted(undecodable_keys)).encode("utf-8")
+    ).hexdigest()
+
     return (
         database_identity,
         account_scope,
@@ -2761,14 +2907,20 @@ def _codex_outline_memo_key(conn, conversation_key, effective_speed):
         event_max_id,
         accounting_revision,
         effective_speed,
+        undecodable_digest,
     )
 
 
-def _codex_outline_memoized(conn, conversation_key, effective_speed):
-    key = _codex_outline_memo_key(conn, conversation_key, effective_speed)
+def _codex_outline_memoized(
+    conn, conversation_key, effective_speed,
+    undecodable_keys: "frozenset[str]" = frozenset(),
+):
+    key = _codex_outline_memo_key(
+        conn, conversation_key, effective_speed, undecodable_keys)
     if key is None:
         return _outline_envelope(
-            conn, conversation_key, effective_speed=effective_speed)
+            conn, conversation_key, effective_speed=effective_speed,
+            undecodable_keys=undecodable_keys)
     with _CODEX_OUTLINE_MEMO_LOCK:
         hit = _CODEX_OUTLINE_MEMO.get(key)
         if hit is not None:
@@ -2789,7 +2941,8 @@ def _codex_outline_memoized(conn, conversation_key, effective_speed):
         return flight.result
     try:
         body = _outline_envelope(
-            conn, conversation_key, effective_speed=effective_speed)
+            conn, conversation_key, effective_speed=effective_speed,
+            undecodable_keys=undecodable_keys)
     except BaseException as exc:
         with _CODEX_OUTLINE_MEMO_LOCK:
             flight.error = exc
@@ -2860,11 +3013,13 @@ def get_codex_conversation_outline(
     """
     with _read_snapshot(conn):
         return _codex_outline_memoized(
-            conn, conversation_key, effective_speed)
+            conn, conversation_key, effective_speed,
+            undecodable_codex_conversation_keys(conn))
 
 
 def _outline_envelope(
-    conn: sqlite3.Connection, conversation_key: str, *, effective_speed: str
+    conn: sqlite3.Connection, conversation_key: str, *, effective_speed: str,
+    undecodable_keys: "frozenset[str]" = frozenset(),
 ) -> dict:
     if not codex_normalization_authoritative(conn):
         return {"status": "normalization_pending", "conversation_key": conversation_key,
@@ -2988,7 +3143,9 @@ def _outline_envelope(
                 failed_calls, outcome_positions, derivation),
         },
         "files": _conversation_files(segment_index, derivation),
-        "children": _children_of(conn, conversation_key, effective_speed),
+        "children": _children_of(
+            conn, conversation_key, effective_speed,
+            undecodable_keys=undecodable_keys),
     }
 
 
@@ -3000,11 +3157,15 @@ def _is_fork(fields: dict) -> bool:
     return bool(parent) and parent != fields.get("native_thread_id")
 
 
-def _browse_row(conn: sqlite3.Connection, conversation_key: str, effective_speed: str, fields: dict) -> dict:
+def _browse_row(
+    conn: sqlite3.Connection, conversation_key: str, effective_speed: str,
+    fields: dict, *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> dict:
     return _browse_row_from_fields(
         conversation_key, fields,
         cost_usd=_conversation_total_cost(conn, conversation_key, effective_speed),
-        parent=_parent_of(conn, conversation_key),
+        parent=_parent_of(
+            conn, conversation_key, undecodable_keys=undecodable_keys),
     )
 
 
@@ -3078,12 +3239,16 @@ def _stored_rollups_present(conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM codex_conversation_rollups LIMIT 1").fetchone() is not None
 
 
-def _live_browse_fields(conn: sqlite3.Connection) -> list[tuple[str, dict]]:
+def _live_browse_fields(
+    conn: sqlite3.Connection,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> list[tuple[str, dict]]:
     """Live-recompute fallback used only while no stored rollups exist."""
     out = []
     for (conversation_key,) in conn.execute(
             "SELECT DISTINCT conversation_key FROM codex_conversation_messages"):
-        fields = _rollup_fields(conn, conversation_key)
+        fields = _rollup_fields(
+            conn, conversation_key, undecodable_keys=undecodable_keys)
         if fields is not None:
             out.append((conversation_key, fields))
     return out
@@ -3100,12 +3265,25 @@ def _facets_from_fields(fields_rows: list[tuple[str, dict]]) -> dict:
     ])
 
 
-def _stored_browse_facets(conn: sqlite3.Connection) -> dict:
+def _stored_browse_facets(
+    conn: sqlite3.Connection,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> dict:
+    """Project and model facets from the persisted rollups.
+
+    A conversation in the request's set contributes no project facet: its
+    stored attribution predates the corruption and no write repairs it, so
+    counting it would publish a project membership the detail route no longer
+    shows. Its models still count, because the model list is not derived from
+    the thread's metadata.
+    """
     fields_rows = []
     for conversation_key, project_key, project_label, models_json in conn.execute(
         "SELECT conversation_key, project_key, project_label, models_json "
         "FROM codex_conversation_rollups"
     ):
+        if conversation_key in undecodable_keys:
+            project_key = project_label = None
         try:
             parsed = json.loads(models_json) if models_json else []
             models = parsed if isinstance(parsed, list) else []
@@ -3119,12 +3297,28 @@ def _stored_browse_facets(conn: sqlite3.Connection) -> dict:
     return _facets_from_fields(fields_rows)
 
 
-def _stored_filter_sql(alias: str, project_key: str | None, model: str | None):
+def _stored_filter_sql(
+    alias: str, project_key: str | None, model: str | None,
+    undecodable_keys: "frozenset[str]" = frozenset(),
+):
+    """The stored page's WHERE clause, and its exclusion of the request's set.
+
+    The exclusion rides on the PROJECT filter only. Under an active project
+    filter a member must be neither counted under its stale project, nor
+    returned by that filter, nor used as that filter's cursor row; an
+    unfiltered page still lists it, with NULL attribution.
+    """
     clauses = []
     params = []
     if project_key is not None:
         clauses.append(f"{alias}.project_key = ?")
         params.append(project_key)
+        if undecodable_keys:
+            ordered = sorted(undecodable_keys)
+            placeholders = ",".join("?" for _ in ordered)
+            clauses.append(
+                f"{alias}.conversation_key NOT IN ({placeholders})")
+            params.extend(ordered)
     if model is not None:
         # models_json is the writer's canonical JSON array.  Searching for the
         # complete JSON string literal is exact and does not require JSON1.
@@ -3156,9 +3350,10 @@ def _page_costs(
 def _stored_browse_page(
     conn: sqlite3.Connection, *, effective_speed: str,
     project_key: str | None, model: str | None, limit: int,
-    cursor: str | None,
+    cursor: str | None, undecodable_keys: "frozenset[str]" = frozenset(),
 ):
-    where_sql, filter_params = _stored_filter_sql("r", project_key, model)
+    where_sql, filter_params = _stored_filter_sql(
+        "r", project_key, model, undecodable_keys)
     total = conn.execute(
         f"SELECT COUNT(*) FROM codex_conversation_rollups r WHERE {where_sql}",
         filter_params,
@@ -3166,7 +3361,8 @@ def _stored_browse_page(
 
     cursor_row = None
     if cursor is not None:
-        cursor_where, cursor_params = _stored_filter_sql("c", project_key, model)
+        cursor_where, cursor_params = _stored_filter_sql(
+            "c", project_key, model, undecodable_keys)
         cursor_row = conn.execute(
             "SELECT COALESCE(c.last_activity_utc, ''), c.conversation_key "
             "FROM codex_conversation_rollups c "
@@ -3221,6 +3417,8 @@ def _stored_browse_page(
             models = parsed if isinstance(parsed, list) else []
         except (TypeError, json.JSONDecodeError):
             models = []
+        if conversation_key in undecodable_keys:
+            row_project_key = project_label = None
         fields = {
             "item_count": item_count,
             "started": started,
@@ -3235,6 +3433,8 @@ def _stored_browse_page(
         }
         parent = None
         if parent_key is not None:
+            if parent_key in undecodable_keys:
+                parent_project_label = None
             parent = {
                 "conversation_key": parent_key,
                 "title": _display_chain({
@@ -3265,8 +3465,13 @@ def list_codex_conversation_facets(conn: sqlite3.Connection) -> dict:
         return {"status": "normalization_pending",
                 "facets": {"projects": [], "models": []},
                 "filter_degraded": True}
-    facets = (_stored_browse_facets(conn) if _stored_rollups_present(conn)
-              else _facets_from_fields(_live_browse_fields(conn)))
+    undecodable_keys = undecodable_codex_conversation_keys(conn)
+    facets = (
+        _stored_browse_facets(conn, undecodable_keys=undecodable_keys)
+        if _stored_rollups_present(conn)
+        else _facets_from_fields(
+            _live_browse_fields(conn, undecodable_keys=undecodable_keys))
+    )
     return {"status": "ok", "facets": facets}
 
 
@@ -3289,22 +3494,27 @@ def list_codex_conversations(
     if not codex_normalization_authoritative(conn):
         return {"status": "normalization_pending", "rows": [],
                 "facets": {"projects": [], "models": []}, "page": {"total": 0}}
+    undecodable_keys = undecodable_codex_conversation_keys(conn)
     if _stored_rollups_present(conn):
-        facets = _stored_browse_facets(conn)
+        facets = _stored_browse_facets(conn, undecodable_keys=undecodable_keys)
         page_rows, page = _stored_browse_page(
             conn, effective_speed=effective_speed, project_key=project_key,
-            model=model, limit=limit, cursor=cursor)
+            model=model, limit=limit, cursor=cursor,
+            undecodable_keys=undecodable_keys)
         result = {"status": "ok", "rows": page_rows, "facets": facets, "page": page}
         if selected is not None:
-            fields = _rollup_fields(conn, selected)
+            fields = _rollup_fields(
+                conn, selected, undecodable_keys=undecodable_keys)
             if fields is not None:
                 result["selected"] = _browse_row(
-                    conn, selected, effective_speed, fields)
+                    conn, selected, effective_speed, fields,
+                    undecodable_keys=undecodable_keys)
         return result
 
-    fields_rows = _live_browse_fields(conn)
+    fields_rows = _live_browse_fields(conn, undecodable_keys=undecodable_keys)
     rows = [
-        _browse_row(conn, conversation_key, effective_speed, fields)
+        _browse_row(conn, conversation_key, effective_speed, fields,
+                    undecodable_keys=undecodable_keys)
         for conversation_key, fields in fields_rows
     ]
     facets = _facets_from_fields(fields_rows)
@@ -3909,6 +4119,7 @@ def _search_excerpt(text: str | None, query: str, width: int = 200) -> str:
 
 def _collapse_message_hits(
     conn: sqlite3.Connection, matched_rows: list, query: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
 ) -> list[dict]:
     """Collapse matched physical rows to canonical ``item_key`` BEFORE totals /
     badges (§6.2) — both members of a mirror pair map to one item_key, so mirror
@@ -3920,7 +4131,8 @@ def _collapse_message_hits(
     collapsed: dict[tuple, dict] = {}
     for ck, mrows in by_conv.items():
         pos_map = _pos_to_item_key(conn, ck)
-        title, last_act, project_label = _conversation_hit_fields(conn, ck)
+        title, last_act, project_label = _conversation_hit_fields(
+            conn, ck, undecodable_keys=undecodable_keys)
         for source_path, line_offset, kind, disp in mrows:
             item_key = pos_map.get((source_path, line_offset))
             if item_key is None:
@@ -3941,7 +4153,10 @@ def _collapse_message_hits(
     ]
 
 
-def _search_title(conn: sqlite3.Connection, query: str) -> list[dict]:
+def _search_title(
+    conn: sqlite3.Connection, query: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> list[dict]:
     """Title search over the rollup table — identical LIKE semantics in both FTS
     and LIKE modes (§6.2). Conversation-level hits (no item anchor).
 
@@ -3960,11 +4175,16 @@ def _search_title(conn: sqlite3.Connection, query: str) -> list[dict]:
         hits.append(
             {"conversation_key": ck, "item_key": None, "title": cleaned,
              "snippet": _excerpt(cleaned), "badges": ["title"],
-             "last_activity_utc": last_act, "project_label": project_label})
+             "last_activity_utc": last_act,
+             "project_label": (
+                 None if ck in undecodable_keys else project_label)})
     return hits
 
 
-def _search_files(conn: sqlite3.Connection, query: str) -> list[dict]:
+def _search_files(
+    conn: sqlite3.Connection, query: str,
+    *, undecodable_keys: "frozenset[str]" = frozenset(),
+) -> list[dict]:
     """File-touch search — matches file paths, collapsed to the owning message's
     canonical item_key (§6.2). ``message_id`` is an application-level link, so
     an orphan is skipped and cannot suppress valid rows."""
@@ -3983,7 +4203,8 @@ def _search_files(conn: sqlite3.Connection, query: str) -> list[dict]:
             continue
         if ck not in pos_cache:
             pos_cache[ck] = _pos_to_item_key(conn, ck)
-            fields_cache[ck] = _conversation_hit_fields(conn, ck)
+            fields_cache[ck] = _conversation_hit_fields(
+                conn, ck, undecodable_keys=undecodable_keys)
         item_key = pos_cache[ck].get((member[0], member[1]))
         title, last_act, project_label = fields_cache[ck]
         hit = collapsed.setdefault(
@@ -4036,13 +4257,15 @@ def search_codex_conversations(
                 "total": 0, "mode": mode, "depth": "full"}
     if kind not in CODEX_SEARCH_KINDS:
         kind = "all"
+    undecodable_keys = undecodable_codex_conversation_keys(conn)
     if kind == "title":
-        hits = _search_title(conn, query)
+        hits = _search_title(conn, query, undecodable_keys=undecodable_keys)
     elif kind == "files":
-        hits = _search_files(conn, query)
+        hits = _search_files(conn, query, undecodable_keys=undecodable_keys)
     else:
         hits = _collapse_message_hits(
-            conn, _matched_message_rows(conn, query, kind, mode), query)
+            conn, _matched_message_rows(conn, query, kind, mode), query,
+            undecodable_keys=undecodable_keys)
     hits.sort(key=lambda h: (h["conversation_key"], h["item_key"] or ""))
     total = len(hits)
     page_hits, page = _paginate_hits(hits, cursor=cursor, limit=limit)

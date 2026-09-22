@@ -611,6 +611,10 @@ export interface WeekIndexEntry {
 
 export interface WeekDetailBlock {
   five_hour_window_key?: number;   // Claude
+  // Claude: only with more than one real account. A physical window may have
+  // several account-owned blocks; the pair is the navigation identity.
+  account_key?: string;
+  account_label?: string;
   key?: string;                    // Codex opaque block key
   block_start_at: string;
   five_hour_resets_at: string;
@@ -696,6 +700,8 @@ export interface FiveHourBlockEnvelope {
   // Window key threading from server-side ``_select_current_block_for_envelope``.
   // Used by analytics dispatches; optional for backward compat.
   five_hour_window_key?: number;
+  // Claude: only when decorated; identifies the live weekly account's block.
+  account_key?: string;
   seven_day_pct_at_block_start: number | null;
   seven_day_pct_delta_pp: number | null;     // null on crossed-reset or missing anchor
   crossed_seven_day_reset: boolean;
@@ -1062,6 +1068,7 @@ export interface MonthlyEnvelope {
 // ---- Blocks panel (envelope §1.3) ------------------------------------
 
 export type BlockAnchor = 'recorded' | 'heuristic';
+export type BlockFactsSource = 'computed' | 'retained';
 
 export interface BlocksPanelRow {
   start_at: string;            // ISO-8601 UTC
@@ -1071,6 +1078,10 @@ export interface BlocksPanelRow {
   cost_usd: number;
   models:   ModelCostRow[];    // sorted desc by cost
   label:    string;            // pre-formatted "HH:MM MMM DD" in local tz
+  // The server stamps this when the displayed totals came from an
+  // unambiguous journal-retained closed block. Optional for older envelopes;
+  // the presentation adapter treats absence as computed.
+  facts_source?: BlockFactsSource;
 }
 
 export interface BlocksEnvelope {
@@ -2015,6 +2026,7 @@ export interface ClaudeBlockSourceRow {
   cost_usd: number;
   models: ModelCostRow[];
   label: string;
+  facts_source?: BlockFactsSource;
 }
 
 export interface ClaudeQuotaDomain {

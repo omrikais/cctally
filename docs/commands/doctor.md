@@ -194,10 +194,22 @@ The append-only journal is the durable truth for stats.db (DB journal redesign �
   file counts, and `deferred_since` / `deferred_at` — never paths.
 - `data.codex_ingest_backlog` — WARN when the Codex hook's *budgeted* ingest has been behind for over an hour. The hook's ingest leg has a wall-clock ceiling (`codex.hook.ingest_budget_seconds`, default 5), so it can legitimately leave rollouts unread for the next tick — that is the mechanism working, and a fresh backlog reports OK with a "draining" summary. The WARN fires only once the backlog has stayed non-zero *continuously* past an hour, which is the shape of a store whose per-tick growth outruns its budget. Remedy: run `cctally cache-sync --source codex`, which is unbudgeted and drains it. Details carry remaining files, remaining bytes, and the timestamp the backlog first appeared — never paths. A WARN alone does not change `doctor`'s exit code.
 - `data.codex_project_metadata` — an all-history, root-qualified partition of
-  retained Codex accounting rows. WARN when rows lack a conversation key or a
-  same-root conversation-thread join; rebuild with `cctally cache-sync --source
-  codex --rebuild`. FAIL when the read-only health query cannot run. Details
-  contain counts only, never source paths or identifiers.
+  retained Codex accounting rows. WARN when rows lack a conversation key, lack a
+  same-root conversation-thread join, or carry project metadata the store cannot
+  decode; rebuild with `cctally cache-sync --source codex --rebuild`. FAIL when
+  the read-only health query cannot run. Details contain counts only, never
+  source paths or identifiers.
+
+  The partition reports three reasons, and `incomplete_rows` is their sum:
+  `missing_conversation_key_rows`, `missing_thread_join_rows` and
+  `undecodable_metadata_rows` (#845). The third counts accounting rows whose
+  project attribution would have to read a `codex_conversation_threads.cwd` or
+  `.git_json` value whose stored bytes are not valid UTF-8. It is a new
+  additive key in the `--json` output; a row is counted under exactly one
+  reason, so the three never double-count the same row. The count is
+  all-history here, deliberately unlike the dashboard's two bounded counts, and
+  the rebuild is a real remedy because it re-derives both columns from the
+  rollout JSON.
 - `data.codex_quota` — physical local-rollout quota freshness per qualified
   Codex window. No Codex corpus is OK/not applicable; Codex files with no
   safely interpreted quota, or any applicable `future`, `stale`, or

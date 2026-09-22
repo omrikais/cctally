@@ -86,6 +86,17 @@ describe('<ProjectsPanel />', () => {
     expect(screen.getByText(/\+3 more/)).toBeInTheDocument();
   });
 
+  it('keeps the explanatory legend and aggregate tail inert while the card body still opens', () => {
+    updateSnapshot(envelopeWithProjects(8));
+    const { container } = render(<ProjectsPanel />);
+    fireEvent.click(container.querySelector('.projects-legend') as HTMLElement);
+    expect(getState().openModal).toBeNull();
+    fireEvent.click(container.querySelector('.projects-row.tail') as HTMLElement);
+    expect(getState().openModal).toBeNull();
+    fireEvent.click(container.querySelector('.projects-body') as HTMLElement);
+    expect(getState().openModal).toBe('projects');
+  });
+
   it('renders the "no project activity yet" panel-empty when rows array is empty', () => {
     const env = baseEnvelope();
     env.projects = {
@@ -239,6 +250,8 @@ describe('<ProjectsPanel /> under the All selection', () => {
     expect(
       screen.queryByRole('button', { name: /project-rolled-over/ }),
     ).toBeNull();
+    fireEvent.click(row as HTMLElement);
+    expect(getState().openModal).toBeNull();
   });
 
   it('states the resolved dates in the empty state too', () => {
@@ -400,5 +413,116 @@ describe('<ProjectsPanel /> header block and row accessibility', () => {
     const row = container.querySelector('[data-drillable="false"]')!;
     const reason = row.querySelector('[data-nodrill-reason]')!;
     expect(reason.textContent).toMatch(/no detail view/i);
+  });
+});
+
+// ── #846 A12 — the transient body sentence ──────────────────────────────────
+
+describe('the Codex metadata retry notice (#846 M2)', () => {
+  const NOTE =
+    'Project metadata could not be read for this build; it will retry on the next refresh.';
+
+  function envWithCodexHealth(
+    state: 'transient_read_failure' | 'malformed_row_partial' | 'healthy',
+    options: { codexRows?: unknown[]; claudeRows?: unknown[] } = {},
+  ): Envelope {
+    const env = structuredClone(fixture) as unknown as Envelope & {
+      sources: Record<string, {
+        metadata_health?: unknown;
+        data?: Record<string, unknown> | null;
+      }>;
+    };
+    env.sources.codex.metadata_health = {
+      state,
+      incomplete_rows: state === 'malformed_row_partial' ? 1 : null,
+      retryable: state === 'transient_read_failure',
+    };
+    // The All tab's ranking reads `sources.all.data.providers.*`, not
+    // `sources.all.data.projects`, so emptying the latter would leave the
+    // ranking intact and the "no provider has rows" case unreachable.
+    const codexEntry = env.sources.codex.data as unknown as
+      { projects: { rows: unknown[] } };
+    const allProviders = (env.sources.all.data as unknown as {
+      providers: {
+        claude: { projects: { aggregate: { rows: unknown[] } } } | null;
+        codex: { projects: { rows: unknown[] } } | null;
+      };
+    }).providers;
+    if (options.codexRows !== undefined) {
+      codexEntry.projects = { ...codexEntry.projects, rows: options.codexRows };
+      if (allProviders.codex != null) {
+        allProviders.codex.projects = {
+          ...allProviders.codex.projects, rows: options.codexRows,
+        };
+      }
+    }
+    if (options.claudeRows !== undefined) {
+      // `presentationProviders` falls back to `sources.claude.data` when the
+      // All mirror publishes no provider leg, so the rows are set on whichever
+      // of the two this fixture actually carries.
+      const claudeLeg = allProviders.claude ?? (
+        env.sources.claude.data as unknown as
+          { projects: { aggregate: { rows: unknown[] } } }
+      );
+      claudeLeg.projects.aggregate = {
+        ...claudeLeg.projects.aggregate, rows: options.claudeRows,
+      };
+    }
+    return env as unknown as Envelope;
+  }
+
+  it('replaces the generic empty sentence on the Codex tab', () => {
+    // §4.6 rule 1 empties the Codex rows on the server; the panel discloses
+    // the state rather than inferring it from the emptiness.
+    updateSnapshot(envWithCodexHealth('transient_read_failure', { codexRows: [] }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ProjectsPanel />);
+    const empty = container.querySelector('.panel-empty')!;
+    expect(empty.textContent).toBe(NOTE);
+    expect(empty.textContent).not.toContain('No project activity');
+  });
+
+  it('renders the notice beside the surviving rows on the All tab', () => {
+    updateSnapshot(envWithCodexHealth('transient_read_failure'));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<ProjectsPanel />);
+    const note = container.querySelector('[data-codex-metadata-transient="true"]')!;
+    expect(note.textContent).toBe(NOTE);
+    // The ranking is NOT replaced: the Claude half of it is intact.
+    expect(container.querySelectorAll('.lb-bar').length).toBeGreaterThan(0);
+  });
+
+  it('becomes the empty-body sentence on All when no provider has rows', () => {
+    updateSnapshot(envWithCodexHealth('transient_read_failure', {
+      codexRows: [], claudeRows: [],
+    }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+    const { container } = render(<ProjectsPanel />);
+    expect(container.querySelector('.panel-empty')!.textContent).toBe(NOTE);
+  });
+
+  it('says nothing for a malformed partial, which publishes real rows', () => {
+    updateSnapshot(envWithCodexHealth('malformed_row_partial'));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ProjectsPanel />);
+    expect(container.querySelector('[data-codex-metadata-transient="true"]'))
+      .toBeNull();
+    expect(container.querySelectorAll('.lb-bar').length).toBeGreaterThan(0);
+  });
+
+  it('keeps the generic empty sentence for a healthy empty Codex tab', () => {
+    updateSnapshot(envWithCodexHealth('healthy', { codexRows: [] }));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ProjectsPanel />);
+    const empty = container.querySelector('.panel-empty')!;
+    expect(empty.textContent).toContain('No project activity');
+    expect(empty.textContent).not.toBe(NOTE);
+  });
+
+  it('never renders it on the Claude tab', () => {
+    updateSnapshot(envWithCodexHealth('transient_read_failure'));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<ProjectsPanel />);
+    expect(container.textContent).not.toContain(NOTE);
   });
 });

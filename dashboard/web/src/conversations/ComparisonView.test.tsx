@@ -78,6 +78,31 @@ describe('ComparisonView', () => {
     expect(screen.getByText('use fixtures')).toBeInTheDocument();
   });
 
+  it('shows the store reason instead of a removed-session error when an outline is degraded', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => Promise.resolve(new Response(JSON.stringify(
+      String(url).includes('/A/')
+        ? { status: 'degraded', degraded_reason: 'schema_behind' }
+        : outlineFixture('B'),
+    ), { status: 200 })));
+    dispatch({ type: 'OPEN_COMPARE', a: 'A', b: 'B' });
+    render(<ComparisonView a="A" b="B" />);
+    await waitFor(() => expect(screen.getByText(/behind this version of cctally/i)).toBeInTheDocument());
+    expect(screen.queryByText(/may have been removed/i)).not.toBeInTheDocument();
+  });
+
+  it('replaces the expanded prompt loading placeholder with the degraded store reason', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => Promise.resolve(new Response(JSON.stringify(
+      String(url).includes('/prompts')
+        ? { status: 'degraded', degraded_reason: 'maintenance', prompts: [] }
+        : outlineFixture(String(url).includes('/A/') ? 'A' : 'B'),
+    ), { status: 200 })));
+    render(<ComparisonView a="A" b="B" />);
+    await waitFor(() => expect(screen.getAllByText('shared').length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByRole('listitem')[0]);
+    await waitFor(() => expect(screen.getAllByText(/busy with maintenance/i)).toHaveLength(2));
+    expect(screen.queryByText('loading…')).not.toBeInTheDocument();
+  });
+
   it('header prefers a cached rail title, else falls back to the session slug (#227)', async () => {
     mockFetch();
     // Seed the shared rail title cache for A only; B has no cached title.

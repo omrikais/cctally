@@ -25,7 +25,9 @@ jobs:
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository ||
       github.repository == 'omrikais/cctally'
-    runs-on: ubuntu-latest
+    # Public mirror remains hosted; private trusted events use the existing
+    # Mac. The if guard above refuses private fork merge code before routing.
+    runs-on: ${{ fromJSON(github.repository == 'omrikais/cctally-dev' && '["self-hosted","macOS","cctally"]' || '["ubuntu-latest"]') }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -36,4 +38,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - run: bin/cctally-doc-lint-test
+      - run: |
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
+          bin/cctally-doc-lint-test

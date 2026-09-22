@@ -82,6 +82,7 @@ export function useConversationSearch(
   // needle/kind change (or a fresh page-0 fetch) aborts whatever it points at,
   // so a stale append can never commit over the newer query's state.
   const ctlRef = useRef<AbortController | null>(null);
+  const degradedRef = useRef(false);
   // Latest hits length, read by loadMore without re-creating the callback on
   // every page (so the rail's button identity stays stable).
   const hitsLenRef = useRef(0);
@@ -121,16 +122,20 @@ export function useConversationSearch(
     setHits([]);
     setTotal(0);
     setCursor(null);
+    degradedRef.current = false;
+    setDegraded(null);
     setFetching(true);
     setLoadingMore(false);
     fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(0), ctl.signal)
       .then((raw) => {
+        if (ctlRef.current !== ctl || ctl.signal.aborted) return;
         // Before either branch reads `hits` off the body — the degraded
         // envelope has none.
         const degradedReason = conversationDegradedReason(raw);
         if (degradedReason != null) {
           setHits([]); setTotal(0); setCursor(null); setPending(false);
           setFilterDegraded(false);
+          degradedRef.current = true;
           setDegraded(conversationDegradedNotice(degradedReason));
           setError(null); setFetching(false);
           return;
@@ -160,7 +165,7 @@ export function useConversationSearch(
         setFetching(false);
       })
       .catch((e) => {
-        if (isAbortError(e)) return;
+        if (isAbortError(e) || ctlRef.current !== ctl || ctl.signal.aborted) return;
         setError('Search failed.'); setFetching(false);
       });
     return () => ctl.abort();
@@ -170,13 +175,30 @@ export function useConversationSearch(
   // once everything is loaded. Shares ctlRef, so a needle/kind change aborts an
   // in-flight append and its response is discarded.
   const loadMore = useCallback(() => {
-    if (loadingMoreRef.current || hitsLenRef.current >= totalRef.current) return;
+    if (degradedRef.current || loadingMoreRef.current || hitsLenRef.current >= totalRef.current) return;
     const offset = hitsLenRef.current;
     const ctl = new AbortController();
     ctlRef.current = ctl;
     setLoadingMore(true);
+    const ownsRequest = () => ctlRef.current === ctl && !ctl.signal.aborted;
     fetchJson<ConversationSearchResult | QualifiedSearchEnvelope>(url(offset, cursor), ctl.signal)
       .then((raw) => {
+        // A degraded 200 has the route's EMPTY shape, not a hits array. Check
+        // it before either adapter or the legacy branch reads the page body;
+        // keep the already-rendered page and stop the cursor so repeated
+        // scrolling cannot turn an actionable store state into "Search failed."
+        if (!ownsRequest()) return;
+        const degradedReason = conversationDegradedReason(raw);
+        if (degradedReason != null) {
+          degradedRef.current = true;
+          setCursor(null);
+          setPending(false);
+          setDegraded(conversationDegradedNotice(degradedReason));
+          setError(null);
+          setLoadingMore(false);
+          return;
+        }
+        setDegraded(null);
         const body = qualified
           ? adaptQualifiedSearch(source, raw as QualifiedSearchEnvelope, accountKey)
           : {
@@ -197,10 +219,11 @@ export function useConversationSearch(
         setFilterDegraded(body.filter_degraded === true);
         setCursor(body.cursor);
         setPending(body.pending);
+        setError(null);
         setLoadingMore(false);
       })
       .catch((e) => {
-        if (isAbortError(e)) return;   // stale append discarded on needle/kind change
+        if (isAbortError(e) || !ownsRequest()) return;   // stale append discarded on needle/kind change
         setError('Search failed.'); setLoadingMore(false);
       });
   }, [url, cursor, source, qualified, accountKey]);

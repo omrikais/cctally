@@ -142,7 +142,10 @@ export function ComparisonView({ a: rawA, b: rawB }: { a: ConversationRefInput; 
     }
   }, [a, b, ha.title, hb.title, copy]);
 
-  if (outA.error || outB.error) {
+  if (outA.degraded || outB.degraded) {
+    return <ComparisonNotFound onClose={onClose} message={(outA.degraded ?? outB.degraded)!.message} />;
+  }
+  if (outA.error || outB.error || outA.notFound || outB.notFound) {
     return <ComparisonNotFound onClose={onClose} />;
   }
 
@@ -167,6 +170,8 @@ export function ComparisonView({ a: rawA, b: rawB }: { a: ConversationRefInput; 
         onToggleRow={(k) => setExpandedKey((cur) => (cur === k ? null : k))}
         promptsA={promptsA.byUuid ?? {}}
         promptsB={promptsB.byUuid ?? {}}
+        promptNoticeA={promptsA.degraded?.message}
+        promptNoticeB={promptsB.degraded?.message}
         onOpenInReader={(side, uuid) => {
           // OPEN_CONVERSATION clears `compare` (reverse-clear, Task 3) so the
           // single reader replaces the comparison, landing on the jumped turn.
@@ -189,11 +194,11 @@ export function ComparisonView({ a: rawA, b: rawB }: { a: ConversationRefInput; 
   );
 }
 
-function ComparisonNotFound({ onClose }: { onClose: () => void }) {
+function ComparisonNotFound({ onClose, message = "Couldn't load one of these sessions — it may have been removed." }: { onClose: () => void; message?: string }) {
   return (
     <div className="conv-cmp conv-cmp--notfound">
       <div className="conv-cmp-notfound-msg">
-        Couldn't load one of these sessions — it may have been removed.
+        {message}
       </div>
       <button type="button" className="conv-cmp-close" aria-label="Close comparison" onClick={onClose}>
         ✕ Close comparison

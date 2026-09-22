@@ -82,6 +82,11 @@
     },
     {
       "expectedStatus": "passed",
+      "id": "chromium::current-week-source-state.spec.ts::Current Week restores keyboard focus while an earlier pointer candidate is pending",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
       "id": "chromium::dashboard-json-doctor.spec.ts::strict Doctor report renders at desktop",
       "runner": "playwright"
     },
@@ -137,7 +142,32 @@
     },
     {
       "expectedStatus": "passed",
-      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#563 \u2014 every 390px domain warning keeps a visible state word",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#757 \u2014 All account cards expose the next card at 320px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#757 \u2014 All account cards expose the next card at 390px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#757 \u2014 Codex account cards expose the next card at 320px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#757 \u2014 Codex account cards expose the next card at 390px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#816 \u2014 a long stale snapshot stays inside the 390px support zone",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-561-563-mobile-hero.spec.ts::#831 \u2014 every 390px domain warning visibly names its domain and state",
       "runner": "playwright"
     },
     {
@@ -167,6 +197,26 @@
     },
     {
       "expectedStatus": "passed",
+      "id": "chromium::issues-593-596-dashboard-geometry.spec.ts::#773 \u2014 a credited Claude billing cycle is named as a cycle at 1440px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-593-596-dashboard-geometry.spec.ts::#773 \u2014 a credited Claude billing cycle is named as a cycle at 390px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-593-596-dashboard-geometry.spec.ts::#773 \u2014 failed historic detail does not borrow current-cycle figures",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-593-596-dashboard-geometry.spec.ts::#773 \u2014 independently bounded Claude account spend does not claim one current cycle",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
       "id": "chromium::issues-616-570-browser.spec.ts::#570 \u2014 All Blocks interleave and label totals at 1440px",
       "runner": "playwright"
     },
@@ -178,6 +228,36 @@
     {
       "expectedStatus": "passed",
       "id": "chromium::issues-616-570-browser.spec.ts::#616 \u2014 doctor remediation flags stay intact at 320px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-616-570-browser.spec.ts::#723 \u2014 long Doctor remediation identifiers stay readable at 320px",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-811-817-818-browser.spec.ts::deep-linked reader explains maintenance without inventing a missing conversation",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-811-817-818-browser.spec.ts::deep-linked reader explains schema_behind without inventing a missing conversation",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-811-817-818-browser.spec.ts::search page two explains maintenance instead of reporting a failed search",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-811-817-818-browser.spec.ts::the open outline names its read state (200) instead of loading forever",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::issues-811-817-818-browser.spec.ts::the open outline names its read state (500) instead of loading forever",
       "runner": "playwright"
     },
     {
@@ -288,6 +368,11 @@
     {
       "expectedStatus": "passed",
       "id": "chromium::reader-reveal.spec.ts::revealing earlier members holds the anchor while content inserts above (#285 pt2, B2)",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::responsive-board.spec.ts::#762 \u2014 degraded Projects title keeps every header action in its cluster and panel",
       "runner": "playwright"
     },
     {
@@ -513,6 +598,11 @@
     {
       "expectedStatus": "passed",
       "id": "chromium::settings-surface.spec.ts::#513 S2 \u2014 the settings surface in a real browser > all three control classes compute the app focus ring, with an unfocused canary",
+      "runner": "playwright"
+    },
+    {
+      "expectedStatus": "passed",
+      "id": "chromium::settings-surface.spec.ts::#513 S2 \u2014 the settings surface in a real browser > an active alert physically suppresses the onboarding toast at 390px",
       "runner": "playwright"
     },
     {
@@ -5107,6 +5197,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/components/AccountsClaude.test.tsx::decorated Claude hero disclosure (#423 items 15 and 21) > does not assert a cycle for a merged cost whose account period is unresolved",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/components/AccountsClaude.test.tsx::decorated Claude hero disclosure (#423 items 15 and 21) > uses the focused Claude card without borrowing the merged forecast",
       "runner": "vitest"
     },
@@ -5642,7 +5737,7 @@
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.source.test.tsx::HeroStrip \u2014 Claude unchanged (default source) > keeps the subscription-week vocabulary under Claude",
+      "id": "src/components/HeroStrip.source.test.tsx::HeroStrip \u2014 Claude cycle vocabulary (default source) > keeps the subscription-cycle vocabulary under Claude",
       "runner": "vitest"
     },
     {
@@ -5742,6 +5837,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > names the Claude cycle in the visual and screen-reader hero labels",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > opens the Current Week modal on Enter / Space",
       "runner": "vitest"
     },
@@ -5762,6 +5862,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > restores focus to the hero region after a nested body click opens its modal",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > spent zone: accurate hero from current_week.spent_usd (\u2192 $14.20) + $/1% sub",
       "runner": "vitest"
     },
@@ -5772,7 +5877,7 @@
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > support zone: renders the vs-last-week and Snapshot rows",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> (#264 S1 \u2014 3 zones) > support zone: renders the vs-last-cycle and Snapshot rows",
       "runner": "vitest"
     },
     {
@@ -5792,32 +5897,32 @@
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > cheaper (negative) \u2192 green + trending-down",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > cheaper (negative) \u2192 green + trending-down",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > costlier (positive) \u2192 red + trending-up",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > costlier (positive) \u2192 red + trending-up",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > flat (|\u0394| < 0.02) \u2192 dim + minus",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > flat (|\u0394| < 0.02) \u2192 dim + minus",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > renders NO delta when the rate operand is absent",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > renders NO delta when the rate operand is absent",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > renders an em-dash value (no icon) when the delta is null",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > renders an em-dash value (no icon) when the delta is null",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
-      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs last week metric (#207 B1) > still renders the delta when the rate IS present \u2014 the guard is not a blanket",
+      "id": "src/components/HeroStrip.test.tsx::<HeroStrip /> vs comparable cycle metric (#207 B1) > still renders the delta when the rate IS present \u2014 the guard is not a blanket",
       "runner": "vitest"
     },
     {
@@ -7547,56 +7652,6 @@
     },
     {
       "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact alerts warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact budget warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact daily warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact forensics warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact hero warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact monthly warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact projects warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact quota warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact sessions warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
-      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps an explicit Unavailable state in the compact weekly warning",
-      "runner": "vitest"
-    },
-    {
-      "expectedStatus": null,
       "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > keeps provider status fresh when only hero and quota domains are stale",
       "runner": "vitest"
     },
@@ -7608,6 +7663,61 @@
     {
       "expectedStatus": null,
       "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names a WITHHELD combined figure, and keeps the state word when compact",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the accounts domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the alerts domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the budget domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the daily domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the forensics domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the hero domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the monthly domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the projects domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the quota domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the sessions domain and unavailable state in compact copy",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/components/SourceStatusChip.test.tsx::SourceStatusChip (\u00a76.8) > names the weekly domain and unavailable state in compact copy",
       "runner": "vitest"
     },
     {
@@ -9002,7 +9112,17 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ComparisonView.test.tsx::ComparisonView > replaces the expanded prompt loading placeholder with the degraded store reason",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ComparisonView.test.tsx::ComparisonView > shows a not-found fallback when an outline errors",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ComparisonView.test.tsx::ComparisonView > shows the store reason instead of a removed-session error when an outline is degraded",
       "runner": "vitest"
     },
     {
@@ -9547,6 +9667,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ConversationRail.test.tsx::ConversationRail degraded transcript store (#769 S6 / #802 QA P1) > keeps the first search page visible but disables more paging when the second page degrades",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ConversationRail.test.tsx::ConversationRail degraded transcript store (#769 S6 / #802 QA P1) > offers no Retry for a state a re-read cannot change",
       "runner": "vitest"
     },
@@ -9907,6 +10032,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ConversationReader.test.tsx::ConversationReader > End does not dispatch a stale-anchor jump when the latest detail read is degraded",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ConversationReader.test.tsx::ConversationReader > End key triggers jump-to-latest but NOT while the filter popover is open (spec \u00a74/\u00a75 guard)",
       "runner": "vitest"
     },
@@ -9997,7 +10127,17 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ConversationReader.test.tsx::ConversationReader > renders a maintenance detail as a named retryable state",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ConversationReader.test.tsx::ConversationReader > renders a styled selection-empty / loading state, not bare text",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ConversationReader.test.tsx::ConversationReader > renders schema-behind detail without offering an ineffective retry",
       "runner": "vitest"
     },
     {
@@ -10822,6 +10962,21 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ConversationsView.test.tsx::Conversations workspace integration > 9b: a completed 'HTTP failure' outline read surfaces its truthful state in the reader panel",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ConversationsView.test.tsx::Conversations workspace integration > 9b: a completed 'not found' outline read surfaces its truthful state in the reader panel",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ConversationsView.test.tsx::Conversations workspace integration > 9b: a completed 'schema behind' outline read surfaces its truthful state in the reader panel",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ConversationsView.test.tsx::Conversations workspace integration > C2: Escape closes the comparison before clearing a leftover rail-search needle",
       "runner": "vitest"
     },
@@ -10898,6 +11053,26 @@
     {
       "expectedStatus": null,
       "id": "src/conversations/CopyButton.test.tsx::CopyButton anon mode (fail-closed) > scrubs the text via the current session anon-map before copying",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/CopyButton.test.tsx::CopyButton anonymized refusal (#850) > a later copy re-requests, observes the 409, writes nothing and arms the record",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/CopyButton.test.tsx::CopyButton anonymized refusal (#850) > concurrent clicks during one flight still share ONE fetch",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/CopyButton.test.tsx::CopyButton anonymized refusal (#850) > explains ambiguous account provenance without recommending a cache rebuild",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/CopyButton.test.tsx::CopyButton anonymized refusal (#850) > the raw copy is unaffected by an armed refusal",
       "runner": "vitest"
     },
     {
@@ -11182,6 +11357,21 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/conversations/ExportMenu.test.tsx::ExportMenu anonymized refusal (#850) > a 409 for another conversation never refuses the selected one",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ExportMenu.test.tsx::ExportMenu anonymized refusal (#850) > a 409 on copy arms the record, discloses it, and a 2xx clears it in place",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/ExportMenu.test.tsx::ExportMenu anonymized refusal (#850) > a 409 on download arms the same record and writes no file",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/conversations/ExternalAgentCall.test.tsx::ExternalAgentCall (#463 S3 \u00a75.5) > is not a tool chip and carries no tool styling",
       "runner": "vitest"
     },
@@ -11343,6 +11533,11 @@
     {
       "expectedStatus": null,
       "id": "src/conversations/FindBar.test.tsx::FindBar > surfaces a \"find failed\" hint on a non-abort fetch failure (M4)",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/conversations/FindBar.test.tsx::FindBar > surfaces a typed degraded find notice instead of a generic failure",
       "runner": "vitest"
     },
     {
@@ -16602,6 +16797,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation > does not show a stale degraded detail response after the conversation changes",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversation.test.tsx::useConversation > does not tail-poll while hasMore is true (#175 F4)",
       "runner": "vitest"
     },
@@ -16678,6 +16878,26 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversation.test.tsx::useConversation > replays a tick that arrives mid-fetch exactly once (coalesce, #175 F4)",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation > reports typed degradation from a tail refresh while retaining the already-read page",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation > reports typed store degradation from a later detail page rather than silently failing",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation > retries a recoverable degraded detail and clears the notice on success",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation > surfaces a degraded qualified detail as an actionable state",
       "runner": "vitest"
     },
     {
@@ -16813,6 +17033,11 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversation.test.tsx::useConversation \u2014 bidirectional windowed pager (#217 S3 E2) > preserves the overlap-race disambiguation across edges (a loadToTarget mid-load awaits the in-flight load)",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversation.test.tsx::useConversation \u2014 bidirectional windowed pager (#217 S3 E2) > refuses a Latest jump when the tail read is degraded",
       "runner": "vitest"
     },
     {
@@ -16962,6 +17187,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > does not install a stale cursor degradation after the query changes",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > does not reconcile an occurrence identity across changed query semantics",
       "runner": "vitest"
     },
@@ -16972,7 +17202,17 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > keeps qualified normalization-pending find behavior distinct from degraded",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > maps an HttpError(400) to an \"invalid regex\" error and clears anchors",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > preserves the current exact page when a paginated find response is degraded",
       "runner": "vitest"
     },
     {
@@ -16988,6 +17228,36 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > resets to empty when the needle is cleared",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'legacy_bridge_pending' envelope as degraded for 'bare' find reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'legacy_bridge_pending' envelope as degraded for 'qualified' find reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'maintenance' envelope as degraded for 'bare' find reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'maintenance' envelope as degraded for 'qualified' find reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'schema_behind' envelope as degraded for 'bare' find reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationFind.test.tsx::useConversationFind > surfaces a 200 'schema_behind' envelope as degraded for 'qualified' find reads",
       "runner": "vitest"
     },
     {
@@ -17037,7 +17307,22 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > classifies a bare 200 degraded outline as maintenance without parsing an empty outline",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > classifies a qualified 200 degraded outline as schema_behind without parsing an empty outline",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > coalesces a tick that lands mid-fetch into exactly one trailing refetch",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > does not publish a progressive outline when the session switches during fallback hashing (#833)",
       "runner": "vitest"
     },
     {
@@ -17048,6 +17333,11 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > fetches the outline on a session id",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > hydrates a valid progressive outline without WebCrypto digest support (#833)",
       "runner": "vitest"
     },
     {
@@ -17072,12 +17362,22 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > recognizes a legacy missing-transcript 404 but does not conceal a server fault",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > refetches on a generated_at change",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > rejects a changed digest even when every chunk repeats it (#682)",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > rejects a corrupt progressive outline without WebCrypto digest support (#833)",
       "runner": "vitest"
     },
     {
@@ -17093,6 +17393,11 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > revalidateOnTick:false suppresses the tick-driven refetch (#227)",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationOutline.test.tsx::useConversationOutline > treats a progressive no-transcript answer as absence without requesting a transfer",
       "runner": "vitest"
     },
     {
@@ -17117,12 +17422,52 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > ignores a late successful response for a session whose request was aborted",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > keeps qualified normalization-pending prompts behavior distinct from degraded",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > reports an error string on a non-ok response",
       "runner": "vitest"
     },
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > resets the cache when the session id changes",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'legacy_bridge_pending' envelope as degraded for 'bare' prompts reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'legacy_bridge_pending' envelope as degraded for 'qualified' prompts reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'maintenance' envelope as degraded for 'bare' prompts reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'maintenance' envelope as degraded for 'qualified' prompts reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'schema_behind' envelope as degraded for 'bare' prompts reads",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationPrompts.test.ts::useConversationPrompts > surfaces a 200 'schema_behind' envelope as degraded for 'qualified' prompts reads",
       "runner": "vitest"
     },
     {
@@ -17172,7 +17517,17 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > drops a stale degraded append after a newer query has committed",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > exposes searchDepth from the response",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > ignores an old degraded response even when an aborted fetch resolves normally",
       "runner": "vitest"
     },
     {
@@ -17188,6 +17543,16 @@
     {
       "expectedStatus": null,
       "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > reports a degraded search as a named state, not a failure",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > stops bare search paging on a degraded response and preserves existing hits",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/hooks/useConversationSearch.test.tsx::useConversationSearch > stops qualified search paging on a degraded response before adapting hits",
       "runner": "vitest"
     },
     {
@@ -17958,6 +18323,11 @@
     {
       "expectedStatus": null,
       "id": "src/lib/allAggregates.test.ts::the merged All daily row (\u00a76.1, \u00a76.2, \u00a76.3) > supplies the date-matched provider legs the drill-down renders",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/allAggregates.test.ts::the merged All daily row (\u00a76.1, \u00a76.2, \u00a76.3) > treats a zero Claude calendar row as absent on a Codex-only day",
       "runner": "vitest"
     },
     {
@@ -18808,6 +19178,11 @@
     {
       "expectedStatus": null,
       "id": "src/lib/conversationAdapters.test.ts::qualified Codex conversation adapters > indexes document position over every wire turn, including ones the navigation filter drops",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/conversationAdapters.test.ts::qualified Codex conversation adapters > keeps a degraded detail envelope typed with its store reason",
       "runner": "vitest"
     },
     {
@@ -20012,6 +20387,56 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > checks abort before invoking native WebCrypto",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > does not publish a native digest after abort",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > handles binary bytes and a two-block padding boundary",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > keeps the exact digest across macrotask yields for a multi-MiB payload",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > matches the SHA-256 fallback vector for \"\"",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > matches the SHA-256 fallback vector for \"The quick brown fox jumps over the lazy dog\"",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > matches the SHA-256 fallback vector for \"abc\"",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > matches the SHA-256 fallback vector for \"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq\"",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > prefers native WebCrypto when its digest API is available",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/lib/sha256.test.ts::sha256Hex > yields to a macrotask and observes abort during fallback hashing",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/lib/snippet.test.tsx::renderSnippet > does not interpret HTML \u2014 angle brackets are inert text",
       "runner": "vitest"
     },
@@ -20443,6 +20868,16 @@
     {
       "expectedStatus": null,
       "id": "src/modals/BlockModal.test.tsx::BlockModal cost-by-model uses shared ModelCostBars (#260) > renders ModelCostBars rows (not the bespoke segmented bar) for a multi-model block",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/BlockModal.test.tsx::BlockModal frozen-block evidence disclosure (#769 S2) > associates one retained-facts note with every retained figure, including an active block",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/BlockModal.test.tsx::BlockModal frozen-block evidence disclosure (#769 S2) > does not point computed figures at a retained-facts note",
       "runner": "vitest"
     },
     {
@@ -21287,6 +21722,21 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/modals/Modal.focus.test.tsx::<Modal /> focus management (A1) > restores the surviving Expand trigger after a card-body click and Escape close",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/Modal.focus.test.tsx::<Modal /> focus management (A1) > restores the surviving Expand trigger after a card-body click and backdrop close",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/Modal.focus.test.tsx::<Modal /> focus management (A1) > restores the surviving Expand trigger after a card-body click and close button close",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/modals/Modal.test.tsx::<Modal /> \u2014 MODAL-1 fake handle removed (#293 S4) > Esc still dismisses the modal",
       "runner": "vitest"
     },
@@ -21423,6 +21873,11 @@
     {
       "expectedStatus": null,
       "id": "src/modals/PeriodDetailCard.test.tsx::PeriodDetailCard > renders the weekly-only Used % / $/1% stats for the weekly variant",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/PeriodDetailCard.test.tsx::PeriodDetailCard > shows one-provider All daily models once with their per-model costs and provider",
       "runner": "vitest"
     },
     {
@@ -22637,6 +23092,31 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::Claude account-owned five-hour navigation (#839) > does not substitute an unqualified legacy live stream into a qualified block",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::Claude account-owned five-hour navigation (#839) > fetches a decorated single-segment cycle before assuming the live block is last",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::Claude account-owned five-hour navigation (#839) > retains the live block and stream while decorated history loads or fails",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::Claude account-owned five-hour navigation (#839) > selects and steps account-owned blocks inserted alice then bob",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::Claude account-owned five-hour navigation (#839) > selects and steps account-owned blocks inserted bob then alice",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/modals/currentWeekHistory.test.tsx::Codex current-cycle block navigator (P2-A) > defaults a historic retained-5h cycle to its last block and traverses the complete list",
       "runner": "vitest"
     },
@@ -22727,7 +23207,22 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::fetch policy + reset-defined cycle wire > does not carry one fetched cycle into the next pending historic cycle",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/modals/currentWeekHistory.test.tsx::fetch policy + reset-defined cycle wire > fetches one opaque historic cycle and renders only its ledger",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::fetch policy + reset-defined cycle wire > uses cycle vocabulary for a historic cycle with no milestones",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/modals/currentWeekHistory.test.tsx::fetch policy + reset-defined cycle wire > uses cycle vocabulary when a historic cycle cannot load",
       "runner": "vitest"
     },
     {
@@ -22968,6 +23463,16 @@
     {
       "expectedStatus": null,
       "id": "src/panels/BlocksPanel.test.tsx::#769 S9 \u2014 a block row opens its OWN account detail > forwards no account when the wire published none",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/BlocksPanel.test.tsx::#798 \u2014 Blocks row facts provenance > carries the Claude cue into All rows without labelling Codex rows",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/BlocksPanel.test.tsx::#798 \u2014 Blocks row facts provenance > marks retained active totals while leaving computed rows unmarked",
       "runner": "vitest"
     },
     {
@@ -23607,6 +24112,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/panels/MonthlyPanel.test.tsx::<MonthlyPanel /> (#264 S2) > keeps All provider section labels inert while a card-body click still opens",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/panels/MonthlyPanel.test.tsx::<MonthlyPanel /> (#264 S2) > renders the pink panel card with the calendar icon and model-split subtitle",
       "runner": "vitest"
     },
@@ -23623,6 +24133,11 @@
     {
       "expectedStatus": null,
       "id": "src/panels/MonthlyPanel.test.tsx::<MonthlyPanel /> (#264 S2) > the \u2922 ExpandButton opens the monthly modal",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::<ProjectsPanel /> > keeps the explanatory legend and aggregate tail inert while the card body still opens",
       "runner": "vitest"
     },
     {
@@ -23753,6 +24268,36 @@
     {
       "expectedStatus": null,
       "id": "src/panels/ProjectsPanel.test.tsx::<ProjectsPanel /> withheld and titled > states its composition under All and leaves the Claude tab alone",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > becomes the empty-body sentence on All when no provider has rows",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > keeps the generic empty sentence for a healthy empty Codex tab",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > never renders it on the Claude tab",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > renders the notice beside the surviving rows on the All tab",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > replaces the generic empty sentence on the Codex tab",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/ProjectsPanel.test.tsx::the Codex metadata retry notice (#846 M2) > says nothing for a malformed partial, which publishes real rows",
       "runner": "vitest"
     },
     {
@@ -23962,6 +24507,11 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/panels/TrendPanel.test.tsx::TrendPanel source seam \u2014 no Claude leak under Codex (#294 S5) > keeps provider labels and chart legends inert while the card body still opens",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/panels/TrendPanel.test.tsx::TrendPanel source seam \u2014 no Claude leak under Codex (#294 S5) > names each provider section by its own heading (#556 S4)",
       "runner": "vitest"
     },
@@ -24073,6 +24623,11 @@
     {
       "expectedStatus": null,
       "id": "src/panels/WeeklyPanel.test.tsx::<WeeklyPanel /> (#264 S2) > discloses every account behind a pooled Codex weekly row",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/panels/WeeklyPanel.test.tsx::<WeeklyPanel /> (#264 S2) > keeps model legends inert while the card body still opens",
       "runner": "vitest"
     },
     {
@@ -27752,6 +28307,31 @@
     },
     {
       "expectedStatus": null,
+      "id": "src/store/store.conversations.test.ts::conversation anonymized-refusal records > SET_ACCOUNT_FOCUS and SET_VIEW do not clear a record either",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/store/store.conversations.test.ts::conversation anonymized-refusal records > a late response for A never changes B, refused or not",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/store/store.conversations.test.ts::conversation anonymized-refusal records > a record set while another conversation was selected returns on reselection",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/store/store.conversations.test.ts::conversation anonymized-refusal records > shows the selected conversation its own record and no other",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
+      "id": "src/store/store.conversations.test.ts::conversation anonymized-refusal records > starts empty and yields nothing without a selection",
+      "runner": "vitest"
+    },
+    {
+      "expectedStatus": null,
       "id": "src/store/store.conversations.test.ts::conversation outline / focus-mode state > OPEN_CONVERSATION resets focus mode + current turn but NOT outlineOpen",
       "runner": "vitest"
     },
@@ -28811,7 +29391,7 @@
       "runner": "vitest"
     }
   ],
-  "generatedFrom": "ebabeff178a94ca52fb1e94390c3c10f42298226",
+  "generatedFrom": "a14c1bcb3ec2cf3fde4473a4c8ce36752d3f4db3",
   "pytestExecution": {
     "legs": [
       {
@@ -29268,6 +29848,7 @@
     "tests/test_620_s2_diagnosis_cli.py::test_every_reported_contributor_carries_a_next_step",
     "tests/test_620_s2_diagnosis_cli.py::test_every_share_states_its_named_denominator",
     "tests/test_620_s2_diagnosis_cli.py::test_explain_is_registered_as_a_top_level_command",
+    "tests/test_620_s2_diagnosis_cli.py::test_explain_retries_transient_generation_incoherence",
     "tests/test_620_s2_diagnosis_cli.py::test_fully_withheld_report_still_exits_0",
     "tests/test_620_s2_diagnosis_cli.py::test_generation_is_published_with_its_id",
     "tests/test_620_s2_diagnosis_cli.py::test_healthy_report_exits_0",
@@ -29392,7 +29973,13 @@
     "tests/test_620_s2_diagnosis_route.py::test_an_unresolvable_week_anchor_is_400_not_500",
     "tests/test_620_s2_diagnosis_route.py::test_api_auth_applies_to_the_route",
     "tests/test_620_s2_diagnosis_route.py::test_concurrent_identical_diagnoses_share_one_process_wide_build",
+    "tests/test_620_s2_diagnosis_route.py::test_diagnosis_admission_bounds_same_and_cross_key_callers",
+    "tests/test_620_s2_diagnosis_route.py::test_diagnosis_burst_over_64_caps_admitted_waiters_and_producers",
+    "tests/test_620_s2_diagnosis_route.py::test_diagnosis_deadline_retires_stuck_producer_and_recovers",
+    "tests/test_620_s2_diagnosis_route.py::test_diagnosis_route_maps_saturation_and_timeout_to_safe_503",
     "tests/test_620_s2_diagnosis_route.py::test_explicit_half_open_bounds_are_honoured",
+    "tests/test_620_s2_diagnosis_route.py::test_failed_diagnosis_wakes_coalesced_callers_and_recovers",
+    "tests/test_620_s2_diagnosis_route.py::test_generation_incoherence_is_retried_before_the_route_answers",
     "tests/test_620_s2_diagnosis_route.py::test_generation_incoherent_is_503",
     "tests/test_620_s2_diagnosis_route.py::test_half_open_bounds_must_be_ordered",
     "tests/test_620_s2_diagnosis_route.py::test_malformed_window_is_400",
@@ -29433,6 +30020,7 @@
     "tests/test_620_s2_diagnosis_sources.py::test_an_unpriceable_population_is_still_pricing_unavailable",
     "tests/test_620_s2_diagnosis_sources.py::test_an_unreadable_provider_table_is_provider_unavailable",
     "tests/test_620_s2_diagnosis_sources.py::test_build_diagnosis_publishes_the_generation_on_each_result",
+    "tests/test_620_s2_diagnosis_sources.py::test_build_diagnosis_retries_a_generation_failure_as_a_fresh_build",
     "tests/test_620_s2_diagnosis_sources.py::test_build_diagnosis_returns_one_result_per_provider",
     "tests/test_620_s2_diagnosis_sources.py::test_class_coverage_is_measured_over_the_class_population",
     "tests/test_620_s2_diagnosis_sources.py::test_claude_cost_fold_includes_cache_create_1h_tokens",
@@ -29444,6 +30032,8 @@
     "tests/test_620_s2_diagnosis_sources.py::test_generation_id_changes_when_a_component_changes",
     "tests/test_620_s2_diagnosis_sources.py::test_generation_id_changes_when_the_scope_changes",
     "tests/test_620_s2_diagnosis_sources.py::test_generation_is_a_three_component_vector",
+    "tests/test_620_s2_diagnosis_sources.py::test_generation_retry_does_not_retry_other_establishment_failures",
+    "tests/test_620_s2_diagnosis_sources.py::test_generation_retry_is_bounded_by_the_monotonic_admission_deadline",
     "tests/test_620_s2_diagnosis_sources.py::test_generation_retry_predicate_fires_once_then_raises",
     "tests/test_620_s2_diagnosis_sources.py::test_is_fallback_pricing_survives_into_the_subject",
     "tests/test_620_s2_diagnosis_sources.py::test_no_denominator_spans_providers",
@@ -29456,6 +30046,7 @@
     "tests/test_620_s2_diagnosis_sources.py::test_session_cost_is_repriced_and_never_read_from_a_stored_column",
     "tests/test_620_s2_diagnosis_sources.py::test_the_baseline_is_the_preceding_equal_duration_window",
     "tests/test_620_s2_diagnosis_sources.py::test_the_block_baseline_is_the_max_block_share_in_its_pool",
+    "tests/test_620_s2_diagnosis_sources.py::test_the_codex_worker_retries_a_generation_failure",
     "tests/test_620_s2_diagnosis_sources.py::test_the_compiled_codex_pricer_is_exactly_the_canonical_cost[tokens0-fast-a-model-from-the-future]",
     "tests/test_620_s2_diagnosis_sources.py::test_the_compiled_codex_pricer_is_exactly_the_canonical_cost[tokens0-fast-gpt-5.3-codex]",
     "tests/test_620_s2_diagnosis_sources.py::test_the_compiled_codex_pricer_is_exactly_the_canonical_cost[tokens0-fast-gpt-5.4-2026-03-05]",
@@ -29823,6 +30414,65 @@
     "tests/test_828_metadata_probe.py::test_828_the_qualified_reader_agrees_with_the_probe[missing_thread_join]",
     "tests/test_828_metadata_probe.py::test_828_the_qualified_reader_agrees_with_the_probe[naive_timestamp]",
     "tests/test_828_metadata_probe.py::test_828_the_unbounded_doctor_helper_is_preserved",
+    "tests/test_828_metadata_probe.py::test_845_a20_an_empty_rooted_identity_escapes_with_the_class_default",
+    "tests/test_828_metadata_probe.py::test_845_a21_a_healthy_store_keeps_doctors_established_answer",
+    "tests/test_828_metadata_probe.py::test_845_a21_doctor_counts_a_two_year_old_undecodable_thread",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-accounting-direct-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-accounting-direct-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-accounting-inherited-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-accounting-inherited-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-year-direct-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-year-direct-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-year-inherited-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[inside-year-inherited-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[outside-year-direct-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[outside-year-direct-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[outside-year-inherited-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_matrix_holds_over_both_columns_and_all_three_horizons[outside-year-inherited-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_year_only_case_is_byte_identical_to_the_healthy_one[direct-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_year_only_case_is_byte_identical_to_the_healthy_one[direct-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_year_only_case_is_byte_identical_to_the_healthy_one[inherited-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a2_the_year_only_case_is_byte_identical_to_the_healthy_one[inherited-git_json]",
+    "tests/test_828_metadata_probe.py::test_845_a4_a_clean_store_runs_no_per_identity_query",
+    "tests/test_828_metadata_probe.py::test_845_a4_each_population_subtracts_only_the_overlaps_it_counted[direct-and-inherited]",
+    "tests/test_828_metadata_probe.py::test_845_a4_each_population_subtracts_only_the_overlaps_it_counted[missing-conversation-key]",
+    "tests/test_828_metadata_probe.py::test_845_a4_each_population_subtracts_only_the_overlaps_it_counted[unparseable-timestamp]",
+    "tests/test_828_metadata_probe.py::test_845_a4_each_population_subtracts_only_the_overlaps_it_counted[unusable-token-operand]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[C1-valid-cwd-bad-git-json]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[C2-direct-git-json-wins]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[C3-inherited-cwd-wins]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[E1-direct-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[E2-inherited-cwd]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[E3-direct-git-json]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[E4-inherited-git-json]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[R1-empty-conversation-key]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[R2-missing-thread-join]",
+    "tests/test_828_metadata_probe.py::test_845_a6_the_reader_the_counter_and_the_identity_map_agree[Z-empty-rooted-identity]",
+    "tests/test_828_metadata_probe.py::test_845_a7_every_new_counting_statement_seeks[False-False]",
+    "tests/test_828_metadata_probe.py::test_845_a7_every_new_counting_statement_seeks[False-True]",
+    "tests/test_828_metadata_probe.py::test_845_a7_every_new_counting_statement_seeks[True-False]",
+    "tests/test_828_metadata_probe.py::test_845_a7_every_new_counting_statement_seeks[True-True]",
+    "tests/test_828_metadata_probe.py::test_845_an_undecodable_value_outside_every_horizon_stays_healthy",
+    "tests/test_828_metadata_probe.py::test_852_budget_accounting_extends_carrier_beyond_detail_year[False]",
+    "tests/test_828_metadata_probe.py::test_852_budget_accounting_extends_carrier_beyond_detail_year[True]",
+    "tests/test_828_metadata_probe.py::test_852_carrier_includes_accounting_end_instant[False]",
+    "tests/test_828_metadata_probe.py::test_852_carrier_includes_accounting_end_instant[True]",
+    "tests/test_828_metadata_probe.py::test_852_doctor_counts_malformed_newest_timestamp",
+    "tests/test_828_metadata_probe.py::test_852_doctor_names_malformed_accounting_all_history",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[False-overrides0]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[False-overrides1]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[False-overrides2]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[False-overrides3]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[False-overrides4]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[True-overrides0]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[True-overrides1]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[True-overrides2]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[True-overrides3]",
+    "tests/test_828_metadata_probe.py::test_852_malformed_accounting_row_is_counted_and_good_project_survives[True-overrides4]",
+    "tests/test_828_metadata_probe.py::test_852_sqlite_fallback_fault_is_transient_not_a_skipped_row[False]",
+    "tests/test_828_metadata_probe.py::test_852_sqlite_fallback_fault_is_transient_not_a_skipped_row[True]",
+    "tests/test_828_metadata_probe.py::test_852_sqlite_probe_fault_remains_transient[False]",
+    "tests/test_828_metadata_probe.py::test_852_sqlite_probe_fault_remains_transient[True]",
     "tests/test_829_health_states.py::test_829_a_healthy_probe_counts_zero_rows",
     "tests/test_829_health_states.py::test_829_a_malformed_carrier_is_refused_at_construction",
     "tests/test_829_health_states.py::test_829_a_malformed_row_partial_counts_its_rows_and_is_not_retryable",
@@ -29875,6 +30525,7 @@
     "tests/test_830_partial_reuse_retry.py::test_830_the_kernel_refuses_a_naive_clock",
     "tests/test_830_partial_reuse_retry.py::test_830_the_kernel_refuses_an_unknown_provider",
     "tests/test_830_partial_reuse_retry.py::test_830_the_returned_state_is_immutable_and_the_input_is_untouched",
+    "tests/test_830_partial_reuse_retry.py::test_846_a14_the_carrier_refuses_before_the_retry_kernel_is_consulted",
     "tests/test_832_projection_account_characterization.py::test_characterization_832_unattributed_event_contaminates_a_real_account_projection",
     "tests/test_837_account_scoped_boundary.py::test_837_boundary_selection_is_account_scoped[explicit-week-active-first]",
     "tests/test_837_account_scoped_boundary.py::test_837_boundary_selection_is_account_scoped[explicit-week-inactive-first]",
@@ -29899,6 +30550,50 @@
     "tests/test_837_account_scoped_boundary.py::test_837_refusal_over_a_genuinely_empty_week_stays_bare",
     "tests/test_837_account_scoped_boundary.py::test_837_report_resolves_its_scoped_accounts_boundary",
     "tests/test_837_account_scoped_boundary.py::test_837_trend_view_resolves_its_scoped_accounts_boundary",
+    "tests/test_845_decode_tolerance.py::test_845_a8_the_rollup_writer_persists_null_for_a_malformed_thread",
+    "tests/test_845_decode_tolerance.py::test_845_a8_the_scoped_projection_overrides_a_stale_persisted_rollup",
+    "tests/test_845_decode_tolerance.py::test_a_non_blob_operand_fails_loudly",
+    "tests/test_845_decode_tolerance.py::test_a_read_failure_during_resolution_is_not_an_absent_table",
+    "tests/test_845_decode_tolerance.py::test_a_scoped_temp_view_does_not_hide_the_raw_table",
+    "tests/test_845_decode_tolerance.py::test_an_unresolvable_connection_raises",
+    "tests/test_845_decode_tolerance.py::test_bytes_decode_strictly_and_a_failure_is_recorded_per_field",
+    "tests/test_845_decode_tolerance.py::test_no_in_scope_statement_selects_a_bare_thread_column",
+    "tests/test_845_decode_tolerance.py::test_str_is_verbatim_and_none_stays_none",
+    "tests/test_845_decode_tolerance.py::test_the_allowlist_names_only_the_diagnosis_reader_and_is_not_vacuous",
+    "tests/test_845_decode_tolerance.py::test_the_attributed_counterexamples[empty direct cwd, valid direct git_json, empty inherited cwd, undecodable inherited git_json-direct1-inherited1]",
+    "tests/test_845_decode_tolerance.py::test_the_attributed_counterexamples[no metadata at all-None-None]",
+    "tests/test_845_decode_tolerance.py::test_the_attributed_counterexamples[nothing undecodable at all-direct3-None]",
+    "tests/test_845_decode_tolerance.py::test_the_attributed_counterexamples[valid direct cwd beside an undecodable direct git_json-direct0-None]",
+    "tests/test_845_decode_tolerance.py::test_the_attributed_counterexamples[valid inherited cwd beside an undecodable inherited git_json-direct2-inherited2]",
+    "tests/test_845_decode_tolerance.py::test_the_decoder_never_changes_the_connection_text_factory",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E1-direct0-inherited0]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E1-no-inherited-direct1-None]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E2-direct-cwd-empty-direct3-inherited3]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E2-direct-row-absent-None-inherited2]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E3-direct4-inherited4]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E3-no-inherited-direct5-None]",
+    "tests/test_845_decode_tolerance.py::test_the_four_malformed_cases[E4-direct6-inherited6]",
+    "tests/test_845_decode_tolerance.py::test_the_raw_table_resolves_on_a_bare_cache_connection",
+    "tests/test_845_decode_tolerance.py::test_the_raw_table_resolves_through_an_attached_cache",
+    "tests/test_845_decode_tolerance.py::test_the_static_gate_detects_a_bare_selection",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a13_healthy_malformed_healthy_through_the_tick",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a13_healthy_transient_healthy_through_the_tick",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a9_a_second_tick_rebuilds_the_transient_generation",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a9_an_ingest_failure_republishes_the_transient_carrier",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a9_no_account_child_publishes_a_project_row",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a9_the_idle_snapshot_rebuilds_the_transient_generation",
+    "tests/test_846_tui_metadata_ticks.py::test_846_a9_the_retention_leg_refuses_and_clears_the_armed_key",
+    "tests/test_846_tui_metadata_ticks.py::test_846_the_idle_gate_clears_the_armed_key_it_refuses_on",
+    "tests/test_857_outline_admission.py::test_disconnect_and_expiry_cancel_active_producer",
+    "tests/test_857_outline_admission.py::test_more_than_64_http_joiners_are_bounded_and_recover",
+    "tests/test_857_outline_admission.py::test_producer_limit_timeout_and_failure_release_admission",
+    "tests/test_857_outline_admission.py::test_replaced_generation_survives_old_producer_completion",
+    "tests/test_857_request_admission.py::test_active_request_cap_returns_http_503_and_recovers",
+    "tests/test_857_request_admission.py::test_dashboard_listener_has_burst_backlog",
+    "tests/test_857_request_admission.py::test_diagnosis_real_http_burst_has_bounded_waiters_and_recovers",
+    "tests/test_857_request_admission.py::test_disconnected_diagnosis_waiter_releases_its_admission_slot",
+    "tests/test_857_request_admission.py::test_http_diagnosis_recovers_after_nonterminating_process_is_retired",
+    "tests/test_857_request_admission.py::test_slow_rejected_client_does_not_block_accept_loop",
     "tests/test_account_attribute.py::test_a_claude_ref_is_refused",
     "tests/test_account_attribute.py::test_a_crash_after_the_append_recovers_without_a_duplicate_op",
     "tests/test_account_attribute.py::test_a_failure_inside_the_bounded_adoption_pass_aborts_the_apply",
@@ -32116,12 +32811,12 @@
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_and_test_macos_admit_the_same_contexts",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_guard_is_exactly_its_consumers_guard",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_is_read_only_and_does_not_persist_credentials",
-    "tests/test_ci_receipt_gate.py::test_the_receipt_gate_job_exists_and_is_hosted",
+    "tests/test_ci_receipt_gate.py::test_the_receipt_gate_job_exists",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_publishes_a_discharged_output",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_runs_the_public_classifier",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_still_runs_wherever_its_consumer_can[a push to main-kwargs0]",
     "tests/test_ci_receipt_gate.py::test_the_receipt_gate_still_runs_wherever_its_consumer_can[a same-repository pull request-kwargs1]",
-    "tests/test_ci_receipt_gate.py::test_the_release_classifier_stays_deliberately_unguarded",
+    "tests/test_ci_receipt_gate.py::test_the_release_classifier_keeps_the_public_mirror_but_refuses_private_forks",
     "tests/test_ci_receipt_gate.py::test_the_test_macos_condition_is_exactly_the_specified_string",
     "tests/test_ci_receipt_gate.py::test_the_three_fork_guards_are_byte_unchanged",
     "tests/test_ci_receipt_gate.py::test_the_workflow_level_concurrency_group_is_exactly_as_specified",
@@ -32136,6 +32831,7 @@
     "tests/test_claude_fast_pricing.py::test_effective_fast_rate_matrix_prices_complete_request[claude-opus-4-6-6.0]",
     "tests/test_claude_fast_pricing.py::test_effective_fast_rate_matrix_prices_complete_request[claude-opus-4-7-6.0]",
     "tests/test_claude_fast_pricing.py::test_effective_fast_rate_matrix_prices_complete_request[claude-opus-5-2.0]",
+    "tests/test_claude_fast_pricing.py::test_effective_fast_rate_matrix_prices_complete_request[claude-opus-5-5-2.0]",
     "tests/test_claude_fast_pricing.py::test_fast_rate_applies_across_full_context_window",
     "tests/test_claude_fast_pricing.py::test_non_authoritative_speed_values_preserve_standard_float[1]",
     "tests/test_claude_fast_pricing.py::test_non_authoritative_speed_values_preserve_standard_float[FAST]",
@@ -32177,6 +32873,8 @@
     "tests/test_cmd_doctor.py::test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority",
     "tests/test_codex_56_pricing.py::test_cyber_prices_from_its_own_card_across_the_272k_tier[380000-100000-20000]",
     "tests/test_codex_56_pricing.py::test_cyber_prices_from_its_own_card_across_the_272k_tier[390000-300000-10000]",
+    "tests/test_codex_56_pricing.py::test_daybreak_red_alias_prices_from_the_current_cyber_card",
+    "tests/test_codex_56_pricing.py::test_gpt_6_luna_prices_vendor_standard_long_and_fast_rates",
     "tests/test_codex_56_pricing.py::test_session_metrics_alias_map_mirrors_every_alias_it_can_price",
     "tests/test_codex_56_pricing.py::test_session_metrics_normalizes_the_gpt_56_alias",
     "tests/test_codex_56_pricing.py::test_session_metrics_rate_card_matches_the_authoritative_table",
@@ -32253,6 +32951,12 @@
     "tests/test_codex_astra_pricing.py::test_astra_prices_the_above_272k_card",
     "tests/test_codex_astra_pricing.py::test_litellm_scope_keeps_astra_for_future_drift_detection",
     "tests/test_codex_astra_pricing.py::test_pricing_coverage_accepts_astra_as_directly_priced",
+    "tests/test_codex_astra_pricing.py::test_pricing_coverage_accepts_sol_as_directly_priced",
+    "tests/test_codex_astra_pricing.py::test_sol_has_the_standard_vendor_card_without_fallback",
+    "tests/test_codex_astra_pricing.py::test_sol_prices_standard_cached_output_and_fast_tokens[fast-0.456]",
+    "tests/test_codex_astra_pricing.py::test_sol_prices_standard_cached_output_and_fast_tokens[standard-0.228]",
+    "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[fast-3.08]",
+    "tests/test_codex_astra_pricing.py::test_sol_prices_the_above_272k_card_at_each_speed[standard-1.54]",
     "tests/test_codex_auto_review_pricing.py::test_auto_review_cost_uses_canonical_standard_and_fast_rates[fast-8.75]",
     "tests/test_codex_auto_review_pricing.py::test_auto_review_cost_uses_canonical_standard_and_fast_rates[standard-3.5]",
     "tests/test_codex_auto_review_pricing.py::test_auto_review_resolves_to_gpt_5_5_without_legacy_fallback",
@@ -32306,6 +33010,9 @@
     "tests/test_codex_budget_alerts.py::test_preprobe_skips_sum_when_all_recorded",
     "tests/test_codex_budget_alerts.py::test_reconcile_on_set_records_without_dispatch_then_later_fires",
     "tests/test_codex_budget_alerts.py::test_snap_up_crosses_threshold",
+    "tests/test_codex_conversation_api.py::test_850_a24_both_anonymized_routes_refuse_with_the_typed_status",
+    "tests/test_codex_conversation_api.py::test_850_a25_the_detail_route_opens_the_affected_conversation",
+    "tests/test_codex_conversation_api.py::test_850_both_anonymized_routes_refuse_when_the_count_read_fails",
     "tests/test_codex_conversation_api.py::test_account_qualifier_reaches_collection_and_entity_queries",
     "tests/test_codex_conversation_api.py::test_account_scoped_browse_keeps_unscoped_codex_project_identity",
     "tests/test_codex_conversation_api.py::test_anon_map_v1_codex_includes_roots_and_scrubs",
@@ -32348,6 +33055,8 @@
     "tests/test_codex_conversation_api.py::test_s3_no_raw_session_id_reaches_any_served_route",
     "tests/test_codex_conversation_api.py::test_s3_patch_card_paths_are_covered_by_the_anon_plan",
     "tests/test_codex_conversation_api.py::test_scoped_claude_anon_map_excludes_other_account_file_path",
+    "tests/test_codex_conversation_api.py::test_scoped_codex_anonymization_refuses_ambiguous_thread_cwd",
+    "tests/test_codex_conversation_api.py::test_scoped_codex_anonymization_uses_only_proven_account_paths",
     "tests/test_codex_conversation_api.py::test_search_cursor_roundtrip_over_http",
     "tests/test_codex_conversation_api.py::test_search_malformed_cursor_is_400",
     "tests/test_codex_conversation_api.py::test_search_offset_with_source_is_400",
@@ -32390,6 +33099,19 @@
     "tests/test_codex_conversation_live_tail.py::test_targeted_parity_with_full_sync_for_that_file",
     "tests/test_codex_conversation_live_tail.py::test_two_target_preflight_shrink_is_zero_mutation",
     "tests/test_codex_conversation_live_tail.py::test_vanished_file_is_clean_and_dropped",
+    "tests/test_codex_conversation_normalization.py::test_850_a22_the_scrub_vocabulary_keeps_every_decodable_path",
+    "tests/test_codex_conversation_normalization.py::test_850_a25_the_detail_opens_and_the_live_path_equals_the_stored_path",
+    "tests/test_codex_conversation_normalization.py::test_850_a25_the_identity_only_readers_work_on_a_corrupted_thread",
+    "tests/test_codex_conversation_normalization.py::test_850_a26_each_viewer_request_reads_the_raw_table_exactly_once",
+    "tests/test_codex_conversation_normalization.py::test_850_a26_no_viewer_surface_shows_a_later_corrupted_threads_attribution",
+    "tests/test_codex_conversation_normalization.py::test_850_a26_the_outline_memo_cannot_serve_a_stale_child_summary",
+    "tests/test_codex_conversation_normalization.py::test_850_a26_the_scoped_connection_excludes_the_same_keys",
+    "tests/test_codex_conversation_normalization.py::test_850_a26_the_scoped_request_reads_the_raw_table_the_same_way",
+    "tests/test_codex_conversation_normalization.py::test_850_a_read_failure_during_resolution_refuses_both_reads",
+    "tests/test_codex_conversation_normalization.py::test_850_fail_closed_count_propagates_a_read_failure",
+    "tests/test_codex_conversation_normalization.py::test_850_fail_closed_count_still_answers_zero_without_the_table",
+    "tests/test_codex_conversation_normalization.py::test_850_undecodable_key_set_propagates_a_read_failure",
+    "tests/test_codex_conversation_normalization.py::test_850_undecodable_key_set_still_answers_empty_without_the_table",
     "tests/test_codex_conversation_normalization.py::test_a_block_key_is_unchanged_by_segmentation",
     "tests/test_codex_conversation_normalization.py::test_a_boundary_never_splits_a_bracketed_patch_completion",
     "tests/test_codex_conversation_normalization.py::test_a_boundary_never_splits_a_web_search_completion[2]",
@@ -32723,6 +33445,14 @@
     "tests/test_codex_debug_sample_emission.py::test_e2e_debug_samples_zero_suppresses_block",
     "tests/test_codex_debug_sample_emission.py::test_e2e_debug_total_cost_honors_fast_speed",
     "tests/test_codex_debug_sample_emission.py::test_e2e_no_debug_flag_no_report",
+    "tests/test_codex_detail_bounded_reads.py::test_845_a3_the_partial_generation_publishes_every_surviving_project",
+    "tests/test_codex_detail_bounded_reads.py::test_845_a3_the_project_route_reaches_every_surviving_key",
+    "tests/test_codex_detail_bounded_reads.py::test_845_a3_the_two_refused_entries_are_counted_by_their_own_reasons",
+    "tests/test_codex_detail_bounded_reads.py::test_845_a_degraded_generation_publishes_the_same_quota_blocks",
+    "tests/test_codex_detail_bounded_reads.py::test_845_the_healthy_build_reads_the_inventory_exactly_once",
+    "tests/test_codex_detail_bounded_reads.py::test_845_the_inventory_reads_each_table_once_and_issues_no_per_file_query",
+    "tests/test_codex_detail_bounded_reads.py::test_845_the_linear_alias_map_preserves_the_sql_winner",
+    "tests/test_codex_detail_bounded_reads.py::test_845_the_partial_build_reads_the_inventory_exactly_once",
     "tests/test_codex_detail_bounded_reads.py::test_a_codex_block_detail_materialises_no_accounting_rows",
     "tests/test_codex_detail_bounded_reads.py::test_a_codex_block_detail_reads_only_its_own_physical_group",
     "tests/test_codex_detail_bounded_reads.py::test_a_codex_block_detail_resolves_beyond_the_two_hundred_and_fiftieth",
@@ -34073,6 +34803,15 @@
     "tests/test_conversation_account_dimension.py::test_every_ingested_message_gets_a_stamp",
     "tests/test_conversation_account_dimension.py::test_invalid_utf8_does_not_move_the_digest_between_runs",
     "tests/test_conversation_account_dimension.py::test_pruning_a_source_path_removes_its_unreachable_stamps",
+    "tests/test_conversation_account_dimension.py::test_scoped_anon_preserves_caller_home_identity_scrub",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_handles_store_without_raw_threads_table",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_provenance_does_not_materialize_non_metadata_events",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_provenance_has_a_partial_session_meta_index",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_refuses_failed_root_path_read",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_refuses_root_path_owned_as_foreign_cwd",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_refuses_thread_path_from_other_account",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_anon_uses_only_physically_owned_project_paths",
+    "tests/test_conversation_account_dimension.py::test_scoped_codex_cli_export_refuses_ambiguous_path",
     "tests/test_conversation_account_dimension.py::test_the_backfill_advances_a_durable_cursor_across_chunks",
     "tests/test_conversation_account_dimension.py::test_the_coverage_gate_lets_a_backfilled_store_through",
     "tests/test_conversation_account_dimension.py::test_the_digest_is_over_the_raw_on_disk_bytes",
@@ -35148,6 +35887,14 @@
     "tests/test_dashboard_activity_publication.py::test_set_final_stores_and_clears_the_flag_in_one_acquisition",
     "tests/test_dashboard_activity_publication.py::test_the_update_check_republish_sends_the_merged_snapshot",
     "tests/test_dashboard_activity_publication.py::test_update_check_republish_patches_the_latest_snapshot",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_resolves_projected_metric_and_all_axis_providers[claude]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_resolves_projected_metric_and_all_axis_providers[codex]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_response_matches_real_envelope_account_decoration[account_order0]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_response_matches_real_envelope_account_decoration[account_order1]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_response_matches_real_envelope_account_decoration[account_order2]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_response_matches_real_envelope_account_decoration[account_order3]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_response_matches_real_envelope_account_decoration[account_order4]",
+    "tests/test_dashboard_alert_accounts.py::test_alert_test_without_stats_db_does_not_create_one",
     "tests/test_dashboard_alert_accounts.py::test_claude_alert_rows_gain_conditional_account_key_and_label",
     "tests/test_dashboard_alert_accounts.py::test_codex_alert_rows_keep_internal_key_and_gain_public_account_fields",
     "tests/test_dashboard_alert_accounts.py::test_every_claude_alert_mapper_threads_the_account_dimension",
@@ -35382,6 +36129,7 @@
     "tests/test_dashboard_handler_static.py::test_static_denies_path_traversal",
     "tests/test_dashboard_handler_static.py::test_static_denies_percent_encoded_traversal",
     "tests/test_dashboard_handler_static.py::test_static_placeholder_served_with_200",
+    "tests/test_dashboard_handler_static.py::test_warm_shell_304_skips_read_and_gzip_then_changed_build_invalidates",
     "tests/test_dashboard_html_assets.py::test_dashboard_html_references_all_resolvable_assets",
     "tests/test_dashboard_html_assets.py::test_dashboard_shell_javascript_stays_within_cold_load_budget",
     "tests/test_dashboard_json_wire.py::test_accepts_gzip[*-True]",
@@ -35878,6 +36626,13 @@
     "tests/test_dashboard_source_kernel.py::test_unavailable_source_has_no_data_or_success_version",
     "tests/test_dashboard_source_kernel.py::test_unavailable_source_state_has_no_account_scope",
     "tests/test_dashboard_source_kernel.py::test_unchanged_coherent_provider_state_is_reused_by_identity",
+    "tests/test_dashboard_source_read_model.py::test_846_a10_a_failed_metadata_read_is_not_an_empty_store",
+    "tests/test_dashboard_source_read_model.py::test_846_a11_a_failing_alias_pragma_propagates",
+    "tests/test_dashboard_source_read_model.py::test_846_a11_the_accounting_health_leg_no_longer_escapes",
+    "tests/test_dashboard_source_read_model.py::test_846_a9_any_failed_metadata_leg_publishes_a_transient_generation[accounting_health]",
+    "tests/test_dashboard_source_read_model.py::test_846_a9_any_failed_metadata_leg_publishes_a_transient_generation[conversation_metadata]",
+    "tests/test_dashboard_source_read_model.py::test_846_a9_any_failed_metadata_leg_publishes_a_transient_generation[detail_probe]",
+    "tests/test_dashboard_source_read_model.py::test_846_a9_any_failed_metadata_leg_publishes_a_transient_generation[qualified_accounting]",
     "tests/test_dashboard_source_read_model.py::test_a_baseline_switch_is_picked_up_at_its_deadline",
     "tests/test_dashboard_source_read_model.py::test_a_cache_report_row_that_ages_out_of_the_window_leaves_its_group",
     "tests/test_dashboard_source_read_model.py::test_a_live_in_memory_store_keeps_one_stable_identity",
@@ -36543,6 +37298,8 @@
     "tests/test_doctor_codex_ingest_backlog.py::test_the_gather_carries_the_record_across",
     "tests/test_doctor_codex_ingest_backlog.py::test_the_leg_is_registered_in_the_data_category",
     "tests/test_doctor_codex_ingest_backlog.py::test_warns_once_it_has_been_stuck_for_over_an_hour",
+    "tests/test_doctor_codex_project_metadata.py::test_845_a_health_result_without_the_new_key_still_reads",
+    "tests/test_doctor_codex_project_metadata.py::test_845_undecodable_rows_are_a_third_reason_in_the_sum",
     "tests/test_doctor_codex_project_metadata.py::test_codex_project_metadata_gather_error_is_fail",
     "tests/test_doctor_codex_project_metadata.py::test_codex_project_metadata_is_ok_when_empty_or_all_qualified",
     "tests/test_doctor_codex_project_metadata.py::test_codex_project_metadata_is_registered_after_codex_cache",
@@ -36939,6 +37696,13 @@
     "tests/test_five_hour_block_envelope.py::test_836_the_block_selection_is_ordered_and_limited",
     "tests/test_five_hour_block_envelope.py::test_836_the_published_block_key_set_is_exactly_the_published_keys",
     "tests/test_five_hour_block_envelope.py::test_836_the_server_publishes_the_effective_field_on_three_surfaces",
+    "tests/test_five_hour_block_envelope.py::test_839_crossed_reset_anchor_excludes_held_and_other_account",
+    "tests/test_five_hour_block_envelope.py::test_839_current_week_owns_its_block_credit_and_milestones[order0]",
+    "tests/test_five_hour_block_envelope.py::test_839_current_week_owns_its_block_credit_and_milestones[order1]",
+    "tests/test_five_hour_block_envelope.py::test_839_decorated_live_block_publishes_its_account_identity",
+    "tests/test_five_hour_block_envelope.py::test_839_held_other_account_does_not_choose_its_window",
+    "tests/test_five_hour_block_envelope.py::test_839_missing_weekly_account_block_does_not_borrow_other_account",
+    "tests/test_five_hour_block_envelope.py::test_839_one_real_account_does_not_borrow_unattributed_block",
     "tests/test_five_hour_block_envelope.py::test_block_envelope_credits_chain_in_ascending_order",
     "tests/test_five_hour_block_envelope.py::test_block_envelope_credits_empty_when_no_event",
     "tests/test_five_hour_block_envelope.py::test_block_envelope_populates_credits_when_event_row_exists",
@@ -39615,6 +40379,10 @@
     "tests/test_milestone_epoch_stale_seed.py::test_stale_pre_credit_replica_does_not_fabricate_a_post_reset_milestone",
     "tests/test_milestone_epoch_stale_seed.py::test_the_fix_does_not_recover_the_crossings_the_replica_suppresses",
     "tests/test_milestone_history.py::test_836_one_window_two_accounts_do_not_share_milestones",
+    "tests/test_milestone_history.py::test_839_decorated_detail_stamp_moves_for_other_account_5h_changes",
+    "tests/test_milestone_history.py::test_839_same_window_history_keeps_each_accounts_credit_and_identity[insertion_order0]",
+    "tests/test_milestone_history.py::test_839_same_window_history_keeps_each_accounts_credit_and_identity[insertion_order1]",
+    "tests/test_milestone_history.py::test_839_single_account_history_keeps_legacy_block_wire",
     "tests/test_milestone_history.py::test_api_milestones_bad_source_400",
     "tests/test_milestone_history.py::test_api_milestones_claude_reset_cycles_fetch_independently",
     "tests/test_milestone_history.py::test_api_milestones_claude_unknown_week_404",
@@ -39842,8 +40610,9 @@
     "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates4]",
     "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates3]",
     "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates5]",
+    "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates7]",
     "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates6]",
-    "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates7]",
+    "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]",
     "tests/test_pricing_check.py::test_diff_pricing_allowlist_suppresses_value_and_missing",
     "tests/test_pricing_check.py::test_diff_pricing_categories_and_allowlist",
     "tests/test_pricing_check.py::test_doctor_coverage_scan_emits_no_cost_warning_on_stderr",
@@ -39888,12 +40657,24 @@
     "tests/test_pricing_check.py::test_pricing_observed_models_no_mutation_on_fresh_home",
     "tests/test_pricing_check.py::test_refreshed_models_price_every_cache_tier[claude-mythos-5-93.5]",
     "tests/test_pricing_check.py::test_refreshed_models_price_every_cache_tier[claude-mythos-preview-233.75]",
+    "tests/test_pricing_check.py::test_refreshed_models_price_every_cache_tier[claude-opus-5-5-37.2]",
     "tests/test_pricing_check.py::test_refreshed_models_price_every_cache_tier[claude-sonnet-5-18.7]",
     "tests/test_pricing_check.py::test_scope_litellm_keeps_only_claude_and_codex_set",
     "tests/test_pricing_check.py::test_sonnet_5_permanent_rate_needs_no_drift_suppression",
     "tests/test_pricing_check.py::test_stale_allowlist_entries_empty_when_divergence_real",
     "tests/test_pricing_check.py::test_stale_allowlist_entries_flags_resolved_divergence",
     "tests/test_pricing_check.py::test_table_shapes_clean_on_live_tables",
+    "tests/test_private_ci_routing.py::test_all_executing_private_ci_jobs_use_the_mac[pull_request]",
+    "tests/test_private_ci_routing.py::test_all_executing_private_ci_jobs_use_the_mac[push]",
+    "tests/test_private_ci_routing.py::test_all_executing_private_ci_jobs_use_the_mac[schedule]",
+    "tests/test_private_ci_routing.py::test_all_executing_private_ci_jobs_use_the_mac[workflow_dispatch]",
+    "tests/test_private_ci_routing.py::test_doc_lint_private_trusted_runs_on_mac_and_public_on_hosted[pull_request]",
+    "tests/test_private_ci_routing.py::test_doc_lint_private_trusted_runs_on_mac_and_public_on_hosted[push]",
+    "tests/test_private_ci_routing.py::test_private_fork_pr_never_executes_a_ci_job",
+    "tests/test_private_ci_routing.py::test_private_pricing_check_uses_mac_and_public_stays_skipped[schedule]",
+    "tests/test_private_ci_routing.py::test_private_pricing_check_uses_mac_and_public_stays_skipped[workflow_dispatch]",
+    "tests/test_private_ci_routing.py::test_public_mirror_keeps_the_hosted_classifier_and_pr_lane[pull_request]",
+    "tests/test_private_ci_routing.py::test_public_mirror_keeps_the_hosted_classifier_and_pr_lane[push]",
     "tests/test_probe_table_nonempty.py::test_empty_table_is_false",
     "tests/test_probe_table_nonempty.py::test_missing_table_is_false",
     "tests/test_probe_table_nonempty.py::test_nonempty_table_is_true",
@@ -41042,15 +41823,25 @@
     "tests/test_rederive_command.py::test_rederive_apply_incident_records_the_rederive_apply_trigger",
     "tests/test_rederive_command.py::test_rederive_clears_quarantined_same_revision_conflicts",
     "tests/test_rederive_command.py::test_rederive_keeps_every_decoded_record",
+    "tests/test_rederive_command.py::test_retained_reviewed_weekly_op_requires_its_exact_preceding_prefix",
+    "tests/test_rederive_command.py::test_reviewed_weekly_apply_excludes_unrelated_baseline_corrections",
+    "tests/test_rederive_command.py::test_reviewed_weekly_completed_op_recovers_with_plain_rederive",
+    "tests/test_rederive_command.py::test_reviewed_weekly_decision_command_is_durable_and_idempotent",
+    "tests/test_rederive_command.py::test_reviewed_weekly_large_manifest_checks_encoded_line_limit",
+    "tests/test_rederive_command.py::test_reviewed_weekly_manifest_rejects_bad_ids_and_prefix_drift",
+    "tests/test_rederive_command.py::test_reviewed_weekly_retry_refuses_new_observations_after_decision",
+    "tests/test_rederive_command.py::test_reviewed_weekly_v2_manifest_records_exact_identity_pair",
     "tests/test_rederive_command.py::test_s5_rederive_plan_is_byte_identical_to_the_frozen_cli_baseline",
     "tests/test_rederive_command.py::test_s5_rederive_refuses_the_tainted_prefix_identically",
     "tests/test_rederive_command.py::test_the_whole_rederive_apply_takes_one_prefix_traversal",
     "tests/test_rederive_command.py::test_unsupported_family_is_handler_owned_exit_2_json",
+    "tests/test_rederive_command.py::test_week_reset_add_burst_refuses_preview_and_apply_before_append",
     "tests/test_rederive_planner.py::test_a_journal_without_retained_evidence_plans_no_destruction",
     "tests/test_rederive_planner.py::test_applying_plan_through_task_a_seam_makes_next_plan_empty",
     "tests/test_rederive_planner.py::test_automatic_week_reset_is_rederived_with_dependent_snapshot",
     "tests/test_rederive_planner.py::test_cache_fingerprint_ignores_surrogate_insertion_order",
     "tests/test_rederive_planner.py::test_claude_family_preserves_codex_owned_budget_and_projection_events",
+    "tests/test_rederive_planner.py::test_closed_block_keeps_its_frozen_money_when_current_ownership_differs",
     "tests/test_rederive_planner.py::test_delayed_cache_entry_is_excluded_from_earlier_as_of_cost",
     "tests/test_rederive_planner.py::test_derivable_window_events_still_retire_when_no_longer_derived",
     "tests/test_rederive_planner.py::test_family_registry_exhaustively_classifies_current_journal_kinds",
@@ -41060,6 +41851,7 @@
     "tests/test_rederive_planner.py::test_forced_supersede_moves_exactly_the_conflicted_count",
     "tests/test_rederive_planner.py::test_forced_supersede_previews_are_byte_identical_and_idempotent",
     "tests/test_rederive_planner.py::test_future_custom_sync_window_is_bounded_by_retained_op_time",
+    "tests/test_rederive_planner.py::test_held_replay_does_not_replace_the_later_genuine_journal_decision",
     "tests/test_rederive_planner.py::test_historical_reset_marker_and_five_hour_hwm_are_replayed_in_memory",
     "tests/test_rederive_planner.py::test_history_retired_by_a_prior_rederive_batch_is_revived",
     "tests/test_rederive_planner.py::test_history_retired_by_another_family_is_left_alone",
@@ -41075,11 +41867,24 @@
     "tests/test_rederive_planner.py::test_positive_account_without_its_own_cache_rows_refuses_precisely",
     "tests/test_rederive_planner.py::test_post_batch_selector_reports_zero_winning_revision_conflicts",
     "tests/test_rederive_planner.py::test_pre_cutover_history_is_preserved_not_tombstoned",
+    "tests/test_rederive_planner.py::test_raw_replay_keeps_accepted_equal_snapshot_identity",
     "tests/test_rederive_planner.py::test_record_credit_effect_identity_change_is_dependency_closed",
     "tests/test_rederive_planner.py::test_rederive_refuses_a_tainted_structural_batch_directly",
     "tests/test_rederive_planner.py::test_rederive_still_refuses_an_acknowledged_tainted_batch",
+    "tests/test_rederive_planner.py::test_replay_of_repeated_high_low_observations_refuses_reset_burst",
+    "tests/test_rederive_planner.py::test_reviewed_causal_delta_excludes_three_older_block_closes",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_high_retains_five_hour_credit_without_milestone",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_hold_changes_only_a_frozen_blocks_weekly_axes",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_hold_keeps_genuine_second_in_place_reset",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_hold_requires_a_raw_weekly_capture",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_hold_stops_stale_storm_but_not_genuine_reset",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_hold_without_account_basis_fails_closed",
+    "tests/test_rederive_planner.py::test_reviewed_weekly_low_does_not_mint_in_place_credit",
     "tests/test_rederive_planner.py::test_scratch_planner_reuses_current_derivation_and_cache_ttl_split",
     "tests/test_rederive_planner.py::test_unknown_cache_ttl_split_refuses_before_any_planning_write",
+    "tests/test_rederive_planner.py::test_week_reset_add_burst_refuses_three_matching_adds_with_real_plan",
+    "tests/test_rederive_planner.py::test_week_reset_add_guard_allows_two_and_distinct_groups",
+    "tests/test_rederive_planner.py::test_weekly_cost_snapshot_equivalent_offset_spelling_is_retained",
     "tests/test_rederive_planner.py::test_wrong_snapshot_is_superseded_and_applied_plan_is_noop",
     "tests/test_refresh_usage_cmd.py::test_cmd_refresh_usage_corrupt_stats_is_actionable_staged_error",
     "tests/test_refresh_usage_cmd.py::test_cmd_refresh_usage_fires_nudge_once_on_ok",
@@ -42242,6 +43047,14 @@
     "tests/test_snapshot_cache_owner_thread.py::test_armed_foreign_thread_raises",
     "tests/test_snapshot_cache_owner_thread.py::test_remark_transfers_ownership",
     "tests/test_snapshot_cache_owner_thread.py::test_unarmed_is_noop",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_in_window_undecodable_value_degrades_per_the_table[cmd_source_cache_report]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_in_window_undecodable_value_degrades_per_the_table[cmd_source_diff]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_in_window_undecodable_value_degrades_per_the_table[cmd_source_project]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_in_window_undecodable_value_degrades_per_the_table[cmd_source_range_cost]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_out_of_window_undecodable_value_leaves_every_consumer_intact[cmd_source_cache_report]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_out_of_window_undecodable_value_leaves_every_consumer_intact[cmd_source_diff]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_out_of_window_undecodable_value_leaves_every_consumer_intact[cmd_source_project]",
+    "tests/test_source_aware_analytics.py::test_845_a18_an_out_of_window_undecodable_value_leaves_every_consumer_intact[cmd_source_range_cost]",
     "tests/test_source_aware_analytics.py::test_all_source_diff_combines_a_b_and_delta_without_flattening_provider_blocks",
     "tests/test_source_aware_analytics.py::test_all_source_diff_omits_unavailable_codex_values_from_combined",
     "tests/test_source_aware_analytics.py::test_all_source_report_omits_combined_even_when_series_overlap",
@@ -44240,10 +45053,40 @@
     "tests/test_timing_budget_guard.py::test_it_flags_the_composed_deadlines_the_cap_cannot_grant",
     "tests/test_timing_budget_guard.py::test_it_flags_the_subprocess_budget_the_cap_cannot_grant",
     "tests/test_timing_budget_guard.py::test_it_flags_the_wait_that_polled_the_wrong_condition",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[10]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[11]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[12]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[13]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[14]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[15]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[1]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[2]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[3]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[4]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[5]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[6]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[7]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[8]",
+    "tests/test_timing_budget_guard.py::test_no_additional_pytest_file_carries_a_bad_timing_budget[9]",
     "tests/test_timing_budget_guard.py::test_no_pytest_file_carries_an_unreachable_or_load_sensitive_budget",
     "tests/test_timing_budget_guard.py::test_no_shell_harness_waits_on_the_clock",
     "tests/test_timing_budget_guard.py::test_poll_cadence_is_ignored",
     "tests/test_timing_budget_guard.py::test_poll_cadence_stays_below_the_floor_rather_than_being_reported_by_it",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[10]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[11]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[12]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[13]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[14]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[15]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[1]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[2]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[3]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[4]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[5]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[6]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[7]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[8]",
+    "tests/test_timing_budget_guard.py::test_remaining_timing_thresholds_sit_in_estate_gaps[9]",
     "tests/test_timing_budget_guard.py::test_the_allowlist_is_closed_and_every_entry_still_applies",
     "tests/test_timing_budget_guard.py::test_the_cap_is_the_one_the_suite_applies",
     "tests/test_timing_budget_guard.py::test_the_composed_threshold_is_not_parked_on_a_sum",
@@ -44276,6 +45119,8 @@
     "tests/test_transcript_access.py::test_host_allowed_blocks_dns_rebinding",
     "tests/test_transcript_access.py::test_is_loopback",
     "tests/test_transcript_access.py::test_transcripts_allowed_loopback_default_then_expose",
+    "tests/test_transcript_cli.py::test_850_a23_anonymized_codex_export_fails_closed_scoped_or_not",
+    "tests/test_transcript_cli.py::test_850_anonymized_export_writes_nothing_when_the_count_read_fails",
     "tests/test_transcript_cli.py::test_cli_http_byte_parity_all_scopes",
     "tests/test_transcript_cli.py::test_export_bad_scope_exits_2",
     "tests/test_transcript_cli.py::test_export_codex_cli_http_byte_parity",

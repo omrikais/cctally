@@ -1,4 +1,4 @@
-"""GPT-6 Astra uses OpenAI's published rate card without fallback."""
+"""GPT-6 models use OpenAI's published rate cards without fallback."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 MODEL = "gpt-6-astra"
+SOL = "gpt-6-sol"
 
 ASTRA_CARD = {
     "input_cost_per_token": 1e-05,
@@ -20,6 +21,14 @@ ASTRA_CARD = {
     "input_cost_per_token_above_272k_tokens": 2e-05,
     "cache_read_input_token_cost_above_272k_tokens": 2e-06,
     "output_cost_per_token_above_272k_tokens": 7.5e-05,
+}
+SOL_CARD = {
+    "input_cost_per_token": 2e-06,
+    "cache_read_input_token_cost": 2e-07,
+    "output_cost_per_token": 1e-05,
+    "input_cost_per_token_above_272k_tokens": 4e-06,
+    "cache_read_input_token_cost_above_272k_tokens": 4e-07,
+    "output_cost_per_token_above_272k_tokens": 1.5e-05,
 }
 
 
@@ -73,7 +82,7 @@ def test_astra_prices_standard_cached_output_and_fast_tokens(
 
 
 def test_astra_prices_the_above_272k_card():
-    # The non-cached input axis crosses cctally's per-axis tier boundary.
+    # Inclusive prompt size qualifies the entire request for the long card.
     cost = pricing._calculate_codex_entry_cost(
         MODEL,
         input_tokens=400_000,
@@ -82,12 +91,7 @@ def test_astra_prices_the_above_272k_card():
         reasoning_output_tokens=5_000,
     )
 
-    expected = (
-        272_000 * 1e-05
-        + 28_000 * 2e-05
-        + 100_000 * 1e-06
-        + 20_000 * 5e-05
-    )
+    expected = 300_000 * 2e-05 + 100_000 * 2e-06 + 20_000 * 7.5e-05
     assert cost == pytest.approx(expected)
 
 
@@ -107,10 +111,76 @@ def test_litellm_scope_keeps_astra_for_future_drift_detection():
             "litellm_provider": "openai",
             "input_cost_per_token": 1e-05,
         },
+        SOL: {
+            "litellm_provider": "openai",
+            "input_cost_per_token": 2e-06,
+        },
         "gpt-4o": {
             "litellm_provider": "openai",
             "input_cost_per_token": 2.5e-06,
         },
     })
 
-    assert set(scoped) == {MODEL}
+    assert set(scoped) == {MODEL, SOL}
+
+
+def test_sol_has_the_standard_vendor_card_without_fallback(capsys):
+    pricing._unknown_codex_model_warnings.discard(SOL)
+
+    resolved, is_fallback = pricing._resolve_codex_pricing(SOL)
+
+    assert pricing.CODEX_MODEL_PRICING[SOL] == SOL_CARD
+    assert resolved is pricing.CODEX_MODEL_PRICING[SOL]
+    assert is_fallback is False
+    assert pricing._is_codex_fallback(SOL) is False
+    assert pricing._codex_fast_multiplier(SOL) == 2.0
+    assert "unknown model" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("speed", "expected_cost"),
+    [("standard", 0.228), ("fast", 0.456)],
+)
+def test_sol_prices_standard_cached_output_and_fast_tokens(
+    speed, expected_cost, capsys,
+):
+    pricing._unknown_codex_model_warnings.discard(SOL)
+
+    cost = pricing._calculate_codex_entry_cost(
+        SOL,
+        input_tokens=100_000,
+        cached_input_tokens=40_000,
+        output_tokens=10_000,
+        reasoning_output_tokens=2_000,
+        speed=speed,
+    )
+
+    assert cost == pytest.approx(expected_cost)
+    assert "unknown model" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("speed", "expected_cost"),
+    [("standard", 1.54), ("fast", 3.08)],
+)
+def test_sol_prices_the_above_272k_card_at_each_speed(speed, expected_cost):
+    cost = pricing._calculate_codex_entry_cost(
+        SOL,
+        input_tokens=400_000,
+        cached_input_tokens=100_000,
+        output_tokens=20_000,
+        reasoning_output_tokens=5_000,
+        speed=speed,
+    )
+
+    assert cost == pytest.approx(expected_cost)
+
+
+def test_pricing_coverage_accepts_sol_as_directly_priced():
+    gaps = pricing_check.classify_coverage(
+        [("codex", SOL, 3, 123_456)],
+        lambda _model: None,
+        pricing._is_codex_fallback,
+    )
+
+    assert gaps == []

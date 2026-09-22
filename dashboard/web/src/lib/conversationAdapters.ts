@@ -27,7 +27,13 @@ import type {
   CodexLifecycleState,
 } from '../types/conversation';
 import type { ConversationSource } from '../types/conversation';
-import type { QualifiedBrowseEnvelope, QualifiedBrowseRow, QualifiedSearchEnvelope } from './conversationTransport';
+import {
+  conversationDegradedNotice,
+  conversationDegradedReason,
+  type QualifiedBrowseEnvelope,
+  type QualifiedBrowseRow,
+  type QualifiedSearchEnvelope,
+} from './conversationTransport';
 // #463 S3 §5.4 — one vocabulary for naming a session reference, shared with the
 // card components so the collapsed row and the card body cannot drift apart.
 import {
@@ -45,6 +51,21 @@ import { landmarkOwners } from '../conversations/mergeLandmarks';
 
 export class ConversationNormalizationPending extends Error {
   constructor() { super('Conversation indexing is still finishing.'); }
+}
+
+// A 200 response can still be a truthful read failure when the conversation
+// store is unavailable. Keep that reason typed across the adapter boundary so
+// consumers can render the store's actionable state instead of mistaking the
+// route's empty envelope for a missing conversation.
+export class ConversationDegraded extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    const notice = conversationDegradedNotice(reason);
+    super(notice.message);
+    this.name = 'ConversationDegraded';
+    this.reason = notice.reason;
+  }
 }
 
 export type NativeTokens = {
@@ -1023,7 +1044,8 @@ function adaptItem(ref: ConversationRef, item: QualifiedItem): ConversationItem 
 }
 
 type QualifiedDetailEnvelope = {
-  status: 'ok' | 'normalization_pending' | 'not_found';
+  status: 'ok' | 'normalization_pending' | 'not_found' | 'degraded';
+  degraded_reason?: string;
   conversation_key: string;
   title?: string | null;
   items?: QualifiedItem[];
@@ -1039,6 +1061,8 @@ type QualifiedDetailEnvelope = {
 };
 
 export function adaptQualifiedDetail(ref: ConversationRef, body: QualifiedDetailEnvelope): ConversationDetail {
+  const degradedReason = conversationDegradedReason(body);
+  if (degradedReason != null) throw new ConversationDegraded(degradedReason);
   if (body.status === 'normalization_pending') throw new ConversationNormalizationPending();
   if (body.status !== 'ok') throw new Error('Conversation not found.');
   const items = (body.items ?? []).map((item) => adaptItem(ref, item));

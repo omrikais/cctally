@@ -1,7 +1,9 @@
 import json
 import pathlib
+import shutil
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -200,6 +202,7 @@ def _open_scoped_codex_fixture(
 
     conn = sqlite3.connect(":memory:")
     db._apply_conversations_schema(conn)
+    db._ensure_codex_session_meta_provenance_index(conn)
     conn.execute(
         "INSERT INTO cache_meta(key,value) VALUES(?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -334,6 +337,383 @@ def test_account_scope_preserves_safe_codex_project_attribution(
         ).fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_scoped_codex_anon_uses_only_physically_owned_project_paths(tmp_path):
+    """A surviving B message cannot make an A session_meta CWD B's token."""
+    from _lib_conversation_anon import plan_to_wire, scrub_text
+
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    alice_path = "/Users/alice/account-a-project"
+    bravo_path = "/Users/bravo/account-b-project"
+    try:
+        conn.execute(
+            "UPDATE cache_db.codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key='v1.shared'", (alice_path,),
+        )
+        conn.execute(
+            "INSERT INTO cache_db.codex_conversation_threads "
+            "(conversation_key,source_root_key,native_thread_id,root_thread_id,"
+            "source_path,cwd) VALUES(?,?,?,?,?,?)",
+            ("v1.bravo", "root", "bravo-thread", "bravo-thread",
+             "bravo-codex.jsonl", bravo_path),
+        )
+        for key, path, account, source in (
+            ("v1.shared", alice_path, ACCOUNT_A, "shared-codex.jsonl"),
+            ("v1.bravo", bravo_path, ACCOUNT_B, "bravo-codex.jsonl"),
+        ):
+            conn.execute(
+                "INSERT INTO main.codex_conversation_events "
+                "(source_path,line_offset,source_root_key,conversation_key,"
+                "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (source, 0, "root", key, key, key, "session_meta",
+                 json.dumps({"type": "session_meta", "payload": {"cwd": path}}),
+                 account),
+            )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+        result = claude_query.build_anon_plan_for_sources(
+            conn, home_dir="/Users/alice", sources={"codex"},
+        )
+        wire = json.dumps(plan_to_wire(result.plan))
+        assert alice_path in wire
+        assert bravo_path not in wire
+        assert "account-b-project" not in wire
+        assert alice_path not in scrub_text(alice_path, result.plan)
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_refuses_thread_path_from_other_account(tmp_path):
+    """The B leaf survives, but its thread CWD came from A's session_meta."""
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_B, scope=False)
+    alice_path = "/Users/alice/account-a-project"
+    try:
+        conn.execute(
+            "UPDATE cache_db.codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key='v1.shared'", (alice_path,),
+        )
+        conn.execute(
+            "INSERT INTO main.codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,"
+            "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("shared-codex.jsonl", 0, "root", "v1.shared", "shared-thread",
+             "shared-thread", "session_meta",
+             json.dumps({"type": "session_meta", "payload": {"cwd": alice_path}}),
+             ACCOUNT_A),
+        )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_B)
+        result = claude_query.build_anon_plan_for_sources(
+            conn, home_dir="/Users/bravo", sources={"codex"},
+        )
+        assert result.undecodable_cwd_rows == 0
+        assert result.ambiguous_cwd_rows == 1
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_refuses_root_path_owned_as_foreign_cwd(tmp_path):
+    """A's provider-root name must not re-admit B's known project path."""
+    from _lib_conversation_anon import plan_to_wire
+
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    owned_path = "/Users/alice/own-project"
+    foreign_path = "/Users/bravo/foreign-project"
+    try:
+        conn.execute(
+            "UPDATE cache_db.codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key='v1.shared'", (owned_path,),
+        )
+        conn.execute(
+            "INSERT INTO cache_db.codex_source_roots "
+            "(source_root_key,canonical_root_path,first_seen_utc,last_seen_utc) "
+            "VALUES('root',?,'2026-08-04T00:00:00Z','2026-08-04T00:00:00Z')",
+            (foreign_path,),
+        )
+        for source, root, key, path, account in (
+            ("owned.jsonl", "root", "v1.shared", owned_path, ACCOUNT_A),
+            ("foreign.jsonl", "foreign-root", "v1.foreign", foreign_path,
+             ACCOUNT_B),
+        ):
+            conn.execute(
+                "INSERT INTO main.codex_conversation_events "
+                "(source_path,line_offset,source_root_key,conversation_key,"
+                "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+                "VALUES(?,0,?,?,?,?,'session_meta',?,?)",
+                (source, root, key, key, key,
+                 json.dumps({"type": "session_meta", "payload": {"cwd": path}}),
+                 account),
+            )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+        result = claude_query.build_anon_plan_for_sources(
+            conn, home_dir="/Users/operator", sources={"codex"},
+        )
+        assert result.ambiguous_cwd_rows > 0
+        assert foreign_path not in json.dumps(plan_to_wire(result.plan))
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_refuses_failed_root_path_read(tmp_path):
+    """An unreadable root must abort the plan before any token map is served."""
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    try:
+        conn.execute(
+            "INSERT INTO cache_db.codex_source_roots "
+            "(source_root_key,canonical_root_path,first_seen_utc,last_seen_utc) "
+            "VALUES('root',CAST(x'ff' AS TEXT),"
+            "'2026-08-04T00:00:00Z','2026-08-04T00:00:00Z')"
+        )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+        with pytest.raises(sqlite3.OperationalError):
+            claude_query.build_anon_plan_for_sources(
+                conn, home_dir="/Users/operator", sources={"codex"},
+            )
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_handles_store_without_raw_threads_table():
+    """A fresh conversations store has no Codex cache table to resolve yet."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        db._apply_conversations_schema(conn)
+        assert claude_query._scoped_codex_anon_paths(conn, ACCOUNT_A) == (
+            set(), 0, 0,
+        )
+        conn.execute(
+            "INSERT INTO codex_conversation_messages "
+            "(conversation_key,source_root_key,source_path,line_offset,kind,"
+            "record_family,content_digest,content_len) "
+            "VALUES('v1.orphan','root','orphan.jsonl',1,'assistant',"
+            "'response_item','digest',0)"
+        )
+        with pytest.raises(RuntimeError, match="raw threads table missing"):
+            claude_query._scoped_codex_anon_paths(conn, ACCOUNT_A)
+    finally:
+        conn.close()
+
+
+def test_scoped_anon_preserves_caller_home_identity_scrub(tmp_path):
+    """Account scoping must not drop the caller's home token vocabulary."""
+    from _lib_conversation_anon import scrub_text
+
+    conn = _open_scoped_fixture(tmp_path, ACCOUNT_A)
+    try:
+        result = claude_query.build_anon_plan_for_sources(
+            conn, home_dir="/Users/alice", sources={"claude"},
+        )
+        scrubbed = scrub_text(
+            "note in /Users/alice/private-note outside /work/alpha", result.plan,
+        )
+        assert "/Users/alice" not in scrubbed
+        assert "~/private-note" in scrubbed
+        assert "/work/alpha" not in scrubbed
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_provenance_does_not_materialize_non_metadata_events(
+        tmp_path):
+    """The provenance read must stay bounded to session_meta rows."""
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    try:
+        conn.executemany(
+            "INSERT INTO main.codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,"
+            "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            [
+                ("noise.jsonl", offset, "root", "v1.shared", "shared",
+                 "shared", "response_item", "{}", ACCOUNT_A)
+                for offset in range(2000)
+            ] + [
+                ("shared-codex.jsonl", 2000, "root", "v1.shared", "shared",
+                 "shared", "session_meta",
+                 json.dumps({"type": "session_meta", "payload": {
+                     "cwd": "/work/cctally-dev",
+                 }}), ACCOUNT_A)
+            ],
+        )
+        conn.commit()
+        cache.scope_conversations_db_to_account(conn, ACCOUNT_A)
+
+        class _CountingCursor:
+            def __init__(self, cursor, owner):
+                self._cursor = cursor
+                self._owner = owner
+
+            def __iter__(self):
+                for row in self._cursor:
+                    self._owner.event_rows += 1
+                    yield row
+
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+
+        class _CountingConnection:
+            def __init__(self, connection):
+                self._connection = connection
+                self.event_rows = 0
+
+            def execute(self, sql, parameters=()):
+                cursor = self._connection.execute(sql, parameters)
+                if "codex_conversation_events" in sql:
+                    return _CountingCursor(cursor, self)
+                return cursor
+
+        counted = _CountingConnection(conn)
+        result = claude_query.build_anon_plan_for_sources(
+            counted, home_dir="/Users/alice", sources={"codex"},
+        )
+        assert result.ambiguous_cwd_rows == 0
+        assert counted.event_rows == 1
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_anon_provenance_has_a_partial_session_meta_index(
+        tmp_path):
+    """The physical provenance read must have an index-only session_meta plan."""
+    conn = _open_scoped_codex_fixture(tmp_path, ACCOUNT_A, scope=False)
+    try:
+        db._ensure_codex_session_meta_provenance_index(conn)
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT source_root_key,payload_json,account_key "
+            "FROM main.codex_conversation_events "
+            "WHERE record_type='session_meta'"
+        ).fetchall()
+        detail = " ".join(str(row[-1]) for row in plan)
+        assert "USING COVERING INDEX " \
+            "idx_codex_events_session_meta_provenance" in detail
+    finally:
+        conn.close()
+
+
+def test_scoped_codex_cli_export_refuses_ambiguous_path(
+        tmp_path, monkeypatch, capsysbinary):
+    """The CLI must not emit an anonymized copy over unproven CWD ownership."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    provider = tmp_path / "provider"
+    rollout = provider / "sessions" / "2026" / "08" / "04" / "modern-full.jsonl"
+    rollout.parent.mkdir(parents=True)
+    corpus = pathlib.Path(__file__).parent / "fixtures" / "codex-parity" / "v1" / "rollouts" / "modern-full.jsonl"
+    shutil.copyfile(corpus, rollout)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    cache_conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](cache_conn, rebuild=True)
+        key = cache_conn.execute(
+            "SELECT conversation_key FROM codex_conversation_threads "
+            "WHERE source_path LIKE '%/modern-full.jsonl'"
+        ).fetchone()[0]
+    finally:
+        cache_conn.close()
+    conversations = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conversations, rebuild=True)
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key=?",
+            (ACCOUNT_B,),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_events SET account_key=?",
+            (ACCOUNT_A,),
+        )
+        conversations.commit()
+    finally:
+        conversations.close()
+    cache_conn = ns["open_cache_db"]()
+    try:
+        cache_conn.execute(
+            "UPDATE codex_conversation_threads SET cwd=? "
+            "WHERE conversation_key=?",
+            ("/Users/alice/account-a-project", key),
+        )
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT INTO accounts (account_key,provider,natural_id,email,label,"
+            "plan_type,label_source,first_seen_utc,last_seen_utc) "
+            "VALUES (?,'codex',?,?,?,NULL,'auto',?,?)",
+            (ACCOUNT_B, ACCOUNT_B, "bravo@example.test", "bravo",
+             "2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"),
+        )
+        stats.commit()
+    finally:
+        stats.close()
+
+    args = SimpleNamespace(
+        transcript_action="export", session_id=key, scope="all", raw=False,
+        output=None, speed=None, account=ACCOUNT_B,
+    )
+    assert ns["cmd_transcript"](args) == 3
+    captured = capsysbinary.readouterr()
+    assert captured.out == b""
+    assert "ambiguous account provenance" in captured.err.decode("utf-8")
+
+    # The same physical path becomes provable for A once its session_meta
+    # record is account-stamped; the CLI then scrubs it from the copy.
+    conversations = ns["open_conversations_db"]()
+    try:
+        root_key = conversations.execute(
+            "SELECT source_root_key FROM codex_conversation_events "
+            "WHERE conversation_key=? LIMIT 1", (key,),
+        ).fetchone()[0]
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key=?",
+            (ACCOUNT_A,),
+        )
+        conversations.execute(
+            "INSERT INTO codex_conversation_events "
+            "(source_path,line_offset,source_root_key,conversation_key,"
+            "native_thread_id,root_thread_id,record_type,payload_json,account_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("account-a.jsonl", 0, root_key, key, "a-thread", "a-thread",
+             "session_meta", json.dumps({"type": "session_meta", "payload": {
+                 "cwd": "/Users/alice/account-a-project",
+             }}), ACCOUNT_A),
+        )
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET text=? "
+            "WHERE conversation_key=?",
+            ("A says /Users/alice/account-a-project", key),
+        )
+        conversations.commit()
+    finally:
+        conversations.close()
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT INTO accounts (account_key,provider,natural_id,email,label,"
+            "plan_type,label_source,first_seen_utc,last_seen_utc) "
+            "VALUES (?,'codex',?,?,?,NULL,'auto',?,?)",
+            (ACCOUNT_A, ACCOUNT_A, "alice@example.test", "alice",
+             "2026-08-04T00:00:00Z", "2026-08-04T00:00:00Z"),
+        )
+        stats.commit()
+    finally:
+        stats.close()
+    args.account = ACCOUNT_A
+    assert ns["cmd_transcript"](args) == 0
+    scrubbed = capsysbinary.readouterr()
+    assert b"/Users/alice/account-a-project" not in scrubbed.out
+    assert b"A says" in scrubbed.out
+
+    args.raw = True
+    assert ns["cmd_transcript"](args) == 0
+    raw = capsysbinary.readouterr()
+    assert b"/Users/alice/account-a-project" in raw.out
+    assert raw.out.startswith(b"#")
 
 
 def test_account_scope_derives_codex_project_while_rollup_is_bootstrapping(

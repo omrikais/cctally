@@ -71,7 +71,7 @@ export function ConversationsView() {
   // outline hook and (via props) the reader's useConversation.
   const liveSid = compare !== null ? null : selected;
   const { growthNonce, live } = useConversationLiveTail(liveSid);
-  const { outline, loading: outlineLoading } = useConversationOutline(liveSid, { growthNonce, live });
+  const { outline, loading: outlineLoading, error: outlineError, degraded: outlineDegraded, notFound: outlineNotFound } = useConversationOutline(liveSid, { growthNonce, live });
 
   useKeymap(CONVERSATIONS_BINDINGS);
   // #217 S4 / I-1.5 — Cmd/Ctrl+F intercept (capture-phase; the central keymap
@@ -136,7 +136,7 @@ export function ConversationsView() {
               onClick={() => dispatch({ type: 'CLOSE_CONV_OUTLINE_MOBILE' })}
             >✕</button>
           </div>
-          <OutlinePanel sessionId={conversationRef} outline={outline} />
+          <OutlinePanel sessionId={conversationRef} outline={outline} loading={outlineLoading} error={outlineError} degraded={outlineDegraded} notFound={outlineNotFound} />
         </div>
       </>
     )
@@ -186,7 +186,7 @@ export function ConversationsView() {
               the outline column (it computes width off the outline's right edge,
               which is its next sibling). */}
           <OutlineResizer />
-          <OutlinePanel sessionId={selected!} outline={outline} />
+          <OutlinePanel sessionId={selected!} outline={outline} loading={outlineLoading} error={outlineError} degraded={outlineDegraded} notFound={outlineNotFound} />
         </>
       )}
       {/* #228 S3 F1 — the tablet-band (641–1100) outline sheet, rendered when the

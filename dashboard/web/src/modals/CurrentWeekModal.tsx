@@ -15,6 +15,7 @@ import { ShareIcon } from '../components/ShareIcon';
 import {
   CODEX_STALE_CYCLE_NOTE,
   CODEX_HERO_RECONCILING_NOTE,
+  CURRENT_WEEK_HERO_TRIGGER_ID,
   codexIngestBacklogNote,
 } from '../components/HeroStrip';
 import { fmt, spendWindowLabel, type FmtCtx } from '../lib/fmt';
@@ -80,7 +81,7 @@ function formatCycleRange(entry: WeekIndexEntry, ctx: FmtCtx): string {
 // reset cell showing a dash, with nothing saying why either was short. It
 // carries real milestones, so it must render them AND state what is missing.
 export const BOUNDS_MISSING_NOTE =
-  'This week\u2019s exact start and reset were never recorded, so its range and '
+  'This cycle\u2019s exact start and reset were never recorded, so its range and '
   + 'reset time cannot be shown. The milestones below are unaffected.';
 
 export function hasNoRecordedBounds(entry: WeekIndexEntry | null): boolean {
@@ -202,12 +203,15 @@ function useMilestoneNav(
   // fetch key, so switching the chip re-fetches instead of re-showing the
   // previous account's cycle.
   accountKey: string | null = null,
+  // A decorated Claude block can be first or last among the account-owned
+  // rows for the same window. Fetch to know its actual position before nav.
+  eagerCurrentBlocks = false,
 ): MilestoneNav {
   const [weekKey, setWeekKeyRaw] = useState<string | null>(null);
   const [blockSel, setBlockSel] = useState<string | number | null>(null);
   const [wantDetail, setWantDetail] = useState(false);
   const [pendingBlockStep, setPendingBlockStep] = useState<-1 | 1 | null>(null);
-  const [detail, setDetail] = useState<WeekDetailPayload | null>(null);
+  const [fetchedDetail, setFetchedDetail] = useState<{ key: string; payload: WeekDetailPayload } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<{ status?: number; code?: string } | null>(null);
   const reqSeq = useRef(0);
@@ -244,11 +248,15 @@ function useMilestoneNav(
       // has a reason to fetch, because the disclosure lives on the detail
       // payload and the envelope's active-segment rows carry no runs.
       selectedEntry.has_observation_gap === true ||
+      eagerCurrentBlocks ||
       wantDetail
     );
   const fetchKey = shouldFetch && selectedEntry
     ? `${accountKey ?? ''}|${selectedEntry.key}|${selectedEntry.detail_stamp}`
     : null;
+  // A prior response remains in state until the new fetch settles. Never
+  // expose it as the selected cycle's facts during that interval (or on error).
+  const detail = fetchedDetail?.key === fetchKey ? fetchedDetail.payload : null;
 
   // Switching the account chip replaces the whole cycle index, so a week key
   // held from the previous account names a cycle that account never had. Drop
@@ -263,14 +271,14 @@ function useMilestoneNav(
   }, [accountKey]);
 
   const doFetch = useCallback(() => {
-    if (!selectedEntry) return;
+    if (!selectedEntry || fetchKey == null) return;
     const seq = ++reqSeq.current;
     setLoading(true);
     setError(null);
     fetchWeekDetail(source, selectedEntry, accountKey)
       .then((payload) => {
         if (seq !== reqSeq.current) return; // only the latest selection resolves
-        setDetail(payload);
+        setFetchedDetail({ key: fetchKey, payload });
         setLoading(false);
       })
       .catch((e: { status?: number; code?: string }) => {
@@ -278,13 +286,13 @@ function useMilestoneNav(
         setError({ status: e?.status, code: e?.code });
         setLoading(false);
       });
-  }, [source, selectedEntry, accountKey]);
+  }, [source, selectedEntry, accountKey, fetchKey]);
 
   useEffect(() => {
     if (fetchKey == null) {
       // Current week rendered purely from the envelope — clear any prior fetch.
       reqSeq.current++;
-      setDetail(null);
+      setFetchedDetail(null);
       setLoading(false);
       setError(null);
       return;
@@ -358,6 +366,8 @@ interface BlockNavWindow {
   block_start_at?: string | null;
   five_hour_resets_at?: string | null;
   crossed_seven_day_reset?: boolean;
+  account_key?: string;
+  account_label?: string;
 }
 
 function BlockNavHeaderFrame({
@@ -395,6 +405,9 @@ function BlockNavHeaderFrame({
         {crossed ? '⚡ ' : ''}Block {selectedIndex + 1} of {blockCount}
       </span>
       <span className="mcw-ms-sub">{startShort} → {endShort}</span>
+      {block?.account_key != null && (
+        <span className="mcw-ms-sub">{block.account_label ?? block.account_key}</span>
+      )}
       <button
         type="button"
         className={`m-pill ${accentClass} mcw-blocknav-btn`}
@@ -464,6 +477,33 @@ function CurrentBlockNavHeader({
   );
 }
 
+function PendingAccountBlockNavHeader({
+  block, ctx, singleId, accentClass,
+}: {
+  block: BlockNavWindow | null;
+  ctx: FmtCtx;
+  singleId: (v: string) => string | undefined;
+  accentClass: string;
+}) {
+  // The live account's position among same-window rows is unknowable until
+  // detail arrives. Keep the known live block visible without claiming it is
+  // the last of N or enabling a direction that may not exist.
+  return (
+    <div className="mcw-mshead mcw-blocknav" id={singleId('mcw-blocknav')}>
+      <button type="button" className={`m-pill ${accentClass} mcw-blocknav-btn`}
+        aria-label="Older block" disabled>‹</button>
+      <span className={`m-pill ${accentClass}`}>Current block</span>
+      <span className="mcw-ms-sub">
+        {fmt.startedShort(block?.block_start_at, ctx, { noSuffix: true })}
+        {' → '}
+        {fmt.startedShort(block?.five_hour_resets_at, ctx, { noSuffix: true })}
+      </span>
+      <button type="button" className={`m-pill ${accentClass} mcw-blocknav-btn`}
+        aria-label="Newer block" disabled>›</button>
+    </div>
+  );
+}
+
 function BlockDetailLoading({ id }: { id?: string }) {
   return (
     <p className="empty-state" id={id} role="status">
@@ -507,7 +547,12 @@ function CurrentWeekShell({
 }) {
   if (embedded) return <>{children}</>;
   return (
-    <Modal title={title} accentClass={accentClass} headerExtras={headerExtras}>
+    <Modal
+      title={title}
+      accentClass={accentClass}
+      headerExtras={headerExtras}
+      triggerId={CURRENT_WEEK_HERO_TRIGGER_ID}
+    >
       {children}
     </Modal>
   );
@@ -1182,7 +1227,8 @@ function ClaudeCurrentWeekModal({
   const cw = env?.current_week ?? null;
   const header = env?.header ?? null;
   const index: WeekIndexEntry[] = Array.isArray(cw?.week_index) ? cw!.week_index! : [];
-  const nav = useMilestoneNav('claude', index);
+  const activeAccountKey = cw?.five_hour_block?.account_key;
+  const nav = useMilestoneNav('claude', index, null, activeAccountKey != null);
   const {
     weekKey, setWeekKey, selectedEntry, detail, loading, error, vanished,
     blockSel, setBlockSel, requestCurrentDetail, wantDetail, pendingBlockStep,
@@ -1199,6 +1245,15 @@ function ClaudeCurrentWeekModal({
     : [];
   const fhStream = buildFhStream(fhMs, fhCredits);
   const activeWindowKey = cw?.five_hour_block?.five_hour_window_key ?? null;
+
+  // Legacy single-account payloads have no account field. A decorated
+  // payload's account must match before its block can borrow the live stream.
+  const blockIdentity = (b: WeekDetailBlock): string | number | null => {
+    if (b.five_hour_window_key == null) return null;
+    return b.account_key == null
+      ? b.five_hour_window_key
+      : JSON.stringify([b.account_key, b.five_hour_window_key]);
+  };
 
   // Render from the fetched payload for a historic week, a multi-segment
   // current week, or once a block-step asked for the current week's payload.
@@ -1220,8 +1275,8 @@ function ClaudeCurrentWeekModal({
     : [];
   const weeklyRows: WeeklyRow[] = flat
     ? flat.rows
-    : envMs.map((m) => ({ kind: 'ms', m, key: `ms-${m.percent}` }));
-  const weeklyCount = flat ? flat.count : envMs.length;
+    : isHistoric ? [] : envMs.map((m) => ({ kind: 'ms', m, key: `ms-${m.percent}` }));
+  const weeklyCount = flat ? flat.count : isHistoric ? 0 : envMs.length;
 
   // Hero numbers: current → envelope; historic → last segment's last
   // milestone. The override is HISTORIC-only (spec §4): the current week's
@@ -1234,23 +1289,27 @@ function ClaudeCurrentWeekModal({
   let spent: number | null | undefined = cw?.spent_usd;
   let dpp: number | null | undefined = cw?.dollar_per_pct;
   let resetCell = cw?.reset_at_utc;
-  if (isHistoric && detail) {
-    const lastSeg = detail.segments[detail.segments.length - 1];
+  if (isHistoric) {
+    // The navigator moves before its detail arrives. Until that payload is
+    // present (including after a failed request), the CURRENT envelope has no
+    // authority over this historic cycle's percentage, spend, or reset.
+    const lastSeg = detail?.segments[detail.segments.length - 1];
     const lastMs = (lastSeg?.milestones as Milestone[] | undefined)?.slice(-1)[0];
-    heroPct = lastMs?.percent ?? 0;
-    spent = lastMs?.cumulative_usd ?? null;
-    dpp = spent != null && (heroPct ?? 0) > 0 ? spent / (heroPct as number) : null;
-    resetCell = detail.end_at_utc;
+    heroPct = detail ? lastMs?.percent ?? 0 : null;
+    spent = detail ? lastMs?.cumulative_usd ?? null : null;
+    dpp = detail && spent != null && (heroPct ?? 0) > 0 ? spent / (heroPct as number) : null;
+    resetCell = detail?.end_at_utc ?? null;
   }
   const pct = clamp0_100(heroPct);
   const [bigInt, bigUnit] = splitBigNum(heroPct);
+  const hasSelectedCycleFacts = !isHistoric || detail != null;
   const weekPillText = isHistoric && selectedEntry
     ? formatCycleRange(selectedEntry, ctx)
     : (cw ? formatWeekWindow(header?.week_label, cw.reset_at_utc, ctx) : '—');
   const ticks = dedupeTicks(
     weeklyRows.filter((r): r is Extract<WeeklyRow, { kind: 'ms' }> => r.kind === 'ms').map((r) => r.m),
   );
-  const subText = useDetail ? null : msSub(envMs);
+  const subText = useDetail || isHistoric ? null : msSub(envMs);
   const singleId = (value: string) => embedded ? undefined : value;
 
   // #556 S4 F8 - when this presenter is embedded under a provider heading in
@@ -1259,14 +1318,19 @@ function ClaudeCurrentWeekModal({
   // is a worse hierarchy than no heading at all.
   const SecTag = embedded ? 'h4' : 'h3';
 
-  // Block list: current-default → the envelope active block (rendered as the
-  // live fhStream, no nav); historic / fetched → the payload's blocks.
-  const payloadBlocks: WeekDetailBlock[] = useDetail && detail ? detail.blocks : [];
+  // Block list: undecorated current-default → the envelope active block;
+  // decorated current and historic weeks → the fetched account-owned blocks.
+  // Fetching decorated blocks must not replace the envelope's live weekly
+  // rows with the merged historic weekly detail on a single-segment cycle.
+  const blocksReady = detail != null && (useDetail || activeAccountKey != null);
+  const payloadBlocks: WeekDetailBlock[] = blocksReady && detail ? detail.blocks : [];
   const hasPayloadBlocks = payloadBlocks.length > 0;
   const defaultBlockIndex = (() => {
     if (!hasPayloadBlocks) return -1;
     if (!isHistoric && activeWindowKey != null) {
-      const i = payloadBlocks.findIndex((b) => b.five_hour_window_key === activeWindowKey);
+      const i = payloadBlocks.findIndex((b) =>
+        b.five_hour_window_key === activeWindowKey
+        && b.account_key === activeAccountKey);
       if (i >= 0) return i;
     }
     return payloadBlocks.length - 1; // historic default: last block
@@ -1274,39 +1338,40 @@ function ClaudeCurrentWeekModal({
   const selectedBlockIndex = (() => {
     if (!hasPayloadBlocks) return -1;
     if (blockSel != null) {
-      const i = payloadBlocks.findIndex((b) => b.five_hour_window_key === blockSel);
+      const i = payloadBlocks.findIndex((b) => blockIdentity(b) === blockSel);
       if (i >= 0) return i;
     }
     return defaultBlockIndex;
   })();
   useEffect(() => {
-    if (pendingBlockStep == null || !useDetail) return;
+    if (pendingBlockStep == null || !blocksReady) return;
     if (hasPayloadBlocks) {
       const next = defaultBlockIndex + pendingBlockStep;
       if (next >= 0 && next < payloadBlocks.length) {
-        setBlockSel(payloadBlocks[next].five_hour_window_key ?? null);
+        setBlockSel(blockIdentity(payloadBlocks[next]));
       }
     }
     clearPendingBlockStep();
   }, [
     clearPendingBlockStep, defaultBlockIndex, hasPayloadBlocks,
-    payloadBlocks, pendingBlockStep, setBlockSel, useDetail,
+    payloadBlocks, pendingBlockStep, setBlockSel, blocksReady,
   ]);
   const selectedBlock = selectedBlockIndex >= 0 ? payloadBlocks[selectedBlockIndex] : null;
   const stepBlock = (dir: -1 | 1) => {
     // On the current week before the payload is fetched, the first block-step
     // fetches the full week payload; the effect then re-renders with the nav.
-    if (!isHistoric && !useDetail) { requestCurrentDetail(dir); return; }
+    if (!isHistoric && !blocksReady) { requestCurrentDetail(dir); return; }
     if (!hasPayloadBlocks) return;
     const next = selectedBlockIndex + dir;
     if (next < 0 || next >= payloadBlocks.length) return;
-    setBlockSel(payloadBlocks[next].five_hour_window_key ?? null);
+    setBlockSel(blockIdentity(payloadBlocks[next]));
   };
 
   // The selected block's stream: live overlay from the envelope when it IS the
   // active block, otherwise from the fetched block's rows.
   const selectedIsActive = !isHistoric && selectedBlock != null
-    && selectedBlock.five_hour_window_key === activeWindowKey;
+    && selectedBlock.five_hour_window_key === activeWindowKey
+    && selectedBlock.account_key === activeAccountKey;
   const selectedBlockStream = selectedBlock
     ? (selectedIsActive
       ? fhStream
@@ -1314,15 +1379,16 @@ function ClaudeCurrentWeekModal({
         (selectedBlock.milestones as FiveHourMilestone[]) ?? [],
         selectedBlock.credits ?? [],
       ))
-    : fhStream;
+    : isHistoric ? [] : fhStream;
 
-  // Show the full navigator from compact index/live-block facts on the current
-  // default; fetching detail remains lazy until the first step.
+  // Show the full navigator from compact facts only when the account is
+  // unambiguous; decorated current weeks fetch to learn the real row order.
   const showBlockNav = hasPayloadBlocks;
-  const currentBlockCount = !isHistoric && !useDetail
+  const currentBlockCount = !isHistoric && !blocksReady
     ? (selectedEntry?.block_count ?? 0)
     : 0;
   const currentHasBlocks = currentBlockCount > 0;
+  const waitingForAccountBlockOrder = currentHasBlocks && activeAccountKey != null;
   const currentBlockPreview: BlockNavWindow | null = cw?.five_hour_block
     ? {
       block_start_at: cw.five_hour_block.block_start_at,
@@ -1356,7 +1422,7 @@ function ClaudeCurrentWeekModal({
 
   if (vanished) {
     return (
-      <CurrentWeekShell embedded={embedded} title="Week — per-percent milestones" accentClass="accent-green" headerExtras={headerExtras}>
+      <CurrentWeekShell embedded={embedded} title="Cycle — per-percent milestones" accentClass="accent-green" headerExtras={headerExtras}>
         <VanishedState onBack={() => setWeekKey(null)} />
       </CurrentWeekShell>
     );
@@ -1365,7 +1431,7 @@ function ClaudeCurrentWeekModal({
   return (
     <CurrentWeekShell
       embedded={embedded}
-      title={isHistoric ? 'Week — per-percent milestones' : 'Current Week — per-percent milestones'}
+      title={isHistoric ? 'Cycle — per-percent milestones' : 'Current Cycle — per-percent milestones'}
       accentClass="accent-green"
       headerExtras={headerExtras}
     >
@@ -1378,6 +1444,9 @@ function ClaudeCurrentWeekModal({
           </div>
         )}
 
+        {/* The index supplies the historic date, but not its figures. An
+            outstanding/failed detail request cannot mean 0% or 0 crossed. */}
+        {hasSelectedCycleFacts && <>
         <div className="mcw-herobar">
           <div className="mcw-bignum" id={singleId('mcw-bignum')}>
             <span className="int">{bigInt}</span>
@@ -1448,16 +1517,17 @@ function ClaudeCurrentWeekModal({
             ))}
           </ul>
         )}
-        {loading ? (
+        </>}
+        {(loading || (isHistoric && detail == null && !error)) ? (
           <p className="empty-state">Loading…</p>
         ) : error ? (
           <p className="empty-state" id={singleId('mcw-error')}>
-            Couldn’t load this week.{' '}
+            Couldn’t load this cycle.{' '}
             <button type="button" className="m-pill accent-green" onClick={() => nav.retry()}>Retry</button>
           </p>
         ) : weeklyCount === 0 ? (
           <p className="empty-state" id={singleId('mcw-empty')}>
-            {isHistoric ? 'No milestones recorded this week' : 'No milestones yet — earliest crosses at 1 %.'}
+            {isHistoric ? 'No milestones recorded this cycle' : 'No milestones yet — earliest crosses at 1 %.'}
           </p>
         ) : (
           <table className="m-histable mcw-table" id={singleId('mcw-table')}>
@@ -1526,7 +1596,8 @@ function ClaudeCurrentWeekModal({
             cross-reset straddler) never unmounts the navigator — and equally
             for the current-default navigator (`currentHasBlocks`) or a
             non-empty live stream; only the TABLE below varies (spec §4). */}
-        {!error && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
+        {(!error || (!isHistoric && activeAccountKey != null))
+          && (showBlockNav || currentHasBlocks || selectedBlockStream.length > 0) && (
           <>
             <SecTag className="m-sec sec-ms sec-5h">
               <svg className="icon" aria-hidden="true">
@@ -1539,6 +1610,13 @@ function ClaudeCurrentWeekModal({
                 blocks={payloadBlocks}
                 selectedIndex={selectedBlockIndex}
                 onStep={stepBlock}
+                ctx={ctx}
+                singleId={singleId}
+                accentClass="accent-purple"
+              />
+            ) : waitingForAccountBlockOrder ? (
+              <PendingAccountBlockNavHeader
+                block={currentBlockPreview}
                 ctx={ctx}
                 singleId={singleId}
                 accentClass="accent-purple"
@@ -1559,7 +1637,7 @@ function ClaudeCurrentWeekModal({
                 </span>
               </div>
             )}
-            {loading ? (
+            {loading && (isHistoric || activeAccountKey == null) ? (
               <BlockDetailLoading id={singleId('mcw-5h-loading')} />
             ) : selectedBlockStream.length === 0 ? (
               <p className="empty-state" id={singleId('mcw-5h-empty')}>
@@ -1743,6 +1821,7 @@ function AllCurrentWeekModal({
       title="Current Usage — provider cycles"
       accentClass="accent-blue"
       wide
+      triggerId={CURRENT_WEEK_HERO_TRIGGER_ID}
       headerExtras={
         <ShareIcon
           panel="current-week"

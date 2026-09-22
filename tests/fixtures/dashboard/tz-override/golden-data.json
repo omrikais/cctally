@@ -32,6 +32,7 @@
         "anchor": "recorded",
         "cost_usd": 41.5,
         "end_at": "2026-04-20T15:00:00+00:00",
+        "facts_source": "retained",
         "is_active": true,
         "label": "10:00 Apr 20 UTC",
         "models": [
@@ -2327,6 +2328,7 @@
               "anchor": "recorded",
               "cost_usd": 41.5,
               "end_at": "2026-04-20T15:00:00+00:00",
+              "facts_source": "retained",
               "is_active": true,
               "key": "block:mXsdfyAdCZ7_4NYwHnypXegB7IFbU67SlXBh3srgFFU",
               "label": "10:00 Apr 20 UTC",

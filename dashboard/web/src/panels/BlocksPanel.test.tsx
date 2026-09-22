@@ -258,6 +258,69 @@ describe('BlocksPanel source-bound detail routing (#319 Task 1)', () => {
   });
 });
 
+// #798 — the row must identify the same retained-facts decision that supplied
+// its displayed totals. This is deliberately independent of `is_active`: the
+// retained fixture is active by the wall clock even though its block is closed.
+describe('#798 — Blocks row facts provenance', () => {
+  it('marks retained active totals while leaving computed rows unmarked', () => {
+    const env = baseEnvelope();
+    const retainedModel = {
+      model: 'claude-opus-4-1', display: 'opus-4-1', chip: 'opus' as const,
+      cost_usd: 27.5, cost_pct: (27.5 / 41.5) * 100,
+    };
+    env.blocks = {
+      rows: [
+        Object.assign(blockRow({
+          start_at: '2026-07-01T10:00:00Z',
+          end_at: '2026-07-01T15:00:00Z',
+          label: 'Retained active', is_active: true, cost_usd: 41.5,
+          models: [retainedModel],
+        }), { facts_source: 'retained' as const }),
+        Object.assign(blockRow({
+          start_at: '2026-07-01T05:00:00Z',
+          end_at: '2026-07-01T10:00:00Z',
+          label: 'Computed', is_active: false, cost_usd: 18.6,
+        }), { facts_source: 'computed' as const }),
+      ],
+      total_cost_usd: 60.1,
+    };
+    updateSnapshot(env);
+
+    const { container } = render(<BlocksPanel />);
+    const rows = [...container.querySelectorAll('.blocks-row')];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent('$41.50');
+    expect(rows[0]).toHaveTextContent('opus-4-1');
+    expect(rows[0].querySelector('[data-testid="block-facts-chip"]'))
+      .toHaveTextContent('Retained');
+    expect(rows[0]).toHaveAccessibleName(/retained totals from block close/i);
+    expect(rows[1].querySelector('[data-testid="block-facts-chip"]')).toBeNull();
+  });
+
+  it('carries the Claude cue into All rows without labelling Codex rows', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.claude.data!.quota.blocks = [
+      {
+        key: 'block:claude-retained', source: 'claude',
+        start_at: '2026-04-24T08:00:00Z', end_at: '2026-04-24T13:00:00Z',
+        anchor: 'recorded', is_active: true, cost_usd: 41.5, models: [],
+        label: '08:00 Apr 24 UTC', facts_source: 'retained' as const,
+      },
+    ];
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' });
+
+    const { container } = render(<BlocksPanel />);
+    const claudeRow = container.querySelector('.source-chip--claude')!
+      .closest('.blocks-row')!;
+    const codexRow = container.querySelector('.source-chip--codex')!
+      .closest('.blocks-row')!;
+    expect(claudeRow.querySelector('[data-testid="block-facts-chip"]'))
+      .toHaveTextContent('Retained');
+    expect(codexRow.querySelector('[data-testid="block-facts-chip"]')).toBeNull();
+  });
+});
+
 // #556 S2 §6.4 — the footer keeps its sum and says what the sum is made of.
 describe('#556 S2 — the All blocks footer', () => {
   function allBlocksEnvelope(): Envelope {

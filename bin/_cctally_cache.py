@@ -136,6 +136,9 @@ import _lib_quota
 # #496 S5b §4: the journal-to-cache coverage certificate kernel. Stdlib-only,
 # so it is circular-safe for the same reason.
 import _lib_cache_coverage
+# #845 §4.1: the decode helper is a stdlib-only leaf that imports nothing from
+# this package, so binding it here is circular-safe for the same reason.
+import _lib_codex_metadata
 
 
 # Module-level back-ref shims for the three out-of-scope JSONL/project
@@ -2766,18 +2769,45 @@ def _recompute_codex_rollups(
         models = sorted({r.model for r in rows if r.model})
         models_json = json.dumps(models) if models else None
         source_root_key = rows[0].source_root_key
+        # #845 §4.7. The two columns are read as BLOBs and decoded field by
+        # field, so one undecodable byte no longer raises here and no longer
+        # fails the whole recompute. The table name stays UNQUALIFIED, because
+        # this writer must honor account scoping: under
+        # `scope_conversations_db_to_account` it sees the empty TEMP view on
+        # purpose.
         thread = conn.execute(
-            "SELECT cwd, git_json, parent_thread_id, source_root_key "
+            "SELECT CAST(cwd AS BLOB) AS cwd_blob, "
+            "CAST(git_json AS BLOB) AS git_json_blob, parent_thread_id, "
+            "source_root_key "
             "FROM codex_conversation_threads WHERE conversation_key = ?",
             (conversation_key,),
         ).fetchone()
         cwd = git_json = parent_thread_id = None
+        thread_malformed = False
         if thread is not None:
-            cwd, git_json, parent_thread_id, thread_root = thread
+            cwd_blob, git_json_blob, parent_thread_id, thread_root = thread
+            decoded = _lib_codex_metadata.decode_codex_project_metadata(
+                cwd_blob, git_json_blob)
+            cwd, git_json = decoded.cwd, decoded.git_json
+            # The DIRECT-ONLY predicate: this writer resolves the thread's own
+            # fields through `_codex_conversation_project_attribution`, which
+            # stops at a usable `cwd`, so a valid `cwd` beside an undecodable
+            # `git_json` is still attributed.
+            thread_malformed = _lib_codex_metadata.codex_metadata_is_malformed(
+                decoded, None)
             if thread_root:
                 source_root_key = thread_root
-        project_key, project_label = _codex_conversation_project_attribution(
-            source_root_key, cwd, git_json)
+        if thread_malformed:
+            # `(unassigned)` is a real answer for a thread with no metadata.
+            # Persisting it for a thread whose metadata could not be READ would
+            # stamp a wrong answer that every later read prefers, which is the
+            # failure class `docs/codex-gotchas.md` records for the materialized
+            # `"(unassigned)"`. NULL is the absence every reader already
+            # handles.
+            project_key = project_label = None
+        else:
+            project_key, project_label = _codex_conversation_project_attribution(
+                source_root_key, cwd, git_json)
         conn.execute(
             "INSERT INTO codex_conversation_rollups "
             "(conversation_key, source_root_key, parent_thread_id, item_count, "
@@ -11012,23 +11042,42 @@ def scope_conversations_db_to_account(
     }
     safe_project_attribution: dict[str, tuple[str | None, str | None]] = {}
     for conversation_key in codex_keys:
+        # #845 §4.7. The thread is re-tested EVEN WHEN a rollup is persisted:
+        # a rollup materialized before the thread was corrupted carries a
+        # pre-corruption attribution, and preferring it would keep publishing
+        # an answer the store can no longer support. The raw table is named
+        # explicitly because the unqualified name is an empty TEMP view here.
+        thread = conn.execute(
+            "SELECT source_root_key, CAST(cwd AS BLOB) AS cwd_blob, "
+            "CAST(git_json AS BLOB) AS git_json_blob "
+            "FROM cache_db.codex_conversation_threads WHERE conversation_key=?",
+            (conversation_key,),
+        ).fetchone()
+        decoded = None
+        thread_malformed = False
+        if thread is not None:
+            decoded = _lib_codex_metadata.decode_codex_project_metadata(
+                thread[1], thread[2])
+            thread_malformed = _lib_codex_metadata.codex_metadata_is_malformed(
+                decoded, None)
         persisted = conn.execute(
             "SELECT project_key,project_label "
             "FROM main.codex_conversation_rollups WHERE conversation_key=?",
             (conversation_key,),
         ).fetchone()
         if persisted is not None:
-            safe_project_attribution[conversation_key] = persisted
-            continue
-        thread = conn.execute(
-            "SELECT source_root_key,cwd,git_json "
-            "FROM cache_db.codex_conversation_threads WHERE conversation_key=?",
-            (conversation_key,),
-        ).fetchone()
-        if thread is not None:
             safe_project_attribution[conversation_key] = (
-                _codex_conversation_project_attribution(*thread)
+                (None, None) if thread_malformed else persisted
             )
+            continue
+        if thread is not None:
+            if thread_malformed:
+                safe_project_attribution[conversation_key] = (None, None)
+            else:
+                safe_project_attribution[conversation_key] = (
+                    _codex_conversation_project_attribution(
+                        thread[0], decoded.cwd, decoded.git_json)
+                )
     _recompute_codex_rollups(
         conn, codex_keys, advance_render_revision=False,
     )

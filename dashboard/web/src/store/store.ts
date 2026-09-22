@@ -478,6 +478,17 @@ export interface UIState {
   // opened by '/' over an open reader, closed on Esc / its ✕ / a genuine
   // session switch. Never persists.
   convFindOpen: boolean;
+  // #850 §4.9 — the last anonymized-response decision this page observed, PER
+  // CONVERSATION, keyed by `conversationRefKey` and holding the M5 viewer
+  // sentence. Independent per-conversation state: a response for conversation A
+  // changes A's entry and nothing else, however late it arrives, so it can
+  // neither refuse nor un-refuse B. No selection change clears it and no
+  // reducer branch enumerates it, so a record's visibility depends only on
+  // which conversation is selected, never on the branch that selected it. It
+  // is DISCLOSURE only — the fail-closed guarantee is the per-action request,
+  // which never trusts a record. Not persisted: a reload starts without
+  // records, as it starts without a selection.
+  convAnonRefusals: Readonly<Record<string, string>>;
   // Browse-list filters (filters spec §4). `conversationFilters` is the active
   // filter set threaded into the /api/conversations AND /api/conversation/search
   // query strings (#217 S4 / I-2.5 — filters now apply to BOTH browse and
@@ -864,6 +875,7 @@ function loadInitial(): UIState {
     convPinnedAnchorKey: null,
     // #217 S6 F4 — no conversation selected at init → no bookmarks hydrated.
     convBookmarks: {},
+    convAnonRefusals: {},
     convFindOpen: false,
     conversationFilters: railPrefs.filters,
     convFiltersOpen: false,
@@ -943,6 +955,16 @@ export function getState(): UIState { return state; }
 // (opt-out, default true): an older server / a first tick before bootstrap
 // reads as markers-on. MessageItem, OutlinePanel, and deriveOutline all read
 // THIS so none of them re-invents the defaulting.
+// #850 §4.9 — the readers' selector: the record for the conversation that is
+// currently selected, if any. Every anonymized action shows it as its
+// disclosure and stays activatable, so an open conversation recovers in place
+// after the rebuild remedy without navigation.
+export function selectConvAnonRefusal(s: UIState = state): string | null {
+  const ref = s.selectedConversationRef;
+  if (!ref) return null;
+  return s.convAnonRefusals[conversationRefKey(ref)] ?? null;
+}
+
 export function selectMarkersEnabled(s: UIState = state): boolean {
   return s.dashboardPrefs.cache_failure_markers !== false;
 }
@@ -1275,6 +1297,12 @@ export type Action =
   // default in-reader path), so existing callers are unchanged.
   | { type: 'TOGGLE_BOOKMARK'; uuid: string; conversationRef?: ConversationRef; sessionId?: string }
   | { type: 'SET_BOOKMARK_NOTE'; uuid: string; note: string; conversationRef?: ConversationRef; sessionId?: string }
+  // #850 §4.9 — record the server's last anonymized decision for ONE
+  // conversation: `refused: true` with the M5 sentence on a 409, `refused:
+  // false` on a 2xx, which deletes the entry. The ref is captured when the
+  // request is ISSUED, not when it resolves, so a late response lands on the
+  // conversation it was made for.
+  | { type: 'SET_CONV_ANON_REFUSAL'; conversationRef: ConversationRef; refused: boolean; message?: string }
   // #177 S6 — the in-conversation find bar open flag.
   | { type: 'OPEN_CONV_FIND' }
   | { type: 'CLOSE_CONV_FIND' }
@@ -1881,6 +1909,24 @@ export function dispatch(action: Action): void {
       if (state.convPinnedUuid === action.uuid
           && state.convPinnedAnchorKey === anchorKey) break;
       state = { ...state, convPinnedUuid: action.uuid, convPinnedAnchorKey: anchorKey };
+      break;
+    }
+    case 'SET_CONV_ANON_REFUSAL': {
+      const key = conversationRefKey(action.conversationRef);
+      const current = state.convAnonRefusals[key];
+      if (action.refused) {
+        const message = action.message ?? '';
+        if (current === message) break;
+        state = {
+          ...state,
+          convAnonRefusals: { ...state.convAnonRefusals, [key]: message },
+        };
+        break;
+      }
+      if (current === undefined) break;
+      const next = { ...state.convAnonRefusals };
+      delete next[key];
+      state = { ...state, convAnonRefusals: next };
       break;
     }
     case 'CLEAR_CONV_PIN':

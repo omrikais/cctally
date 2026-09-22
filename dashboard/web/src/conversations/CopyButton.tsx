@@ -1,8 +1,15 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useRef, useState, useSyncExternalStore } from 'react';
 import { useCopy } from './useCopy';
 import { CopyIcon, CheckIcon } from './ConvIcons';
 import { useAnonMode, useConversationRef } from './TranscriptContext';
-import { fetchAnonPlan, scrubText } from './anonScrub';
+import {
+  ANON_UNAVAILABLE_STATUS,
+  AnonRequestError,
+  anonUnavailableMessage,
+  fetchAnonPlan,
+  scrubText,
+} from './anonScrub';
+import { dispatch, selectConvAnonRefusal, subscribeStore } from '../store/store';
 import { conversationRefKey, sameConversationRef } from '../types/conversation';
 
 // Compact, icon-only copy button (G2 §5b). The clipboard glyph swaps to a
@@ -25,6 +32,10 @@ export function CopyButton({ text, className }: { text: string; className?: stri
   const mountedRef = useRef(true);
   const conversationRefRef = useRef(conversationRef);
   conversationRefRef.current = conversationRef;
+  // #850 §4.9 — the last server decision this page observed for the SELECTED
+  // conversation, as disclosure only. The fail-closed guarantee is the request
+  // below, which asks the server every time and never trusts this record.
+  const refusal = useSyncExternalStore(subscribeStore, () => selectConvAnonRefusal());
 
   const onClick = useCallback(
     (e: React.MouseEvent) => {
@@ -39,12 +50,30 @@ export function CopyButton({ text, className }: { text: string; className?: stri
       void (async () => {
         try {
           const plan = await fetchAnonPlan(forSession);
+          // The record is keyed by the ref captured at click time, so a late
+          // 2xx clears THAT conversation's record and no other's.
+          dispatch({
+            type: 'SET_CONV_ANON_REFUSAL',
+            conversationRef: forSession,
+            refused: false,
+          });
           // Session switched mid-flight → discard the stale plan, never write.
           if (!sameConversationRef(conversationRefRef.current, forSession)) return;
           const scrubbed = scrubText(text, plan); // may throw on a bad pattern
           copy(scrubbed);
-        } catch {
-          // Fail-closed: clipboard untouched, surface a visible error state.
+        } catch (err) {
+          // Fail-closed: clipboard untouched. A typed 409 arms this
+          // conversation's refusal record, which is the M5 disclosure; any
+          // other failure keeps today's error state.
+          if (err instanceof AnonRequestError && err.status === ANON_UNAVAILABLE_STATUS) {
+            dispatch({
+              type: 'SET_CONV_ANON_REFUSAL',
+              conversationRef: forSession,
+              refused: true,
+              message: anonUnavailableMessage(err),
+            });
+            return;
+          }
           if (mountedRef.current) setErrored(true);
         }
       })();
@@ -60,26 +89,34 @@ export function CopyButton({ text, className }: { text: string; className?: stri
   }, []);
 
   const anonActive = anonMode && !!conversationRef;
-  const label = errored
-    ? 'Copy failed'
-    : copied
-      ? anonActive
-        ? 'Copied (anonymized)'
-        : 'Copied'
-      : anonActive
-        ? 'Copy (anonymized)'
-        : 'Copy';
+  // The refusal is disclosure for the ANONYMIZED action only; a raw copy is
+  // unaffected and keeps its own label. The button stays activatable, so an
+  // activation re-requests and a 2xx clears the record in place.
+  const anonRefused = anonActive ? refusal : null;
+  const label = anonRefused
+    ? anonRefused
+    : errored
+      ? 'Copy failed'
+      : copied
+        ? anonActive
+          ? 'Copied (anonymized)'
+          : 'Copied'
+        : anonActive
+          ? 'Copy (anonymized)'
+          : 'Copy';
 
   return (
     <button
       ref={setRef}
       type="button"
-      className={`conv-copy-btn ${anonActive ? 'conv-copy-btn-anon' : ''} ${errored ? 'conv-copy-btn-error' : ''} ${className ?? ''}`.trim()}
+      className={`conv-copy-btn ${anonActive ? 'conv-copy-btn-anon' : ''} ${errored ? 'conv-copy-btn-error' : ''} ${anonRefused ? 'conv-copy-btn-anon-unavailable' : ''} ${className ?? ''}`.trim()}
       aria-label={label}
+      title={anonRefused ?? undefined}
       data-anon={anonActive ? '1' : undefined}
+      data-anon-unavailable={anonRefused ? '1' : undefined}
       onClick={onClick}
     >
-      {errored ? '✕' : copied ? <CheckIcon /> : <CopyIcon />}
+      {anonRefused || errored ? '✕' : copied ? <CheckIcon /> : <CopyIcon />}
     </button>
   );
 }

@@ -801,7 +801,7 @@ function SearchResults({ data, needle, kind, ctx, selectedId, pickAnchor, partia
         <div className="conv-rail-search-filters-degraded">Some filters unavailable while indexing.</div>
       )}
       {partialNote && <div className="conv-rail-search-filters-degraded">{partialNote}</div>}
-      {degraded
+      {degraded && hits.length === 0
         ? <DegradedNotice notice={degraded} />
         : error
         ? <div className="conv-rail-empty" role="alert">{error}</div>
@@ -837,11 +837,12 @@ function SearchResults({ data, needle, kind, ctx, selectedId, pickAnchor, partia
             )
             : (
               <>
+                {degraded && <DegradedNotice notice={degraded} />}
                 <div className="conv-rail-count" aria-live="polite">{countText}</div>
                 {hits.map((h, i) => (
                   <SearchRow key={`${conversationRefKey(searchHitConversationRef(h))}-${h.uuid}-${i}`} hit={h} ctx={ctx} kind={kind} selectedId={selectedId} pickAnchor={pickAnchor} />
                 ))}
-                {hits.length < total && (
+                {!degraded && hits.length < total && (
                   <button
                     type="button"
                     className="conv-rail-more"

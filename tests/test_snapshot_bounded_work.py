@@ -967,7 +967,10 @@ def test_dirty_path_metadata_query_uses_indexed_file_identities(source_env):
     _ns, cache, _stats, _module = source_env
     import _cctally_source_analytics as analytics
 
-    sql = analytics._inherited_codex_path_metadata_sql(2)
+    # #845 §4.3 renamed this statement: the quadratic files-to-threads join is
+    # retired and the alias leg now reads the file table alone, still bounded
+    # to the dirty identities a delta-resumed read asked for.
+    sql = analytics._codex_alias_inventory_sql(2)
     plan = " ".join(str(row[3]) for row in cache.execute(
         "EXPLAIN QUERY PLAN " + sql,
         ("root-a", "/rollouts/a.jsonl", "root-b", "/rollouts/b.jsonl"),

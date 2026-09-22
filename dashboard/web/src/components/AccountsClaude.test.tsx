@@ -43,9 +43,16 @@ function decoratedClaudeEnv(accounts: AccountCard[]): Envelope {
 
 function decoratedClaudeHeroEnv(): Envelope {
   const slice = makeSourceEnvelope();
+  const data = makeDecoratedClaudeSourceData();
+  // Each latest cost row belongs to its own account window; these need not
+  // share bounds, so a merged total must not claim one "this cycle".
+  data.accounts![1] = {
+    ...data.accounts![1],
+    spendWindow: { kind: 'subscription-week', startAt: '2026-04-22T00:00:00Z', endAt: '2026-04-29T00:00:00Z' },
+  };
   const claude = {
     ...slice.sources.claude,
-    data: makeDecoratedClaudeSourceData(),
+    data,
   };
   return {
     header: {
@@ -142,8 +149,26 @@ describe('decorated Claude hero disclosure (#423 items 15 and 21)', () => {
     expect(hero).not.toHaveTextContent('5-HOUR37%');
     expect(hero).not.toHaveTextContent('Forecast @ reset95%');
     expect(hero).toHaveTextContent('per account');
-    expect(hero).toHaveTextContent('SPENT THIS WEEK$107.60');
+    expect(hero).toHaveTextContent('SPENT · ACCOUNT CYCLES$107.60');
+    expect(hero.querySelector('.hero-spent')).toHaveAttribute('aria-label', 'Spent across latest account cycles');
     expect(screen.getAllByTestId('account-hero-card')).toHaveLength(2);
+  });
+
+  it('does not assert a cycle for a merged cost whose account period is unresolved', () => {
+    const env = decoratedClaudeHeroEnv() as Envelope & {
+      sources: { claude: { data: { accounts: AccountCard[] } } };
+    };
+    env.sources.claude.data.accounts[1] = {
+      ...env.sources.claude.data.accounts[1],
+      spendUsd: 19.4,
+      spendWindow: undefined,
+    };
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'claude' });
+    const { container } = render(<HeroStrip />);
+    const spent = container.querySelector('.hero-spent')!;
+    expect(spent).toHaveTextContent('SPENT · ACCOUNT TOTAL$107.60');
+    expect(spent).toHaveAttribute('aria-label', 'Sum of available account costs');
   });
 
   it('uses the focused Claude card without borrowing the merged forecast', () => {
@@ -156,7 +181,8 @@ describe('decorated Claude hero disclosure (#423 items 15 and 21)', () => {
     const hero = container.querySelector('.hero-strip')!;
     expect(hero).toHaveTextContent('22.0%');
     expect(hero).toHaveTextContent('5-HOUR8%');
-    expect(hero).toHaveTextContent('SPENT THIS WEEK$19.40');
+    expect(hero).toHaveTextContent('SPENT · ACCOUNT CYCLE$19.40');
+    expect(hero.querySelector('.hero-spent')).toHaveAttribute('aria-label', 'Spent over latest account cycle');
     expect(hero).toHaveTextContent('— / 1% used');
     expect(hero).not.toHaveTextContent('$0.88 / 1% used');
     expect(hero).not.toHaveTextContent('64.0%');

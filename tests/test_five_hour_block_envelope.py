@@ -560,23 +560,225 @@ def test_836_the_server_publishes_the_effective_field_on_three_surfaces(ctx):
 # ── #834 S1 (#836) Gate A R6: the block selection is DETERMINISTIC ───────
 
 
+def _register_839_accounts(conn):
+    conn.executemany(
+        "INSERT INTO accounts (account_key, provider, natural_id) "
+        "VALUES (?, 'claude', ?)",
+        [("alice", "alice"), ("zbob", "zbob")],
+    )
+    conn.commit()
+
+
+def test_839_decorated_live_block_publishes_its_account_identity(ctx):
+    ns, conn = ctx
+    import _cctally_dashboard_envelope as env
+
+    _register_839_accounts(conn)
+    key = 1777595400
+    _seed_839_snapshot(conn, "alice", 17.0, key,
+                       "2026-04-30T11:00:00Z")
+    _seed_839_snapshot(conn, "zbob", 23.0, key,
+                       "2026-04-30T11:00:00Z")
+    _seed_839_block(conn, "alice", key, start_pct=10.0)
+    _seed_839_block(conn, "zbob", key, start_pct=20.0)
+
+    selected = ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=23.0, now_utc=_PINNED_NOW,
+        account_key="zbob")
+    assert selected is not None and selected["_account_key"] == "zbob"
+    wire = env._five_hour_block_wire(selected)
+    assert wire["account_key"] == "zbob"
+    assert not [key for key in wire if key.startswith("_")]
+
+
+def _seed_839_snapshot(conn, account, percent, key, captured, *, held=0,
+                       five_hour_percent=12.0, resets_at=None):
+    conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(week_start_date, week_end_date, week_start_at, week_end_at, "
+        " captured_at_utc, weekly_percent, five_hour_percent, "
+        " five_hour_window_key, five_hour_resets_at, weekly_observation_held, "
+        " account_key, payload_json) "
+        "VALUES ('2026-04-27', '2026-05-04', "
+        " '2026-04-27T00:00:00+00:00', '2026-05-04T00:00:00+00:00', "
+        " ?, ?, ?, ?, ?, ?, ?, '{}')",
+        (captured, percent, five_hour_percent, key, resets_at, held, account),
+    )
+    conn.commit()
+
+
+def _seed_839_block(conn, account, key, *, crossed=0, start_pct=20.0):
+    cur = conn.execute(
+        "INSERT INTO five_hour_blocks "
+        "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+        " first_observed_at_utc, last_observed_at_utc, "
+        " final_five_hour_percent, seven_day_pct_at_block_start, "
+        " crossed_seven_day_reset, is_closed, created_at_utc, "
+        " last_updated_at_utc, account_key) "
+        "VALUES (?, '2026-04-30T15:30:00+00:00', "
+        " '2026-04-30T10:30:00+00:00', '2026-04-30T10:30:00+00:00', "
+        " '2026-04-30T11:00:00+00:00', 12.0, ?, ?, 0, "
+        " '2026-04-30T11:00:00+00:00', '2026-04-30T11:00:00+00:00', ?)",
+        (key, start_pct, crossed, account),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+@pytest.mark.parametrize("order", [("zbob", "alice"), ("alice", "zbob")])
+def test_839_current_week_owns_its_block_credit_and_milestones(ctx, order):
+    ns, conn = ctx
+    import _cctally_tui as tui
+    import _cctally_dashboard_envelope as env
+
+    key = 1777595400
+    _register_839_accounts(conn)
+    # Bob's snapshot is older; the displayed non-held weekly reading is Alice's.
+    _seed_839_snapshot(conn, "zbob", 81.0, key, "2026-04-30T10:59:00Z",
+                       five_hour_percent=81.0)
+    _seed_839_snapshot(conn, "alice", 23.0, key, "2026-04-30T11:00:00Z",
+                       five_hour_percent=13.0)
+    ids = {account: _seed_839_block(conn, account, key,
+                                   start_pct=70.0 if account == "zbob" else 20.0)
+           for account in order}
+    for account in order:
+        pct = 80 if account == "zbob" else 13
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, effective_reset_at_utc, five_hour_window_key, "
+            " prior_percent, post_percent, account_key) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("2026-04-30T11:10:00Z", "2026-04-30T11:10:00Z", key,
+             pct + 20.0, float(pct), account),
+        )
+        conn.execute(
+            "INSERT INTO five_hour_milestones "
+            "(block_id, five_hour_window_key, percent_threshold, "
+            " captured_at_utc, usage_snapshot_id, account_key) "
+            "VALUES (?, ?, ?, '2026-04-30T11:00:00Z', 0, ?)",
+            (ids[account], key, pct, account),
+        )
+    conn.commit()
+    assert ids[order[0]] < ids[order[1]]
+    assert conn.execute("SELECT COUNT(*) FROM five_hour_blocks").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM five_hour_reset_events").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM five_hour_milestones").fetchone()[0] == 2
+
+    cw = tui._tui_build_current_week(conn, _PINNED_NOW, skip_sync=True)
+    assert cw is not None and cw.used_pct == 23.0
+    assert cw.five_hour_block is not None
+    block = cw.five_hour_block
+    assert block["_account_key"] == "alice"
+    assert block["_block_id"] == ids["alice"]
+    assert block["seven_day_pct_at_block_start"] == 20.0
+    assert block["seven_day_pct_delta_pp"] == 3.0
+    assert [c["post_percent"] for c in block["credits"]] == [13.0]
+    milestones = tui._tui_build_five_hour_milestones(
+        conn, key, block["_account_key"], block_id=block["_block_id"])
+    assert [m["percent_threshold"] for m in milestones] == [13]
+    assert "_account_key" not in env._five_hour_block_wire(block)
+
+
+def test_839_held_other_account_does_not_choose_its_window(ctx):
+    ns, conn = ctx
+    import _cctally_tui as tui
+
+    key = 1777595400
+    other_key = key + 600
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "alice", 23.0, key, "2026-04-30T11:00:00Z")
+    _seed_839_snapshot(conn, "zbob", 81.0, other_key,
+                       "2026-04-30T11:05:00Z", held=1,
+                       five_hour_percent=90.0,
+                       resets_at="2026-04-30T16:00:00+00:00")
+    _seed_839_snapshot(conn, "alice", 23.0, key,
+                       "2026-04-30T11:04:00Z", held=1,
+                       five_hour_percent=17.0,
+                       resets_at="2026-04-30T15:30:00+00:00")
+    alice_id = _seed_839_block(conn, "alice", key)
+    _seed_839_block(conn, "zbob", other_key, start_pct=70.0)
+    cw = tui._tui_build_current_week(conn, _PINNED_NOW, skip_sync=True)
+    assert cw is not None and cw.used_pct == 23.0
+    assert cw.five_hour_pct == 17.0
+    assert cw.five_hour_resets_at == dt.datetime(
+        2026, 4, 30, 15, 30, tzinfo=dt.timezone.utc)
+    assert cw.five_hour_block is not None
+    assert cw.five_hour_block["_block_id"] == alice_id
+
+
+def test_839_missing_weekly_account_block_does_not_borrow_other_account(ctx):
+    ns, conn = ctx
+    import _cctally_tui as tui
+
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "zbob", 81.0, key, "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 23.0, key, "2026-04-30T11:00:00Z")
+    _seed_839_block(conn, "zbob", key, start_pct=70.0)
+    cw = tui._tui_build_current_week(conn, _PINNED_NOW, skip_sync=True)
+    assert cw is not None and cw.used_pct == 23.0
+    assert cw.five_hour_block is None
+    assert ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=23.0, now_utc=_PINNED_NOW) is None
+
+
+def test_839_one_real_account_does_not_borrow_unattributed_block(ctx):
+    ns, conn = ctx
+    import _cctally_tui as tui
+
+    key = 1777595400
+    conn.execute(
+        "INSERT INTO accounts (account_key, provider, natural_id) "
+        "VALUES ('alice', 'claude', 'alice')")
+    _seed_839_snapshot(conn, "unattributed", 81.0, key,
+                       "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 23.0, key,
+                       "2026-04-30T11:00:00Z")
+    _seed_839_block(conn, "unattributed", key, start_pct=70.0)
+    alice_id = _seed_839_block(conn, "alice", key, start_pct=20.0)
+    for account, post in (("unattributed", 80.0), ("alice", 13.0)):
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, effective_reset_at_utc, five_hour_window_key, "
+            " prior_percent, post_percent, account_key) "
+            "VALUES ('2026-04-30T11:10:00Z', '2026-04-30T11:10:00Z', "
+            " ?, ?, ?, ?)",
+            (key, post + 20.0, post, account),
+        )
+    conn.commit()
+
+    cw = tui._tui_build_current_week(conn, _PINNED_NOW, skip_sync=True)
+    assert cw is not None and cw.used_pct == 23.0
+    assert cw.five_hour_block is not None
+    assert cw.five_hour_block["_block_id"] == alice_id
+    assert cw.five_hour_block["_account_key"] == "alice"
+    assert [c["post_percent"] for c in cw.five_hour_block["credits"]] == [13.0]
+
+
+def test_839_crossed_reset_anchor_excludes_held_and_other_account(ctx):
+    ns, conn = ctx
+    _register_839_accounts(conn)
+    key = 1777595400
+    _seed_839_snapshot(conn, "alice", 95.0, key,
+                       "2026-04-30T10:31:00Z", held=1)
+    _seed_839_snapshot(conn, "zbob", 70.0, key,
+                       "2026-04-30T10:32:00Z")
+    _seed_839_snapshot(conn, "alice", 3.0, key,
+                       "2026-04-30T10:40:00Z")
+    _seed_839_snapshot(conn, "alice", 9.0, key,
+                       "2026-04-30T11:00:00Z")
+    _seed_839_block(conn, "zbob", key, crossed=1, start_pct=88.0)
+    alice_id = _seed_839_block(conn, "alice", key, crossed=1, start_pct=95.0)
+    block = ns["_select_current_block_for_envelope"](
+        conn, current_used_pct=9.0, now_utc=_PINNED_NOW,
+        account_key="alice")
+    assert block is not None and block["_block_id"] == alice_id
+    assert block["crossed_seven_day_reset"] is True
+    assert block["seven_day_pct_delta_pp"] == 6.0
+
+
 def test_836_the_block_selection_is_ordered_and_limited(ctx):
-    """`_select_current_block_for_envelope` selected the live block with no
-    `ORDER BY` and no `LIMIT` and took `.fetchone()`, so with two accounts on one
-    physical window SQLite decided which block was returned — and since #836
-    `_block_id` inherits that decision, which now also decides whose milestones
-    the live route loads.
-
-    Today's plan is a table scan, so the lowest rowid wins; that is measured, not
-    assumed, and it is what the explicit order preserves. WHICH ACCOUNT IS SERVED
-    IS NOT CHANGED HERE: that is a product decision and it is filed as #839.
-
-    Two assertions, because neither alone is enough. The behavioural one pins the
-    block, so a later reordering that silently switched accounts fails. The
-    source-level one requires the order to be STATED, because determinism that
-    depends on the query planner is not determinism — it is the planner agreeing
-    with itself, and it stops agreeing when an index or a SQLite version changes.
-    """
+    """A multi-account selector names the weekly account despite lower other id."""
     import inspect
     import _cctally_dashboard_envelope as env
     ns, conn = ctx
@@ -585,9 +787,8 @@ def test_836_the_block_selection_is_ordered_and_limited(ctx):
     resets_iso = "2026-04-30T15:30:00+00:00"
     key = ns["_canonical_5h_window_key"](
         int(dt.datetime.fromisoformat(resets_iso).timestamp()))
-    _seed_snapshot(conn, used_pct=66.7, key=key,
-                   captured="2026-04-30T11:00:00Z",
-                   week_start_at="2026-04-27T00:00:00+00:00")
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "alice", 66.7, key, "2026-04-30T11:00:00Z")
     # Seeded so rowid order and account-name order DISAGREE, or the test could
     # not tell a rowid order from an alphabetical one.
     ids = {}
@@ -610,14 +811,15 @@ def test_836_the_block_selection_is_ordered_and_limited(ctx):
     assert ids["zbob"] < ids["alice"], "the fixture must disagree on the two orders"
 
     first = ns["_select_current_block_for_envelope"](
-        conn, current_used_pct=66.7, now_utc=_PINNED_NOW)
+        conn, current_used_pct=66.7, now_utc=_PINNED_NOW,
+        account_key="alice")
     second = ns["_select_current_block_for_envelope"](
-        conn, current_used_pct=66.7, now_utc=_PINNED_NOW)
+        conn, current_used_pct=66.7, now_utc=_PINNED_NOW,
+        account_key="alice")
     assert first is not None
-    assert first["_block_id"] == second["_block_id"] == ids["zbob"], (
-        "the two-account selection is not the lowest-rowid block it was before "
-        "the order was stated — which account the dashboard serves is #839, not "
-        "this change")
+    assert first["_block_id"] == second["_block_id"] == ids["alice"], (
+        "the current weekly account must win even when another block has "
+        "the lower id")
 
     source = inspect.getsource(env._select_current_block_for_envelope)
     # Bounded to the block query's own SQL literal. Slicing to the end of the

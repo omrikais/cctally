@@ -278,6 +278,7 @@ import secrets
 import shutil
 import signal as _signal
 import socket
+import select
 import sqlite3
 import sys
 import threading
@@ -297,7 +298,7 @@ from _lib_retained_size import retained_size_bytes
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
-    """`ThreadingHTTPServer` that swallows client-disconnect tracebacks.
+    """Bounded HTTP threads with quiet client-disconnect handling.
 
     A backgrounded/closed/reloaded dashboard tab hangs up mid-response, so the
     per-request thread's socket write raises one of the "peer went away"
@@ -313,6 +314,111 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+    request_queue_size = 256
+    max_request_threads = 96
+    _reject_workers_count = 4
+    _reject_queue_size = 256
+    _busy_body = b'{"error":"server busy"}'
+    _busy_response = (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Cache-Control: no-store\r\n"
+        b"Connection: close\r\n"
+        + f"Content-Length: {len(_busy_body)}\r\n\r\n".encode("ascii")
+        + _busy_body
+    )
+
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(
+            self.max_request_threads)
+        self._reject_queue: queue.Queue[socket.socket] = queue.Queue(
+            maxsize=self._reject_queue_size)
+        self._reject_stop = threading.Event()
+        self._reject_start_lock = threading.Lock()
+        self._reject_workers: list[threading.Thread] = []
+        super().__init__(*args, **kwargs)
+
+    def _reject_request(self, request: socket.socket) -> None:
+        try:
+            # Read only the bounded request headers so a close with unread
+            # input does not reset a client before it sees the 503. Slow peers
+            # are confined to a fixed reject worker, never the accept loop.
+            request.settimeout(0.25)
+            received = bytearray()
+            while b"\r\n\r\n" not in received and len(received) < 8192:
+                chunk = request.recv(min(8192 - len(received), 4096))
+                if not chunk:
+                    break
+                received.extend(chunk)
+            request.sendall(self._busy_response)
+        except OSError:
+            pass  # A peer that disconnected cannot receive the overload reply.
+        finally:
+            self.shutdown_request(request)
+
+    def _reject_loop(self) -> None:
+        while not self._reject_stop.is_set():
+            try:
+                request = self._reject_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._reject_request(request)
+            finally:
+                self._reject_queue.task_done()
+
+    def _queue_rejection(self, request: socket.socket) -> None:
+        with self._reject_start_lock:
+            if not self._reject_workers:
+                for index in range(self._reject_workers_count):
+                    worker = threading.Thread(
+                        target=self._reject_loop,
+                        name=f"cctally-http-reject-{index}", daemon=True,
+                    )
+                    worker.start()
+                    self._reject_workers.append(worker)
+        try:
+            self._reject_queue.put_nowait(request)
+        except queue.Full:
+            # This last-resort reply is nonblocking. It keeps the accept loop
+            # responsive even if the bounded reject queue also saturates.
+            try:
+                request.setblocking(False)
+                request.send(self._busy_response)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            self._queue_rejection(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def server_close(self):
+        self._reject_stop.set()
+        while True:
+            try:
+                request = self._reject_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.shutdown_request(request)
+            self._reject_queue.task_done()
+        for worker in self._reject_workers:
+            worker.join(timeout=0.5)
+        super().server_close()
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -332,6 +438,30 @@ class _DiagnosisFlight:
     result: Any = None
     error: BaseException | None = None
     callers: int = 0
+    deadline: float = 0.0
+
+
+class _DiagnosisOverloaded(Exception):
+    """The bounded diagnosis admission has no room for another caller."""
+
+
+class _DiagnosisTimedOut(Exception):
+    """A diagnosis did not finish within its flight's deadline."""
+
+
+class _DiagnosisClientGone(Exception):
+    """The requesting peer disconnected while its diagnosis was pending."""
+
+
+def _diagnosis_peer_gone(connection: socket.socket) -> bool:
+    """Check a waiting GET socket without consuming any request bytes."""
+    try:
+        if not select.select([connection], [], [], 0)[0]:
+            return False
+        return not connection.recv(
+            1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+    except (OSError, ValueError):
+        return True
 
 
 def _diagnosis_flight_key(
@@ -360,46 +490,153 @@ class _DiagnosisAdmission:
     never retained, so this adds no stale report cache or periodic work.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_callers: int = 32, max_per_key: int = 16,
+                 max_keys: int = 8, deadline_seconds: float = 15.0) -> None:
+        if min(max_callers, max_per_key, max_keys) < 1 or deadline_seconds <= 0:
+            raise ValueError("diagnosis admission limits must be positive")
         self._changed = threading.Condition()
         self._admission = threading.BoundedSemaphore(1)
         self._flights: dict[tuple[Any, bool, bool], _DiagnosisFlight] = {}
+        self._callers = 0
+        self._max_callers = max_callers
+        self._max_per_key = max_per_key
+        self._max_keys = max_keys
+        self._deadline_seconds = deadline_seconds
 
-    def run(self, key: tuple[Any, bool, bool], build):
+    def _finish(self, key, flight, *, result=None, error=None) -> None:
+        with self._changed:
+            if flight.done.is_set():
+                return
+            flight.result = result
+            flight.error = error
+            flight.done.set()
+            if self._flights.get(key) is flight:
+                del self._flights[key]
+            self._changed.notify_all()
+
+    def _produce(self, key, flight, build, bounded_build) -> None:
+        remaining = max(0.0, flight.deadline - time.monotonic())
+        acquired = self._admission.acquire(timeout=remaining)
+        if not acquired:
+            self._finish(key, flight, error=_DiagnosisTimedOut())
+            return
+        try:
+            # A queued flight may have expired while a prior producer held the
+            # single process-wide slot. It must never start a late build.
+            if flight.done.is_set() or time.monotonic() >= flight.deadline:
+                self._finish(key, flight, error=_DiagnosisTimedOut())
+                return
+            try:
+                remaining = max(0.0, flight.deadline - time.monotonic())
+                result = (
+                    bounded_build(remaining)
+                    if bounded_build is not None else build()
+                )
+            except TimeoutError:
+                self._finish(key, flight, error=_DiagnosisTimedOut())
+            except BaseException as exc:
+                self._finish(
+                    key, flight,
+                    error=(_DiagnosisTimedOut()
+                           if time.monotonic() >= flight.deadline else exc),
+                )
+            else:
+                if time.monotonic() >= flight.deadline:
+                    self._finish(key, flight, error=_DiagnosisTimedOut())
+                else:
+                    self._finish(key, flight, result=result)
+        finally:
+            # Production passes a killable process build, so reaching the
+            # deadline retires that process tree before this slot is released.
+            # Direct in-process builds remain available only to focused unit
+            # callers whose producer is known to terminate.
+            self._admission.release()
+
+    def run(self, key: tuple[Any, bool, bool], build, *, peer_gone=None,
+            bounded_build=None):
         with self._changed:
             flight = self._flights.get(key)
             owner = flight is None
+            if self._callers >= self._max_callers:
+                raise _DiagnosisOverloaded()
             if owner:
-                flight = _DiagnosisFlight()
+                if len(self._flights) >= self._max_keys:
+                    raise _DiagnosisOverloaded()
+                flight = _DiagnosisFlight(
+                    deadline=time.monotonic() + self._deadline_seconds,
+                )
                 self._flights[key] = flight
+            elif flight.callers >= self._max_per_key:
+                raise _DiagnosisOverloaded()
             flight.callers += 1
+            self._callers += 1
             self._changed.notify_all()
-
-        if not owner:
-            flight.done.wait()
-            if flight.error is not None:
-                raise flight.error
-            return flight.result
-
         try:
-            with self._admission:
-                result = build()
+            if owner:
+                try:
+                    threading.Thread(
+                        target=self._produce,
+                        args=(key, flight, build, bounded_build),
+                        name="cctally-diagnosis", daemon=True,
+                    ).start()
+                except BaseException as exc:
+                    self._finish(key, flight, error=exc)
+            while not flight.done.is_set():
+                if peer_gone is not None and peer_gone():
+                    raise _DiagnosisClientGone()
+                remaining = flight.deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                flight.done.wait(min(0.1, remaining))
+            if not flight.done.is_set():
+                self._finish(key, flight, error=_DiagnosisTimedOut())
             with self._changed:
-                flight.result = result
-            return result
-        except BaseException as exc:
-            with self._changed:
-                flight.error = exc
-            raise
+                if flight.error is not None:
+                    raise flight.error
+                return flight.result
         finally:
             with self._changed:
-                if self._flights.get(key) is flight:
-                    del self._flights[key]
-                flight.done.set()
+                flight.callers -= 1
+                self._callers -= 1
                 self._changed.notify_all()
 
 
 _DIAGNOSIS_ADMISSION = _DiagnosisAdmission()
+
+
+class _StaticValidatorCache:
+    """Bounded validators for bytes already served by this process."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple[pathlib.Path, bool],
+                                   tuple[tuple[int, ...], str]] = OrderedDict()
+        self._max_entries = max_entries
+
+    @staticmethod
+    def fingerprint(stat_result: os.stat_result) -> tuple[int, ...]:
+        # ctime catches a rewrite that restores size and mtime. Device/inode
+        # distinguishes replacement of a mutable-name shell during a build.
+        return (stat_result.st_dev, stat_result.st_ino, stat_result.st_size,
+                stat_result.st_mtime_ns, stat_result.st_ctime_ns)
+
+    def get(self, key, fingerprint) -> str | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry[0] != fingerprint:
+                return None
+            self._entries.move_to_end(key)
+            return entry[1]
+
+    def put(self, key, fingerprint, etag: str) -> None:
+        with self._lock:
+            self._entries[key] = (fingerprint, etag)
+            self._entries.move_to_end(key)
+            if len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+_STATIC_VALIDATORS = _StaticValidatorCache()
 
 
 def _cctally():
@@ -669,6 +906,7 @@ from _cctally_dashboard_envelope import (
     _envelope_rows_projected,
     _envelope_rows_project_budget,
     _ENVELOPE_AXIS_MAPPERS,
+    _alert_account_resolver,
     _build_alerts_envelope_array,
     _build_meter_rate_change_array,
     _model_breakdowns_to_models,
@@ -4807,6 +5045,7 @@ def _blocks_view_with_retained_facts(conn, view):
                 models=_model_breakdowns_to_models(
                     facts["model_breakdowns"], facts["cost_usd"],
                 ),
+                facts_source="retained",
             )
     return dataclasses.replace(
         view,
@@ -10103,7 +10342,31 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 primary_model="claude-sonnet-4-6",
             )
         status = _dispatch_alert_notification(payload, mode="test")
-        self._respond_json(200, {"alert": payload, "dispatch": status})
+        # Dispatch and alerts.log keep the builder's internal snake_case key.
+        # The response is an AlertEntry-shaped toast preview, so its public
+        # account fields must follow the same R8 gate as real envelope rows.
+        # Work on a copy: removing the key from `payload` would also change
+        # what the native notifier and test log receive.
+        response_alert = {k: v for k, v in payload.items() if k != "account_key"}
+        provider = (
+            "codex" if axis == "codex_budget" or (
+                axis == "projected" and metric == "codex_budget_usd"
+            ) else "claude"
+        )
+        if _cctally_core.DB_PATH.exists():
+            try:
+                conn = _stats_ro_guarded()
+                try:
+                    response_alert.update(_alert_account_resolver(conn)(
+                        provider, payload.get("account_key"),
+                    ))
+                finally:
+                    conn.close()
+            except (OSError, sqlite3.Error):
+                # A rehearsal still works without a readable account registry;
+                # no writable DB open or synthetic milestone is needed.
+                pass
+        self._respond_json(200, {"alert": response_alert, "dispatch": status})
 
 
     # ---- share endpoints (spec §5.1) — thin delegators to the F1 sibling ----
@@ -10198,6 +10461,43 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         return False
 
     def _serve_static_file(self, path: pathlib.Path, ctype: str) -> None:
+        compressible = (
+            ctype.startswith("text/")
+            or ctype.startswith("application/javascript")
+            or ctype.startswith("image/svg+xml")
+        )
+        gzip_on = compressible and _accepts_gzip(
+            self.headers.get("Accept-Encoding")
+        )
+        cache_control = (
+            "public, max-age=31536000, immutable"
+            if self._is_hashed_static_asset(path)
+            else "no-cache"
+        )
+        validator = self.headers.get("If-None-Match")
+        key = (path, gzip_on)
+        try:
+            before = _STATIC_VALIDATORS.fingerprint(path.stat())
+        except (FileNotFoundError, IsADirectoryError):
+            self.send_error(404, "not found")
+            return
+
+        # Only a validator derived from bytes previously served for this exact
+        # encoding and unchanged file identity can answer before I/O. In
+        # particular, a mutable dashboard.html replacement invalidates this.
+        if validator:
+            warm_etag = _STATIC_VALIDATORS.get(key, before)
+            if warm_etag and self._etag_matches(validator, warm_etag):
+                self.send_response(304)
+                self.send_header("ETag", warm_etag)
+                self.send_header("Cache-Control", cache_control)
+                if compressible:
+                    self.send_header("Vary", "Accept-Encoding")
+                if gzip_on:
+                    self.send_header("Content-Encoding", "gzip")
+                self.end_headers()
+                return
+
         try:
             body = path.read_bytes()
         except FileNotFoundError:
@@ -10207,23 +10507,16 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404, "not found")
             return
 
-        compressible = (
-            ctype.startswith("text/")
-            or ctype.startswith("application/javascript")
-            or ctype.startswith("image/svg+xml")
-        )
-        gzip_on = compressible and _accepts_gzip(
-            self.headers.get("Accept-Encoding")
-        )
         encoded = gzip.compress(body, compresslevel=6, mtime=0) if gzip_on else body
         etag = f'"{hashlib.sha256(encoded).hexdigest()}"'
-        cache_control = (
-            "public, max-age=31536000, immutable"
-            if self._is_hashed_static_asset(path)
-            else "no-cache"
-        )
+        try:
+            after = _STATIC_VALIDATORS.fingerprint(path.stat())
+        except (FileNotFoundError, IsADirectoryError):
+            after = None
+        if after == before:
+            _STATIC_VALIDATORS.put(key, before, etag)
 
-        if self._etag_matches(self.headers.get("If-None-Match"), etag):
+        if after == before and self._etag_matches(validator, etag):
             self.send_response(304)
             self.send_header("ETag", etag)
             self.send_header("Cache-Control", cache_control)
@@ -10588,12 +10881,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     scope, transcripts_visible, reveal,
                 )
 
-                def _prepare_diagnosis():
-                    report = sources.build_diagnosis(
-                        scope,
-                        measured_at=now_utc,
-                        transcripts_visible=transcripts_visible,
-                    )
+                def _project_diagnosis(report):
                     scopes = {
                         result.source: diagnosis._scope_for(
                             sources, scope, result.source,
@@ -10612,10 +10900,43 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     )
                     return status, body
 
+                def _prepare_diagnosis():
+                    return _project_diagnosis(sources.build_diagnosis(
+                        scope,
+                        measured_at=now_utc,
+                        transcripts_visible=transcripts_visible,
+                    ))
+
+                def _prepare_bounded_diagnosis(remaining):
+                    return _project_diagnosis(
+                        sources.build_diagnosis_bounded(
+                            scope,
+                            measured_at=now_utc,
+                            transcripts_visible=transcripts_visible,
+                            timeout_seconds=remaining,
+                        )
+                    )
+
                 status, body = _DIAGNOSIS_ADMISSION.run(
                     flight_key,
                     _prepare_diagnosis,
+                    peer_gone=lambda: _diagnosis_peer_gone(self.connection),
+                    bounded_build=_prepare_bounded_diagnosis,
                 )
+            except _DiagnosisClientGone:
+                return
+            except _DiagnosisOverloaded:
+                self._send_diagnosis_json(503, {
+                    "error": "diagnosis busy; retry shortly",
+                    "code": "diagnosis_overloaded",
+                })
+                return
+            except _DiagnosisTimedOut:
+                self._send_diagnosis_json(503, {
+                    "error": "diagnosis timed out; retry shortly",
+                    "code": "diagnosis_timeout",
+                })
+                return
             except _DiagnosisSelectorError as exc:
                 self._send_diagnosis_json(
                     400, {"error": exc.message, "code": exc.code})

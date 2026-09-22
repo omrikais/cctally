@@ -8,9 +8,10 @@
 // the `alerts` modal (RecentAlertsModal) because it wraps in <Modal> and renders
 // with an empty `alerts` array, so no envelope snapshot is needed.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { act, render } from '@testing-library/react';
+import { act, fireEvent, render } from '@testing-library/react';
 import { Modal } from './Modal';
 import { ModalRoot } from './ModalRoot';
+import { RecentAlertsPanel } from '../components/RecentAlertsPanel';
 import {
   _resetForTests,
   dispatch,
@@ -33,6 +34,27 @@ afterEach(() => {
 });
 
 describe('<Modal /> focus management (A1)', () => {
+  it.each(['Escape', 'close button', 'backdrop'])(
+    'restores the surviving Expand trigger after a card-body click and %s close',
+    (closeVia) => {
+      render(<><RecentAlertsPanel /><ModalRoot /></>);
+      const cardRegion = document.querySelector('[data-panel-kind="alerts"]') as HTMLElement;
+      const expand = cardRegion.querySelector('.panel-expand') as HTMLButtonElement;
+      expect(expand).toBeTruthy();
+      fireEvent.click(cardRegion);
+      expect(document.querySelector('.modal-card')).toBeTruthy();
+      if (closeVia === 'Escape') {
+        fireEvent.keyDown(document, { key: 'Escape' });
+      } else if (closeVia === 'backdrop') {
+        fireEvent.click(document.querySelector('.modal-backdrop') as HTMLElement);
+      } else {
+        fireEvent.click(document.querySelector('.modal-close') as HTMLElement);
+      }
+      expect(document.querySelector('.modal-card')).toBeNull();
+      expect(document.activeElement).toBe(expand);
+    },
+  );
+
   it('moves focus inside the modal card on open and restores to the trigger on close', () => {
     // A trigger button that holds focus at open time. The hook should capture
     // it as the restore target.

@@ -16,6 +16,7 @@ import {
 import type { FocusMode } from './applyFocusMode';
 import { FilesTab } from './FilesTab';
 import { fmt, plural, type FmtCtx } from '../lib/fmt';
+import type { ConversationDegradedNotice } from '../lib/conversationTransport';
 import {
   ChatIcon,
   PlanIcon,
@@ -444,9 +445,17 @@ function OutlineCacheRebuilds({
 export function OutlinePanel({
   sessionId,
   outline,
+  loading = true,
+  error = null,
+  degraded = null,
+  notFound = false,
 }: {
   sessionId: ConversationRefInput;
   outline: ConversationOutline | null;
+  loading?: boolean;
+  error?: string | null;
+  degraded?: ConversationDegradedNotice | null;
+  notFound?: boolean;
 }) {
   const qualifiedInput = typeof sessionId !== 'string';
   const conversationRef = normalizeConversationRef(sessionId);
@@ -628,7 +637,9 @@ export function OutlinePanel({
   return (
     <nav className="conv-outline" aria-label="Session outline">
       {outline == null ? (
-        <div className="conv-outline-placeholder">Loading outline…</div>
+        <div className="conv-outline-placeholder" role={degraded || error ? 'status' : undefined}>
+          {degraded?.message ?? error ?? (notFound ? 'No retained transcript for this session.' : loading ? 'Loading outline…' : 'Outline unavailable.')}
+        </div>
       ) : (
         <>
           <div className="conv-outline-stats">

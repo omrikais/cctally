@@ -15,6 +15,7 @@ import base64 as _base64
 import json as _json
 import os
 import re
+import dataclasses
 import sqlite3
 from datetime import datetime as _datetime, timezone as _timezone
 
@@ -3151,6 +3152,188 @@ def build_anon_plan_for_db(conn, *, home_dir):
         home_dirs=sorted(home_dirs), usernames=sorted(usernames))
 
 
+#: The Codex leg's fail-closed count, read from the RAW threads table so a
+#: scoped plan observes the same condition an unscoped one does. The vocabulary
+#: statements below keep their unqualified names for the legacy/unscoped path;
+#: account-scoped requests use physical event provenance before reading the
+#: same raw table.
+_CODEX_UNDECODABLE_CWD_SQL = """
+    SELECT CAST(cwd AS BLOB) AS cwd_blob
+      FROM {threads}
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceAnonPlan:
+    """A provider-aware :class:`AnonPlan` and the fail-closed count beside it.
+
+    ``undecodable_cwd_rows`` counts Codex threads whose ``cwd`` bytes are not
+    valid UTF-8. A path the store cannot supply as a scrub token can appear in
+    any transcript, so a count above zero refuses EVERY anonymized export whose
+    plan includes the Codex leg, rather than only the conversation that owns
+    the bad row (#850 M5). ``--raw``, ``search`` and Claude-only plans are
+    unaffected. ``ambiguous_cwd_rows`` counts scoped Codex thread/root paths
+    whose account ownership is not proven by physical account-stamped events;
+    scoped anonymized copies refuse when it is non-zero.
+    """
+
+    plan: object
+    undecodable_cwd_rows: int
+    ambiguous_cwd_rows: int = 0
+
+
+def _anon_scope_account(conn) -> str | None:
+    """Return the active read scope without confusing it with an empty store."""
+    scoped = conn.execute(
+        "SELECT 1 FROM sqlite_temp_master "
+        "WHERE type='table' AND name='_conversation_account_scope'"
+    ).fetchone()
+    if scoped is None:
+        return None
+    row = conn.execute(
+        "SELECT account_key FROM temp._conversation_account_scope"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("conversation account scope has no account key")
+    return row[0]
+
+
+def _scoped_codex_anon_paths(conn, account_key: str):
+    """Prove scoped paths from account-stamped physical session_meta events.
+
+    The thread row and provider root are conversation/root metadata, not account
+    facts. In particular, a shared thread's CWD can have been written before an
+    account switch. A session_meta event's own account stamp is the narrowest
+    retained proof for its payload CWD and source root. A path/root seen under
+    another session_meta account is ambiguous and is never offered as a
+    client-side token.
+    """
+    from _lib_codex_metadata import (
+        decode_codex_project_metadata, resolve_codex_threads_table,
+    )
+
+    observations: dict[str, set[str]] = {}
+    root_owners: dict[str, set[str]] = {}
+    # Only session_meta carries the CWD/root provenance needed here. Keep this
+    # read narrow: selecting and decoding every response/tool event made each
+    # account-scoped copy proportional to the entire physical event store.
+    # A read-only opener that predates the schema ensure must refuse the
+    # vocabulary rather than silently reintroduce the old full-table scan.
+    # The raw thread pass below will turn every visible path into an ambiguity
+    # refusal while still preserving the independent undecodable count.
+    provenance_index = conn.execute(
+        "SELECT 1 FROM main.sqlite_master "
+        "WHERE type='index' AND name='idx_codex_events_session_meta_provenance'"
+    ).fetchone() is not None
+    if provenance_index:
+        for source_root_key, payload_json, owner in conn.execute(
+            "SELECT source_root_key, payload_json, "
+            "COALESCE(account_key,'unattributed') "
+            "FROM main.codex_conversation_events "
+            "WHERE record_type='session_meta'"
+        ):
+            if source_root_key:
+                root_owners.setdefault(source_root_key, set()).add(owner)
+            try:
+                obj = _json.loads(payload_json)
+            except (TypeError, ValueError):
+                continue
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            path = payload.get("cwd") if isinstance(payload, dict) else None
+            if isinstance(path, str) and path and os.path.isabs(path):
+                observations.setdefault(path, set()).add(owner)
+    visible_keys = {
+        key for (key,) in conn.execute(
+            "SELECT DISTINCT conversation_key FROM codex_conversation_messages"
+        ) if key
+    }
+    try:
+        threads = resolve_codex_threads_table(conn)
+    except RuntimeError:
+        if visible_keys:
+            # Messages without their raw thread metadata leave project-path
+            # coverage unknown. Refuse rather than offer a partial scrub plan.
+            raise RuntimeError("Codex raw threads table missing for scoped anonymization")
+        return set(), 0, 0
+    ambiguous = 0
+    thread_schema = threads.split(".", 1)[0]
+    root_paths: dict[str, str] = {}
+    for root_key, root_path in conn.execute(
+        "SELECT source_root_key, canonical_root_path FROM "
+        + thread_schema + ".codex_source_roots"
+    ):
+        if isinstance(root_key, str) and isinstance(root_path, str):
+            if root_path and os.path.isabs(root_path):
+                root_paths[root_key] = root_path
+    owned_roots = {
+        root_key for root_key, owners in root_owners.items()
+        if owners == {account_key}
+    }
+    # A string can be both a provider root and a different account's project
+    # CWD. Merge evidence by path before admitting it; unioning individually
+    # approved roots back into `owned` would leak the foreign CWD to anon-map.
+    path_owners = {path: set(owners) for path, owners in observations.items()}
+    for root_key, root_path in root_paths.items():
+        path_owners.setdefault(root_path, set()).update(
+            root_owners.get(root_key, ())
+        )
+    owned = {path for path, owners in path_owners.items()
+             if owners == {account_key}}
+
+    undecodable = 0
+    for key, source_root_key, cwd_blob in conn.execute(
+        "SELECT conversation_key, source_root_key, CAST(cwd AS BLOB) "
+        "FROM " + threads
+    ):
+        decoded = decode_codex_project_metadata(cwd_blob, None)
+        if "cwd" in decoded.undecodable_fields:
+            undecodable += 1
+        if key not in visible_keys:
+            continue
+        cwd = decoded.cwd
+        if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
+            if cwd not in owned:
+                ambiguous += 1
+        if source_root_key and source_root_key in root_paths:
+            if (source_root_key not in owned_roots
+                    or root_paths[source_root_key] not in owned):
+                ambiguous += 1
+    return owned, ambiguous, undecodable
+
+
+def _count_undecodable_codex_cwd(conn) -> int:
+    """Codex threads whose ``cwd`` cannot be decoded, read past a scoped view.
+
+    A store with no Codex threads table has no undecodable row, so it answers
+    zero rather than refusing an export that would otherwise have worked. That
+    absent-table case reaches here as ``resolve_codex_threads_table``'s
+    ``RuntimeError``, and it is the ONLY failure this answers with zero.
+
+    A ``sqlite3.Error`` is a read the store could not perform, not the answer
+    "nothing is undecodable", so it propagates. M5 is fail-closed: a locked or
+    malformed cache.db must stop every anonymized export rather than let one
+    proceed on a scrub vocabulary that was never established. The escaping
+    error already lands on each caller's own error path — ``cctally transcript
+    export`` reports it and exits non-zero without writing the transcript, and
+    ``_run_conversation_query`` answers both dashboard routes with a typed JSON
+    error on a 500, emitting neither markdown nor a token map.
+    """
+    from _lib_codex_metadata import (
+        decode_codex_project_metadata, resolve_codex_threads_table,
+    )
+
+    try:
+        threads = resolve_codex_threads_table(conn)
+    except RuntimeError:
+        return 0
+    rows = conn.execute(_CODEX_UNDECODABLE_CWD_SQL.format(threads=threads))
+    count = 0
+    for (cwd_blob,) in rows:
+        if "cwd" in decode_codex_project_metadata(cwd_blob, None).undecodable_fields:
+            count += 1
+    return count
+
+
 def build_anon_plan_for_sources(conn, *, home_dir, sources):
     """Provider-aware :class:`AnonPlan` for QUALIFIED conversation surfaces
     (#294 S7, §3.6). A SEPARATE builder from :func:`build_anon_plan_for_db`, which
@@ -3160,16 +3343,30 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
     requests (both providers), which are new and carry no byte-compat debt.
 
     ``sources`` selects the provider legs to include (e.g. ``{"codex"}`` or
-    ``{"claude"}``). The Codex leg draws ONLY from the authoritative tables:
-    provider root dirs from ``codex_source_roots.canonical_root_path``, observed
-    project paths from validated ``codex_conversation_threads.cwd`` (absolute paths
-    only), display labels from ``codex_conversation_rollups.project_label``.
-    ``git_json`` is NOT a path source (its fields are branch/repository metadata,
-    not filesystem roots). The existing home-dir/username machinery and
-    ``SECRET_PATTERNS`` apply unchanged; coverage stays best-effort-over-known-tokens
-    and the per-token replacement stays fail-closed."""
+    ``{"claude"}`). An unscoped Codex leg draws ONLY from the authoritative
+    tables: provider root dirs from ``codex_source_roots.canonical_root_path``,
+    observed project paths from validated ``codex_conversation_threads.cwd``
+    (absolute paths only), and display labels from
+    ``codex_conversation_rollups.project_label``. An account-scoped Codex leg
+    instead accepts a path only after account-stamped physical events prove its
+    ownership; the conversation-level thread/root metadata is then used only to
+    detect an unproven path that requires refusal. ``git_json`` is NOT a path
+    source (its fields are branch/repository metadata, not filesystem roots).
+    The existing home-dir/username machinery and ``SECRET_PATTERNS`` apply
+    unchanged; coverage stays best-effort-over-known-tokens and the per-token
+    replacement stays fail-closed.
+
+    Returns a :class:`SourceAnonPlan`: the plan, the number of Codex thread
+    ``cwd`` values the store cannot decode, and (for an account-scoped request)
+    the number of visible thread/root paths without physical ownership proof.
+    The Codex leg decodes PER ROW, so a single undecodable value no longer costs
+    the vocabulary every path after it — the loop's
+    ``except sqlite3.OperationalError: pass`` swallowed that error
+    mid-iteration and the plan came back silently short."""
+    from _lib_codex_metadata import decode_codex_project_metadata
     from _lib_conversation_anon import build_anon_plan
     want = set(sources or ())
+    scoped_account = _anon_scope_account(conn)
     project_roots: dict = {}
     paths: set = set()
     if "claude" in want:
@@ -3193,33 +3390,49 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
         for c in cwds:
             project_roots[c] = _project_label(c)
             paths.add(c)
+    undecodable_cwd_rows = 0
+    ambiguous_cwd_rows = 0
     if "codex" in want:
-        labels: dict = {}
-        try:
-            for ck, pl in conn.execute(
-                    "SELECT conversation_key, project_label FROM codex_conversation_rollups "
-                    "WHERE project_label IS NOT NULL AND project_label != ''"):
-                labels[ck] = pl
-        except sqlite3.OperationalError:
-            pass
-        try:
-            for ck, cwd in conn.execute(
-                    "SELECT conversation_key, cwd FROM codex_conversation_threads "
-                    "WHERE cwd IS NOT NULL AND cwd != ''"):
-                if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
-                    project_roots[cwd] = labels.get(ck) or _project_label(cwd)
-                    paths.add(cwd)
-        except sqlite3.OperationalError:
-            pass
-        try:
-            for (root_path,) in conn.execute(
-                    "SELECT canonical_root_path FROM codex_source_roots "
-                    "WHERE canonical_root_path IS NOT NULL AND canonical_root_path != ''"):
-                if isinstance(root_path, str) and root_path and os.path.isabs(root_path):
-                    project_roots.setdefault(root_path, _project_label(root_path))
-                    paths.add(root_path)
-        except sqlite3.OperationalError:
-            pass
+        if scoped_account is not None:
+            (
+                owned,
+                ambiguous_cwd_rows,
+                undecodable_cwd_rows,
+            ) = _scoped_codex_anon_paths(conn, scoped_account)
+            for cwd in owned:
+                project_roots[cwd] = _project_label(cwd)
+                paths.add(cwd)
+        else:
+            labels: dict = {}
+            try:
+                for ck, pl in conn.execute(
+                        "SELECT conversation_key, project_label FROM codex_conversation_rollups "
+                        "WHERE project_label IS NOT NULL AND project_label != ''"):
+                    labels[ck] = pl
+            except sqlite3.OperationalError:
+                pass
+            try:
+                for ck, cwd_blob in conn.execute(
+                        "SELECT conversation_key, CAST(cwd AS BLOB) AS cwd_blob "
+                        "FROM codex_conversation_threads "
+                        "WHERE cwd IS NOT NULL AND cwd != ''"):
+                    cwd = decode_codex_project_metadata(cwd_blob, None).cwd
+                    if isinstance(cwd, str) and cwd and os.path.isabs(cwd):
+                        project_roots[cwd] = labels.get(ck) or _project_label(cwd)
+                        paths.add(cwd)
+            except sqlite3.OperationalError:
+                pass
+        if scoped_account is None:
+            undecodable_cwd_rows = _count_undecodable_codex_cwd(conn)
+            try:
+                for (root_path,) in conn.execute(
+                        "SELECT canonical_root_path FROM codex_source_roots "
+                        "WHERE canonical_root_path IS NOT NULL AND canonical_root_path != ''"):
+                    if isinstance(root_path, str) and root_path and os.path.isabs(root_path):
+                        project_roots.setdefault(root_path, _project_label(root_path))
+                        paths.add(root_path)
+            except sqlite3.OperationalError:
+                pass
     home_dirs: set = set()
     usernames: set = set()
     if home_dir:
@@ -3234,9 +3447,13 @@ def build_anon_plan_for_sources(conn, *, home_dir, sources):
                 if user:
                     home_dirs.add(prefix + user)
                     usernames.add(user)
-    return build_anon_plan(
-        project_roots=project_roots,
-        home_dirs=sorted(home_dirs), usernames=sorted(usernames))
+    return SourceAnonPlan(
+        plan=build_anon_plan(
+            project_roots=project_roots,
+            home_dirs=sorted(home_dirs), usernames=sorted(usernames)),
+        undecodable_cwd_rows=undecodable_cwd_rows,
+        ambiguous_cwd_rows=ambiguous_cwd_rows,
+    )
 
 
 _TASK_TRIO = ("TaskCreate", "TaskUpdate", "TaskList")

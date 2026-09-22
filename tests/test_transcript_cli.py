@@ -499,3 +499,130 @@ def test_search_codex_cursor_roundtrip_via_subprocess(tmp_path, monkeypatch):
     a = (d1["hits"][0]["conversationKey"], d1["hits"][0]["itemKey"])
     b = (d2["hits"][0]["conversationKey"], d2["hits"][0]["itemKey"])
     assert a != b
+
+
+# ---- #850 §4.9 / A23: anonymized export fails closed -----------------------
+
+_A23_BAD = b"/synthetic/\xffproject"
+_A23_ACCOUNTS = ("a23aaaa" + "0" * 25, "a23bbbb" + "0" * 25)
+_A23_SENTENCE = (
+    "transcript: anonymized export is unavailable: 1 Codex project path(s) "
+    "could not be read; run cctally cache-sync --source codex --rebuild"
+)
+
+
+def _a23_two_account_store(ns, tmp_path, monkeypatch):
+    """A two-account store whose one Codex thread carries an undecodable cwd."""
+    key, _rollout = _seed_codex(ns, tmp_path, monkeypatch)
+    _seed(ns, session_id="a23-claude", text="edited /home/u/proj/secret.py")
+    stats = ns["open_db"]()
+    try:
+        for index, account in enumerate(_A23_ACCOUNTS):
+            stats.execute(
+                "INSERT INTO accounts (account_key, provider, natural_id, "
+                "email, label, plan_type, label_source, first_seen_utc, "
+                "last_seen_utc) VALUES (?,'codex',?,?,?,NULL,'auto',?,?)",
+                (account, account, f"a23-{index}@example.test",
+                 f"a23-label-{index}", "2026-07-01T00:00:00Z",
+                 "2026-07-01T00:00:00Z"),
+            )
+        stats.commit()
+    finally:
+        stats.close()
+    cache = ns["open_cache_db"]()
+    try:
+        cache.execute(
+            "UPDATE codex_conversation_threads SET cwd = CAST(? AS TEXT) "
+            "WHERE conversation_key = ?", (_A23_BAD, key))
+        cache.commit()
+    finally:
+        cache.close()
+    # The Codex rows belong to the first account, so `--account a23-label-0`
+    # still resolves the conversation and the refusal is the reason the export
+    # stops — not a conversation the scope filtered away.
+    conversations = ns["open_conversations_db"]()
+    try:
+        conversations.execute(
+            "UPDATE codex_conversation_messages SET account_key = ?",
+            (_A23_ACCOUNTS[0],))
+        conversations.commit()
+    finally:
+        conversations.close()
+    return key
+
+
+def test_850_a23_anonymized_codex_export_fails_closed_scoped_or_not(
+    tmp_path, monkeypatch, capsysbinary,
+):
+    """A23. A path the store cannot supply as a scrub token can appear in any
+    transcript, so the anonymized export refuses while any Codex thread `cwd`
+    is undecodable — and it writes nothing, rather than emitting bytes that
+    only look scrubbed. The scoped arm fails today for a second reason: the
+    planner sees an EMPTY view, so it would have counted zero.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key = _a23_two_account_store(ns, tmp_path, monkeypatch)
+
+    for account in (None, "a23-label-0"):
+        args = _ns_export(key)
+        args.account = account
+        rc = ns["cmd_transcript"](args)
+        captured = capsysbinary.readouterr()
+        assert rc == 3, account
+        assert captured.out == b"", account
+        assert _A23_SENTENCE in captured.err.decode("utf-8"), account
+
+    raw = _ns_export(key, raw=True)
+    raw.account = None
+    assert ns["cmd_transcript"](raw) == 0
+    assert capsysbinary.readouterr().out.startswith(b"#")
+
+    claude = _ns_export("a23-claude")
+    claude.account = None
+    assert ns["cmd_transcript"](claude) == 0
+    assert capsysbinary.readouterr().out.startswith(b"#")
+
+
+# ---- #850 §4.9 / M5: a read failure never yields anonymized bytes ----------
+
+def _break_the_fail_closed_count(monkeypatch):
+    """Make the planner's fail-closed count read raise a real `sqlite3.Error`.
+
+    The raw-table reference is resolved at call time, so pointing it at a table
+    that is not there makes `conn.execute` raise `OperationalError: no such
+    table` at exactly the statement under test. `_lib_codex_conversation_query`
+    binds the resolver at import time, so the viewer's own key set is not
+    affected and the planner leg is the only failing read.
+    """
+    import _lib_codex_metadata as metadata
+    monkeypatch.setattr(
+        metadata, "resolve_codex_threads_table",
+        lambda conn: "main.codex_conversation_threads_absent")
+
+
+def test_850_anonymized_export_writes_nothing_when_the_count_read_fails(
+    tmp_path, monkeypatch, capsysbinary,
+):
+    """M5 is fail-closed, so a count the store could not perform must stop the
+    export. Answering that read with zero let the CLI emit an anonymized
+    transcript whose scrub vocabulary was never established.
+
+    The command is driven through ``main`` rather than ``cmd_transcript``,
+    because the deliberate outcome is the dispatcher's: a non-zero exit and a
+    one-line message, not a traceback.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    key, _rollout = _seed_codex(ns, tmp_path, monkeypatch)
+    _break_the_fail_closed_count(monkeypatch)
+
+    rc = ns["main"](["transcript", "export", key])
+    captured = capsysbinary.readouterr()
+    assert rc != 0, captured.err
+    assert captured.out == b""
+    assert b"Traceback" not in captured.err
+    assert b"Error: no such table" in captured.err
+
+    assert ns["main"](["transcript", "export", key, "--raw"]) == 0
+    assert capsysbinary.readouterr().out.startswith(b"#")

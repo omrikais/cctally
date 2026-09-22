@@ -1113,6 +1113,17 @@ describe('ConversationRail degraded transcript store (#769 S6 / #802 QA P1)', ()
     const notice = screen.getByTestId('conv-rail-degraded');
     expect(notice.textContent).toContain('cctally cache-sync');
   });
+
+  it('keeps the first search page visible but disables more paging when the second page degrades', () => {
+    searchHits = [hit({ uuid: 'kept-first', snippet: 'first-page match' })];
+    searchTotal = 2;
+    searchDegraded = { reason: 'maintenance', message: 'The conversation store is busy with maintenance.', retryable: true };
+    dispatch({ type: 'SET_CONVERSATION_SEARCH', text: 'first-page' });
+    render(<ConversationRail />);
+    expect(screen.getByText(/first-page match/)).toBeInTheDocument();
+    expect(screen.getByText(/busy with maintenance/)).toBeInTheDocument();
+    expect(document.querySelector('.conv-rail-more')).toBeNull();
+  });
 });
 
 describe('ConversationRail sort control (#217 S4 / I-2.4)', () => {

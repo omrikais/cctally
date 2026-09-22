@@ -1923,7 +1923,11 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
     import importlib
     _cctally_store = importlib.import_module("_cctally_store")
 
-    ensure_dirs()
+    # Alternate targets are private scratch indexes. A rederive preview may
+    # open one while the live data directory has never had a logs/ directory;
+    # creating that directory would violate the preview's zero-write contract.
+    if _target_path is None:
+        ensure_dirs()
     # #453: probe the live index before the maintenance-shared opener. During
     # a large detached rebuild that opener can wait for its bounded 5-second
     # guard; a statusline arriving mid-replay would otherwise pay that delay

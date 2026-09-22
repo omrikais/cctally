@@ -132,6 +132,23 @@ describe('useConversationSearch', () => {
     expect(result.current.hits[0].uuid).toBe('new');
   });
 
+  it('ignores an old degraded response even when an aborted fetch resolves normally', async () => {
+    let resolveOld!: (response: Response) => void;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveOld = resolve; }));
+    mockFetchOnce(result1);
+    const { result, rerender } = renderHook(({ q }) => useConversationSearch(q), { initialProps: { q: 'old' } });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    rerender({ q: 'flock' });
+    await act(async () => {
+      resolveOld({ ok: true, status: 200, json: async () => ({ status: 'degraded', degraded_reason: 'maintenance' }) } as Response);
+      await Promise.resolve(); await Promise.resolve();
+    });
+    expect(result.current.degraded).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(250); await Promise.resolve(); await Promise.resolve(); });
+    expect(result.current.hits.map((hit) => hit.uuid)).toEqual(['u1']);
+    expect(result.current.degraded).toBeNull();
+  });
+
   it('aborts the in-flight fetch the instant the needle changes — a late prior-needle response cannot commit (ctlRef)', async () => {
     // 'old' fetch is in flight when the needle advances to 'older'; effect (1)'s
     // cleanup aborts 'old' IMMEDIATELY. Resolving the (now-aborted) 'old'
@@ -250,6 +267,67 @@ describe('useConversationSearch', () => {
     const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
     const moreUrl = fetchMock.mock.calls[1][0] as string;
     expect(moreUrl).toContain('offset=1');   // offset = prior hits.length
+  });
+
+  it('stops bare search paging on a degraded response and preserves existing hits', async () => {
+    mockFetchOnce({ ...result1, total: 2 });
+    const { result } = renderHook(() => useConversationSearch('flock'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    mockFetchOnce({ results: [], total: 0, status: 'degraded', degraded_reason: 'maintenance' });
+    await act(async () => { await result.current.loadMore(); });
+
+    expect(result.current.hits.map((hit) => hit.uuid)).toEqual(['u1']);
+    expect(result.current.total).toBe(2);
+    expect(result.current.degraded).toMatchObject({ reason: 'maintenance', retryable: true });
+    expect(result.current.error).toBeNull();
+    await act(async () => { result.current.loadMore(); await Promise.resolve(); });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops qualified search paging on a degraded response before adapting hits', async () => {
+    mockFetchOnce({
+      status: 'ok', query: 'needle', total: 2, mode: 'fts', depth: 'full',
+      hits: [{ conversation_key: 'v1.root-a', item_key: 'civ1.item', title: 'Codex thread', snippet: 'needle', badges: [], last_activity_utc: null, project_label: 'proj' }],
+      page: { returned: 1, cursor: 'next' },
+    });
+    const { result } = renderHook(() => useConversationSearch('needle', 'all', 'codex'));
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    mockFetchOnce({ results: [], total: 0, status: 'degraded', degraded_reason: 'maintenance' });
+    await act(async () => { await result.current.loadMore(); });
+
+    expect(result.current.hits.map((hit) => hit.uuid)).toEqual(['civ1.item']);
+    expect(result.current.total).toBe(2);
+    expect(result.current.degraded).toMatchObject({ reason: 'maintenance', retryable: true });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('drops a stale degraded append after a newer query has committed', async () => {
+    mockFetchOnce({ ...result1, total: 2 });
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    let resolveMore: (value: unknown) => void = () => {};
+    const { result, rerender } = renderHook(({ q }) => useConversationSearch(q), { initialProps: { q: 'flock' } });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    fetchMock.mockImplementationOnce(() => new Promise((resolve) => { resolveMore = resolve; }));
+    await act(async () => { result.current.loadMore(); });
+    mockFetchOnce({ ...result1, query: 'fresh', hits: [{ ...result1.hits[0], uuid: 'fresh' }] });
+    rerender({ q: 'fresh' });
+    await act(async () => { vi.advanceTimersByTime(250); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    await act(async () => {
+      resolveMore({ ok: true, status: 200, json: async () => ({ results: [], total: 0, status: 'degraded', degraded_reason: 'maintenance' }) });
+      await Promise.resolve(); await Promise.resolve();
+    });
+
+    expect(result.current.hits.map((hit) => hit.uuid)).toEqual(['fresh']);
+    expect(result.current.degraded).toBeNull();
+    expect(result.current.error).toBeNull();
   });
 
   it('discards a stale loadMore append when the needle changes mid-flight', async () => {

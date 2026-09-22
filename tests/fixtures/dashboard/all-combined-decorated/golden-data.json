@@ -251,7 +251,7 @@
     "window_days": 14
   },
   "current_week": {
-    "dollar_per_pct": 0.0612089552238806,
+    "dollar_per_pct": 0.09113333333333333,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -267,11 +267,11 @@
     "reset_in_sec": 0,
     "spent_usd": 2.0505,
     "total_tokens": 511000,
-    "used_pct": 34.0,
+    "used_pct": 23.0,
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "169c5df519d2b40f",
+        "detail_stamp": "738d1f0f9aa17e09",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -882,11 +882,11 @@
   },
   "generated_at": "__NOW__",
   "header": {
-    "dollar_per_pct": 0.0612089552238806,
+    "dollar_per_pct": 0.09113333333333333,
     "five_hour_pct": null,
     "forecast_pct": 78.16666666666667,
     "forecast_verdict": "ok",
-    "used_pct": 34.0,
+    "used_pct": 23.0,
     "vs_last_week_delta": null,
     "week_label": "Apr 13\u2013Apr 20"
   },
@@ -1803,7 +1803,7 @@
         "hero": {
           "cost_usd": 2.0505,
           "current_week": {
-            "dollar_per_pct": 0.0612089552238806,
+            "dollar_per_pct": 0.09113333333333333,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": null,
@@ -1819,11 +1819,11 @@
             "reset_in_sec": 345600,
             "spent_usd": 2.0505,
             "total_tokens": 511000,
-            "used_pct": 34.0,
+            "used_pct": 23.0,
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "169c5df519d2b40f",
+                "detail_stamp": "738d1f0f9aa17e09",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -1933,11 +1933,11 @@
             "week_avg_projection_pct": 78.16666666666667
           },
           "header": {
-            "dollar_per_pct": 0.0612089552238806,
+            "dollar_per_pct": 0.09113333333333333,
             "five_hour_pct": null,
             "forecast_pct": 78.16666666666667,
             "forecast_verdict": "ok",
-            "used_pct": 34.0,
+            "used_pct": 23.0,
             "vs_last_week_delta": null,
             "week_label": "Apr 13\u2013Apr 20"
           },
@@ -3643,7 +3643,7 @@
             }
           ],
           "current_week": {
-            "dollar_per_pct": 0.0612089552238806,
+            "dollar_per_pct": 0.09113333333333333,
             "five_hour_block": null,
             "five_hour_pct": null,
             "five_hour_resets_in_sec": null,
@@ -3657,11 +3657,11 @@
             "reset_in_sec": 345600,
             "spent_usd": 2.0505,
             "total_tokens": 511000,
-            "used_pct": 34.0,
+            "used_pct": 23.0,
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "169c5df519d2b40f",
+                "detail_stamp": "738d1f0f9aa17e09",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,

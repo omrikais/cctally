@@ -29,6 +29,7 @@ ALIAS = "gpt-5.6"
 CANONICAL = "gpt-5.6-sol"
 CYBER = "gpt-5.6-cyber"
 ASTRA = "gpt-6-astra"
+LUNA = "gpt-6-luna"
 
 # Every runtime identifier OpenAI documents as pointing at Sol's card.
 # `docs/pricing-gotchas.md` requires the same three properties of each of them
@@ -37,6 +38,7 @@ ASTRA = "gpt-6-astra"
 # #643's new one alone. `gpt-daybreak-blue-latest` is the older of the two and
 # is the alias this branch adds to the second rate card's map.
 SOL_ALIASES = ("gpt-5.6", "gpt-daybreak-blue-latest")
+RED_ALIAS = "gpt-daybreak-red-latest"
 
 # The second rate card is maintainer-local and mirror-private, so a public
 # clone does not carry the script and the two assertions over it have nothing
@@ -106,19 +108,6 @@ def _load_session_metrics():
     return module
 
 
-def _axis_cost(card: dict, tokens: int, base_key: str, tiered_key: str) -> float:
-    """Apply the documented per-axis tier rule to an embedded card.
-
-    Only the portion above ``CODEX_TIERED_THRESHOLD`` is charged at the tier
-    rate. This derives the expectation from the card and the rule rather than
-    restating a number, so the assertion still fails if the card is wrong.
-    """
-    threshold = pricing.CODEX_TIERED_THRESHOLD
-    if tokens <= threshold:
-        return tokens * card[base_key]
-    return threshold * card[base_key] + (tokens - threshold) * card[tiered_key]
-
-
 @pytest.mark.parametrize("alias", SOL_ALIASES)
 def test_sol_alias_resolves_to_the_canonical_card(alias, capsys):
     """D3 — an alias resolves to one canonical card, not a duplicate."""
@@ -177,14 +166,14 @@ def test_sol_alias_bills_the_fast_tier_at_the_canonical_multiplier(
 @pytest.mark.parametrize(
     ("input_tokens", "cached_input_tokens", "output_tokens"),
     [
-        (380_000, 100_000, 20_000),   # non-cached input crosses the threshold
-        (390_000, 300_000, 10_000),   # cached input crosses it instead
+        (380_000, 100_000, 20_000),   # mostly uncached qualifying prompt
+        (390_000, 300_000, 10_000),   # mostly cached qualifying prompt
     ],
 )
 def test_cyber_prices_from_its_own_card_across_the_272k_tier(
     input_tokens, cached_input_tokens, output_tokens, capsys,
 ):
-    """D4 — cyber has its own card and its above-272k tier is applied per axis."""
+    """D4 — the full request uses Cyber's long card when input exceeds 272K."""
     pricing._unknown_codex_model_warnings.discard(CYBER)
     card = pricing.CODEX_MODEL_PRICING[CYBER]
 
@@ -193,21 +182,15 @@ def test_cyber_prices_from_its_own_card_across_the_272k_tier(
     non_cached_input = input_tokens - cached_input_tokens
 
     expected = (
-        _axis_cost(card, non_cached_input,
-                   "input_cost_per_token",
-                   "input_cost_per_token_above_272k_tokens")
-        + _axis_cost(card, cached_input_tokens,
-                     "cache_read_input_token_cost",
-                     "cache_read_input_token_cost_above_272k_tokens")
-        + _axis_cost(card, output_tokens,
-                     "output_cost_per_token",
-                     "output_cost_per_token_above_272k_tokens")
+        non_cached_input * card["input_cost_per_token_above_272k_tokens"]
+        + cached_input_tokens
+        * card["cache_read_input_token_cost_above_272k_tokens"]
+        + output_tokens * card["output_cost_per_token_above_272k_tokens"]
     )
     untiered = (non_cached_input * card["input_cost_per_token"]
                 + cached_input_tokens * card["cache_read_input_token_cost"]
                 + output_tokens * card["output_cost_per_token"])
-    # Without this the vector could sit entirely below the threshold and the
-    # assertion below would pass without ever exercising the tier.
+    # A tier-positive vector makes the assertion sensitive to the tier.
     assert expected > untiered
 
     cost = pricing._calculate_codex_entry_cost(
@@ -219,6 +202,61 @@ def test_cyber_prices_from_its_own_card_across_the_272k_tier(
     assert "unknown model" not in capsys.readouterr().err
 
 
+def test_gpt_6_luna_prices_vendor_standard_long_and_fast_rates(capsys):
+    """New Luna usage must avoid the legacy gpt-5 fallback at every tier."""
+    pricing._unknown_codex_model_warnings.discard(LUNA)
+    standard = pricing._calculate_codex_entry_cost(
+        LUNA, 100_000, 20_000, 10_000, 0,
+    )
+    long_context = pricing._calculate_codex_entry_cost(
+        LUNA, 500_000, 0, 0, 0,
+    )
+    fast = pricing._calculate_codex_entry_cost(
+        LUNA, 500_000, 0, 0, 0, speed="fast",
+    )
+    boundary = pricing._calculate_codex_entry_cost(
+        LUNA, 272_000, 0, 0, 0,
+    )
+    first_long = pricing._calculate_codex_entry_cost(
+        LUNA, 272_001, 0, 0, 0,
+    )
+    whole_long_request = pricing._calculate_codex_entry_cost(
+        LUNA, 300_000, 100_000, 10_000, 2_000,
+    )
+    output_does_not_qualify = pricing._calculate_codex_entry_cost(
+        LUNA, 100_000, 20_000, 300_000, 50_000,
+    )
+
+    assert standard == pytest.approx(0.0132)
+    assert long_context == pytest.approx(0.1)
+    assert fast == pytest.approx(0.2)
+    assert boundary == pytest.approx(0.0272)
+    assert first_long == pytest.approx(0.0544002)
+    assert whole_long_request == pytest.approx(0.0495)
+    assert output_does_not_qualify == pytest.approx(0.1582)
+    assert pricing._is_codex_fallback(LUNA) is False
+    assert "unknown model" not in capsys.readouterr().err
+
+
+def test_daybreak_red_alias_prices_from_the_current_cyber_card(capsys):
+    pricing._unknown_codex_model_warnings.discard(RED_ALIAS)
+    resolved, fallback = pricing._resolve_codex_pricing(RED_ALIAS)
+
+    assert RED_ALIAS not in pricing.CODEX_MODEL_PRICING
+    assert resolved is pricing.CODEX_MODEL_PRICING[CYBER]
+    assert fallback is False
+    vector = (100_000, 20_000, 10_000, 0)
+    assert pricing._calculate_codex_entry_cost(RED_ALIAS, *vector) == (
+        pricing._calculate_codex_entry_cost(CYBER, *vector)
+    )
+    assert pricing._calculate_codex_entry_cost(
+        RED_ALIAS, *vector, speed="fast",
+    ) == pricing._calculate_codex_entry_cost(
+        CYBER, *vector, speed="fast",
+    )
+    assert "unknown model" not in capsys.readouterr().err
+
+
 @requires_session_metrics
 def test_session_metrics_rate_card_matches_the_authoritative_table():
     """Every model the second estimator prices agrees with the real table."""
@@ -226,7 +264,20 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
 
     assert metrics.PRICING, "the estimator prices no model at all"
     assert CYBER in metrics.PRICING
+    assert metrics.PRICING["gpt-5.5-cyber"] == (12.5, 75.0)
+    historical = pricing.CODEX_MODEL_PRICING["gpt-5.5-cyber"]
+    assert historical == {
+        "input_cost_per_token": 1.25e-05,
+        "cache_read_input_token_cost": 1.25e-06,
+        "output_cost_per_token": 7.5e-05,
+    }
+    assert pricing._is_codex_fallback("gpt-5.5-cyber") is False
+    assert pricing._calculate_codex_entry_cost(
+        "gpt-5.5-cyber", 300_000, 100_000, 10_000, 0,
+    ) == pytest.approx(3.375)
     assert metrics.PRICING[ASTRA] == (10.0, 50.0)
+    assert metrics.PRICING["gpt-6-sol"] == (2.0, 10.0)
+    assert metrics.PRICING[LUNA] == (0.1, 0.5)
     for model, (input_per_mtok, output_per_mtok) in metrics.PRICING.items():
         card = pricing.CODEX_MODEL_PRICING[pricing._canonical_codex_model(model)]
         assert input_per_mtok == pytest.approx(

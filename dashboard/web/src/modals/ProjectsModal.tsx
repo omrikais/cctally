@@ -427,54 +427,48 @@ function CanonicalProjectsModal({ source }: { source: DashboardSelection }) {
       }
     >
       <div className="projects-modal-body">
-        <div className="projects-controls" role="radiogroup" aria-label="Window">
-          {WINDOW_PILLS.map((w) => (
+        <div className="projects-controls">
+          <div className="projects-control-group" role="radiogroup" aria-label="Window">
+            {WINDOW_PILLS.map((w) => (
+              <button
+                key={`window-${w}`}
+                type="button"
+                role="radio"
+                aria-checked={windowWeeks === w}
+                aria-label={`${w} ${w === 1 ? 'cycle' : 'cycles'}`}
+                className={`pill ${windowWeeks === w ? 'on' : ''}`}
+                disabled={!isClaude}
+                title={!isClaude ? 'Provider-native project history is unavailable' : undefined}
+                onClick={() => savePref('projectsWindowWeeks', w)}
+              >
+                {w}
+              </button>
+            ))}
+            {/* Bare-number pills keep the unit visible; each radio includes
+                it in its accessible name. `0` still selects 12 cycles. */}
+            <span className="projects-window-unit" aria-hidden="true">cycles</span>
+          </div>
+          <span className="sep" aria-hidden="true">|</span>
+          <div className="projects-control-group" role="radiogroup" aria-label="Y-axis">
             <button
-              key={`window-${w}`}
               type="button"
               role="radio"
-              aria-checked={windowWeeks === w}
-              aria-label={`${w} ${w === 1 ? 'cycle' : 'cycles'}`}
-              className={`pill ${windowWeeks === w ? 'on' : ''}`}
-              disabled={!isClaude}
-              title={!isClaude ? 'Provider-native project history is unavailable' : undefined}
-              onClick={() => savePref('projectsWindowWeeks', w)}
+              aria-checked={yMode === 'share'}
+              className={`pill ${yMode === 'share' ? 'on' : ''}`}
+              onClick={() => savePref('projectsTrendYMode', 'share')}
             >
-              {w}
+              share %
             </button>
-          ))}
-          {/* The pills render bare numbers under this explicit unit label
-              (#750 S4 D2/D6). The `0` key still selects 12, so the keymap is
-              unchanged.
-              The unit reaches assistive technology through each radio's own
-              `aria-label`, not through this span and not through the group's
-              label: a non-radio text child of a radiogroup is not tied to the
-              radios, so a screen-reader user heard four bare numbers and then a
-              loose "cycles". Naming the GROUP for the unit would be wrong in
-              the other direction, because this one radiogroup also holds the
-              `share %` and `$ absolute` radios, which count no cycles. The span
-              is hidden from the accessibility tree because it now duplicates
-              what every window radio already announces. */}
-          <span className="projects-window-unit" aria-hidden="true">cycles</span>
-          <span className="sep" aria-hidden="true">|</span>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={yMode === 'share'}
-            className={`pill ${yMode === 'share' ? 'on' : ''}`}
-            onClick={() => savePref('projectsTrendYMode', 'share')}
-          >
-            share %
-          </button>
-          <button
-            type="button"
-            role="radio"
-            aria-checked={yMode === 'absolute'}
-            className={`pill ${yMode === 'absolute' ? 'on' : ''}`}
-            onClick={() => savePref('projectsTrendYMode', 'absolute')}
-          >
-            $ absolute
-          </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={yMode === 'absolute'}
+              className={`pill ${yMode === 'absolute' ? 'on' : ''}`}
+              onClick={() => savePref('projectsTrendYMode', 'absolute')}
+            >
+              $ absolute
+            </button>
+          </div>
         </div>
 
         {/* #620 S1 D2/D13 — the definitions in rendered text, under the
