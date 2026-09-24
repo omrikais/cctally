@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.111.0] - 2026-09-24
+
+### Fixed
+- After `cctally update` or a Homebrew upgrade installs a newer version, a running `dashboard` restarts itself so new prices and code apply. Restart it yourself once after installing this release, and after any manual `npm install -g`.
+- A `dashboard` restart after an update no longer leaves an extra Node process running on npm installs.
+
 ## [1.110.0] - 2026-09-22
 
 ### Added

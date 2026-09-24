@@ -107,13 +107,10 @@ def _import_pricing_kernel():
 
 
 # ``DEFAULT_TIERED_THRESHOLD`` above is Anthropic's per-call >200K-tokens tier,
-# READ FROM ``_lib_pricing`` rather than duplicated here (#714). It used to be a
-# literal `200_000` with nothing keeping it equal to
-# ``_lib_pricing.TIERED_THRESHOLD``, which made it a pricing value a reload
-# could not replace. It is refreshed by ``PRICING_EXPORT_BINDINGS`` on every
-# swap, and ``_compute_entry_cache_dollars`` resolves it at CALL time — a
-# default argument would bind it once at function-definition time, so the
-# refresh would reach the name and never the calls.
+# READ FROM ``_lib_pricing.TIERED_THRESHOLD`` rather than duplicated here, so
+# the two cannot drift. ``_compute_entry_cache_dollars`` resolves it at CALL
+# time instead of binding it as a default argument, so this module global is
+# the one place the value is taken from.
 # Callers may still override via the ``tiered_threshold`` kwarg.
 
 
@@ -384,9 +381,9 @@ def _compute_entry_cache_dollars(
     warning for unknown models elsewhere.
 
     ``tiered_threshold=None`` resolves ``DEFAULT_TIERED_THRESHOLD`` HERE rather
-    than in the signature (#714). A default argument is evaluated once, at
-    function-definition time, so an in-process pricing reload would refresh the
-    module global and leave every call pricing from the superseded revision.
+    than in the signature. A default argument is evaluated once, at
+    function-definition time, so a change to the module global would never
+    reach the calls.
     """
     if tiered_threshold is None:
         tiered_threshold = DEFAULT_TIERED_THRESHOLD

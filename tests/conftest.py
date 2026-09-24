@@ -814,6 +814,7 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "UPDATE_LOG_PATH": share / "update.log",
         "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
         "UPDATE_CHECK_LAST_FETCH_PATH": share / "update-check.last-fetch",
+        "INSTALL_SUCCESS_RECORD_PATH": share / "install-success.json",
         # Anonymous install-count telemetry markers (spec 2026-07-07). Pinned
         # here so a beat/arm during a test writes install_id + markers to the
         # per-test tmp APP_DIR, never the developer's real prod data dir.

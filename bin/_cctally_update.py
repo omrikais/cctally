@@ -75,7 +75,12 @@ worker / polling thread:
   (two-thread pump → callbacks + log lines),
   ``_do_update_install`` (acquire lock → run steps → release →
   rotate log; dry-run path skips lock + subprocesses),
-  ``_resolve_execvp_target`` (npm shim re-entry path, spec §5.7).
+  ``_resolve_execvp_target`` (spec §5.7; npm execs Python directly
+  since #868) and ``_execvp_target_problem`` (target validity).
+- Install evidence (#868): ``install-success.json`` via
+  ``_write_install_success_record`` / ``_read_install_success_record``,
+  ``_update_lock_is_held``, ``_install_root_for_entrypoint``,
+  ``_read_changelog_version_at``, ``_install_layout``.
 - Dashboard surface: ``UpdateWorker`` (single-slot orchestrator,
   spec §5.6; idempotent-release contract per §5.6.1),
   ``_DashboardUpdateCheckThread`` (poll cadence ≠ network-call
@@ -184,12 +189,14 @@ import argparse
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import pathlib
 import queue
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -677,6 +684,101 @@ def _release_update_lock(fd: int) -> None:
         pass
 
 
+_INSTALL_SUCCESS_RECORD_SCHEMA = 1
+
+
+@dataclass(frozen=True)
+class InstallSuccessRecord:
+    """One install event from ``install-success.json`` (#868)."""
+
+    version: str
+    at_utc: str
+    token: str
+
+
+def _write_install_success_record(version: str) -> None:
+    """Atomically replace the install-only success record (#868).
+
+    ``_do_update_check`` loads ``update-state.json`` before its network fetch
+    and saves that object afterward, so an install that stamps success during
+    the fetch loses its fields there. Only the install paths write this file,
+    so no update check can erase an install event. Every write mints a fresh
+    random token: a running dashboard compares tokens, never times, so a clock
+    step can neither hide a new install nor revive an old one.
+    """
+    path = _cctally_core.INSTALL_SUCCESS_RECORD_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps({
+        "_schema": _INSTALL_SUCCESS_RECORD_SCHEMA,
+        "version": version,
+        "at_utc": _now_utc().isoformat(),
+        "token": secrets.token_hex(16),
+    }, sort_keys=True) + "\n").encode("utf-8")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        raise
+
+
+def _read_install_success_record() -> "InstallSuccessRecord | None":
+    """The current install-success record, or None when absent or malformed."""
+    try:
+        raw = json.loads(
+            _cctally_core.INSTALL_SUCCESS_RECORD_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("_schema") != _INSTALL_SUCCESS_RECORD_SCHEMA:
+        return None
+    fields = (raw.get("version"), raw.get("at_utc"), raw.get("token"))
+    if not all(isinstance(v, str) and v for v in fields):
+        return None
+    try:
+        _release_parse_semver(fields[0])
+    except ValueError:
+        return None
+    return InstallSuccessRecord(*fields)
+
+
+def _update_lock_is_held() -> bool:
+    """True unless ``update.lock`` is provably free; never creates the file.
+
+    A shared non-blocking probe conflicts with the updater's exclusive lock. A
+    lock file left behind by a finished or crashed updater carries no lock, so
+    it reads as free. The probe holds its shared lock for an instant, so an
+    updater whose own non-blocking attempt lands in that instant takes its
+    contention path. Any other error proves nothing about the updater and
+    reads as held.
+    """
+    try:
+        fd = os.open(str(_cctally_core.UPDATE_LOCK_PATH), os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _rotate_update_log_if_needed() -> None:
     """Rotate ``update.log`` → ``update.log.1`` when the live log
     crosses :data:`UPDATE_LOG_ROTATE_BYTES` (1 MB, spec §1.5).
@@ -905,6 +1007,9 @@ def _stamp_install_success_to_state(
          installed version. Skipped on brew for the reason above.
       4. ``state.latest_version`` — last resort, also covers the npm
          path when CHANGELOG is unreadable.
+
+    The same version is also written to ``install-success.json`` (#868),
+    which a running dashboard reads to decide whether to restart itself.
     """
     c = _cctally()
     state = c._load_update_state() or {"_schema": 1}
@@ -923,6 +1028,15 @@ def _stamp_install_success_to_state(
         state["current_version"] = cur
         state["last_install_success_at_utc"] = _now_utc().isoformat()
         c._save_update_state(state)
+        try:
+            c._write_install_success_record(cur)
+        except OSError as exc:
+            # The install itself succeeded; only a running dashboard's
+            # automatic restart loses its evidence.
+            eprint(f"cctally: could not write "
+                   f"{_cctally_core.INSTALL_SUCCESS_RECORD_PATH.name} ({exc}); "
+                   "a running dashboard will not restart itself for this "
+                   "install")
 
 
 def _self_heal_current_version() -> None:
@@ -2106,7 +2220,7 @@ def _do_update_install(
         c._rotate_update_log_if_needed()
 
 
-# === Dashboard execvp re-entry (spec §5.7) ===
+# === Dashboard execvp re-entry (spec §5.7; #868) ===
 # ORIGINAL_SYS_ARGV / ORIGINAL_ENTRYPOINT are captured at dashboard
 # server boot in cmd_dashboard (in bin/cctally, written via
 # ``global ORIGINAL_SYS_ARGV, ORIGINAL_ENTRYPOINT`` so the running
@@ -2117,31 +2231,114 @@ def _do_update_install(
 #
 # _resolve_execvp_target uses them to return (entrypoint, exec_argv)
 # for os.execvp:
-#   - npm: entrypoint = <prefix>/bin/cctally → Node shim, which
-#     re-resolves CCTALLY_PYTHON before re-spawning Python (so a
-#     custom interpreter setting survives the restart).
+#   - npm: the interpreter the Node shim would use (CCTALLY_PYTHON, else
+#     python3 on PATH) on the install's bin/cctally. Re-entering the shim
+#     would add a Node process per restart, because the shim starts Python
+#     with spawnSync and waits for it (#868).
 #   - brew: entrypoint = <brew>/bin/cctally → symlink into the
 #     post-upgrade Python script with its rewritten shebang.
 #   - Fallback when shutil.which("cctally") returned None: use
-#     sys.argv[0] directly. Loses the npm shim layer; we accept the
-#     degraded edge case rather than guess.
+#     sys.argv[0] directly.
+# The install watcher (#868) and UpdateWorker both refuse a target that
+# _execvp_target_problem rejects.
+
+
+def _install_root_for_entrypoint(entrypoint: "str | None") -> "pathlib.Path | None":
+    """Install root behind a user-facing entrypoint, resolved afresh (#868).
+
+    npm: ``<prefix>/bin/cctally`` → ``…/node_modules/cctally/bin/cctally-npm-shim.js``
+    → ``…/node_modules/cctally``. Homebrew: ``<prefix>/bin/cctally`` →
+    ``Cellar/cctally/<v>/libexec/bin/cctally`` → ``…/libexec``, where the
+    formula installs ``CHANGELOG.md``. The process's own ``CHANGELOG_PATH`` is
+    never used for this: it stays inside the install the process booted from.
+    """
+    if not entrypoint:
+        return None
+    try:
+        real = pathlib.Path(os.path.realpath(entrypoint))
+    except (OSError, ValueError):
+        return None
+    if real.parent.name != "bin":
+        return None
+    return real.parent.parent
+
+
+def _read_changelog_version_at(root) -> "str | None":
+    """Latest stamped version in ``<root>/CHANGELOG.md``, or None."""
+    try:
+        text = (pathlib.Path(root) / "CHANGELOG.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    m = _cctally().RELEASE_HEADER_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _install_layout(root) -> str:
+    """``"npm"``, ``"brew"`` or ``"other"`` for an install root."""
+    root = pathlib.Path(root)
+    if ((root / "bin" / "cctally-npm-shim.js").is_file()
+            and (root / "package.json").is_file()):
+        return "npm"
+    parts = root.parts
+    if (root.name == "libexec" and len(parts) >= 4
+            and parts[-4] == "Cellar" and parts[-3] == "cctally"):
+        return "brew"
+    return "other"
 
 
 def _resolve_execvp_target() -> tuple[str, list[str]]:
-    """Return (entrypoint, exec_argv) per spec §5.7.
+    """Return (entrypoint, exec_argv) for the in-place restart.
 
-    Re-enters the npm shim by execvp'ing the PATH-resolved ``cctally``
-    (Node shim for npm, brew symlink for brew). Falls back to
-    ``sys.argv[0]`` only when ``shutil.which`` returned ``None`` at
-    dashboard boot (rare absolute-path invocation).
+    npm installs exec the interpreter the shim would use (``CCTALLY_PYTHON``,
+    else ``python3`` on ``PATH``) on the install's ``bin/cctally`` directly, so
+    the serving Python process keeps its PID and the original shim stays its
+    only Node parent (#868). Homebrew re-enters the captured entrypoint, which
+    resolves into the newly linked keg. Falls back to ``sys.argv[0]`` only when
+    ``shutil.which`` returned ``None`` at dashboard boot.
     """
     c = _cctally()
     if c.ORIGINAL_ENTRYPOINT is not None:
+        root = _install_root_for_entrypoint(c.ORIGINAL_ENTRYPOINT)
+        if root is not None and _install_layout(root) == "npm":
+            python = os.environ.get("CCTALLY_PYTHON") or "python3"
+            if os.path.sep not in python:
+                python = shutil.which(python) or python
+            return (python,
+                    [python, str(root / "bin" / "cctally"),
+                     *c.ORIGINAL_SYS_ARGV[1:]])
         return (
             c.ORIGINAL_ENTRYPOINT,
             [c.ORIGINAL_ENTRYPOINT, *c.ORIGINAL_SYS_ARGV[1:]],
         )
     return (c.ORIGINAL_SYS_ARGV[0], list(c.ORIGINAL_SYS_ARGV))
+
+
+def _execvp_target_problem(entrypoint: str, argv: "list[str]") -> "str | None":
+    """Why ``os.execvp(entrypoint, argv)`` cannot start cctally, or None.
+
+    The executable must resolve to an executable file. When ``argv[1]`` is an
+    install's ``bin/cctally`` (the npm target), that script must exist and be
+    readable, the same file the npm shim checks before it starts Python.
+    """
+    path = entrypoint if os.path.sep in entrypoint else shutil.which(entrypoint)
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return f"restart target {entrypoint!r} is not an executable file"
+    if (len(argv) >= 2 and os.path.isabs(argv[1])
+            and pathlib.Path(argv[1]).parts[-2:] == ("bin", "cctally")):
+        if not (os.path.isfile(argv[1]) and os.access(argv[1], os.R_OK)):
+            return f"restart script {argv[1]!r} is missing or unreadable"
+    return None
+
+
+class AutomaticRestartInProgress(Exception):
+    """``UpdateWorker.start`` refused: the install watcher holds the restart
+    claim (#868, maintainer decision 6)."""
+
+    def __init__(self, version: str) -> None:
+        self.version = version
+        super().__init__(
+            f"The dashboard is restarting to load v{version}. "
+            "Try again in a moment.")
 
 
 class UpdateWorker:
@@ -2175,15 +2372,23 @@ class UpdateWorker:
         # consumer ever subscribes, ``start()`` reaps stale entries on
         # the next run.
         self._streams: dict[str, "queue.Queue"] = {}
+        # The install watcher's restart claim (#868): the candidate version
+        # while held, else None. Guarded by ``_lock`` together with
+        # ``_current_id``, so a claim and an admitted run exclude each other.
+        self._auto_restart_version: "str | None" = None
 
     def start(self, version: "str | None") -> tuple[bool, str]:
         """Begin a run. Returns (accepted, run_id).
 
         ``accepted=False`` when another run is in progress; the
         returned ``run_id`` is the in-progress one (so the caller can
-        surface it as ``run_id_in_progress`` to the client).
+        surface it as ``run_id_in_progress`` to the client). Raises
+        :class:`AutomaticRestartInProgress` while the install watcher holds
+        the restart claim (#868).
         """
         with self._lock:
+            if self._auto_restart_version is not None:
+                raise AutomaticRestartInProgress(self._auto_restart_version)
             if self._current_id is not None:
                 return (False, self._current_id)
             # Reap any stale entries from prior no-consumer runs. Safe
@@ -2205,6 +2410,26 @@ class UpdateWorker:
         """Return ``{"current_run_id": <run_id|None>}`` for /api/update/status."""
         with self._lock:
             return {"current_run_id": self._current_id}
+
+    def claim_automatic_restart(self, version: str) -> bool:
+        """Claim the in-place restart for the install watcher (#868).
+
+        Fails while an update run is admitted, because that run owns its own
+        stamp, flush, lock release and exec. The claim is not an update run:
+        it has no run id, stream or event, so ``status()`` still reports no
+        run and a client that clicks Update meanwhile gets
+        :class:`AutomaticRestartInProgress` from ``start``.
+        """
+        with self._lock:
+            if (self._current_id is not None
+                    or self._auto_restart_version is not None):
+                return False
+            self._auto_restart_version = version
+            return True
+
+    def release_automatic_restart(self) -> None:
+        with self._lock:
+            self._auto_restart_version = None
 
     def _emit(self, run_id: str, event: dict) -> None:
         q = self._streams.get(run_id)
@@ -2310,6 +2535,9 @@ class UpdateWorker:
             _log_update_event(log_fd, "INSTALL_SUCCESS")
             c._stamp_install_success_to_state(resolved_version, method)
             entrypoint, exec_argv = c._resolve_execvp_target()
+            problem = c._execvp_target_problem(entrypoint, exec_argv)
+            if problem is not None:
+                raise UpdateError(problem)
             self._emit(run_id, {"type": "execvp", "argv": exec_argv})
             try:
                 log_fd.close()
@@ -2345,6 +2573,184 @@ class UpdateWorker:
                 # _streams[run_id] intentionally retained — see class
                 # docstring. Cleanup is owned by stream()'s finally;
                 # start() sweeps stale entries on the next run.
+
+
+# === Install watch (#868) =================================================
+# A running dashboard restarts itself in place when a proven install puts a
+# strictly newer cctally under it. Spec:
+# docs/superpowers/specs/2026-09-23-868-dashboard-restart-on-install-design.md
+
+_INSTALL_WATCH_INTERVAL_S = 60.0
+_INSTALL_RESTART_RETRY_DELAYS_S = (60.0, 300.0, 900.0)
+_INSTALL_RESTART_FLUSH_S = 0.5
+
+
+@dataclass(frozen=True)
+class InstallBootState:
+    """What the dashboard process booted from. Later polls compare against it,
+    never against wall-clock time, so a restarted process cannot qualify on the
+    install it booted from."""
+
+    version: "str | None"
+    root: "pathlib.Path | None"
+    record_token: "str | None"
+
+
+def capture_install_boot_state() -> InstallBootState:
+    c = _cctally()
+    latest = c._release_read_latest_release_version()
+    record = _read_install_success_record()
+    return InstallBootState(
+        version=latest[0] if latest else None,
+        root=_install_root_for_entrypoint(c.ORIGINAL_ENTRYPOINT),
+        record_token=record.token if record else None,
+    )
+
+
+@dataclass(frozen=True)
+class RestartCandidate:
+    """A proven newer install. ``identity`` keys the retry budget: the version
+    with the record token (updater) or the resolved install root (Homebrew)."""
+
+    version: str
+    evidence: str
+    identity: tuple
+
+
+class InstallWatch:
+    """Restart the dashboard in place after a proven newer install (#868).
+
+    Proven means cctally's updater wrote a new install-success record, or
+    Homebrew switched the entrypoint into a newer keg. A manual npm install
+    rewrites files in place with no completion signal, so it never qualifies.
+
+    The restart meets the Update-button safety bar and no more: nothing is
+    stopped before the exec, and an in-flight write is interrupted as in a
+    crash. The claim on ``UpdateWorker`` keeps an admitted update run as the
+    sole owner of its own restart.
+    """
+
+    def __init__(self, boot, *, worker_fn, exec_fn=os.execvp,
+                 sleep_fn=time.sleep, monotonic_fn=time.monotonic,
+                 log_fn=None, interval_s=_INSTALL_WATCH_INTERVAL_S,
+                 retry_delays=_INSTALL_RESTART_RETRY_DELAYS_S,
+                 flush_s=_INSTALL_RESTART_FLUSH_S):
+        self._boot = boot
+        self._worker_fn = worker_fn
+        self._exec = exec_fn
+        self._sleep = sleep_fn
+        self._monotonic = monotonic_fn
+        self._log = log_fn or eprint
+        self.interval_s = interval_s
+        self._retry_delays = tuple(retry_delays)
+        self._flush_s = flush_s
+        # identity -> (failed attempts, monotonic time of the next attempt)
+        self._attempts: dict = {}
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+
+    def _say(self, msg: str) -> None:
+        # A lost log line, e.g. stderr on a closed pipe, must not count as a
+        # failed restart attempt or end the watch thread.
+        try:
+            self._log(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def find_candidate(self) -> "RestartCandidate | None":
+        boot = self._boot
+        if boot.version is None:
+            return None
+        root = _install_root_for_entrypoint(_cctally().ORIGINAL_ENTRYPOINT)
+        if root is None:
+            return None
+        record = _read_install_success_record()
+        if (record is not None and record.token != boot.record_token
+                and _semver_gt(record.version, boot.version)
+                and not _update_lock_is_held()
+                and _read_changelog_version_at(root) == record.version):
+            return RestartCandidate(record.version, "updater",
+                                    (record.version, "updater", record.token))
+        # Homebrew links the new keg only after installing it completely, so
+        # the switch itself is the completion event.
+        if root != boot.root and _install_layout(root) == "brew":
+            version = _read_changelog_version_at(root)
+            if version and _semver_gt(version, boot.version):
+                return RestartCandidate(version, "brew",
+                                        (version, "brew", str(root)))
+        return None
+
+    def poll_once(self) -> str:
+        """One check. Returns ``"idle"``, ``"backoff"``, ``"exhausted"``,
+        ``"deferred"``, ``"stopped"``, ``"failed"`` or ``"exec"``."""
+        candidate = self.find_candidate()
+        if candidate is None:
+            return "idle"
+        now = self._monotonic()
+        prior = self._attempts.get(candidate.identity)
+        if prior is not None:
+            failures, next_at = prior
+            if failures > len(self._retry_delays):
+                return "exhausted"
+            if now < next_at:
+                return "backoff"
+        worker = self._worker_fn()
+        if worker is None:
+            return "deferred"
+        c = _cctally()
+        claimed = False
+        try:
+            entrypoint, argv = c._resolve_execvp_target()
+            problem = c._execvp_target_problem(entrypoint, argv)
+            if problem is None:
+                again = self.find_candidate()
+                if again is None or again.identity != candidate.identity:
+                    problem = "the install changed before the restart"
+            if problem is not None:
+                raise UpdateError(problem)
+            if not worker.claim_automatic_restart(candidate.version):
+                return "deferred"
+            claimed = True
+            self._say(f"[update] restarting dashboard: v{self._boot.version} "
+                      f"-> v{candidate.version} ({candidate.evidence} install)")
+            # Lets a POST /api/update already refused under the claim finish
+            # writing its 503 before the process image is replaced.
+            self._sleep(self._flush_s)
+            if self._stop.is_set():
+                worker.release_automatic_restart()
+                return "stopped"
+            self._exec(entrypoint, argv)
+        except Exception as exc:  # noqa: BLE001 — a failed attempt keeps serving
+            if claimed:
+                worker.release_automatic_restart()
+            failures = (prior[0] if prior else 0) + 1
+            delay = (self._retry_delays[failures - 1]
+                     if failures <= len(self._retry_delays) else math.inf)
+            self._attempts[candidate.identity] = (failures, now + delay)
+            self._say(f"[update] automatic restart to v{candidate.version} "
+                      f"failed: {exc}")
+            return "failed"
+        return "exec"
+
+    def run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            try:
+                self.poll_once()
+            except Exception as exc:  # noqa: BLE001 — the watch must not die
+                self._say(f"[update] install watch poll failed: {exc!r}")
+
+    def start(self) -> "threading.Thread":
+        thread = threading.Thread(target=self.run, name="cctally-install-watch",
+                                  daemon=True)
+        thread.start()
+        self._thread = thread
+        return thread
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
 
 
 class _DashboardUpdateCheckThread(threading.Thread):

@@ -80,6 +80,7 @@ def _init_paths_from_env() -> None:
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
     global UPDATE_CHECK_LAST_FETCH_PATH, CLAUDE_SETTINGS_PATH
+    global INSTALL_SUCCESS_RECORD_PATH
     global CLAUDE_PROJECTS_DIR, CLAUDE_JSON_PATH
     global TELEMETRY_INSTALL_ID_PATH, TELEMETRY_LAST_BEAT_PATH
     global TELEMETRY_NOTICE_SHOWN_PATH, TELEMETRY_FIRST_SEEN_PATH
@@ -195,6 +196,8 @@ def _init_paths_from_env() -> None:
     UPDATE_LOG_PATH = APP_DIR / "update.log"
     UPDATE_LOG_ROTATED_PATH = APP_DIR / "update.log.1"
     UPDATE_CHECK_LAST_FETCH_PATH = APP_DIR / "update-check.last-fetch"
+    # Written only by the install paths (#868), never by an update check.
+    INSTALL_SUCCESS_RECORD_PATH = APP_DIR / "install-success.json"
 
     # Anonymous install-count telemetry markers (see spec 2026-07-07).
     # All four derive from APP_DIR and are re-bound here so a redirected

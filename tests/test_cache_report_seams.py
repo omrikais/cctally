@@ -87,14 +87,15 @@ def test_cache_write_dollars_apply_the_tiered_rate_above_200k():
     )
 
 
-def test_the_default_threshold_is_the_snapshot_value_and_follows_a_reload():
-    """#714: the tier threshold is a pricing value, so a reload must replace it.
+def test_the_default_threshold_is_the_pricing_value_resolved_at_call_time(
+        monkeypatch):
+    """The tier threshold is a pricing value read from `_lib_pricing`, and the
+    no-argument call resolves the module global at call time.
 
-    Two defects met here. The literal `200_000` duplicated
-    `_lib_pricing.TIERED_THRESHOLD` with nothing keeping the two equal, and
-    the value was bound as a DEFAULT ARGUMENT — evaluated once at
-    function-definition time — so even refreshing the module global would have
-    left every call pricing from the superseded revision.
+    The literal `200_000` used to duplicate `_lib_pricing.TIERED_THRESHOLD`
+    with nothing keeping the two equal, and the value was bound as a DEFAULT
+    ARGUMENT, evaluated once at function-definition time, so the global was
+    not the value the calls used.
     """
     import _lib_cache_report as crk
     import _lib_pricing
@@ -102,33 +103,18 @@ def test_the_default_threshold_is_the_snapshot_value_and_follows_a_reload():
     assert crk.DEFAULT_TIERED_THRESHOLD == _lib_pricing.TIERED_THRESHOLD, (
         "the cache-report threshold is a second copy of a pricing value")
 
-    before = _lib_pricing.current_pricing_snapshot()
-    candidate = _lib_pricing.PricingSnapshot(
-        snapshot_date="2099-01-31",
-        claude_pricing=before.claude_pricing,
-        codex_pricing=before.codex_pricing,
-        aliases=before.aliases,
-        tier_thresholds={"claude": 50_000, "codex": before.tier_thresholds["codex"]},
-        fallback_model=before.fallback_model,
-        cache_write_1h_multiplier=before.cache_write_1h_multiplier,
-        fast_multipliers=before.fast_multipliers,
-    )
+    monkeypatch.setattr(crk, "DEFAULT_TIERED_THRESHOLD", 50_000)
     pricing = _pricing()
-    try:
-        assert _lib_pricing.adopt_pricing_candidate(candidate) is True
-        assert crk.DEFAULT_TIERED_THRESHOLD == 50_000
-        # The call with NO `tiered_threshold` argument is the one every
-        # production caller makes, and it is the one a default-argument bind
-        # would have left on the old value.
-        below = crk._compute_entry_cache_dollars(
-            TIERED_MODEL, 0, 49_999, pricing=pricing)[0]
-        above = crk._compute_entry_cache_dollars(
-            TIERED_MODEL, 0, 100_000, pricing=pricing)[0]
-        assert above / 100_000 != below / 49_999, (
-            "the new 50,000 threshold never engaged, so the default argument "
-            "is still bound to the superseded revision's value")
-    finally:
-        _lib_pricing.adopt_pricing_candidate(before, force=True)
+    # The call with NO `tiered_threshold` argument is the one every production
+    # caller makes, and it is the one a default-argument bind would have left
+    # on the import-time value.
+    below = crk._compute_entry_cache_dollars(
+        TIERED_MODEL, 0, 49_999, pricing=pricing)[0]
+    above = crk._compute_entry_cache_dollars(
+        TIERED_MODEL, 0, 100_000, pricing=pricing)[0]
+    assert above / 100_000 != below / 49_999, (
+        "the 50,000 threshold never engaged, so the call did not read the "
+        "module global")
 
 
 def test_the_tier_boundary_itself_is_not_crossed_at_exactly_200k():

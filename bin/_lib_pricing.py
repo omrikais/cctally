@@ -17,16 +17,11 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 """
 from __future__ import annotations
 
-import contextlib as _contextlib
-import contextvars as _contextvars
 import dataclasses
 import datetime as dt
 import re
 import sys
-import threading as _threading
 from typing import Any
-
-_sys = sys
 
 
 def _eprint(*args: Any) -> None:
@@ -1448,36 +1443,20 @@ def _short_model_name(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# #714 — the published pricing snapshot, and the reader that replaces it
+# The pricing snapshot every cost kernel reads.
 #
-# Every CLI invocation re-imports this module, so only a long-lived process —
-# the dashboard — can hold pricing an installer has already replaced on disk.
-# Two rules shape everything below.
-#
-# A PARTIAL SWAP IS WORSE THAN NO SWAP. `PRICING_SNAPSHOT_DATE` is what gates
-# the materialized-cost write refusal in `_cctally_cache`, so replacing the
-# date alone clears the refusal and resumes writing cost computed from the old
-# tables. A candidate is therefore validated whole and adopted whole, or it is
-# rejected and the live snapshot is retained unchanged.
-#
-# NEVER `importlib.reload`. It executes arbitrary module code from a file an
-# installer has just written; it mutates a live module dict incrementally, so a
-# request in flight can see half a table; and it would not even fix the bug,
-# because reloading this module rebinds none of the import-time copies listed
-# in `PRICING_EXPORT_BINDINGS`. `ast.literal_eval` cannot execute code.
-
-
-class PricingCandidateRejected(Exception):
-    """A candidate pricing file was not adopted. Carries the reason."""
+# Built once at import from the module globals above and never replaced. A
+# long-lived dashboard does not reload pricing in process: after a proven
+# install of a newer version it restarts itself (#868), and after a manual
+# install it keeps these tables until the user restarts it.
 
 
 class PricingSnapshot:
     """One complete, immutable pricing revision.
 
-    Every pricing-affecting value lives here — not only the two tables. A
-    tier threshold, the Codex fallback model, an alias or a fast multiplier
-    left behind by a partial swap prices part of an entry from the previous
-    revision, which is the same defect as a stale table and harder to see.
+    Every pricing-affecting value lives here — not only the two tables: both
+    tier thresholds, the Codex fallback model, the aliases, the cache-write
+    multiplier and the fast multipliers.
 
     Hand-written frozen rather than ``@dataclasses.dataclass(frozen=True)``,
     for the reason `PricingFingerprintObservation` above states at length:
@@ -1522,81 +1501,6 @@ class PricingSnapshot:
                 f"codex_models={len(self.codex_pricing)})")
 
 
-#: The complete inventory of import-time copies, made explicit so it can be
-#: tested rather than asserted. `(module name, attribute, field accessor)`.
-#: `bin/cctally` copies the tables at import and both dashboard source modules
-#: read those copies, so a swap that missed one would price from a stale table
-#: with the refusal latch already cleared.
-PRICING_EXPORT_BINDINGS = (
-    ("_lib_pricing", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
-    ("_lib_pricing", "CLAUDE_MODEL_PRICING", lambda s: s.claude_pricing),
-    ("_lib_pricing", "CODEX_MODEL_PRICING", lambda s: s.codex_pricing),
-    ("_lib_pricing", "CODEX_MODEL_ALIASES", lambda s: s.aliases),
-    ("_lib_pricing", "TIERED_THRESHOLD",
-     lambda s: s.tier_thresholds["claude"]),
-    ("_lib_pricing", "CODEX_TIERED_THRESHOLD",
-     lambda s: s.tier_thresholds["codex"]),
-    ("_lib_pricing", "CODEX_LEGACY_FALLBACK_MODEL", lambda s: s.fallback_model),
-    ("_lib_pricing", "CACHE_WRITE_1H_MULTIPLIER",
-     lambda s: s.cache_write_1h_multiplier),
-    ("_lib_pricing", "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
-     lambda s: s.fast_multipliers["claude"]),
-    ("_lib_pricing", "CODEX_FAST_MULTIPLIER_OVERRIDES",
-     lambda s: s.fast_multipliers["codex"]),
-    ("_lib_pricing", "CODEX_FAST_MULTIPLIER_FALLBACK",
-     lambda s: s.fast_multipliers["codex_fallback"]),
-    ("cctally", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
-    ("cctally", "CLAUDE_MODEL_PRICING", lambda s: s.claude_pricing),
-    ("cctally", "CODEX_MODEL_PRICING", lambda s: s.codex_pricing),
-    ("cctally", "TIERED_THRESHOLD", lambda s: s.tier_thresholds["claude"]),
-    ("cctally", "CODEX_TIERED_THRESHOLD",
-     lambda s: s.tier_thresholds["codex"]),
-    ("cctally", "CODEX_LEGACY_FALLBACK_MODEL", lambda s: s.fallback_model),
-    ("cctally", "CACHE_WRITE_1H_MULTIPLIER",
-     lambda s: s.cache_write_1h_multiplier),
-    ("cctally", "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
-     lambda s: s.fast_multipliers["claude"]),
-    ("cctally", "CODEX_FAST_MULTIPLIER_OVERRIDES",
-     lambda s: s.fast_multipliers["codex"]),
-    ("cctally", "CODEX_FAST_MULTIPLIER_FALLBACK",
-     lambda s: s.fast_multipliers["codex_fallback"]),
-    # `_cctally_cache` binds the date as a module global on purpose, so a test
-    # can monkeypatch it; that affordance is preserved and the binding is
-    # simply refreshed here too.
-    ("_cctally_cache", "PRICING_SNAPSHOT_DATE", lambda s: s.snapshot_date),
-    # `_lib_cache_report` unpacks the multiplier and the Claude tier threshold
-    # at import. The threshold used to be a literal `200_000` in that file with
-    # nothing keeping it equal to `TIERED_THRESHOLD` here, which made it a
-    # pricing value no reload could replace; it is read from this module now
-    # and refreshed through this entry.
-    ("_lib_cache_report", "CACHE_WRITE_1H_MULTIPLIER",
-     lambda s: s.cache_write_1h_multiplier),
-    ("_lib_cache_report", "DEFAULT_TIERED_THRESHOLD",
-     lambda s: s.tier_thresholds["claude"]),
-)
-
-#: The names `read_pricing_snapshot_from_source` requires, each mapped to the
-#: `PricingSnapshot` field it fills. A missing OR non-literal name rejects the
-#: whole candidate.
-_CANDIDATE_ASSIGNMENTS = (
-    "PRICING_SNAPSHOT_DATE",
-    "CLAUDE_MODEL_PRICING",
-    "CODEX_MODEL_PRICING",
-    "CODEX_MODEL_ALIASES",
-    "TIERED_THRESHOLD",
-    "CODEX_TIERED_THRESHOLD",
-    "CODEX_LEGACY_FALLBACK_MODEL",
-    "CACHE_WRITE_1H_MULTIPLIER",
-    "CLAUDE_FAST_MULTIPLIER_OVERRIDES",
-    "CODEX_FAST_MULTIPLIER_OVERRIDES",
-    "CODEX_FAST_MULTIPLIER_FALLBACK",
-)
-
-_PRICING_PUBLISH_LOCK = _threading.Lock()
-_PRICING_CONTEXT = _contextvars.ContextVar("cctally_pricing_snapshot",
-                                           default=None)
-
-
 def _snapshot_from_module_globals() -> PricingSnapshot:
     return PricingSnapshot(
         snapshot_date=PRICING_SNAPSHOT_DATE,
@@ -1619,161 +1523,6 @@ _LIVE_PRICING_SNAPSHOT = _snapshot_from_module_globals()
 
 
 def current_pricing_snapshot() -> PricingSnapshot:
-    """The snapshot this caller must price from.
-
-    A caller inside `pricing_snapshot_context()` keeps the revision it entered
-    with, so a request, a dashboard snapshot build or a sync pass already
-    under way is never assembled from two revisions. Everyone else reads the
-    live pointer, which is one immutable object replaced by one assignment.
-    """
-    captured = _PRICING_CONTEXT.get()
-    return _LIVE_PRICING_SNAPSHOT if captured is None else captured
-
-
-@_contextlib.contextmanager
-def pricing_snapshot_context(snapshot: "PricingSnapshot | None" = None):
-    """Pin one revision for the duration of a request, build or sync pass."""
-    pinned = current_pricing_snapshot() if snapshot is None else snapshot
-    token = _PRICING_CONTEXT.set(pinned)
-    try:
-        yield pinned
-    finally:
-        _PRICING_CONTEXT.reset(token)
-
-
-def publish_pricing_snapshot(snapshot: PricingSnapshot) -> None:
-    """Swap the live pointer and refresh every import-time copy.
-
-    The pointer swap is one assignment of one frozen object, so a concurrent
-    reader observes the old revision whole or the new one whole. The binding
-    refresh that follows exists for call sites that still read a copied name;
-    every cost kernel in this module reads `current_pricing_snapshot()`
-    instead, so correctness does not depend on the refresh reaching a module
-    that has not been imported.
-    """
-    global _LIVE_PRICING_SNAPSHOT
-    with _PRICING_PUBLISH_LOCK:
-        _LIVE_PRICING_SNAPSHOT = snapshot
-        for module_name, attr, accessor in PRICING_EXPORT_BINDINGS:
-            module = _sys.modules.get(module_name)
-            if module is None:
-                continue
-            try:
-                setattr(module, attr, accessor(snapshot))
-            except Exception:  # noqa: BLE001
-                # A module that refuses an attribute set must not stop the
-                # rest of the inventory being refreshed.
-                _eprint(f"[pricing] could not refresh {module_name}.{attr}")
-
-
-def adopt_pricing_candidate(candidate: PricingSnapshot, *,
-                            force: bool = False) -> bool:
-    """Publish `candidate` iff it is strictly newer than the live snapshot.
-
-    `_lib_pricing` documents that a pricing revision always ADVANCES
-    `PRICING_SNAPSHOT_DATE`, so a candidate that does not is a rollback, a
-    corrupt read or the same revision read twice; each of those is a reason to
-    keep what is running. `force` exists for tests restoring a captured
-    snapshot and for nothing else.
-    """
-    if force:
-        publish_pricing_snapshot(candidate)
-        return True
-    live = _LIVE_PRICING_SNAPSHOT
-    new_date = parse_pricing_fingerprint(candidate.snapshot_date)
-    live_date = parse_pricing_fingerprint(live.snapshot_date)
-    if new_date is None:
-        return False
-    if live_date is not None and new_date <= live_date:
-        return False
-    publish_pricing_snapshot(candidate)
-    return True
-
-
-def _file_signature(path) -> tuple:
-    st = path.stat()
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-
-
-def read_pricing_snapshot_from_source(path) -> PricingSnapshot:
-    """Build a candidate from the literal assignments in a pricing file.
-
-    `ast.parse` plus `ast.literal_eval`, never `importlib.reload` and never
-    `exec`: the file is one an installer has just written and this process
-    must not run it.
-
-    Raises `PricingCandidateRejected` — never returns a partial snapshot — on
-    a missing name, a name whose value is not a literal, a date that does not
-    parse, or a file whose inode/size/mtime signature changes while it is
-    being read, which is an installer replacing it mid-parse.
-    """
-    import ast
-    import pathlib as _pathlib
-
-    path = _pathlib.Path(path)
-    try:
-        before = _file_signature(path)
-        source = path.read_bytes()
-        after = _file_signature(path)
-    except OSError as exc:
-        raise PricingCandidateRejected(
-            f"pricing candidate could not be read: {exc}") from exc
-    if before != after:
-        raise PricingCandidateRejected(
-            "pricing candidate signature changed while it was being read")
-
-    try:
-        tree = ast.parse(source.decode("utf-8"), filename=str(path))
-    except (SyntaxError, UnicodeDecodeError) as exc:
-        raise PricingCandidateRejected(
-            f"pricing candidate does not parse: {exc}") from exc
-
-    found: "dict[str, Any]" = {}
-    for node in tree.body:
-        targets = []
-        if isinstance(node, ast.Assign):
-            targets = [t for t in node.targets if isinstance(t, ast.Name)]
-            value = node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target,
-                                                            ast.Name):
-            targets = [node.target]
-            value = node.value
-        else:
-            continue
-        for target in targets:
-            if target.id not in _CANDIDATE_ASSIGNMENTS or value is None:
-                continue
-            try:
-                found[target.id] = ast.literal_eval(value)
-            except (ValueError, SyntaxError, TypeError) as exc:
-                raise PricingCandidateRejected(
-                    f"{target.id} is no longer a literal, so the in-process "
-                    f"pricing reload cannot read it: {exc}") from exc
-
-    missing = [name for name in _CANDIDATE_ASSIGNMENTS if name not in found]
-    if missing:
-        raise PricingCandidateRejected(
-            "pricing candidate is incomplete; adopting a partial revision "
-            "would clear the write refusal and price from the old tables. "
-            f"Missing: {', '.join(missing)}")
-
-    if parse_pricing_fingerprint(found["PRICING_SNAPSHOT_DATE"]) is None:
-        raise PricingCandidateRejected(
-            "pricing candidate has no orderable PRICING_SNAPSHOT_DATE: "
-            f"{found['PRICING_SNAPSHOT_DATE']!r}")
-
-    return PricingSnapshot(
-        snapshot_date=found["PRICING_SNAPSHOT_DATE"],
-        claude_pricing=found["CLAUDE_MODEL_PRICING"],
-        codex_pricing=found["CODEX_MODEL_PRICING"],
-        aliases=found["CODEX_MODEL_ALIASES"],
-        tier_thresholds={"claude": found["TIERED_THRESHOLD"],
-                         "codex": found["CODEX_TIERED_THRESHOLD"]},
-        fallback_model=found["CODEX_LEGACY_FALLBACK_MODEL"],
-        cache_write_1h_multiplier=found["CACHE_WRITE_1H_MULTIPLIER"],
-        fast_multipliers={
-            "claude": found["CLAUDE_FAST_MULTIPLIER_OVERRIDES"],
-            "codex": found["CODEX_FAST_MULTIPLIER_OVERRIDES"],
-            "codex_fallback": found["CODEX_FAST_MULTIPLIER_FALLBACK"],
-        },
-    )
+    """The snapshot every cost kernel prices from; it never changes after
+    import."""
+    return _LIVE_PRICING_SNAPSHOT

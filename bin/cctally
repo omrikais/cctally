@@ -351,6 +351,7 @@ UPDATE_LOCK_PATH = _cctally_core.UPDATE_LOCK_PATH
 UPDATE_LOG_PATH = _cctally_core.UPDATE_LOG_PATH
 UPDATE_LOG_ROTATED_PATH = _cctally_core.UPDATE_LOG_ROTATED_PATH
 UPDATE_CHECK_LAST_FETCH_PATH = _cctally_core.UPDATE_CHECK_LAST_FETCH_PATH
+INSTALL_SUCCESS_RECORD_PATH = _cctally_core.INSTALL_SUCCESS_RECORD_PATH
 
 CLAUDE_SETTINGS_PATH = _cctally_core.CLAUDE_SETTINGS_PATH
 
@@ -1356,6 +1357,10 @@ _persist_npm_prefix_to_state = _cctally_update._persist_npm_prefix_to_state
 _detect_install_method = _cctally_update._detect_install_method
 _persist_install_method_to_state = _cctally_update._persist_install_method_to_state
 _stamp_install_success_to_state = _cctally_update._stamp_install_success_to_state
+InstallSuccessRecord = _cctally_update.InstallSuccessRecord
+_write_install_success_record = _cctally_update._write_install_success_record
+_read_install_success_record = _cctally_update._read_install_success_record
+_update_lock_is_held = _cctally_update._update_lock_is_held
 _self_heal_current_version = _cctally_update._self_heal_current_version
 _BREW_VERSION_RE_LIST = _cctally_update._BREW_VERSION_RE_LIST
 _update_user_agent = _cctally_update._update_user_agent
@@ -1388,8 +1393,17 @@ _preflight_install = _cctally_update._preflight_install
 _build_update_steps = _cctally_update._build_update_steps
 _run_streaming = _cctally_update._run_streaming
 _do_update_install = _cctally_update._do_update_install
+_install_root_for_entrypoint = _cctally_update._install_root_for_entrypoint
+_read_changelog_version_at = _cctally_update._read_changelog_version_at
+_install_layout = _cctally_update._install_layout
 _resolve_execvp_target = _cctally_update._resolve_execvp_target
+_execvp_target_problem = _cctally_update._execvp_target_problem
+AutomaticRestartInProgress = _cctally_update.AutomaticRestartInProgress
 UpdateWorker = _cctally_update.UpdateWorker
+InstallBootState = _cctally_update.InstallBootState
+capture_install_boot_state = _cctally_update.capture_install_boot_state
+RestartCandidate = _cctally_update.RestartCandidate
+InstallWatch = _cctally_update.InstallWatch
 _DashboardUpdateCheckThread = _cctally_update._DashboardUpdateCheckThread
 cmd_update = _cctally_update.cmd_update
 _args_emit_json = _cctally_update._args_emit_json
@@ -2661,14 +2675,13 @@ def _warn_budget_bad_config_once(exc: Exception) -> None:
 # server boot in cmd_dashboard. The moved _resolve_execvp_target
 # uses them to return (entrypoint, exec_argv) for os.execvp:
 #
-#   - npm: entrypoint = <prefix>/bin/cctally → Node shim, which
-#     re-resolves CCTALLY_PYTHON before re-spawning Python (so a
-#     custom interpreter setting survives the restart).
+#   - npm: the interpreter the Node shim would use (CCTALLY_PYTHON,
+#     else python3 on PATH) on the install's bin/cctally, so a restart
+#     adds no Node process (#868).
 #   - brew: entrypoint = <brew>/bin/cctally → symlink into the
 #     post-upgrade Python script with its rewritten shebang.
 #   - Fallback when shutil.which("cctally") returned None: use
-#     sys.argv[0] directly. Loses the npm shim layer; we accept the
-#     degraded edge case rather than guess.
+#     sys.argv[0] directly.
 ORIGINAL_SYS_ARGV: list[str] = []
 ORIGINAL_ENTRYPOINT: "str | None" = None
 

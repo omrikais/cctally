@@ -31,6 +31,7 @@ from __future__ import annotations
 import types
 
 import datetime as dt
+import errno
 import json
 import os
 import pathlib
@@ -89,6 +90,7 @@ def update_paths(ns, tmp_path, monkeypatch):
         "UPDATE_LOG_PATH": share / "update.log",
         "UPDATE_LOG_ROTATED_PATH": share / "update.log.1",
         "UPDATE_CHECK_LAST_FETCH_PATH": share / "update-check.last-fetch",
+        "INSTALL_SUCCESS_RECORD_PATH": share / "install-success.json",
     }
     for name, value in paths.items():
         monkeypatch.setattr(_cctally_core, name, value)
@@ -710,6 +712,322 @@ class TestStampInstallSuccess:
         ns["_stamp_install_success_to_state"](None, npm_method)
         loaded = ns["_load_update_state"]()
         assert loaded["current_version"] == "1.6.3"
+
+
+class TestInstallSuccessRecord:
+    """#868: the install-only success record that update checks cannot erase."""
+
+    def test_stamp_writes_record_with_version_and_token(self, ns, update_paths):
+        ns["_save_update_state"]({"_schema": 1, "latest_version": "1.6.0"})
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        rec = ns["_read_install_success_record"]()
+        assert rec is not None
+        assert rec.version == "1.6.5"
+        assert len(rec.token) == 32
+        on_disk = json.loads(
+            _cctally_core.INSTALL_SUCCESS_RECORD_PATH.read_text(encoding="utf-8"))
+        assert on_disk["_schema"] == 1
+        assert on_disk["version"] == "1.6.5"
+        assert on_disk["token"] == rec.token
+        assert on_disk["at_utc"] == rec.at_utc
+
+    def test_each_stamp_mints_a_new_token(self, ns, update_paths):
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        first = ns["_read_install_success_record"]().token
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        assert ns["_read_install_success_record"]().token != first
+
+    def test_no_signal_writes_no_record(self, ns, update_paths, monkeypatch):
+        ns["_save_update_state"]({"_schema": 1})
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version", lambda: None)
+        ns["_stamp_install_success_to_state"](None)
+        assert not _cctally_core.INSTALL_SUCCESS_RECORD_PATH.exists()
+        assert ns["_read_install_success_record"]() is None
+
+    def test_update_check_save_cannot_erase_the_record(self, ns, update_paths):
+        stale = ns["_load_update_state"]() or {"_schema": 1}
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        ns["_save_update_state"](stale)
+        rec = ns["_read_install_success_record"]()
+        assert rec is not None and rec.version == "1.6.5"
+
+    def test_real_update_check_interleaved_with_an_install_keeps_the_record(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """R11: `_do_update_check` loads update-state.json, fetches, then saves
+        the object it loaded. An install that stamps success during that fetch
+        loses its update-state.json fields to the stale save; the install-only
+        record survives because only the install paths write it."""
+        ns["_save_update_state"]({"_schema": 1, "current_version": "1.6.0"})
+        method = ns["InstallMethod"](
+            method="npm",
+            realpath="/usr/local/lib/node_modules/cctally/bin/cctally",
+            npm_prefix="/usr/local",
+        )
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
+        monkeypatch.setitem(
+            ns, "_release_read_latest_release_version",
+            lambda: ("1.6.0", "2026-05-12"))
+        stamped = []
+
+        def fetch_during_which_an_install_completes():
+            ns["_stamp_install_success_to_state"]("1.6.5")
+            stamped.append(ns["_load_update_state"]()["current_version"])
+            return "1.6.5"
+
+        monkeypatch.setitem(
+            ns, "_check_npm_latest_version",
+            fetch_during_which_an_install_completes)
+        ns["_do_update_check"]()
+
+        assert stamped == ["1.6.5"]
+        after = ns["_load_update_state"]()
+        assert after["current_version"] == "1.6.0"
+        assert "last_install_success_at_utc" not in after
+        rec = ns["_read_install_success_record"]()
+        assert rec is not None and rec.version == "1.6.5"
+
+    @pytest.mark.parametrize("body", [
+        "",
+        "{",
+        "[]",
+        '{"_schema": 2, "version": "1.6.5", "at_utc": "x", "token": "t"}',
+        '{"_schema": 1, "version": "", "at_utc": "x", "token": "t"}',
+        '{"_schema": 1, "version": "not-a-version", "at_utc": "x", "token": "t"}',
+        '{"_schema": 1, "version": "1.6.5", "at_utc": "x"}',
+        '{"_schema": 1, "version": "1.6.5", "at_utc": "x", "token": 7}',
+    ])
+    def test_malformed_record_reads_as_none(self, ns, update_paths, body):
+        _cctally_core.INSTALL_SUCCESS_RECORD_PATH.write_text(body)
+        assert ns["_read_install_success_record"]() is None
+
+    def test_absent_record_reads_as_none(self, ns, update_paths):
+        assert ns["_read_install_success_record"]() is None
+
+    def test_lock_probe_free_when_absent_and_when_stale(self, ns, update_paths):
+        assert ns["_update_lock_is_held"]() is False
+        assert not _cctally_core.UPDATE_LOCK_PATH.exists()
+        _cctally_core.UPDATE_LOCK_PATH.write_text("PID=999999\n")
+        assert ns["_update_lock_is_held"]() is False
+
+    def test_lock_probe_held_while_update_lock_acquired(self, ns, update_paths):
+        fd = ns["_acquire_update_lock"]()
+        try:
+            assert ns["_update_lock_is_held"]() is True
+        finally:
+            ns["_release_update_lock"](fd)
+        assert ns["_update_lock_is_held"]() is False
+
+    def test_lock_probe_reads_an_unexplained_error_as_held(
+        self, ns, update_paths, monkeypatch,
+    ):
+        """An error that proves nothing about the updater is not a free lock."""
+        lock = _cctally_core.UPDATE_LOCK_PATH
+        lock.write_text("PID=999999\n")
+        assert ns["_update_lock_is_held"]() is False
+        lock.unlink()
+        lock.symlink_to(lock.name)  # ELOOP on open
+        assert ns["_update_lock_is_held"]() is True
+        lock.unlink()
+        lock.write_text("PID=999999\n")
+        mod = sys.modules["_cctally_update"]
+        iso_fcntl = types.SimpleNamespace(**vars(mod.fcntl))
+
+        def flock(fd, op):
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        iso_fcntl.flock = flock
+        monkeypatch.setattr(mod, "fcntl", iso_fcntl)
+        assert ns["_update_lock_is_held"]() is True
+
+    def test_a_failed_record_write_keeps_the_install_successful(
+        self, ns, update_paths, capsys,
+    ):
+        record = _cctally_core.INSTALL_SUCCESS_RECORD_PATH
+        record.mkdir()
+        (record / "occupied").write_text("x")
+        ns["_stamp_install_success_to_state"]("1.6.5")
+        assert ns["_load_update_state"]()["current_version"] == "1.6.5"
+        assert ns["_read_install_success_record"]() is None
+        assert list(record.parent.glob(f"{record.name}.tmp.*")) == []
+        assert record.name in capsys.readouterr().err
+
+    def test_cli_install_writes_the_record_only_on_success(
+        self, ns, update_paths, tmp_path, monkeypatch,
+    ):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method)
+        monkeypatch.setitem(ns, "load_config", lambda *a, **k: {})
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 7)
+        monkeypatch.setitem(ns, "_release_update_lock", lambda fd: None)
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 1)
+        assert ns["_do_update_install"](
+            version="1.6.5", dry_run=False, output_json=False) == 1
+        assert ns["_read_install_success_record"]() is None
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 0)
+        assert ns["_do_update_install"](
+            version="1.6.5", dry_run=False, output_json=False) == 0
+        rec = ns["_read_install_success_record"]()
+        assert rec is not None and rec.version == "1.6.5"
+
+
+# #868: real install layouts under tmp_path. `tests/test_dashboard_install_restart.py`
+# imports these, so they stay module-level.
+def _make_npm_install(root, version):
+    (root / "bin").mkdir(parents=True)
+    shim = root / "bin" / "cctally-npm-shim.js"
+    shim.write_text("#!/usr/bin/env node\n")
+    shim.chmod(0o755)
+    (root / "bin" / "cctally").write_text("#!/usr/bin/env python3\n")
+    (root / "package.json").write_text('{"name": "cctally"}\n')
+    (root / "CHANGELOG.md").write_text(
+        f"# Changelog\n\n## [Unreleased]\n\n## [{version}] - 2026-09-23\n")
+    return root
+
+
+def _make_brew_keg(prefix, version):
+    libexec = prefix / "Cellar" / "cctally" / version / "libexec"
+    (libexec / "bin").mkdir(parents=True)
+    script = libexec / "bin" / "cctally"
+    script.write_text("#!/usr/bin/env python3\n")
+    script.chmod(0o755)
+    (libexec / "CHANGELOG.md").write_text(
+        f"# Changelog\n\n## [{version}] - 2026-09-23\n")
+    keg_bin = prefix / "Cellar" / "cctally" / version / "bin"
+    keg_bin.mkdir()
+    (keg_bin / "cctally").symlink_to(script)
+    return libexec
+
+
+def _link(entry, target):
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry.is_symlink() or entry.exists():
+        entry.unlink()
+    entry.symlink_to(target)
+    return entry
+
+
+class TestInstallRoots:
+    """#868: the install root behind an entrypoint, and its CHANGELOG version."""
+
+    def test_npm_root_layout_and_version(self, ns, tmp_path):
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        got = ns["_install_root_for_entrypoint"](str(entry))
+        assert got == root.resolve()
+        assert ns["_install_layout"](got) == "npm"
+        assert ns["_read_changelog_version_at"](got) == "1.2.3"
+
+    def test_brew_root_follows_both_symlinks_into_libexec(self, ns, tmp_path):
+        libexec = _make_brew_keg(tmp_path, "1.2.3")
+        entry = _link(tmp_path / "bin/cctally",
+                      tmp_path / "Cellar/cctally/1.2.3/bin/cctally")
+        got = ns["_install_root_for_entrypoint"](str(entry))
+        assert got == libexec.resolve()
+        assert ns["_install_layout"](got) == "brew"
+        assert ns["_read_changelog_version_at"](got) == "1.2.3"
+
+    def test_other_layout_and_unreadable_changelog(self, ns, tmp_path):
+        script = tmp_path / "src" / "bin" / "cctally"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/usr/bin/env python3\n")
+        entry = _link(tmp_path / "bin/cctally", script)
+        got = ns["_install_root_for_entrypoint"](str(entry))
+        assert got == (tmp_path / "src").resolve()
+        assert ns["_install_layout"](got) == "other"
+        assert ns["_read_changelog_version_at"](got) is None
+
+    def test_unknown_entrypoint_has_no_root(self, ns, tmp_path):
+        assert ns["_install_root_for_entrypoint"](None) is None
+        loose = tmp_path / "cctally"
+        loose.write_text("")
+        assert ns["_install_root_for_entrypoint"](str(loose)) is None
+
+
+class TestExecTarget:
+    """#868 R10: npm restarts exec Python on the install's script directly."""
+
+    def test_npm_target_execs_python_directly(self, ns, tmp_path, monkeypatch):
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV",
+                            ["/x/bin/cctally", "dashboard", "--host", "0.0.0.0"])
+        monkeypatch.setenv("CCTALLY_PYTHON", sys.executable)
+        target, argv = ns["_resolve_execvp_target"]()
+        assert target == sys.executable
+        assert argv == [sys.executable, str(root.resolve() / "bin/cctally"),
+                        "dashboard", "--host", "0.0.0.0"]
+        assert ns["_execvp_target_problem"](target, argv) is None
+
+    def test_npm_target_resolves_bare_python3_on_path(self, ns, tmp_path,
+                                                      monkeypatch):
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        pybin = tmp_path / "pybin"
+        pybin.mkdir()
+        (pybin / "python3").symlink_to(sys.executable)
+        monkeypatch.setenv("PATH", str(pybin))
+        monkeypatch.delenv("CCTALLY_PYTHON", raising=False)
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["/x", "dashboard"])
+        target, argv = ns["_resolve_execvp_target"]()
+        assert target == str(pybin / "python3")
+        assert argv == [target, str(root.resolve() / "bin/cctally"), "dashboard"]
+
+    def test_unresolvable_interpreter_is_an_invalid_target(self, ns, tmp_path,
+                                                           monkeypatch):
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        monkeypatch.setenv("CCTALLY_PYTHON", "cctally-no-such-python-868")
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["/x", "dashboard"])
+        target, argv = ns["_resolve_execvp_target"]()
+        assert target == "cctally-no-such-python-868"
+        assert ns["_execvp_target_problem"](target, argv) is not None
+
+    def test_brew_target_keeps_entrypoint(self, ns, tmp_path, monkeypatch):
+        _make_brew_keg(tmp_path, "1.2.3")
+        entry = _link(tmp_path / "bin/cctally",
+                      tmp_path / "Cellar/cctally/1.2.3/bin/cctally")
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["/x", "dashboard"])
+        target, argv = ns["_resolve_execvp_target"]()
+        assert (target, argv) == (str(entry), [str(entry), "dashboard"])
+        assert ns["_execvp_target_problem"](target, argv) is None
+
+    def test_problem_when_npm_script_missing_or_unreadable(self, ns, tmp_path):
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        py = sys.executable
+        script = root / "bin/cctally"
+        assert ns["_execvp_target_problem"](py, [py, str(script), "dashboard"]) is None
+        script.chmod(0o000)
+        try:
+            assert ns["_execvp_target_problem"](
+                py, [py, str(script), "dashboard"]) is not None
+        finally:
+            script.chmod(0o644)
+        script.unlink()
+        assert ns["_execvp_target_problem"](
+            py, [py, str(script), "dashboard"]) is not None
+
+    def test_problem_when_target_missing_or_not_executable(self, ns, tmp_path):
+        f = tmp_path / "not-exec"
+        f.write_text("")
+        assert ns["_execvp_target_problem"](str(f), [str(f), "dashboard"]) is not None
+        missing = tmp_path / "missing"
+        assert ns["_execvp_target_problem"](
+            str(missing), [str(missing), "dashboard"]) is not None
+        f.chmod(0o755)
+        assert ns["_execvp_target_problem"](str(f), [str(f), "dashboard"]) is None
 
 
 class TestSelfHealCurrentVersion:
@@ -2693,6 +3011,10 @@ class TestUpdateWorker:
         monkeypatch.setattr(
             _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
         )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
 
         def blocking_run_streaming(cmd, *, on_stdout, on_stderr, log_fd):
             gate.set()
@@ -2820,6 +3142,10 @@ class TestUpdateWorker:
         monkeypatch.setattr(
             _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
         )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
 
         # Subprocess returns non-zero — must NOT call execvp.
         monkeypatch.setitem(
@@ -2879,16 +3205,23 @@ class TestUpdateWorker:
         monkeypatch.setattr(
             _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
         )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 0,
         )
 
-        # Pre-set the boot-captured globals as cmd_dashboard would.
+        # Pre-set the boot-captured globals as cmd_dashboard would, on a real
+        # Homebrew layout: #868 validates the target before exec, so a path
+        # that does not exist on the runner would now end in error_event.
+        _make_brew_keg(tmp_path, "1.2.3")
+        entry = _link(tmp_path / "bin/cctally",
+                      tmp_path / "Cellar/cctally/1.2.3/bin/cctally")
         monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["cctally", "dashboard"])
-        monkeypatch.setitem(
-            ns, "ORIGINAL_ENTRYPOINT", "/opt/homebrew/bin/cctally"
-        )
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
 
         captured: list[tuple[str, list[str]]] = []
 
@@ -2928,9 +3261,7 @@ class TestUpdateWorker:
         assert "exit" in event_types
         terminal = events[-1]
         assert terminal["type"] == "execvp"
-        assert terminal["argv"] == [
-            "/opt/homebrew/bin/cctally", "dashboard"
-        ]
+        assert terminal["argv"] == [str(entry), "dashboard"]
         # The execvp event is emitted BEFORE the actual os.execvp call —
         # wait for the worker thread to clear current_run_id (which
         # happens in finally after fake_execvp's SystemExit unwinds).
@@ -2940,11 +3271,121 @@ class TestUpdateWorker:
                 break
             time.sleep(0.01)
         # execvp was invoked with the resolved entrypoint.
-        assert captured == [(
-            "/opt/homebrew/bin/cctally",
-            ["/opt/homebrew/bin/cctally", "dashboard"],
-        )]
+        assert captured == [(str(entry), [str(entry), "dashboard"])]
         # Lock released exactly once on the success path (pre-execvp).
+        assert released == [7]
+        # #868: the dashboard install path writes the install-success record.
+        rec = ns["_read_install_success_record"]()
+        assert rec is not None
+        assert rec.version == ns["_load_update_state"]()["current_version"]
+
+    @staticmethod
+    def _success_worker(ns, tmp_path, monkeypatch, captured, released):
+        method = _writable_npm_method(ns, tmp_path)
+        monkeypatch.setitem(
+            ns, "_detect_install_method", lambda mutate=True: method
+        )
+        monkeypatch.setitem(ns, "_acquire_update_lock", lambda: 7)
+        monkeypatch.setitem(
+            ns, "_release_update_lock", lambda fd: released.append(fd)
+        )
+        monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
+        monkeypatch.setattr(
+            _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
+        monkeypatch.setitem(
+            ns, "_run_streaming",
+            lambda cmd, *, on_stdout, on_stderr, log_fd: 0,
+        )
+        _iso_os = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].os))
+        _iso_os.execvp = lambda path, argv: captured.append((path, list(argv)))
+        monkeypatch.setattr(sys.modules["_cctally_update"], "os", _iso_os)
+        _iso_time = types.SimpleNamespace(
+            **vars(sys.modules["_cctally_update"].time))
+        _iso_time.sleep = lambda _s: None
+        monkeypatch.setattr(sys.modules["_cctally_update"], "time", _iso_time)
+        return ns["UpdateWorker"]()
+
+    @staticmethod
+    def _wait_idle(worker):
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        while time.monotonic() < deadline:
+            if worker.status()["current_run_id"] is None:
+                return
+            time.sleep(0.01)
+        raise AssertionError("worker thread did not finish within timeout")
+
+    def test_success_on_npm_execs_python_directly(self, tmp_path, monkeypatch):
+        """#868 R10: the Update-button restart no longer re-enters the npm
+        shim, which would start one more Node process per restart."""
+        ns = load_script()
+        captured: list = []
+        released: list = []
+        worker = self._success_worker(ns, tmp_path, monkeypatch, captured,
+                                      released)
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["cctally", "dashboard"])
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setenv("CCTALLY_PYTHON", sys.executable)
+
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
+        self._wait_idle(worker)
+        expected_argv = [sys.executable, str(root.resolve() / "bin/cctally"),
+                         "dashboard"]
+        assert events[-1] == {"type": "execvp", "argv": expected_argv}
+        assert captured == [(sys.executable, expected_argv)]
+        assert released == [7]
+
+    def test_invalid_target_emits_error_and_never_execs(self, tmp_path,
+                                                        monkeypatch):
+        """#868 R10: an invalid target ends the run in error_event, and the
+        lock is still released exactly once."""
+        ns = load_script()
+        captured: list = []
+        released: list = []
+        worker = self._success_worker(ns, tmp_path, monkeypatch, captured,
+                                      released)
+        root = _make_npm_install(tmp_path / "lib/node_modules/cctally", "1.2.3")
+        entry = _link(tmp_path / "bin/cctally", root / "bin/cctally-npm-shim.js")
+        (root / "bin" / "cctally").unlink()
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["cctally", "dashboard"])
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", str(entry))
+        monkeypatch.setenv("CCTALLY_PYTHON", sys.executable)
+
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
+        self._wait_idle(worker)
+        assert events[-1]["type"] == "error_event"
+        assert "bin/cctally" in events[-1]["message"]
+        assert "execvp" not in [ev["type"] for ev in events]
+        assert captured == []
+        assert released == [7]
+
+    def test_patched_target_problem_blocks_exec(self, tmp_path, monkeypatch):
+        ns = load_script()
+        captured: list = []
+        released: list = []
+        worker = self._success_worker(ns, tmp_path, monkeypatch, captured,
+                                      released)
+        monkeypatch.setitem(ns, "ORIGINAL_SYS_ARGV", ["cctally", "dashboard"])
+        monkeypatch.setitem(ns, "ORIGINAL_ENTRYPOINT", sys.executable)
+        monkeypatch.setitem(ns, "_execvp_target_problem",
+                            lambda entrypoint, argv: "bad target")
+        ok, run_id = worker.start(None)
+        assert ok is True
+        events = _drain_stream(worker, run_id, timeout_s=PRESENCE_BACKSTOP_SECONDS)
+        self._wait_idle(worker)
+        assert events[-1] == {"type": "error_event", "message": "bad target"}
+        assert captured == []
         assert released == [7]
 
     def test_stream_observable_after_worker_completes_pre_subscribe(
@@ -2969,6 +3410,10 @@ class TestUpdateWorker:
         monkeypatch.setattr(_cctally_core, "UPDATE_LOG_PATH", tmp_path / "update.log")
         monkeypatch.setattr(
             _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
+        )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
         )
         monkeypatch.setitem(
             ns, "_run_streaming",
@@ -3022,6 +3467,10 @@ class TestUpdateWorker:
         monkeypatch.setattr(
             _cctally_core, "UPDATE_STATE_PATH", tmp_path / "update-state.json",
         )
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
         monkeypatch.setitem(
             ns, "_run_streaming",
             lambda cmd, *, on_stdout, on_stderr, log_fd: 1,
@@ -3073,6 +3522,82 @@ class TestUpdateWorker:
         target, argv = ns["_resolve_execvp_target"]()
         assert target == "/abs/path/to/cctally"
         assert argv == ["/abs/path/to/cctally", "dashboard"]
+
+
+class TestAutomaticRestartClaim:
+    """#868 R5 / decision 6: the install watcher's private restart claim."""
+
+    DECISION_6 = ("The dashboard is restarting to load v1.111.0. "
+                  "Try again in a moment.")
+
+    def test_claim_blocks_start_with_decision_6_text(self):
+        ns = load_script()
+        w = ns["UpdateWorker"]()
+        assert w.claim_automatic_restart("1.111.0") is True
+        with pytest.raises(ns["AutomaticRestartInProgress"]) as ei:
+            w.start(None)
+        assert str(ei.value) == self.DECISION_6
+        assert ei.value.version == "1.111.0"
+        assert w.status() == {"current_run_id": None}
+        assert w._streams == {}
+
+    def test_claim_fails_while_a_run_is_admitted(self, monkeypatch):
+        ns = load_script()
+        w = ns["UpdateWorker"]()
+        monkeypatch.setattr(w, "_run", lambda run_id, version: None)
+        accepted, run_id = w.start(None)
+        assert accepted is True
+        assert w.claim_automatic_restart("1.111.0") is False
+        assert w.start(None) == (False, run_id)
+
+    def test_second_claim_fails_while_one_is_held(self):
+        ns = load_script()
+        w = ns["UpdateWorker"]()
+        assert w.claim_automatic_restart("1.111.0") is True
+        assert w.claim_automatic_restart("1.112.0") is False
+        with pytest.raises(ns["AutomaticRestartInProgress"]) as ei:
+            w.start(None)
+        assert ei.value.version == "1.111.0"
+
+    def test_release_reopens_start_and_claim(self, monkeypatch):
+        ns = load_script()
+        w = ns["UpdateWorker"]()
+        monkeypatch.setattr(w, "_run", lambda run_id, version: None)
+        assert w.claim_automatic_restart("1.111.0")
+        w.release_automatic_restart()
+        assert w.claim_automatic_restart("1.111.0") is True
+        w.release_automatic_restart()
+        assert w.start(None)[0] is True
+
+    def test_claim_and_start_interleave_under_one_lock(self, monkeypatch):
+        ns = load_script()
+        for _ in range(50):
+            w = ns["UpdateWorker"]()
+            monkeypatch.setattr(w, "_run", lambda run_id, version: None)
+            results = {}
+            barrier = threading.Barrier(2)
+
+            def claim():
+                barrier.wait()
+                results["claim"] = w.claim_automatic_restart("1.111.0")
+
+            def start():
+                barrier.wait()
+                try:
+                    results["start"] = w.start(None)[0]
+                except ns["AutomaticRestartInProgress"]:
+                    results["start"] = False
+
+            ts = [threading.Thread(target=claim), threading.Thread(target=start)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(PRESENCE_BACKSTOP_SECONDS)
+            assert sorted(results.values()) == [False, True], results
+            if results["claim"]:
+                assert w.status() == {"current_run_id": None}
+            else:
+                assert w.status()["current_run_id"] is not None
 
 
 class TestDashboardUpdateCheckThread:
@@ -3208,6 +3733,10 @@ class TestDashboardUpdateCheckThread:
         )
         state_path = tmp_path / "update-state.json"
         monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", state_path)
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
 
         # Held snapshot carries a STALE precompute: no known latest version.
         stale_precompute = {
@@ -3324,6 +3853,10 @@ class TestDashboardUpdateCheckThread:
         )
         state_path = tmp_path / "update-state.json"
         monkeypatch.setattr(_cctally_core, "UPDATE_STATE_PATH", state_path)
+        monkeypatch.setattr(
+            _cctally_core, "INSTALL_SUCCESS_RECORD_PATH",
+            tmp_path / "install-success.json",
+        )
 
         stale_precompute = {
             "config": {},

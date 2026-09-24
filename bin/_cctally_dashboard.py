@@ -712,10 +712,6 @@ from _lib_aggregators import (
     _finalize_bucket,
 )
 from _lib_fmt import stable_sum
-# The MODULE, not just the names: #714's `pricing_snapshot_context` has to be
-# reached through the live module object so a test that swaps the snapshot is
-# seen by the request, build and sync entries below.
-import _lib_pricing
 from _lib_pricing import (_calculate_entry_cost, _chip_for_model,
                           _short_model_name, claude_usage_dict)
 from _lib_five_hour import _canonical_5h_window_key, _round_to_ten_minutes
@@ -2272,13 +2268,6 @@ def _make_dashboard_run_iteration(
 
     def run_iteration(batch=None) -> dict:
         warnings: list = []
-        # #714: the whole snapshot build runs on ONE pricing revision. A swap
-        # landing part-way through would publish a snapshot whose panels were
-        # priced from two different tables.
-        with _lib_pricing.pricing_snapshot_context():
-            return _run_iteration_body(batch, warnings)
-
-    def _run_iteration_body(batch, warnings: list) -> dict:
         if batch is not None and batch[1] and not skip_sync:
             with sync_lock:
                 result = _refresh_usage_inproc()
@@ -2556,101 +2545,36 @@ def _wake_schema_writer() -> None:
             _SCHEMA_WAKE_THREAD = None
 
 
-#: How often the pricing watch stats the deployed pricing file. A monotonic
-#: cadence, because a wall-clock one would re-poll or stall across a system
-#: clock change.
-_PRICING_WATCH_INTERVAL_S = 60.0
+_INSTALL_WATCH = None
 
 
-class _PricingWatch:
-    """Detect a replaced `_lib_pricing.py` and adopt it in process (#714).
+def _start_install_watch(boot):
+    """Own the install watch on its own lifecycle thread, in every mode (#868).
 
-    An installer overwrites the deployed file under a running dashboard.
-    Nothing about that reaches this process: every CLI invocation re-imports
-    and picks the new tables up, and only a long-lived process holds the old
-    ones.
-
-    STAT FIRST, PARSE SECOND. The poll compares an inode/size/mtime signature
-    and parses only when it changed, so the steady state is one `stat` a
-    minute rather than an `ast.parse` of a 1,400-line file.
-
-    NEVER RAISES OUT OF `poll_once`. The file it reads is one an installer may
-    be part-way through writing, so a half-written file is the ordinary case
-    rather than an exceptional one; a raising poll would end the thread and
-    leave the process permanently stale, which is the very condition this
-    exists to clear.
+    Not started from a git checkout, where file changes are development work,
+    not installs.
     """
-
-    def __init__(self, source_path=None, interval_s=None):
-        self.source_path = pathlib.Path(
-            source_path if source_path is not None
-            else sys.modules["_lib_pricing"].__file__)
-        self.interval_s = (_PRICING_WATCH_INTERVAL_S if interval_s is None
-                           else interval_s)
-        self._signature = None
-        self._stop = threading.Event()
-
-    def _current_signature(self):
-        try:
-            st = self.source_path.stat()
-        except OSError:
-            return None
-        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-
-    def poll_once(self) -> bool:
-        """One check. Returns True iff a new snapshot was adopted."""
-        try:
-            signature = self._current_signature()
-            if signature is None or signature == self._signature:
-                return False
-            self._signature = signature
-            pricing = sys.modules["_lib_pricing"]
-            candidate = pricing.read_pricing_snapshot_from_source(
-                self.source_path)
-            if not pricing.adopt_pricing_candidate(candidate):
-                return False
-            eprint("[pricing] adopted pricing revision "
-                   f"{candidate.snapshot_date} without restarting")
-            return True
-        except Exception:  # noqa: BLE001
-            # Including `PricingCandidateRejected`: a rejected candidate is a
-            # normal outcome, and the signature is already recorded so the
-            # same bad file is not re-parsed every minute.
-            return False
-
-    def run(self) -> None:
-        while not self._stop.wait(self.interval_s):
-            self.poll_once()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-
-_PRICING_WATCH: "_PricingWatch | None" = None
-
-
-def _start_pricing_watch() -> "_PricingWatch | None":
-    """Own the pricing detector on a lifecycle thread that runs in BOTH modes.
-
-    Deliberately not `_DashboardSyncThread` and not the conversation sync
-    thread: `cmd_dashboard` disables both under `--no-sync`, so a detector in
-    either would silently have no owner exactly where a long-lived process is
-    most likely to run.
-    """
-    global _PRICING_WATCH
-    if _PRICING_WATCH is not None:
-        return _PRICING_WATCH
-    try:
-        watch = _PricingWatch()
-        watch.poll_once()  # establish the baseline signature; adopts nothing
-        thread = threading.Thread(
-            target=watch.run, name="cctally-pricing-watch", daemon=True)
-        thread.start()
-    except Exception as exc:  # noqa: BLE001
-        eprint(f"[pricing] watch not started ({exc})")
+    global _INSTALL_WATCH
+    if _cctally_core._is_dev_checkout():
         return None
-    _PRICING_WATCH = watch
+    if _INSTALL_WATCH is not None:
+        return _INSTALL_WATCH
+    try:
+        watch = InstallWatch(
+            boot, worker_fn=lambda: getattr(_cctally(), "_UPDATE_WORKER", None))
+        watch.start()
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"[update] install watch not started ({exc})")
+        return None
+    _INSTALL_WATCH = watch
     return watch
+
+
+def _stop_install_watch() -> None:
+    global _INSTALL_WATCH
+    watch, _INSTALL_WATCH = _INSTALL_WATCH, None
+    if watch is not None:
+        watch.stop()
 
 
 def _dashboard_maybe_prune_retention() -> None:
@@ -2812,18 +2736,7 @@ def _conversation_sync_pass() -> str:
     therefore NO SECOND OPEN ATTEMPT AFTER A FAILED OPEN — stated that narrowly
     because a successful pass opens the store twice by design, once here and
     once inside the prune.
-
-    #714: the whole pass runs on ONE pricing revision. This pass writes
-    materialized cost, so a swap landing between the Claude leg and the Codex
-    leg would derive one store's rollup from two revisions — the ordered-write
-    guard would not even see it, because both halves are the same process.
     """
-    with _lib_pricing.pricing_snapshot_context():
-        return _conversation_sync_pass_body()
-
-
-def _conversation_sync_pass_body() -> str:
-    """The body of `_conversation_sync_pass`, run under its pricing context."""
     try:
         conn = open_conversations_db()
     except (OSError, sqlite3.DatabaseError) as exc:
@@ -3373,6 +3286,14 @@ def UpdateWorker(*args, **kwargs):
 
 def _DashboardUpdateCheckThread(*args, **kwargs):
     return sys.modules["cctally"]._DashboardUpdateCheckThread(*args, **kwargs)
+
+
+def capture_install_boot_state(*args, **kwargs):
+    return sys.modules["cctally"].capture_install_boot_state(*args, **kwargs)
+
+
+def InstallWatch(*args, **kwargs):
+    return sys.modules["cctally"].InstallWatch(*args, **kwargs)
 
 
 # Module-level __getattr__ — lazy-resolves a handful of cctally globals at
@@ -8610,19 +8531,6 @@ _GET_ROUTES = (
      ("scope", "endpoint.conversation_detail"), True),
 )
 
-#: Handlers that block for the life of a client connection rather than for one
-#: response. `_dispatch` must NOT pin a pricing revision around these: the pin
-#: would last as long as the stream, so a viewer who left a tab open would keep
-#: pricing from whichever revision was live when the tab connected — the exact
-#: staleness #714 removes. Both are streams that carry no cost of their own;
-#: the envelopes they forward are priced by the build that produced them, which
-#: has its own context.
-_STREAMING_ROUTE_HANDLERS = frozenset({
-    "_serve_api_events",
-    "_handle_get_update_stream",
-    "_handle_get_conversation_events",
-})
-
 _POST_ROUTES = (
     ("exact", "/api/auth", "_handle_post_auth", None, False),
     ("exact", "/api/sync", "_handle_post_sync", None, False),
@@ -8758,13 +8666,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         eleven path-taking handlers. (NOTE: returning a bool, not ``fn()`` —
         the void handlers all return None, so a None-return contract could not
         tell "handled" from "unmatched".)
-
-        #714: every matched route runs inside a pricing-snapshot context, so a
-        response is never assembled from two pricing revisions when an
-        installer replaces `_lib_pricing.py` mid-request. The two long-lived
-        streaming routes are excluded — a context entered there would pin one
-        revision for the whole life of the stream, which is minutes to hours
-        and the opposite of what the reload exists to achieve.
         """
         path = self.path.split("?", 1)[0]
         for kind, pattern, name, perf, wants_path in table:
@@ -8778,19 +8679,14 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 continue
             fn = getattr(self, name)
             args = (path,) if wants_path else ()
-            if name in _STREAMING_ROUTE_HANDLERS:
-                pinned = contextlib.nullcontext()
-            else:
-                pinned = _lib_pricing.pricing_snapshot_context()
-            with pinned:
-                if perf is None:
+            if perf is None:
+                fn(*args)
+            elif perf[0] == "scope":
+                with self._perf_scope(perf[1]):
                     fn(*args)
-                elif perf[0] == "scope":
-                    with self._perf_scope(perf[1]):
-                        fn(*args)
-                else:  # "phase"
-                    with self._perf_gate().phase(perf[1]):
-                        fn(*args)
+            else:  # "phase"
+                with self._perf_gate().phase(perf[1]):
+                    fn(*args)
             return True
         return False
 
@@ -11731,7 +11627,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         as an explicit user pin; the worker resolves the selected channel
         afresh. CSRF-gated. Returns
         202 + ``{"run_id": ...}`` on accept; 409 + ``{"run_id_in_progress": ...}``
-        when another run is already in progress.
+        when another run is already in progress; 503 + ``{"error": ...}`` while
+        the install watcher holds the automatic-restart claim (#868), which
+        the unchanged client shows as a failed start.
         """
         if not self._check_origin_csrf():
             return
@@ -11753,7 +11651,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # The dashboard has no explicit-version input. Older clients sent the
         # cached beta target here; trusting it as a pin recreates #342 whenever
         # the registry advances while the modal is open.
-        accepted, run_id = worker.start(None)
+        try:
+            accepted, run_id = worker.start(None)
+        except sys.modules["cctally"].AutomaticRestartInProgress as exc:
+            self._respond_json(503, {"error": str(exc)})
+            return
         if accepted:
             self._respond_json(202, {"run_id": run_id})
         else:
@@ -12339,16 +12241,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     _cctally_core.enable_quota_projection_reconciliation()
 
     # Spec §5.7: capture the un-mutated argv + PATH-resolved entrypoint
-    # at boot so the in-place ``execvp`` after a successful update
-    # re-enters the user-facing wrapper (npm Node shim → CCTALLY_PYTHON
-    # honoured; brew symlink → post-upgrade Python script). Module-level
-    # globals live in cctally (declared at L23205 pre-extract); we write
-    # them via the module-proxy so ``UpdateWorker`` (in _cctally_update)
-    # reads the right values via ``cctally.X`` at call time.
+    # at boot. ``_resolve_execvp_target`` derives the in-place restart
+    # from them: an npm install execs Python directly on its own
+    # ``bin/cctally`` (no added Node process, #868), and a brew install
+    # re-enters the symlink into the newly linked keg. Module-level
+    # globals live in cctally; we write them via the module-proxy so
+    # ``UpdateWorker`` and the install watch (in _cctally_update) read the
+    # right values via ``cctally.X`` at call time.
     _c_boot = _cctally()
     _c_boot.ORIGINAL_SYS_ARGV = list(sys.argv)
     _c_boot.ORIGINAL_ENTRYPOINT = shutil.which("cctally")
     _c_boot._UPDATE_WORKER = UpdateWorker()
+    # #868: captured before any thread starts; the install watch compares every
+    # later poll against what this process booted from.
+    _install_boot = capture_install_boot_state()
 
     # Load config for the bind-host + expose-transcripts resolution below. (#217
     # S1 / U7b: dropped the dead ``args._resolved_tz = resolve_display_tz(...)``
@@ -12433,11 +12339,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     _cctally_cache_module.set_conversation_derivations_suppressed(
         bool(args.no_sync))
     _dashboard_startup_schema_migration(run_derivations=not bool(args.no_sync))
-    # #714: the pricing-file watch, in EVERY mode for the same reason. Both
-    # `_DashboardSyncThread` and `_make_conversation_sync_thread` are disabled
-    # under `--no-sync`, so a detector placed in either would have no owner in
-    # the one mode a long-lived read-only dashboard runs in.
-    _start_pricing_watch()
+    # #868: in EVERY mode, because `--no-sync` disables both sync threads and a
+    # long-lived read-only dashboard is still left behind by an install.
+    _start_install_watch(_install_boot)
     _heal = _dashboard_self_heal_orphans(skip_sync=bool(args.no_sync))
     if _heal is not None and _heal.pruned_files:
         print(f"dashboard: pruned {_heal.pruned_files} orphaned cache file(s) "
@@ -12703,6 +12607,8 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     try:
         _dashboard_wait_for_signal((_signal.SIGINT, _signal.SIGTERM))
     finally:
+        # First, so a shutdown can never be followed by an automatic restart.
+        _stop_install_watch()
         if sync_thread is not None:
             sync_thread.stop()
         conversation_sync_stop.set()

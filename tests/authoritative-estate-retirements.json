@@ -1759,6 +1759,65 @@
           "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]"
         }
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0177",
+      "predecessorDigest": "283bfb04255a23b0ba0f7c262dbdd7b0e842bddc561ec9eb706137c6444a8927",
+      "profile": "public",
+      "reason": "#868 removed the #714 in-process pricing reload: the dashboard now restarts itself in place after a proven install, so _PricingWatch, read_pricing_snapshot_from_source, adopt_pricing_candidate, publish_pricing_snapshot, PRICING_EXPORT_BINDINGS and pricing_snapshot_context no longer exist and tests/test_dashboard_pricing_reload.py was deleted. Every row here tested that removed machinery. tests/test_dashboard_install_restart.py covers the replacement (spec R1-R10), and the #705 write-refusal and doctor pricing.conversation_rollup_writer tests remain in their own modules.",
+      "rows": [
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CACHE_WRITE_1H_MULTIPLIER]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CLAUDE_FAST_MULTIPLIER_OVERRIDES]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CLAUDE_MODEL_PRICING]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_FAST_MULTIPLIER_FALLBACK]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_FAST_MULTIPLIER_OVERRIDES]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_LEGACY_FALLBACK_MODEL]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_MODEL_ALIASES]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_MODEL_PRICING]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[CODEX_TIERED_THRESHOLD]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[PRICING_SNAPSHOT_DATE]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_missing_any_field_is_rejected[TIERED_THRESHOLD]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_whose_date_is_unusable_is_rejected[-absent]",
+        "tests/test_dashboard_pricing_reload.py::test_a_candidate_whose_date_is_unusable_is_rejected[not-a-date-unparseable]",
+        "tests/test_dashboard_pricing_reload.py::test_a_complete_candidate_is_read_into_a_snapshot",
+        "tests/test_dashboard_pricing_reload.py::test_a_dashboard_cost_calculation_uses_the_new_rate",
+        "tests/test_dashboard_pricing_reload.py::test_a_downgrade_candidate_is_refused_and_the_live_snapshot_retained",
+        "tests/test_dashboard_pricing_reload.py::test_a_file_whose_signature_changes_mid_parse_is_rejected",
+        "tests/test_dashboard_pricing_reload.py::test_a_non_literal_assignment_is_rejected_loudly",
+        "tests/test_dashboard_pricing_reload.py::test_a_real_request_observes_one_pricing_revision_across_a_live_swap",
+        "tests/test_dashboard_pricing_reload.py::test_a_reload_clears_the_refusal_on_the_next_authorized_sync",
+        "tests/test_dashboard_pricing_reload.py::test_a_reload_drops_no_connected_sse_client",
+        "tests/test_dashboard_pricing_reload.py::test_concurrent_readers_never_observe_a_half_swapped_snapshot",
+        "tests/test_dashboard_pricing_reload.py::test_every_cost_kernel_prices_from_the_published_snapshot",
+        "tests/test_dashboard_pricing_reload.py::test_every_recorded_binding_is_refreshed_by_a_swap",
+        "tests/test_dashboard_pricing_reload.py::test_no_pricing_named_global_escapes_the_inventory",
+        "tests/test_dashboard_pricing_reload.py::test_the_conversation_sync_pass_pins_one_pricing_revision",
+        "tests/test_dashboard_pricing_reload.py::test_the_documented_boundary_is_recorded",
+        "tests/test_dashboard_pricing_reload.py::test_the_inventory_is_complete_no_module_keeps_an_unreplaceable_copy",
+        "tests/test_dashboard_pricing_reload.py::test_the_pricing_watch_thread_starts_under_no_sync",
+        "tests/test_dashboard_pricing_reload.py::test_the_shipped_pricing_module_is_still_literal_evaluable",
+        "tests/test_dashboard_pricing_reload.py::test_the_snapshot_build_iteration_pins_one_pricing_revision",
+        "tests/test_dashboard_pricing_reload.py::test_the_watch_actually_adopts_a_replaced_pricing_file",
+        "tests/test_dashboard_pricing_reload.py::test_the_watch_never_raises_out_of_its_thread",
+        "tests/test_dashboard_pricing_reload.py::test_the_watch_parses_only_after_the_signature_changes",
+        "tests/test_dashboard_pricing_reload.py::test_work_in_flight_keeps_the_snapshot_it_captured"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0178",
+      "predecessorDigest": "283bfb04255a23b0ba0f7c262dbdd7b0e842bddc561ec9eb706137c6444a8927",
+      "profile": "public",
+      "reason": "#868 removed the #714 in-process pricing reload, so this cache-report test can no longer adopt a candidate snapshot. It is renamed to state what it still checks, that DEFAULT_TIERED_THRESHOLD equals _lib_pricing.TIERED_THRESHOLD and that _compute_entry_cache_dollars reads it at call time, and it now proves the call-time read by monkeypatching the module global.",
+      "renames": [
+        {
+          "from": "tests/test_cache_report_seams.py::test_the_default_threshold_is_the_snapshot_value_and_follows_a_reload",
+          "to": "tests/test_cache_report_seams.py::test_the_default_threshold_is_the_pricing_value_resolved_at_call_time"
+        }
+      ]
     }
   ],
   "schemaVersion": 1
