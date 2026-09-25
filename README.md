@@ -30,15 +30,14 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.109.0** (2026-09-15)
+**Latest stable: v1.111.0** (2026-09-24)
 
-Highlights from the `v1.104.0` to `v1.109.0` stable upgrade:
+Highlights from the `v1.109.0` to `v1.111.0` stable upgrade:
 
-- The dashboard picks up a new pricing revision without a restart. It re-reads the deployed pricing file every 60 seconds, adopts a complete newer revision, and keeps serving; no connected client is dropped.
-- The conversation filter popover says `Projects appear once indexing finishes.` in place of `No projects.` while the transcript index is being rebuilt. Model counts stay live on the Claude tab.
-- The dashboard's Projects panel gives every billing cycle of a credited week its own percentage. Both cycles shared one calendar date, and only the later reading survived, so the second cycle could never carry one.
+- After `cctally update` or a Homebrew upgrade installs a newer version, a running `dashboard` restarts itself so new prices and code apply. Restart it yourself once after installing this release, and after any manual `npm install -g`.
+- A `dashboard` restart after an update no longer leaves an extra Node process running on npm installs.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.109.0)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.111.0)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
