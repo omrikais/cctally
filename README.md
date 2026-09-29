@@ -30,15 +30,13 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.112.0** (2026-09-29)
+**Latest stable: v1.113.0** (2026-09-29)
 
-Highlights from the `v1.111.0` to `v1.112.0` stable upgrade:
+Highlights from the `v1.112.0` to `v1.113.0` stable upgrade:
 
-- Claude cost reports price `claude-sonnet-5-5` at its published input, output and cache rates instead of showing $0 for new usage.
-- `cctally dashboard` uses less CPU while idle on a large history.
-- The Conversation Viewer keeps project-filtered browse working with any number of unreadable Codex project paths, avoids repeated metadata schema probes, and preserves SQLite alias ordering.
+- Codex cost reports price `gpt-6.1-sol` at its published input, cached-input and output rates, including long-context and Fast pricing, instead of using fallback rates.
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.112.0)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.113.0)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
