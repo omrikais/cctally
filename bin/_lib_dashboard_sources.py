@@ -6,8 +6,10 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
@@ -717,6 +719,54 @@ def reuse_coherent_source_state(
     return prior if _reusable_provider(prior) and prior.data_version == data_version else None
 
 
+#: The complete warning-code set of a settled cycle-unavailable generation.
+SETTLED_CODEX_CYCLE_WARNING_CODES = frozenset(("codex_cycle_unavailable",))
+
+
+def settled_codex_cycle_unavailable(state: object) -> bool:
+    """Whether a Codex generation is the SETTLED cycle-unavailable state (#857).
+
+    The one Codex-only predicate both TUI retention legs consult. It names the
+    everyday state of an install that has not used Codex since its last weekly
+    reset: the build SUCCEEDED, every domain it publishes is current, and the
+    only thing withheld is the hero, because no native weekly boundary contains
+    ``now``. That is ``partial`` and ``fresh`` with data present and exactly one
+    warning code, ``codex_cycle_unavailable``.
+
+    It is deliberately narrower than "partial for a known cause". Every
+    neighbour still rebuilds: a composite with an incoherent projection (the
+    certificate-recovery case), an unresolved account scope (#819), incomplete
+    metadata (the retry kernel's own business), an unknown code, stale or
+    missing data, a failed aggregate fold, and a RETRYABLE metadata carrier,
+    which no reuse or retention gate may admit (#846). The cause is NOT added to
+    ``_lib_source_retry.RETAINABLE_PARTIAL_CAUSES``: that allowlist also decides
+    composite keys, and this state is not a throttled retry but a generation
+    with nothing left to retry.
+
+    This predicate states only the SHAPE. Whether the shape may be republished
+    this tick is the caller's question — its captured input identity must still
+    be current and its decision deadline must not have passed — because only
+    the caller holds the current identity and the clock.
+    """
+    if not isinstance(state, SourceDashboardState) or state.source != "codex":
+        return False
+    if (
+        state.availability != "partial"
+        or state.freshness != "fresh"
+        or state.data is None
+        or not state.data_version
+    ):
+        return False
+    if frozenset(
+        warning.code for warning in state.warnings
+    ) != SETTLED_CODEX_CYCLE_WARNING_CODES:
+        return False
+    health = state.metadata_health
+    if health is not None and bool(health.get("retryable")):
+        return False
+    return not aggregate_scope_failed(state)
+
+
 # === #556 S1 — the typed combined outcome (spec §3.5, §3.7) =================
 #
 # `combined` is the sum, over both providers, of that provider's accounting
@@ -987,15 +1037,7 @@ def _decorated_combined_leg(
     }, ()
 
 
-def canonical_alerted_at(value: object) -> str:
-    """Normalize an aware ISO-8601 firing instant to one UTC ``Z`` spelling.
-
-    #556 S3 §2.2. The union sorted on a field one writer never wrote, so a
-    missing or malformed value must raise here rather than degrade to a
-    sentinel that sorts silently. Sub-second precision is truncated, so two
-    alerts firing in the same second compare equal and fall back to source
-    order; no writer emits it today.
-    """
+def _parse_alerted_at(value: object) -> dt.datetime:
     if not isinstance(value, str) or not value:
         raise ValueError(f"alerted_at must be a non-empty ISO-8601 string, got {value!r}")
     try:
@@ -1004,25 +1046,96 @@ def canonical_alerted_at(value: object) -> str:
         raise ValueError(f"unparseable alerted_at {value!r}") from exc
     if parsed.tzinfo is None:
         raise ValueError(f"naive alerted_at {value!r}; an aware instant is required")
-    return parsed.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def canonical_alerted_at(value: object) -> str:
+    """Normalize an aware ISO-8601 firing instant to one UTC ``Z`` spelling.
+
+    #556 S3 §2.2. The union sorted on a field one writer never wrote, so a
+    missing or malformed value must raise here rather than degrade to a
+    sentinel that sorts silently. A whole-second instant keeps its historical
+    ``…SSZ`` spelling. #869 F14: a Codex budget crossing records the exact
+    microsecond cutoff its spend scan used, so a sub-second instant keeps its
+    six-digit fraction instead of being truncated into a tie with a Claude
+    alert from the same second. This value is for publication; ordering uses
+    :func:`alerted_at_order_key`, because two widths do not sort as text.
+    """
+    parsed = _parse_alerted_at(value)
+    if parsed.microsecond:
+        return parsed.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def alerted_at_order_key(value: object) -> str:
+    """The full firing instant as fixed-width UTC text: ``…SS.ffffffZ``.
+
+    #869 F14. Every truncation and union across vendors compares firing
+    instants, and a whole-second Claude alert must sort before a Codex alert
+    fired later in the same second. Fixed width makes text order equal instant
+    order, and :func:`alerted_at_order_key_sql` produces the same string in
+    SQLite. Raises exactly as :func:`canonical_alerted_at` does.
+    """
+    return _parse_alerted_at(value).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _alerted_at_fraction_sql(column: str) -> str:
+    """The six-digit sub-second fraction of an ISO-8601 value, in SQLite.
+
+    SQLite's date functions keep only milliseconds, so the fraction is read
+    from the text itself. A UTC offset is a whole number of minutes, so the
+    source fraction is also the UTC instant's fraction.
+    """
+    tail = f"substr({column}, 21)"
+    digits = (
+        f"substr({tail}, 1, CASE "
+        f"WHEN instr({tail}, 'Z') > 0 THEN instr({tail}, 'Z') - 1 "
+        f"WHEN instr({tail}, '+') > 0 THEN instr({tail}, '+') - 1 "
+        f"WHEN instr({tail}, '-') > 0 THEN instr({tail}, '-') - 1 "
+        f"ELSE length({tail}) END)"
+    )
+    return (
+        f"(CASE WHEN substr({column}, 20, 1) = '.' "
+        f"THEN substr({digits} || '000000', 1, 6) ELSE '000000' END)"
+    )
+
+
+def alerted_at_order_key_sql(column: str = "alerted_at") -> str:
+    """The SQL twin of :func:`alerted_at_order_key`, for ``ORDER BY … LIMIT``.
+
+    #556 S3 §2.3 / #869 F14. Every per-axis ``LIMIT`` decides MEMBERSHIP, not
+    merely order, so it must compare the full instant: two rows fired in the
+    same second are otherwise tie-broken by an unrelated column and the newer
+    one can be dropped before any later projection sees it. SQLite parses the
+    offset for the seconds part and the text supplies the fraction, so for
+    every aware spelling this returns the Python helper's string —
+    ``tests/test_556_s3_alert_ordering.py`` pins that agreement. A naive value
+    is read as UTC here where the Python helper raises; an unparseable value
+    yields ``NULL``, which sorts last under ``DESC``. The expression names
+    ``column`` several times, so a bound parameter must be numbered (``?1``).
+    """
+    return (
+        f"(strftime('%Y-%m-%dT%H:%M:%S', {column}) || '.' || "
+        f"{_alerted_at_fraction_sql(column)} || 'Z')"
+    )
 
 
 def canonical_alerted_at_sql(column: str = "alerted_at") -> str:
-    """The SQL twin of :func:`canonical_alerted_at`, for ordering in SQLite.
+    """The SQL twin of :func:`canonical_alerted_at`, for the same spelling.
 
-    #556 S3 §2.3. Every per-axis ``LIMIT`` decides MEMBERSHIP, not merely
-    order, so a row excluded by a textual comparison of two spellings of one
-    instant cannot be recovered by any later projection. SQLite parses the
-    timezone indicator, so for every aware spelling this returns the same
-    canonical UTC ``Z`` string the Python helper returns —
-    ``tests/test_556_s3_alert_ordering.py`` pins that agreement over the
-    committed estate. The twins diverge on exactly one input: SQLite reads a
-    naive value as UTC where the Python helper raises, so such a row is ordered
-    here and rejected later. An unparseable value yields SQL ``NULL``, which
-    sorts last under ``DESC``, so the ``LIMIT`` usually drops that row before
-    composition can reject it — corruption is truncated away, not surfaced.
+    #556 S3 §2.3 / #869 F14. It agrees with the Python helper for every aware
+    spelling, including a sub-second one, and is kept so a writer emitting a
+    spelling only one side understands surfaces in the agreement test. It is
+    variable-width, so it never orders a ``LIMIT``; that is
+    :func:`alerted_at_order_key_sql`'s job.
     """
-    return f"strftime('%Y-%m-%dT%H:%M:%SZ', {column})"
+    fraction = _alerted_at_fraction_sql(column)
+    return (
+        f"(CASE WHEN {fraction} = '000000' "
+        f"THEN strftime('%Y-%m-%dT%H:%M:%SZ', {column}) "
+        f"ELSE strftime('%Y-%m-%dT%H:%M:%S', {column}) || '.' || {fraction} "
+        f"|| 'Z' END)"
+    )
 
 
 def _leg_period(
@@ -1525,7 +1638,7 @@ def _combined_alert_rows(
 
     def _instant(row: Mapping[str, object]) -> str:
         try:
-            return canonical_alerted_at(row.get("alerted_at"))
+            return alerted_at_order_key(row.get("alerted_at"))
         except ValueError as exc:
             identity = row.get("id") if row.get("id") is not None else row.get("key")
             raise ValueError(
@@ -1827,10 +1940,116 @@ _CLAUDE_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+_STATS_RELATIONS_DIGEST_MEMO: "dict[tuple, str]" = {}
+
+# A file timestamp is only as fine as its filesystem: nanoseconds on APFS, a
+# kernel tick on ext4, one second on HFS+, two on FAT. Two commits inside one
+# tick can leave identical timestamps, so no digest is memoized until the
+# file's newest timestamp is at least this old. Any later commit then carries a
+# strictly newer timestamp, whatever the granularity up to this bound.
+_STATS_DIGEST_MEMO_SETTLE_SECONDS = 2.0
+
+
+def _stats_memo_now() -> float:
+    """The wall clock the settle window is measured on (a test seam)."""
+    return time.time()
+
+
+def _stats_relations_digest_signal(
+    stats_conn: sqlite3.Connection,
+) -> "tuple | None":
+    """Return the stats file's write identity, or no cache key.
+
+    The journal cursor cannot serve as this identity. ``_run_cycle`` runs the
+    Codex projection leg and the budget-config reconcile on a cycle that
+    consumed no journal bytes and rewrites the cursor to the same high-water
+    mark, and the own-connection reconcile branches, the incomplete-projection
+    reconciliation and every administrative writer never touch it at all.
+
+    Every committed SQLite write in rollback-journal mode rewrites pages of the
+    main file, which moves its mtime and ctime, so the file's ``stat`` covers
+    all of those writers, in every process, without enumerating them. SQLite
+    skips an overwrite whose bytes are unchanged, so an idle cycle that
+    rewrites the cursor and selector rows to identical values leaves the file,
+    and this key, untouched. ``(st_dev, st_ino)`` covers a rebuilt or replaced
+    index, and ``st_size`` rides along for free.
+
+    The file is only ever ``stat``-ed, never opened: closing a second
+    descriptor on a database file releases every POSIX lock this process's
+    SQLite connections hold on it.
+
+    A connection inside a transaction may be reading its own uncommitted
+    writes, which the file does not show yet, so it stays on the cold path, as
+    does an in-memory or temporary store.
+    """
+    if stats_conn.in_transaction:
+        return None
+    try:
+        rows = stats_conn.execute("PRAGMA database_list").fetchall()
+        path = next(
+            str(row[2]) for row in rows
+            if len(row) > 2 and str(row[1]) == "main" and row[2]
+        )
+        stat = os.stat(path)
+    except (OSError, StopIteration, sqlite3.Error, TypeError, ValueError):
+        return None
+    return (
+        path, stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
+def _stats_relations_digest_memoizable(
+    stats_conn: sqlite3.Connection,
+    signal: tuple,
+    observed_at: float,
+) -> bool:
+    """May a digest computed under ``signal`` be served to a later read?
+
+    Only when the file did not move while the relations were read, the file had
+    settled before they were, and the store is not in WAL mode. A WAL commit
+    lands in the ``-wal`` file and leaves the main file's timestamps alone, so
+    the key could not see it. The mode is read here, after the relation reads,
+    because a connection reports ``wal`` only once it has read the file. A later
+    switch into WAL is itself a write to the main file, so a stored entry never
+    has to be re-checked.
+    """
+    newest = max(signal[4], signal[5]) / 1e9
+    if observed_at - newest < _STATS_DIGEST_MEMO_SETTLE_SECONDS:
+        return False
+    try:
+        if stats_conn.in_transaction:
+            return False
+        mode = stats_conn.execute("PRAGMA journal_mode").fetchone()
+        if mode is None or str(mode[0]).lower() == "wal":
+            return False
+        stat = os.stat(signal[0])
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return False
+    return signal[1:] == (
+        stat.st_dev, stat.st_ino, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
 def _stats_relations_digest(
     stats_conn: sqlite3.Connection,
     relations: tuple[tuple[str, str], ...],
+    *,
+    memo_namespace: "str | None" = None,
 ) -> str:
+    signal = None
+    observed_at = 0.0
+    if memo_namespace is not None:
+        # The clock is read BEFORE the file, so the settle test compares the
+        # file against an instant no later than the relation reads.
+        observed_at = _stats_memo_now()
+        signal = _stats_relations_digest_signal(stats_conn)
+    key = (memo_namespace, signal) if signal is not None else None
+    if key is not None:
+        cached = _STATS_RELATIONS_DIGEST_MEMO.get(key)
+        if cached is not None:
+            return cached
     relation_rows: list[list[list[object]]] = []
     for _name, query in relations:
         try:
@@ -1846,7 +2065,15 @@ def _stats_relations_digest(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    digest = hashlib.sha256(canonical).hexdigest()
+    if key is not None and _stats_relations_digest_memoizable(
+        stats_conn, signal, observed_at,
+    ):
+        for prior in tuple(_STATS_RELATIONS_DIGEST_MEMO):
+            if prior[0] == memo_namespace:
+                _STATS_RELATIONS_DIGEST_MEMO.pop(prior, None)
+        _STATS_RELATIONS_DIGEST_MEMO[key] = digest
+    return digest
 
 
 def claude_stats_digest(stats_conn: sqlite3.Connection) -> str:
@@ -1855,7 +2082,11 @@ def claude_stats_digest(stats_conn: sqlite3.Connection) -> str:
     A missing table is an empty relation, so an older or fresh stats database
     still has a stable digest — the same posture ``codex_stats_digest`` takes.
     """
-    return _stats_relations_digest(stats_conn, _CLAUDE_STATS_DIGEST_RELATIONS)
+    return _stats_relations_digest(
+        stats_conn,
+        _CLAUDE_STATS_DIGEST_RELATIONS,
+        memo_namespace="claude",
+    )
 
 
 def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
@@ -1866,7 +2097,11 @@ def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
     then follows the source all-or-prior failure matrix instead of publishing a
     guessed identity.
     """
-    return _stats_relations_digest(stats_conn, _CODEX_STATS_DIGEST_RELATIONS)
+    return _stats_relations_digest(
+        stats_conn,
+        _CODEX_STATS_DIGEST_RELATIONS,
+        memo_namespace="codex",
+    )
 
 
 def assess_codex_projection_coherence(

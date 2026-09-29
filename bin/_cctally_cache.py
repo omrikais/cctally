@@ -9478,6 +9478,7 @@ def _sum_codex_cost_for_range(
     speed: str = "auto",
     skip_sync: bool = False,
     account_key: "str | None" = None,
+    pricing_provenance: "dict | None" = None,
 ) -> float:
     """Sum USD Codex cost of all `codex_session_entries` in ``[start, end)``.
 
@@ -9511,17 +9512,23 @@ def _sum_codex_cost_for_range(
     """
     c = _cctally()
     eff_speed = c._resolve_codex_speed(speed)
+    entries = c.get_codex_entries(
+        start, end, skip_sync=skip_sync, account_key=account_key,
+    )
+    if pricing_provenance is not None:
+        import _lib_cost_provenance
+        total, evidence = _lib_cost_provenance.codex_cost_with_provenance(
+            entries, end=end, speed=eff_speed,
+        )
+        pricing_provenance.update(evidence)
+        return total
     total = 0.0
-    for entry in c.get_codex_entries(start, end, skip_sync=skip_sync,
-                                     account_key=account_key):
+    for entry in entries:
         if entry.timestamp >= end:
             continue
         total += c._calculate_codex_entry_cost(
-            entry.model,
-            entry.input_tokens,
-            entry.cached_input_tokens,
-            entry.output_tokens,
-            entry.reasoning_output_tokens,
+            entry.model, entry.input_tokens, entry.cached_input_tokens,
+            entry.output_tokens, entry.reasoning_output_tokens,
             speed=eff_speed,
         )
     return total

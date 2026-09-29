@@ -3,10 +3,13 @@
 Specification `docs/superpowers/specs/2026-09-15-845-846-codex-metadata-decode-tolerance.md`,
 acceptance rows A9 and A13. Both rows are explicit that a builder-only test
 does not satisfy them: the defect they pin is not in the builder at all. The
-builder publishes a `transient_read_failure` generation correctly, and then
-`_tui_retain_refused_partial` and `_tui_source_bundle_can_idle` republish it
-for up to `PARTIAL_RETRY_INTERVAL` while the chip promises a retry. Only a
-second TICK over the first tick's generation can observe that.
+builder publishes a `transient_read_failure` generation correctly. Current
+production clears the provider key at `_tui_retain_refused_partial`, clears the
+idle-reuse key at `_tui_source_bundle_can_idle` before its availability refusal,
+and clears obsolete `metadata_incomplete` state after a forced fresh build
+reports healthy metadata. Real follow-up ticks plus armed-key boundary checks
+distinguish those paths. The legacy synthetic `availability="ok"` carrier in
+`test_830_partial_reuse_retry.py` is defensive compatibility coverage only.
 
 Every generation here is produced by forcing a real `sqlite3.Error` in one
 metadata leg of the real builder, never by editing a carrier onto a state: a
@@ -50,7 +53,10 @@ class _TickHarness:
         self.tui = sys.modules["_cctally_tui"]
         self.bundle = None
 
-    def tick(self, *, prior=..., codex_ingest_failed=False, now_utc=NOW):
+    def tick(
+        self, *, prior=..., codex_ingest_failed=False,
+        claude_ingest_failed=False, now_utc=NOW,
+    ):
         # The accounting memo is deliberately NOT reset between ticks: resetting
         # it marks the accounting cache pending, and a pending ledger forces a
         # rebuild through `_codex_forced_rebuild` before the retention leg is
@@ -62,6 +68,7 @@ class _TickHarness:
             display_tz_name="UTC",
             codex_ingest_contended=False,
             codex_ingest_failed=codex_ingest_failed,
+            claude_ingest_failed=claude_ingest_failed,
             claude_cost_usd=1.0,
             claude_total_tokens=100,
             common_range_start=START,
@@ -145,17 +152,12 @@ def test_846_a9_a_second_tick_rebuilds_the_transient_generation(
 ):
     """A9's retention half, through `_tui_build_source_bundle`.
 
-    A failed metadata leg publishes `partial` with the warning code
-    `codex_metadata_incomplete`, which `_lib_source_retry` normalizes to the
-    retainable cause `metadata_incomplete`. `_tui_retain_refused_partial`
-    derived its cause from `prior.warnings` alone, so it would retain that
-    generation for up to `PARTIAL_RETRY_INTERVAL`.
-
-    Measured while writing this: with the carrier leg removed, the ticks below
-    still rebuild, because the skipped qualified read leaves the accounting
-    ledger pending and `_codex_forced_rebuild` fires before the retention leg
-    is consulted. So this row asserts the published outcome, and the RED proof
-    of the leg itself is the predicate test that follows.
+    A failed metadata leg publishes the production `partial`/`fresh` carrier
+    with warning `codex_metadata_incomplete`. The skipped qualified read keeps
+    the accounting ledger pending, so `_codex_forced_rebuild` drives these
+    repeated real ticks before provider retention is consulted. This case pins
+    the published outcome and empty retry state; the next case directly pins
+    `_tui_retain_refused_partial`'s provider-scoped clear.
     """
     source_module = sys.modules["_cctally_dashboard_sources"]
     with monkeypatch.context() as broken:
@@ -168,9 +170,8 @@ def test_846_a9_a_second_tick_rebuilds_the_transient_generation(
 
         # The SAME fault on every later tick, over an unchanged store, so the
         # cause and the version repeat exactly as they do in production. The
-        # retry kernel rebuilds on the FIRST observation of a key and retains
-        # the repeat inside its deadline, so the third tick is the one that was
-        # retained; every tick here must rebuild, and no key may ever be armed.
+        # pending accounting ledger forces each build; no tick may reuse a
+        # transient generation or arm a retry key for it.
         seen = [first_codex]
         for _ in range(2):
             later = ticks.tick().sources["codex"]
@@ -192,12 +193,14 @@ def test_846_a9_a_second_tick_rebuilds_the_transient_generation(
 
 def test_846_a9_the_retention_leg_refuses_and_clears_the_armed_key(ticks,
                                                                    monkeypatch):
-    """The same defect at the predicate, with the armed key observed.
+    """The provider-reuse boundary clears only the retryable provider.
 
-    The first tick arms the provider's retry key; the leg must refuse the
-    second tick AND drop that key, so the tick after a recovery is not met by
-    a key still inside its deadline.
+    The retry kernel arms both provider keys before the boundary is called.
+    The leg must refuse the retryable Codex carrier and drop only Codex, so the
+    tick after a recovery is not met by a stale provider deadline.
     """
+    import _lib_source_retry as retry
+
     source_module = sys.modules["_cctally_dashboard_sources"]
     tui = ticks.tui
     with monkeypatch.context() as broken:
@@ -207,14 +210,35 @@ def test_846_a9_the_retention_leg_refuses_and_clears_the_armed_key(ticks,
     assert codex.availability == "partial"
     assert "codex_metadata_incomplete" in [w.code for w in codex.warnings]
 
+    _decision, armed_codex = retry.plan_partial_retry(
+        retry.EMPTY_RETRY_STATE,
+        provider="codex",
+        cause=("codex_metadata_incomplete",),
+        data_version=codex.data_version,
+        now=NOW,
+    )
+    _decision, armed_both = retry.plan_partial_retry(
+        armed_codex,
+        provider="claude",
+        cause=("codex_metadata_incomplete",),
+        data_version=first.sources["claude"].data_version,
+        now=NOW,
+    )
+    assert set(armed_both) == {"claude", "codex"}
+    tui._PARTIAL_RETRY_STATE = armed_both
+
     assert tui._tui_retain_refused_partial(
         codex, provider="codex", now_utc=NOW,
         data_version=codex.data_version,
     ) is False
+    assert set(tui._PARTIAL_RETRY_STATE) == {"claude"}, (
+        "the provider boundary must clear Codex without disturbing Claude"
+    )
     assert tui._tui_retain_refused_partial(
         codex, provider="codex", now_utc=NOW,
         data_version=codex.data_version,
     ) is False, "a repeated call must not arm the key either"
+    assert set(tui._PARTIAL_RETRY_STATE) == {"claude"}
 
 
 def test_846_a9_an_ingest_failure_republishes_the_transient_carrier(
@@ -290,6 +314,9 @@ def test_846_a13_healthy_transient_healthy_through_the_tick(ticks, monkeypatch):
     healthy = ticks.tick(prior=None)
     healthy_codex = healthy.sources["codex"]
     assert healthy_codex.metadata_health["state"] == "healthy"
+    assert healthy_codex.availability == "partial"
+    assert "codex_projection_incoherent" in [
+        warning.code for warning in healthy_codex.warnings]
     healthy_labels = [
         row["label"] for row in healthy_codex.data["projects"]["rows"]]
     assert healthy_labels
@@ -306,22 +333,34 @@ def test_846_a13_healthy_transient_healthy_through_the_tick(ticks, monkeypatch):
     degraded_codex = degraded.sources["codex"]
     assert degraded_codex.metadata_health["state"] == "transient_read_failure"
     assert degraded_codex.data["projects"]["rows"] == ()
-    # Arm a key so the recovery tick has something to clear. With the
-    # retention leg in place this call refuses and clears without arming;
-    # without the leg it arms, and the assertion below is what fails.
-    tui._tui_retain_refused_partial(
-        degraded_codex, provider="codex", now_utc=NOW,
+    # Arm a real retry-kernel key so the forced fresh build's healthy-metadata
+    # result has obsolete `metadata_incomplete` state to clear even though the
+    # rebuild bypasses `_tui_retain_refused_partial`.
+    import _lib_source_retry as retry
+    _decision, armed = retry.plan_partial_retry(
+        retry.EMPTY_RETRY_STATE,
+        provider="codex",
+        cause=("codex_metadata_incomplete",),
         data_version=degraded_codex.data_version,
+        now=NOW,
     )
+    assert set(armed) == {"codex"}
+    tui._PARTIAL_RETRY_STATE = armed
 
     recovered = ticks.tick()
+    recovered_codex = recovered.sources["codex"]
     assert tui._PARTIAL_RETRY_STATE == EMPTY_RETRY_STATE, (
         "the recovery tick left a key armed, so the next partial of the same "
-        "cause would be retained rather than rebuilt"
+        "cause would be retained rather than rebuilt: "
+        f"availability={recovered_codex.availability!r} "
+        f"health={recovered_codex.metadata_health!r} "
+        f"same_object={recovered_codex is degraded_codex}"
     )
-    recovered_codex = recovered.sources["codex"]
     assert recovered_codex is not degraded_codex
     assert recovered_codex.metadata_health == healthy_codex.metadata_health
+    assert recovered_codex.availability == "partial", (
+        "healthy metadata must clear its obsolete retry key even when an "
+        "independent projection condition keeps the provider partial")
     assert [
         row["label"] for row in recovered_codex.data["projects"]["rows"]
     ] == healthy_labels
@@ -383,20 +422,17 @@ def test_846_a13_healthy_malformed_healthy_through_the_tick(ticks, monkeypatch):
         w.code for w in healthy_codex.warnings]
 
 
-def test_846_the_idle_gate_clears_the_armed_key_it_refuses_on(ticks,
-                                                              monkeypatch):
-    """The `clear_partial_retry` branch of `_tui_source_bundle_can_idle`.
+def test_846_the_idle_gate_clears_the_armed_key_it_refuses_on(
+    ticks, monkeypatch,
+):
+    """`_tui_source_bundle_can_idle` clears a real carrier's provider key.
 
-    The refusal itself was already covered; the CLEAR added beside it was not.
-    Without it, the tick after the fault clears finds a key still inside its
-    deadline and retains one more transient generation.
-
-    The bundle is a real tick's, with its codex state's `availability` raised
-    to `ok`. Under §4.6 rule 1 every transient generation now takes the
-    cache-only fallback and therefore publishes `partial`, so the gate's
-    availability leg would refuse first and the carrier leg would never run.
-    Raising it is what makes the carrier the only leg that can refuse, which is
-    the branch under test; the carrier itself is the production one.
+    The metadata failure publishes the exact partial/fresh carrier consumed by
+    production. The idle predicate must check both providers and clear Codex
+    before its broader partial refusal returns; the idle snapshot must then
+    rebuild that generation and publish the first healthy result without one
+    stale retry interval. No synthetic `availability="ok"` carrier is evidence
+    for this production path.
     """
     import _lib_source_retry as retry
 
@@ -404,35 +440,64 @@ def test_846_the_idle_gate_clears_the_armed_key_it_refuses_on(ticks,
     tui = ticks.tui
     with monkeypatch.context() as broken:
         _a9_force_leg_failure(broken, source_module, "detail_probe")
-        bundle = ticks.tick(prior=None)
+        bundle = ticks.tick(prior=None, claude_ingest_failed=True)
     codex = bundle.sources["codex"]
+    assert bundle.sources["claude"].availability == "unavailable"
     assert codex.metadata_health["state"] == "transient_read_failure"
     assert codex.metadata_health["retryable"] is True
+    assert codex.availability == "partial"
 
-    bundle = dataclasses.replace(
-        bundle,
-        sources={
-            **dict(bundle.sources),
-            "codex": dataclasses.replace(
-                codex, availability="ok", freshness="fresh"),
-        },
-    )
-
-    _decision, armed = retry.plan_partial_retry(
+    _decision, armed_codex = retry.plan_partial_retry(
         retry.EMPTY_RETRY_STATE,
         provider="codex",
         cause=("codex_metadata_incomplete",),
         data_version=codex.data_version,
         now=NOW,
     )
-    assert armed != retry.EMPTY_RETRY_STATE, (
-        "the fixture must actually arm a key, or the clear asserts nothing"
+    _decision, armed_both = retry.plan_partial_retry(
+        armed_codex,
+        provider="claude",
+        cause=("codex_metadata_incomplete",),
+        data_version=bundle.sources["claude"].data_version,
+        now=NOW,
     )
-    tui._PARTIAL_RETRY_STATE = armed
+    assert set(armed_both) == {"claude", "codex"}, (
+        "the fixture must arm both provider keys before testing isolation"
+    )
+    tui._PARTIAL_RETRY_STATE = armed_both
 
-    assert tui._tui_source_bundle_can_idle(bundle) is False
+    # #857: the stamped identity, so the refusal is the carrier's and never
+    # missing provenance.
+    identity = codex.clock_data["codex_quota_dependency"]
+    assert identity is not None, "precondition: a stamped identity"
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=identity) is False
+    assert set(tui._PARTIAL_RETRY_STATE) == {"claude"}, (
+        "the idle refusal must clear Codex without disturbing Claude"
+    )
+
+    tui._PARTIAL_RETRY_STATE = armed_codex
+    prior = dataclasses.replace(
+        tui._tui_empty_snapshot(NOW), source_bundle=bundle)
+    idle = tui._tui_build_idle_snapshot(
+        prior,
+        now_utc=NOW,
+        precompute_envelope=False,
+        runtime_bind=None,
+        raw_config={},
+        errors=[],
+        display_tz_pref_override="utc",
+        source_stats_conn=ticks.stats,
+        source_display_tz_name="UTC",
+        source_display_tz=dt.timezone.utc,
+        codex_dependency=identity,
+    )
+    assert idle.source_bundle is not bundle
+    recovered = idle.source_bundle.sources["codex"]
+    assert recovered.metadata_health["state"] == "healthy"
+    assert recovered.data["projects"]["rows"]
     assert tui._PARTIAL_RETRY_STATE == retry.EMPTY_RETRY_STATE, (
-        "the gate refused but left the key armed"
+        "the first healthy idle rebuild must not leave stale retry state"
     )
 
 
@@ -459,7 +524,12 @@ def test_846_a9_the_idle_snapshot_rebuilds_the_transient_generation(
 
         prior = dataclasses.replace(
             tui._tui_empty_snapshot(NOW), source_bundle=bundle)
-        assert tui._tui_source_bundle_can_idle(bundle) is False, (
+        # #857: the stamped identity, so the refusal is the carrier's and
+        # never missing provenance.
+        identity = codex.clock_data["codex_quota_dependency"]
+        assert identity is not None, "precondition: a stamped identity"
+        assert tui._tui_source_bundle_can_idle(
+            bundle, codex_dependency=identity) is False, (
             "the idle gate must refuse, or the rebuild branch never runs"
         )
         idle = tui._tui_build_idle_snapshot(
@@ -473,6 +543,7 @@ def test_846_a9_the_idle_snapshot_rebuilds_the_transient_generation(
             source_stats_conn=harness.stats,
             source_display_tz_name="UTC",
             source_display_tz=ZoneInfo("UTC"),
+            codex_dependency=identity,
         )
         assert idle.source_bundle is not bundle, (
             "the rebuild branch must have run: a clock refresh would have "
@@ -480,6 +551,92 @@ def test_846_a9_the_idle_snapshot_rebuilds_the_transient_generation(
         )
         rebuilt = idle.source_bundle.sources["codex"]
         assert rebuilt.metadata_health["state"] == "healthy"
+    finally:
+        harness.cache.close()
+        harness.stats.close()
+        tui._tui_reset_partial_retry_state()
+
+
+def test_857_entering_the_settled_cycle_exception_clears_only_the_codex_key(
+    tmp_path, monkeypatch,
+):
+    """#857: a settled cycle-only generation is admitted to reuse by its OWN
+    narrow exception, which bypasses `_tui_retain_refused_partial` — so it must
+    clear the Codex key itself. A metadata key armed before the cycle-only
+    generation would otherwise still be inside its deadline when a metadata
+    partial of the same version recurred, and the recurrence would be RETAINED
+    instead of rebuilt. Claude's independent key must survive both legs.
+    """
+    import _lib_source_retry as retry
+    from _lib_dashboard_sources import SourceDashboardWarning
+
+    harness = _harness(tmp_path, monkeypatch)
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    tui = harness.tui
+    try:
+        # The only weekly window reset an hour ago: accounting exists, so the
+        # build publishes the settled cycle-only generation.
+        _install_active_native_cycle(
+            monkeypatch, source_module, reset=NOW - dt.timedelta(hours=1),
+            root=_cache_root_key(harness.cache))
+        bundle = harness.tick(prior=None)
+        codex = bundle.sources["codex"]
+        assert codex.availability == "partial"
+        assert codex.freshness == "fresh"
+        assert [w.code for w in codex.warnings] == ["codex_cycle_unavailable"]
+        identity = codex.clock_data["codex_quota_dependency"]
+        assert identity is not None
+        sc = sys.modules["_lib_snapshot_cache"]
+        assert identity == sc.codex_quota_dependency_identity(
+            harness.cache,
+            opened_file=sc.codex_cache_file_identity(
+                sc.codex_main_database_path(harness.cache)),
+        )
+        recurrence = dataclasses.replace(codex, warnings=(SourceDashboardWarning(
+            "codex_metadata_incomplete",
+            "1 Codex accounting row(s) lack project metadata.", "projects"),))
+
+        def arm_both():
+            _decision, armed = retry.plan_partial_retry(
+                retry.EMPTY_RETRY_STATE, provider="codex",
+                cause=("codex_metadata_incomplete",),
+                data_version=codex.data_version, now=NOW)
+            _decision, armed = retry.plan_partial_retry(
+                armed, provider="claude",
+                cause=("codex_metadata_incomplete",),
+                data_version=bundle.sources["claude"].data_version, now=NOW)
+            assert set(armed) == {"claude", "codex"}
+            tui._PARTIAL_RETRY_STATE = armed
+
+        def recurrence_is_retained(at):
+            return tui._tui_retain_refused_partial(
+                recurrence, provider="codex", now_utc=at,
+                data_version=codex.data_version)
+
+        # Non-vacuity: with the old Codex key still armed, the recurrence would
+        # be retained inside the deadline rather than rebuilt.
+        arm_both()
+        assert recurrence_is_retained(NOW + dt.timedelta(seconds=5)) is True
+
+        # The idle leg.
+        arm_both()
+        assert tui._tui_source_bundle_can_idle(
+            bundle, codex_dependency=identity,
+            now_utc=NOW + dt.timedelta(seconds=5)) is True
+        assert set(tui._PARTIAL_RETRY_STATE) == {"claude"}, (
+            "entering the settled exception must clear Codex, and only Codex")
+        assert recurrence_is_retained(NOW + dt.timedelta(seconds=10)) is False, (
+            "the recurrence must rebuild immediately")
+
+        # The active leg: an exact-version tick keeps the settled generation.
+        arm_both()
+        monkeypatch.setattr(
+            tui, "capture_codex_source_state",
+            lambda *_a, **_k: pytest.fail("the settled generation was rebuilt"))
+        again = harness.tick(now_utc=NOW + dt.timedelta(seconds=5))
+        assert again.sources["codex"].data_version == codex.data_version
+        assert set(tui._PARTIAL_RETRY_STATE) == {"claude"}
+        assert recurrence_is_retained(NOW + dt.timedelta(seconds=10)) is False
     finally:
         harness.cache.close()
         harness.stats.close()

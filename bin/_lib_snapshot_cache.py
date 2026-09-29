@@ -44,8 +44,10 @@ reason.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
+import itertools
 import os
 import sqlite3
 import sys
@@ -272,6 +274,210 @@ def compute_signature(
         codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
         claude_stats_digest=str(claude_stats_digest),
     )
+
+
+# === #857 — the Codex quota-dependency identity =============================
+
+
+#: Bumped whenever the leg set below changes, so an identity captured by an
+#: older build can never compare equal to one read by a newer rule.
+CODEX_QUOTA_DEPENDENCY_VERSION = "codex-quota-dependency-v1"
+
+#: `_cctally_quota._DASHBOARD_PROJECTION_CERTIFICATE_KEY`, spelled here because
+#: this kernel may not import the quota glue; a test pins the two together.
+_CODEX_PROJECTION_CERTIFICATE_KEY = "codex_quota_projection_certificate"
+
+@contextlib.contextmanager
+def one_read_snapshot(conn: sqlite3.Connection):
+    """Run the enclosed reads on ONE database snapshot.
+
+    Joins a transaction the caller already holds — the dashboard's pinned
+    source build, or the dispatch read that wraps its signature and its Codex
+    quota-dependency identity in one — rather than nesting one; otherwise opens
+    a deferred read transaction and rolls it back, leaving the connection as it
+    was found. Without it each statement reads its own snapshot, so a commit
+    landing between two legs yields an identity no database state ever had. A
+    deferred ``BEGIN`` takes no lock and pins no snapshot until the first read,
+    so work done inside the block before that read holds nothing. A failing
+    ``BEGIN`` raises ``sqlite3.Error`` to the caller, whose own handler decides.
+    """
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+
+
+def codex_cache_file_identity(path: object) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of the file ``path`` names NOW (#857).
+
+    ``None`` when it cannot be stat'ed. A path is only a name: this describes
+    whichever file holds it at the instant of the call, which is why
+    `codex_quota_dependency_identity` brackets its reads with it rather than
+    trusting one stat.
+    """
+    try:
+        file_stat = os.stat(path)  # type: ignore[arg-type]
+    except (OSError, TypeError, ValueError):
+        return None
+    return (int(file_stat.st_dev), int(file_stat.st_ino))
+
+
+def codex_quota_observation_legs(
+    conn: sqlite3.Connection,
+) -> tuple[int, str] | None:
+    """The cache.db half of the quota-observation identity (#583 S5, #857).
+
+    ``(quota_window_change_log high-water, codex_window_attribution_revision)``,
+    read on one snapshot. Its callers are the doctor's quota-probe signal, the
+    dashboard's cross-build quota memo (`_codex_quota_reuse_identity`) and the
+    quota-dependency identity below; each leg's query is stated once, the
+    revision's in `_read_codex_window_attribution_revision`, which the
+    accounting population signature reads too.
+
+    The high-water mark is read from ``sqlite_sequence``, not ``MAX(seq)``: the
+    projector PRUNES consumed ledger entries, and ``AUTOINCREMENT`` keeps its
+    high-water across that ``DELETE``, so a prune never reads as a regression.
+    Every insert, delete and semantic update of ``quota_window_snapshots`` is
+    recorded by the ledger triggers, including a write that forgot to advance
+    ``codex_physical_mutation_seq``. The attribution revision covers the overlay
+    the journal applies with no ``quota_window_snapshots`` write at all.
+
+    ``None`` means "cannot establish identity" and every caller must treat it
+    as a cold read: an absent or unreadable ledger is not an idle ledger.
+    """
+    try:
+        with one_read_snapshot(conn):
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='quota_window_change_log'"
+            ).fetchone()
+            if table is None:
+                return None
+            seq_row = conn.execute(
+                "SELECT seq FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'"
+            ).fetchone()
+            revision = _read_codex_window_attribution_revision(conn)
+    except sqlite3.Error:
+        return None
+    try:
+        high_water = 0 if seq_row is None else int(seq_row[0])
+    except (TypeError, ValueError):
+        return None
+    return (high_water, "" if revision is None else revision)
+
+
+def _codex_projection_certificate_digest(conn: sqlite3.Connection) -> str:
+    """SHA-256 of the certificate's stored bytes, ``""`` when absent.
+
+    Raises ``sqlite3.Error``; the identity's handler decides what that means.
+    """
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (_CODEX_PROJECTION_CERTIFICATE_KEY,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return ""
+    return hashlib.sha256(str(row[0]).encode("utf-8")).hexdigest()
+
+
+def codex_quota_dependency_identity(
+    conn: sqlite3.Connection,
+    *,
+    opened_file: "tuple[int, int] | None",
+) -> tuple | None:
+    """What a Codex quota verdict depends on beyond the signature legs (#857).
+
+    The dispatch signature carries ``codex_physical_mutation_seq`` and the
+    accounting ledger, but not three inputs that can change a Codex cycle or
+    projection verdict on their own: the dedicated quota change ledger (a
+    writer that forgot the physical counter, or manual repair), the window
+    attribution revision (which also invalidates the projection certificate
+    with no row write), and the projection certificate itself (a
+    certificate-only recovery or loss). Nor does it see the database file being
+    replaced by a restored copy whose counters match.
+
+    Legs: the version tag, ``st_dev`` / ``st_ino`` of the file this connection
+    reads, the two observation legs above, and a digest of the certificate's
+    stored bytes (empty when absent). The digest covers only the certificate's
+    CONTENTS. Whether those contents are valid is decided with inputs this
+    identity does not carry: ``codex_physical_mutation_seq``, which the
+    certificate must match, is a dispatch-signature leg and part of the Codex
+    ``data_version``; and the stats.db ``quota_projection_state`` it is checked
+    against is covered by ``codex_stats_digest``, also in both. The contents
+    are the one part neither of those sees, so they are this identity's leg,
+    and the key and the version together cover the rest.
+
+    File identity is ``(st_dev, st_ino)`` rather than the path string: the
+    dashboard compares an identity read on its pinned read-write connection with
+    one read at dispatch on another connection, and the path SQLite reports is
+    a spelling of the same file that two openers need not share.
+
+    **What is bound.** ``opened_file`` is REQUIRED: the
+    ``codex_cache_file_identity`` of the configured database path, observed by
+    the caller BEFORE it opened ``conn``. After this function's last read, the
+    path ``PRAGMA database_list`` reports for ``conn`` — resolved once, here —
+    is stat'ed once more, and the identity exists only when that stat names the
+    same file. SQLite opens the main database file when the connection is
+    created and reads through that one descriptor for its lifetime; a stat of
+    a path, by contrast, describes whatever file holds the name at that
+    instant. So agreement between a stat taken before the open and a stat of
+    the connection's own path taken after every read proves the connection
+    read the file both name. The binding has two blind spots, either mistaken
+    for no replacement only when every other leg of the identity matches as
+    well: a file moved away and then back to that same inode inside the
+    bracket; and, on a filesystem that reuses inode numbers (APFS does not), a
+    replacement that received the number of the file it replaced once that
+    file was freed, whose identity then names the same ``(st_dev, st_ino)`` as
+    a stamp taken on its predecessor. Disagreement is ``None``: the file was
+    replaced between the open and the last read (a stat then names the NEW
+    inode beside the OLD rows), or the connection was opened on a different
+    file than the configured path names.
+
+    **There is no fallback.** ``opened_file=None`` — the pre-open stat failed,
+    whether because the name was absent (a fresh install, or a restore caught
+    mid-rename) or for any other reason — yields ``None``: nothing observed
+    before the open, so nothing establishes which file the connection opened,
+    and a bracket that began after the open could stat a replacement twice
+    around reads from the replaced file. A caller that needs an identity where
+    the file did not exist yet must observe the file its first open created
+    and open AGAIN (the dashboard's dispatch read does exactly that). A
+    replacement AFTER the bracket needs nothing more: the connection keeps
+    reading the file the identity names, and the next read, on a new
+    connection, names the new file.
+
+    Every leg is read on ONE snapshot (`one_read_snapshot`), so a commit
+    landing between two legs cannot produce an identity no state ever had.
+    Every read is O(1) — ``PRAGMA database_list`` once, one ``stat``, a catalog
+    lookup and three primary-key reads — because the dashboard pays it on
+    every idle tick. It is STABLE while nothing changes: none of the legs moves
+    on a read, a WAL checkpoint, or a ledger prune. ``None`` means "cannot
+    establish identity", which every caller must treat as "rebuild".
+    """
+    if opened_file is None:
+        return None
+    path = codex_main_database_path(conn)
+    if not path:
+        return None
+    try:
+        with one_read_snapshot(conn):
+            legs = codex_quota_observation_legs(conn)
+            certificate = _codex_projection_certificate_digest(conn)
+    except sqlite3.Error:
+        return None
+    if legs is None:
+        return None
+    after = codex_cache_file_identity(path)
+    if after is None or after != tuple(opened_file):
+        return None
+    return (CODEX_QUOTA_DEPENDENCY_VERSION, *after, *legs, certificate)
 
 
 # === Task 0.2 — new-entry timestamp watermark ==============================
@@ -1103,26 +1309,99 @@ class CodexAccountingCacheResult:
     #: all. `None` means "cannot establish an identity", which every consumer
     #: must treat as a cold read rather than as a hit.
     population_signature: tuple | None = None
+    #: #857: the capture-owned accounting provenance token — the never-reused
+    #: name of the population in `entries` (`build_cached_codex_accounting`
+    #: states when it is minted and when preserved). The dashboard stamps it on
+    #: the generation this capture builds and admits a retained generation
+    #: only while its stamp equals `codex_accounting_consumed_provenance()`.
+    provenance_token: int | None = None
 
 
 _CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = _ObservedSnapshotDict()
 _CODEX_ACCOUNTING_MAX_DIRTY_PATHS = 300
 
+#: #857: the server-only ``clock_data`` key a Codex generation carries its
+#: capture's accounting provenance token under (`None` for a build that
+#: bypassed the qualified accounting read, which no admission gate accepts).
+CODEX_ACCOUNTING_PROVENANCE_KEY = "codex_accounting_provenance"
+#: The state-dictionary key the token of the population the dictionary holds
+#: lives under. Inside the dictionary on purpose: a checkpoint copies it and a
+#: restore puts it back together with exactly the state it names, never apart.
+_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY = "provenance_token"
+#: The token allocator. Never rewound: not by a reset, not by a restore and not
+#: by memory eviction, so no two populations this process ever held — however
+#: their ``population_signature`` generations compare after a clear — share a
+#: token.
+_CODEX_ACCOUNTING_PROVENANCE_TOKENS = itertools.count(1)
+#: The token of the population the process accounting cache most recently
+#: CONSUMED — set by every successful `build_cached_codex_accounting` call.
+#: Deliberately OUTSIDE `_CODEX_ACCOUNTING_CACHE_STATE`: snapshot memory
+#: enforcement clears that dictionary after a published build, and an eviction
+#: consumes nothing, so it must not invalidate the generation just published.
+#: A reset or a checkpoint restore does not move it either. When the failed
+#: build's capture minted, a generation stamped with the checkpoint's token
+#: predates accounting this process consumed once and stays refused until a
+#: capture names the population again; when that capture preserved the token,
+#: it consumed nothing, and the checkpoint's generation correctly stays current.
+_CODEX_ACCOUNTING_CONSUMED_PROVENANCE: int | None = None
+
+
+def codex_accounting_consumed_provenance() -> int | None:
+    """The token of the accounting population this process last consumed.
+
+    #857. An O(1) read of a module global — no database, no state walk — so
+    every Codex admission gate can compare a retained generation's stamp
+    against it on every tick. ``None`` until the first qualified capture.
+    Not owner-asserted because it mutates nothing. It is safe only because
+    every writer is owner-asserted and every gate reads on the owner thread, so
+    no read can land between a capture's state write and its consume call.
+    """
+    return _CODEX_ACCOUNTING_CONSUMED_PROVENANCE
+
+
+def _mint_codex_accounting_provenance() -> int:
+    """A token no earlier population of this process has carried (#857)."""
+    return next(_CODEX_ACCOUNTING_PROVENANCE_TOKENS)
+
+
+def _consume_codex_accounting_provenance(token: int) -> int:
+    """Record ``token`` as the last consumed population's name and return it."""
+    global _CODEX_ACCOUNTING_CONSUMED_PROVENANCE
+    _CODEX_ACCOUNTING_CONSUMED_PROVENANCE = token
+    return token
+
 
 def reset_codex_accounting_cache_state() -> None:
-    """Drop #582's value-only Codex accounting cache and ledger cursor."""
+    """Drop #582's value-only Codex accounting cache and ledger cursor.
+
+    #857: the consumed provenance token and its allocator are untouched. A
+    reset consumes nothing, and the next capture goes cold and mints a token
+    no earlier population carried.
+    """
     _assert_owner()
     _CODEX_ACCOUNTING_CACHE_STATE.clear()
 
 
 def checkpoint_codex_accounting_cache_state() -> dict[str, object]:
-    """Copy the value-only state so a failed source build can roll back."""
+    """Copy the value-only state so a failed source build can roll back.
+
+    The copy carries the population's provenance token (#857), so a restore
+    puts back exactly the state that token names.
+    """
     _assert_owner()
     return dict(_CODEX_ACCOUNTING_CACHE_STATE)
 
 
 def restore_codex_accounting_cache_state(state: dict[str, object]) -> None:
-    """Restore a checkpoint after downstream source construction fails."""
+    """Restore a checkpoint after downstream source construction fails.
+
+    #857: the state's own token comes back with it, but the CONSUMED token does
+    not move back and the allocator is never rewound. If the failed build's
+    capture minted, a generation stamped with the checkpoint's token predates
+    accounting that build consumed and stays refused until a capture names the
+    population again; if it preserved the token, it consumed nothing and that
+    generation correctly stays current.
+    """
     _assert_owner()
     _CODEX_ACCOUNTING_CACHE_STATE.clear()
     _CODEX_ACCOUNTING_CACHE_STATE.update(state)
@@ -1175,18 +1454,31 @@ def _codex_window_attribution_revision(conn: sqlite3.Connection) -> str | None:
     keyed on the ledger alone would keep serving a population built before the
     operator's attribution landed. Carrying the revision turns that window into
     an unnecessary miss, which is the direction this signature is written in.
+
+    An unreadable revision reads as ``None`` here, which the signature treats
+    as one more value; the #857 identity reads the same query through
+    `_read_codex_window_attribution_revision` instead, because there an
+    unreadable leg must refuse the identity rather than become a value.
     """
     try:
-        row = conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='codex_window_attribution_revision'"
-        ).fetchone()
+        return _read_codex_window_attribution_revision(conn)
     except sqlite3.Error:
         return None
+
+
+def _read_codex_window_attribution_revision(
+    conn: sqlite3.Connection,
+) -> str | None:
+    """The ONE statement of the attribution-revision read; raises on error."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_window_attribution_revision'"
+    ).fetchone()
     return None if row is None or row[0] is None else str(row[0])
 
 
-def _codex_main_database_path(conn: sqlite3.Connection) -> str | None:
+def codex_main_database_path(conn: sqlite3.Connection) -> str | None:
+    """The path SQLite reports for ``conn``'s ``main`` database, or ``None``."""
     try:
         return next(
             str(row[2]) for row in conn.execute("PRAGMA database_list")
@@ -1237,6 +1529,15 @@ def build_cached_codex_accounting(
     or clock regression goes cold.  When the upper bound advances, paths with
     already-stored future rows crossing into the range are dirtied even though
     no mutation sequence moved.
+
+    #857: every successful call also returns — and records as the process's
+    CONSUMED provenance (`codex_accounting_consumed_provenance`) — the
+    population's provenance token, established here beside the state it names.
+    A cold reconstruction, a ledger advance (whether or not it dirties a path)
+    and a path replacement (a revealed future row included) each MINT a token
+    no earlier population carried; only a capture that changed nothing — same
+    ledger head, no dirty path, an upper bound that revealed no row — PRESERVES
+    the state's token. A failed load publishes nothing, token included.
     """
     _assert_owner()
     if (
@@ -1246,7 +1547,7 @@ def build_cached_codex_accounting(
     ):
         raise ValueError("Codex accounting cache range must be aware and ordered")
     current_seq = _codex_accounting_mutation_seq(cache_conn)
-    database_path = _codex_main_database_path(cache_conn)
+    database_path = codex_main_database_path(cache_conn)
     attribution_revision = _codex_window_attribution_revision(cache_conn)
     state = _CODEX_ACCOUNTING_CACHE_STATE
     prior_cached_entries = tuple(state.get("entries", ())) if state else ()
@@ -1341,6 +1642,8 @@ def build_cached_codex_accounting(
         }))
         generation = int(state.get("generation", 0)) + 1
         population_signature = signature(generation)
+        # #857: a reconstruction is a new population, whatever it contains.
+        provenance_token = _mint_codex_accounting_provenance()
         _CODEX_ACCOUNTING_CACHE_STATE.clear()
         _CODEX_ACCOUNTING_CACHE_STATE.update({
             "entries": entries,
@@ -1350,21 +1653,36 @@ def build_cached_codex_accounting(
             "extra": extra_signature,
             "generation": generation,
             "population_signature": population_signature,
+            _CODEX_ACCOUNTING_PROVENANCE_STATE_KEY: provenance_token,
         })
         return CodexAccountingCacheResult(
             entries, (), accounts, True, prior_cached_entries, entries,
             population_signature=population_signature,
+            provenance_token=_consume_codex_accounting_provenance(
+                provenance_token),
         )
 
     prior_entries = tuple(state["entries"])
     if not dirty:
         population_signature = signature(int(state.get("generation", 0)))
+        # #857: no row moved, but a ledger advance still consumed a ledger
+        # state the population did not carry before, so it is renamed; only a
+        # capture over the same head keeps the state's token.
+        provenance_token = state.get(_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY)
+        if (
+            current_seq != int(state.get("seq", -1))
+            or not isinstance(provenance_token, int)
+        ):
+            provenance_token = _mint_codex_accounting_provenance()
         state["seq"] = current_seq
         state["end"] = range_end
         state["population_signature"] = population_signature
+        state[_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY] = provenance_token
         return CodexAccountingCacheResult(
             prior_entries, (), (), False,
             population_signature=population_signature,
+            provenance_token=_consume_codex_accounting_provenance(
+                provenance_token),
         )
 
     dirty_paths = tuple(sorted(dirty))
@@ -1405,14 +1723,19 @@ def build_cached_codex_accounting(
     _mark_snapshot_accelerators_dirty()
     generation = int(state.get("generation", 0)) + 1
     population_signature = signature(generation)
+    # #857: a path replacement is a new population, even one whose rows
+    # compare equal — the ledger moved or the bound revealed a row.
+    provenance_token = _mint_codex_accounting_provenance()
     state["entries"] = entries
     state["seq"] = current_seq
     state["end"] = range_end
     state["generation"] = generation
     state["population_signature"] = population_signature
+    state[_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY] = provenance_token
     return CodexAccountingCacheResult(
         entries, dirty_paths, dirty_accounts, False, changed_old, changed_new,
         population_signature=population_signature,
+        provenance_token=_consume_codex_accounting_provenance(provenance_token),
     )
 
 

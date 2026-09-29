@@ -302,6 +302,7 @@ from _lib_dashboard_sources import (
     dashboard_resource_key,
     degrade_source_state,
     reuse_coherent_source_state,
+    settled_codex_cycle_unavailable,
     unavailable_source_state,
 )
 from _lib_source_retry import (
@@ -3595,6 +3596,223 @@ def _tui_retain_refused_partial(
     return decision.action == "retain"
 
 
+#: The server-only ``clock_data`` key carrying the Codex quota-dependency
+#: identity a Codex generation was BUILT from (#857). Stamped only on a fresh
+#: build, from the same pinned cache read as that build's capture; never
+#: re-stamped on a reuse, degrade or retained-bundle path, because those publish
+#: a generation an earlier tick read. The three handlers that retain the prior
+#: bundle after an attempted rebuild and return normally withdraw it (``None``,
+#: `_tui_withdraw_codex_quota_dependency`). Those withdrawals are per-site and
+#: do NOT cover every way an attempt can end unpublished — a failure escalated
+#: as stats corruption leaves before any handler runs, and a tick with no
+#: dispatch key memoizes nothing to withdraw on. What closes that class
+#: generically is the SECOND stamp, the accounting provenance token
+#: (`_lib_snapshot_cache.CODEX_ACCOUNTING_PROVENANCE_KEY`,
+#: `_tui_codex_accounting_provenance_current`): any capture that consumed
+#: accounting moves the process's consumed token past every generation it did
+#: not publish.
+_CODEX_QUOTA_DEPENDENCY_KEY = "codex_quota_dependency"
+
+
+def _tui_cache_file_before_open() -> "tuple[int, int] | None":
+    """The cache file a tick is about to open, observed BEFORE it opens (#857).
+
+    ``(st_dev, st_ino)`` of the configured cache path, or ``None`` when it
+    cannot be stat'ed — an absent file included. Taken immediately before the
+    tick's cache handle is opened; it is the ``opened_file`` that
+    `_tui_read_codex_quota_dependency` binds the identity read on that handle
+    to, and ``None`` binds nothing.
+    """
+    try:
+        return _cctally()._load_sibling(
+            "_lib_snapshot_cache"
+        ).codex_cache_file_identity(_cctally_core.CACHE_DB_PATH)
+    except Exception:  # noqa: BLE001 — an unobserved file binds nothing
+        return None
+
+
+def _tui_read_codex_quota_dependency(conn, *, opened_file) -> "tuple | None":
+    """Read the #857 identity on ``conn``; any failure is "no identity".
+
+    ``opened_file`` is `_tui_cache_file_before_open`'s observation, taken
+    before ``conn`` was opened, and the identity is bound to it STRICTLY
+    (`codex_quota_dependency_identity`): it exists only when the file ``conn``
+    reports after the identity's last read is the file observed before the
+    open. A failed or missing pre-open observation, a replacement inside that
+    bracket, and a handle opened on any other file all read as ``None`` —
+    "rebuild" — never as a late bracket that begins after the open.
+    """
+    try:
+        return _cctally()._load_sibling(
+            "_lib_snapshot_cache"
+        ).codex_quota_dependency_identity(conn, opened_file=opened_file)
+    except Exception:  # noqa: BLE001 — no identity means rebuild, never a crash
+        return None
+
+
+def _tui_withdraw_codex_quota_dependency(bundle):
+    """``bundle`` with its Codex generation's identity stamp withdrawn (#857).
+
+    For a PRIOR bundle a tick republishes after its own rebuild attempt was
+    abandoned. Three sites withdraw: the full path's source build raised
+    (`_tui_retain_failed_source_bundle`, always); a build completed but lost
+    the stats generation race and returned the prior bundle instead of its own;
+    or the idle path's bounded source adapter raised and
+    `_tui_build_idle_snapshot` kept ``prior.source_bundle``. The last two
+    withdraw only when that build SCHEDULED the Codex pass — a superset of
+    running it, since a pass that fails before consuming anything counts too,
+    which over-withdraws safely. In every case the retained generation was not
+    re-validated against what this tick read, and the attempt may already have
+    consumed evidence the NEXT tick needs to see as moved: the Codex pass
+    publishes the process accounting cache before the post-build
+    reconciliation, which can raise as well as lose the race, so accounting
+    that moved in place (window-spend adoption stamps ``account_key`` without
+    moving ``MAX(id)``, the physical sequence or the quota identity) no longer
+    reads as pending, and the Codex version cannot see it. The idle adapter is
+    no exception for running under an unchanged key: it reads the cache on its
+    OWN snapshot, opened after the dispatch read, so accounting that commits
+    between the two is pending to the adapter and absent from the key. The
+    stamp is what admits a Codex generation to the idle gate — ordinary and
+    settled alike — and to exact-version reuse
+    (`_tui_codex_dependency_current`), so leaving it would let the next tick
+    republish the old generation for as long as nothing else moves. Withdrawn,
+    the next tick rebuilds Codex once, whichever path it takes. Nothing
+    published changes; ``clock_data`` never reaches the wire.
+
+    These withdrawals are belt-and-braces now, not the closure. They run only
+    in a handler that returns normally, so they cannot reach a failure that
+    escalates as stats corruption before the handler's withdrawal, or a tick
+    with no dispatch key, whose retained bundle nothing memoizes. The
+    accounting provenance token covers every such site at once
+    (`_tui_codex_accounting_provenance_current`): the capture that consumed
+    moved the consumed token past the retained generation's stamp.
+
+    A raced build or failed idle adapter that reused or degraded Codex
+    scheduled no pass, consumed nothing, and keeps the stamp. That is safe:
+    accounting that moved is still pending, and an accounting commit moves the
+    dispatch key, so the next tick takes the full path and rebuilds Codex. A
+    race moves the next key in any case, because every stats leg its check
+    compares is also a dispatch signature leg; after a failed idle adapter with
+    nothing committed, the retained generation is exactly as current as it was.
+    """
+    if not isinstance(bundle, SourceDashboardBundle):
+        return bundle
+    codex = bundle.sources.get("codex")
+    if (
+        not isinstance(codex, SourceDashboardState)
+        or not isinstance(codex.clock_data, Mapping)
+        or codex.clock_data.get(_CODEX_QUOTA_DEPENDENCY_KEY) is None
+    ):
+        return bundle
+    withdrawn = dataclasses.replace(codex, clock_data={
+        **codex.clock_data, _CODEX_QUOTA_DEPENDENCY_KEY: None,
+    })
+    return dataclasses.replace(
+        bundle, sources={**bundle.sources, "codex": withdrawn},
+    )
+
+
+def _tui_retain_failed_source_bundle(prior_bundle, *, dispatch_key):
+    """The bundle a full tick publishes when its source build FAILED (#857).
+
+    The prior bundle, retained whole as before. When this tick also memoizes
+    the snapshot under its new ``dispatch_key``, the retained Codex generation
+    loses its identity stamp (`_tui_withdraw_codex_quota_dependency`): dispatch
+    movement guaranteed this tick an ATTEMPTED rebuild, not a successful one,
+    and the next tick must not read an unchanged key as proof that the retained
+    generation is current. With no key, nothing is memoized — the dispatch memo
+    keeps the snapshot the prior bundle was validated under — so the retained
+    object is returned untouched; if the failed build consumed accounting, that
+    memoized generation is refused anyway, by its accounting provenance token
+    (`_tui_codex_accounting_provenance_current`).
+    """
+    if dispatch_key is None:
+        return prior_bundle
+    return _tui_withdraw_codex_quota_dependency(prior_bundle)
+
+
+def _tui_codex_accounting_provenance_current(state) -> bool:
+    """Whether ``state`` names the accounting population last consumed (#857).
+
+    ``state``'s stamped accounting provenance token — the one its build's
+    capture returned — must equal the token of the population the process
+    accounting cache most recently consumed
+    (`_lib_snapshot_cache.codex_accounting_consumed_provenance`). That closes
+    unpublished consumption as a CLASS: a capture that consumed pending
+    accounting (a ledger advance, a revealed row, a reconstruction) mints a new
+    token, so a build that then failed to publish what it built — a raise, a
+    lost race, a corruption escalation and its heal retry, a tick with no
+    dispatch key — leaves every retained generation behind the consumed token,
+    whatever the failure site. The consumed token lives outside the evictable
+    accounting state, so snapshot memory enforcement alone never refuses a
+    published generation. A missing stamp (a bypassing build, a hand-built
+    prior) and a process that has consumed nothing yet are not current. The
+    comparison is an in-memory read, O(1) per tick.
+    """
+    if not isinstance(state, SourceDashboardState):
+        return False
+    # A `sys.modules` hit in every load context: `_cctally_dashboard_sources`,
+    # imported at this module's top, imports it at ITS top, and its captures
+    # are what write the token. Deliberately not `_cctally()._load_sibling`,
+    # so the idle gate needs no `cctally` module to answer.
+    import _lib_snapshot_cache as sc
+    consumed = sc.codex_accounting_consumed_provenance()
+    if consumed is None:
+        return False
+    clock_data = state.clock_data
+    return isinstance(clock_data, Mapping) and clock_data.get(
+        sc.CODEX_ACCOUNTING_PROVENANCE_KEY) == consumed
+
+
+def _tui_codex_dependency_current(state, *, codex_dependency) -> bool:
+    """Whether ``state`` was built from exactly the inputs current this tick.
+
+    #857. The one comparison behind every Codex admission that skips a
+    rebuild: the idle gate, for EVERY availability (the settled exception and
+    an ordinary ``ok``/``empty`` generation alike), the settled active-path
+    exception and ordinary exact-version reuse. Two provenance legs, both
+    required: the quota-dependency identity read this tick, and the accounting
+    provenance token of the population the process last consumed
+    (`_tui_codex_accounting_provenance_current`). An unavailable identity on
+    either side — none read now, none stamped, or a stamp withdrawn after an
+    abandoned rebuild — or a token behind the consumed one is not current, so
+    a generation carrying one is rebuilt once and, once its fresh stamps
+    match, idles again.
+    """
+    if codex_dependency is None or not isinstance(state, SourceDashboardState):
+        return False
+    clock_data = state.clock_data
+    return (
+        isinstance(clock_data, Mapping)
+        and clock_data.get(_CODEX_QUOTA_DEPENDENCY_KEY) == codex_dependency
+        and _tui_codex_accounting_provenance_current(state)
+    )
+
+
+def _tui_codex_settled_cycle_holds(
+    state, *, codex_dependency, now_utc: dt.datetime,
+) -> bool:
+    """Whether a settled cycle-unavailable Codex generation is still current.
+
+    #857. ``settled_codex_cycle_unavailable`` states the shape; this adds the
+    facts only the tick holds. Its provenance must be current
+    (`_tui_codex_dependency_current`): the identity the generation was built
+    from equals the one read now — an unavailable identity on either side
+    fails — and its accounting provenance token is the one the process last
+    consumed; and its decision deadline must not have passed, since cycle
+    resolution is time-dependent on frozen evidence and the deadline is the
+    first instant it could resolve differently. Each caller adds its own path's
+    conditions.
+    """
+    if not settled_codex_cycle_unavailable(state):
+        return False
+    if not _tui_codex_dependency_current(
+        state, codex_dependency=codex_dependency,
+    ):
+        return False
+    return not codex_decision_deadline_passed(state, now_utc)
+
+
 def _tui_note_codex_regime(value: str) -> None:
     """Stamp the REALISED Codex source-leg decision on the open tick (§1.5).
 
@@ -3633,14 +3851,25 @@ def _tui_build_source_bundle(
     projects_envelope: dict | None = None,
     prior_bundle: SourceDashboardBundle | None = None,
     raw_config: dict[str, object] | None = None,
+    attempt: dict[str, bool] | None = None,
 ) -> SourceDashboardBundle:
     """Build one frozen source bundle after the dashboard's coordinated ingest.
 
     This helper is reachable only from ``precompute_envelope=True``.  It opens
     a fresh cache handle after the ingest handle has closed, then performs
     read-only provider adaptation with no implicit sync or rollout fallback.
+
+    ``attempt`` (#857), when given, gets ``attempt["codex_pass"] = True`` as
+    soon as this build schedules the Codex pass, so a caller that retains the
+    prior bundle after this build RAISED knows whether the attempt may have
+    consumed pending accounting (`_tui_withdraw_codex_quota_dependency`).
     """
+    global _PARTIAL_RETRY_STATE
     c = _cctally()
+    # #857: observed BEFORE the handle opens, so the Codex quota-dependency
+    # identity below is bound to the file this handle actually reads. Strict:
+    # an unobserved file stamps no identity (the next tick rebuilds Codex once).
+    cache_file_before_open = _tui_cache_file_before_open()
     with _perf.phase("source.store_open"):
         cache_conn = c.open_cache_db()
     cache_read_tx = False
@@ -3772,6 +4001,18 @@ def _tui_build_source_bundle(
                 accounts_digest=accounts_digest,
                 claude_stats_digest=claude_digest,
             )
+        # #857: the Codex quota-dependency identity, read on the SAME pinned
+        # cache snapshot the Codex capture below reads, so a generation built
+        # this tick is stamped with exactly the inputs it saw — never with a
+        # later identity it did not read. Bound STRICTLY to the file observed
+        # before the handle opened: an unobserved file, or a replacement since
+        # the open, is `None`, never the new inode beside the old rows. The
+        # capture needs no second check — it reads through the descriptor this
+        # bracket bound, and a replacement after it is a later file the next
+        # dispatch read names.
+        codex_dependency = _tui_read_codex_quota_dependency(
+            cache_conn, opened_file=cache_file_before_open,
+        )
         _acct_suffix = f":a{accounts_digest}" if accounts_digest else ""
         # public #5: the hook's budgeted ingest can change what the Codex
         # envelope owes without moving `codex_physical_mutation_seq` — a tick
@@ -3909,9 +4150,25 @@ def _tui_build_source_bundle(
             # list of warning strings was a second and incomplete definition
             # of non-reusability, and `reuse_coherent_source_state` now
             # refuses every `partial` prior unconditionally.
+            # #857: the quota-dependency identity is the third forcing leg.
+            # The version string carries none of its inputs — the quota change
+            # ledger, the attribution revision, the projection certificate,
+            # the cache file — so exact-version reuse cannot see them move:
+            # a certificate lost behind an `ok` generation would be reused
+            # here, and every later idle tick would retain the obsolete
+            # verdict. A moved, unreadable or withdrawn identity (a bundle
+            # retained across a failed rebuild) refuses every reuse and
+            # retention path below, exactly like pending accounting. The same
+            # comparison requires the generation's accounting provenance token
+            # to be the process's consumed one: pending accounting that an
+            # earlier, unpublished attempt already consumed no longer reads as
+            # pending here, and only the token still sees it.
             _codex_forced_rebuild = prior_codex is not None and (
                 _codex_accounting_pending
                 or codex_decision_deadline_passed(prior_codex, now_utc)
+                or not _tui_codex_dependency_current(
+                    prior_codex, codex_dependency=codex_dependency,
+                )
             )
             codex = (
                 None if _codex_forced_rebuild
@@ -3919,7 +4176,33 @@ def _tui_build_source_bundle(
                     prior_codex, data_version=codex_reuse_version,
                 )
             )
-            if codex is None and not _codex_forced_rebuild and (
+            if (
+                codex is None
+                and not _codex_forced_rebuild
+                and prior_codex is not None
+                and prior_codex.data_version == codex_reuse_version
+                and _tui_codex_settled_cycle_holds(
+                    prior_codex,
+                    codex_dependency=codex_dependency,
+                    now_utc=now_utc,
+                )
+            ):
+                # #857: the settled cycle-unavailable generation over UNCHANGED
+                # Codex inputs — exact version, exact quota-dependency identity
+                # and accounting provenance, no pending accounting and no
+                # elapsed decision deadline (all but the version are
+                # `_codex_forced_rebuild`). Rebuilding it re-derives
+                # the same partial generation, so a tick that another source
+                # forced onto this path must not pay a Codex build for it. Its
+                # own exception bypasses `_tui_retain_refused_partial`, so it
+                # clears the Codex retry key itself: a metadata key armed before
+                # this generation is obsolete, and left armed it would retain a
+                # later metadata recurrence instead of rebuilding it.
+                codex = prior_codex
+                _PARTIAL_RETRY_STATE = clear_partial_retry(
+                    _PARTIAL_RETRY_STATE, provider="codex",
+                )
+            elif codex is None and not _codex_forced_rebuild and (
                 _tui_retain_refused_partial(
                     prior_codex,
                     provider="codex",
@@ -3964,6 +4247,17 @@ def _tui_build_source_bundle(
         codex_capture = None
         codex_capture_failed = False
         codex_context = None
+        # #857: whether this build schedules the Codex pass — the one step
+        # that can consume pending accounting (it publishes the process
+        # accounting cache). Only such a build withdraws the prior stamp if it
+        # loses the generation race below, or (through `attempt`) if it raises
+        # under the idle path's adapter; a reused or degraded Codex consumed
+        # nothing. Scheduled, not completed: a pass that fails before it
+        # consumes anything (a `DashboardReadContext` failure, say) still
+        # counts, which over-withdraws safely at the cost of one Codex rebuild.
+        codex_pass_attempted = codex is None
+        if attempt is not None and codex_pass_attempted:
+            attempt["codex_pass"] = True
         codex_split_seams_unpatched = (
             build_codex_source_state
             is sys.modules["_cctally_dashboard_sources"].build_codex_source_state
@@ -4181,9 +4475,15 @@ def _tui_build_source_bundle(
                 # Attached ONLY on a fresh build, never on the reuse or degrade
                 # paths: those carry rows this tick did not produce, and their
                 # own carrier already describes the range that bounds them.
+                # #857: the quota-dependency identity follows the same rule, for
+                # the same reason — it names the inputs THIS build read.
                 codex = dataclasses.replace(
                     codex,
                     aggregate_scope=build_aggregate_scope(published_range),
+                    clock_data={
+                        **(codex.clock_data or {}),
+                        _CODEX_QUOTA_DEPENDENCY_KEY: codex_dependency,
+                    },
                 )
                 codex_built_this_tick = True
             except Exception:
@@ -4199,6 +4499,29 @@ def _tui_build_source_bundle(
                     if prior_codex is not None
                     else unavailable_source_state("codex", warning)
                 )
+        codex_health = (
+            codex.metadata_health
+            if isinstance(codex.metadata_health, Mapping)
+            else {}
+        )
+        codex_retry_entry = _PARTIAL_RETRY_STATE.get("codex")
+        if codex_built_this_tick and (
+            codex.availability != "partial"
+            or bool(codex_health.get("retryable"))
+            or (
+                codex_health.get("state") == "healthy"
+                and getattr(codex_retry_entry, "cause", None)
+                == "metadata_incomplete"
+            )
+        ):
+            # A forced rebuild bypasses `_tui_retain_refused_partial`. Once it
+            # publishes healthy metadata, the prior metadata retry is obsolete
+            # even when an independent projection condition keeps the overall
+            # provider partial. Never clear another partial cause on that
+            # metadata fact alone.
+            _PARTIAL_RETRY_STATE = clear_partial_retry(
+                _PARTIAL_RETRY_STATE, provider="codex",
+            )
         # #350 spec §3.3: clock Codex UNCONDITIONALLY — after every build /
         # reuse / degrade branch and before composition — so the retained
         # cycle's expiry invariant holds on EVERY path, including the reuse
@@ -4244,6 +4567,14 @@ def _tui_build_source_bundle(
         # The cache pin ended after carrier capture. These cheap post-build
         # signatures intentionally reject only stats-side movement; a cache
         # commit during the pure folds belongs to the next generation.
+        #
+        # The two digests below may be served by the warm-digest memo, and that
+        # is safe only because its key is the stats file's own write identity:
+        # any commit that lands mid-build moves it, whether or not it moved the
+        # journal cursor, because an entry is stored only for a settled file
+        # and the settle window guarantees the next commit a newer timestamp
+        # even on a coarse-timestamp filesystem. So these reads rescan and see
+        # the new generation (#857; `_stats_relations_digest_signal`).
         with _perf.phase("source.reconciliation"):
             post_stats_digest = codex_stats_digest(stats_conn)
             post_accounts_digest = accounts_identity_digest(stats_conn)
@@ -4266,6 +4597,16 @@ def _tui_build_source_bundle(
             )
         if stats_generation_moved:
             if prior_bundle is not None:
+                # #857: the prior bundle, never re-validated by this build.
+                # When this build scheduled the Codex pass, that pass may have
+                # consumed the pending accounting — so the retained Codex
+                # generation loses its provenance and the next tick rebuilds it
+                # once, whichever path it takes
+                # (`_tui_withdraw_codex_quota_dependency`). A build that reused
+                # or degraded Codex consumed nothing, and the retained stamp is
+                # exactly as current as before.
+                if codex_pass_attempted:
+                    return _tui_withdraw_codex_quota_dependency(prior_bundle)
                 return prior_bundle
             raise RuntimeError("source read generation moved during build")
         return bundle
@@ -4317,7 +4658,13 @@ def _tui_hydrating_source_bundle() -> SourceDashboardBundle:
     )
 
 
-def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
+def _tui_source_bundle_can_idle(
+    bundle: SourceDashboardBundle | None,
+    *,
+    codex_dependency: "tuple | None",
+    codex_ingest_degraded: bool = False,
+    now_utc: dt.datetime | None = None,
+) -> bool:
     """Return whether both physical provider generations are safe to retain.
 
     A stable dispatch key alone cannot prove that a previously unavailable or
@@ -4325,13 +4672,74 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
     repaired without changing accounting facts.  Such a source must take the
     full source-bundle path again; that path still independently reuses the
     healthy provider by its own data version.
+
+    #857: a Codex generation of ANY availability idles only on current
+    provenance (`_tui_codex_dependency_current`): the identity it was built
+    from equals ``codex_dependency``, the identity read this tick, and its
+    accounting provenance token equals the token of the population the process
+    last consumed. The key being unchanged establishes neither. A generation
+    retained across an abandoned rebuild may be memoized under a key naming
+    inputs it never read (its stamp is then WITHDRAWN), or may have had its
+    accounting consumed by the attempt (its token is then behind the consumed
+    one); one built while the identity was unreadable carries no stamp. Any of
+    them would otherwise be retained for as long as the key stays unchanged.
+    Refused, it takes the bounded source adapter, which rebuilds Codex once and
+    stamps the result, after which it idles again. ``codex_dependency`` is
+    REQUIRED, with no default: ``None`` idles no Codex generation, so a caller
+    that could omit it would silently disable Codex idling.
+
+    ONE degraded Codex shape is exempt from the availability refusal — the
+    settled cycle-unavailable generation (``settled_codex_cycle_unavailable``),
+    whose rebuild re-derives the same partial state on every tick. It also
+    needs ``now_utc`` with its decision deadline not passed, and no Codex
+    ingest failed or contended this tick. Entering the exception clears
+    Codex's retry key, never Claude's. The retryable-carrier scan still runs
+    first, for both providers.
     """
+    global _PARTIAL_RETRY_STATE
     if not isinstance(bundle, SourceDashboardBundle):
         return False
+    physical_states: dict[str, SourceDashboardState] = {}
     for source in ("claude", "codex"):
         state = bundle.sources.get(source)
         if not isinstance(state, SourceDashboardState):
             return False
+        physical_states[source] = state
+    retryable_carrier = False
+    for source, state in physical_states.items():
+        # #846 §4.6: the retryable carrier is authoritative and must be read
+        # for BOTH providers before any broader availability refusal. A real
+        # transient metadata generation is partial, so checking availability
+        # source-by-source could return on Claude without clearing Codex's
+        # armed key. Refuse AND clear each retryable provider at the idle
+        # boundary; provider-keyed clearing leaves unrelated deadlines intact.
+        health = state.metadata_health
+        if health is not None and bool(health.get("retryable")):
+            _PARTIAL_RETRY_STATE = clear_partial_retry(
+                _PARTIAL_RETRY_STATE, provider=source,
+            )
+            retryable_carrier = True
+    if retryable_carrier:
+        return False
+    settled_codex = False
+    for source, state in physical_states.items():
+        if source == "codex" and not _tui_codex_dependency_current(
+            state, codex_dependency=codex_dependency,
+        ):
+            # #857: no current provenance, whatever the availability.
+            return False
+        if (
+            source == "codex"
+            and now_utc is not None
+            and not codex_ingest_degraded
+            and _tui_codex_settled_cycle_holds(
+                state, codex_dependency=codex_dependency, now_utc=now_utc,
+            )
+        ):
+            # #857: the settled cycle-unavailable generation over unchanged
+            # inputs. Its predicate already excludes a failed aggregate fold.
+            settled_codex = True
+            continue
         # Idle eligibility is provider-generation coherence, deliberately not a
         # hero/quota/sessions age aggregate.
         if (state.availability not in ("ok", "empty")
@@ -4346,31 +4754,13 @@ def _tui_source_bundle_can_idle(bundle: SourceDashboardBundle | None) -> bool:
         # rebuild per tick, so it creates no retry loop.
         if aggregate_scope_failed(state):
             return False
-        # #834 S2 (#829, #830), gate 2 of 2, and the same shape as gate 1. A
-        # caught detail-probe read failure ALSO leaves an otherwise `ok` and
-        # `fresh` provider, because `availability` turns `partial` only on
-        # incomplete accounting rows, a failed hero projection or an unreadable
-        # account registry -- never on the probe. Without this leg the bundle
-        # qualifies for idle reuse and the transient state is republished for
-        # the life of the process, which is what the browser measured: 4 minutes
-        # 47 seconds across roughly twenty generations with no rebuild.
-        #
-        # `_lib_dashboard_sources._reusable_provider` refuses the same
-        # generation, and refusing it there is NOT sufficient: this branch
-        # republishes through the clock refreshes without ever calling
-        # `reuse_coherent_source_state`, so the predicate is bypassed before it
-        # is consulted. Both legs are required, and the browser gate found this
-        # one by reading the path the first fix did not reach.
-        health = state.metadata_health
-        if health is not None and bool(health.get("retryable")):
-            # #846 §4.6: refuse AND clear any armed key, so the tick after the
-            # fault clears rebuilds rather than finding a key still inside its
-            # deadline.
-            global _PARTIAL_RETRY_STATE
-            _PARTIAL_RETRY_STATE = clear_partial_retry(
-                _PARTIAL_RETRY_STATE, provider=source,
-            )
-            return False
+    if settled_codex:
+        # #857: the exception bypasses `_tui_retain_refused_partial`, so it
+        # retires an obsolete Codex key itself (see the active-path twin in
+        # `_tui_build_source_bundle`).
+        _PARTIAL_RETRY_STATE = clear_partial_retry(
+            _PARTIAL_RETRY_STATE, provider="codex",
+        )
     return True
 
 
@@ -4786,9 +5176,16 @@ def _tui_build_snapshot_once(
             except Exception as exc:
                 capture_failure("prior-source-bundle", "other", exc)
             dispatch_sig = None
+            # #857: the Codex quota-dependency identity, read on the
+            # signature's own cache handle. An unreadable identity is `None`.
+            codex_dependency = None
             with _perf.phase("signature"):
                 try:
-                    dispatch_sig = _tui_compute_dispatch_signature(conn)
+                    dispatch_sig, codex_dependency = (
+                        _tui_compute_dispatch_signature(
+                            conn, with_codex_dependency=True,
+                        )
+                    )
                 except QuotaProjectionIncomplete as exc:
                     # #496 S5b §4.7: ahead of the generic handler on purpose.
                     # Below it the refusal is sanitized into a generic
@@ -4796,9 +5193,11 @@ def _tui_build_snapshot_once(
                     # remedy; the message this leg records carries both.
                     capture_failure("quota-projection", "other", exc)
                     dispatch_sig = None
+                    codex_dependency = None
                 except Exception as exc:
                     capture_failure("dispatch-signature", "stats_or_cache", exc)
                     dispatch_sig = None
+                    codex_dependency = None
             if dispatch_sig is not None:
                 # The idle decision keys on the DB signature AND a render key
                 # that captures the config-derived inputs the composite
@@ -4814,7 +5213,15 @@ def _tui_build_snapshot_once(
                     display_tz_pref_override,
                     json.dumps(raw_config, sort_keys=True, default=str),
                 )
-                dispatch_key = (dispatch_sig, render_key)
+                # #857: the Codex quota-dependency identity — the dedicated
+                # quota change ledger, the attribution revision, the projection
+                # certificate and the cache file's identity, none of which the
+                # signature above carries. It rides the dispatch KEY rather
+                # than `SnapshotSignature`, so the published `data_version`
+                # bytes and the signature's own contract are unchanged. `None`
+                # (an unreadable identity) is a value like any other here; the
+                # idle gate is what refuses to idle any Codex generation on it.
+                dispatch_key = (dispatch_sig, render_key, codex_dependency)
                 # #300: carry the change signal onto the non-idle snapshot built
                 # below. (The idle path returns `idle_snap`, which inherits the
                 # prior — equal, since idle ⇒ signature unchanged — value.)
@@ -4848,6 +5255,7 @@ def _tui_build_snapshot_once(
                             claude_ingest_contended=claude_ingest_contended,
                             claude_ingest_failed=claude_ingest_failed,
                             errors=errors,
+                            codex_dependency=codex_dependency,
                         )
                         assert _sc is not None
                         _sc.store_dispatch_state(dispatch_key, idle_snap)
@@ -5465,12 +5873,20 @@ def _tui_build_snapshot_once(
                 # source panel with no cause and no remedy stated. The message
                 # this leg records carries both.
                 capture_failure("quota-projection", "other", exc)
-                source_bundle = prior_source_bundle
+                source_bundle = _tui_retain_failed_source_bundle(
+                    prior_source_bundle, dispatch_key=dispatch_key,
+                )
             except Exception as exc:
                 # Public source warnings are stable/sanitized; the detailed
                 # exception remains only on the internal rebuild-error string.
+                # #857: `capture_failure` can raise `_StatsSnapshotCorruption`
+                # before the retention below; the prior generation's accounting
+                # provenance token refuses it on the heal's retry if this
+                # build consumed accounting.
                 capture_failure("source-bundle", "stats_or_cache", exc)
-                source_bundle = prior_source_bundle
+                source_bundle = _tui_retain_failed_source_bundle(
+                    prior_source_bundle, dispatch_key=dispatch_key,
+                )
             snap = dataclasses.replace(
                 snap,
                 last_sync_error=("; ".join(errors) if errors else None),
@@ -5587,7 +6003,35 @@ def _tui_precompute_envelope_config(raw_config: dict) -> dict:
     }
 
 
-def _tui_compute_dispatch_signature(stats_conn):
+def _tui_open_observed_cache(c):
+    """The dispatch read's cache handle, opened after observing its file (#857).
+
+    ``(opened_file, conn)``: `_tui_cache_file_before_open`'s observation and
+    the handle opened immediately after it, so the Codex quota-dependency
+    identity read on ``conn`` is bound to ``opened_file`` strictly.
+
+    When that observation fails, the handle has opened anyway, and the usual
+    cause is the absence this very open repaired: a fresh install's first
+    dispatch read is what creates cache.db. Nothing binds an identity to that
+    handle — a stat taken after an open cannot show which file the open got —
+    so it is closed, the file observed again, and a second handle opened,
+    which is bound exactly like any other. Without that, a fresh install's
+    first dispatch key would carry no identity and its second would carry one,
+    and the second tick would pay a full rebuild for nothing. A second failed
+    observation is final: ``opened_file`` stays ``None`` and so does the
+    identity (rebuild). The extra open happens only on a tick whose file could
+    not be observed, never on an ordinary tick.
+    """
+    opened_file = _tui_cache_file_before_open()
+    conn = c.open_cache_db()
+    if opened_file is not None:
+        return opened_file, conn
+    conn.close()
+    opened_file = _tui_cache_file_before_open()
+    return opened_file, c.open_cache_db()
+
+
+def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
     """Composite data-version signature for the three-path dispatch (#268 M5.1).
 
     Cheap ``MAX(id)`` b-tree descents over cache.db + stats.db, the reset-event
@@ -5597,6 +6041,15 @@ def _tui_compute_dispatch_signature(stats_conn):
     ``compute_signature`` never raises (each leg degrades to 0 on a missing
     table); a cache-open failure propagates so the caller skips the idle path
     and does a full rebuild.
+
+    ``with_codex_dependency`` (#857) returns ``(signature, codex_dependency)``
+    instead: the Codex quota-dependency identity read on the SAME throwaway
+    handle (`_tui_open_observed_cache`), strictly bound to the file observed
+    before that handle opened, and read in the SAME read transaction as the
+    signature's cache legs — so a commit landing between the two cannot pair
+    an older signature with a newer identity in one dispatch key. The tick
+    pays no second connection for it. ``None`` when it cannot be established,
+    which the idle gate treats as "rebuild".
     """
     c = _cctally()
     sc = c._load_sibling("_lib_snapshot_cache")
@@ -5605,16 +6058,29 @@ def _tui_compute_dispatch_signature(stats_conn):
     # projection tables from a pure kernel (#496 S5b section 4.7).
     from _cctally_quota import assert_projection_readable
     assert_projection_readable(stats_conn)
-    cache_conn = c.open_cache_db()
+    if with_codex_dependency:
+        opened_file, cache_conn = _tui_open_observed_cache(c)
+    else:
+        opened_file, cache_conn = None, c.open_cache_db()
     try:
-        return sc.compute_signature(
-            cache_conn,
-            stats_conn,
-            generation=sc.current_generation(),
-            codex_stats_digest=codex_stats_digest(stats_conn),
-            accounts_digest=accounts_identity_digest(stats_conn),
-            claude_stats_digest=claude_stats_digest(stats_conn),
-        )
+        # One deferred read transaction on the cache handle: it pins nothing
+        # until `compute_signature`'s first cache read, and every cache read
+        # after that — the signature's legs and the identity's — shares that
+        # snapshot. The stats legs stay statement-scoped, as before.
+        with sc.one_read_snapshot(cache_conn):
+            signature = sc.compute_signature(
+                cache_conn,
+                stats_conn,
+                generation=sc.current_generation(),
+                codex_stats_digest=codex_stats_digest(stats_conn),
+                accounts_digest=accounts_identity_digest(stats_conn),
+                claude_stats_digest=claude_stats_digest(stats_conn),
+            )
+            if not with_codex_dependency:
+                return signature
+            return signature, _tui_read_codex_quota_dependency(
+                cache_conn, opened_file=opened_file,
+            )
     finally:
         cache_conn.close()
 
@@ -5681,7 +6147,8 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                              claude_ingest_contended=False,
                              claude_ingest_failed=False,
                              failures=None,
-                             stats_heal_attempted=False):
+                             stats_heal_attempted=False,
+                             codex_dependency):
     """Fresh snapshot reusing ``prior``'s heavy rows, re-patching only the
     time-derived fields + the doctor payload / envelope precompute on each idle
     tick (spec §3 idle path).
@@ -5708,6 +6175,10 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
     the idle path (the short-circuit only runs when the render key — which bundles
     the full raw config — is unchanged), so recomputing is cheap small-JSON I/O,
     not CPU, and byte-matches a full rebuild's envelope for the same state.
+
+    ``codex_dependency`` (#857) is this tick's Codex quota-dependency identity,
+    REQUIRED with no default for the reason `_tui_source_bundle_can_idle`
+    states: ``None`` idles no Codex generation.
     """
     import time
     doctor_payload = prior.doctor_payload
@@ -5723,6 +6194,8 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             errors.append(f"envelope-precompute: {exc}")
     idle_failures = failures if failures is not None else []
     source_bundle = prior.source_bundle
+    # #857: whether the bounded source adapter below scheduled the Codex pass.
+    source_attempt: dict[str, bool] = {}
     if source_bundle is not None:
         try:
             prior_claude = source_bundle.sources["claude"]
@@ -5731,8 +6204,21 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             # the idle clock is no longer entitled to speak for the cycle — its
             # public-history view cannot re-resolve it — so fall through to the
             # bounded source-adapter path, which rebuilds Codex authoritatively.
+            #
+            # #857: `codex_dependency` is this tick's Codex quota-dependency
+            # identity; a Codex generation of any availability idles only
+            # while it equals the identity that generation was built from, and
+            # the settled cycle-unavailable one never across a failed or
+            # contended Codex ingest.
             if (
-                _tui_source_bundle_can_idle(source_bundle)
+                _tui_source_bundle_can_idle(
+                    source_bundle,
+                    codex_dependency=codex_dependency,
+                    codex_ingest_degraded=(
+                        codex_ingest_failed or codex_ingest_contended
+                    ),
+                    now_utc=now_utc,
+                )
                 and not codex_decision_deadline_passed(prior_codex, now_utc)
             ):
                 claude = _refresh_claude_source_clock(
@@ -5794,6 +6280,7 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                     projects_envelope=prior.projects_envelope,
                     prior_bundle=source_bundle,
                     raw_config=raw_config,
+                    attempt=source_attempt,
                 )
         except _StatsSnapshotCorruption:
             raise
@@ -5806,7 +6293,13 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
             idle_failures.append(SyncFailureAttribution(
                 leg="quota-projection", database="other", corruption=False,
             ))
-            source_bundle = prior.source_bundle
+            # #857: a failed adapter that scheduled the Codex pass may have
+            # consumed accounting that committed after the dispatch read
+            # (`_tui_withdraw_codex_quota_dependency`).
+            source_bundle = (
+                _tui_withdraw_codex_quota_dependency(prior.source_bundle)
+                if source_attempt.get("codex_pass") else prior.source_bundle
+            )
         except Exception as exc:  # noqa: BLE001 — retain prior complete bundle
             # #496 S3 §8 (F16). This branch read stats through
             # `source_stats_conn` and swallowed the failure into a plain
@@ -5828,7 +6321,15 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                 )
             else:
                 errors.append(f"source-clock-refresh: {exc}")
-            source_bundle = prior.source_bundle
+            # #857: as in the handler above. A failure escalated as stats
+            # corruption raised out of `_tui_capture_sync_failure` before this
+            # line and never reaches it; the retained generation's accounting
+            # provenance token refuses it on the heal's retry instead
+            # (`_tui_codex_accounting_provenance_current`).
+            source_bundle = (
+                _tui_withdraw_codex_quota_dependency(prior.source_bundle)
+                if source_attempt.get("codex_pass") else prior.source_bundle
+            )
     return dataclasses.replace(
         prior,
         generated_at=now_utc,

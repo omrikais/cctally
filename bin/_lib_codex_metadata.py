@@ -23,11 +23,23 @@ from __future__ import annotations
 
 import dataclasses
 import sqlite3
+import threading
+from collections import OrderedDict
 
 
 #: The physical name of the raw threads table. ``resolve_codex_threads_table``
 #: returns it qualified by whichever schema actually holds it.
 CODEX_THREADS_TABLE = "codex_conversation_threads"
+
+
+# ``sqlite3.Connection`` has no writable attribute dictionary and cannot be
+# weak-referenced. A small strong-key LRU carries each positive resolution on
+# the connection object itself. Holding the object prevents an ``id`` reuse
+# from inheriting another connection's answer; the bound prevents closed
+# connection objects from accumulating without limit.
+_THREADS_TABLE_RESOLUTION_CACHE_MAX = 64
+_threads_table_resolution_cache: "OrderedDict[object, str]" = OrderedDict()
+_threads_table_resolution_lock = threading.Lock()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,7 +183,7 @@ def _schema_holds_threads_table(conn: sqlite3.Connection, schema: str) -> bool:
 
 
 def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
-    """The RAW threads table reference for this connection, resolved at call time.
+    """The RAW threads table reference for this connection.
 
     A bare cache connection (``open_cache_db()``) holds the table in its own
     ``main`` schema; a conversations connection
@@ -187,6 +199,16 @@ def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
     with ``no such table`` on the bare cache connection, which is why the
     reference is resolved rather than written out.
 
+    A positive resolution is retained for this connection object. Production
+    connections establish their fixed ``main``/``cache_db`` topology before
+    their first read, so steady-state requests perform no repeated
+    ``sqlite_master`` or ``database_list`` probes. A caller that changes that
+    topology with ATTACH, DETACH, or table DDL must call
+    :func:`invalidate_codex_threads_table_resolution` before the next read.
+    Closing the connection ends the useful lifetime of its entry, and the
+    bounded LRU eventually releases the closed object. Absent-table results
+    are never cached.
+
     ``RuntimeError`` means exactly one thing: the table is absent from every
     schema this connection can see. A ``sqlite3.Error`` raised while
     resolving is a read the store could not perform and propagates unchanged,
@@ -194,14 +216,38 @@ def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
     (zero undecodable rows, the empty key set) never gives that answer for a
     locked or malformed store.
     """
+    with _threads_table_resolution_lock:
+        cached = _threads_table_resolution_cache.get(conn)
+        if cached is not None:
+            _threads_table_resolution_cache.move_to_end(conn)
+            return cached
+
+    resolved = None
     if _schema_holds_threads_table(conn, "main"):
-        return f"main.{CODEX_THREADS_TABLE}"
-    attached = tuple(conn.execute("PRAGMA database_list"))
-    for row in attached:
-        name = str(row[1]) if len(row) > 1 else ""
-        if name == "cache_db" and _schema_holds_threads_table(conn, name):
-            return f"cache_db.{CODEX_THREADS_TABLE}"
-    raise RuntimeError(
-        "the Codex threads table is not present in this connection's main "
-        "schema and no cache database is attached as cache_db"
-    )
+        resolved = f"main.{CODEX_THREADS_TABLE}"
+    else:
+        attached = tuple(conn.execute("PRAGMA database_list"))
+        for row in attached:
+            name = str(row[1]) if len(row) > 1 else ""
+            if name == "cache_db" and _schema_holds_threads_table(conn, name):
+                resolved = f"cache_db.{CODEX_THREADS_TABLE}"
+                break
+    if resolved is None:
+        raise RuntimeError(
+            "the Codex threads table is not present in this connection's main "
+            "schema and no cache database is attached as cache_db"
+        )
+
+    with _threads_table_resolution_lock:
+        _threads_table_resolution_cache[conn] = resolved
+        _threads_table_resolution_cache.move_to_end(conn)
+        while len(_threads_table_resolution_cache) > (
+                _THREADS_TABLE_RESOLUTION_CACHE_MAX):
+            _threads_table_resolution_cache.popitem(last=False)
+    return resolved
+
+
+def invalidate_codex_threads_table_resolution(conn: sqlite3.Connection) -> None:
+    """Forget a positive raw-table answer after connection schema changes."""
+    with _threads_table_resolution_lock:
+        _threads_table_resolution_cache.pop(conn, None)

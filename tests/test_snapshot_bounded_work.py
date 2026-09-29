@@ -40,6 +40,31 @@ from test_dashboard_source_read_model import (  # noqa: E402
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
+def _content(state):
+    """A Codex generation with its #857 accounting provenance token reduced
+    to whether it is ``None``.
+
+    The token names the process-local accounting population the build's
+    capture read, and the cold rebuild these tests compare against mints a new
+    one by design, so two builds over identical data never share it. A build
+    that bypassed the qualified read stamps ``None`` instead, and that
+    difference must still fail the comparison, so the token is replaced by
+    ``token is None`` rather than dropped. It never reaches the wire; every
+    published field and every other server-only field must still be exactly
+    equal.
+    """
+    import _lib_snapshot_cache as sc
+
+    clock = state.clock_data
+    if clock is None or sc.CODEX_ACCOUNTING_PROVENANCE_KEY not in clock:
+        return state
+    token = clock[sc.CODEX_ACCOUNTING_PROVENANCE_KEY]
+    assert token is None or isinstance(token, int), token
+    return replace(state, clock_data={
+        **clock, sc.CODEX_ACCOUNTING_PROVENANCE_KEY: token is None,
+    })
+
+
 def _widen_corpus(cache, *, files=3, per_file=4, prefix="widened",
                   offset_base=1000):
     """Clone the corpus row so entries outnumber files.
@@ -710,7 +735,7 @@ def test_metadata_incomplete_fallback_never_reuses_an_id_stable_update(
     module.reset_codex_source_caches()
     cold = module.build_codex_source_state(
         context, data_version="metadata-fallback-b")
-    assert warm == cold
+    assert _content(warm) == _content(cold)
 
 
 def test_same_path_cache_replacement_cold_rebuilds_the_source_population(
@@ -767,7 +792,7 @@ def test_same_path_cache_replacement_cold_rebuilds_the_source_population(
         module.reset_codex_source_caches()
         cold = module.build_codex_source_state(
             _context(module, replaced, stats), data_version="after-replacement")
-        assert warm == cold
+        assert _content(warm) == _content(cold)
     finally:
         replaced.close()
 
@@ -1171,7 +1196,7 @@ def test_incremental_source_is_exactly_equal_to_cold_rebuild(source_env):
     cold = module.build_codex_source_state(
         context, data_version="stable-public-version")
 
-    assert warm == cold
+    assert _content(warm) == _content(cold)
 
 
 def test_full_invalidation_source_is_exactly_equal_to_cold_rebuild(source_env):
@@ -1209,7 +1234,7 @@ def test_full_invalidation_source_is_exactly_equal_to_cold_rebuild(source_env):
     cold = module.build_codex_source_state(
         context, data_version="stable-public-version")
 
-    assert warm == cold
+    assert _content(warm) == _content(cold)
 
 
 def test_incremental_session_splice_preserves_equal_timestamp_order():
@@ -1292,7 +1317,7 @@ def test_failed_incremental_source_build_rolls_back_cache_generation(
     module.reset_codex_account_scope_cache()
     cold = module.build_codex_source_state(
         context, data_version="stable-public-version")
-    assert retry == cold
+    assert _content(retry) == _content(cold)
 
 
 def test_failed_source_build_rolls_back_account_card_fallback_counter(
@@ -1696,7 +1721,8 @@ def test_warm_reuse_equals_cold_rebuild_after_each_mutation(
     cold = module.build_codex_source_state(
         _context(module, cache, stats), data_version="after-mutation")
 
-    assert warm == cold, f"warm reuse diverged from a cold rebuild after {mutation}"
+    assert _content(warm) == _content(cold), (
+        f"warm reuse diverged from a cold rebuild after {mutation}")
 
 
 def test_the_cold_reset_covers_every_cache_the_build_checkpoints(source_env):
@@ -2044,7 +2070,7 @@ def test_warm_reuse_equals_cold_rebuild_across_an_active_window_transition(
         _context(module, cache, stats, now_utc=after),
         data_version="after-transition")
 
-    assert warm == cold, (
+    assert _content(warm) == _content(cold), (
         "warm reuse diverged from a cold rebuild across an active-window "
         "transition"
     )
@@ -2084,7 +2110,8 @@ def test_warm_reuse_equals_cold_rebuild_after_a_ledger_mutation(
     cold = module.build_codex_source_state(
         _context(module, cache, stats), data_version="after-ledger")
 
-    assert warm == cold, f"warm reuse diverged from a cold rebuild after {mutation}"
+    assert _content(warm) == _content(cold), (
+        f"warm reuse diverged from a cold rebuild after {mutation}")
 
 
 #: Two distinguishable values per `load_codex_quota_observations` parameter,

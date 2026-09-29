@@ -5928,11 +5928,16 @@ mark.current {
      second line on phones; the zone tag stays atomic and the share/close
      controls keep their fixed-size slots. Other modal titles retain the
      established single-line ellipsis contract above. */
-  .block-modal-card .modal-header h2 {
+  .block-modal-card .modal-header h2,
+  .current-usage-modal .modal-header h2 {
     overflow: visible;
     text-overflow: clip;
     white-space: normal;
   }
+  /* Phones only: the fixed onboarding toast otherwise covers the lower edge
+     of Current Usage. On wider viewports it sits in the bottom-right corner,
+     at most grazing the dialog card, so it stays visible there. */
+  body:has(.current-usage-modal) .onboarding-toast { display: none; }
   .modal-header .share-icon,
   .modal-header .provider-section-status,
   .modal-header .modal-close { flex-shrink: 0; }

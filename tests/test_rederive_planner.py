@@ -2811,3 +2811,2326 @@ def test_reviewed_causal_delta_excludes_three_older_block_closes(
     assert [action.event_id for action in authorized.actions] == [
         decision["id"], reset["id"],
     ]
+
+
+# ---------------------------------------------------------------------------
+# #875: five-hour milestones under a frozen close keep their block cost
+# ---------------------------------------------------------------------------
+
+_875_WINDOW = 1785088200
+_875_ACCOUNT = "acct-875"
+_875_CLOSE_ID = f"fhbc:{_875_ACCOUNT}:{_875_WINDOW}"
+_875_CREDIT_REF = (
+    f"fhc:{_875_ACCOUNT}:{_875_WINDOW}:2026-07-26T13:00:00+00:00"
+)
+
+
+def _875_close(journal, *, total, models, pricing=None, **overrides):
+    payload = {
+        "account_key": _875_ACCOUNT,
+        "five_hour_window_key": _875_WINDOW,
+        "five_hour_resets_at": "2026-07-26T16:30:00Z",
+        "block_start_at": "2026-07-26T11:30:00Z",
+        "first_observed_at_utc": "2026-07-26T12:00:00Z",
+        "last_observed_at_utc": "2026-07-26T16:10:00Z",
+        "final_five_hour_percent": 42.0,
+        "is_closed": 1,
+        "total_cost_usd": total,
+        "total_input_tokens": 300,
+        "_models": models,
+        "_projects": [{"project_path": "/repo", "cost_usd": total}],
+    }
+    if pricing is not None:
+        payload["_pricing"] = pricing
+    payload.update(overrides)
+    return journal.make_evt(
+        kind="five_hour_block_close", id=_875_CLOSE_ID, at=AT,
+        payload=payload,
+    )
+
+
+def _875_milestone(journal, threshold, block_cost, marginal, *,
+                   reset_ref="0", tokens=None, alerted_at=None, at=AT,
+                   captured=None, event_id=None):
+    return journal.make_evt(
+        kind="five_hour_milestone",
+        id=event_id or (
+            f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:{reset_ref}:{threshold}"
+        ),
+        at=at,
+        payload={
+            "account_key": _875_ACCOUNT,
+            "five_hour_window_key": _875_WINDOW,
+            "percent_threshold": threshold,
+            "reset_event_ref": reset_ref,
+            "captured_at_utc": captured or f"2026-07-26T12:{threshold:02d}:00Z",
+            "usage_snapshot_ref": f"sa:o:875-{reset_ref}-{threshold}",
+            "block_input_tokens": 100 * threshold if tokens is None else tokens,
+            "block_output_tokens": 0,
+            "block_cache_create_tokens": 0,
+            "block_cache_read_tokens": 0,
+            "block_cost_usd": block_cost,
+            "marginal_cost_usd": marginal,
+            "seven_day_pct_at_crossing": 1.0,
+            "alerted_at": alerted_at,
+        },
+    )
+
+
+def _875_priced_close(journal, total):
+    return _875_close(
+        journal, total=total,
+        models=[{"model": "m", "cost_usd": total, "input_tokens": 300}],
+    )
+
+
+def _875_plan(rederive, journal, current, desired, *, preserved=(),
+              **kwargs):
+    return rederive.build_claude_usage_plan(
+        selection=journal.resolve_effective_events(list(current)),
+        desired_events=list(desired),
+        journal_high_water=("observations-2026-07.jsonl", 10),
+        cache_fingerprint="sha256:cache",
+        config_fingerprint="sha256:config",
+        preserved_events=tuple(preserved),
+        **kwargs,
+    )
+
+
+def _875_milestone_actions(plan):
+    return {
+        action.event_id: action for action in plan.actions
+        if action.kind == "five_hour_milestone"
+    }
+
+
+def _875_money(action):
+    payload = action.payload or {}
+    return payload["block_cost_usd"], payload["marginal_cost_usd"]
+
+
+def _875_corrected_state(journal, current, plan):
+    """The effective records after applying ``plan``, re-spelled at rev 0.
+
+    A second plan over this state must be a no-op. Rev 0 keeps the check free
+    of correction-batch machinery; only the payloads matter here.
+    """
+    by_id = {record["id"]: record for record in current}
+    for action in plan.actions:
+        if action.disposition == "tombstone":
+            by_id.pop(action.event_id, None)
+            continue
+        payload = dict(action.payload or {})
+        kind = payload.pop("kind")
+        by_id[action.event_id] = journal.make_evt(
+            kind=kind, id=action.event_id, at=action.at, payload=payload,
+        )
+    return list(by_id.values())
+
+
+def _875_kept_close_kinds(rederive):
+    """(current close kwargs, desired close kwargs) per kept-close kind."""
+    priced_models = [{"model": "m", "cost_usd": 6.0, "input_tokens": 300}]
+    repriced_models = [{"model": "m", "cost_usd": 14.0, "input_tokens": 300}]
+    repriced = dict(
+        total=14.0, models=repriced_models,
+        pricing={"version": 1, "unpricedModels": []},
+    )
+    return {
+        "genuinely-priced": (
+            dict(total=6.0, models=priced_models), repriced,
+        ),
+        "unmarked-uncertain": (
+            dict(total=0.0, models=[
+                {"model": "m", "cost_usd": 0.0, "input_tokens": 300},
+            ]),
+            repriced,
+        ),
+        "partial-missing-card": (
+            dict(total=6.0, models=[
+                {"model": "m", "cost_usd": 6.0, "input_tokens": 200},
+                {"model": "m2", "cost_usd": 0.0, "input_tokens": 100},
+            ], pricing={"version": 1, "unpricedModels": ["m2"]}),
+            dict(total=14.0, models=[
+                {"model": "m", "cost_usd": 9.0, "input_tokens": 200},
+                {"model": "m2", "cost_usd": 5.0, "input_tokens": 100},
+            ], pricing={"version": 1, "unpricedModels": []}),
+        ),
+        "population-drifted": (
+            dict(total=0.0, models=[
+                {"model": "m", "cost_usd": 0.0, "input_tokens": 300},
+            ], pricing={"version": 1, "unpricedModels": ["m"]}),
+            dict(total=16.0, models=[
+                {"model": "m", "cost_usd": 16.0, "input_tokens": 350},
+            ], pricing={"version": 1, "unpricedModels": []}),
+        ),
+        "869-corrected": (
+            dict(total=6.0, models=priced_models, pricing={
+                "version": 1, "unpricedModels": [],
+                "basis": rederive.RECORDED_CLOSE_CORRECTION_BASIS,
+            }),
+            repriced,
+        ),
+        "869-historical": (
+            dict(total=6.0, models=priced_models, pricing={
+                "version": 1, "unpricedModels": [],
+                "basis": rederive.HISTORICAL_CLOSE_BASIS,
+            }),
+            repriced,
+        ),
+    }
+
+
+@pytest.mark.parametrize("close_kind", [
+    "genuinely-priced", "unmarked-uncertain", "partial-missing-card",
+    "population-drifted", "869-corrected", "869-historical",
+])
+def test_875_price_only_edit_keeps_milestone_money_under_every_kept_close(
+    cctally_module, close_kind,
+):
+    """Spec §6.1 test 1 (A1, A7): the close is kept, so both fields stay."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current_kwargs, desired_kwargs = _875_kept_close_kinds(rederive)[close_kind]
+    current = [
+        _875_close(journal, **current_kwargs),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_close(journal, **desired_kwargs),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == (), [
+        (a.disposition, a.event_id, a.payload) for a in plan.actions
+    ]
+
+
+def test_875_predecessor_identity_correction_updates_successor_marginal(
+    cctally_module,
+):
+    """Spec §6.1 test 2 (A1, A6): the live 254-case chain, no card edit."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 5.0, None),
+        _875_milestone(journal, 2, 8.1945, 3.1945, tokens=200),
+        _875_milestone(journal, 3, 18.2246, 10.0301, tokens=300),
+    ]
+    desired = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 5.0, None),
+        _875_milestone(journal, 2, 8.3209, 3.3209, tokens=210),
+        _875_milestone(journal, 3, 18.2246, 9.9037, tokens=300),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    one, two, three = (
+        f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:{n}" for n in (1, 2, 3)
+    )
+    assert one not in actions
+    assert _875_money(actions[two]) == (8.3209, 8.3209 - 5.0)
+    assert actions[two].payload["block_input_tokens"] == 210
+    block, marginal = _875_money(actions[three])
+    assert block == 18.2246
+    assert marginal == 18.2246 - 8.3209
+    assert abs(marginal - 9.9037) <= 1e-9
+
+
+def test_875_card_edit_with_predecessor_correction_resolves_final_difference(
+    cctally_module,
+):
+    """Spec §6.1 test 3 (A1, A6)."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 5.0, None),
+        _875_milestone(journal, 2, 8.1945, 3.1945, tokens=200),
+        _875_milestone(journal, 3, 18.2246, 10.0301, tokens=300),
+    ]
+    desired = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 11.6, 4.6, tokens=210),
+        _875_milestone(journal, 3, 25.5, 13.9, tokens=300),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    one, two, three = (
+        f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:{n}" for n in (1, 2, 3)
+    )
+    assert one not in actions
+    assert _875_money(actions[two]) == (11.6, 11.6 - 5.0)
+    assert _875_money(actions[three]) == (18.2246, 18.2246 - 11.6)
+
+
+def test_875_closure_evidence_change_releases_milestones_to_replay(
+    cctally_module,
+):
+    """Spec §6.1 test 4 (A4): a corrected close is not kept."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    moved = _875_close(
+        journal, total=14.0,
+        models=[{"model": "m", "cost_usd": 14.0, "input_tokens": 300}],
+        final_five_hour_percent=43.0,
+    )
+    desired = [
+        moved,
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+    actions = _875_milestone_actions(plan)
+
+    assert any(a.event_id == _875_CLOSE_ID for a in plan.actions)
+    assert _875_money(actions[f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1"]) == (
+        7.0, None)
+    assert _875_money(actions[f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"]) == (
+        14.0, 7.0)
+
+
+@pytest.mark.parametrize("desired_marginal, expected_marginal", [
+    (9.0, 16.0 - 3.0),
+    (None, None),
+])
+def test_875_identity_corrected_candidate_takes_replay_money_and_presence(
+    cctally_module, desired_marginal, expected_marginal,
+):
+    """Spec §6.1 test 5 (A4, spec §7.2)."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0, tokens=200),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 16.0, desired_marginal, tokens=250),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    assert f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1" not in actions
+    corrected = actions[f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"]
+    assert _875_money(corrected) == (16.0, expected_marginal)
+    assert corrected.payload["block_input_tokens"] == 250
+
+
+def test_875_alerted_milestone_under_kept_close_stays_frozen(cctally_module):
+    """Spec §6.1 test 6 (A7; the alert-envelope row of A2)."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    alerted = "2026-07-26T12:02:05Z"
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0, alerted_at=alerted),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0, alerted_at=None),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == ()
+
+
+def test_875_predecessor_is_found_only_within_its_credit_segment(
+    cctally_module,
+):
+    """Spec §6.1 test 7: each credit segment has its own predecessor chain.
+
+    The post-credit segment reuses thresholds 1 and 2. With the segments
+    merged, pre-credit threshold 2's predecessor would tie on threshold 1 and
+    could resolve to the post-credit $10 crossing, giving a -$4 marginal; the
+    rule keeps each segment's own $3 difference and $2 difference.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 12.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+        _875_milestone(journal, 1, 10.0, None, reset_ref=_875_CREDIT_REF),
+        _875_milestone(journal, 2, 12.0, 2.0, reset_ref=_875_CREDIT_REF),
+    ]
+    desired = [
+        _875_priced_close(journal, 12.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+        _875_milestone(journal, 1, 23.0, None, reset_ref=_875_CREDIT_REF),
+        _875_milestone(journal, 2, 28.0, 5.0, reset_ref=_875_CREDIT_REF),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == ()
+
+
+def test_875_same_tick_thresholds_keep_a_null_marginal(cctally_module):
+    """Spec §6.1 test 8: thresholds 3 and 4 crossed on one tick."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    tick = "2026-07-26T12:30:00Z"
+    current = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+        _875_milestone(journal, 3, 9.0, 3.0, captured=tick),
+        _875_milestone(journal, 4, 9.0, None, captured=tick),
+    ]
+    desired = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+        _875_milestone(journal, 3, 21.0, 7.0, captured=tick),
+        _875_milestone(journal, 4, 21.0, None, captured=tick),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == ()
+
+
+@pytest.mark.parametrize("current_marginal, expected", [
+    (3.0, None),
+    # An inconsistent recorded marginal is re-resolved against the preserved
+    # predecessor; without it in the final state the pair would be kept.
+    (2.5, (6.0, 3.0)),
+])
+def test_875_preserved_predecessor_keeps_a_present_marginal(
+    cctally_module, current_marginal, expected,
+):
+    """Spec §6.1 test 9 (A9): replay never sees a preserved b: crossing."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    preserved = _875_milestone(
+        journal, 1, 3.0, None, event_id="b:five_hour_milestones:875")
+    current = [
+        _875_priced_close(journal, 6.0),
+        preserved,
+        _875_milestone(journal, 2, 6.0, current_marginal),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 2, 14.0, None),
+    ]
+    plan = _875_plan(
+        rederive, journal, current, desired, preserved=[preserved])
+
+    if expected is None:
+        assert plan.actions == ()
+    else:
+        actions = _875_milestone_actions(plan)
+        assert list(actions) == [f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"]
+        assert _875_money(actions[f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"]) \
+            == expected
+
+
+def test_875_reviewed_hold_removed_predecessor_is_not_copied_from_replay(
+    cctally_module,
+):
+    """Spec §6.1 test 10 (A9).
+
+    Replay adds threshold 2 from an observation whose snapshot the reviewed
+    hold keeps, and no accepted snapshot exists for it, so the hold removes it
+    before the diff. Threshold 3's replayed marginal ($7, against the removed
+    predecessor) must not be copied.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_milestone(journal, 2, 14.0, 7.0)
+    held["payload"]["usage_snapshot_ref"] = "sa:o:875-held"
+    current = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 3, 9.0, 6.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 7.0, None),
+        held,
+        _875_milestone(journal, 3, 21.0, 7.0),
+    ]
+    plan = _875_plan(
+        rederive, journal, current, desired,
+        reviewed_weekly_hold_ids=("o:875-held",),
+    )
+
+    assert plan.actions == ()
+
+
+def test_875_present_marginal_without_predecessor_keeps_the_pair(
+    cctally_module,
+):
+    """Spec §6.1 test 11 (A9): fail closed, never invent a marginal."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == ()
+
+
+def test_875_second_plan_over_the_corrected_state_is_a_noop(cctally_module):
+    """Spec §6.1 test 12 (A3), over test 3's card-edit-plus-correction case."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 5.0, None),
+        _875_milestone(journal, 2, 8.1945, 3.1945, tokens=200),
+        _875_milestone(journal, 3, 18.2246, 10.0301, tokens=300),
+    ]
+    desired = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 11.6, 4.6, tokens=210),
+        _875_milestone(journal, 3, 25.5, 13.9, tokens=300),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+    assert first.actions
+
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(rederive, journal, corrected, desired)
+
+    assert second.actions == (), [
+        (a.disposition, a.event_id, a.payload) for a in second.actions
+    ]
+
+
+def test_875_at_corrected_predecessor_is_in_the_final_state(cctally_module):
+    """Spec §6.1 test 13 (A1, A3).
+
+    Threshold 1's crossing moved, so the planner supersedes it to its desired
+    payload (its event id excludes the capture time). The unchanged threshold 2
+    keeps its $6 block cost under the card edit and resolves its marginal
+    against threshold 1's new $3.20.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    moved_at = "2026-07-25T12:05:00Z"
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.2, None, at=moved_at,
+                       captured="2026-07-26T12:01:30Z"),
+        _875_milestone(journal, 2, 14.0, 10.8),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+    actions = _875_milestone_actions(first)
+
+    one = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1"
+    two = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+    assert actions[one].at == moved_at
+    assert _875_money(actions[one]) == (3.2, None)
+    assert _875_money(actions[two]) == (6.0, 6.0 - 3.2)
+
+    corrected = _875_corrected_state(journal, current, first)
+    assert _875_plan(rederive, journal, corrected, desired).actions == ()
+
+
+def test_875_marginal_within_tolerance_keeps_its_recorded_bytes(
+    cctally_module,
+):
+    """Spec §4.3: 18.2246 - 8.3209 is 9.903699999999999, not 9.9037.
+
+    The recorded 9.9037 is within 1e-9 of the recomputed difference, so it is
+    kept byte-for-byte; without the snap every such milestone would churn.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    assert 18.2246 - 8.3209 != 9.9037
+    current = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 2, 8.3209, None),
+        _875_milestone(journal, 3, 18.2246, 9.9037),
+    ]
+    desired = [
+        _875_priced_close(journal, 20.0),
+        _875_milestone(journal, 2, 11.6, None),
+        _875_milestone(journal, 3, 25.5, 13.9),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == ()
+
+
+def test_875_replay_addition_under_a_kept_close_resolves_its_chain(
+    cctally_module,
+):
+    """Spec §4.2-§4.3, §7.3: an addition takes replay money and joins the chain.
+
+    Replay adds threshold 2 at the new card ($14). It is a predecessor of the
+    unchanged threshold 3, whose $9 block cost stays frozen, so its marginal is
+    the final-cost difference 9 - 14 = -5 (the mixed-card chain the approved
+    exclusions admit), and the addition's own marginal is 14 - 3 = 11.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 3, 9.0, 6.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+        _875_milestone(journal, 3, 21.0, 7.0),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    one, two, three = (
+        f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:{n}" for n in (1, 2, 3)
+    )
+    assert one not in actions
+    assert actions[two].disposition == "add"
+    assert _875_money(actions[two]) == (14.0, 14.0 - 3.0)
+    assert actions[three].disposition == "supersede"
+    assert _875_money(actions[three]) == (9.0, 9.0 - 14.0)
+
+
+def test_875_tombstoned_milestone_is_not_a_predecessor(cctally_module):
+    """Spec §4.2: a milestone the plan tombstones leaves the final state.
+
+    Replay drops threshold 2, so threshold 3 resolves against threshold 1:
+    9 - 3 = 6. Counting the tombstone would keep the recorded 9 - 6 = 3.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+        _875_milestone(journal, 3, 9.0, 3.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 3, 21.0, 14.0),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    two = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+    three = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:3"
+    assert actions[two].disposition == "tombstone"
+    assert actions[three].disposition == "supersede"
+    assert _875_money(actions[three]) == (9.0, 9.0 - 3.0)
+
+
+def test_875_empty_reset_ref_spellings_share_the_pre_credit_segment(
+    cctally_module,
+):
+    """Spec §4.2: an empty reset_event_ref spelling is the "0" segment.
+
+    The predecessor carries ``None``; the successor ``"0"``. Only the shared
+    pre-credit segment gives the successor a predecessor, which re-resolves
+    its inconsistent recorded 2.5 to 6 - 3 = 3; apart, the pair would be kept.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None, reset_ref=None),
+        _875_milestone(journal, 2, 6.0, 2.5),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 7.0, None, reset_ref=None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    actions = _875_milestone_actions(
+        _875_plan(rederive, journal, current, desired))
+
+    two = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+    assert list(actions) == [two]
+    assert _875_money(actions[two]) == (6.0, 3.0)
+
+
+def _875_action_summary(plan):
+    """(disposition, event id, block cost, marginal) per action, for messages."""
+    return [
+        (
+            action.disposition, action.event_id,
+            (action.payload or {}).get("block_cost_usd"),
+            (action.payload or {}).get("marginal_cost_usd"),
+        )
+        for action in plan.actions
+    ]
+
+
+def test_875_at_moved_milestone_after_a_retained_predecessor_converges(
+    cctally_module,
+):
+    """Spec §6.1 test 14 (A3): the live non-convergence of spec §1.3.
+
+    Threshold 1 is an unchanged crossing, so it keeps its frozen $20 under the
+    card edit (replay repriced it to $10) and is never rewritten. Threshold 2's
+    replayed crossing moved its ``at``, and replay's marginal 15 - 10 = 5
+    disagrees with the final-state difference 15 - 20 = -5. Copying replay's 5
+    left the second plan to supersede it to -5; resolving the at-moved
+    crossing in the first plan makes the second plan a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    moved_at = "2026-07-25T12:05:00Z"
+    current = [
+        _875_priced_close(journal, 30.0),
+        _875_milestone(journal, 1, 20.0, None),
+        _875_milestone(journal, 2, 26.0, 6.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 30.0),
+        _875_milestone(journal, 1, 10.0, None),
+        _875_milestone(journal, 2, 15.0, 5.0, at=moved_at),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(rederive, journal, corrected, desired)
+    residual = _875_action_summary(second)
+
+    two = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+    actions = _875_milestone_actions(first)
+    assert list(actions) == [two], _875_action_summary(first)
+    assert actions[two].disposition == "supersede"
+    assert actions[two].at == moved_at
+    assert _875_money(actions[two]) == (15.0, 15.0 - 20.0), residual
+    assert second.actions == (), residual
+
+
+def test_875_at_moved_milestone_without_a_predecessor_keeps_its_desired_pair(
+    cctally_module,
+):
+    """Spec §6.1 test 15 (A3, A9).
+
+    The lone crossing in its segment moved its ``at``, so it is a corrected
+    crossing. With no final-state predecessor it keeps the desired pair
+    (12, 3) whole, not the current (10, 2), and the second plan keeps that
+    same pair from current. Copying replay reached the same payload, so this
+    guards the no-predecessor pair rather than reproducing the §1.3 failure.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    moved_at = "2026-07-25T12:05:00Z"
+    current = [
+        _875_priced_close(journal, 12.0),
+        _875_milestone(journal, 2, 10.0, 2.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 12.0),
+        _875_milestone(journal, 2, 12.0, 3.0, at=moved_at),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+
+    two = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+    actions = _875_milestone_actions(first)
+    assert list(actions) == [two], _875_action_summary(first)
+    assert actions[two].disposition == "supersede"
+    assert actions[two].at == moved_at
+    assert _875_money(actions[two]) == (12.0, 3.0)
+
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(rederive, journal, corrected, desired)
+    assert second.actions == (), _875_action_summary(second)
+
+
+_875_TWO = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+_875_ONE = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1"
+_875_PRESERVED_CLOSE_ID = "b:five_hour_blocks:875"
+#: A reading of the overlapping earlier window. A hold on it holds that window,
+#: never this block's close.
+_875_NEIGHBOUR_WINDOW = _875_WINDOW - 3600
+#: A real card, so the historical-close rule can prove a $0 close (#869).
+_875_PRICED_MODEL = "claude-3-5-sonnet-20241022"
+#: sha256 of `git show 80edb5f24:bin/_lib_rederive.py`, the pre-#875 planner.
+_875_PRE_875_SHA256 = (
+    "fcd9a9b466ebf52842ae99bb25276d52d7096e478a22286c7c63d374c2e67e64"
+)
+
+
+def _875_moved_close(journal, total):
+    """A replayed close whose closure evidence moved, so the plan corrects it."""
+    return _875_close(
+        journal, total=total,
+        models=[{"model": "m", "cost_usd": total, "input_tokens": 300}],
+        final_five_hour_percent=43.0,
+    )
+
+
+def _875_preserved_close(journal, total):
+    """A cutover-exported close for the same block: preserved history."""
+    return {**_875_priced_close(journal, total), "id": _875_PRESERVED_CLOSE_ID}
+
+
+def _875_snapshot(journal, raw_id, *, window=_875_WINDOW):
+    return journal.make_evt(
+        kind="snapshot_accept", id=f"sa:{raw_id}", at=AT,
+        payload={
+            "account_key": _875_ACCOUNT, "captured_at_utc": AT,
+            "weekly_percent": 63.0, "five_hour_percent": 41.0,
+            "five_hour_window_key": window,
+        },
+    )
+
+
+def _875_referencing(milestone, snapshot):
+    """``milestone`` crossed on ``snapshot``'s observation."""
+    milestone["payload"]["usage_snapshot_ref"] = snapshot["id"]
+    return milestone
+
+
+def _875_pre_875_planner():
+    """The planner exactly as it was before #875, at ``80edb5f24``.
+
+    ``tests/fixtures/rederive/pre_875_lib_rederive.py`` is a byte-for-byte copy
+    of ``git show 80edb5f24:bin/_lib_rederive.py``, pinned by its sha256. It is
+    committed because the remote runner receives a materialized tree that may
+    carry no ``.git``. It loads under its own module name, never as
+    ``_lib_rederive``, and it imports only the standard library and
+    ``_lib_cost_provenance``.
+    """
+    import hashlib
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    name = "_lib_rederive_pre_875"
+    module = sys.modules.get(name)
+    if module is not None:
+        return module
+    path = (Path(__file__).parent / "fixtures" / "rederive"
+            / "pre_875_lib_rederive.py")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == \
+        _875_PRE_875_SHA256
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    # Dataclasses resolve string annotations through sys.modules.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _875_run_passes(planner, journal, records, desired, *, limit=5, **kwargs):
+    """Plan, append the plan as a committed batch, and repeat until a no-op.
+
+    Returns every plan up to and including the first one without an action.
+    Each pass derives ``preserved_events`` from the journal records exactly as
+    the command does, so a revived or tombstoned ``b:`` event behaves as it
+    would on a real store.
+    """
+    records = list(records)
+    plans = []
+    for number in range(1, limit + 1):
+        plan = planner.build_claude_usage_plan(
+            selection=journal.resolve_effective_events(records),
+            desired_events=list(desired),
+            journal_high_water=("observations-2026-07.jsonl", 10),
+            cache_fingerprint="sha256:cache",
+            config_fingerprint="sha256:config",
+            preserved_events=tuple(planner.preserved_history(
+                records, evidence_retained=True).values()),
+            **kwargs,
+        )
+        plans.append(plan)
+        if not plan.actions:
+            return plans
+        records.extend(journal.make_correction_batch(
+            batch_id=f"rederive:claude-usage:875-pass-{number}",
+            family="claude-usage", at=AT,
+            actions=plan.to_correction_actions(),
+        ))
+    raise AssertionError(
+        f"no no-op within {limit} passes: "
+        + repr([_875_action_summary(plan) for plan in plans])
+    )
+
+
+def _875_ids(plan):
+    return [action.event_id for action in plan.actions]
+
+
+def test_875_replaced_close_corrected_then_frozen_is_a_noop(cctally_module):
+    """Spec §6.1 test 16 (A3): a corrected close, then the same close kept.
+
+    The first plan corrects the close, so it replaces it: the milestone at
+    threshold 2 is a corrected crossing with replay's $14 block cost, and its
+    marginal is the final-state difference against the preserved ``b:``
+    predecessor that replay never reproduces, 14 - 3 = 11, not replay's 7. The
+    second plan keeps the close, finds the same (14, 11), and is a no-op.
+    Revision 7 wrote replay's (14, 7), and its second plan superseded that to
+    (14, 11) (spec §1.4).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    preserved = _875_milestone(
+        journal, 1, 3.0, None, event_id="b:five_hour_milestones:875")
+    current = [
+        _875_priced_close(journal, 6.0),
+        preserved,
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_moved_close(journal, 14.0), _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    first = _875_plan(
+        rederive, journal, current, desired, preserved=[preserved])
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(
+        rederive, journal, corrected, desired, preserved=[preserved])
+    summary = (_875_action_summary(first), _875_action_summary(second))
+
+    assert _875_ids(first) == [_875_CLOSE_ID, _875_TWO], summary
+    assert _875_money(_875_milestone_actions(first)[_875_TWO]) == (
+        14.0, 11.0), summary
+    assert second.actions == (), summary
+
+
+def test_875_replaced_close_added_then_frozen_is_a_noop(cctally_module):
+    """Spec §6.1 test 17 (A3): the close only replay holds, which the plan adds.
+
+    Current holds no close for the block, so the first plan adds replay's
+    close and resolves the milestone under it as a corrected crossing: (14,
+    11) against the preserved predecessor. The second plan keeps the added
+    close and is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    preserved = _875_milestone(
+        journal, 1, 3.0, None, event_id="b:five_hour_milestones:875")
+    current = [preserved, _875_milestone(journal, 2, 6.0, 3.0)]
+    desired = [
+        _875_priced_close(journal, 14.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    first = _875_plan(
+        rederive, journal, current, desired, preserved=[preserved])
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(
+        rederive, journal, corrected, desired, preserved=[preserved])
+    summary = (_875_action_summary(first), _875_action_summary(second))
+
+    assert [(a.disposition, a.event_id) for a in first.actions] == [
+        ("add", _875_CLOSE_ID), ("supersede", _875_TWO),
+    ], summary
+    assert _875_money(_875_milestone_actions(first)[_875_TWO]) == (
+        14.0, 11.0), summary
+    assert second.actions == (), summary
+
+
+def test_875_revived_predecessor_serves_the_marginal_chain(cctally_module):
+    """Spec §6.1 test 18 (A9): a revived preserved milestone is a predecessor.
+
+    This family's earlier batch retired the preserved ``b:`` crossing at
+    threshold 1, so the plan revives it. Threshold 2's recorded marginal 2.5
+    is inconsistent; only the revived predecessor gives it the final-state
+    difference 6 - 3 = 3. Without the revival in the final state it has no
+    predecessor and keeps its pair, and the plan would not touch it.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    retired = _875_milestone(
+        journal, 1, 3.0, None, event_id="b:five_hour_milestones:875")
+    records = [
+        _875_priced_close(journal, 6.0),
+        retired,
+        *_tombstone_batch(
+            journal, retired["id"],
+            batch_id="rederive:claude-usage:875-retired",
+        ),
+        _875_milestone(journal, 2, 6.0, 2.5),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plans = _875_run_passes(rederive, journal, records, desired)
+    first = plans[0]
+    actions = {action.event_id: action for action in first.actions}
+    summary = [_875_action_summary(plan) for plan in plans]
+
+    assert list(actions) == [retired["id"], _875_TWO], summary
+    assert actions[retired["id"]].disposition == "supersede"
+    assert actions[retired["id"]].revision == 2
+    assert actions[retired["id"]].payload == retired["payload"]
+    assert _875_money(actions[_875_TWO]) == (6.0, 3.0), summary
+    assert len(plans) == 2, summary
+
+
+_875_MALFORMED_COSTS = [
+    "3.0", None, True, float("nan"), float("inf"),
+    # An int too large for a float: ``math.isfinite`` raises on it.
+    pytest.param(10 ** 400, id="int-beyond-float"),
+]
+
+
+@pytest.mark.parametrize("malformed", _875_MALFORMED_COSTS, ids=repr)
+def test_875_malformed_nearest_predecessor_fails_closed(
+    cctally_module, malformed,
+):
+    """Spec §6.1 test 19, first case (A9): no skipping past a malformed row.
+
+    Threshold 2's block cost is unusable, but its threshold is not, so it
+    still occupies threshold 2. Threshold 3 then has no usable predecessor and
+    keeps its pair (9, 2.5). Skipping to threshold 1 would write 9 - 3 = 6.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, malformed, None),
+        _875_milestone(journal, 3, 9.0, 2.5),
+    ]
+    desired = [
+        _875_priced_close(journal, 9.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, None),
+        _875_milestone(journal, 3, 21.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == (), _875_action_summary(plan)
+
+
+@pytest.mark.parametrize("malformed", _875_MALFORMED_COSTS, ids=repr)
+def test_875_malformed_candidate_cost_keeps_its_pair(cctally_module, malformed):
+    """Spec §6.1 test 19, second case (A9): no subtraction from its own cost."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, malformed, 2.5),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == (), _875_action_summary(plan)
+
+
+@pytest.mark.parametrize("malformed", [True, 1.0, "1"], ids=repr)
+def test_875_malformed_threshold_occupies_no_position(
+    cctally_module, malformed,
+):
+    """Spec §6.1 test 19, third case (A9).
+
+    A row whose threshold is a bool or not an ``int`` is no predecessor, even
+    where ``int()`` would read it as 1. Threshold 2 then has no predecessor and
+    keeps its pair (6, 2.5); reading the row as threshold 1 writes 6 - 3 = 3.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    def odd(block_cost):
+        return _875_milestone(
+            journal, malformed, block_cost, None, tokens=100,
+            captured="2026-07-26T12:01:00Z",
+            event_id=f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:malformed",
+        )
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        odd(3.0),
+        _875_milestone(journal, 2, 6.0, 2.5),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        odd(7.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == (), _875_action_summary(plan)
+
+
+@pytest.mark.parametrize("reference", ["n/a", "3.0", True], ids=repr)
+def test_875_non_numeric_reference_marginal_writes_the_difference(
+    cctally_module, reference,
+):
+    """Spec §6.1 test 19, fourth case (A9, §4.3).
+
+    The recorded marginal is present but not a number, so it cannot be the
+    snap reference. The plan is not aborted: it writes the numeric final-state
+    difference 6 - 3 = 3, never the reference's bytes.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, reference),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+    actions = _875_milestone_actions(plan)
+
+    assert list(actions) == [_875_TWO], _875_action_summary(plan)
+    money = _875_money(actions[_875_TWO])
+    assert money == (6.0, 3.0)
+    assert type(money[1]) is float
+
+
+_875_TIE_LESSER = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1-a"
+_875_TIE_GREATER = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1-b"
+
+
+def _875_tie_rows(journal, lesser_cost, greater_cost):
+    """Two final-state rows that share threshold 1, by ascending event id."""
+    return [
+        _875_milestone(journal, 1, lesser_cost, None, event_id=_875_TIE_LESSER),
+        _875_milestone(
+            journal, 1, greater_cost, None, event_id=_875_TIE_GREATER),
+    ]
+
+
+def test_875_shared_nearest_threshold_takes_the_greater_event_id(
+    cctally_module,
+):
+    """Spec §6.1 test 19, fifth case, both rows usable (A9, §4.3).
+
+    Two rows occupy threshold 1 under a kept $6 close. The predecessor is
+    the one with the greater event id, whose $2 is the SMALLER cost, so
+    threshold 2's marginal becomes 6 - 2 = 4. The lesser id, or the greater
+    cost, would give 6 - 4 = 2.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [
+        _875_priced_close(journal, 6.0),
+        *_875_tie_rows(journal, 4.0, 2.0),
+        _875_milestone(journal, 2, 6.0, 1.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        *_875_tie_rows(journal, 9.0, 5.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+    actions = _875_milestone_actions(plan)
+
+    assert list(actions) == [_875_TWO], _875_action_summary(plan)
+    assert _875_money(actions[_875_TWO]) == (6.0, 4.0)
+
+
+@pytest.mark.parametrize("malformed", _875_MALFORMED_COSTS, ids=repr)
+@pytest.mark.parametrize("malformed_row", ["lesser", "greater"])
+def test_875_shared_nearest_threshold_with_an_unusable_row_fails_closed(
+    cctally_module, malformed_row, malformed,
+):
+    """Spec §6.1 test 19, fifth case, either row unusable (A9, §4.3).
+
+    One of the two rows at threshold 1 has an unusable block cost, so
+    threshold 2 has no usable predecessor and keeps its chosen pair (6, 1).
+    Taking the other row would write 6 - 4 = 2 or 6 - 2 = 4.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    lesser, greater = (
+        (malformed, 2.0) if malformed_row == "lesser" else (4.0, malformed)
+    )
+    current = [
+        _875_priced_close(journal, 6.0),
+        *_875_tie_rows(journal, lesser, greater),
+        _875_milestone(journal, 2, 6.0, 1.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 6.0),
+        *_875_tie_rows(journal, 9.0, 5.0),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    assert plan.actions == (), _875_action_summary(plan)
+
+
+def _875_reconciled_predecessor(journal):
+    """The #858 reconciliation shape, with a five-hour crossing that cites it.
+
+    A held statusline replay candidate precedes the genuine API acceptance
+    the journal recorded. Reconciliation keeps the accepted snapshot and
+    carries its dependent five-hour milestone into ``desired`` whole, at its
+    recorded $2.50 rather than replay's $2.00.
+    """
+    account = "c719887886403b0a1e3004e967dbd20e"
+    window = 1785978600
+    week_end = int(dt.datetime(
+        2026, 8, 29, 5, 0, tzinfo=dt.timezone.utc,
+    ).timestamp())
+    new_at = "2026-08-23T00:20:25Z"
+    old_at = "2026-08-23T00:20:27Z"
+    new_raw = {**journal.make_obs(
+        at=new_at, src="record-usage", provider="claude", account=account,
+        payload={
+            "captured_at": new_at, "source": "statusline",
+            "weekly_percent": 10.0, "resets_at": week_end,
+            "five_hour_percent": 1.0,
+            "five_hour_resets_at": "2026-08-23T04:50:00+00:00",
+        },
+    ), "id": "o:f1c3e45eafe02d65"}
+    old_raw = {**journal.make_obs(
+        at=old_at, src="record-usage", provider="claude", account=account,
+        payload={
+            "captured_at": old_at, "source": "api",
+            "weekly_percent": 11.0, "resets_at": week_end - 1,
+            "five_hour_percent": 1.0,
+            "five_hour_resets_at": "2026-08-23T04:49:59+00:00",
+        },
+    ), "id": "o:b8db6f3413ca6dd0"}
+    common = {
+        "account_key": account,
+        "week_start_date": "2026-08-22", "week_end_date": "2026-08-29",
+        "week_start_at": "2026-08-22T05:00:00+00:00",
+        "week_end_at": "2026-08-29T05:00:00+00:00",
+        "weekly_percent": 11.0, "five_hour_percent": 1.0,
+        "five_hour_window_key": window, "page_url": None,
+    }
+    old = journal.make_evt(
+        kind="snapshot_accept", id=f"sa:{old_raw['id']}", at=old_at,
+        payload={
+            **common, "captured_at_utc": old_at, "source": "api",
+            "five_hour_resets_at": "2026-08-23T04:49:59+00:00",
+            "payload_json": json.dumps({
+                "source": "api", "capturedAt": old_at,
+                "weeklyPercent": 11.0, "fiveHourPercent": 1.0,
+            }),
+        },
+    )
+    new = journal.make_evt(
+        kind="snapshot_accept", id=f"sa:{new_raw['id']}", at=new_at,
+        payload={
+            **common, "captured_at_utc": new_at, "source": "statusline",
+            "five_hour_resets_at": "2026-08-23T04:50:00+00:00",
+            "weekly_observation_held": 1,
+            "payload_json": json.dumps({
+                "source": "statusline", "capturedAt": new_at,
+                "weeklyPercent": 11.0, "rawWeeklyPercent": 10.0,
+                "weeklyObservationHeld": True, "fiveHourPercent": 1.0,
+            }),
+        },
+    )
+    predecessor_id = f"fhm:{account}:{window}:0:1"
+    old_predecessor = journal.make_evt(
+        kind="five_hour_milestone", id=predecessor_id, at=old_at,
+        payload={
+            "account_key": account, "five_hour_window_key": window,
+            "percent_threshold": 1, "captured_at_utc": old_at,
+            "usage_snapshot_ref": old["id"],
+            "block_cost_usd": 2.5, "marginal_cost_usd": None,
+            "seven_day_pct_at_crossing": 11.0,
+            "input_tokens": 111, "output_tokens": 222,
+            "cache_create_tokens": 333, "cache_read_tokens": 444,
+        },
+    )
+    new_predecessor = journal.make_evt(
+        kind="five_hour_milestone", id=predecessor_id, at=new_at,
+        payload={
+            **old_predecessor["payload"], "captured_at_utc": new_at,
+            "usage_snapshot_ref": new["id"],
+            "block_cost_usd": 2.0, "seven_day_pct_at_crossing": 10.0,
+            "input_tokens": 999, "output_tokens": 999,
+            "cache_create_tokens": 999, "cache_read_tokens": 999,
+        },
+    )
+    close = journal.make_evt(
+        kind="five_hour_block_close", id=f"fhbc:{account}:{window}", at=AT,
+        payload={
+            **_875_priced_close(journal, 20.0)["payload"],
+            "account_key": account, "five_hour_window_key": window,
+        },
+    )
+
+    def successor(at, block_cost, marginal):
+        return journal.make_evt(
+            kind="five_hour_milestone", id=f"fhm:{account}:{window}:0:2",
+            at=at,
+            payload={
+                "account_key": account, "five_hour_window_key": window,
+                "percent_threshold": 2, "reset_event_ref": "0",
+                "captured_at_utc": "2026-08-23T01:00:00Z",
+                "usage_snapshot_ref": "sa:o:875-successor",
+                "block_cost_usd": block_cost, "marginal_cost_usd": marginal,
+                "seven_day_pct_at_crossing": 11.0,
+            },
+        )
+
+    return dict(
+        old=old, new=new, old_raw=old_raw, new_raw=new_raw,
+        old_predecessor=old_predecessor, new_predecessor=new_predecessor,
+        close=close, successor=successor,
+    )
+
+
+def test_875_reconciliation_carried_predecessor_serves_the_chain(
+    cctally_module,
+):
+    """Spec §6.1 test 20 (A3): the live shape of spec §1.3.
+
+    Reconciliation keeps the accepted snapshot and carries the crossing that
+    cites it whole, at $2.50. The successor's replayed crossing moved its
+    ``at``, and replay's marginal 14 - 2 = 12 is against a predecessor the
+    final state does not hold. The first plan writes 14 - 2.5 = 11.5, and the
+    second plan, which reconciles the same way, is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    fx = _875_reconciled_predecessor(journal)
+    moved_at = "2026-08-23T01:00:05Z"
+    successor_id = fx["successor"](AT, 0, 0)["id"]
+    current = [
+        fx["old"], fx["old_predecessor"], fx["close"],
+        fx["successor"](AT, 6.0, 4.0),
+    ]
+    desired = [
+        fx["new"], fx["new_predecessor"], fx["close"],
+        fx["successor"](moved_at, 14.0, 12.0),
+    ]
+    raw = [fx["new_raw"], fx["old_raw"]]
+
+    first = _875_plan(
+        rederive, journal, current, desired, raw_observations=raw)
+    unreconciled = _875_plan(rederive, journal, current, desired)
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(
+        rederive, journal, corrected, desired, raw_observations=raw)
+    summary = [_875_action_summary(plan)
+               for plan in (first, unreconciled, second)]
+
+    # The reconciliation happened: without the raw origins the same inputs
+    # swap the snapshots and correct the predecessor to replay's $2.00.
+    assert {(a.disposition, a.event_id) for a in unreconciled.actions} >= {
+        ("tombstone", fx["old"]["id"]), ("add", fx["new"]["id"]),
+        ("supersede", fx["old_predecessor"]["id"]),
+    }, summary
+    assert _875_money(next(
+        a for a in unreconciled.actions if a.event_id == successor_id
+    )) == (14.0, 12.0), summary
+    # With them, only the successor moves, against the carried $2.50.
+    assert _875_ids(first) == [successor_id], summary
+    assert first.actions[0].at == moved_at
+    assert _875_money(first.actions[0]) == (14.0, 14.0 - 2.5), summary
+    assert second.actions == (), summary
+
+
+def _875_flip_fixture(journal, variant, successor_marginal):
+    """(records, desired, plan kwargs) for one spec §6.1 test 21 variant."""
+    held = _875_snapshot(journal, "o:875-held")
+    closed = _875_preserved_close(journal, 6.0)
+    replay_marginal = None if successor_marginal is None else 7.0
+    milestones = [
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, successor_marginal),
+    ]
+    desired = [
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, replay_marginal),
+    ]
+    retired = _tombstone_batch(
+        journal, closed["id"], batch_id="rederive:claude-usage:875-retired")
+    if variant == "held-then-preserved":
+        # Held through a snapshot the same plan tombstones (spec §1.6).
+        return (
+            [closed, held, *milestones], desired,
+            {"reviewed_weekly_hold_ids": ("o:875-held",)},
+        )
+    if variant == "revived-then-held":
+        # Replay keeps the held snapshot, so the hold outlives the revival.
+        return (
+            [closed, *retired, held, *milestones], [held, *desired],
+            {"reviewed_weekly_hold_ids": ("o:875-held",)},
+        )
+    assert variant == "revived-then-preserved"
+    return [closed, *retired, *milestones], desired, {}
+
+
+@pytest.mark.parametrize("successor_marginal", [3.0, None])
+@pytest.mark.parametrize("variant", [
+    "held-then-preserved", "revived-then-held", "revived-then-preserved",
+])
+def test_875_kept_and_preserved_flips_freeze_the_same_block_cost(
+    cctally_module, variant, successor_marginal,
+):
+    """Spec §6.1 test 21 (A3; spec §1.6, §4.1).
+
+    A ``b:`` close moves between the kept and the preserved roles from one
+    plan to the next. Both are frozen, so the unchanged crossings keep their
+    current $3 and $6 in both plans and neither plan takes a milestone
+    action. Revision 7 froze only kept closes: it repriced them to replay's
+    $7 and $14 whenever the close was preserved.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, desired, kwargs = _875_flip_fixture(
+        journal, variant, successor_marginal)
+    plans = _875_run_passes(rederive, journal, records, desired, **kwargs)
+    summary = [_875_action_summary(plan) for plan in plans]
+    first = plans[0]
+
+    assert len(plans) == 2, summary
+    assert _875_milestone_actions(first) == {}, summary
+    if variant == "held-then-preserved":
+        # Kept through hold injection first (not preserved), then preserved.
+        assert _875_ids(first) == ["sa:o:875-held"], summary
+        assert first.actions[0].disposition == "tombstone"
+        assert [plan.preserved_event_count for plan in plans] == [0, 1]
+    else:
+        assert _875_ids(first) == [_875_PRESERVED_CLOSE_ID], summary
+        assert first.actions[0].revision == 2
+        expected = [1, 0] if variant == "revived-then-held" else [1, 1]
+        assert [plan.preserved_event_count for plan in plans] == expected
+
+
+@pytest.mark.parametrize("successor_marginal", [3.0, 2.0])
+def test_875_close_corrected_again_takes_no_milestone_pass_of_its_own(
+    cctally_module, successor_marginal,
+):
+    """Spec §6.1 test 22 (A3, §7.7): weekly-axis correction, then the marker.
+
+    An unmarked, historically provable $0 close sits in a held window. The
+    reviewed hold first corrects only its weekly axes, and the next plan's
+    #869 historical-marker branch corrects the same close again: the close's
+    own decision takes a second pass. Every plan gets the same normally
+    derived markers and the same replay, and the held snapshot stays
+    supported throughout, because the predecessor that cites it keeps it
+    alive. The hold persists, so both corrections keep the held payload's $0
+    total: the close is frozen on both passes (spec §4.1, revision 13). The
+    successor is an unchanged crossing, so it keeps its $6 block cost
+    (replay says $14), and its marginal is 6 - 3 = 3 against the held
+    predecessor, which replay prices at $7. Copying replay would write 7,
+    and revision 11, which replaced the close, wrote (14, 11). With a
+    recorded marginal of 3 the first plan takes no milestone action; with 2
+    it writes (6, 3). The second plan's only action is the marker, and the
+    third is a no-op. The pre-#875 planner needs no fewer passes on the same
+    sequence.
+    """
+    import types
+
+    import _cctally_rederive as command
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _875_close(
+        journal, total=0.0,
+        models=[{"model": _875_PRICED_MODEL, "cost_usd": 0.0,
+                 "input_tokens": 300}],
+        seven_day_pct_at_block_start=60.0, seven_day_pct_at_block_end=63.0,
+        crossed_seven_day_reset=0,
+    )
+    replayed_close = _875_close(
+        journal, total=14.0,
+        models=[{"model": _875_PRICED_MODEL, "cost_usd": 14.0,
+                 "input_tokens": 300}],
+        pricing={"version": 1, "unpricedModels": []},
+        seven_day_pct_at_block_start=60.0, seven_day_pct_at_block_end=15.0,
+        crossed_seven_day_reset=1,
+    )
+    held = _875_snapshot(journal, "o:875-held")
+    records = [
+        close, held,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, successor_marginal),
+    ]
+    replayed_successor = _875_milestone(journal, 2, 14.0, 7.0)
+    desired = [
+        replayed_close,
+        _875_referencing(_875_milestone(journal, 1, 7.0, None), held),
+        replayed_successor,
+    ]
+    entry = types.SimpleNamespace(
+        source_account_key=_875_ACCOUNT, source_line_offset=0,
+        source_path="/tmp/875.jsonl",
+        timestamp=dt.datetime(2026, 7, 26, 12, 0, tzinfo=dt.timezone.utc),
+        model=_875_PRICED_MODEL, cost_usd=None, speed=None,
+        input_tokens=300, output_tokens=0, cache_creation_tokens=0,
+        cache_1h_tokens=None, cache_read_tokens=0,
+    )
+    markers = command._historical_close_markers(
+        journal.resolve_effective_events(records), desired,
+        {(_875_ACCOUNT, _875_WINDOW): [entry]},
+    )
+    assert list(markers) == [_875_CLOSE_ID]
+    kwargs = dict(
+        reviewed_weekly_hold_ids=("o:875-held",),
+        historical_close_markers=markers,
+    )
+
+    fixed = _875_run_passes(rederive, journal, records, desired, **kwargs)
+    pre = _875_run_passes(
+        _875_pre_875_planner(), journal, records, desired, **kwargs)
+    summary = {
+        "fixed": [_875_action_summary(plan) for plan in fixed],
+        "pre-875": [_875_action_summary(plan) for plan in pre],
+    }
+
+    # The held snapshot stays supported: no plan retires it, or the
+    # predecessor whose citation keeps it alive.
+    for plan in fixed:
+        assert not {held["id"], _875_ONE} & set(_875_ids(plan)), summary
+    # First pass: the weekly-axis correction keeps the $0 total, so the
+    # close is frozen and the successor keeps its $6.
+    assert _875_ids(fixed[0])[0] == _875_CLOSE_ID, summary
+    weekly = fixed[0].actions[0].payload
+    assert (weekly["seven_day_pct_at_block_end"], weekly["total_cost_usd"],
+            "_pricing" in weekly) == (15.0, 0.0, False)
+    milestones = _875_milestone_actions(fixed[0])
+    if successor_marginal == 3.0:
+        assert milestones == {}, summary
+    else:
+        assert list(milestones) == [_875_TWO], summary
+        money = _875_money(milestones[_875_TWO])
+        assert money == (6.0, 6.0 - 3.0), summary
+        assert money[1] != replayed_successor["payload"]["marginal_cost_usd"]
+    # Second pass: the marker is the only change, the $0 total stays, and
+    # the frozen block takes no milestone action.
+    assert _875_ids(fixed[1]) == [_875_CLOSE_ID], summary
+    marked = fixed[1].actions[0].payload
+    assert marked["_pricing"] == markers[_875_CLOSE_ID]
+    assert marked["total_cost_usd"] == 0.0
+
+    def unmarked(payload):
+        return {key: value for key, value in payload.items()
+                if key not in {"_pricing", "pricing_provenance_json"}}
+
+    assert unmarked(marked) == unmarked(weekly), summary
+    assert _875_milestone_actions(fixed[1]) == {}, summary
+    assert len(fixed) == 3, summary
+    # The same close takes both passes under the pre-#875 planner too.
+    assert [_875_CLOSE_ID in _875_ids(plan) for plan in pre[:2]] == [
+        True, True], summary
+    assert len(pre) >= len(fixed), summary
+    # §7.7 evidence: both planners reach the no-op at the third plan.
+    assert (len(pre), len(fixed)) == (3, 3), summary
+
+
+def _875_causal_plans(rederive, journal, records, baseline_desired,
+                      reviewed_desired, *, preserved=(),
+                      reviewed_hold_ids=(), conflicted_event_ids=()):
+    """Baseline and reviewed plans over one current graph, and their subset."""
+    selection = journal.resolve_effective_events(list(records))
+    common = dict(
+        selection=selection,
+        journal_high_water=("observations-2026-07.jsonl", 10),
+        cache_fingerprint="sha256:cache",
+        preserved_events=tuple(preserved), enforce_guard=False,
+        conflicted_event_ids=frozenset(conflicted_event_ids),
+    )
+    baseline = rederive.build_claude_usage_plan(
+        desired_events=list(baseline_desired),
+        config_fingerprint="sha256:baseline", **common,
+    )
+    reviewed = rederive.build_claude_usage_plan(
+        desired_events=list(reviewed_desired),
+        config_fingerprint="sha256:reviewed",
+        reviewed_weekly_hold_ids=tuple(reviewed_hold_ids), **common,
+    )
+    current_events = {
+        event_id: selected.record
+        for event_id, selected in selection.by_id.items()
+        if selected.status == "active" and selected.record is not None
+    }
+    causal = rederive.causal_delta_plan(
+        baseline, reviewed, current_events=current_events)
+    return baseline, reviewed, causal, current_events
+
+
+def _875_applied(current_events, actions, event_ids):
+    """(at, payload) per id in ``event_ids`` after applying ``actions``."""
+    state = {
+        event_id: (record.get("at"), record.get("payload"))
+        for event_id, record in current_events.items()
+    }
+    for action in actions:
+        if action.disposition == "tombstone":
+            state.pop(action.event_id, None)
+        else:
+            state[action.event_id] = (action.at, action.payload)
+    return {event_id: state.get(event_id) for event_id in event_ids}
+
+
+_875_PRICING_STATES = [1.0, 1.5]
+
+
+def _875_close_total_moves(plan, current_total):
+    """True when ``plan``'s close action moves the total by over 1e-9 USD.
+
+    A correction within that tolerance is frozen under spec revision 12
+    (§4.1) and would leave the causal closure unexercised.
+    """
+    close = next(
+        action for action in plan.actions
+        if action.kind == "five_hour_block_close"
+    )
+    return abs(close.payload["total_cost_usd"] - current_total) > 1e-9
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_subset_applies_a_replaced_close_block_whole(
+    cctally_module, card,
+):
+    """Spec §6.1 test 23, replaced close in both plans (A12; spec §1.5).
+
+    Both plans correct the close identically, so the B/R filter drops that
+    correction. The reviewed plan's hold keeps the predecessor whole at $3
+    while the baseline reprices it, so only the successor's target differs.
+    The block closure brings the close correction back, and the applied block
+    equals the reviewed target instead of repricing the successor under a
+    close left at $6.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(
+        journal, "o:875-held", window=_875_NEIGHBOUR_WINDOW)
+    crossing = _875_snapshot(journal, "o:875-0-2")
+    records = [
+        _875_priced_close(journal, 6.0), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_moved_close(journal, 14.0 * card), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 7.0 * card, None), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+    )
+    block = [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    assert _875_ids(baseline) == block, summary
+    assert _875_ids(reviewed) == [_875_CLOSE_ID, _875_TWO], summary
+    assert baseline.actions[0].to_correction_action() == \
+        reviewed.actions[0].to_correction_action()
+    # A replaced close: both plans change its money (spec §4.1).
+    assert _875_close_total_moves(baseline, 6.0), summary
+    assert _875_close_total_moves(reviewed, 6.0), summary
+    assert _875_money(reviewed.actions[1]) == (
+        14.0 * card, 14.0 * card - 3.0), summary
+    assert _875_ids(causal) == [_875_CLOSE_ID, _875_TWO], summary
+    assert _875_applied(current, causal.actions, block) == \
+        _875_applied(current, reviewed.actions, block)
+
+
+@pytest.mark.parametrize("current_marginal", [3.0, 2.0])
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_subset_keeps_frozen_block_cost_under_a_preserved_close(
+    cctally_module, card, current_marginal,
+):
+    """Spec §6.1 test 23, retained preserved close (A12; spec §1.6, §4.5).
+
+    The baseline corrects the predecessor's crossing at today's card, while
+    the reviewed plan's hold keeps it whole at $3. The successor is an
+    unchanged crossing under a frozen close, so its block cost is $6 in both
+    plans and in both pricing states. With a recorded marginal of 3 the
+    reviewed plan takes no action; with 2 it takes a marginal-only action,
+    which the subset may keep. Neither reprices the successor.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(
+        journal, "o:875-held", window=_875_NEIGHBOUR_WINDOW)
+    crossing = _875_snapshot(journal, "o:875-0-2")
+    closed = _875_preserved_close(journal, 6.0)
+    records = [
+        closed, held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, current_marginal),
+    ]
+    desired = [
+        held, crossing,
+        _875_referencing(
+            _875_milestone(journal, 1, 7.0 * card, None, tokens=110), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired, preserved=[closed],
+        reviewed_hold_ids=("o:875-held",),
+    )
+    block = [_875_PRESERVED_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    assert _875_money(_875_milestone_actions(baseline)[_875_TWO]) == (
+        6.0, 6.0 - 7.0 * card), summary
+    reviewed_actions = _875_milestone_actions(reviewed)
+    causal_actions = _875_milestone_actions(causal)
+    if current_marginal == 3.0:
+        assert reviewed_actions == {}, summary
+        assert causal_actions == {}, summary
+    else:
+        assert list(reviewed_actions) == [_875_TWO], summary
+        assert _875_money(reviewed_actions[_875_TWO]) == (6.0, 3.0), summary
+        assert list(causal_actions) == [_875_TWO], summary
+        assert _875_money(causal_actions[_875_TWO]) == (6.0, 3.0), summary
+    assert _875_applied(current, causal.actions, block) == \
+        _875_applied(current, reviewed.actions, block)
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_subset_leaves_an_unchanged_kept_close_block_alone(
+    cctally_module, card,
+):
+    """Spec §6.1 test 23, unchanged kept-close control (A12).
+
+    A card edit alone keeps the close, so neither plan acts on the block and
+    neither does the subset: the block keeps its frozen amounts.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(
+        journal, "o:875-held", window=_875_NEIGHBOUR_WINDOW)
+    crossing = _875_snapshot(journal, "o:875-0-2")
+    records = [
+        _875_priced_close(journal, 6.0), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 14.0 * card), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 7.0 * card, None), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+    )
+    block = [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    for plan in (baseline, reviewed, causal):
+        assert not set(_875_ids(plan)) & set(block), summary
+    assert _875_applied(current, causal.actions, block) == \
+        _875_applied(current, (), block)
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_closure_reads_a_milestone_tombstones_block_from_current(
+    cctally_module, card,
+):
+    """Spec §6.1 test 23, a milestone tombstone under a replaced close (A12).
+
+    Only the reviewed replay drops threshold 2, so the filter keeps its
+    tombstone alone. A tombstone has no payload; its block comes from its
+    current record, and the closure then brings the identical close and
+    threshold-1 corrections along, so the block lands whole.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    snapshots = [
+        _875_snapshot(journal, "o:875-0-1"), _875_snapshot(journal, "o:875-0-2"),
+    ]
+    records = [
+        _875_priced_close(journal, 6.0), *snapshots,
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    reviewed_desired = [
+        _875_moved_close(journal, 14.0 * card), *snapshots,
+        _875_milestone(journal, 1, 7.0 * card, None),
+    ]
+    baseline_desired = [
+        *reviewed_desired,
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, baseline_desired, reviewed_desired,
+    )
+    block = [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    assert [(a.disposition, a.event_id) for a in reviewed.actions] == [
+        ("supersede", _875_CLOSE_ID), ("supersede", _875_ONE),
+        ("tombstone", _875_TWO),
+    ], summary
+    assert [a.to_correction_action() for a in baseline.actions[:2]] == [
+        a.to_correction_action() for a in reviewed.actions[:2]
+    ], summary
+    # A replaced close: both plans change its money (spec §4.1).
+    assert _875_close_total_moves(baseline, 6.0), summary
+    assert _875_close_total_moves(reviewed, 6.0), summary
+    assert _875_ids(causal) == block, summary
+    assert causal.actions[2].disposition == "tombstone"
+    assert _875_applied(current, causal.actions, block) == \
+        _875_applied(current, reviewed.actions, block)
+
+
+def test_875_hold_supported_close_tombstoned_next_takes_no_extra_pass(
+    cctally_module,
+):
+    """Spec §6.1 test 24 (A3, §7.7): the second pre-existing close sequence.
+
+    An ordinary close is kept only because the reviewed hold injects it from
+    a held snapshot the same plan tombstones. The next plan no longer sees
+    the snapshot, so it tombstones the close: the close's own decision takes
+    a second pass. Its milestones are frozen while the close is kept and
+    follow replay once it is gone, so their actions accompany that close
+    tombstone and #875 adds no pass. The pre-#875 planner, which never froze
+    them, reaches its no-op after the same number of plans.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(journal, "o:875-held")
+    records = [
+        _875_priced_close(journal, 6.0), held,
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    kwargs = {"reviewed_weekly_hold_ids": ("o:875-held",)}
+
+    fixed = _875_run_passes(rederive, journal, records, desired, **kwargs)
+    pre = _875_run_passes(
+        _875_pre_875_planner(), journal, records, desired, **kwargs)
+    summary = {
+        "fixed": [_875_action_summary(plan) for plan in fixed],
+        "pre-875": [_875_action_summary(plan) for plan in pre],
+    }
+
+    assert _875_ids(fixed[0]) == [held["id"]], summary
+    assert [(a.disposition, a.event_id) for a in fixed[1].actions] == [
+        ("tombstone", _875_CLOSE_ID),
+        ("supersede", _875_ONE), ("supersede", _875_TWO),
+    ], summary
+    assert [_875_money(a) for a in fixed[1].actions[1:]] == [
+        (7.0, None), (14.0, 7.0),
+    ], summary
+    assert [(a.disposition, a.event_id) for a in pre[1].actions] == [
+        ("tombstone", _875_CLOSE_ID),
+    ], summary
+    # §7.7 evidence: both planners reach the no-op at the third plan.
+    assert (len(pre), len(fixed)) == (3, 3), summary
+
+
+def _875_axis_close(journal, total, *, end, crossed, **overrides):
+    """A priced close with explicit weekly axes (spec §1.7)."""
+    return _875_close(
+        journal, total=total,
+        models=[{"model": "m", "cost_usd": total, "input_tokens": 300}],
+        seven_day_pct_at_block_start=60.0, seven_day_pct_at_block_end=end,
+        crossed_seven_day_reset=crossed, **overrides,
+    )
+
+
+@pytest.mark.parametrize("successor_marginal", [3.0, 2.0])
+def test_875_money_preserving_close_correction_freezes_its_block(
+    cctally_module, successor_marginal,
+):
+    """Spec §6.1 test 25, base case (§1.7; A1, A3).
+
+    A genuinely priced $6 close sits in a held window. The reviewed hold
+    merges only replay's weekly axes into it and keeps its payload, money
+    included, so the plan corrects the close without moving its total: a
+    money-preserving correction, which is frozen. The unchanged crossing at
+    threshold 2 keeps its $6 block cost although replay prices it at $14,
+    and its marginal follows the final chain, 6 - 3 = 3 against the held
+    predecessor. With a recorded marginal of 3 that takes no action; with 2
+    it writes (6, 3). Revision 11 classified the close as replaced because
+    its content changed, and repriced the crossing to (14, 11) above its
+    unchanged $6 close. The second plan is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(journal, "o:875-held")
+    records = [
+        _875_axis_close(journal, 6.0, end=63.0, crossed=0), held,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, successor_marginal),
+    ]
+    desired = [
+        _875_axis_close(journal, 14.0, end=15.0, crossed=1),
+        _875_referencing(_875_milestone(journal, 1, 7.0, None), held),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plans = _875_run_passes(
+        rederive, journal, records, desired,
+        reviewed_weekly_hold_ids=("o:875-held",),
+    )
+    summary = [_875_action_summary(plan) for plan in plans]
+    first = plans[0]
+
+    assert _875_ids(first)[0] == _875_CLOSE_ID, summary
+    close = first.actions[0].payload
+    assert (close["total_cost_usd"], close["seven_day_pct_at_block_end"],
+            close["crossed_seven_day_reset"]) == (6.0, 15.0, 1), summary
+    milestones = _875_milestone_actions(first)
+    if successor_marginal == 3.0:
+        assert milestones == {}, summary
+    else:
+        assert list(milestones) == [_875_TWO], summary
+        assert _875_money(milestones[_875_TWO]) == (6.0, 3.0), summary
+    assert len(plans) == 2, summary
+
+
+@pytest.mark.parametrize("current_total, desired_total, frozen", [
+    (6.0, 6.0, True),
+    (6.0, 6.0 + 5e-10, True),
+    (6.0, 6.0 - 5e-10, True),
+    (6.0, 6.0 + 2e-9, False),
+    (6.0, 6.0 - 2e-9, False),
+    (6.0, 14.0, False),
+    (None, 6.0, False),
+    (6.0, "6.0", False),
+    (True, 1.0, False),
+], ids=repr)
+def test_875_close_correction_is_frozen_only_while_it_keeps_the_money(
+    cctally_module, current_total, desired_total, frozen,
+):
+    """Spec §6.1 test 25, tolerance pair (§4.1; A1, A3).
+
+    Replay moves the close's final five-hour reading, closure evidence the
+    keep rule does not absorb, so the plan corrects the close. That
+    correction is frozen only when both totals are usable (a finite ``int``
+    or ``float``, not a ``bool``) and within 1e-9 USD of each other: the
+    unchanged crossings then keep their $3 and $6. Otherwise it is replaced,
+    and every matched milestone takes replay's (7, None) and (14, 7). Either
+    way the second plan is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    models = [{"model": "m", "cost_usd": 6.0, "input_tokens": 300}]
+    current = [
+        _875_close(journal, total=current_total, models=models),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_close(journal, total=desired_total, models=models,
+                   final_five_hour_percent=43.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(rederive, journal, corrected, desired)
+    summary = (_875_action_summary(first), _875_action_summary(second))
+
+    assert _875_ids(first)[0] == _875_CLOSE_ID, summary
+    close = first.actions[0].payload
+    assert close["final_five_hour_percent"] == 43.0
+    total = close["total_cost_usd"]
+    assert (total, type(total)) == (desired_total, type(desired_total))
+    if frozen:
+        assert _875_ids(first) == [_875_CLOSE_ID], summary
+    else:
+        assert _875_ids(first) == [_875_CLOSE_ID, _875_ONE, _875_TWO], summary
+        assert [_875_money(action) for action in first.actions[1:]] == [
+            (7.0, None), (14.0, 7.0),
+        ], summary
+    assert second.actions == (), summary
+
+
+def test_875_open_close_corrected_to_closed_is_replaced(cctally_module):
+    """Spec §6.1 test 25, open to closed (§4.1; A1, A3).
+
+    Current holds the block's close open, and replay closes it at the same
+    $6 total. The current record is not closed, so this plan writes the
+    close's money and the close is replaced although the totals are equal:
+    both matched milestones take replay's (7, None) and (14, 7). The second
+    plan keeps the close and is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    models = [{"model": "m", "cost_usd": 6.0, "input_tokens": 300}]
+    current = [
+        _875_close(journal, total=6.0, models=models, is_closed=0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_close(journal, total=6.0, models=models),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    first = _875_plan(rederive, journal, current, desired)
+    corrected = _875_corrected_state(journal, current, first)
+    second = _875_plan(rederive, journal, corrected, desired)
+    summary = (_875_action_summary(first), _875_action_summary(second))
+
+    assert _875_ids(first) == [_875_CLOSE_ID, _875_ONE, _875_TWO], summary
+    close = first.actions[0].payload
+    assert (close["is_closed"], close["total_cost_usd"]) == (1, 6.0)
+    assert [_875_money(action) for action in first.actions[1:]] == [
+        (7.0, None), (14.0, 7.0),
+    ], summary
+    assert second.actions == (), summary
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_closure_restores_an_open_to_closed_close_correction(
+    cctally_module, card,
+):
+    """Spec §6.1 test 25, open to closed, causal variant (§4.5; A12).
+
+    Both plans close the open close at its unchanged $6 total, so the B/R
+    filter drops that identical correction. The reviewed plan's hold keeps
+    the predecessor at $3 through test 23's neighbouring-window hold, while
+    the baseline reprices it, so the baseline targets the successor at
+    (14, 7) and the reviewed plan at (14, 11). The close is replaced, so the
+    closure restores the dropped close correction beside the successor.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(
+        journal, "o:875-held", window=_875_NEIGHBOUR_WINDOW)
+    crossing = _875_snapshot(journal, "o:875-0-2")
+    models = [{"model": "m", "cost_usd": 6.0, "input_tokens": 300}]
+    records = [
+        _875_close(journal, total=6.0, models=models, is_closed=0),
+        held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_close(journal, total=6.0, models=models), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 7.0 * card, None), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+    )
+    block = [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    assert _875_ids(baseline) == block, summary
+    assert _875_ids(reviewed) == [_875_CLOSE_ID, _875_TWO], summary
+    assert baseline.actions[0].to_correction_action() == \
+        reviewed.actions[0].to_correction_action()
+    assert (reviewed.actions[0].payload["is_closed"],
+            reviewed.actions[0].payload["total_cost_usd"]) == (1, 6.0)
+    assert _875_money(baseline.actions[2]) == (
+        14.0 * card, 7.0 * card), summary
+    assert _875_money(reviewed.actions[1]) == (
+        14.0 * card, 14.0 * card - 3.0), summary
+    assert _875_ids(causal) == [_875_CLOSE_ID, _875_TWO], summary
+    assert _875_applied(current, causal.actions, block) == \
+        _875_applied(current, reviewed.actions, block)
+
+
+def test_875_frozen_close_wins_a_block_with_a_replaced_close(cctally_module):
+    """Spec §6.1 test 25, frozen wins (§4.1; A1, A3).
+
+    The block holds a preserved ``b:`` close the plan retains, and replay
+    adds a natural close for the same block. A block holding a frozen close
+    is frozen, so the unchanged crossings keep their $3 and $6 instead of
+    following the added close to replay's (7, 14), and the plan's only
+    action is the add. The second plan is a no-op.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records = [
+        _875_preserved_close(journal, 6.0),
+        _875_milestone(journal, 1, 3.0, None),
+        _875_milestone(journal, 2, 6.0, 3.0),
+    ]
+    desired = [
+        _875_priced_close(journal, 14.0),
+        _875_milestone(journal, 1, 7.0, None),
+        _875_milestone(journal, 2, 14.0, 7.0),
+    ]
+    plans = _875_run_passes(rederive, journal, records, desired)
+    summary = [_875_action_summary(plan) for plan in plans]
+
+    assert [(a.disposition, a.event_id) for a in plans[0].actions] == [
+        ("add", _875_CLOSE_ID),
+    ], summary
+    assert plans[0].preserved_event_count == 1
+    assert len(plans) == 2, summary
+
+
+_875_THREE = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:3"
+
+
+def _875_frozen_sibling_fixture(journal, current_close, desired_close, card):
+    """(records, desired) for a frozen block with a divergent successor.
+
+    The neighbouring-window hold keeps threshold 1 at $3 in the reviewed
+    plan only, while the baseline corrects its crossing (``tokens=110``) at
+    today's card. Threshold 2 is then the one milestone whose targets
+    differ; threshold 3 follows threshold 2's frozen $6 identically in both
+    plans, so the B/R filter drops it.
+    """
+    held = _875_snapshot(
+        journal, "o:875-held", window=_875_NEIGHBOUR_WINDOW)
+    crossings = [
+        _875_snapshot(journal, "o:875-0-2"), _875_snapshot(journal, "o:875-0-3"),
+    ]
+    records = [
+        current_close, held, *crossings,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, 2.0),
+        _875_milestone(journal, 3, 9.0, 2.5),
+    ]
+    desired = [
+        desired_close, held, *crossings,
+        _875_referencing(
+            _875_milestone(journal, 1, 7.0 * card, None, tokens=110), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+        _875_milestone(journal, 3, 21.0 * card, 7.0 * card),
+    ]
+    return records, desired
+
+
+def _875_assert_only_the_successor_is_causal(baseline, reviewed, causal,
+                                             current, dropped, card):
+    """The filter drops ``dropped`` and the closure never brings it back."""
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+    baseline_by_id = {
+        action.event_id: action.to_correction_action()
+        for action in baseline.actions
+    }
+    reviewed_by_id = {action.event_id: action for action in reviewed.actions}
+
+    for event_id in dropped:
+        assert baseline_by_id[event_id] == \
+            reviewed_by_id[event_id].to_correction_action(), summary
+    assert _875_money(reviewed_by_id[_875_THREE]) == (9.0, 3.0), summary
+    assert _875_money(reviewed_by_id[_875_TWO]) == (6.0, 3.0), summary
+    assert _875_money(next(
+        action for action in baseline.actions if action.event_id == _875_TWO
+    )) == (6.0, 6.0 - 7.0 * card), summary
+    assert _875_ids(causal) == [_875_TWO], summary
+    block = [_875_ONE, _875_TWO, _875_THREE]
+    assert _875_applied(current, causal.actions, block)[_875_TWO][1][
+        "block_cost_usd"] == 6.0
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_closure_never_replaces_a_frozen_block(cctally_module, card):
+    """Spec §6.1 test 25, frozen wins, causal variant (§4.5; A12).
+
+    The block holds a retained preserved ``b:`` close, and both plans add
+    the same natural close, a replaced close, beside it. The block is
+    frozen, so the subset's one milestone action, threshold 2's marginal
+    correction, pulls in neither the added close's action nor threshold 3's
+    identical sibling correction, both of which the filter dropped.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    closed = _875_preserved_close(journal, 6.0)
+    records, desired = _875_frozen_sibling_fixture(
+        journal, closed, _875_priced_close(journal, 14.0 * card), card)
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired, preserved=[closed],
+        reviewed_hold_ids=("o:875-held",),
+    )
+
+    assert [(a.disposition, a.event_id) for a in reviewed.actions] == [
+        ("add", _875_CLOSE_ID), ("supersede", _875_TWO),
+        ("supersede", _875_THREE),
+    ], _875_action_summary(reviewed)
+    _875_assert_only_the_successor_is_causal(
+        baseline, reviewed, causal, current, [_875_CLOSE_ID, _875_THREE],
+        card)
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_closure_skips_a_money_preserving_close_correction(
+    cctally_module, card,
+):
+    """Spec §4.5 (A12), the tolerance pair's causal counterpart.
+
+    Both plans correct the close's closure evidence at its unchanged $6
+    total, a money-preserving correction the filter drops as identical. The
+    block is frozen, so the subset's one milestone action, threshold 2's
+    marginal correction, pulls in neither that close correction nor
+    threshold 3's identical sibling correction.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, desired = _875_frozen_sibling_fixture(
+        journal, _875_priced_close(journal, 6.0),
+        _875_moved_close(journal, 6.0), card)
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+    )
+
+    assert _875_ids(reviewed) == [
+        _875_CLOSE_ID, _875_TWO, _875_THREE,
+    ], _875_action_summary(reviewed)
+    assert not _875_close_total_moves(reviewed, 6.0)
+    _875_assert_only_the_successor_is_causal(
+        baseline, reviewed, causal, current, [_875_CLOSE_ID, _875_THREE],
+        card)
+
+
+@pytest.mark.parametrize("successor_marginal", [3.0, 2.0])
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_subset_keeps_a_weekly_axis_corrected_close_frozen(
+    cctally_module, card, successor_marginal,
+):
+    """Spec §6.1 test 25, causal weekly-axis variant (§4.5; A12).
+
+    The reviewed plan's hold corrects only the close's weekly axes and keeps
+    its $6, while the baseline, which holds nothing, reprices the close and
+    both milestones at today's card. The close is frozen in the reviewed
+    plan, so its unchanged crossing is targeted at its current $6, and the
+    subset never changes that block cost: with a recorded marginal of 3 it
+    takes no milestone action, and with 2 only the marginal-only (6, 3).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(journal, "o:875-held")
+    crossing = _875_snapshot(journal, "o:875-0-2")
+    records = [
+        _875_axis_close(journal, 6.0, end=63.0, crossed=0), held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 3.0, None), held),
+        _875_milestone(journal, 2, 6.0, successor_marginal),
+    ]
+    desired = [
+        _875_axis_close(journal, 14.0 * card, end=15.0, crossed=1),
+        held, crossing,
+        _875_referencing(_875_milestone(journal, 1, 7.0 * card, None), held),
+        _875_milestone(journal, 2, 14.0 * card, 7.0 * card),
+    ]
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+    )
+    block = [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+
+    assert _875_ids(baseline) == block, summary
+    assert baseline.actions[0].payload["total_cost_usd"] == 14.0 * card
+    assert _875_money(baseline.actions[2]) == (14.0 * card, 7.0 * card)
+    weekly = reviewed.actions[0].payload
+    assert (weekly["total_cost_usd"], weekly["seven_day_pct_at_block_end"],
+            weekly["crossed_seven_day_reset"]) == (6.0, 15.0, 1), summary
+    causal_milestones = _875_milestone_actions(causal)
+    if successor_marginal == 3.0:
+        assert causal_milestones == {}, summary
+    else:
+        assert list(causal_milestones) == [_875_TWO], summary
+        assert _875_money(causal_milestones[_875_TWO]) == (6.0, 3.0), summary
+    applied = _875_applied(current, causal.actions, block)
+    assert applied[_875_TWO][1]["block_cost_usd"] == 6.0, summary
+    assert applied == _875_applied(current, reviewed.actions, block)
+
+
+@pytest.mark.parametrize("card", _875_PRICING_STATES)
+def test_875_causal_closure_skips_a_reaffirmed_close_with_an_unusable_total(
+    cctally_module, card,
+):
+    """Spec §4.1, §4.5 (A12): a forced-conflict reaffirmation is a kept close.
+
+    The kept close's total is unusable, so the money rule alone cannot call
+    its reaffirmation frozen, yet it re-writes the current content and the
+    resolver froze its block. Both plans reaffirm it identically, so the
+    filter drops it; the subset's one milestone action, threshold 2's
+    marginal correction, must pull in neither the reaffirmation nor threshold
+    3's identical sibling correction.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    models = [{"model": "m", "cost_usd": 6.0, "input_tokens": 300}]
+    records, desired = _875_frozen_sibling_fixture(
+        journal, _875_close(journal, total=None, models=models),
+        _875_priced_close(journal, 14.0 * card), card)
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, desired, desired,
+        reviewed_hold_ids=("o:875-held",),
+        conflicted_event_ids=(_875_CLOSE_ID,),
+    )
+
+    assert _875_ids(reviewed) == [
+        _875_CLOSE_ID, _875_TWO, _875_THREE,
+    ], _875_action_summary(reviewed)
+    reaffirmed = reviewed.actions[0]
+    assert (reaffirmed.disposition, reaffirmed.payload) == (
+        "supersede", current[_875_CLOSE_ID]["payload"])
+    _875_assert_only_the_successor_is_causal(
+        baseline, reviewed, causal, current, [_875_CLOSE_ID, _875_THREE],
+        card)

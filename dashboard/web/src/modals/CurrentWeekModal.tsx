@@ -1820,6 +1820,7 @@ function AllCurrentWeekModal({
     <Modal
       title="Current Usage — provider cycles"
       accentClass="accent-blue"
+      cardClassName="current-usage-modal"
       wide
       triggerId={CURRENT_WEEK_HERO_TRIGGER_ID}
       headerExtras={

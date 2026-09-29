@@ -721,7 +721,8 @@ def _resolve_budget_window(conn, *, vendor, now_utc, period, config, tz,
 
 
 def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc,
-                             account_key: str = "*") -> float:
+                             account_key: str = "*",
+                             pricing_provenance: "dict | None" = None) -> float:
     """Spend over ``[start_at, now]`` for ``vendor`` (#143) — the COSTLY leg,
     called only after the pre-probe finds pending thresholds (spec §4.2). claude
     routes through the Claude cost SUM (``mode="auto"``); codex through the Codex
@@ -742,12 +743,15 @@ def _budget_spend_for_vendor(conn, *, vendor, start_at, now_utc,
     extra = {} if scope is None else {"account_key": scope}
     if vendor == "claude":
         return c._sum_cost_for_range(start_at, now_utc, mode="auto", **extra)
+    if pricing_provenance is not None:
+        extra["pricing_provenance"] = pricing_provenance
     return c._sum_codex_cost_for_range(start_at, now_utc, **extra)
 
 
 def _reconcile_budget_milestones_on_set(
     conn, *, vendor, target, thresholds, now_utc, period, config=None, tz=None,
     as_of=None, commit=True, account_key: str = "*",
+    journal_ctx=None,
 ):
     """Forward-only-from-set reconcile for the budget axis (both vendors, #143):
     on `budget set`, every threshold ALREADY crossed for the current
@@ -773,16 +777,22 @@ def _reconcile_budget_milestones_on_set(
     if start_at is None:
         return
     period_key = start_at.isoformat(timespec="seconds")
+    provenance = {}
+    spend_options = (
+        {"pricing_provenance": provenance}
+        if vendor == "codex" and journal_ctx is not None else {}
+    )
     spent = _budget_spend_for_vendor(
         conn, vendor=vendor, start_at=start_at, now_utc=now_utc,
         account_key=account_key,
+        **spend_options,
     )
     # target > 0 guaranteed by the caller (validated weekly_usd / amount_usd);
     # the else is belt-and-suspenders.
     consumption_pct = (spent / target * 100.0) if target > 0 else 0.0
     for t in sorted(thresholds):
         if consumption_pct + 1e-9 >= t:
-            insert_budget_milestone(
+            inserted = insert_budget_milestone(
                 conn,
                 vendor=vendor,
                 period_start_at=period_key,
@@ -795,6 +805,17 @@ def _reconcile_budget_milestones_on_set(
                 as_of=as_of,
                 account_key=account_key,
             )
+            if inserted == 1 and journal_ctx is not None and provenance:
+                row = conn.execute(
+                    "SELECT id FROM budget_milestones WHERE vendor=? "
+                    "AND account_key=? AND period_start_at=? AND period=? "
+                    "AND threshold=?",
+                    (vendor, account_key, period_key, period, t),
+                ).fetchone()
+                if row is not None:
+                    journal_ctx.pricing_provenance[("budget", int(row[0]))] = dict(
+                        provenance
+                    )
             # alerted_at UPDATE keys on the CONCRETE (vendor, account_key, period)
             # (not the wildcard): only the row we just inserted is stamped, never
             # a pre-011 NULL-period sibling (#137), another vendor's row (#143),
@@ -878,7 +899,9 @@ def _budget_crossings(
     return fired
 
 
-def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_of=None):
+def _reconcile_codex_budget_on_config_write(
+    validated_budget, *, conn=None, as_of=None, journal_ctx=None,
+):
     """Forward-only reconcile shared by the Codex-budget config write paths
     (`budget set --vendor codex`, `config set budget.codex`). Gated +
     best-effort: a Codex budget with alerts off or no thresholds records
@@ -907,6 +930,8 @@ def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_o
         config = c.load_config()
         tz = c.resolve_display_tz(argparse.Namespace(tz=None), config)
         now_utc = _as_of_or_command(as_of)
+        if as_of is None:
+            as_of = now_utc.isoformat().replace("+00:00", "Z")
         # #386 R1-RESIDUAL: an own_conn write is an ADMINISTRATIVE stats
         # writer — outside the ingest cycle and, before this, outside every
         # lock. It now takes the maintenance lock + the sanctioned scope.
@@ -933,6 +958,7 @@ def _reconcile_codex_budget_on_config_write(validated_budget, *, conn=None, as_o
                         as_of=as_of,
                         commit=False,
                         account_key=acct_key,
+                        journal_ctx=journal_ctx,
                     )
                 if own_conn:
                     conn.commit()

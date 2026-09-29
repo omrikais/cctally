@@ -291,6 +291,11 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "An in-memory memo write of two references at the end of the full "
         "path. It performs no query and touches no database."
     ),
+    "_tui_retain_failed_source_bundle": (
+        "#857: runs only on an already-failing source-bundle leg, and does at "
+        "most one `dataclasses.replace` of the retained Codex state and its "
+        "bundle to withdraw an identity stamp. No query and no I/O."
+    ),
 }
 
 

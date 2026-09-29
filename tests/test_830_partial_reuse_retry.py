@@ -496,17 +496,31 @@ def test_830_a_malformed_row_generation_stays_reusable_on_its_own_axis():
 
 # === The idle path's copy of the same refusal ===============================
 #
-# Refusing reuse in `_reusable_provider` is not sufficient, and the browser
-# gate is what established that. The idle tick never calls
-# `reuse_coherent_source_state`: it decides eligibility in
-# `_cctally_tui._tui_source_bundle_can_idle` and then republishes the prior
-# generation through the two clock refreshes. So a retryable carrier has to be
-# refused in both places or the defect survives on the path that produced it.
+# The provider-level gate above and the idle gate are independent boundaries.
+# This unit fixture preserves the older `ok` carrier shape defensively; the
+# current production builder publishes a transient metadata generation as
+# `partial`, and its load-bearing idle/recovery execution coverage lives in
+# `test_846_tui_metadata_ticks.py`.
 
 
-def _idle_bundle(codex_health):
+#: A stand-in #857 Codex quota-dependency identity. Since #857 a Codex
+#: generation idles only when the identity it was built from equals the one
+#: the tick read, so the fixture stamps one and the calls below pass it: every
+#: refusal these tests assert is then the CARRIER's, never missing provenance.
+_830_CODEX_DEPENDENCY = ("830-fixture-codex-quota-dependency",)
+#: A stand-in #857 accounting provenance token, pinned as the process's
+#: consumed one for the same reason: the idle gate also requires the Codex
+#: generation's stamped token to be the token of the population last consumed.
+_830_CODEX_PROVENANCE = 830_857
+
+
+def _idle_bundle(codex_health, monkeypatch):
     """A bundle whose providers are both idle-eligible but for the carrier."""
     import _cctally_tui as tui
+    import _lib_snapshot_cache as sc
+
+    monkeypatch.setattr(
+        sc, "_CODEX_ACCOUNTING_CONSUMED_PROVENANCE", _830_CODEX_PROVENANCE)
 
     def provider(source, health=None):
         return lds.SourceDashboardState(
@@ -519,6 +533,13 @@ def _idle_bundle(codex_health):
             capabilities={},
             data={"hero": {}},
             metadata_health=health,
+            clock_data=(
+                {
+                    "codex_quota_dependency": _830_CODEX_DEPENDENCY,
+                    sc.CODEX_ACCOUNTING_PROVENANCE_KEY: _830_CODEX_PROVENANCE,
+                }
+                if source == "codex" else None
+            ),
         )
 
     claude = provider("claude")
@@ -538,43 +559,55 @@ def _idle_bundle(codex_health):
     return tui, bundle
 
 
-def test_830_idle_reuse_refuses_a_retryable_carrier():
-    """The idle tick must fall through to a rebuild, not refresh the clock.
+def test_830_idle_reuse_refuses_a_retryable_carrier(monkeypatch):
+    """The idle gate defensively rejects the legacy `ok` carrier shape.
 
-    Found by the browser gate reading the path the first fix did not reach.
-    `availability` is `ok` here on purpose: a detail-probe read failure never
-    sets `partial`, so every other leg of the idle gate passes and this is the
-    only one that can refuse. Without it the transient generation is
-    republished for the life of the process, which is exactly what was
-    measured before the fix.
+    This is compatibility coverage, not the production-path proof. The real
+    transient partial generation, armed retry key, and idle rebuild boundary
+    are exercised together by `test_846_tui_metadata_ticks.py`.
     """
-    tui, bundle = _idle_bundle(lds.build_metadata_health("transient_read_failure"))
+    tui, bundle = _idle_bundle(
+        lds.build_metadata_health("transient_read_failure"), monkeypatch)
     assert bundle.sources["codex"].availability == "ok", (
-        "the fixture no longer reproduces the defect: the carrier must be the "
-        "only disqualifying leg, or this test says nothing about it")
-    assert tui._tui_source_bundle_can_idle(bundle) is False
+        "this defensive fixture must retain the legacy carrier shape")
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=_830_CODEX_DEPENDENCY) is False
 
 
-def test_830_idle_reuse_still_admits_a_healthy_bundle():
+def test_830_idle_reuse_still_admits_a_healthy_bundle(monkeypatch):
     """The counterexample: a healthy install must still take the idle path.
 
     A leg that refused any carrier would pass the test above while forcing a
     full source rebuild on every idle tick of a completely healthy install,
     which is a worse regression than the defect it set out to fix.
     """
-    tui, bundle = _idle_bundle(lds.build_metadata_health("healthy"))
-    assert tui._tui_source_bundle_can_idle(bundle) is True
+    tui, bundle = _idle_bundle(
+        lds.build_metadata_health("healthy"), monkeypatch)
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=_830_CODEX_DEPENDENCY) is True
+    # #857: the same healthy bundle without current provenance does not idle —
+    # neither with no identity read this tick, nor once the process has
+    # consumed an accounting population the generation was not built from.
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=None) is False
+    import _lib_snapshot_cache as sc
+
+    monkeypatch.setattr(
+        sc, "_CODEX_ACCOUNTING_CONSUMED_PROVENANCE", _830_CODEX_PROVENANCE + 1)
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=_830_CODEX_DEPENDENCY) is False
 
 
-def test_830_idle_reuse_admits_a_bundle_with_no_carrier_at_all():
+def test_830_idle_reuse_admits_a_bundle_with_no_carrier_at_all(monkeypatch):
     """A provider describing no Codex metadata is not a degraded provider.
 
     `metadata_health` is None on a Claude-only generation and on any provider
     published before the carrier existed. Treating absent as degraded would
     make every such install rebuild on every tick.
     """
-    tui, bundle = _idle_bundle(None)
-    assert tui._tui_source_bundle_can_idle(bundle) is True
+    tui, bundle = _idle_bundle(None, monkeypatch)
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=_830_CODEX_DEPENDENCY) is True
 
 
 # === #846 A14 — the retry kernel is never consulted for a retryable carrier ==

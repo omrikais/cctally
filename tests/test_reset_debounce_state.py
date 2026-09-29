@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import itertools
 
 import pytest
 
@@ -57,11 +58,41 @@ def _pin_as_of(monkeypatch, offset_seconds):
     second one then cannot confirm the first — correctly, because it carries
     no new information — so a test that means to exercise a genuine two-tick
     confirm has to separate the ticks.
+
+    Both clocks that reach the id are pinned. `CCTALLY_AS_OF` pins the
+    observation's `at`, but the payload's `captured_at` reads the wall clock
+    unless `CCTALLY_TEST_PIN_CAPTURE` is set. Pinning only the first let a
+    loaded runner put a crashed tick and its retry in different wall-clock
+    seconds, which made them two readings and let the retry confirm.
     """
     stamp = (dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
              + dt.timedelta(seconds=offset_seconds))
     monkeypatch.setenv(
         "CCTALLY_AS_OF", stamp.isoformat().replace("+00:00", "Z"))
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+
+
+def _advance_wall_clock_on_every_read(monkeypatch):
+    """Put every unpinned wall-clock read in a later second.
+
+    This is what a loaded runner does to two ticks recorded back to back:
+    they straddle a second boundary. `cmd_record_usage` stamps the payload's
+    `captured_at` from the wall clock unless the capture is pinned, and the
+    payload is part of the observation id, so a straddle turns a replay of one
+    reading into two distinct readings.
+    """
+    import _cctally_core
+    import _cctally_record
+    real = _cctally_core.now_utc_iso
+    reads = itertools.count(1)
+
+    def advancing(now_utc=None):
+        if now_utc is not None:
+            return real(now_utc)
+        return real(dt.datetime.now(dt.timezone.utc)
+                    + dt.timedelta(seconds=next(reads)))
+
+    monkeypatch.setattr(_cctally_record, "now_utc_iso", advancing)
 
 
 def _future_week_end_iso():
@@ -156,6 +187,9 @@ def test_a3_an_arm_side_crash_rolls_the_state_back_and_only_re_arms(
     # The crash and retry replay one physical observation. Pin its capture
     # instant so a loaded runner crossing a wall-clock second cannot turn the
     # retry into a genuinely later zero that correctly confirms the reset.
+    # The advancing clock makes every run that loaded runner, so the pin is
+    # exercised here rather than trusted to the scheduler.
+    _advance_wall_clock_on_every_read(monkeypatch)
     _pin_as_of(monkeypatch, 0)
     _record_crashing(ns, jr, _record_usage_args(percent=0.0,
                                                 resets_at=end_epoch))

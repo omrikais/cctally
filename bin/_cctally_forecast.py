@@ -3173,7 +3173,8 @@ def cmd_budget(args: argparse.Namespace) -> int:
 
             def _codex_backstop_leg(ictx):
                 c.maybe_record_codex_budget_milestone(
-                    {}, conn=ictx.conn, alert_sink=ictx.pending_alerts)
+                    {}, conn=ictx.conn, alert_sink=ictx.pending_alerts,
+                    journal_ctx=ictx)
                 if projected_on:
                     c.maybe_record_projected_alert(
                         {}, only_metrics={"codex_budget_usd"},

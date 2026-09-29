@@ -3314,11 +3314,8 @@ def _stored_filter_sql(
         clauses.append(f"{alias}.project_key = ?")
         params.append(project_key)
         if undecodable_keys:
-            ordered = sorted(undecodable_keys)
-            placeholders = ",".join("?" for _ in ordered)
             clauses.append(
-                f"{alias}.conversation_key NOT IN ({placeholders})")
-            params.extend(ordered)
+                f"cctally_codex_undecodable({alias}.conversation_key) = 0")
     if model is not None:
         # models_json is the writer's canonical JSON array.  Searching for the
         # complete JSON string literal is exact and does not require JSON1.
@@ -3347,7 +3344,46 @@ def _page_costs(
     return totals
 
 
+@contextlib.contextmanager
+def _stored_undecodable_membership(
+    conn: sqlite3.Connection, undecodable_keys: "frozenset[str]",
+):
+    """Install the stored page's request-bounded membership predicate.
+
+    Only one membership bit crosses the SQL boundary; the raw unscoped read's
+    attribution values never do. Key cardinality consumes no host parameters,
+    registration executes no SQL, and cleanup prevents a later request from
+    seeing this request's frozen set.
+    """
+    if not undecodable_keys:
+        yield
+        return
+    frozen = frozenset(undecodable_keys)
+    conn.create_function(
+        "cctally_codex_undecodable", 1,
+        lambda conversation_key: int(conversation_key in frozen),
+        deterministic=True,
+    )
+    try:
+        yield
+    finally:
+        conn.create_function("cctally_codex_undecodable", 1, None)
+
+
 def _stored_browse_page(
+    conn: sqlite3.Connection, *, effective_speed: str,
+    project_key: str | None, model: str | None, limit: int,
+    cursor: str | None, undecodable_keys: "frozenset[str]" = frozenset(),
+):
+    membership = undecodable_keys if project_key is not None else frozenset()
+    with _stored_undecodable_membership(conn, membership):
+        return _stored_browse_page_queries(
+            conn, effective_speed=effective_speed, project_key=project_key,
+            model=model, limit=limit, cursor=cursor,
+            undecodable_keys=undecodable_keys)
+
+
+def _stored_browse_page_queries(
     conn: sqlite3.Connection, *, effective_speed: str,
     project_key: str | None, model: str | None, limit: int,
     cursor: str | None, undecodable_keys: "frozenset[str]" = frozenset(),

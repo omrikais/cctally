@@ -1032,31 +1032,17 @@ def _codex_quota_observation_signal() -> "tuple | None":
     except sqlite3.Error:
         return None
     try:
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='quota_window_change_log'"
-        ).fetchone()
-        if table is None:
-            return None
-        seq_row = conn.execute(
-            "SELECT seq FROM sqlite_sequence "
-            "WHERE name='quota_window_change_log'"
-        ).fetchone()
-        revision_row = conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='codex_window_attribution_revision'"
-        ).fetchone()
-    except sqlite3.Error:
-        return None
+        # #857: the two ledger legs are stated once, in the snapshot-cache
+        # kernel, and shared with the dashboard's Codex quota-dependency
+        # identity rather than restated here.
+        legs = _cctally()._load_sibling(
+            "_lib_snapshot_cache"
+        ).codex_quota_observation_legs(conn)
     finally:
         conn.close()
-    return (
-        str(path),
-        stat.st_dev,
-        stat.st_ino,
-        0 if seq_row is None else int(seq_row[0]),
-        "" if revision_row is None else str(revision_row[0]),
-    )
+    if legs is None:
+        return None
+    return (str(path), stat.st_dev, stat.st_ino, *legs)
 
 
 def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
@@ -1076,6 +1062,67 @@ def _load_codex_quota_observations_for_doctor(*, force_cold: bool = False):
         # Replace rather than accumulate: the bound is one entry.
         _QUOTA_OBSERVATION_MEMO.clear()
         _QUOTA_OBSERVATION_MEMO[signal] = loaded
+    return loaded
+
+
+# The all-history project-metadata partition is the other large immutable input
+# in a warm dashboard Doctor gather.  On the production-shaped #857 copy it
+# cost 422-432 ms per call while returning the same six counts every 30-second
+# Doctor refresh.  Retain only that raw partition, never a Doctor verdict or a
+# clock-derived field, under the cache identity plus the existing physical
+# mutation sequence.  Codex ingest advances that sequence in the same
+# transaction as token, thread, root, cursor, and metadata writes, which are
+# exactly the three-table inputs of ``load_codex_project_metadata_health``.
+# Replacement is covered separately by device/inode, and an absent or malformed
+# signal always takes the cold path.  The path is the one the passed connection
+# opened, never the global ``CACHE_DB_PATH``: the sequence is read from that
+# connection, so the file identity must describe the same file (#857).
+_CODEX_PROJECT_METADATA_MEMO: "dict[tuple, object]" = {}
+
+
+def _codex_project_metadata_signal(
+    cache_conn: sqlite3.Connection,
+) -> "tuple | None":
+    try:
+        path = next(
+            str(row[2]) for row in cache_conn.execute("PRAGMA database_list")
+            if len(row) > 2 and str(row[1]) == "main" and row[2]
+        )
+        stat = os.stat(path)
+        row = cache_conn.execute(
+            "SELECT value FROM cache_meta "
+            "WHERE key='codex_physical_mutation_seq'"
+        ).fetchone()
+        if row is None:
+            return None
+        sequence = int(row[0])
+        if sequence < 0:
+            return None
+    except (OSError, StopIteration, sqlite3.Error, TypeError, ValueError):
+        return None
+    return (path, stat.st_dev, stat.st_ino, sequence)
+
+
+def _load_codex_project_metadata_health_for_doctor(
+    cache_conn: sqlite3.Connection,
+    *,
+    force_cold: bool = False,
+):
+    signal = (
+        None if force_cold
+        else _codex_project_metadata_signal(cache_conn)
+    )
+    if signal is not None:
+        cached = _CODEX_PROJECT_METADATA_MEMO.get(signal)
+        if cached is not None:
+            return cached
+    analytics = _cctally()._load_sibling("_cctally_source_analytics")
+    loaded = analytics.load_codex_project_metadata_health(
+        cache_conn=cache_conn,
+    )
+    if signal is not None:
+        _CODEX_PROJECT_METADATA_MEMO.clear()
+        _CODEX_PROJECT_METADATA_MEMO[signal] = loaded
     return loaded
 
 
@@ -1835,10 +1882,9 @@ def _doctor_gather_state_impl(
                     # connection.  A failed probe is health evidence, not an
                     # empty corpus: the kernel renders it as a distinct FAIL.
                     try:
-                        import _cctally_source_analytics
-
-                        health = _cctally_source_analytics.load_codex_project_metadata_health(
-                            cache_conn=conn,
+                        health = _load_codex_project_metadata_health_for_doctor(
+                            conn,
+                            force_cold=_force_cold_inputs,
                         )
                         codex_project_metadata_health = {
                             "total_rows": health.total_rows,

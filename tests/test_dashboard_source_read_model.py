@@ -763,7 +763,9 @@ def test_deadline_is_capture_plus_stale_after_when_that_is_sooner():
         ),
     ))
 
-    assert deadline == captured_at + dt.timedelta(seconds=3600)
+    # #857: `quota_freshness` compares the whole-second age with a strict `>`,
+    # so the flip is at capture + 3601s; capture + 3600s is still fresh.
+    assert deadline == captured_at + dt.timedelta(seconds=3601)
     assert deadline < reset
 
 
@@ -847,6 +849,170 @@ def test_deadline_is_never_at_or_before_now():
     ))
 
     assert deadline is not None and deadline > NOW
+
+
+# =========================================================================
+# #857 — deadline COMPLETENESS. A settled cycle-unavailable generation idles
+# until its decision deadline, so every instant at which frozen evidence can
+# resolve differently must be a candidate, and each candidate must be the FIRST
+# instant its transition is observable: a deadline that fires early is
+# discarded by the rebuild it causes (candidates at or before `now` drop out)
+# while the transition it stood for is still ahead, so that transition is then
+# missed for good.
+# =========================================================================
+
+_ONE_MICROSECOND = dt.timedelta(microseconds=1)
+
+
+def _cycle_verdict(observations, now_utc):
+    """What an authoritative build would resolve at ``now_utc``."""
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    try:
+        cycles = source_module._resolve_codex_weekly_cycle(observations, now_utc)
+    except source_module.CodexCycleUnavailable as exc:
+        return exc.reason
+    return tuple((cycle.resets_at, cycle.evidence_stale) for cycle in cycles)
+
+
+def _deadline_passed(deadline, now_utc):
+    source_module = sys.modules["_cctally_dashboard_sources"]
+    return source_module.codex_decision_deadline_passed(
+        SimpleNamespace(clock_data={"codex_next_decision_at": deadline}), now_utc,
+    )
+
+
+def test_857_the_stale_deadline_is_the_first_instant_the_evidence_is_stale():
+    """`quota_freshness` truncates the age to whole seconds and compares with a
+    strict `>`, so evidence captured at C is still fresh at C + 3600s and at
+    C + 3600.999999s, and stale from C + 3601s. A deadline at C + 3600s fires
+    one second early, and the rebuild at that instant drops it while the flip
+    is still ahead."""
+    reset = NOW + dt.timedelta(days=2)
+    captured_at = NOW - dt.timedelta(minutes=10)
+    observations = (
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=captured_at,
+        ),
+    )
+    flip = captured_at + dt.timedelta(seconds=3601)
+
+    assert _next_decision_at(observations) == flip
+    assert _cycle_verdict(observations, captured_at + dt.timedelta(seconds=3600)) == (
+        (reset, False),
+    )
+    assert _cycle_verdict(observations, flip - _ONE_MICROSECOND) == ((reset, False),)
+    assert _cycle_verdict(observations, flip) == ((reset, True),)
+    assert _cycle_verdict(observations, flip + dt.timedelta(seconds=1)) == (
+        (reset, True),
+    )
+    assert not _deadline_passed(flip, flip - _ONE_MICROSECOND)
+    assert _deadline_passed(flip, flip)
+    # A rebuild that lands inside the last second before the flip must still
+    # carry the flip forward rather than skip to the reset.
+    assert _next_decision_at(
+        observations, now_utc=captured_at + dt.timedelta(seconds=3600.5),
+    ) == flip
+
+
+def test_857_a_future_start_window_becomes_eligible_strictly_after_its_start():
+    """The resolver rejects `start >= now`, so a captured window whose nominal
+    start lies ahead is usable only strictly after that start — on frozen
+    evidence, with no new observation to move any signature."""
+    start = NOW + dt.timedelta(days=1)
+    reset = start + dt.timedelta(minutes=10_080)
+    observations = (_stale_weekly_observation(resets_at=reset),)
+    eligible = start + _ONE_MICROSECOND
+
+    assert _cycle_verdict(observations, NOW) == "missing"
+    assert _next_decision_at(observations) == eligible
+    assert _cycle_verdict(observations, start) == "missing"
+    assert _cycle_verdict(observations, eligible) == ((reset, True),)
+    assert _cycle_verdict(observations, eligible + dt.timedelta(minutes=5)) == (
+        (reset, True),
+    )
+    assert not _deadline_passed(eligible, start)
+    assert _deadline_passed(eligible, eligible)
+
+
+def test_857_a_conflict_resolves_when_an_unselected_boundary_expires():
+    """Two stale boundaries conflict and neither is SELECTED, so the old
+    candidate set (selected resets only) recorded no deadline at all — yet the
+    conflict resolves on its own the instant the earlier one resets."""
+    a_reset = NOW + dt.timedelta(hours=1)
+    b_reset = NOW + dt.timedelta(days=3)
+    observations = (
+        _stale_weekly_observation(
+            root="root-a", resets_at=a_reset, logical_limit_key="limit-a",
+        ),
+        _stale_weekly_observation(
+            root="root-b", resets_at=b_reset, logical_limit_key="limit-b",
+        ),
+    )
+
+    assert _cycle_verdict(observations, NOW) == "conflicting"
+    assert _next_decision_at(observations) == a_reset
+    assert _cycle_verdict(observations, a_reset - _ONE_MICROSECOND) == "conflicting"
+    assert _cycle_verdict(observations, a_reset) == ((b_reset, True),)
+    assert _cycle_verdict(observations, a_reset + dt.timedelta(seconds=1)) == (
+        (b_reset, True),
+    )
+
+
+def test_857_a_future_dated_capture_stops_being_future_inside_the_skew_window():
+    """A physical capture more than `FUTURE_CLOCK_SKEW_SECONDS` ahead makes the
+    history `future` (ineligible). It turns `fresh` once the truncated age is no
+    longer below -300, i.e. strictly after F - 301s — five minutes before the
+    capture itself becomes a baseline, which was the only candidate recorded."""
+    reset = NOW + dt.timedelta(days=2)
+    future_capture = NOW + dt.timedelta(minutes=20)
+    observations = (
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=NOW - dt.timedelta(minutes=10), used_percent=25.0,
+        ),
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=future_capture, used_percent=30.0, line_offset=2,
+        ),
+    )
+    flip = future_capture - dt.timedelta(seconds=301) + _ONE_MICROSECOND
+
+    assert _cycle_verdict(observations, NOW) == "stale"
+    assert _next_decision_at(observations) == flip
+    assert _cycle_verdict(observations, flip - _ONE_MICROSECOND) == "stale"
+    assert _cycle_verdict(observations, flip) == ((reset, False),)
+    assert _cycle_verdict(observations, flip + dt.timedelta(seconds=1)) == (
+        (reset, False),
+    )
+
+
+def test_857_a_future_capture_on_a_model_scoped_history_is_still_a_deadline():
+    """The pool label is read from the BASELINE, and `limit_name` is not part of
+    history identity, so a future capture can move a history out of the Spark
+    pool. Skipping the history before its future captures were recorded missed
+    that transition."""
+    reset = NOW + dt.timedelta(days=2)
+    standard_capture = NOW + dt.timedelta(seconds=10)
+    observations = (
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=NOW - dt.timedelta(minutes=10),
+            limit_name="GPT-5.3-Codex-Spark",
+        ),
+        _quota_observation(
+            root="root", window_minutes=10_080, resets_at=reset,
+            captured_at=standard_capture, limit_name="Standard weekly",
+            line_offset=2,
+        ),
+    )
+
+    assert _cycle_verdict(observations, NOW) == "missing"
+    assert _next_decision_at(observations) == standard_capture
+    assert _cycle_verdict(observations, standard_capture - _ONE_MICROSECOND) == (
+        "missing"
+    )
+    assert _cycle_verdict(observations, standard_capture) == ((reset, False),)
 
 
 def test_codex_cycle_selects_one_full_identity_for_one_boundary():
@@ -1259,7 +1425,7 @@ def test_build_records_the_cycle_decision_deadline_in_private_clock_data(
 
         # A fresh boundary goes stale before it resets, so that is the deadline.
         assert state.clock_data["codex_next_decision_at"] == (
-            captured_at + dt.timedelta(seconds=3600)
+            captured_at + dt.timedelta(seconds=3601)
         )
         assert "codex_budget_cost_events" in state.clock_data
         wire = sys.modules["_cctally_dashboard_envelope"]._source_state_to_wire(state)
@@ -3786,7 +3952,7 @@ def test_a_passed_deadline_forces_an_authoritative_codex_rebuild(tmp_path, monke
             "sessions": "fresh",
         }
         assert initial.clock_data["codex_next_decision_at"] == (
-            captured_at + dt.timedelta(seconds=3600)
+            captured_at + dt.timedelta(seconds=3601)
         )
 
         # Before the deadline: the coherent prior is reused verbatim (only the
@@ -3928,9 +4094,18 @@ def test_reused_codex_state_is_clocked_before_all_composition(tmp_path, monkeypa
         assert initial.capabilities["hero"].status == "supported"
 
         # Strip the deadline so ONLY the reuse path can be under test — this is
-        # the shape any state without a recorded deadline presents.
+        # the shape any state without a recorded deadline presents. The #857
+        # quota-dependency stamp and accounting provenance token stay: a
+        # generation without them names no validated inputs, so exact-version
+        # reuse refuses it.
         no_deadline = dataclasses.replace(
-            initial, clock_data={"codex_budget_cost_events": ()},
+            initial, clock_data={
+                "codex_budget_cost_events": (),
+                "codex_quota_dependency": (
+                    initial.clock_data["codex_quota_dependency"]),
+                "codex_accounting_provenance": (
+                    initial.clock_data["codex_accounting_provenance"]),
+            },
         )
         prior_claude = initial_bundle.sources["claude"]
         prior_bundle = tui.SourceDashboardBundle(
@@ -4028,7 +4203,7 @@ def test_drift_to_two_stale_boundaries_resolves_conflicting(tmp_path, monkeypatc
         initial = initial_bundle.sources["codex"]
         assert initial.data["hero"]["cycle"]["resets_at"] == fresh_reset.isoformat()
         assert initial.clock_data["codex_next_decision_at"] == (
-            captured_at + dt.timedelta(seconds=3600)
+            captured_at + dt.timedelta(seconds=3601)
         )
 
         drifted = _build_tick_bundle(

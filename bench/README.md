@@ -102,48 +102,164 @@ The committed `bench/baselines/assembly.json` is the maintainer-machine evidence
 
 ### Dashboard memory and background-work soak (`dashboard-soak.py`)
 
-`bench/dashboard-soak.py` launches the real dashboard against the deterministic
-large corpus, samples RSS, CPU, block I/O, server threads, disk footprint and
-numeric retained-owner counters, and
-stresses both providers through source add/remove, account rotation, cache
-rebuild, privacy variants, 21 manual synchronous refresh samples plus the
-queued path, rail and large
-conversation reads, diagnosis, main SSE reconnects and dedicated live-tail.
-It deliberately removes and restores the scratch stats store and requires the
-resulting diagnosis `503` to recover to a coherent `200`, plus unchanged SQLite
-`cache_size`/`temp_store`/`page_size`/`mmap_size`, a post-warm RSS slope whose
-one-sided 95% upper confidence bound stays below the unchanged +4 MiB/min
-ceiling,
-combined background duty below 75% of one core, whole-process sampled CPU below
-one core, and clean shutdown. Oversize or
-uncapped owner retention or missing evidence fails `--gate`. A paired run also
-gates main/conversation periods and rail/live-tail/reader/reconnect/manual p50
-and p95 against the baseline. The run waits up to 120 seconds after stress for
-asynchronous source and snapshot-memory generations newer than the final stress
-targets; a zero, pre-stress, failed or missing owner measurement fails closed.
-Owner and background-duty gates use the peak across stress diagnostics rather
-than only the final sample. Median cadence keeps a strict 5% margin. The
-sparse publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
-slope evaluator fails closed without enough samples and is pinned by growing,
-flat and noisy-flat synthetic receipts, so a harmless positive point estimate
-inside sampling noise does not masquerade as a demonstrated leak. The sparse
-publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
-sparse publish P95 uses `max(15%, 1.5 s)`, calibrated from an 8.30-9.66 s
-same-machine baseline spread across five identical paired runs; a 2.1 s
-regression still fails. Conversation P95 uses `max(15%, 1.0 s)`, covering the
-measured >0.9 s identical-baseline spread while its median remains at 5%.
-HTTP non-inferiority uses the larger of 10 ms or 5% so single-digit-millisecond
-socket and scheduler noise cannot decide the result.
+The soak runs the real dashboard, samples process RSS/CPU/I/O, retained owners,
+full-tick durations and publication periods, and exercises HTTP/SSE, diagnosis
+recovery, source add/remove, account rotation and cache rebuild. A synthetic
+`--scale large` run remains a useful diagnostic, but it is **not** a #716/#679
+certification: the generator disables retention and is not a multi-GB
+production copy. `--gate` now refuses to certify that fixture.
 
-Run before and after in one command on the same remote host and seed.
-`--baseline-ref` materializes the committed baseline with `git archive` into
-temporary storage, so the comparison cannot mutate a worktree or accidentally
-cross hosts:
+For the certification soak, supply `--fixture-copy` as an operator-prepared
+**copy** with `data/` (including `conversations.db` and `config.json`),
+`claude/projects/`, and at least one `codex-*/sessions/` root. The script
+rejects symlinks, clones the supplied copy into a new `--root` for each arm,
+and mutates only those clones. Never point `--root` or `--fixture-copy` at live
+production stores. The source copy must have a conversation DB of at least
+2 GiB and retention configured above zero. The producer makes retention due
+only on its isolated clone and must observe a successful `delete` phase before
+staging scenarios. A synthetic `large` fixture
+does not satisfy this requirement regardless of its entry count.
+Production-copy runs explicitly remove `CCTALLY_AS_OF` from the dashboard
+environment so current retention, window selection and freshness are measured;
+only deterministic synthetic runs keep the January 2026 fixture pin.
+
+Absolute candidate ceilings are: 5% true-idle process CPU, 50%
+sampled whole-process CPU, 25% combined main/conversation CPU duty, 1.5 GiB
+RSS, 768 MiB summed retained-owner bytes, +4 MiB/min one-sided 95% post-warm
+RSS slope, 5 s full-tick p50, 10 s full-tick p95, 3 s API p95, 10 s main and
+conversation publication p95 with no individual gap over 15 s, and 10 s
+mutation-to-render. Missing, nonfinite
+or insufficient numeric evidence fails closed. Owner-specific caps, thread/I/O
+bounds, shutdown, stress, SQLite settings and the earlier paired relative
+latency/cadence comparisons remain in force; a receipt cannot raise an absolute
+ceiling. The paired baseline must resolve to the true pre-epic commit
+`2eb71fe3305fa91f2936a14fa935212283d72962`. A dirty candidate tree
+cannot pass `--gate`.
+
+The full-size `bothActive` regime gates only part of this list, by operator decision; see *Full-size `bothActive` gate* below. The direct soak and the other regimes are unchanged.
+
+True-idle CPU is measured in a separate 180-second interval after warm-up and
+manual refresh. The harness makes no HTTP/SSE request, changes no source, and
+runs no stress action during that interval. CPU is cumulative process CPU-time
+delta divided by wall time, not an instantaneous `ps %cpu` reading; at least
+150 seconds and six samples are required. The backend trace must also cover
+the interval with idle main ticks and caught-up conversation passes, so active
+loop samples cannot be relabeled as idle.
+
+`--baseline-ref` materializes that commit without changing a checkout and runs
+both arms on one remote host. If the old binary cannot open the copied current
+schema, create a separately measured pre-epic receipt on a compatible isolated
+copy and pass it with `--compare`; do not substitute a post-epic baseline or
+silently waive the comparison. In either form, both receipts must name the same
+initial fixture-population metadata fingerprint (relative file paths, sizes
+and mtimes) and the same measurement host. This detects a changed source
+population without hashing every byte of a multi-GB DB; it is not a
+cryptographic content proof, so review source-copy provenance separately.
+
+The single soak cannot itself perform every adversarial regime. The revised `--produce-evidence` path first normalizes the multi-GB copy, runs due retention once through the real dashboard, and records the elapsed time, deleted payload bytes, reclaimed file bytes, the inherited backlog, and zero pending/freelist state. Normalization first runs the product's own foreground `cctally db rebuild --db stats`: a copy keeps its source build's stats epoch, and the candidate's first stats read would otherwise detach an epoch rebuild and make the clone's `cache-sync --rebuild` exit "retry shortly" (the 2026-09-25 full-size copy took 531 s at epoch 1015 to 1016). Production reclaim is budgeted to two seconds a pass and goes dormant below 256 MiB until the next daily run, so it cannot drain a multi-GB backlog inside any setup bound; the 2026-09-24 copy drained about 143 pages a second. When the deletion's budgeted continuation leaves a backlog, the prepass compacts the remainder with the product's own `cctally db vacuum --db conversations`, then restarts the dashboard until the product's next reclaim pass clears its now-stale record. The evidence names that `drainMechanism` (`production` or `production+compaction`) and records the production, compaction and settle stages separately, each with its own duration and database-family bytes. The validator fails closed unless a successful due deletion is followed by a budgeted reclaim, the payload deleted is non-zero, the stages' bytes chain consistently, and any second deletion during the settle is the labelled cleanup of a dormant record. The same drain runs before the template is staged from the direct soak's post-rebuild root and at the end of each cold preparation, once both rails have caught up after its Claude rebuild, because a from-zero replay restores rows older than retention and its forced prune deletes them again. The one-hour stats-rebuild bound, the four-hour prepass bound, the one-hour compaction bound and the 30-minute settle bound cover setup only; none alters a measured interval or ceiling. The producer then runs the direct soak and stages a template only after reclaim completes. `idle` and `bothActive` run on separate full-size clones. The eight other regimes run on separate small-fixture clones against the absolute ceilings of their regime. Both prior-schema upgrade probes run during the full-size producer on committed prior-schema fixture databases; those upgrade inputs are not multi-GB migration copies. The source, template, direct root, and each probe root remain available for read-back under unique paths. `--small-pipeline` exercises the complete two-tier producer and manifest validator with small fixtures in both tiers, but cannot certify full size. Each clone runs the real dashboard path before its named runtime action. The direct soak finishes its live measurement and stops the dashboard before `cache-sync --rebuild`; transcript recovery requires the database family to have no open readers. It then starts a dashboard on the rebuilt clone and requires `/api/data` to succeed. Active-provider regimes append real source records, publish activity, and wait until the running dashboard reports a full/final tick that holds the mutation: the cache population has increased, and each provider's published cache ID has advanced and equals the store's current cache signature; their `mutationToRenderMs` is measured from mutation to that observation, never from a standalone cache-sync command. Hook regimes exercise the runtime frontier against real marker and database state; the race runs cache ingestion across two real appends; and pricing skew tampers and re-derives materialized conversation costs. The degraded-reader regime holds the real maintenance flock while requesting `/api/conversations`, then observes HTTP recovery after release. Overload sends 80 concurrent HTTP requests to the isolated dashboard's `/api/diagnosis`, counts real overload responses and recovery, and samples that server process's RSS and thread count during the burst. The producer records only values observed from process/debug timing, HTTP results, runtime results, and SQLite state. Pytest pass counts, asserted success constants, and measurements copied from the direct soak are rejected as production evidence. It also copies the committed cache-044 and conversations-009 pre-migration fixtures into separate temporary data roots, opens them with the candidate CLI, and measures their exact schema, marker delta and integrity before and after migration. These upgrade roots and the soak root are isolated; the operator's source copy remains read-only. The producer requires `--candidate-sha` and compares the materialized tracked tree and untracked-file set with that exact commit, independent of the runner's current `HEAD`. It refuses a different checkout, the wrong baseline, a missing production fixture or an existing output/raw directory. Any failed/empty probe or out-of-bound measurement stops production without a manifest, so hand-authored JSON is not the supported evidence path.
+
+The version-1 validator requires all artifacts to be contained regular
+files under the bundle's directory (no symlinks); each
+reference carries its exact SHA-256 digest. The bundle and each artifact bind
+the candidate to the measured committed SHA, the true pre-epic baseline and
+the fingerprint of its declared fixture tier. The full-size tier shares the
+direct soak's fingerprint; the small tier has a distinct fingerprint. Distinct artifacts carry
+`kind`, `name`, `measurements` (numbers; full-size `bothActive` also carries its `ungatedFields` list and may record `null` evidence), a unique `measurementRunId`, and an
+observed `runtimeObservationCount`, plus a host, ordered timezone-aware
+timestamps, the successful command argv/exit code and captured execution
+duration, stdout and stderr. Every artifact
+must name the direct soak's `measurementHost` (the runner's hostname). Duplicate
+JSON keys and nonfinite numbers are
+rejected. Regime commands that invoke pytest, execution receipts containing a
+`passedCases` claim, duplicate run IDs, and identical common active-regime
+measurements are rejected. An `externalEvidenceVerified: true` claim in a file
+is never trusted.
+
+The manifest has this shape (repeat for every required name; the digests here
+are placeholders, not valid evidence):
+
+```json
+{
+  "schemaVersion": 1,
+  "candidateSha": "<40-hex-committed-candidate-SHA>",
+  "baselineSha": "2eb71fe3305fa91f2936a14fa935212283d72962",
+  "fixtureSourceFingerprint": "<64-hex-fingerprint-from-direct-soak>",
+  "fixtureTiers": {"fullSize": "<direct-soak-fingerprint>",
+                   "smallFixture": "<different-small-fixture-fingerprint>"},
+  "pipelineMode": "fullSizeCertification",
+  "retentionWhenDue": {"path": "raw/retention-when-due.json", "sha256": "<actual-sha256>"},
+  "regimes": {
+    "idle": {"path": "raw/idle.json", "sha256": "<actual-64-hex-sha256>"},
+    "claudeActive": {"path": "raw/claude-active.json", "sha256": "<actual-sha256>"},
+    "codexActive": {"path": "raw/codex-active.json", "sha256": "<actual-sha256>"},
+    "bothActive": {"path": "raw/both-active.json", "sha256": "<actual-sha256>"},
+    "missingHook": {"path": "raw/missing-hook.json", "sha256": "<actual-sha256>"},
+    "ineffectiveHook": {"path": "raw/ineffective-hook.json", "sha256": "<actual-sha256>"},
+    "mutationRace": {"path": "raw/mutation-race.json", "sha256": "<actual-sha256>"},
+    "pricingSkew": {"path": "raw/pricing-skew.json", "sha256": "<actual-sha256>"},
+    "degradedConversation": {"path": "raw/degraded-conversation.json", "sha256": "<actual-sha256>"},
+    "requestOverload": {"path": "raw/request-overload.json", "sha256": "<actual-sha256>"}
+  },
+  "priorSchemaUpgrades": {
+    "cache-044": {"path": "raw/cache-044.json", "sha256": "<actual-sha256>"},
+    "conversations-009": {"path": "raw/conversations-009.json", "sha256": "<actual-sha256>"}
+  }
+}
+```
+
+Each referenced file has this envelope, with its **own** exact name and kind:
+
+```json
+{
+  "schemaVersion": 1, "kind": "regime", "name": "missingHook",
+  "fixtureTier": "smallFixture",
+  "candidateSha": "<same-40-hex-SHA>",
+  "baselineSha": "2eb71fe3305fa91f2936a14fa935212283d72962",
+  "provenance": {
+    "host": "<same-runner-alias>",
+    "fixtureSourceFingerprint": "<small-fixture-fingerprint>",
+    "startedAt": "2026-09-19T10:00:00Z",
+    "finishedAt": "2026-09-19T10:03:00Z",
+    "command": {"argv": ["python3", "bench/dashboard-soak.py",
+                          "--execute-regime", "missingHook", "..."],
+                "exitCode": 0}
+  },
+  "execution": {"durationMs": 812.4,
+                "stdout": "{...runtime measurements...}", "stderr": ""},
+  "measurements": {
+    "measurementRunId": "<unique-64-hex-runtime-run-id>",
+    "runtimeObservationCount": 6,
+    "frontierExpirySeconds": 120, "invalidHookRejected": true,
+    "fallbackRefreshCount": 2, "trustedFreshFrontierCount": 1,
+    "untrustedStaleFrontierCount": 1, "observedMutationCount": 2,
+    "mutationToRenderMs": 700
+  }
+}
+```
+
+Numeric bounds are checked by regime: idle needs a quiet 150-second/six-sample interval under 5% CPU; the small-fixture `claudeActive` and `codexActive` regimes each need four samples, their provider events, and absolute process/owner/CPU/duty/full-tick/API/publication/freshness ceilings; full-size `bothActive` needs the narrower gate described below; missing/ineffective hooks need observed trusted-fresh and untrusted-stale frontiers, invalidation, fallback and a visible mutation within 10 seconds; mutation race needs at least two observed and equally many rendered mutations, zero losses and freshness; pricing skew needs observed mismatches, equal recalculations and at most 1e-9 USD error; degraded conversation needs HTTP-observed degraded/recovered responses, zero unavailable-content leaks and bounded route latency; overload needs more than 64 concurrent HTTP requests, an observed overload response, HTTP recovery, zero unexpected responses and bounded server-process threads/RSS/API p95. The upgrades need their respective exact 44/9 starting heads, the current exact 46/10 heads afterward, exactly two/one applied migrations, integrity success, zero regressions and a finite positive duration. Unknown or missing regimes/heads fail. A `smallFixtureTrial` bundle cannot claim full-size verification, and the validator rejects an artifact assigned to the wrong tier. The expiry used by the direct soak is still read from the candidate source; external data cannot relabel a synthetic fixture, enlarge measured store size, or claim retention ran.
+
+**Full-size `bothActive` gate.** By operator decision (#857 Task B), the full-size `bothActive` gate is narrower than the other active regimes, because at full size the product cannot meet the CPU, duty, build, freshness and publication-cadence ceilings. A full-size activity tick takes about 7 s and the product's duty cap stretches the cadence to 12.8–14.8 s, so only about three ticks fit in the probe window. The probe appends exactly one event per provider and never restimulates. It then requires every appended Claude and Codex event to become visible in a published tick within the unchanged probe window of `max(30, 8 × sync interval + 5)` seconds, which is 45 s at the default 5 s interval. Visible means a final full publication holds the events: the dataset count rose for both providers, and each provider's published cache ID has advanced and equals the store's current cache signature. The probe credits that publication even when one poll first sees both the higher count and the publication. The probe does not abandon 2 s after the 10 s freshness ceiling, as the small-fixture regimes do, and an event still invisible at the deadline fails the regime. Still gated at full size: no appended event missed (`observedClaudeEvents` ≥ `appendedClaudeEvents` ≥ 1, and the same for Codex), at least four process samples, `rssBytes` ≤ 1.5 GiB, `retainedOwnerBytes` ≤ 768 MiB and `apiP95Ms` ≤ 3 s. Still recorded as evidence but no longer gated at full size, and moved unchanged into #862 Task C's acceptance: `processCpuPercent` (50%), `combinedCpuDuty` (0.25), `fullBuildP50Ms`/`fullBuildP95Ms` (5 s / 10 s), `mutationToRenderMs` (10 s), and `publishP95Ms`/`publishMaxMs` and `conversationPublishP95Ms`/`conversationPublishMaxMs` (10 s / 15 s). Each of these is a finite non-negative number, or `null` when the run could not measure it (no full build, no usable publication period, or unmeasured CPU duty), except `mutationToRenderMs`, which is always measured because an invisible event fails the probe. The receipt lists all nine in `ungatedFields`, and the validator rejects any other list. The small-fixture `claudeActive` and `codexActive` regimes, the full-size `idle` regime, and every threshold, ceiling, duration and sampling setting are unchanged.
+
+Produce the raw manifest first, then consume it in the paired gate on the same
+remote host and unchanged candidate. Preserve both commands' output:
 
 ```bash
-CCTALLY_REMOTE_HOST=<runner-alias> bin/cctally-test-remote \
-  bench/dashboard-soak.py --root /tmp/cctally-dashboard-paired \
-  --baseline-ref <baseline-sha> --duration-seconds 600 \
+TZ=Etc/UTC bin/cctally-test-remote bench/dashboard-soak.py \
+  --root /tmp/cctally-dashboard-evidence-<candidate-sha> \
+  --fixture-copy <isolated-copy-path-on-runner> \
+  --baseline-ref 2eb71fe3305fa91f2936a14fa935212283d72962 \
+  --candidate-sha <candidate-sha> \
+  --produce-evidence --duration-seconds 600 \
+  --output /tmp/cctally-dashboard-evidence/manifest.json
+
+TZ=Etc/UTC bin/cctally-test-remote bench/dashboard-soak.py \
+  --root /tmp/cctally-dashboard-paired-<candidate-sha> \
+  --fixture-copy <same-isolated-copy-path-on-runner> \
+  --baseline-ref 2eb71fe3305fa91f2936a14fa935212283d72962 \
+  --candidate-sha <candidate-sha> \
+  --evidence /tmp/cctally-dashboard-evidence/manifest.json \
+  --duration-seconds 600 \
   --output /tmp/cctally-dashboard-after.json --summary-only --gate
 ```
 
@@ -159,9 +275,11 @@ remain diagnostic.
 Thirty cycles are the default and `CCTALLY_BROWSER_SOAK_CYCLES=120` selects a
 long pass.
 
-The committed prose does not freeze one transient receipt. Record the exact
-paired JSON used for an issue or release gate alongside its SHA; the corpus
-counts, seed, numeric ceilings and evaluator are the reproducible contract.
+This command is only one gate in #857 Task B. Preserve its exact JSON with the
+browser, upgrade, mutation/concurrency, review, remote-suite, generation,
+estate, CI and issue-state evidence for the same candidate SHA. Do not treat a
+green soak, a synthetic fixture or verified digests as the frozen certification
+verdict without independent raw-artifact review.
 
 ### Statement-cache cost campaign (`measure-778-statement-cache.py`)
 

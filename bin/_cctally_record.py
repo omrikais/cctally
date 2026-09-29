@@ -1041,10 +1041,32 @@ def maybe_record_milestone(
             conn.close()
 
 
+def _claude_latch_recreates_retired_crossing(conn, kind, rowid) -> bool:
+    """True iff a just-inserted Claude alert latch re-creates a crossing that a
+    correction retired, so it is stamped but never notified again (#869 V2).
+
+    `db rederive` cannot see historical alert configuration, so it retires
+    every Claude latch (``budget``, ``projected``, ``project_budget``) as a
+    re-materialized projection, never because the crossing was found false.
+    The next live tick of the same period re-inserts the still-crossed
+    threshold. What tells that recreation apart from a first crossing is a
+    durable fact, not timing: the correction's tombstone on the natural key's
+    legacy event, read from the live effective metadata in the writer's own
+    transaction (`latch_crossing_was_retired`). Harvest reads the same fact to
+    journal the row under its version-2 incarnation id. A Codex budget
+    crossing is retired only when its own recorded pricing evidence puts it
+    below the threshold, so its later crossing is genuine and still notifies.
+    """
+    import _cctally_journal as _jr
+
+    return _jr.latch_crossing_was_retired(conn, kind, rowid)
+
+
 def _record_budget_milestone_for_vendor(
     *, vendor, target, thresholds, period, config, tz, build_payload,
     raise_errors: bool = False, conn=None, as_of=None, alert_sink=None,
     account_key: str = "*", window_account_key=None,
+    journal_ctx=None,
 ) -> int:
     """Shared budget-milestone firing core for both vendors (#143).
 
@@ -1077,6 +1099,11 @@ def _record_budget_milestone_for_vendor(
     """
     import _cctally_cache  # for the fail-closed AccountAttributionUnavailable skip (#341)
     now_utc = _as_of_or_command(as_of)
+    if vendor == "codex" and as_of is None:
+        # The source scan and durable crossing must share an exact cutoff.
+        # now_utc_iso() reads a second clock and truncates subsecond precision;
+        # preserving this instant also retains a crossing in its final second.
+        as_of = now_utc.isoformat().replace("+00:00", "Z")
     pending_alerts: list[dict[str, Any]] = []
     own_conn = conn is None
     if own_conn:
@@ -1102,9 +1129,15 @@ def _record_budget_milestone_for_vendor(
         if not pending:
             return 0  # nothing left this window → skip the cost SUM
 
+        provenance = {}
+        spend_options = (
+            {"pricing_provenance": provenance}
+            if vendor == "codex" and journal_ctx is not None else {}
+        )
         spent = _budget_spend_for_vendor(
             conn, vendor=vendor, start_at=start_at, now_utc=now_utc,
             account_key=account_key,
+            **spend_options,
         )
         # Shared INSERT-and-arm core (set-then-dispatch, fire-once via rowcount);
         # commit=False inside, so this conn owns the single durable commit below.
@@ -1120,6 +1153,25 @@ def _record_budget_milestone_for_vendor(
             as_of=as_of,
             account_key=account_key,
         ):
+            row = None
+            if (journal_ctx is not None and provenance) or vendor == "claude":
+                row = conn.execute(
+                    "SELECT id FROM budget_milestones WHERE vendor=? "
+                    "AND account_key=? AND period_start_at=? AND period=? "
+                    "AND threshold=?",
+                    (vendor, account_key, period_key, period, t),
+                ).fetchone()
+            if journal_ctx is not None and provenance and row is not None:
+                journal_ctx.pricing_provenance[("budget", int(row[0]))] = dict(
+                    provenance
+                )
+            if (
+                vendor == "claude" and row is not None
+                and _claude_latch_recreates_retired_crossing(
+                    conn, "budget", int(row[0]))
+            ):
+                # #869 V2: stamped by `_budget_crossings`, never re-sent.
+                continue
             pending_alerts.append(build_payload(
                 threshold=t,
                 crossed_at_utc=crossed_at,
@@ -1423,6 +1475,7 @@ def maybe_record_project_budget_milestone(
             # racing record-usage instance OR an already-recorded pair gets
             # rowcount==0 and skips.
             if inserted == 1:
+                rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 crossed_at = as_of or now_utc_iso()
                 # set-then-dispatch: alerted_at lands on the row BEFORE the
                 # Popen, sharing this transaction with the INSERT (commit=False).
@@ -1433,6 +1486,10 @@ def maybe_record_project_budget_milestone(
                     "  AND threshold = ? AND alerted_at IS NULL",
                     (crossed_at, week_key, project_key, t),
                 )
+                if _claude_latch_recreates_retired_crossing(
+                    conn, "project_budget", rowid,
+                ):
+                    continue  # #869 V2: stamped above, never re-sent
                 # Collision-aware label (shared primitive, #130); resolved once
                 # on the first dispatch and reused for the rest of this tick.
                 # Kept defensive fallback (F4).
@@ -1485,6 +1542,7 @@ def maybe_record_project_budget_milestone(
 def maybe_record_codex_budget_milestone(
     saved: dict[str, Any], *, raise_errors: bool = False, conn=None, as_of=None,
     alert_sink: "list | None" = None,
+    journal_ctx=None,
 ) -> int:
     """Fire Codex budget alerts on ACTUAL-Codex-spend threshold crossings (axis
     ``codex_budget``, calendar-period-codex-budgets spec §6 — the gap the Codex
@@ -1560,6 +1618,7 @@ def maybe_record_codex_budget_milestone(
             build_payload=_codex_budget_payload, account_key="*",
             raise_errors=raise_errors, conn=conn, as_of=as_of,
             alert_sink=alert_sink,
+            journal_ctx=journal_ctx,
         ) or 0
     for acct_key, acct_usd in accounts.items():
         fired += _record_budget_milestone_for_vendor(
@@ -1568,6 +1627,7 @@ def maybe_record_codex_budget_milestone(
             build_payload=_codex_budget_payload, account_key=acct_key,
             raise_errors=raise_errors, conn=conn, as_of=as_of,
             alert_sink=alert_sink,
+            journal_ctx=journal_ctx,
         ) or 0
     return fired
 
@@ -1998,6 +2058,7 @@ def maybe_record_projected_alert(
             # a racing record-usage instance gets rowcount==0 and skips. The
             # alerted_at UPDATE keys on the CONCRETE `period` (#137).
             if inserted == 1:
+                rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 conn.execute(
                     "UPDATE projected_milestones SET alerted_at = ? "
                     "WHERE week_start_at = ? AND period = ? AND metric = ? "
@@ -2005,6 +2066,12 @@ def maybe_record_projected_alert(
                     (as_of or now_utc_iso(), p["week_start_at"], p["period"],
                      p["metric"], p["threshold"]),
                 )
+                if (
+                    not str(p["metric"]).startswith("codex_")
+                    and _claude_latch_recreates_retired_crossing(
+                        conn, "projected", rowid)
+                ):
+                    continue  # #869 V2: stamped above, never re-sent
                 fired.append(p)
         # Single commit: every INSERT + its alerted_at marker durable together.
         # On the passed-conn (ingest) path the caller owns commit + dispatch.
@@ -2232,6 +2299,8 @@ def _compute_block_totals(
     owner_key: Any,
     windows: "Iterable[Any]",
     skip_sync: bool = False,
+    pricing_evidence: "dict | None" = None,
+    owned_entries: "list | None" = None,
 ) -> dict[str, Any]:
     """Sum tokens + cost over the entries the target block OWNS within
     [block_start_at, range_end], plus per-model and per-project breakdowns
@@ -2275,6 +2344,9 @@ def _compute_block_totals(
             f"the competing-window context"
         )
 
+    missing_without_raw = set()
+    observed_raw = set()
+
     def _priced():
         loaded = get_claude_session_entries(
             block_start_at, range_end, skip_sync=skip_sync,
@@ -2283,6 +2355,20 @@ def _compute_block_totals(
             loaded, ownership_windows,
         )
         for entry in owned[owner_key]:
+            if owned_entries is not None:
+                owned_entries.append(entry)
+            if pricing_evidence is not None and (
+                entry.input_tokens or entry.output_tokens
+                or entry.cache_creation_tokens or entry.cache_read_tokens
+            ):
+                if entry.cost_usd is not None:
+                    observed_raw.add(entry.model)
+                else:
+                    import _lib_pricing
+                    if _lib_pricing._resolve_model_pricing(
+                        entry.model, warn=False,
+                    ) is None:
+                        missing_without_raw.add(entry.model)
             usage = claude_usage_dict(   # #195 chokepoint
                 input_tokens=entry.input_tokens,
                 output_tokens=entry.output_tokens,
@@ -2304,7 +2390,15 @@ def _compute_block_totals(
                 cost_usd=cost,
             )
 
-    return fold_block_totals(_priced()).as_legacy_dict()
+    result = fold_block_totals(_priced()).as_legacy_dict()
+    if pricing_evidence is not None:
+        pricing_evidence["unpricedModels"] = sorted(
+            missing_without_raw - observed_raw
+        )
+        ambiguous = sorted(missing_without_raw & observed_raw)
+        if ambiguous:
+            pricing_evidence["uncertainModels"] = ambiguous
+    return result
 
 
 def maybe_update_five_hour_block(
@@ -2455,10 +2549,41 @@ def maybe_update_five_hour_block(
             load_start=block_start_dt,
             load_end=captured_at_dt,
         )
+        pricing_evidence = {}
+        # `db rederive`'s scratch replay alone supplies this sink (#869), keyed
+        # by the blocks whose historical close it must prove. It keeps the
+        # exact entries behind the totals this tick applies, so the planner
+        # proves a missing card from the very population that produced the
+        # replayed children. A frozen close's upsert applies nothing, so its
+        # later recomputations are not kept.
+        source_sink = getattr(journal_ctx, "block_source_evidence", None)
+        source_key = (account_key, int(five_hour_window_key))
+        owned_entries = (
+            [] if source_sink is not None and source_key in source_sink
+            and not current_is_frozen else None
+        )
         totals = _compute_block_totals(
             block_start_dt, captured_at_dt,
             owner_key=int(five_hour_window_key),
             windows=ownership_windows,
+            pricing_evidence=pricing_evidence,
+            owned_entries=owned_entries,
+        )
+        if owned_entries is not None:
+            source_sink[source_key] = tuple(owned_entries)
+        # This describes the pricing used for THESE computed totals. A later
+        # successor closes this block without recomputing it, so looking up
+        # cards while harvesting the close would describe the wrong binary.
+        import _lib_pricing
+        pricing_marker = {
+            "version": 1,
+            "pricingDate": _lib_pricing.current_pricing_snapshot().snapshot_date,
+            "unpricedModels": pricing_evidence["unpricedModels"],
+        }
+        if pricing_evidence.get("uncertainModels"):
+            pricing_marker["uncertainModels"] = pricing_evidence["uncertainModels"]
+        pricing_provenance_json = json.dumps(
+            pricing_marker, sort_keys=True, separators=(",", ":"),
         )
 
         # Hoist alerts config above BEGIN (M1 + M2): single read serves
@@ -2607,12 +2732,13 @@ def maybe_update_five_hour_block(
                   total_cache_create_tokens,
                   total_cache_read_tokens,
                   total_cost_usd,
+                  pricing_provenance_json,
                   is_closed,
                   created_at_utc,
                   last_updated_at_utc,
                   account_key
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
                 ON CONFLICT(account_key, five_hour_window_key) DO UPDATE SET
                   last_observed_at_utc       = excluded.last_observed_at_utc,
                   final_five_hour_percent    = excluded.final_five_hour_percent,
@@ -2622,6 +2748,7 @@ def maybe_update_five_hour_block(
                   total_cache_create_tokens  = excluded.total_cache_create_tokens,
                   total_cache_read_tokens    = excluded.total_cache_read_tokens,
                   total_cost_usd             = excluded.total_cost_usd,
+                  pricing_provenance_json    = excluded.pricing_provenance_json,
                   last_updated_at_utc        = excluded.last_updated_at_utc
                 WHERE five_hour_blocks.is_closed = 0
                    OR five_hour_blocks.journal_id IS NULL
@@ -2641,6 +2768,7 @@ def maybe_update_five_hour_block(
                     totals["cache_create_tokens"],
                     totals["cache_read_tokens"],
                     totals["cost_usd"],
+                    pricing_provenance_json,
                     now_iso,
                     now_iso,
                     account_key,
@@ -6369,6 +6497,7 @@ def _cmd_hook_tick_codex(
             def _codex_budget_leg(ictx):
                 _budget_holder["n"] = int(c.maybe_record_codex_budget_milestone(
                     {}, conn=ictx.conn, alert_sink=ictx.pending_alerts,
+                    journal_ctx=ictx,
                     raise_errors=True) or 0)
 
             budget_ingest = _jr_codex.run_stats_ingest(
@@ -7134,7 +7263,8 @@ def _derive_5h_window_key(conn, five_hour_resets_at_epoch):
     )
 
 
-def _run_dollar_axes(saved, *, conn, as_of, alert_sink, enabled=True):
+def _run_dollar_axes(saved, *, conn, as_of, alert_sink, enabled=True,
+                     journal_ctx=None):
     """The four dollar-decoupled alert axes in cmd_record_usage's legacy order
     (budget → project-budget → codex-budget → projected). Runs on BOTH the accept
     path AND every dedup-skip tick (spec §4.5: USD spend can cross a $ threshold
@@ -7149,7 +7279,8 @@ def _run_dollar_axes(saved, *, conn, as_of, alert_sink, enabled=True):
     c.maybe_record_project_budget_milestone(
         saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
     c.maybe_record_codex_budget_milestone(
-        saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
+        saved, conn=conn, as_of=as_of, alert_sink=alert_sink,
+        journal_ctx=journal_ctx)
     c.maybe_record_projected_alert(
         saved, conn=conn, as_of=as_of, alert_sink=alert_sink)
 
@@ -7561,6 +7692,7 @@ def _pipeline_claude_usage(ctx, rec):
         conn=conn,
         as_of=as_of,
         alert_sink=ctx.pending_alerts,
+        journal_ctx=ctx,
         # Budget/projected rows depend on historical config that was not retained
         # in the journal. Task B classifies them as re-materialized projections:
         # the planner retires stale latches and never fabricates old config.

@@ -2602,6 +2602,10 @@ _PRIVATE_CHILD_SITE_OWNERS = {
 _GENERATED_CHILD_SITES = {
     "test_cache_write_ttl_pricing.py": 1,
     "test_claude_fast_pricing.py": 1,
+    # The Doctor subprocess pins retention's free-space reading before
+    # loading cctally, so hosts below the policy floor cannot change the
+    # exit-zero tests. The child still runs cctally's real main().
+    "test_cmd_doctor.py": 1,
     "test_codex_fused_ingest.py": 1,
     "test_correction_rebuild_orchestration_394.py": 1,
     "test_debug_sample_emission.py": 1,
@@ -2665,7 +2669,7 @@ def _generated_child_diff(found, known, *, profile):
 
 
 def test_generated_child_sites_are_named_rather_than_silently_left():
-    """Fourteen modules on the private profile, and twelve on the public
+    """Fifteen modules on the private profile, and thirteen on the public
     one, embed a loader in source for a separate interpreter.
 
     A child program started by `subprocess` has no `tests/` on its path and no

@@ -1011,7 +1011,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1015
+            epoch = 1016
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -3528,7 +3528,7 @@ def _check_journal_writer_guard(s: DoctorState) -> CheckResult:
 # not promise one it cannot deliver.
 _REDERIVABLE_CONFLICT_PREFIXES = (
     "sa:", "wcs:", "wce:", "wr:", "fhc:", "fhbc:", "pm:", "fhm:",
-    "bm:", "pjm:", "pbm:",
+    "bm:", "bm2:", "pjm:", "pjm2:", "pbm:", "pbm2:",
 )
 
 

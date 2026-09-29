@@ -56,8 +56,8 @@ from _cctally_core import (
 )
 from _lib_dashboard_sources import (
     SOURCE_SCHEMA_VERSION,
-    canonical_alerted_at as _canonical_alerted_at,
-    canonical_alerted_at_sql as _canonical_alerted_at_sql,
+    alerted_at_order_key as _alerted_at_order_key,
+    alerted_at_order_key_sql as _alerted_at_order_key_sql,
     dashboard_resource_key as _dashboard_resource_key,
 )
 from _lib_display_tz import _compute_display_block, format_display_dt
@@ -475,9 +475,10 @@ def _alert_account_resolver(conn: sqlite3.Connection):
 # and a row excluded there is unrecoverable. Two spellings of one instant
 # compare equal here; a nonzero offset — which the ``all-combined`` fixture
 # stores deliberately — orders by its true instant rather than by its
-# local-time text.
-_CANON_ALERTED_AT = _canonical_alerted_at_sql()
-_CANON_ALERTED_AT_M = _canonical_alerted_at_sql("m.alerted_at")
+# local-time text. #869 F14: the key carries the full sub-second instant, so a
+# Codex crossing fired later in the same second as a Claude alert sorts newer.
+_CANON_ALERTED_AT = _alerted_at_order_key_sql()
+_CANON_ALERTED_AT_M = _alerted_at_order_key_sql("m.alerted_at")
 
 
 def _envelope_rows_weekly(
@@ -1169,7 +1170,7 @@ def _build_alerts_envelope_array(
         # `_combined_alert_rows` does — otherwise the operator sees an empty
         # panel and a message that identifies nothing.
         try:
-            return _canonical_alerted_at(alert["alerted_at"])
+            return _alerted_at_order_key(alert["alerted_at"])
         except (KeyError, ValueError) as exc:
             identity = alert.get("key") or alert.get("id")
             raise ValueError(

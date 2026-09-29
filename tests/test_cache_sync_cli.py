@@ -186,6 +186,11 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     """
     ns, tmp_path, monkeypatch = env
     cache_mod = ns["_cctally_cache"]
+    # The fixture entry has a fixed 2026-07-01 timestamp, and the default
+    # 90-day transcript retention would prune it once the wall clock passes
+    # that window, leaving the retry with no conversation messages. Retention
+    # is not what this test exercises, so turn it off.
+    ns["save_config"]({"conversation": {"retention_days": 0}})
     _write_claude_entry(tmp_path)
     monkeypatch.setattr(
         cache_mod,

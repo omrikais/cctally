@@ -14,6 +14,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -102,7 +103,7 @@ def _cache_contract(cache_conn: sqlite3.Connection) -> dict[str, set[str]]:
     }
 
 
-def _cache_fingerprint(cache_conn: sqlite3.Connection) -> str:
+def _cache_fingerprint(cache_conn: sqlite3.Connection, *, include_codex=False) -> str:
     """Hash every cost-bearing Claude cache row and its project metadata."""
     entry_columns = (
         "source_path", "line_offset", "timestamp_utc", "model", "input_tokens",
@@ -120,7 +121,276 @@ def _cache_fingerprint(cache_conn: sqlite3.Connection) -> str:
             "SELECT " + ",".join(file_columns)
             + " FROM session_files ORDER BY path")
     ]
-    return _fingerprint({"sessionEntries": entries, "sessionFiles": files})
+    basis = {"sessionEntries": entries, "sessionFiles": files}
+    if include_codex:
+        if "codex_session_entries" not in _cache_contract(cache_conn):
+            raise _lib_rederive.RederiveDataGap(
+                "missing cache.db table codex_session_entries"
+            )
+        basis["codexEntries"] = [
+            list(row) for row in cache_conn.execute(
+                "SELECT source_path,line_offset,timestamp_utc,session_id,model,"
+                "input_tokens,cached_input_tokens,output_tokens,"
+                "reasoning_output_tokens,account_key "
+                "FROM codex_session_entries ORDER BY source_path,line_offset"
+            )
+        ]
+    return _fingerprint(basis)
+
+
+def _split_matches(parts, total) -> bool:
+    """A recorded cost split agrees with its total up to summation order.
+
+    The at-fire writer sums one interleaved entry stream into the total and
+    into per-model buckets, and the two association orders round differently
+    as spend grows. `fsum` removes the split's own rounding; the relative bound
+    absorbs the total's, while a material mismatch still fails (#869 F8).
+    """
+    return math.isclose(
+        math.fsum(parts), total, rel_tol=1e-10, abs_tol=1e-9,
+    )
+
+
+def _desired_codex_budget_costs(selection, cache_conn, *, uncertain=None):
+    """Correct only journaled fallback facts with an unchanged source set.
+
+    ``uncertain`` collects the ids of crossings kept unchanged because their
+    retained source population no longer matches the recorded one.
+    """
+    import _cctally_cache
+    import _lib_cost_provenance
+    import _lib_pricing
+    out = []
+    for selected in selection.by_id.values():
+        record = selected.record
+        if selected.status != "active" or record is None:
+            continue
+        payload = record.get("payload") or {}
+        if payload.get("kind") != "budget" or payload.get("vendor") != "codex":
+            continue
+        old = payload.get("_pricing") or {}
+        if old.get("version") != 1:
+            continue  # legacy evidence is insufficient for automatic repricing
+        missing = old.get("fallbackModels") or []
+        if not missing:
+            out.append(record)  # a genuinely priced at-fire fact is immutable
+            continue
+        old_model_costs = old.get("modelCostsUsd")
+        spent_value = payload.get("spent_usd")
+        if (
+            not isinstance(missing, list)
+            or not missing
+            or any(not isinstance(model, str) or not model for model in missing)
+            or len(set(missing)) != len(missing)
+            or not isinstance(old_model_costs, dict)
+            or any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(value) or value < 0
+                for value in old_model_costs.values()
+            )
+            or any(model not in old_model_costs for model in missing)
+            or not isinstance(old.get("directCostUsd"), (int, float))
+            or not math.isfinite(old["directCostUsd"])
+            or old["directCostUsd"] < 0
+            or old.get("speed") not in ("standard", "fast")
+            or not isinstance(spent_value, (int, float))
+            or not math.isfinite(spent_value)
+            or not _split_matches(old_model_costs.values(), spent_value)
+            or not _split_matches(
+                [old["directCostUsd"],
+                 *(old_model_costs[model] for model in missing)],
+                spent_value,
+            )
+        ):
+            raise _lib_rederive.RederiveDataGap(
+                f"Codex budget {record['id']} has incomplete at-fire "
+                "pricing provenance"
+            )
+        if any(_lib_pricing._is_codex_fallback(model) for model in missing):
+            # #869 F1: a direct card has not shipped for every fallback model,
+            # so nothing about this crossing can change yet. Decided before
+            # the population comparison: drift in a fact this run cannot
+            # correct must not refuse every other correction in the family.
+            out.append(record)
+            continue
+        try:
+            start = dt.datetime.fromisoformat(
+                payload["period_start_at"].replace("Z", "+00:00")
+            )
+            end = dt.datetime.fromisoformat(
+                payload["crossed_at_utc"].replace("Z", "+00:00")
+            )
+            if start.tzinfo is None or end.tzinfo is None or start >= end:
+                raise ValueError("invalid budget cost bounds")
+            speed = old["speed"]
+            threshold = float(payload["threshold"])
+            target = float(payload["budget_usd"])
+            scope = payload.get("account_key")
+            if scope == "*":
+                scope = None
+            source = _cctally_cache.iter_codex_entries(
+                cache_conn, start, end, account_key=scope,
+            )
+            cost, newer = _lib_cost_provenance.codex_cost_with_provenance(
+                source, end=end, speed=speed,
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise _lib_rederive.RederiveDataGap(
+                f"Codex budget {record['id']} lacks retained cost inputs: {exc}"
+            ) from exc
+        if (
+            newer["sourceHash"] != old.get("sourceHash")
+            or newer["entryCount"] != old.get("entryCount")
+        ):
+            # A changed population cannot license a new amount, but it does
+            # not invalidate the recorded crossing either: keep it exactly as
+            # fired and disclose it (#869 F1/Q2).
+            if uncertain is not None:
+                uncertain.add(record["id"])
+            out.append(record)
+            continue
+        if any(model not in newer["modelCostsUsd"] for model in missing):
+            raise _lib_rederive.RederiveDataGap(
+                f"Codex budget {record['id']} lacks a complete at-fire "
+                "priced-cost split"
+            )
+        if any(
+            model in newer["fallbackModels"]
+            for model in old_model_costs if model not in missing
+        ):
+            # #869 V5: a model priced by a direct card at fire has lost that
+            # card, so this run cannot price the crossing truthfully. That is
+            # this crossing's gap alone: keep it exactly as fired and disclose
+            # it, rather than refusing every other correction in the family.
+            if uncertain is not None:
+                uncertain.add(record["id"])
+            out.append(record)
+            continue
+        # Only the fallback-priced models change. The direct-card contribution
+        # is a real at-fire fact even when those cards are revised later.
+        cost = math.fsum([
+            float(old["directCostUsd"]),
+            *(newer["modelCostsUsd"][model] for model in missing),
+        ])
+        consumption_pct = cost / target * 100.0 if target > 0 else 0.0
+        if consumption_pct + 1e-9 < threshold:
+            # #869 F6: the fallback overpriced this crossing and the real card
+            # puts it below its threshold. Omitting it from the desired set
+            # tombstones it in the correction batch, so the natural key is
+            # free for a genuine later crossing (which re-fires under a new
+            # incarnation id, `bm2:`).
+            continue
+        revised = copy.deepcopy(record)
+        revised_payload = revised["payload"]
+        revised_payload["spent_usd"] = cost
+        revised_payload["consumption_pct"] = consumption_pct
+        revised_pricing = copy.deepcopy(newer)
+        revised_pricing["modelCostsUsd"] = {
+            model: (
+                newer["modelCostsUsd"][model] if model in missing else value
+            )
+            for model, value in old_model_costs.items()
+        }
+        revised_pricing["directCostUsd"] = cost
+        revised_payload["_pricing"] = revised_pricing
+        out.append(revised)
+    return out
+
+
+def _historical_close_candidates(selection) -> set:
+    """(account_key, window key) of each unmarked close with a $0 model."""
+    import _lib_accounts
+
+    out = set()
+    for selected in selection.by_id.values():
+        record = selected.record
+        if selected.status != "active" or record is None:
+            continue
+        payload = record.get("payload") or {}
+        if (
+            payload.get("kind") != "five_hour_block_close"
+            or payload.get("_pricing")
+            or payload.get("pricing_provenance_json") is not None
+            or not _lib_rederive.close_cost_is_uncertain(payload)
+        ):
+            continue
+        try:
+            out.add((
+                payload.get("account_key") or _lib_accounts.UNATTRIBUTED,
+                int(payload["five_hour_window_key"]),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _historical_close_markers(selection, desired_events, block_sources):
+    """event id -> correction marker for each provable historical close (#869).
+
+    An unmarked close predates computation-time pricing evidence. It is
+    provable only from the retained entries the scratch replay assigned to the
+    same block, with the same account, no provider cost, and a positive current
+    card rate for every token class those entries used. The planner still
+    compares the replayed child populations before adopting the correction.
+    """
+    import _lib_accounts
+    import _lib_cost_provenance
+
+    desired_closes = {
+        event.get("id"): event for event in desired_events
+        if (event.get("payload") or {}).get("kind") == "five_hour_block_close"
+    }
+    markers = {}
+    for event_id, selected in selection.by_id.items():
+        record = selected.record
+        if (
+            selected.status != "active"
+            or record is None
+            or event_id not in desired_closes
+        ):
+            continue
+        payload = record.get("payload") or {}
+        if payload.get("kind") != "five_hour_block_close":
+            continue
+        desired = desired_closes[event_id].get("payload") or {}
+        key = (
+            desired.get("account_key") or _lib_accounts.UNATTRIBUTED,
+            desired.get("five_hour_window_key"),
+        )
+        try:
+            key = (key[0], int(key[1]))
+        except (TypeError, ValueError):
+            continue
+        marker = _lib_cost_provenance.historical_close_marker(
+            payload, block_sources.get(key),
+            unattributed=_lib_accounts.UNATTRIBUTED,
+        )
+        if marker is not None:
+            markers[event_id] = marker
+    return markers
+
+
+def _uncertain_cost_facts(selection) -> set:
+    """Ids of retained Codex monetary events lacking proof of their inputs.
+
+    Closed Claude blocks are judged by the plan itself, because whether one
+    stays uncertain depends on the correction this plan makes to it.
+    """
+    out = set()
+    for event_id, selected in selection.by_id.items():
+        if selected.status != "active" or selected.record is None:
+            continue
+        payload = selected.record.get("payload") or {}
+        kind = payload.get("kind")
+        if (kind == "budget" and payload.get("vendor") == "codex"
+                and "_pricing" not in payload):
+            out.add(event_id)
+        elif (kind == "projected"
+              and payload.get("metric") == "codex_budget_usd"):
+            # Historical projection inputs/config are not retained, so this
+            # at-fire alert value cannot be recomputed from a new rate card.
+            out.add(event_id)
+    return out
 
 
 def _validate_cache_rows(cache_conn: sqlite3.Connection,
@@ -180,7 +450,7 @@ def _joined_entries(cache_conn, range_start, range_end, *,
         "SELECT se.timestamp_utc, se.model, se.input_tokens, se.output_tokens, "
         "se.cache_create_tokens, se.cache_read_tokens, se.source_path, "
         "sf.session_id, sf.project_path, se.cost_usd_raw, se.speed, "
-        "se.cache_create_1h_tokens "
+        "se.cache_create_1h_tokens, se.line_offset, se.account_key "
         "FROM session_entries se "
         "LEFT JOIN session_files sf ON sf.path = se.source_path "
         "WHERE se.timestamp_utc >= ? AND se.timestamp_utc <= ?"
@@ -203,7 +473,7 @@ def _joined_entries(cache_conn, range_start, range_end, *,
     sql += " ORDER BY se.timestamp_utc ASC, se.id ASC"
     out = []
     for row in cache_conn.execute(sql, params):
-        out.append(cache._JoinedClaudeEntry(
+        entry = cache._JoinedClaudeEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),
             model=row[1],
             input_tokens=int(row[2] or 0),
@@ -216,7 +486,13 @@ def _joined_entries(cache_conn, range_start, range_end, *,
             cost_usd=row[9],
             usage_extra=({"speed": row[10]} if row[10] else None),
             cache_1h_tokens=(None if row[11] is None else int(row[11])),
-        ))
+        )
+        # #869: the retained source identity and account of the entry. The
+        # cost path never reads these; the historical-close proof fingerprints
+        # the exact population and requires every entry to be the close's.
+        entry.source_line_offset = row[12]
+        entry.source_account_key = row[13]
+        out.append(entry)
     return out
 
 
@@ -691,7 +967,8 @@ def _normalize_legacy_accounts(records: list[dict]) -> None:
 
 def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
                            scratch_dir: Path, *,
-                           held_weekly_observation_ids=frozenset()) -> list[dict]:
+                           held_weekly_observation_ids=frozenset(),
+                           block_sources: "dict | None" = None) -> list[dict]:
     # #386: this replays the whole ingest pipeline into a PRIVATE scratch index
     # and is reached from `db rederive`'s PREVIEW, which takes no locks by
     # design (its contract is zero persistent writes to the live family). The
@@ -705,12 +982,14 @@ def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
     with _cctally_store.stats_write_scope("rederive-derive"):
         return _derive_desired_events_into(
             records, cache_conn, str(scratch_path),
-            held_weekly_observation_ids=held_weekly_observation_ids)
+            held_weekly_observation_ids=held_weekly_observation_ids,
+            block_sources=block_sources)
 
 
 def _derive_desired_events_into(
     records, cache_conn, scratch_path, *,
     held_weekly_observation_ids=frozenset(),
+    block_sources: "dict | None" = None,
 ) -> list[dict]:
     raw_records = _rederivable_raw_records(records)
     held_ids = frozenset(held_weekly_observation_ids)
@@ -747,6 +1026,7 @@ def _derive_desired_events_into(
                     held_weekly_observation_ids=held_ids,
                     reviewed_weekly_basis_by_account=(
                         reviewed_weekly_basis_by_account),
+                    block_source_evidence=block_sources,
                 )
                 conn.execute("BEGIN IMMEDIATE")
                 try:
@@ -811,7 +1091,15 @@ def plan_claude_usage(
     _lib_rederive.validate_claude_cache_contract(_cache_contract(cache_conn))
     raw_records = _rederivable_raw_records(records)
     _validate_cache_rows(cache_conn, raw_records)
-    cache_fingerprint = _cache_fingerprint(cache_conn)
+    codex_pricing_records = any(
+        (record.get("payload") or {}).get("vendor") == "codex"
+        and (record.get("payload") or {}).get("kind") == "budget"
+        and (record.get("payload") or {}).get("_pricing")
+        for record in records
+    )
+    cache_fingerprint = _cache_fingerprint(
+        cache_conn, include_codex=codex_pricing_records,
+    )
     held_ids, _accepted_ids, identity_pairs, reviewed_ops = (
         _reviewed_weekly_state(records)
     )
@@ -855,11 +1143,21 @@ def plan_claude_usage(
         raise _lib_rederive.RederiveConflict(
             "journal contains tainted correction batch(es): " + summary
         )
+    # Only an unmarked close with a zero-cost model can need the historical
+    # proof, so the scratch replay keeps retained entries for those blocks
+    # alone rather than for every block in the journal.
+    block_sources = dict.fromkeys(_historical_close_candidates(selection))
     with tempfile.TemporaryDirectory(prefix="cctally-rederive-") as tmp:
         desired = _derive_desired_events(
             records, cache_conn, Path(tmp),
             held_weekly_observation_ids=held_ids,
+            block_sources=block_sources,
         )
+    historical_markers = _historical_close_markers(
+        selection, desired, block_sources)
+    codex_uncertain: set = set()
+    desired.extend(_desired_codex_budget_costs(
+        selection, cache_conn, uncertain=codex_uncertain))
     # #426: the scratch replay only sees RETAINED sources, so it can never
     # reproduce the pre-cutover rows the journal exported as `b:<table>:<rowid>`
     # evt lines. Hold them out of the diff instead of retiring them. Evidence is
@@ -883,6 +1181,9 @@ def plan_claude_usage(
         raw_observations=raw_records,
         snapshot_identity_decisions=identity_pairs,
         reviewed_weekly_hold_ids=held_ids,
+        uncertain_cost_fact_ids=(
+            _uncertain_cost_facts(selection) | codex_uncertain),
+        historical_close_markers=historical_markers,
         enforce_guard=enforce_guard,
     )
 
@@ -1885,6 +2186,8 @@ def _command_payload(
     }
     if reviewed_decision_id is not None:
         body["reviewedWeeklyDecisionId"] = reviewed_decision_id
+    if plan is not None and plan.uncertain_cost_fact_count:
+        body["uncertainCostFactCount"] = plan.uncertain_cost_fact_count
     if preview is not None and preview.baseline_plan is not None:
         body["baselinePlanHash"] = preview.baseline_plan.plan_hash
         body["baselineActionCounts"] = dict(preview.baseline_plan.counts)

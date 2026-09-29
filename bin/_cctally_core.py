@@ -468,7 +468,12 @@ _init_paths_from_env()
 # a migration is unchanged: the registry is frozen at 13, and an epoch-current
 # open returns before any schema work, so a handler or an
 # `add_column_if_missing` would never run on an upgraded install.
-STATS_INDEX_EPOCH = 1015
+# 1015 -> 1016 (#869): an open five-hour block records the pricing evidence
+# used to compute its current cost. Closing a different block on a successor
+# tick must carry that earlier evidence into the journal, even after this
+# binary learns a new model card. A pre-existing open projection that was
+# rebuilt without the marker remains unproven until a new tick recomputes it.
+STATS_INDEX_EPOCH = 1016
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -2506,6 +2511,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 total_cache_create_tokens     INTEGER NOT NULL DEFAULT 0,
                 total_cache_read_tokens       INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd                REAL    NOT NULL DEFAULT 0,
+                pricing_provenance_json       TEXT,
                 is_closed                     INTEGER NOT NULL DEFAULT 0,
                 created_at_utc                TEXT    NOT NULL,
                 last_updated_at_utc           TEXT    NOT NULL,
@@ -2517,6 +2523,8 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         add_column_if_missing(
             conn, "five_hour_blocks", "account_key",
             "TEXT NOT NULL DEFAULT 'unattributed'")
+        add_column_if_missing(
+            conn, "five_hour_blocks", "pricing_provenance_json", "TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_five_hour_blocks_block_start

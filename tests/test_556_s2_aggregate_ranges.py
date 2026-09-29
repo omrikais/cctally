@@ -1145,6 +1145,12 @@ def test_transient_fold_failure_does_not_survive_a_tick(
     prior generation unchanged and one transient failure would withhold the
     aggregate for the life of the process.
     """
+    tui = dashboard_harness.tui
+    # #857: a Codex generation idles only on the quota-dependency identity it
+    # was stamped with, and a build stamps one only for a cache file it
+    # observed before opening it. Create the file first so the build below
+    # stamps a real identity and gate 1 can be asked with it.
+    dashboard_harness.ns["open_cache_db"]().close()
     with monkeypatch.context() as failing:
         first = dashboard_harness.tick(fold_raises=True, monkeypatch=failing)
     assert first.sources["all"].data["aggregates"]["projects"] == {
@@ -1158,7 +1164,12 @@ def test_transient_fold_failure_does_not_survive_a_tick(
     assert first.sources["claude"].freshness == "fresh"
 
     # Gate 1: an apparently healthy provider whose fold failed must not idle.
-    assert dashboard_harness.tui._tui_source_bundle_can_idle(first) is False
+    # Asked with the identity the Codex generation was stamped with, so the
+    # refusal cannot be #857's missing-provenance refusal.
+    first_identity = first.sources["codex"].clock_data["codex_quota_dependency"]
+    assert first_identity is not None, "precondition: a stamped identity"
+    assert tui._tui_source_bundle_can_idle(
+        first, codex_dependency=first_identity) is False
 
     # Nothing else changed; the next tick must recover.
     second = dashboard_harness.tick()
@@ -1168,6 +1179,13 @@ def test_transient_fold_failure_does_not_survive_a_tick(
     assert second.sources["claude"] is not first.sources["claude"], (
         "gate 2: provider reuse must not return the failed object"
     )
+    # Attribution: with the fold recovered, the same store's bundle idles on
+    # its own stamp, so gate 1's refusal above was the failed fold's alone.
+    assert tui._tui_source_bundle_can_idle(
+        second,
+        codex_dependency=second.sources["codex"].clock_data[
+            "codex_quota_dependency"],
+    ) is True
 
 
 def test_outcome_participates_in_version_identity(
@@ -2515,6 +2533,14 @@ def test_the_idle_rebuild_carries_the_prior_projects_envelope(
     assert prior.projects_envelope is not None
     bundle = prior.source_bundle
     assert bundle is not None
+    # #857: the identity the Codex generation was stamped with. Every idle
+    # question below is asked with it, so no refusal can be the missing-
+    # provenance one; the unmodified bundle idles on it.
+    identity = bundle.sources["codex"].clock_data["codex_quota_dependency"]
+    assert identity is not None, "precondition: a stamped identity"
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=identity) is True, (
+        "precondition: only the injected failure may refuse")
 
     claude = bundle.sources["claude"]
     failed = dataclasses.replace(
@@ -2530,7 +2556,8 @@ def test_the_idle_rebuild_carries_the_prior_projects_envelope(
             bundle, sources={**dict(bundle.sources), "claude": failed},
         ),
     )
-    assert not tui._tui_source_bundle_can_idle(prior.source_bundle), (
+    assert not tui._tui_source_bundle_can_idle(
+        prior.source_bundle, codex_dependency=identity), (
         "the idle guard must refuse, or the rebuild branch never runs"
     )
 
@@ -2547,6 +2574,7 @@ def test_the_idle_rebuild_carries_the_prior_projects_envelope(
             source_stats_conn=stats,
             source_display_tz_name="UTC",
             source_display_tz=ZoneInfo("UTC"),
+            codex_dependency=identity,
         )
     finally:
         stats.close()
@@ -2589,6 +2617,14 @@ def test_the_idle_tick_rebuilds_a_retryable_metadata_health_generation(
     )
     bundle = prior.source_bundle
     assert bundle is not None
+    # #857: the identity the Codex generation was stamped with, carried by the
+    # degraded copy below. Every idle question is asked with it, so no refusal
+    # can be the missing-provenance one; the unmodified bundle idles on it.
+    identity = bundle.sources["codex"].clock_data["codex_quota_dependency"]
+    assert identity is not None, "precondition: a stamped identity"
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=identity) is True, (
+        "precondition: only the injected carrier may refuse")
 
     codex = bundle.sources["codex"]
     degraded = dataclasses.replace(
@@ -2607,7 +2643,8 @@ def test_the_idle_tick_rebuilds_a_retryable_metadata_health_generation(
         "the fixture must leave availability ok, or the guard would refuse on "
         "a different leg and this test would say nothing about the carrier"
     )
-    assert not tui._tui_source_bundle_can_idle(prior.source_bundle), (
+    assert not tui._tui_source_bundle_can_idle(
+        prior.source_bundle, codex_dependency=identity), (
         "the idle guard must refuse a retryable carrier, or the transient "
         "state is republished without ever re-reading the store"
     )
@@ -2625,6 +2662,7 @@ def test_the_idle_tick_rebuilds_a_retryable_metadata_health_generation(
             source_stats_conn=stats,
             source_display_tz_name="UTC",
             source_display_tz=ZoneInfo("UTC"),
+            codex_dependency=identity,
         )
     finally:
         stats.close()

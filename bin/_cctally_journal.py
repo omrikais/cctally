@@ -1409,12 +1409,19 @@ class IngestContext:
     # (reset INSERT OR IGNORE rowcount == 1), so a crash-replayed reset never
     # re-suppresses with a divergent list.
     suppression_map: dict = field(default_factory=dict)
+    # Indexed by (event kind, local row id) until harvest persists the marker.
+    pricing_provenance: dict = field(default_factory=dict)
     # Task B rederive seam. Normal ingest leaves both defaults unchanged.
     # A scratch planner supplies an in-memory sink so derived events are captured
     # instead of appended to the durable journal, and disables projection-file
     # writes while still exercising the same SQLite derivation/fold code.
     event_sink: "list | None" = None
     projection_writes: bool = True
+    # #869 `db rederive` scratch replay only. Its keys name the (account_key,
+    # window key) blocks the planner must prove; each value becomes the
+    # retained entries behind the totals that block last applied. Live ingest
+    # leaves it None and keeps no entries.
+    block_source_evidence: "dict | None" = None
     # Operator-reviewed scratch replay only. Normal ingest leaves this empty.
     held_weekly_observation_ids: frozenset[str] = field(default_factory=frozenset)
     reviewed_weekly_basis_by_account: dict = field(default_factory=dict)
@@ -4127,7 +4134,10 @@ def _apply_generic_evt(conn, evt):
         return None
     cols = {"journal_id": evt["id"]}
     for key, value in payload.items():
-        if key == "kind":
+        # `journal_identity_version` names how the event id was minted (#869
+        # alert-latch re-fire incarnations: bm2/pjm2/pbm2); it is journal
+        # metadata, never a column.
+        if key in ("kind", "_pricing", "journal_identity_version"):
             continue
         if key in spec.fk_refs:
             column, ref_table = spec.fk_refs[key]
@@ -4493,7 +4503,7 @@ def _apply_block_close(conn, evt):
     parent = {"journal_id": evt["id"]}
     children = {}
     for key, value in payload.items():
-        if key == "kind":
+        if key in ("kind", "_pricing"):
             continue
         if key in _BLOCK_CHILD_KEYS:
             children[key] = value or []
@@ -4552,7 +4562,7 @@ def _apply_reset_with_suppression(conn, evt):
         return None
     cols = {"journal_id": evt["id"]}
     for key, value in payload.items():
-        if key in ("kind", "suppression", "suppression_table"):
+        if key in ("kind", "suppression", "suppression_table", "_pricing"):
             continue
         if key in spec.fk_refs:
             column, ref_table = spec.fk_refs[key]
@@ -4834,6 +4844,59 @@ def _build_harvest_evt(ctx, spec, row):
             {k: cr[k] for k in cr.keys() if k not in ("id", "block_id")}
             for cr in child_rows
         ]
+    if spec.kind == "five_hour_block_close":
+        raw_pricing = row["pricing_provenance_json"]
+        if raw_pricing is not None:
+            try:
+                pricing = json.loads(raw_pricing)
+            except (TypeError, ValueError) as exc:
+                raise JournalError(
+                    "five_hour_block_close has malformed computation-time "
+                    "pricing provenance"
+                ) from exc
+            if (
+                not isinstance(pricing, dict)
+                or pricing.get("version") != 1
+                or not isinstance(pricing.get("pricingDate"), str)
+                or not pricing["pricingDate"]
+                or not isinstance(pricing.get("unpricedModels"), list)
+                or any(not isinstance(model, str) or not model
+                       for model in pricing["unpricedModels"])
+                or pricing["unpricedModels"] != sorted(set(
+                    pricing["unpricedModels"]
+                ))
+                or (
+                    "uncertainModels" in pricing
+                    and (
+                        not isinstance(pricing["uncertainModels"], list)
+                        or any(not isinstance(model, str) or not model
+                               for model in pricing["uncertainModels"])
+                        or pricing["uncertainModels"] != sorted(set(
+                            pricing["uncertainModels"]
+                        ))
+                    )
+                )
+            ):
+                raise JournalError(
+                    "five_hour_block_close has incomplete computation-time "
+                    "pricing provenance"
+                )
+            positive_models = {
+                child["model"] for child in payload.get("_models", [])
+                if sum(int(child.get(key) or 0) for key in (
+                    "input_tokens", "output_tokens", "cache_create_tokens",
+                    "cache_read_tokens",
+                )) > 0
+            }
+            if not (
+                set(pricing["unpricedModels"])
+                | set(pricing.get("uncertainModels") or [])
+            ) <= positive_models:
+                raise JournalError(
+                    "five_hour_block_close pricing provenance does not match "
+                    "its computed model population"
+                )
+            payload["_pricing"] = pricing
     # #750 S3 §1.1: ONE producer for the id parts and for the suppression-map
     # key. A family with an `id_parts_fn` (today only `week_reset_events`,
     # whose identity is dual-shaped) supplies both from that callable; every
@@ -4851,9 +4914,83 @@ def _build_harvest_evt(ctx, spec, row):
         supp = ctx.suppression_map.get(supp_key)
         if supp:
             payload["suppression"] = list(supp)
+    provenance = ctx.pricing_provenance.get((spec.kind, int(row["id"])))
+    if provenance is not None:
+        payload["_pricing"] = provenance
     eid = _lib_journal.evt_id(spec.id_prefix, *parts)
+    refire_prefix = _LATCH_REFIRE_ID_PREFIXES.get(spec.kind)
+    if (
+        refire_prefix is not None
+        and ctx.event_sink is None
+        and _latch_event_was_retired(conn, eid)
+    ):
+        # #869 F6/V1: a correction retired this natural key's earlier crossing
+        # with a higher-revision tombstone, so a revision-0 event under the
+        # same id can never become effective. A later crossing is a new
+        # incarnation: its id adds the crossing instant, while the table's
+        # natural key still deduplicates it. Every other crossing, and every
+        # already-journaled id, keeps the legacy spelling.
+        eid = _lib_journal.evt_id(
+            refire_prefix, *parts, row["crossed_at_utc"])
+        payload["journal_identity_version"] = 2
     at = row[spec.at_column] if spec.at_column else _now_iso()
     return _lib_journal.make_evt(kind=spec.kind, id=eid, at=at, payload=payload)
+
+
+#: #869 F6/V1. The id prefix, per alert-latch kind, of a crossing that re-fires
+#: after a correction tombstoned the natural key's earlier crossing (the legacy
+#: prefix + identity version 2). `db rederive` retires these latches, so each
+#: one needs a spelling a later live crossing can journal under.
+#:
+#: Coupling: the live writers (`_claude_latch_recreates_retired_crossing` in
+#: `_cctally_record`) stamp a recreated CLAUDE latch without notifying, on the
+#: premise that every Claude-latch tombstone is the claude-usage family's
+#: stale-config retirement, never a verdict that the crossing was false. A
+#: future rule that retires a Claude latch as a false crossing must record
+#: that distinction durably, or the genuine later crossing is silently
+#: suppressed.
+_LATCH_REFIRE_ID_PREFIXES = {
+    "budget": "bm2",
+    "projected": "pjm2",
+    "project_budget": "pbm2",
+}
+
+
+def _latch_event_was_retired(conn, legacy_event_id) -> bool:
+    """True iff the effective selection for this natural-key id is a tombstone.
+
+    Read from the live effective metadata the rebuild published, never
+    recomputed. A missing row or an active event keeps the legacy id.
+    """
+    prior = _metadata_row(conn, legacy_event_id)
+    return prior is not None and str(prior[1]) == "tombstone"
+
+
+def latch_crossing_was_retired(conn, kind, rowid) -> bool:
+    """True iff alert-latch row ``rowid`` re-creates a retired crossing (#869).
+
+    ``kind`` is a latch family with a re-fire incarnation (``budget``,
+    ``projected``, ``project_budget``). The row's legacy natural-key event id
+    is minted exactly as harvest mints it, and the answer is the live effective
+    metadata's: a tombstone means a completed correction batch retired an
+    earlier crossing of this natural key, so harvest will journal this row
+    under the kind's version-2 prefix. A live writer calls this in the same
+    transaction as its insert, before harvest runs, so both decisions read one
+    durable fact.
+    """
+    if kind not in _LATCH_REFIRE_ID_PREFIXES:
+        raise ValueError(f"{kind!r} has no re-fire incarnation")
+    [spec] = [item for item in _HARVEST_SPECS if item.kind == kind]
+    if spec.fk_refs or spec.id_parts_fn is not None:
+        raise ValueError(f"{kind!r} ids are not plain natural-key columns")
+    row = conn.execute(
+        f"SELECT {', '.join(spec.id_parts)} FROM {spec.table} WHERE id = ?",
+        (int(rowid),),
+    ).fetchone()
+    if row is None:
+        return False
+    return _latch_event_was_retired(
+        conn, _lib_journal.evt_id(spec.id_prefix, *tuple(row)))
 
 
 def _emit_harvest_row(ctx, spec, row):
@@ -5334,7 +5471,10 @@ def _run_config_reconcile(ctx, reconcile_config) -> None:
         if fn is None:
             continue
         try:
-            fn(validated_budget, conn=ctx.conn)
+            if axis == "codex_budget":
+                fn(validated_budget, conn=ctx.conn, journal_ctx=ctx)
+            else:
+                fn(validated_budget, conn=ctx.conn)
         except Exception as exc:  # best-effort; never break the cycle over a reconcile
             print(f"[budget-reconcile] {name} failed: {exc}", file=sys.stderr)
     # Per-project reconcile takes `touched_projects` as its 2nd positional
@@ -6086,7 +6226,8 @@ def _effective_event_for_convergence(conn, event_id) -> dict:
 
 # Effect keys that ride an evt payload but are NOT target-table columns.
 _EVT_EFFECT_KEYS = frozenset(
-    {"kind", "suppression", "suppression_table", "floor_suppression", "hwm_floor"}
+    {"kind", "suppression", "suppression_table", "floor_suppression",
+     "hwm_floor", "_pricing", "journal_identity_version"}
 )
 
 
@@ -8020,7 +8161,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "b8f18315bce871bd9692ba1db73cf7e2bda716b360616fc65149ce209248906d"
+    "e0f2225f00843952b4887fa8afb046edacd3da0642d0f402ebaa5219a6e30697"
 )
 
 

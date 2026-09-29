@@ -356,7 +356,16 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_five_hour.py": 1,
     # Sixteen, not eighteen: the two `event {} rev {} conflicts with effective
     # rev {} from {}` refusals are prose and no longer count.
-    "_cctally_journal.py": 16,
+    #
+    # Seventeen since #869: `latch_crossing_was_retired` reads a latch row's
+    # natural-key columns with `SELECT … FROM {spec.table} WHERE id = ?` so a
+    # live writer can ask whether harvest will journal it as a re-fire. It
+    # accepts only the `budget`, `projected` and `project_budget` harvest
+    # specs (`_LATCH_REFIRE_ID_PREFIXES`), so `{spec.table}` is always
+    # `budget_milestones`, `projected_milestones` or
+    # `project_budget_milestones`. None is a projection table, so it needs no
+    # entry below.
+    "_cctally_journal.py": 17,
     "_cctally_pricing_check.py": 1,
     # One, in `_read_stats_component`: a single `SELECT {column} FROM
     # {table}` shared by `week_reset_events` and `weekly_credit_floors`,

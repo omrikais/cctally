@@ -78,7 +78,8 @@ def _context(module, cache, stats):
     )
 
 
-def _accounting(cache, *, range_end=None, extra=("speed", ("root",))):
+def _accounting(cache, *, range_end=None, extra=("speed", ("root",)),
+                range_start=START):
     """One `build_cached_codex_accounting` round over the seeded corpus."""
     from _cctally_source_analytics import load_cached_rooted_codex_accounting_entries
 
@@ -86,7 +87,7 @@ def _accounting(cache, *, range_end=None, extra=("speed", ("root",))):
 
     def load_all():
         return load_cached_rooted_codex_accounting_entries(
-            START, end, speed="auto", cache_conn=cache)
+            range_start, end, speed="auto", cache_conn=cache)
 
     def load_paths(identities):
         return tuple(
@@ -97,7 +98,7 @@ def _accounting(cache, *, range_end=None, extra=("speed", ("root",))):
 
     return snapshot.build_cached_codex_accounting(
         cache_conn=cache,
-        range_start=START,
+        range_start=range_start,
         range_end=end,
         extra_signature=extra,
         load_all=load_all,
@@ -448,6 +449,220 @@ def test_the_label_algorithm_version_is_part_of_the_signature(env, monkeypatch):
     assert isinstance(snapshot.CODEX_POPULATION_SIGNATURE_VERSION, str)
     assert snapshot.CODEX_POPULATION_SIGNATURE_VERSION in before, (
         "the accounting carrier's own signature version must be a member too")
+
+
+# ── #857: the capture-owned accounting provenance token ────────────────────
+#
+# The dashboard admits a retained Codex generation only while the token its
+# build captured is the token of the population the process accounting cache
+# last consumed. The signature above cannot serve: its generation leg restarts
+# at one whenever the state is cleared, so a later population can carry an
+# earlier one's name. The token is minted from an allocator that is never
+# rewound, preserved only across a capture that changed nothing, and the
+# consumed copy lives outside the evictable state.
+
+_857_END = NOW + dt.timedelta(microseconds=1)
+
+
+def _857_token(result):
+    token = result.provenance_token
+    assert isinstance(token, int), (
+        "a qualified capture always names the population it returns")
+    return token
+
+
+def _857_ledger_head(cache):
+    return int(cache.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_accounting_mutation_seq'").fetchone()[0])
+
+
+def test_857_an_unchanged_capture_preserves_the_provenance_token(env):
+    _ns, cache, _stats, _module = env
+    snapshot.reset_codex_accounting_cache_state()
+    first = _accounting(cache, range_end=_857_END)
+    assert first.cold is True
+    token = _857_token(first)
+    assert snapshot.codex_accounting_consumed_provenance() == token
+
+    again = _accounting(cache, range_end=_857_END)
+    assert again.cold is False and not again.dirty_paths, (
+        "precondition: nothing changed")
+    assert _857_token(again) == token
+    # An upper bound that reveals no row leaves the population, and so its
+    # name, exactly as they were — the tick-by-tick case.
+    later = _accounting(cache, range_end=_857_END + dt.timedelta(hours=1))
+    assert later.cold is False and not later.dirty_paths, (
+        "precondition: the advanced bound revealed nothing")
+    assert _857_token(later) == token
+    assert snapshot.codex_accounting_consumed_provenance() == token
+
+
+def test_857_every_population_change_mints_a_never_reused_token(env):
+    """Cold reconstruction, every ledger advance (a dirty path or none), and
+    every replacement the ledger does not name — a semantic-key change, a
+    range-start change, a clock regression, a revealed future row, a
+    sequence regression — each mint a token no earlier capture carried."""
+    _ns, cache, _stats, _module = env
+    snapshot.reset_codex_accounting_cache_state()
+    seen: list[int] = []
+
+    def minted(result, why):
+        token = _857_token(result)
+        assert token not in seen, f"{why}: reused an earlier token"
+        assert snapshot.codex_accounting_consumed_provenance() == token, why
+        seen.append(token)
+
+    minted(_accounting(cache, range_end=_857_END), "cold reconstruction")
+
+    _widen_corpus(cache, files=1, per_file=1, prefix="857-insert",
+                  offset_base=91_000)
+    result = _accounting(cache, range_end=_857_END)
+    assert result.cold is False and result.dirty_paths, "precondition"
+    minted(result, "an inserted row")
+
+    row_id = cache.execute(
+        "SELECT id FROM codex_session_entries ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    cache.execute(
+        "UPDATE codex_session_entries SET account_key = ? WHERE id = ?",
+        ("acct-857-restamped", row_id))
+    cache.commit()
+    result = _accounting(cache, range_end=_857_END)
+    assert result.cold is False and result.dirty_paths, "precondition"
+    minted(result, "an in-place restamp")
+
+    # A ledger advance whose change names no path: the rows are unchanged,
+    # but the cursor moved, so the population consumed a new ledger state.
+    head = _857_ledger_head(cache)
+    cache.execute(
+        "INSERT INTO codex_accounting_change_log "
+        "(mutation_seq, change_kind, source_root_key, source_path) "
+        "VALUES (?, 'path', NULL, NULL)", (head + 1,))
+    cache.execute(
+        "UPDATE cache_meta SET value=? "
+        "WHERE key='codex_accounting_mutation_seq'", (str(head + 1),))
+    cache.commit()
+    result = _accounting(cache, range_end=_857_END)
+    assert result.cold is False and not result.dirty_paths, "precondition"
+    minted(result, "a ledger advance that dirties no path")
+
+    other = ("speed", ("857-other-root",))
+    minted(_accounting(cache, range_end=_857_END, extra=other),
+           "a semantic-key change")
+    minted(_accounting(cache, range_end=_857_END, extra=other,
+                       range_start=START + dt.timedelta(days=1)),
+           "a range-start change")
+    minted(_accounting(cache, range_end=_857_END - dt.timedelta(hours=1),
+                       extra=other, range_start=START + dt.timedelta(days=1)),
+           "a clock regression")
+
+    template = cache.execute(
+        "SELECT session_id, model, input_tokens, cached_input_tokens, "
+        "output_tokens, reasoning_output_tokens, total_tokens, "
+        "source_root_key, conversation_key FROM codex_session_entries "
+        "ORDER BY id LIMIT 1"
+    ).fetchone()
+    cache.execute(
+        "INSERT INTO codex_session_entries (source_path, line_offset, "
+        "timestamp_utc, session_id, model, input_tokens, "
+        "cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, source_root_key, conversation_key) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("/cached/857-future.jsonl", 857_001,
+         (_857_END + dt.timedelta(hours=6)).isoformat(), *template),
+    )
+    cache.commit()
+    stable = dict(extra=other, range_start=START + dt.timedelta(days=1))
+    minted(_accounting(cache, range_end=_857_END, **stable),
+           "the future row's own insert")
+    revealed = _accounting(
+        cache, range_end=_857_END + dt.timedelta(days=1), **stable)
+    assert revealed.cold is False and revealed.dirty_paths, (
+        "precondition: the bound revealed the stored future row")
+    minted(revealed, "a revealed future row")
+
+    cache.execute(
+        "UPDATE cache_meta SET value='0' "
+        "WHERE key='codex_accounting_mutation_seq'")
+    cache.commit()
+    result = _accounting(
+        cache, range_end=_857_END + dt.timedelta(days=1), **stable)
+    assert result.cold is True, "precondition"
+    minted(result, "a sequence regression")
+
+
+def test_857_a_restore_or_reset_never_makes_an_old_token_current_again(env):
+    """A failed build rolls its capture back to the checkpoint, and that state
+    comes back with its own token — but the CONSUMED token does not move
+    back: a generation stamped with the checkpoint's token predates accounting
+    this process already consumed once. A reset restarts the population
+    generation and never the token allocator."""
+    _ns, cache, _stats, _module = env
+    snapshot.reset_codex_accounting_cache_state()
+    old = _857_token(_accounting(cache, range_end=_857_END))
+    checkpoint = snapshot.checkpoint_codex_accounting_cache_state()
+
+    _widen_corpus(cache, files=1, per_file=1, prefix="857-restore",
+                  offset_base=92_000)
+    consumed = _857_token(_accounting(cache, range_end=_857_END))
+    assert consumed != old
+
+    snapshot.restore_codex_accounting_cache_state(checkpoint)
+    assert snapshot.codex_accounting_consumed_provenance() == consumed, (
+        "a restore made the discarded population's predecessor current again")
+    again = _857_token(_accounting(cache, range_end=_857_END))
+    assert again not in (old, consumed), (
+        "the restored state re-consumed the durable insert under an old name")
+
+    snapshot.reset_codex_accounting_cache_state()
+    assert snapshot.codex_accounting_consumed_provenance() == again
+    cold = _accounting(cache, range_end=_857_END)
+    assert cold.cold is True
+    assert _857_token(cold) not in (old, consumed, again), (
+        "a reset rewound the token allocator")
+
+
+def test_857_memory_eviction_keeps_the_consumed_token(env):
+    """Snapshot memory enforcement clears the whole accelerator estate, the
+    accounting state included; the consumed token is not part of it, so an
+    eviction alone never invalidates a generation the dashboard published."""
+    _ns, cache, _stats, _module = env
+    snapshot.reset_codex_accounting_cache_state()
+    token = _857_token(_accounting(cache, range_end=_857_END))
+    snapshot._clear_snapshot_accelerators()
+    assert snapshot.checkpoint_codex_accounting_cache_state() == {}, (
+        "precondition: the eviction emptied the accounting state")
+    assert snapshot.codex_accounting_consumed_provenance() == token
+
+
+def test_857_the_build_stamps_its_capture_token_and_a_bypass_stamps_none(
+    env, monkeypatch,
+):
+    """The generation carries the token ITS capture returned, in server-only
+    `clock_data`. A build that bypasses the qualified accounting read never
+    borrows an unrelated token: it stamps `None`, which no admission gate
+    accepts, and it consumes nothing."""
+    _ns, cache, stats, module = env
+    key = snapshot.CODEX_ACCOUNTING_PROVENANCE_KEY
+    healthy = module.build_codex_source_state(
+        _context(module, cache, stats), data_version="857-healthy")
+    token = healthy.clock_data[key]
+    assert isinstance(token, int)
+    assert token == snapshot.codex_accounting_consumed_provenance()
+
+    def unavailable(**_kwargs):
+        raise module.QualifiedMetadataUnavailable(
+            "857 qualified read unavailable")
+
+    monkeypatch.setattr(
+        module._lib_snapshot_cache, "build_cached_codex_accounting",
+        unavailable)
+    bypassed = module.build_codex_source_state(
+        _context(module, cache, stats), data_version="857-bypassed")
+    assert key in bypassed.clock_data
+    assert bypassed.clock_data[key] is None
+    assert snapshot.codex_accounting_consumed_provenance() == token
 
 
 if __name__ == "__main__":  # pragma: no cover

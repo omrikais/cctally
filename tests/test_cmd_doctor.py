@@ -12,16 +12,44 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CCTALLY = REPO / "bin" / "cctally"
+_FREE_SPACE_FLOOR_BYTES = 10 * 1024 ** 3
 
 
-def _run(args, env_extra=None, home=None):
+_DISK_USAGE_BOOTSTRAP = """
+import importlib.machinery
+import importlib.util
+import pathlib
+import sys
+import types
+
+script, free_bytes, *argv = sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(script).parent))
+import _cctally_retention
+_cctally_retention._disk_usage = lambda path: types.SimpleNamespace(
+    free=int(free_bytes))
+loader = importlib.machinery.SourceFileLoader("cctally", script)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+loader.exec_module(module)
+sys.argv = [script, *argv]
+raise SystemExit(module.main())
+"""
+
+
+def _run(args, env_extra=None, home=None, free_disk_bytes=None):
+    """Run the CLI, optionally pinning retention's disk reading in the child."""
     env = os.environ.copy()
     env["TZ"] = "Etc/UTC"
     if home is not None:
         env["HOME"] = str(home)
     if env_extra:
         env.update(env_extra)
-    return subprocess.run([sys.executable, str(CCTALLY), *args],
+    command = [sys.executable, str(CCTALLY), *args]
+    if free_disk_bytes is not None:
+        command = [sys.executable, "-c", _DISK_USAGE_BOOTSTRAP,
+                   str(CCTALLY), str(free_disk_bytes), *args]
+    return subprocess.run(command,
                           env=env, capture_output=True, text=True)
 
 
@@ -84,7 +112,8 @@ def test_doctor_exit_code_zero_when_no_fail(tmp_path):
     we provision: (a) a `.credentials.json` file matching the
     `_resolve_oauth_token` schema, and (b) a stats DB with a recent
     snapshot anchored to CCTALLY_AS_OF. Other absent-state checks
-    degrade to WARN (not FAIL), so the resulting overall is no-FAIL."""
+    degrade to WARN (not FAIL). Pin free space at the policy floor so the
+    resulting overall is no-FAIL on every runner."""
     import sqlite3
     # (a) OAuth credentials.
     claude_dir = tmp_path / ".claude"
@@ -132,6 +161,7 @@ def test_doctor_exit_code_zero_when_no_fail(tmp_path):
         ["doctor", "--json"],
         home=tmp_path,
         env_extra={"CCTALLY_AS_OF": "2026-05-13T12:34:56Z"},
+        free_disk_bytes=_FREE_SPACE_FLOOR_BYTES,
     )
     payload = json.loads(r.stdout)
     fails = [c for cat in payload["categories"]
@@ -140,6 +170,24 @@ def test_doctor_exit_code_zero_when_no_fail(tmp_path):
         f"unexpected FAILs: {fails}"
     )
     assert r.returncode == 0
+
+
+def test_doctor_retained_artifacts_fails_below_free_space_floor(tmp_path):
+    """The real policy still FAILs when free space is one byte below 10 GiB."""
+    r = _run(
+        ["doctor", "--json"], home=tmp_path,
+        free_disk_bytes=_FREE_SPACE_FLOOR_BYTES - 1,
+    )
+    payload = json.loads(r.stdout)
+    check = next(
+        check for category in payload["categories"]
+        for check in category["checks"]
+        if check["id"] == "db.retained_artifacts"
+    )
+    assert check["severity"] == "fail"
+    assert check["details"]["freeDiskBytes"] == _FREE_SPACE_FLOOR_BYTES - 1
+    assert check["details"]["unsatisfiedRules"] == ["min_free_bytes"]
+    assert r.returncode == 2
 
 
 def test_doctor_quiet_hides_ok_rows(tmp_path):
@@ -605,6 +653,7 @@ def test_doctor_exit_zero_with_a_refused_pricing_write_recorded(tmp_path):
         ["doctor", "--json"],
         home=tmp_path,
         env_extra={"CCTALLY_AS_OF": "2026-05-13T12:34:56Z"},
+        free_disk_bytes=_FREE_SPACE_FLOOR_BYTES,
     )
     payload = json.loads(r.stdout)
     check = next(

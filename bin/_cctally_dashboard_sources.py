@@ -55,15 +55,17 @@ from _lib_dashboard_sources import (
     SourceDashboardState,
     SourceDashboardWarning,
     assess_codex_projection_coherence,
+    alerted_at_order_key,
+    alerted_at_order_key_sql,
     build_metadata_health,
     canonical_alerted_at,
-    canonical_alerted_at_sql,
     claude_stats_digest,
     combined_accounting_version,
     codex_stats_digest,
     dashboard_resource_key,
 )
 from _lib_quota import (
+    FUTURE_CLOCK_SKEW_SECONDS,
     QuotaWindowIdentity,
     build_blocks,
     build_history,
@@ -627,26 +629,12 @@ def _codex_quota_reuse_identity(
                 "stats_identity must be the three-digest tuple or None")
     elif not isinstance(stats_conn, sqlite3.Connection):
         return None
-    try:
-        seq_row = cache_conn.execute(
-            "SELECT seq FROM sqlite_sequence "
-            "WHERE name='quota_window_change_log'"
-        ).fetchone()
-        table = cache_conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='quota_window_change_log'"
-        ).fetchone()
-        revision_row = cache_conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='codex_window_attribution_revision'"
-        ).fetchone()
-        db_path = next(
-            str(row[2]) for row in cache_conn.execute("PRAGMA database_list")
-            if str(row[1]) == "main"
-        )
-    except (sqlite3.Error, StopIteration):
-        return None
-    if table is None:
+    # #857: the cache.db legs are read through the snapshot-cache kernel, which
+    # states each leg's query once and shares it with the doctor's quota probe
+    # and the dashboard's quota-dependency identity.
+    db_path = _lib_snapshot_cache.codex_main_database_path(cache_conn)
+    legs = _lib_snapshot_cache.codex_quota_observation_legs(cache_conn)
+    if db_path is None or legs is None:
         return None
     if stats_identity is None:
         try:
@@ -660,12 +648,7 @@ def _codex_quota_reuse_identity(
             return None
         except sqlite3.Error:
             return None
-    return (
-        db_path,
-        0 if seq_row is None else int(seq_row[0]),
-        "" if revision_row is None else str(revision_row[0]),
-        *stats_identity,
-    )
+    return (db_path, *legs, *stats_identity)
 
 
 def _cached_codex_quota_observations(**kwargs) -> tuple[object, ...]:
@@ -1190,51 +1173,82 @@ def _codex_next_decision_at(
     crossing. That is one rebuild per deadline (a handful per weekly cycle), not
     one per tick.
 
-    The deadline is the ``min`` of three candidate kinds, dropping any candidate
-    at or before ``now_utc``:
+    The deadline is the ``min`` of every candidate below, dropping any
+    candidate at or before ``now_utc``. #857 made the set COMPLETE, because a
+    settled cycle-unavailable generation now idles until this instant: a
+    transition with no candidate is never picked up at all, and one whose
+    candidate fires early is lost too — the rebuild at the early instant drops
+    the candidate (it is no longer after ``now``) while the transition it stood
+    for is still ahead. Each candidate is therefore the FIRST instant its
+    transition is observable, under the resolver's own comparison:
 
-    1. every selected cycle's ``resets_at`` (expiry — including the
-       #341 multi-account case where account A expires while B stays live);
-    2. ``latest_physical_capture + stale_after_seconds(window)`` for every weekly
-       history with a live baseline (fresh -> stale). This is a deliberate
-       SUPERSET of the §3.2 ranking participants — it also covers histories whose
-       freshness is ``"future"``/``"unavailable"`` and so never enter the ranking
-       — because an extra candidate can only pull the deadline EARLIER, and an
-       earlier deadline is always the conservative direction;
-    3. the ``captured_at`` of any future-dated weekly observation
-       (future -> fresh / baseline eligibility).
+    1. every weekly baseline's ``canonical_resets_at`` — selected or not, since
+       an UNSELECTED boundary expiring is what resolves a ``conflicting``
+       account (the resolver drops ``resets_at <= now``, so the reset instant
+       itself is the first expired one). Every selected cycle's ``resets_at`` is
+       one of these; they stay listed explicitly for the #341 multi-account case
+       where account A expires while B stays live;
+    2. every weekly baseline's nominal start plus one microsecond: the resolver
+       rejects ``start >= now`` (#599), so a window captured ahead of its start
+       becomes eligible strictly after it, on frozen evidence;
+    3. for every weekly history with a baseline that has not reset: the
+       fresh -> stale flip of its latest physical capture, which
+       ``quota_freshness`` takes when the whole-second age EXCEEDS
+       ``stale_after_seconds`` — ``capture + stale_after + 1s``, not
+       ``capture + stale_after`` — and the future -> fresh flip, when the
+       truncated age stops being below ``-FUTURE_CLOCK_SKEW_SECONDS`` —
+       strictly after ``capture - (skew + 1)s``. This is a deliberate SUPERSET
+       of the §3.2 ranking participants, because an extra candidate can only
+       pull the deadline EARLIER and costs one rebuild at an instant where the
+       verdict could have changed;
+    4. the ``captured_at`` of any future-dated weekly observation (baseline
+       eligibility, ``captured_at <= now``). Recorded BEFORE the model-scoped
+       skip: the pool label is read from the baseline and ``limit_name`` is not
+       part of history identity, so a future capture can move a history out of
+       a model-scoped pool.
 
     Returns ``None`` when nothing can flip. Server-only: it rides ``clock_data``
     and never reaches the public source envelope.
     """
+    one_microsecond = dt.timedelta(microseconds=1)
     candidates: list[dt.datetime] = []
     for cycle in cycles:
         candidates.append(cycle.resets_at.astimezone(UTC))
     for history in build_history(tuple(observations)):
         if history.identity.window_minutes != 10_080:
             continue
-        baseline = select_baseline(history.observations, now_utc)
-        if codex_history_is_model_scoped(history, baseline=baseline):
-            continue
-        # #428: the anchor, so the decision deadline describes the same window
-        # the hero publishes rather than a jitter sibling up to 600s away.
-        if baseline is not None and baseline.canonical_resets_at > now_utc:
-            latest = latest_physical_observation(history.physical_observations)
-            if latest is not None:
-                candidates.append(
-                    latest.captured_at.astimezone(UTC)
-                    + dt.timedelta(
-                        seconds=stale_after_seconds(history.identity.window_minutes),
-                    )
-                )
-        # A capture ahead of ``now`` is not baseline-eligible yet, so this runs
-        # even for a history with no live baseline at all.
+        # 4. A capture ahead of ``now`` is not baseline-eligible yet, so this
+        # runs even for a history with no live baseline at all.
         for observation in (
             *history.observations, *history.physical_observations,
         ):
             captured_at = observation.captured_at.astimezone(UTC)
             if captured_at > now_utc:
                 candidates.append(captured_at)
+        baseline = select_baseline(history.observations, now_utc)
+        if codex_history_is_model_scoped(history, baseline=baseline):
+            continue
+        if baseline is None:
+            continue
+        # #428: the anchor, so the decision deadline describes the same window
+        # the hero publishes rather than a jitter sibling up to 600s away.
+        resets_at = baseline.canonical_resets_at.astimezone(UTC)
+        window = dt.timedelta(minutes=history.identity.window_minutes)
+        candidates.append(resets_at)                                # 1.
+        candidates.append(resets_at - window + one_microsecond)     # 2.
+        if resets_at > now_utc:                                     # 3.
+            latest = latest_physical_observation(history.physical_observations)
+            if latest is not None:
+                latest_at = latest.captured_at.astimezone(UTC)
+                candidates.append(latest_at + dt.timedelta(
+                    seconds=stale_after_seconds(
+                        history.identity.window_minutes) + 1,
+                ))
+                candidates.append(
+                    latest_at
+                    - dt.timedelta(seconds=FUTURE_CLOCK_SKEW_SECONDS + 1)
+                    + one_microsecond
+                )
     live = [candidate for candidate in candidates if candidate > now_utc]
     return min(live) if live else None
 
@@ -4447,7 +4461,8 @@ def _alerts_wire(
     # row that fired most recently but crossed longest ago was dropped at the
     # LIMIT and never reached the panel at all. `created_at` stays as an
     # equal-valued compatibility alias for a client reading a pre-v7 envelope.
-    canon = canonical_alerted_at_sql()
+    # #869 F14: the full instant, so a same-second pair keeps its newer row.
+    canon = alerted_at_order_key_sql()
 
     def _instants(raw: object) -> dict[str, str]:
         value = canonical_alerted_at(raw)
@@ -4506,7 +4521,7 @@ def _alerts_wire(
         return ()
     return tuple(sorted(
         rows,
-        key=lambda item: canonical_alerted_at(item["alerted_at"]),
+        key=lambda item: alerted_at_order_key(item["alerted_at"]),
         reverse=True,
     )[:SOURCE_HISTORY_LIMIT])
 
@@ -7441,6 +7456,13 @@ class _CodexAccountingCapture:
     #: safety came from the compare-and-swap rather than from the signature,
     #: and carrying the value makes the signature answer for itself.
     population_signature: tuple | None = None
+    #: #857: the accounting provenance token THIS capture's accounting result
+    #: returned — carried for the same reason as the signature above, because
+    #: overlay publication or a concurrent capture can move the module state
+    #: before the fold stamps it. ``None`` when the capture bypassed the
+    #: qualified accounting read: such a generation names no population, and
+    #: borrowing the process's current token would name one it never read.
+    provenance_token: int | None = None
 
 
 #: The detail routes' horizon: one year ending at the generation instant. The
@@ -7532,6 +7554,8 @@ def _capture_codex_accounting(
     changed_old: tuple[object, ...] = ()
     changed_new: tuple[object, ...] = ()
     population_signature: tuple | None = None
+    # #857: set only by a qualified read that returned; every bypass keeps it.
+    provenance_token: int | None = None
 
     def fallback_entries() -> tuple[object, ...]:
         nonlocal metadata_read_failed, failed_legs
@@ -7600,6 +7624,7 @@ def _capture_codex_accounting(
             changed_old = cached_accounting.changed_old
             changed_new = cached_accounting.changed_new
             population_signature = cached_accounting.population_signature
+            provenance_token = cached_accounting.provenance_token
             entries: tuple[object, ...] = qualified_entries
         except QualifiedMetadataUnavailable as exc:
             _lib_log.get_logger("dashboard").warning(
@@ -7644,6 +7669,8 @@ def _capture_codex_accounting(
         failed_legs=failed_legs,
         population_signature=(
             None if metadata_incomplete else population_signature),
+        provenance_token=(
+            None if metadata_incomplete else provenance_token),
     )
 
 
@@ -9253,6 +9280,14 @@ def _build_codex_source_state(
             "codex_next_decision_at": _codex_next_decision_at(
                 quota_observations, cycles_all, context.now_utc,
             ),
+            # #857: the accounting provenance token of the population THIS
+            # build's capture read (`None` when it bypassed the qualified
+            # read). A retained generation is admitted only while this equals
+            # the token of the population the process last consumed, so a
+            # build that consumed accounting and then failed to publish leaves
+            # every older generation refused, whatever the failure site.
+            _lib_snapshot_cache.CODEX_ACCOUNTING_PROVENANCE_KEY: (
+                accounting_capture.provenance_token),
         },
         private_session_labels=private_session_labels,
         # #819: the SAME reading that gated decoration above. Attaching it here

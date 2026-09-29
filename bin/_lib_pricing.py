@@ -63,7 +63,7 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-09-23"
+PRICING_SNAPSHOT_DATE = "2026-09-29"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -400,6 +400,11 @@ PRICING_DRIFT_ALLOWLIST: list[dict] = [
 #   MTok, $5 five-minute cache write, $0.20 cache read, and 2x fast rate.
 #   Its 1M context uses standard rates throughout. The pricing fingerprint
 #   advances to 2026-09-23 because another revision already used 2026-09-22.
+#   2026-09-29: added claude-sonnet-5-5 at Anthropic's published $2/$10 per
+#   MTok, $2.50 five-minute cache write and $0.20 cache read, the same card
+#   as Sonnet 5 and the standard 0.1x read multiplier. 1M context at standard
+#   pricing, so NO above-200k tier, and no fast mode, so no fast multiplier.
+#   Verified against LiteLLM's anthropic-provider row on 2026-09-29.
 # Anthropic prices a cache WRITE by TTL: 1.25x base input for a 5-minute write,
 # 2x for a 1-hour write. Both WRITE multipliers are documented as applying
 # consistently across all supported models, so the 1h rate is DERIVED from
@@ -641,6 +646,13 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "cache_read_input_token_cost": 3e-07,
     },
     "claude-sonnet-5": {
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 1e-05,
+        "cache_creation_input_token_cost": 2.5e-06,
+        "cache_read_input_token_cost": 2e-07,
+    },
+    "claude-sonnet-5-5": {
+        # Source: https://platform.claude.com/docs/en/models/sonnet-5-5/overview
         "input_cost_per_token": 2e-06,
         "output_cost_per_token": 1e-05,
         "cache_creation_input_token_cost": 2.5e-06,

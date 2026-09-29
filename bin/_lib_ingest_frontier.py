@@ -1456,33 +1456,125 @@ def _provider_complete(conn, provider: str) -> bool:
     return row is not None
 
 
-def _source_paths(conn, provider: str) -> tuple[pathlib.Path, ...]:
+def _source_paths(conn, provider: str) -> tuple[str, ...]:
+    """Every absolute accounting source path, as the stored string.
+
+    Strings rather than ``pathlib.Path`` objects: ``_source_directory_closure``
+    resolves each distinct parent directory once, so building a path object
+    per source row here was pure overhead on a large store (#880).
+    """
     table = _ingest_source_table(provider)
     return tuple(
-        pathlib.Path(str(row[0]))
+        str(row[0])
         for row in conn.execute(f"SELECT path FROM {table}")
         if row[0] and os.path.isabs(str(row[0]))
     )
 
 
-def _directory_paths(conn, provider: str, roots) -> tuple[pathlib.Path, ...]:
+def _is_canonical_absolute(raw: str) -> bool:
+    """Whether ``str(pathlib.Path(raw)) == raw`` for an absolute ``raw``.
+
+    POSIX pathlib drops empty and ``.`` segments and a trailing separator, and
+    keeps a leading ``//`` as a distinct anchor. A string with none of those
+    spellings is already in pathlib's form, so its parent is the text before
+    its last separator. ``/`` itself is excluded so that every string this
+    accepts has a non-empty final segment.
+    """
+    return (
+        raw.startswith("/")
+        and "//" not in raw
+        and "/./" not in raw
+        and not raw.endswith("/")
+        and not raw.endswith("/.")
+    )
+
+
+def _add_source_chain_pathlib(raw: str, normalized_roots, directories) -> None:
+    """The original per-source pathlib derivation, for a non-canonical string.
+
+    Adds the parent of ``raw`` and every directory above it, up to and
+    including the FIRST root in ``normalized_roots`` order that lexically
+    contains it. A parent outside every root contributes nothing.
+    """
+    parent = pathlib.Path(raw).parent
+    for root in normalized_roots:
+        try:
+            parent.relative_to(root)
+        except ValueError:
+            continue
+        cur = parent
+        while True:
+            directories.add(str(cur))
+            if cur == root:
+                break
+            cur = cur.parent
+        break
+
+
+def _source_directory_closure(read_sources, roots) -> tuple[pathlib.Path, ...]:
+    """The directory set a walk certifies: the roots, plus each source's chain.
+
+    A source contributes its parent and every directory above it up to the
+    FIRST configured root, in the caller's order, that lexically contains the
+    parent; a source outside every root contributes nothing. That is exactly
+    the per-source ``pathlib`` derivation this replaced, and it returns the
+    same sorted tuple of ``pathlib.Path`` objects.
+
+    What changed is the cost (#880). Thousands of source rows share a few
+    thousand parent directories, and the old loop built a path object per row,
+    tested it against each root with ``relative_to``, and re-walked an
+    ancestor chain its siblings had already collected. Here a canonical string
+    is handled as text: each distinct parent is resolved once, and a chain
+    walk stops at the first directory whose chain up to the SAME root is
+    already collected. The memo is keyed by root, not shared, because with
+    nested roots a directory can be complete up to an inner root while the
+    directories between that inner root and an outer one are not — stopping
+    at "already in the set" would lose them whenever the outer root comes
+    first. A non-canonical string (``//``, ``/./``, a trailing separator)
+    falls back to the original pathlib computation for that one row.
+
+    ``read_sources`` is called only after the roots are resolved, the order
+    the pathlib derivation used, so an unresolvable root fails as the OSError
+    the seed path treats as a non-certifiable walk rather than behind a store
+    error.
+    """
     normalized_roots = tuple(pathlib.Path(root).absolute() for root in roots)
-    directories = set(normalized_roots)
-    for source in _source_paths(conn, provider):
-        parent = source.parent
-        for root in normalized_roots:
-            try:
-                parent.relative_to(root)
-            except ValueError:
+    root_strings = tuple(str(root) for root in normalized_roots)
+    # A canonical parent strictly below root `r` starts with `r + "/"`; the
+    # filesystem root is already its own prefix. A root anchored at `//` can
+    # contain no canonical parent, and none of its prefixes match one.
+    root_prefixes = tuple(
+        root if root.endswith("/") else root + "/" for root in root_strings)
+    directories = set(root_strings)
+    # complete[i]: directories whose whole chain up to root i is collected.
+    complete = tuple({root} for root in root_strings)
+    resolved_parents = set()
+    for raw in read_sources():
+        if not _is_canonical_absolute(raw):
+            _add_source_chain_pathlib(raw, normalized_roots, directories)
+            continue
+        parent = raw[:raw.rfind("/")] or "/"
+        if parent in resolved_parents:
+            continue
+        resolved_parents.add(parent)
+        for index, prefix in enumerate(root_prefixes):
+            if parent != root_strings[index] and not parent.startswith(prefix):
                 continue
+            chain = complete[index]
             cur = parent
-            while True:
+            # Terminates: `cur` lies strictly below root i until it becomes
+            # root i, which is in `chain` from the start.
+            while cur not in chain:
+                chain.add(cur)
                 directories.add(cur)
-                if cur == root:
-                    break
-                cur = cur.parent
+                cur = cur[:cur.rfind("/")] or "/"
             break
-    return tuple(sorted(directories, key=str))
+    return tuple(pathlib.Path(directory) for directory in sorted(directories))
+
+
+def _directory_paths(conn, provider: str, roots) -> tuple[pathlib.Path, ...]:
+    return _source_directory_closure(
+        lambda: _source_paths(conn, provider), roots)
 
 
 def _directory_identity(conn, provider: str, roots):
@@ -1493,10 +1585,28 @@ def _directory_identity(conn, provider: str, roots):
 
 
 def _restat_directory_identity(saved):
-    return {
-        raw: _stat_identity_or_missing(pathlib.Path(raw))
-        for raw in saved
-    }
+    """Restat every saved directory key; ``(0, 0, 0, 0)`` when it is gone.
+
+    Both frontiers run this on every idle tick over thousands of keys. The
+    keys are ``str(path)`` of the paths the walk stated, already in pathlib's
+    normalized form, so ``os.stat`` on the key stats exactly what
+    ``pathlib.Path(key).stat()`` would — without building a path object per
+    key per tick, which cost about three times the stat itself (#880).
+
+    That equivalence holds for exactly those keys: non-empty ``str`` values
+    with no trailing separator. An empty key, a trailing slash, bytes or an
+    integer would behave differently, and the walk never records one.
+    """
+    identity = {}
+    for raw in saved:
+        try:
+            st = os.stat(raw)
+        except OSError:
+            identity[raw] = (0, 0, 0, 0)
+        else:
+            identity[raw] = (
+                st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+    return identity
 
 
 def _guard_identity(paths):
@@ -1935,33 +2045,22 @@ def _conversation_source_table(provider: str) -> str:
     raise ValueError("unknown provider")
 
 
-def _conversation_source_paths(conn, provider: str) -> tuple[pathlib.Path, ...]:
+def _conversation_source_paths(conn, provider: str) -> tuple[str, ...]:
+    """Every absolute transcript source path, as the stored string.
+
+    The transcript twin of ``_source_paths``, and a string for the same reason.
+    """
     table = _conversation_source_table(provider)
     return tuple(
-        pathlib.Path(str(row[0]))
+        str(row[0])
         for row in conn.execute(f"SELECT path FROM {table}")
         if row[0] and os.path.isabs(str(row[0]))
     )
 
 
 def _conversation_directory_paths(conn, provider: str, roots):
-    normalized_roots = tuple(pathlib.Path(root).absolute() for root in roots)
-    directories = set(normalized_roots)
-    for source in _conversation_source_paths(conn, provider):
-        parent = source.parent
-        for root in normalized_roots:
-            try:
-                parent.relative_to(root)
-            except ValueError:
-                continue
-            cur = parent
-            while True:
-                directories.add(cur)
-                if cur == root:
-                    break
-                cur = cur.parent
-            break
-    return tuple(sorted(directories, key=str))
+    return _source_directory_closure(
+        lambda: _conversation_source_paths(conn, provider), roots)
 
 
 def _conversation_directory_identity(conn, provider: str, roots):

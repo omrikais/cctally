@@ -23,6 +23,17 @@ def test_canonical_alerted_at_rejects_rather_than_degrading(bad):
         sources.canonical_alerted_at(bad)
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-08-10T13:58:00.500000Z", "2026-08-10T13:58:00.500000Z"),
+    ("2026-08-10T13:58:00.500000+00:00", "2026-08-10T13:58:00.500000Z"),
+    ("2026-08-10T15:58:00.250000+02:00", "2026-08-10T13:58:00.250000Z"),
+])
+def test_canonical_alerted_at_keeps_the_subsecond_instant(raw, expected):
+    """#869 F14. A Codex budget crossing records its exact scan cutoff, so the
+    canonical instant keeps the fraction a whole-second spelling never had."""
+    assert sources.canonical_alerted_at(raw) == expected
+
+
 def _state(source, rows):
     return sources.SourceDashboardState(
         source=source,
@@ -64,6 +75,20 @@ def test_union_ties_break_claude_before_codex_preserving_native_order():
     codex = [{"source": "codex", "key": "x1", "alerted_at": "2026-08-10T15:00:00+02:00"}]
     rows = sources._combined_alert_rows(_state("claude", claude), _state("codex", codex))
     assert [r.get("id") or r.get("key") for r in rows] == ["c1", "c2", "x1"]
+
+
+def test_union_orders_same_second_alerts_by_full_instant():
+    """#869 F14. A Codex crossing half a second after a Claude one is newer;
+    truncating both to the second tied them and kept the Claude row first."""
+    claude = [{"source": "claude", "id": "c1", "alerted_at": "2026-08-10T13:58:00Z"}]
+    codex = [
+        {"source": "codex", "key": "x1",
+         "alerted_at": "2026-08-10T13:58:00.500000Z"},
+        {"source": "codex", "key": "x0",
+         "alerted_at": "2026-08-10T15:57:59.900000+02:00"},
+    ]
+    rows = sources._combined_alert_rows(_state("claude", claude), _state("codex", codex))
+    assert [r.get("id") or r.get("key") for r in rows] == ["x1", "c1", "x0"]
 
 
 def test_union_raises_on_a_row_with_no_firing_instant():
@@ -215,6 +240,85 @@ def test_codex_alert_wire_truncates_by_firing_instant_not_crossing_instant(ns):
     assert 99 in [row["threshold"] for row in rows]
 
 
+def test_same_second_codex_alerts_survive_the_per_axis_limit_by_full_instant(ns):
+    """#869 F14. The LIMIT decides membership, so it must see the fraction."""
+    import _cctally_dashboard_sources as ds
+
+    conn = ns["open_db"]()
+    try:
+        _seed_budget_alert(
+            conn, vendor="codex", threshold=90,
+            period_start_at="2026-08-01T00:00:00Z",
+            crossed_at="2026-08-10T13:58:00.100000Z",
+            alerted_at="2026-08-10T13:58:00.100000Z",
+        )
+        _seed_budget_alert(
+            conn, vendor="codex", threshold=50,
+            period_start_at="2026-08-02T00:00:00Z",
+            crossed_at="2026-08-10T13:58:00.900000Z",
+            alerted_at="2026-08-10T13:58:00.900000Z",
+        )
+        _seed_budget_alert(
+            conn, vendor="claude", threshold=75,
+            period_start_at="2026-08-03T00:00:00Z",
+            crossed_at="2026-08-10T13:58:00Z",
+            alerted_at="2026-08-10T13:58:00Z",
+        )
+        conn.commit()
+        original = ds.SOURCE_HISTORY_LIMIT
+        ds.SOURCE_HISTORY_LIMIT = 1
+        try:
+            wire = ds._alerts_wire(conn)
+        finally:
+            ds.SOURCE_HISTORY_LIMIT = original
+        envelope = ns["_cctally_dashboard"]._build_alerts_envelope_array(
+            conn, limit=1)
+        full = ns["_cctally_dashboard"]._build_alerts_envelope_array(conn)
+    finally:
+        conn.close()
+    assert [(row["threshold"], row["alerted_at"]) for row in wire] == [
+        (50, "2026-08-10T13:58:00.900000Z")]
+    assert [(row["axis"], row["threshold"]) for row in envelope] == [
+        ("codex_budget", 50)]
+    assert [(row["axis"], row["threshold"]) for row in full] == [
+        ("codex_budget", 50), ("codex_budget", 90), ("budget", 75)]
+
+
+def test_the_sql_order_key_agrees_with_the_python_order_key():
+    """#869 F14. The fixed-width order key sorts every spelling by instant."""
+    import sqlite3
+
+    values = [
+        "2026-08-10T13:58:00Z",
+        "2026-08-10T13:58:00+00:00",
+        "2026-08-10T13:58:00.5Z",
+        "2026-08-10T13:58:00.500000Z",
+        "2026-08-10T13:58:00.123456+00:00",
+        "2026-08-10T15:58:00.250000+02:00",
+        "2026-08-10T08:13:00.000001+05:45",
+        "2026-08-10T08:58:00.999999-05:00",
+    ]
+    conn = sqlite3.connect(":memory:")
+    try:
+        for value in values:
+            (sql_key,) = conn.execute(
+                f"SELECT {sources.alerted_at_order_key_sql('?1')}", (value,),
+            ).fetchone()
+            assert sql_key == sources.alerted_at_order_key(value), value
+            (sql_canonical,) = conn.execute(
+                f"SELECT {sources.canonical_alerted_at_sql('?1')}", (value,),
+            ).fetchone()
+            assert sql_canonical == sources.canonical_alerted_at(value), value
+    finally:
+        conn.close()
+    ordered = sorted(values, key=sources.alerted_at_order_key)
+    instants = [
+        sources.dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        for value in ordered
+    ]
+    assert instants == sorted(instants)
+
+
 def test_the_sql_ordering_expression_agrees_with_the_python_helper():
     """§2.3's assumption, pinned over the committed estate.
 
@@ -261,7 +365,7 @@ def test_the_sql_ordering_expression_agrees_with_the_python_helper():
     try:
         for value in sorted(values):
             (sql_canonical,) = conn.execute(
-                f"SELECT {sources.canonical_alerted_at_sql('?')}", (value,),
+                f"SELECT {sources.canonical_alerted_at_sql('?1')}", (value,),
             ).fetchone()
             assert sql_canonical == sources.canonical_alerted_at(value), value
     finally:

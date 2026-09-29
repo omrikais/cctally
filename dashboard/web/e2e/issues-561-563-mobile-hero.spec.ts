@@ -331,3 +331,54 @@ test('#831 — every 390px domain warning visibly names its domain and state', a
     expect(geometry.right).toBeLessThanOrEqual(391);
   }
 });
+
+test('mobile Current Usage title remains fully visible beside header controls', async ({ page }) => {
+  await serveDecoratedFixture(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectSource(page, 'all');
+  await page.locator('#current-week-hero-trigger').click();
+
+  const heading = page.getByRole('dialog', { name: 'Current Usage — provider cycles' })
+    .getByRole('heading', { name: 'Current Usage — provider cycles' });
+  const geometry = await heading.evaluate((node) => {
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    return {
+      visualLines: range.getClientRects().length,
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+    };
+  });
+  expect(geometry.visualLines).toBeGreaterThan(1);
+  expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth + 1);
+});
+
+test('mobile onboarding toast does not cover an open Current Usage dialog', async ({ page }) => {
+  await serveDecoratedFixture(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await selectSource(page, 'all');
+  const onboarding = page.locator('.onboarding-toast');
+  await expect(onboarding).toBeVisible();
+  await page.locator('#current-week-hero-trigger').click();
+  await expect(page.getByRole('dialog', { name: 'Current Usage — provider cycles' })).toBeVisible();
+  await expect(onboarding).toBeHidden();
+  await expect(onboarding).toHaveCount(1);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: 'Current Usage — provider cycles' })).toBeHidden();
+  await expect(onboarding).toBeVisible();
+});
+
+test('desktop onboarding toast stays visible beside an open Current Usage dialog', async ({ page }) => {
+  await serveDecoratedFixture(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/');
+  await selectSource(page, 'all');
+  const onboarding = page.locator('.onboarding-toast');
+  await expect(onboarding).toBeVisible();
+  await page.locator('#current-week-hero-trigger').click();
+  await expect(page.getByRole('dialog', { name: 'Current Usage — provider cycles' })).toBeVisible();
+  expect(await onboarding.evaluate((node) => getComputedStyle(node).display)).not.toBe('none');
+  await expect(onboarding).toBeVisible();
+});

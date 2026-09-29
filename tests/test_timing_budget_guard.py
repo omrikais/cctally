@@ -47,6 +47,7 @@ from __future__ import annotations
 import ast
 import collections.abc
 import functools
+import hashlib
 import pathlib
 import re
 import subprocess
@@ -2041,10 +2042,25 @@ def _python_estate() -> list:
     return sorted(path for path in _tracked("tests/*.py") if path.exists())
 
 
-def _python_scan_shards() -> tuple:
-    estate = _python_estate()
-    return tuple(tuple(estate[index::PYTHON_SCAN_SHARDS])
-                 for index in range(PYTHON_SCAN_SHARDS))
+def _python_shard_index(path) -> int:
+    """A module's shard, from a stable hash of its own repo-relative path.
+
+    Round-robin over the sorted estate reassigned nearly every module whenever
+    a new one sorted ahead of it, so each addition reshuffled every shard's
+    workload and invited a per-filename exception (#869 F13). Hashing the
+    path alone keeps every existing assignment fixed as the estate grows.
+    """
+    relative = pathlib.Path(path).resolve().relative_to(REPO).as_posix()
+    digest = hashlib.sha256(relative.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % PYTHON_SCAN_SHARDS
+
+
+def _python_scan_shards(estate=None) -> tuple:
+    estate = _python_estate() if estate is None else sorted(estate)
+    shards = [[] for _ in range(PYTHON_SCAN_SHARDS)]
+    for path in estate:
+        shards[_python_shard_index(path)].append(path)
+    return tuple(tuple(shard) for shard in shards)
 
 
 def _assert_no_unrecorded_python_findings(paths) -> None:
@@ -2078,6 +2094,31 @@ def test_no_pytest_file_carries_an_unreachable_or_load_sensitive_budget():
     assert set(flattened) == set(estate)
     assert all(shards), "a timing-budget scan shard is vacuous"
     _assert_no_unrecorded_python_findings(shards[0])
+
+
+def test_a_new_test_module_does_not_move_existing_timing_shards():
+    """Each module's shard depends on its own path, never on its neighbours.
+
+    Round-robin over the sorted estate moved almost every module to another
+    shard whenever a new file sorted ahead of them, so each addition changed
+    every shard's workload at once and invited a per-filename exception.
+    """
+    estate = _python_estate()
+
+    def assignment(paths):
+        return {
+            path: index
+            for index, shard in enumerate(_python_scan_shards(paths))
+            for path in shard
+        }
+
+    before = assignment(estate)
+    for name in ("test_000_first_new_module.py", "test_mmm_middle_module.py",
+                 "test_zzz_last_new_module.py"):
+        newcomer = REPO / "tests" / name
+        after = assignment(estate + [newcomer])
+        assert {path: after[path] for path in estate} == before, name
+        assert newcomer in after
 
 
 @pytest.mark.parametrize("shard_index", range(1, PYTHON_SCAN_SHARDS))

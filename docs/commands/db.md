@@ -416,34 +416,11 @@ point-in-time copy for manual comparison, run `cctally db backup --db stats`
 before apply. Back up `cache.db` separately if the retained cost source itself
 needs archival; `db rederive` reads but never mutates it.
 
-The initial `claude-usage` family covers accepted weekly usage, weekly cost,
-weekly and five-hour reset/credit decisions, closed five-hour blocks, and their
-dependent milestones. Historical budget/projected configuration is not
-retained, so those stale Claude latches are retired and re-materialize from
-current config on later live activity. Codex quota and Codex budget/projection
-state remain outside this family. Missing cache tables/columns, account-specific
-cost inputs, or a known cache-write TTL split fail before mutation.
+The `claude-usage` family covers accepted weekly usage, weekly cost, weekly and five-hour reset/credit decisions, closed five-hour blocks, and their dependent milestones. It also corrects a Codex budget crossing when that crossing carries retained fallback-pricing evidence, a direct card now exists for every fallback model, and the exact source population still matches. A crossing whose population changed, or one with a model whose direct card has since been removed, is kept as recorded and counted in `uncertainCostFactCount` rather than refusing the family. A crossing the direct card puts below its threshold is retired, and a later genuine crossing of the same threshold fires once under a new event identity. Historical budget/projected configuration is not retained, so stale Claude latches are retired and re-materialize from current config on later live activity; a latch that re-materializes in the same period is recorded as alerted without notifying again. Its recorded crossing and alert times, and its spend, are those of the tick that re-materialized it, because a retired event keeps no copy of the original instant; Recent Alerts therefore lists it at that later time. Codex quota and projected-alert state remain outside the correction. Missing cache tables/columns, account-specific cost inputs, or a known cache-write TTL split fail before mutation.
 
-**Pre-cutover history is preserved, never re-derived (#426).** Observations are
-only journaled from the cutover onwards, so the rows the cutover exported as
-`b:<table>:<rowid>` lines are themselves the only durable truth for everything
-older — no replay can reproduce them, because the family's own derivation only
-ever mints natural keys (`sa:`, `wcs:`, `pm:`, …). Those events are held out of
-the diff entirely: never tombstoned, never rewritten from a re-derivation that
-does not cover them. The same protection covers every owned event when no Claude
-observation is retained at all, since a diff against an empty desired set can
-only be destructive. `preservedEventCount` in the JSON reports how many events a
-plan protected. Everything the retained observations do cover still diffs
-normally, so an obsolete derivation still retires.
+**Pre-cutover history is preserved, never re-derived (#426).** Observations are only journaled from the cutover onwards, so the rows the cutover exported as `b:<table>:<rowid>` lines are themselves the only durable truth for everything older — no replay can reproduce them, because the family's own derivation only ever mints natural keys (`sa:`, `wcs:`, `pm:`, …). Those events are held out of the diff entirely: never tombstoned, never rewritten from a re-derivation that does not cover them. The same protection covers every owned event when no Claude observation is retained at all, since a diff against an empty desired set can only be destructive. A Codex budget crossing is never held this way: its desired state comes from its own recorded pricing evidence, so a crossing retired below its threshold stays retired. `preservedEventCount` in the JSON reports how many events a plan protected. Everything the retained observations do cover still diffs normally, so an obsolete derivation still retires.
 
-**Closed five-hour facts and accepted snapshot identities stay frozen.** A
-closed block keeps its journaled token, cost, model and project totals when
-replay reaches the same closure evidence; equivalent timezone spellings of the
-same block boundary do not make a new fact. Replay also keeps an already
-accepted snapshot and its milestone references when exact retained raw
-observations prove that a newer held-row rule only selected the preceding
-candidate for the same crossing. A changed boundary, reading or unknown
-dependency remains an explicit correction in the preview.
+**Closed five-hour facts and accepted snapshot identities stay frozen.** A closed block keeps its journaled token, cost, model and project totals when replay reaches the same closure evidence, with one exception: a close whose zero cost is proven to come from a missing model card adopts that card once, through a correction batch. The proof is either the pricing evidence the close recorded when its cost was computed, or, for a close recorded before that evidence existed, its retained entries. A historical close qualifies only when its total and every model with tokens are exactly $0, every entry it owns belongs to the close's account and carries no provider-reported cost, and the current card prices every token class those entries used at a positive rate. A close that mixes a priced model with an unpriced one is never repriced. The replayed model and project token populations must still match; a close whose population changed is kept and counted in `uncertainCostFactCount`. Once corrected, a close records that basis and stays frozen through later card revisions. In an ordinary full-family rederive, a closed close whose total cost the rederive does not change freezes its block, whatever its pricing basis: one it keeps as it is, one it holds as preserved history (restoring it if an earlier rederive retired it), and one it corrects without changing its total cost, such as its weekly-usage readings. The five-hour milestones of such a block whose crossing is unchanged keep their recorded block cost through later card revisions. Replay still corrects a milestone whose crossing changed, and still adds or retires crossings, at today's cards. Under a close the rederive replaces, one it adds or one it corrects in a way that changes its total cost or closes a block that was open, every milestone takes today's cards. Either way, whether a milestone has a marginal cost follows its recorded row for an unchanged crossing and replay otherwise; a present marginal becomes the difference from its predecessor's final block cost within the same credit segment, and with no predecessor it keeps the value that same source gives it. The rederive does not claim that every milestone's cost stays at or below its close's total (#882). A rederive that applies a reviewed weekly decision applies only the causal subset of its plan. That subset keeps the card-edit guarantee, and whenever it changes a milestone under a close the plan replaces, one it adds or one it corrects in a way that changes its total cost or closes a block that was open, it applies that five-hour block whole, close included; it does not guarantee full marginal-chain consistency (#883). The rederive does not restore a milestone that an earlier rederive already repriced; that repair is tracked in #884. A corrected milestone keeps the time its alert fired. Equivalent timezone spellings of the same block boundary do not make a new fact. Replay also keeps an already accepted snapshot and its milestone references when exact retained raw observations prove that a newer held-row rule only selected the preceding candidate for the same crossing. A changed boundary, reading or unknown dependency remains an explicit correction in the preview.
 
 If an earlier `claude-usage` batch already retired that history — a
 `db rederive --yes` before this fix dropped every pre-cutover weekly usage and
@@ -460,15 +437,7 @@ own re-derivation is a deliberate retirement and is left alone.
 | `--yes` | Apply the previewed plan, or finish recovery of a completed batch. Without it, the command is read-only. |
 | `--json` | Emit a stamped `schemaVersion: 1` object. |
 
-JSON always includes `status`, `family`, `journalHighWater`, `batchId`,
-`planHash`, `actionCounts`, `actionCountsByEventKind`, `planGuard`,
-`preservedEventCount`, `conflicts`,
-`journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and
-retained-source errors preserve the already-captured `journalHighWater`.
-`status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`,
-`missing-source`, or `failed`. New optional keys may be added without a schema
-version bump.
-`reviewedWeeklyDecisionId` is present when this invocation supplied a manifest.
+JSON always includes `status`, `family`, `journalHighWater`, `batchId`, `planHash`, `actionCounts`, `actionCountsByEventKind`, `planGuard`, `preservedEventCount`, `conflicts`, `journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and retained-source errors preserve the already-captured `journalHighWater`. `uncertainCostFactCount` appears when facts the plan leaves in place lack enough provenance for automatic repricing: a closed block with a zero-cost model that cannot be proven unpriced, a close or Codex budget crossing whose retained population changed, a Codex budget crossing with a model whose direct card has since been removed, a Codex budget crossing recorded without pricing evidence, and every Codex projected alert. A no-op plan with this count does not certify that those historical amounts are correct. `status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`, `missing-source`, or `failed`. New optional keys may be added without a schema version bump. `reviewedWeeklyDecisionId` is present when this invocation supplied a manifest.
 
 `actionCountsByEventKind` breaks the planner-owned `retain`, `supersede`,
 `tombstone`, and `add` dispositions out for every classified event kind, with

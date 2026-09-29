@@ -204,21 +204,33 @@ def _codex_alias_inventory_sql(identity_count: int) -> str:
     )
 
 
+def _sqlite_order_key(value: object) -> tuple:
+    """One scalar's SQLite default ascending storage-class order."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return (3, bytes(value))
+    raise TypeError(f"unsupported SQLite value type: {type(value).__name__}")
+
+
 def _alias_winner_sort_key(last_seen_utc: object, conversation_key: object) -> tuple:
     """Reproduce ``ORDER BY last_seen_utc DESC, conversation_key DESC``.
 
     The retired statement ordered its joined rows that way and the qualifier
     kept the FIRST row per ``(source_root_key, path)``, so the winner is the
-    maximum under this key. SQLite sorts NULL FIRST ascending, hence LAST
-    descending, so a NULL ``last_seen_utc`` loses to every stored value; the
-    leading flag is what reproduces that, and ``max`` is what reproduces
-    "first row wins".
+    maximum under this key. SQLite orders ``NULL < INTEGER/REAL < TEXT <
+    BLOB`` before comparing values inside a class. Both columns may carry any
+    storage class despite their declared affinity, so stringifying them changes
+    mixed-class winners. The pair below preserves ordinary TEXT ordering while
+    reproducing every storage-class boundary.
     """
-    has_last_seen = 0 if last_seen_utc is None else 1
     return (
-        has_last_seen,
-        "" if last_seen_utc is None else str(last_seen_utc),
-        str(conversation_key or ""),
+        _sqlite_order_key(last_seen_utc),
+        _sqlite_order_key(conversation_key),
     )
 
 

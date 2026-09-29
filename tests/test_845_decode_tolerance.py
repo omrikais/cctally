@@ -16,12 +16,14 @@ import sqlite3
 
 import pytest
 
+import _lib_codex_metadata as codex_metadata
 from _lib_codex_metadata import (
     DecodedCodexProjectMetadata,
     codex_metadata_is_malformed,
     decode_codex_project_metadata,
     resolve_codex_threads_table,
 )
+import _cctally_source_analytics as source_analytics
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -205,6 +207,68 @@ def test_a_scoped_temp_view_does_not_hide_the_raw_table(tmp_path):
         conn.close()
 
 
+@pytest.mark.parametrize("shape", ("bare", "attached", "scoped"))
+def test_the_raw_table_resolution_is_reused_per_connection(tmp_path, shape):
+    """A repeated request on one stable connection performs no schema probe.
+
+    Removing the cache would reintroduce one or three schema statements before
+    every raw-table pass, depending on the connection shape.
+    """
+    cache_path = tmp_path / f"{shape}.db"
+    if shape == "bare":
+        conn = sqlite3.connect(cache_path)
+        _create_threads(conn)
+    else:
+        cache = sqlite3.connect(cache_path)
+        try:
+            _create_threads(cache)
+            cache.commit()
+        finally:
+            cache.close()
+        conn = sqlite3.connect(":memory:")
+        conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+        if shape == "scoped":
+            conn.execute(
+                "CREATE TEMP VIEW codex_conversation_threads AS "
+                "SELECT * FROM cache_db.codex_conversation_threads WHERE 0"
+            )
+    try:
+        expected = (
+            "main.codex_conversation_threads" if shape == "bare"
+            else "cache_db.codex_conversation_threads"
+        )
+        assert resolve_codex_threads_table(conn) == expected
+        seen = []
+        conn.set_trace_callback(seen.append)
+        assert resolve_codex_threads_table(conn) == expected
+        assert seen == []
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+
+
+def test_raw_table_resolution_invalidation_reprobes_schema(tmp_path):
+    """ATTACH/DETACH or table DDL invalidates the connection-local answer."""
+    cache_path = tmp_path / "cache.db"
+    cache = sqlite3.connect(cache_path)
+    try:
+        _create_threads(cache)
+        cache.commit()
+    finally:
+        cache.close()
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+        assert resolve_codex_threads_table(conn) == (
+            "cache_db.codex_conversation_threads")
+        conn.execute("DETACH DATABASE cache_db")
+        codex_metadata.invalidate_codex_threads_table_resolution(conn)
+        with pytest.raises(RuntimeError):
+            resolve_codex_threads_table(conn)
+    finally:
+        conn.close()
+
+
 def test_an_unresolvable_connection_raises():
     conn = sqlite3.connect(":memory:")
     try:
@@ -251,6 +315,54 @@ def test_a_read_failure_during_resolution_is_not_an_absent_table():
         locked = _ProbeFails(conn, sqlite3.OperationalError("database is locked"))
         with pytest.raises(sqlite3.OperationalError):
             resolve_codex_threads_table(locked)
+    finally:
+        conn.close()
+
+
+def test_alias_winner_sort_key_matches_sqlite_mixed_storage_order():
+    """The in-memory winner must preserve SQLite's storage-class ordering.
+
+    Removing either storage-class rank, numeric comparison, BLOB comparison or
+    the secondary key makes this literal matrix disagree with SQLite's former
+    ``ORDER BY last_seen_utc DESC, conversation_key DESC`` winner order.
+    """
+    rows = [
+        ("null", None, "z"),
+        ("num-key-null", 5, None),
+        ("num-key-num", 5, 2),
+        ("num-key-text", 5, "a"),
+        ("num-key-blob", 5, b"a"),
+        ("num-real", 5.5, "r"),
+        ("text-a", "ordinary", "a"),
+        ("text-b", "ordinary", "b"),
+        ("text-z", "z", None),
+        ("blob-low", b"\x00", "a"),
+        ("blob-high", b"\xff", None),
+    ]
+    expected = [
+        "blob-high", "blob-low", "text-z", "text-b", "text-a",
+        "num-real", "num-key-blob", "num-key-text", "num-key-num",
+        "num-key-null", "null",
+    ]
+    assert [
+        row[0] for row in sorted(
+            rows,
+            key=lambda row: source_analytics._alias_winner_sort_key(
+                row[1], row[2]),
+            reverse=True,
+        )
+    ] == expected
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE candidates(label, last_seen, conversation_key)")
+        conn.executemany("INSERT INTO candidates VALUES (?,?,?)", rows)
+        assert [
+            row[0] for row in conn.execute(
+                "SELECT label FROM candidates "
+                "ORDER BY last_seen DESC, conversation_key DESC"
+            )
+        ] == expected
     finally:
         conn.close()
 
@@ -329,13 +441,64 @@ def _projection_spans(sql: str) -> "list[tuple[int, int]]":
     return spans
 
 
-def _bare_selections(source: str) -> "list[str]":
-    """Every SQL literal in ``source`` that selects a bare thread column."""
-    findings = []
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+def _resolved_string(node: ast.AST, bindings: "dict[str, str]") -> "str | None":
+    """Resolve the statically assembled string subset used by SQL constants."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _resolved_string(node.left, bindings)
+        right = _resolved_string(node.right, bindings)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _sql_string_candidates(tree: ast.AST) -> "list[tuple[int, str]]":
+    """Return literal and named-fragment string assemblies in ``tree``."""
+    assignments: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            assignments.extend(
+                (target.id, node.value)
+                for target in node.targets
+                if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if node.value is not None:
+                assignments.append((node.target.id, node.value))
+
+    bindings: dict[str, str] = {}
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for name, value_node in assignments:
+            value = _resolved_string(value_node, bindings)
+            if value is not None and bindings.get(name) != value:
+                bindings[name] = value
+                changed = True
+        if not changed:
+            break
+
+    candidates = []
+    seen = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Constant, ast.BinOp)):
             continue
-        raw = node.value
+        value = _resolved_string(node, bindings)
+        if value is None:
+            continue
+        item = (getattr(node, "lineno", 0), value)
+        if item not in seen:
+            seen.add(item)
+            candidates.append(item)
+    return candidates
+
+
+def _bare_selections(source: str) -> "list[str]":
+    """Every static SQL string that selects a bare thread column."""
+    findings = []
+    for lineno, raw in _sql_string_candidates(ast.parse(source)):
         if not any(token in raw for token in _THREAD_TABLE_REFERENCES):
             continue
         sql = _strip_sql_comments(raw)
@@ -348,7 +511,7 @@ def _bare_selections(source: str) -> "list[str]":
                 ):
                     continue
                 findings.append(
-                    f"line {node.lineno}: {column.group(0)!r} in "
+                    f"line {lineno}: {column.group(0)!r} in "
                     + " ".join(sql[start:end].split())[:120]
                 )
     return findings
@@ -396,6 +559,22 @@ def test_the_static_gate_detects_a_bare_selection():
         's = """\n-- never expose another account\'s cwd/git metadata\n'
         'SELECT * FROM codex_conversation_threads WHERE 0"""'
     )
+
+    # The table and projection are deliberately separate named fragments: the
+    # gate must inspect the assembled statement, not each literal in isolation.
+    source = '''
+THREAD_TABLE_FRAGMENT = "codex_conversation_threads"
+BARE_PROJECT_FRAGMENT = "cwd, git_json"
+SQL = "SELECT " + BARE_PROJECT_FRAGMENT + " FROM " + THREAD_TABLE_FRAGMENT
+'''
+    assert _bare_selections(source)
+
+    safe_source = '''
+THREAD_TABLE_FRAGMENT = "codex_conversation_threads"
+BLOB_PROJECT_FRAGMENT = "CAST(cwd AS BLOB), CAST(git_json AS BLOB)"
+SQL = "SELECT " + BLOB_PROJECT_FRAGMENT + " FROM " + THREAD_TABLE_FRAGMENT
+'''
+    assert not _bare_selections(safe_source)
 
 
 # ── §4.7 / A8, the two cache-side rollup writers ───────────────────────────

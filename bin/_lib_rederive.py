@@ -16,7 +16,12 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import math
 from collections.abc import Iterable, Mapping
+
+from _lib_cost_provenance import (
+    HISTORICAL_CLOSE_BASIS, RECORDED_CLOSE_CORRECTION_BASIS,
+)
 
 
 FAMILY = "claude-usage"
@@ -151,7 +156,11 @@ def _is_owned_event(record: Mapping) -> bool:
     }:
         return False
     if kind == "budget":
-        return payload.get("vendor", "claude") == "claude"
+        return (
+            payload.get("vendor", "claude") == "claude"
+            or (payload.get("vendor") == "codex"
+                and (payload.get("_pricing") or {}).get("version") == 1)
+        )
     if kind == "projected":
         metric = str(payload.get("metric") or "")
         return not metric.startswith("codex_")
@@ -274,6 +283,13 @@ def preserved_history(records: Iterable[Mapping], *,
             continue
         if not _is_owned_event(candidate):
             continue
+        if _is_codex_budget(candidate):
+            # #869: a Codex crossing's desired state comes only from its own
+            # recorded provenance, never from Claude replay evidence, so it is
+            # never "un-re-derivable history". Holding one here would retain a
+            # crossing the correction retires below its threshold, and would
+            # revive that intentionally retired crossing on the next run.
+            continue
         if evidence_retained and not event_id.startswith(
             _CUTOVER_EXPORT_ID_PREFIX
         ):
@@ -285,6 +301,78 @@ def preserved_history(records: Iterable[Mapping], *,
         if prior is None or (revision, sequence) >= (prior[0], prior[1]):
             best[event_id] = (revision, sequence, candidate)
     return {event_id: entry[2] for event_id, entry in best.items()}
+
+
+def _is_codex_budget(record: Mapping) -> bool:
+    payload = record.get("payload") or {}
+    return payload.get("kind") == "budget" and payload.get("vendor") == "codex"
+
+
+_BLOCK_TOKEN_KEYS = (
+    "input_tokens", "output_tokens", "cache_create_tokens", "cache_read_tokens",
+)
+#: The monetary fields a five-hour milestone snapshots from its block.
+_FIVE_HOUR_MILESTONE_MONETARY_KEYS = frozenset({
+    "block_cost_usd", "marginal_cost_usd",
+})
+#: Milestone kinds whose ``alerted_at`` records an actual dispatch. Scratch
+#: replay runs without alert config, so it can never reproduce that latch.
+_ALERT_LATCHED_MILESTONE_KINDS = frozenset({
+    "percent_milestone", "five_hour_milestone",
+})
+
+
+def _positive_token_models(payload: Mapping) -> set:
+    return {
+        child.get("model")
+        for child in payload.get("_models", [])
+        if any(int(child.get(key) or 0) > 0 for key in _BLOCK_TOKEN_KEYS)
+    }
+
+
+def _child_population(payload: Mapping, key: str) -> list:
+    """A close's child set without its monetary field, order-independent."""
+    return sorted(
+        [
+            {k: v for k, v in child.items() if k != "cost_usd"}
+            for child in payload.get(key, [])
+        ],
+        key=lambda item: json.dumps(item, sort_keys=True),
+    )
+
+
+def _same_child_population(current: Mapping, desired: Mapping) -> bool:
+    return (
+        _child_population(current, "_models")
+        == _child_population(desired, "_models")
+        and _child_population(current, "_projects")
+        == _child_population(desired, "_projects")
+    )
+
+
+def close_cost_is_uncertain(payload: Mapping) -> bool:
+    """A closed block's retained cost lacks proof that every model was priced.
+
+    A computation-time marker settles it except for an ambiguous model, or a
+    missing-card model beside a priced one (project children have no model
+    axis). An unmarked close is uncertain only while a positive-token model
+    carries a zero or unresolved cost; a historical correction marker (#869)
+    is proof in itself.
+    """
+    pricing = payload.get("_pricing")
+    positive = _positive_token_models(payload)
+    if pricing:
+        if pricing.get("basis") == HISTORICAL_CLOSE_BASIS:
+            return False
+        missing = set(pricing.get("unpricedModels") or [])
+        return bool(
+            pricing.get("uncertainModels")
+            or (missing and missing != positive)
+        )
+    return any(
+        child.get("model") in positive and not child.get("cost_usd")
+        for child in payload.get("_models", [])
+    )
 
 
 def _canonical_bytes(value) -> bytes:
@@ -305,17 +393,43 @@ def _semantic_event(record: Mapping) -> dict:
     }
 
 
+def _with_close_marker(record: Mapping, marker: Mapping) -> dict:
+    """A close record carrying ``marker`` in both of its provenance fields."""
+    corrected = dict(record)
+    payload = dict(record.get("payload") or {})
+    payload["_pricing"] = dict(marker)
+    payload["pricing_provenance_json"] = json.dumps(
+        dict(marker), sort_keys=True, separators=(",", ":"),
+    )
+    corrected["payload"] = payload
+    return corrected
+
+
 def _preserve_non_derivable_state(
-    current_record: Mapping, desired_record: Mapping
+    current_record: Mapping, desired_record: Mapping, *,
+    historical_marker: "Mapping | None" = None,
+    drifted_ids: "set | None" = None,
 ) -> Mapping:
     """Carry durable state that scratch replay cannot truthfully reconstruct.
 
-    Percent-milestone ``alerted_at`` is the latch recorded when the first
-    crossing actually dispatched. Historical alert configuration is not
-    retained, so scratch replay deliberately runs with alerts disabled and
-    produces ``None``. Preserve the selected event's exact latch both when the
-    rest of the milestone is retained and when another field needs an audited
-    higher-revision correction (#410 Task B).
+    A percent or five-hour milestone's ``alerted_at`` is the latch recorded
+    when the first crossing actually dispatched. Historical alert
+    configuration is not retained, so scratch replay deliberately runs with
+    alerts disabled and produces ``None``. Preserve the selected event's exact
+    latch both when the rest of the milestone is retained and when another
+    field needs an audited higher-revision correction (#410 Task B; five-hour
+    milestones since #869 V3).
+
+    #869: ``historical_marker`` is the planner's proof that an UNMARKED close
+    priced every positive-token model at $0 only for want of a card; the close
+    then adopts the replay under that marker. A marked or historically proven
+    close whose replayed child population differs is kept unchanged and its id
+    added to ``drifted_ids``. A close corrected from its recorded missing-card
+    marker is stamped with its own basis, ``RECORDED_CLOSE_CORRECTION_BASIS``.
+
+    #875: the milestones of a frozen or replaced close are decided by
+    :func:`_resolve_closed_block_milestones`, not here. This function only
+    carries a milestone's ``alerted_at`` latch.
     """
     current_payload = current_record.get("payload") or {}
     desired_payload = desired_record.get("payload") or {}
@@ -355,7 +469,10 @@ def _preserve_non_derivable_state(
             facts = {
                 key: value for key, value in payload.items()
                 if not key.startswith("total_")
-                and key not in {"_models", "_projects"}
+                and key not in {
+                    "_models", "_projects", "_pricing",
+                    "pricing_provenance_json",
+                }
             }
             # Live close used the display-zone offset; scratch replay writes
             # UTC. Both name one frozen boundary and must compare as an instant.
@@ -373,18 +490,354 @@ def _preserve_non_derivable_state(
             return facts
 
         if structure(current_payload) == structure(desired_payload):
+            current_pricing = current_payload.get("_pricing") or {}
+            desired_pricing = desired_payload.get("_pricing") or {}
+
+            def keep_drifted():
+                # #869 F3: a changed retained population cannot prove the
+                # correction, but it does not falsify the recorded close
+                # either. Keep this close and disclose it; never refuse the
+                # family's other corrections over it.
+                if drifted_ids is not None:
+                    drifted_ids.add(current_record.get("id"))
+                return current_record
+
+            if (
+                not current_pricing
+                and current_payload.get("pricing_provenance_json") is None
+                and historical_marker is not None
+            ):
+                # #869 F2: an unmarked historical close the retained entries
+                # prove was $0 only because its model had no card. Adopt the
+                # replayed parent and BOTH child sets together, under a marker
+                # whose distinct basis freezes the result against later cards.
+                if not _same_child_population(current_payload, desired_payload):
+                    return keep_drifted()
+                return _with_close_marker(desired_record, historical_marker)
+            missing = current_pricing.get("unpricedModels") or []
+            if missing:
+                # A closed amount is frozen unless its own durable close event
+                # says a model had no direct card. Verify the replay covers the
+                # same token population and now has direct cards for every
+                # missing model before allowing a monetary correction.
+                # The retained project children do not contain a model axis.
+                # With both direct and missing-card models, scratch replay
+                # cannot preserve the direct model's at-close contribution in
+                # every project. Leave that entire close unchanged.
+                if (
+                    set(missing) != _positive_token_models(current_payload)
+                    or current_pricing.get("uncertainModels")
+                ):
+                    return current_record
+                if any(
+                    model in (desired_pricing.get("unpricedModels") or [])
+                    for model in missing
+                ):
+                    return current_record
+                if not _same_child_population(current_payload, desired_payload):
+                    return keep_drifted()
+                # #869 V4: record that this close was CORRECTED. The basis is
+                # provenance only: since #875 every frozen close freezes the
+                # block cost of its unchanged five-hour crossings, whatever
+                # its basis. A genuinely priced close's marker looks the same
+                # otherwise.
+                return _with_close_marker(desired_record, {
+                    **desired_pricing, "basis": RECORDED_CLOSE_CORRECTION_BASIS,
+                })
             return current_record
     if (
-        current_payload.get("kind") != "percent_milestone"
-        or desired_payload.get("kind") != "percent_milestone"
-        or "alerted_at" not in current_payload
+        current_payload.get("kind") in _ALERT_LATCHED_MILESTONE_KINDS
+        and desired_payload.get("kind") == current_payload.get("kind")
+        and "alerted_at" in current_payload
     ):
-        return desired_record
-    merged = dict(desired_record)
-    merged_payload = dict(desired_payload)
-    merged_payload["alerted_at"] = current_payload["alerted_at"]
-    merged["payload"] = merged_payload
-    return merged
+        # The recorded dispatch latch survives any correction of the rest of
+        # the milestone (#410 Task B; five-hour milestones since #869 V3).
+        merged = dict(desired_record)
+        merged_payload = dict(desired_payload)
+        merged_payload["alerted_at"] = current_payload["alerted_at"]
+        merged["payload"] = merged_payload
+        desired_record, desired_payload = merged, merged_payload
+    return desired_record
+
+
+#: A resolved five-hour marginal within this many USD of its reference keeps
+#: the reference's exact float, so float spelling never creates a correction
+#: and a second rederive stays a no-op (#875).
+_MARGINAL_TOLERANCE_USD = 1e-9
+#: A dependency reference that names no event. For ``reset_event_ref`` these
+#: are the spellings of the pre-credit ``"0"`` segment.
+_EMPTY_REFERENCE_SENTINELS = frozenset({None, 0, "0", ""})
+
+
+def _milestone_segment_key(payload: Mapping) -> tuple:
+    """A five-hour milestone's credit segment: account, window, reset ref.
+
+    ``"0"`` (and every empty spelling) is the pre-credit segment.
+    """
+    reset_ref = payload.get("reset_event_ref")
+    if reset_ref in _EMPTY_REFERENCE_SENTINELS:
+        reset_ref = "0"
+    return (
+        payload.get("account_key"),
+        payload.get("five_hour_window_key"),
+        str(reset_ref),
+    )
+
+
+def _milestone_identity(payload: Mapping) -> dict:
+    """A five-hour milestone's non-monetary identity."""
+    return {
+        key: value for key, value in payload.items()
+        if key not in _FIVE_HOUR_MILESTONE_MONETARY_KEYS
+    }
+
+
+def _five_hour_block(payload: Mapping) -> tuple:
+    """The ``(account_key, five_hour_window_key)`` block a payload belongs to."""
+    return (payload.get("account_key"), payload.get("five_hour_window_key"))
+
+
+def _usable_threshold(value):
+    """A milestone threshold the marginal rule can order, or ``None``.
+
+    Only an ``int`` qualifies. ``int()`` would read ``True``, ``1.0`` and
+    ``"1"`` as threshold 1 and make a malformed row a predecessor.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _usable_amount(value) -> bool:
+    """True for a finite ``int`` or ``float`` that is not a ``bool``.
+
+    An ``int`` too large for a float is unusable rather than an error, so a
+    malformed row can never abort the plan (spec §4.3).
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+#: A close correction that moves ``total_cost_usd`` by at most this many USD
+#: keeps the close's money, so its block stays frozen (#875, spec §4.1).
+_CLOSE_TOTAL_TOLERANCE_USD = 1e-9
+
+
+def _close_keeps_its_money(current_payload: Mapping,
+                           final_payload: Mapping) -> bool:
+    """#875 (spec §4.1): a close correction that leaves the block's money.
+
+    True when the current close and the one the plan leaves are both closed
+    and both totals are usable (a finite ``int`` or ``float`` that is not a
+    ``bool``) within 1e-9 USD of each other. The reviewed-hold helper's
+    weekly-axis update is the known case: it keeps the current payload and
+    replaces only the block's weekly axes. Such a correction is FROZEN like a
+    kept close. A correction that closes an open block, or whose totals are
+    unusable or differ by more, writes the close's money and REPLACES it.
+    """
+    current_total = current_payload.get("total_cost_usd")
+    final_total = final_payload.get("total_cost_usd")
+    return (
+        current_payload.get("is_closed") == 1
+        and final_payload.get("is_closed") == 1
+        and _usable_amount(current_total)
+        and _usable_amount(final_total)
+        and abs(final_total - current_total) <= _CLOSE_TOTAL_TOLERANCE_USD
+    )
+
+
+def _revived_by_this_family(selected) -> bool:
+    """A preserved event this family's own earlier batch retired (#426)."""
+    return (
+        selected is not None
+        and selected.status == "tombstone"
+        and str(selected.batch_id or "").startswith(_FAMILY_BATCH_PREFIX)
+    )
+
+
+def _resolve_closed_block_milestones(
+    current: Mapping[str, Mapping], desired: Mapping[str, Mapping],
+    preserved: Mapping[str, Mapping], frozen_blocks, replaced_blocks, *,
+    selection,
+) -> dict[str, dict]:
+    """#875: target records of the five-hour milestones of closed blocks.
+
+    A block is classified by the close the plan's final state holds for it
+    (spec §4.1), by its money rather than by whether the plan acts on it. A
+    FROZEN close keeps the money it already had: a kept close, including a
+    forced-conflict reaffirmation; preserved history the plan retains or
+    revives; or a correction of a closed close that leaves its usable total
+    within 1e-9 USD (:func:`_close_keeps_its_money`), such as the reviewed
+    hold's weekly-axis update. Under it, an existing crossing whose ``at``
+    and non-monetary identity are both unchanged keeps its current
+    ``block_cost_usd`` across any card edit, and a crossing whose ``at`` or
+    identity differs is a corrected crossing that takes replay's block cost.
+    A REPLACED close is one this plan adds, or corrects so that it writes the
+    close's money (it closes an open block, or its totals are unusable or
+    differ by more), and every matched milestone under it is a corrected
+    crossing. A block holding a frozen close and a replaced one is frozen.
+    Replay additions take replay's block cost under either. The milestones of
+    every other block follow replay and are not returned.
+
+    A present marginal is its final block cost minus the final block cost of
+    its predecessor: the highest lower threshold in the same (account,
+    window, reset_event_ref) segment of the plan's FINAL state. The final
+    state is every milestone the plan leaves active: these resolved records,
+    replay's milestones of the other blocks, and retained or preserved
+    current milestones. Tombstones are excluded. Block costs are settled
+    before any marginal, so the definition is not circular. A value within
+    1e-9 USD of its reference (the current marginal, or the desired one for
+    an addition) keeps the reference's bytes. A reference that is not a
+    finite number only disables that snap; it never aborts the plan.
+
+    Marginal presence comes from the CURRENT record for an unchanged
+    crossing: replay never reproduces preserved ``b:`` predecessors, and a
+    reviewed hold can remove a desired predecessor before the diff. It comes
+    from the desired record for a corrected crossing or an addition. A
+    candidate keeps its whole chosen monetary pair (the current pair for an
+    unchanged crossing, the desired pair otherwise) rather than inventing a
+    value when it has no usable predecessor, or when its own threshold or
+    block cost is unusable. Only an ``int`` threshold occupies a position,
+    and only a finite amount is usable. A row whose threshold is usable but
+    whose block cost is not still occupies its threshold, so a successor
+    right above it fails closed and never skips to a lower row.
+
+    A second plan is a no-op for a block whose close it takes no action on.
+    That close is frozen in the next plan, kept or preserved, whatever role
+    it had in this one. Every crossing this plan wrote from replay now
+    carries the ``at`` and identity of the raw replay records, and a record
+    that reconciliation or a hold carries into ``desired`` keeps the applied
+    identity and resolved values. So the next plan sees unchanged crossings
+    whose current block cost and presence are the values this plan wrote,
+    and it resolves the same marginals against the same final predecessors.
+
+    Returns ``{event_id: record}`` for every matched milestone and every
+    replay addition of a frozen or replaced block. The ``alerted_at`` latch
+    is carried before the identity comparison, exactly as the ordinary path
+    carries it.
+    """
+    settled_blocks = frozenset(frozen_blocks) | frozenset(replaced_blocks)
+    resolved: dict[str, dict] = {}
+    roles: dict[str, str] = {}
+    final: dict[str, Mapping] = {}
+    for event_id in sorted(set(current) | set(desired) | set(preserved)):
+        current_record = current.get(event_id)
+        desired_record = desired.get(event_id)
+        preserved_record = preserved.get(event_id)
+        kind_payload = (
+            (desired_record or current_record or preserved_record).get(
+                "payload") or {}
+        )
+        if kind_payload.get("kind") != "five_hour_milestone":
+            continue
+        if preserved_record is not None:
+            # Held out of the diff (#426): retained as it stands, or revived
+            # when this family's own earlier batch retired it.
+            if current_record is not None:
+                final[event_id] = current_record
+            elif _revived_by_this_family(selection.by_id.get(event_id)):
+                final[event_id] = preserved_record
+            continue
+        block = _five_hour_block(kind_payload)
+        if block not in settled_blocks:
+            # An open block, or one whose close the plan tombstones: replay
+            # decides these milestones, exactly as it did before #875.
+            if desired_record is not None:
+                final[event_id] = desired_record
+            continue
+        if current_record is not None and desired_record is not None:
+            carried = _preserve_non_derivable_state(
+                current_record, desired_record)
+            current_payload = current_record.get("payload") or {}
+            payload = dict(carried.get("payload") or {})
+            # A moved ``at`` is a corrected crossing like a changed identity:
+            # copying replay's marginal for it would leave the next plan to
+            # re-resolve it against its final predecessor (spec §1.3).
+            if (
+                block in frozen_blocks
+                and current_record.get("at") == desired_record.get("at")
+                and _milestone_identity(current_payload)
+                == _milestone_identity(payload)
+            ):
+                payload["block_cost_usd"] = current_payload.get(
+                    "block_cost_usd")
+                roles[event_id] = "unchanged"
+            else:
+                roles[event_id] = "corrected"
+            record = {**carried, "payload": payload}
+        elif desired_record is not None:
+            roles[event_id] = "added"
+            record = {**desired_record,
+                      "payload": dict(desired_record.get("payload") or {})}
+        else:
+            # Current only and not preserved: the plan tombstones it.
+            continue
+        resolved[event_id] = record
+        final[event_id] = record
+
+    # Every row with a usable threshold occupies it, usable cost or not.
+    occupied: dict[tuple, dict[int, list[str]]] = {}
+    for event_id, record in final.items():
+        payload = record.get("payload") or {}
+        threshold = _usable_threshold(payload.get("percent_threshold"))
+        if threshold is not None:
+            occupied.setdefault(
+                _milestone_segment_key(payload), {}
+            ).setdefault(threshold, []).append(event_id)
+
+    def predecessor_cost(payload):
+        """The final block cost at the nearest lower threshold, or None."""
+        rows = occupied.get(_milestone_segment_key(payload), {})
+        threshold = _usable_threshold(payload.get("percent_threshold"))
+        lower = [value for value in rows if value < threshold]
+        if not lower:
+            return None
+        nearest = rows[max(lower)]
+        costs = {
+            event_id: (final[event_id].get("payload") or {}).get(
+                "block_cost_usd")
+            for event_id in nearest
+        }
+        if not all(_usable_amount(cost) for cost in costs.values()):
+            return None  # fails closed: never skips past an unusable row
+        return costs[max(nearest)]
+
+    for event_id, record in resolved.items():
+        payload = record["payload"]
+        current_payload = (current.get(event_id) or {}).get("payload") or {}
+        desired_payload = (desired.get(event_id) or {}).get("payload") or {}
+        chosen = (
+            current_payload if roles[event_id] == "unchanged"
+            else desired_payload
+        )
+        if chosen.get("marginal_cost_usd") is None:
+            payload["marginal_cost_usd"] = None
+            continue
+        prior = None
+        if (
+            _usable_threshold(payload.get("percent_threshold")) is not None
+            and _usable_amount(payload.get("block_cost_usd"))
+        ):
+            prior = predecessor_cost(payload)
+        if prior is None:
+            payload["block_cost_usd"] = chosen.get("block_cost_usd")
+            payload["marginal_cost_usd"] = chosen.get("marginal_cost_usd")
+            continue
+        value = float(payload["block_cost_usd"]) - float(prior)
+        reference = (
+            current_payload if event_id in current else desired_payload
+        ).get("marginal_cost_usd")
+        if (
+            _usable_amount(reference)
+            and abs(value - reference) <= _MARGINAL_TOLERANCE_USD
+        ):
+            value = reference
+        payload["marginal_cost_usd"] = value
+    return resolved
 
 
 _SNAPSHOT_IDENTITY_FIELDS = (
@@ -395,7 +848,6 @@ _SNAPSHOT_IDENTITY_FIELDS = (
 _SNAPSHOT_DEPENDENT_KINDS = frozenset({
     "percent_milestone", "five_hour_milestone",
 })
-_EMPTY_REFERENCE_SENTINELS = frozenset({None, 0, "0", ""})
 _MILESTONE_BASE_DEPENDENCIES = {
     "usage_snapshot_ref": "snapshot_accept",
     "cost_snapshot_ref": "weekly_cost_snapshot",
@@ -825,12 +1277,16 @@ def _preserve_reviewed_hold_dependencies(
     """Keep frozen five-hour facts reached from exact reviewed holds.
 
     An exact weekly-axis hold must not erase the same observation's retained
-    five-hour crossing. Milestones are historical facts, so retain their whole
-    accepted payload and close the usage/cost reference graph with the exact
-    currently selected events. A closed block may update only its weekly axes;
-    its five-hour close boundary, reading, money, tokens and children stay the
-    selected frozen fact. Any unfamiliar reference shape refuses rather than
-    being guessed or rewritten.
+    five-hour crossing. Milestones are historical facts, so ``desired``
+    receives their whole accepted payload, and the usage/cost reference graph
+    is closed with the exact currently selected events. Under a frozen or a
+    replaced close (#875), :func:`_resolve_closed_block_milestones` still
+    settles such a milestone's marginal against its final predecessor; its
+    block cost stays the accepted one. A closed block may update only its
+    weekly axes; its five-hour close boundary, reading, money, tokens and
+    children stay the selected frozen fact, so that update keeps the close's
+    money and its block stays frozen (spec §4.1). Any unfamiliar reference
+    shape refuses rather than being guessed or rewritten.
     """
     snapshot_ids = {
         f"sa:{raw_id}" for raw_id in reviewed_weekly_hold_ids
@@ -1046,12 +1502,13 @@ class RederivePlan:
     actions: tuple[PlanAction, ...]
     retained_event_count: int
     preserved_event_count: int = 0
+    uncertain_cost_fact_count: int = 0
     action_counts_by_event_kind: Mapping[str, Mapping[str, int]] = dataclasses.field(
         default_factory=dict
     )
 
     def _body(self) -> dict:
-        return {
+        body = {
             "schemaVersion": 1,
             "family": self.family,
             "journalHighWater": (
@@ -1068,6 +1525,9 @@ class RederivePlan:
             "payloadHashes": sorted(action.payload_hash for action in self.actions),
             "actions": [action.to_dict() for action in self.actions],
         }
+        if self.uncertain_cost_fact_count:
+            body["uncertainCostFactCount"] = self.uncertain_cost_fact_count
+        return body
 
     @property
     def plan_hash(self) -> str:
@@ -1106,6 +1566,8 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
                             raw_observations=(),
                             snapshot_identity_decisions=(),
                             reviewed_weekly_hold_ids=(),
+                            uncertain_cost_fact_ids=(),
+                            historical_close_markers=None,
                             enforce_guard=True) -> RederivePlan:
     """Diff current effective events against one scratch-derived desired set.
 
@@ -1126,7 +1588,19 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
     append-only journal forever, which is precisely the case the first design
     called already-correct. The resulting correction is a semantic no-op in
     content and a revision advance in effect, and the revision advance is what
-    suppresses the rev-0 group under the selector's revision filter."""
+    suppresses the rev-0 group under the selector's revision filter.
+
+    ``historical_close_markers`` (#869) maps an unmarked close's event id to
+    the planner's retained-entry proof that its $0 came from a missing card.
+    ``uncertain_cost_fact_ids`` names the non-close monetary events the caller
+    already judged unprovable; closed blocks are judged here, against the
+    state this plan leaves behind.
+
+    #875: the milestones of a block whose final close is frozen (kept,
+    preserved history retained or revived, or corrected without moving its
+    money) or replaced (added, or corrected in a way that writes its money)
+    are decided by :func:`_resolve_closed_block_milestones` before the diff,
+    the same way closes are decided before milestones."""
     conflicted_event_ids = frozenset(conflicted_event_ids or ())
     desired = _desired_by_id(desired_events)
     current = {
@@ -1160,20 +1634,87 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         for kind in sorted(_EVT_CLASSIFICATIONS)
     }
     actions: list[PlanAction] = []
+    historical_close_markers = dict(historical_close_markers or {})
+    drifted_close_ids: set = set()
+
+    def _kind(record):
+        return (record.get("payload") or {}).get("kind")
+
+    # Every close is decided before any milestone, so a five-hour milestone can
+    # follow the decision its block's close actually received (#869).
+    close_decisions = {}
+    for event_id in sorted(set(current) & set(desired)):
+        if (
+            _kind(current[event_id]) == "five_hour_block_close"
+            and _kind(desired[event_id]) == "five_hour_block_close"
+        ):
+            close_decisions[event_id] = _preserve_non_derivable_state(
+                current[event_id], desired[event_id],
+                historical_marker=historical_close_markers.get(event_id),
+                drifted_ids=drifted_close_ids,
+            )
+    # #875 (spec §4.1): classify every block by the closed close the plan's
+    # FINAL state holds for it, whatever its pricing basis. The class depends
+    # on that close's MONEY, the block total its milestones must agree with,
+    # never on whether the plan acts on it: kept and preserved are transient
+    # roles (a hold can inject a preserved close, and the next plan can see
+    # it preserved again), so both are frozen, a revival is frozen although
+    # the plan writes it, and so is a correction that leaves the total where
+    # it was. A frozen close freezes the block cost of its unchanged
+    # crossings; a corrected crossing under it still takes replay's.
+    frozen_close_blocks = set()
+    replaced_close_blocks = set()
+    for event_id, decision in close_decisions.items():
+        payload = decision.get("payload") or {}
+        if payload.get("is_closed") != 1:
+            continue
+        if decision is current[event_id] or _close_keeps_its_money(
+            current[event_id].get("payload") or {}, payload,
+        ):
+            # Kept, including a forced-conflict reaffirmation, which only
+            # re-writes this same content at a higher revision; or a
+            # money-preserving correction, such as the reviewed hold's
+            # weekly-axis update (spec §1.7).
+            frozen_close_blocks.add(_five_hour_block(payload))
+        else:
+            # The plan writes this close's money: it closes a block that was
+            # open, or it moves or cannot compare the total.
+            replaced_close_blocks.add(_five_hour_block(payload))
+    for event_id in set(desired) - set(current):
+        payload = desired[event_id].get("payload") or {}
+        if (payload.get("kind") == "five_hour_block_close"
+                and payload.get("is_closed") == 1):
+            replaced_close_blocks.add(_five_hour_block(payload))  # an add
+    for event_id, record in preserved.items():
+        if event_id in current:
+            final_close = current[event_id]
+        elif _revived_by_this_family(selection.by_id.get(event_id)):
+            final_close = record
+        else:
+            continue  # stays retired: the final state holds no such close
+        payload = final_close.get("payload") or {}
+        if (payload.get("kind") == "five_hour_block_close"
+                and payload.get("is_closed") == 1):
+            frozen_close_blocks.add(_five_hour_block(payload))
+    # Frozen wins (spec §4.1): a block whose final state holds a frozen close
+    # and a replaced one is frozen. The causal block closure applies the same
+    # rule (:func:`_replaced_block_closure`).
+    replaced_close_blocks -= frozen_close_blocks
+    milestone_decisions = _resolve_closed_block_milestones(
+        current, desired, preserved, frozen_close_blocks,
+        replaced_close_blocks, selection=selection,
+    )
 
     for event_id in sorted(set(current) | set(desired) | set(preserved)):
         current_record = current.get(event_id)
-        desired_record = desired.get(event_id)
+        desired_record = milestone_decisions.get(
+            event_id, desired.get(event_id))
         selected = selection.by_id.get(event_id)
         preserved_record = preserved.get(event_id)
         if preserved_record is not None:
             # Un-re-derivable history: retain it, or restore it when this
             # family's own earlier plan retired it (#426).
-            revive = (
-                selected is not None
-                and selected.status == "tombstone"
-                and str(selected.batch_id or "").startswith(_FAMILY_BATCH_PREFIX)
-            )
+            revive = _revived_by_this_family(selected)
             reaffirm = (
                 selected is not None
                 and selected.status == "active"
@@ -1193,9 +1734,12 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
             at = str(source["at"])
             payload = dict(source.get("payload") or {})
         elif current_record is not None and desired_record is not None:
-            desired_record = _preserve_non_derivable_state(
-                current_record, desired_record
-            )
+            if event_id in close_decisions:
+                desired_record = close_decisions[event_id]
+            elif event_id not in milestone_decisions:
+                desired_record = _preserve_non_derivable_state(
+                    current_record, desired_record,
+                )
             if (
                 _semantic_event(current_record) == _semantic_event(desired_record)
                 and event_id not in conflicted_event_ids
@@ -1248,6 +1792,27 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
             kind=kind,
         ))
 
+    # #869 F7/Q9: a close counts only while its cost stays unprovable in the
+    # state this plan leaves behind — not a provably priced close, not one this
+    # plan corrects, and not one an earlier correction already proved.
+    uncertain_closes = {
+        event_id for event_id, record in current.items()
+        if _kind(record) == "five_hour_block_close"
+        and close_cost_is_uncertain(record.get("payload") or {})
+    }
+    for action in actions:
+        if action.kind != "five_hour_block_close":
+            continue
+        if action.disposition == "tombstone":
+            uncertain_closes.discard(action.event_id)
+        elif close_cost_is_uncertain(action.payload or {}):
+            uncertain_closes.add(action.event_id)
+        else:
+            uncertain_closes.discard(action.event_id)
+    uncertain_ids = (
+        set(uncertain_cost_fact_ids or ()) | uncertain_closes
+        | drifted_close_ids
+    )
     plan = RederivePlan(
         family=FAMILY,
         journal_high_water=journal_high_water,
@@ -1257,11 +1822,105 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         actions=tuple(actions),
         retained_event_count=retained_event_count,
         preserved_event_count=len(preserved),
+        uncertain_cost_fact_count=len(uncertain_ids),
         action_counts_by_event_kind=counts_by_kind,
     )
     if enforce_guard:
         enforce_week_reset_add_burst_guard(plan)
     return plan
+
+
+def _replaced_block_closure(
+    included: list, reviewed_actions, current_events: Mapping[str, Mapping],
+) -> list:
+    """#875 (spec §4.5): keep a five-hour block whose close R replaces whole.
+
+    The B/R filter drops a close correction both plans make identically, yet
+    a milestone under that close can still differ between them, for instance
+    when R's hold keeps its predecessor whole while B reprices it. Keeping
+    only the milestone would reprice it under a close the subset leaves as it
+    stands (spec §1.5). So whenever ``included`` holds a five-hour milestone
+    action whose block has a reviewed close action that REPLACES the close,
+    the subset takes that close action and every reviewed action on the
+    block's milestones, whether or not they survived the filter.
+
+    The classification is §4.1's, derived from R's actions and
+    ``current_events`` alone. A close action replaces when it adds a closed
+    close, or supersedes to a closed record whose current record is open,
+    whose totals are unusable, or whose totals differ by more than 1e-9 USD.
+    A block R holds FROZEN never triggers, even beside such an action
+    (frozen wins): a closed current close R takes no action on (kept, or
+    preserved history retained), a revival (a supersede with no active
+    current record), a forced-conflict reaffirmation (a supersede to the
+    current content, whatever its total), or a money-preserving correction.
+    A tombstone carries no payload; its block is read from its current
+    record. Only reviewed actions are ever added, each once. The reverse
+    direction, a causal close action whose milestones are identical in both
+    plans, is #883's.
+    """
+    def block(action):
+        if action.disposition == "tombstone":
+            record = current_events.get(action.event_id) or {}
+            return _five_hour_block(record.get("payload") or {})
+        return _five_hour_block(action.payload or {})
+
+    acted_ids = {action.event_id for action in reviewed_actions}
+    frozen_blocks = set()
+    for event_id, record in current_events.items():
+        payload = record.get("payload") or {}
+        if (
+            event_id not in acted_ids
+            and payload.get("kind") == "five_hour_block_close"
+            and payload.get("is_closed") == 1
+        ):
+            frozen_blocks.add(_five_hour_block(payload))
+    replacing: dict[tuple, set] = {}
+    for action in reviewed_actions:
+        payload = action.payload or {}
+        if (
+            action.kind != "five_hour_block_close"
+            or action.disposition not in {"add", "supersede"}
+            or payload.get("is_closed") != 1
+        ):
+            continue
+        if action.disposition == "supersede":
+            now = current_events.get(action.event_id)
+            if (
+                now is None  # a revival of preserved history
+                # A reaffirmation re-writes the kept content, whatever its
+                # total, exactly as the resolver's ``decision is current``.
+                or _semantic_event(now) == _semantic_event({
+                    "id": action.event_id, "at": action.at,
+                    "payload": payload,
+                })
+                or _close_keeps_its_money(now.get("payload") or {}, payload)
+            ):
+                frozen_blocks.add(block(action))
+                continue
+        replacing.setdefault(block(action), set()).add(action.event_id)
+    for key in frozen_blocks:
+        replacing.pop(key, None)
+    triggered = {
+        block(action) for action in included
+        if action.kind == "five_hour_milestone"
+        and block(action) in replacing
+    }
+    if not triggered:
+        return included
+    close_ids = set().union(*(replacing[key] for key in triggered))
+    expanded = list(included)
+    included_ids = {action.event_id for action in included}
+    for action in reviewed_actions:
+        if action.event_id in included_ids:
+            continue
+        if (
+            action.event_id in close_ids
+            or (action.kind == "five_hour_milestone"
+                and block(action) in triggered)
+        ):
+            expanded.append(action)
+            included_ids.add(action.event_id)
+    return expanded
 
 
 def causal_delta_plan(
@@ -1276,6 +1935,12 @@ def causal_delta_plan(
     reviewed-only or changed action is caused by the proposed operator record.
     A baseline-only action means the reviewed target returns to C and requires
     no correction action.
+
+    #875 (spec §4.5): a five-hour block whose close R replaces, by §4.1's
+    money rule, is applied whole whenever the subset changes one of its
+    milestones, and a block R holds frozen never is; see
+    :func:`_replaced_block_closure`. The snapshot-dependency closure then runs
+    over that expanded set.
     """
     if (
         baseline.journal_high_water != reviewed.journal_high_water
@@ -1306,6 +1971,8 @@ def causal_delta_plan(
             )
         )
     ]
+    actions = _replaced_block_closure(
+        actions, reviewed.actions, current_events)
     action_by_id = {action.event_id: action for action in actions}
     dependency_tombstones = set()
     for action in actions:
@@ -1397,6 +2064,7 @@ def causal_delta_plan(
         actions=actions,
         retained_event_count=reviewed.retained_event_count,
         preserved_event_count=reviewed.preserved_event_count,
+        uncertain_cost_fact_count=reviewed.uncertain_cost_fact_count,
         action_counts_by_event_kind=counts_by_kind,
     )
 

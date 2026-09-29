@@ -193,7 +193,7 @@ def test_codex_tick_retries_budget_after_quota_worker_holds_ingest_lock(
     }) + "\n")
     monkeypatch.setitem(
         ns, "_sum_codex_cost_for_range",
-        lambda start, end, *, speed="auto": 100.0,
+        lambda start, end, *, speed="auto", pricing_provenance=None: 100.0,
     )
     monkeypatch.setitem(
         ns, "_dispatch_alert_notification",

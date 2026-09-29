@@ -233,7 +233,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1015,
+                            "epoch": 1016,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0

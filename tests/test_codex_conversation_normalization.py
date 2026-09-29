@@ -8654,6 +8654,7 @@ def test_850_a26_the_outline_memo_cannot_serve_a_stale_child_summary(
         child = next(c for c in warm["children"]
                      if c["conversation_key"] == "v850-outline-child")
         assert child["title"] == "v850-child", child
+        healthy_child = dict(child)
         assert calls == [1]
         again = q.get_codex_conversation_outline(
             conversations, "v850-b", effective_speed="standard")
@@ -8667,6 +8668,7 @@ def test_850_a26_the_outline_memo_cannot_serve_a_stale_child_summary(
             c for c in after["children"]
             if c["conversation_key"] == "v850-outline-child")
         assert corrupted_child["title"] != "v850-child", corrupted_child
+        assert after != warm
 
         cache.execute(
             "UPDATE codex_conversation_threads SET cwd = ? "
@@ -8674,17 +8676,21 @@ def test_850_a26_the_outline_memo_cannot_serve_a_stale_child_summary(
         cache.commit()
         repaired = q.get_codex_conversation_outline(
             conversations, "v850-b", effective_speed="standard")
-        # The corrupted generation's entry can never be served again, because
-        # its key carries the corrupted set's digest. The repair restores the
-        # pre-corruption digest, whose entry is still resident and is exactly
-        # the body the repair must produce, so the memo may serve it: what the
-        # digest guarantees is that no generation is served under another
-        # generation's key, and the attribution-derived field returns.
+        # Repair restores the pre-corruption digest. Its still-resident healthy
+        # entry is therefore a valid hit: the digest promises generation-key
+        # separation, not a compulsory miss in both directions.
+        assert calls == [1, 1], (
+            "the repaired digest should reuse the resident healthy entry")
+        assert repaired is warm
+        assert repaired is not after, (
+            "the corrupted generation was served under the repaired key")
         assert repaired == warm
-        assert next(
+        repaired_child = next(
             c for c in repaired["children"]
-            if c["conversation_key"] == "v850-outline-child")["title"] == (
-                "v850-child")
+            if c["conversation_key"] == "v850-outline-child")
+        assert repaired_child == healthy_child
+        assert repaired_child["title"] == "v850-child"
+        assert repaired_child["title"] != corrupted_child["title"]
     finally:
         q._codex_outline_memo_clear()
 
@@ -8797,6 +8803,121 @@ def test_850_a26_the_scoped_request_reads_the_raw_table_the_same_way(
     finally:
         scoped.set_trace_callback(None)
         scoped.close()
+
+
+class _StatementCounter:
+    """Transparent connection proxy recording statement and bind counts."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.executions = []
+
+    def execute(self, sql, params=()):
+        self.executions.append((" ".join(str(sql).split()), len(params)))
+        return self._conn.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _seed_many_undecodable_stored_rollups(cache, conversations, count):
+    """Stale-attributed rows whose raw metadata is now undecodable."""
+    project_key = _v850_project_key(conversations, "v850-b")
+    for index in range(count):
+        key = f"v860-undecodable-{index:03d}"
+        native = f"native-v860-{index:03d}"
+        cache.execute(
+            "INSERT INTO codex_conversation_threads "
+            "(conversation_key, source_root_key, native_thread_id,"
+            " root_thread_id, source_path, cwd, git_json, first_seen_utc,"
+            " last_seen_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+            (key, _V850_ROOT, native, native,
+             f"{_V850_ROOT_PATH}/{key}.jsonl", _V850_SHARED_CWD, None,
+             "2026-01-01T00:00:00+00:00", "2026-09-20T00:00:00+00:00"),
+        )
+        conversations.execute(
+            "INSERT INTO codex_conversation_rollups "
+            "(conversation_key, item_count, started_utc, last_activity_utc,"
+            " project_key, project_label, models_json, title, parent_thread_id,"
+            " source_root_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (key, 1, "2026-09-20T00:00:00+00:00",
+             f"2026-09-20T00:{index:02d}:00+00:00", project_key,
+             "v850-shared", '["gpt-5"]', key, None, _V850_ROOT),
+        )
+        _v850_corrupt(cache, key, "cwd")
+    conversations.commit()
+    return [f"v860-undecodable-{index:03d}" for index in range(count)]
+
+
+def test_860_project_filtered_browse_bounds_binds_below_variable_limit(
+    v850_store,
+):
+    """META-854-A: key-set cardinality never becomes host parameters.
+
+    The active limit is deliberately lower than the undecodable population.
+    Before Task A the COUNT statement bound every key in ``NOT IN (...)`` and
+    failed with ``too many SQL variables`` before any page could be returned.
+    """
+    _ns, cache, conversations = v850_store
+    shared_key = _v850_project_key(conversations, "v850-b")
+    baseline = q.list_codex_conversations(
+        conversations, effective_speed="standard", project_key=shared_key,
+        model="gpt-5", limit=2, cursor="v850-b", selected="v850-b")
+    bad_keys = _seed_many_undecodable_stored_rollups(cache, conversations, 17)
+
+    previous_limit = conversations.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 16)
+    counted = _StatementCounter(conversations)
+    try:
+        q.undecodable_codex_conversation_keys(counted)
+        counted.executions.clear()
+        result = q.list_codex_conversations(
+            counted, effective_speed="standard", project_key=shared_key,
+            model="gpt-5", limit=2, cursor="v850-b", selected="v850-b")
+        assert result["rows"] == baseline["rows"]
+        assert result["page"] == baseline["page"]
+        assert result["selected"] == baseline["selected"]
+        assert len(counted.executions) == 14
+        assert max(bound for _sql, bound in counted.executions) == 6
+
+        unfiltered = q.list_codex_conversations(
+            conversations, effective_speed="standard", limit=10)
+        visible_bad = [
+            row for row in unfiltered["rows"]
+            if row["conversation_key"] in bad_keys
+        ]
+        assert visible_bad
+        assert all(
+            row["project_key"] is None and row["project_label"] is None
+            for row in visible_bad
+        )
+    finally:
+        conversations.setlimit(
+            sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+
+def test_860_stored_browse_statement_count_is_key_population_constant(
+    v850_store,
+):
+    """One raw pass and a fixed number of browse reads, independent of N."""
+    _ns, cache, conversations = v850_store
+    shared_key = _v850_project_key(conversations, "v850-b")
+    _v850_corrupt(cache, "v850-a", "cwd")
+    one = _StatementCounter(conversations)
+    # Each transparent proxy is the connection object the resolver sees. Warm
+    # that exact object, then count only the steady-state request.
+    q.undecodable_codex_conversation_keys(one)
+    one.executions.clear()
+    q.list_codex_conversations(
+        one, effective_speed="standard", project_key=shared_key, limit=2)
+    _seed_many_undecodable_stored_rollups(cache, conversations, 16)
+    many = _StatementCounter(conversations)
+    q.undecodable_codex_conversation_keys(many)
+    many.executions.clear()
+    q.list_codex_conversations(
+        many, effective_speed="standard", project_key=shared_key, limit=2)
+
+    assert len(one.executions) == len(many.executions) == 9
+    assert max(bound for _sql, bound in many.executions) == 2
 
 
 # ── #850 §4.9 — the three identity-only readers stop raising ────────────────

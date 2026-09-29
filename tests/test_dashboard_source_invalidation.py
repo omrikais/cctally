@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import fcntl
 import json
 import math
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import sys
@@ -1111,7 +1113,7 @@ def test_snapshot_keeps_prior_complete_source_bundle_when_signature_and_builder_
     prior_snap = dataclasses.replace(prior_snap, source_bundle=prior_bundle)
     sc.store_dispatch_state(("prior",), prior_snap)
 
-    def signature_failure(_stats_conn):
+    def signature_failure(_stats_conn, **_kwargs):
         raise RuntimeError("private digest /canary/root")
 
     def bundle_failure(**_kwargs):
@@ -1360,7 +1362,14 @@ def test_dashboard_held_codex_flock_publishes_unavailable_source_without_prior(
 def test_dashboard_dispatch_retries_a_hero_scoped_codex_projection_after_certificate_recovery(
     tmp_path, monkeypatch,
 ):
-    """Certificate-only recovery must bypass idle and retry only Codex."""
+    """Certificate-only recovery must not idle on the incoherent generation.
+
+    Recovery moves no dispatch-signature leg, only the certificate. Since #857
+    the certificate is a leg of the Codex quota-dependency identity, which
+    rides the dispatch KEY, so the recovery tick takes the FULL path — legacy
+    rows rebuilt once — and republishes a coherent Codex generation; the tick
+    after it idles again.
+    """
     ns, _root, rollout, cache = _sync_setup(tmp_path, monkeypatch)
     import _cctally_quota as quota_module
     import _lib_snapshot_cache as sc
@@ -1404,6 +1413,19 @@ def test_dashboard_dispatch_retries_a_hero_scoped_codex_projection_after_certifi
         assert certificate[0] == physical_seq
         assert ns["_cctally_tui"]._tui_compute_dispatch_signature(stats) == before_retry_signature
 
+        # #857: the certificate is a leg of the Codex quota-dependency
+        # identity, which rides the dispatch KEY, so recovery now takes the
+        # FULL path — legacy rows included — rather than the idle path's
+        # bounded source adapter. Once per change: the next tick idles.
+        tui = ns["_cctally_tui"]
+        legacy_builds = []
+        real_forecast = tui._tui_build_forecast_view
+
+        def counted_forecast(*args, **kwargs):
+            legacy_builds.append(1)
+            return real_forecast(*args, **kwargs)
+
+        monkeypatch.setattr(tui, "_tui_build_forecast_view", counted_forecast)
         recovered = ns["_tui_build_snapshot"](
             now_utc=now,
             skip_sync=True,
@@ -1413,6 +1435,17 @@ def test_dashboard_dispatch_retries_a_hero_scoped_codex_projection_after_certifi
         assert recovered.source_bundle.sources["codex"].availability == "ok"
         assert recovered.source_bundle.sources["codex"] is not unavailable_codex
         assert recovered.source_bundle.sources["claude"] is unavailable.source_bundle.sources["claude"]
+        assert len(legacy_builds) == 1, (
+            "the certificate recovery must rebuild the legacy rows exactly once")
+        again = ns["_tui_build_snapshot"](
+            now_utc=now,
+            skip_sync=True,
+            precompute_envelope=True,
+            runtime_bind="127.0.0.1",
+        )
+        assert len(legacy_builds) == 1, "the recovered snapshot must idle"
+        assert (again.source_bundle.sources["codex"]
+                is recovered.source_bundle.sources["codex"])
     finally:
         sc.reset_dispatch_state()
         cache.close()
@@ -2012,9 +2045,11 @@ def test_dashboard_source_scale_gate_reuses_idle_provider_state_without_rollout_
         # statements over 20,000 Codex entries, 400 files, 200 conversations
         # and 25 quota windows. A regression to per-row or per-window queries
         # crosses this bound by two orders of magnitude.
-        # Measured at 6 on this fixture; the bound leaves room for one more
-        # aggregate without leaving room for a per-window query.
-        assert len(digest_statements) <= 8, (
+        # Measured at 9 on this fixture: seven relation aggregates plus the
+        # warm digest memo's two fixed PRAGMA reads (`database_list`, which
+        # names the file it stats, and `journal_mode`).  The bound leaves room
+        # for one more fixed query without leaving room for a per-window query.
+        assert len(digest_statements) <= 10, (
             f"{len(digest_statements)} statements to digest a fixture of "
             f"{codex_entry_count:,} entries; the digest is no longer bounded"
         )
@@ -2466,3 +2501,1865 @@ def test_an_unchanged_claude_period_does_not_churn_the_source_version(
     assert (again.sources["claude"].data_version
             == first.sources["claude"].data_version)
     assert again.sources["claude"] is first.sources["claude"]
+
+
+# ==========================================================================
+# #857 — a SETTLED cycle-unavailable Codex generation idles.
+#
+# Measured on a full-size store at the production 5-second interval: once the
+# latest weekly window resets with no newer Codex observation, the build
+# publishes `partial`/`fresh` with the one warning `codex_cycle_unavailable`,
+# `_tui_source_bundle_can_idle` refuses it on availability, and every idle tick
+# paid a full Codex capture and build (~30% CPU on an idle dashboard). Nothing
+# about that generation can change until its evidence moves or a time
+# transition its decision deadline records is reached, so these ticks must
+# reclock it instead.
+# ==========================================================================
+
+_857_UTC = dt.timezone.utc
+_857_T0 = dt.datetime(2026, 7, 16, 12, tzinfo=_857_UTC)
+#: The window the fixture appends resets one day after T0 and is long past by
+#: `_857_AFTER`, with no newer observation — the measured state.
+_857_RESET = _857_T0 + dt.timedelta(days=1)
+_857_AFTER = _857_T0 + dt.timedelta(days=2)
+#: The production sync interval of the measurement.
+_857_TICK = dt.timedelta(seconds=5)
+
+
+def _857_append_weekly_snapshot(rollout, *, captured_at, resets_at):
+    payload = {
+        "type": "event_msg",
+        "timestamp": captured_at.isoformat(),
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "rate_limits": {
+                    "limit_id": "fixture-weekly-limit",
+                    "limit_name": "Fixture weekly quota",
+                    "primary": {
+                        "resets_at": int(resets_at.timestamp()),
+                        "used_percent": 25.0,
+                        "window_minutes": 10_080,
+                    },
+                },
+            },
+        },
+    }
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _857_store(
+    tmp_path, monkeypatch, *,
+    captured_at=_857_T0 - dt.timedelta(minutes=1), resets_at=_857_RESET,
+):
+    """A real store: rollout accounting plus one coherent native weekly window."""
+    import _lib_snapshot_cache as sc
+
+    ns, _root, rollout, cache = _sync_setup(tmp_path, monkeypatch)
+    _857_append_weekly_snapshot(
+        rollout, captured_at=captured_at, resets_at=resets_at)
+    ns["sync_codex_cache"](cache)
+    sc.reset_dispatch_state()
+    ns["_cctally_tui"]._tui_reset_partial_retry_state()
+    return ns, cache
+
+
+def _857_tick(ns, now_utc, **kwargs):
+    kwargs.setdefault("skip_sync", True)
+    return ns["_tui_build_snapshot"](
+        now_utc=now_utc,
+        precompute_envelope=True,
+        runtime_bind="127.0.0.1",
+        **kwargs,
+    )
+
+
+def _857_current_identity(ns):
+    """The Codex quota-dependency identity a dispatch read sees now, read the
+    way the tick reads it: on the dispatch signature's own cache handle."""
+    stats = ns["open_db"]()
+    try:
+        return ns["_cctally_tui"]._tui_compute_dispatch_signature(
+            stats, with_codex_dependency=True)[1]
+    finally:
+        stats.close()
+
+
+def _857_identity_on(conn):
+    """The identity read on an ALREADY-open ``conn``, bound to its own file.
+
+    The kernel requires a pre-open observation; for a handle a test opened
+    earlier, observing its file now is the same observation — nothing replaces
+    the file in these tests unless they say so.
+    """
+    import _lib_snapshot_cache as sc
+
+    opened = sc.codex_cache_file_identity(sc.codex_main_database_path(conn))
+    return sc.codex_quota_dependency_identity(conn, opened_file=opened)
+
+
+def _857_spy(monkeypatch, tui):
+    """Count the source-level work each tick does, through the real seams."""
+    calls = {
+        "source_bundle": 0, "capture": 0, "build": 0, "clock": 0,
+        "forecast": 0, "regimes": [],
+    }
+
+    def count(name, key):
+        original = getattr(tui, name)
+
+        def counted(*args, **kwargs):
+            calls[key] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(tui, name, counted)
+
+    count("_tui_build_source_bundle", "source_bundle")
+    count("capture_codex_source_state", "capture")
+    count("build_codex_source_state_from_capture", "build")
+    count("refresh_codex_source_clock", "clock")
+    # The legacy rows: zero means every tick took the idle dispatch.
+    count("_tui_build_forecast_view", "forecast")
+    original_regime = tui._tui_note_codex_regime
+
+    def regime(value):
+        calls["regimes"].append(value)
+        return original_regime(value)
+
+    monkeypatch.setattr(tui, "_tui_note_codex_regime", regime)
+    return calls
+
+
+def _857_assert_settled(codex):
+    assert codex.availability == "partial"
+    assert codex.freshness == "fresh"
+    assert codex.data is not None
+    assert [warning.code for warning in codex.warnings] == [
+        "codex_cycle_unavailable"]
+    assert codex.capabilities["hero"].status == "unavailable"
+    assert codex.data["hero"]["cycle"] is None
+    assert codex.data["hero"]["cost_usd"] is None
+    assert not (codex.metadata_health or {}).get("retryable")
+
+
+@pytest.fixture
+def settled_store(tmp_path, monkeypatch):
+    import _lib_snapshot_cache as sc
+
+    ns, cache = _857_store(tmp_path, monkeypatch)
+    handle = {"cache": cache}
+    try:
+        yield ns, handle
+    finally:
+        sc.reset_dispatch_state()
+        ns["_cctally_tui"]._tui_reset_partial_retry_state()
+        handle["cache"].close()
+
+
+def test_857_a_settled_cycle_unavailable_codex_generation_idles_without_rebuilding(
+    settled_store, monkeypatch,
+):
+    """The measured defect, through real dashboard ticks.
+
+    Beyond the 120-second partial-retry interval, so neither the retry kernel
+    nor any time-based rebuild can be what keeps the ticks quiet.
+    """
+    from _lib_source_retry import PARTIAL_RETRY_INTERVAL
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    first = _857_tick(ns, _857_AFTER)
+    settled = first.source_bundle.sources["codex"]
+    _857_assert_settled(settled)
+    # Nothing about this generation can change by time alone.
+    assert settled.clock_data["codex_next_decision_at"] is None
+
+    calls = _857_spy(monkeypatch, tui)
+    steps = int(PARTIAL_RETRY_INTERVAL / _857_TICK) + 6
+    snapshots = [
+        _857_tick(ns, _857_AFTER + _857_TICK * step)
+        for step in range(1, steps + 1)
+    ]
+
+    assert calls["forecast"] == 0, (
+        "precondition: every tick took the idle dispatch, so any source work "
+        "below was chosen by the idle gate")
+    assert (calls["source_bundle"], calls["capture"], calls["build"]) == (
+        0, 0, 0), (
+        "an idle tick rebuilt the settled Codex generation: "
+        f"{calls['source_bundle']} source bundles, {calls['capture']} captures, "
+        f"{calls['build']} builds over {steps} ticks")
+    assert calls["clock"] >= steps, "the idle clock must keep running"
+    assert "active" not in calls["regimes"]
+    for snapshot in snapshots:
+        codex = snapshot.source_bundle.sources["codex"]
+        _857_assert_settled(codex)
+        assert codex.data_version == settled.data_version
+        assert codex.data["periods"] is settled.data["periods"]
+        assert snapshot.sessions is first.sessions
+
+
+def test_857_a_claude_only_advance_rebuilds_claude_and_only_reclocks_the_settled_codex(
+    settled_store, monkeypatch,
+):
+    """The active path: Claude evidence moved, Codex evidence did not."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    first = _857_tick(ns, _857_AFTER)
+    settled = first.source_bundle.sources["codex"]
+    _857_assert_settled(settled)
+
+    calls = _857_spy(monkeypatch, tui)
+    cache.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) "
+        "VALUES ('session_entries_mutation_seq', '1')"
+    )
+    cache.commit()
+    second = _857_tick(ns, _857_AFTER + _857_TICK)
+
+    assert calls["source_bundle"] == 1, "precondition: the full path ran"
+    claude = second.source_bundle.sources["claude"]
+    assert claude is not first.source_bundle.sources["claude"]
+    assert claude.data_version != first.source_bundle.sources["claude"].data_version
+    assert (calls["capture"], calls["build"]) == (0, 0), (
+        "a Claude-only advance rebuilt the unchanged settled Codex generation")
+    assert calls["regimes"] == ["idle"]
+    codex = second.source_bundle.sources["codex"]
+    _857_assert_settled(codex)
+    assert codex.data_version == settled.data_version
+    assert codex.data["periods"] is settled.data["periods"]
+
+
+@pytest.mark.parametrize("change", ("codex_evidence", "accounting_pending"))
+def test_857_codex_evidence_or_pending_accounting_still_rebuilds_the_settled_codex(
+    settled_store, monkeypatch, change,
+):
+    import _lib_snapshot_cache as sc
+
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    calls = _857_spy(monkeypatch, tui)
+    if change == "codex_evidence":
+        cache.execute(
+            "UPDATE cache_meta SET value=CAST(value AS INTEGER) + 1 "
+            "WHERE key='codex_physical_mutation_seq'"
+        )
+    else:
+        # The process accounting memo no longer names the durable ledger head;
+        # a Claude advance takes the tick onto the full path where it is read.
+        sc.reset_codex_accounting_cache_state()
+        cache.execute(
+            "INSERT OR REPLACE INTO cache_meta(key, value) "
+            "VALUES ('session_entries_mutation_seq', '1')"
+        )
+    cache.commit()
+    _857_tick(ns, _857_AFTER + _857_TICK)
+
+    assert (calls["capture"], calls["build"]) == (1, 1)
+    assert calls["regimes"] == ["active"]
+
+
+def test_857_a_reset_crossing_rebuilds_codex_once_then_the_settled_generation_idles(
+    settled_store, monkeypatch,
+):
+    """One authoritative rebuild AT the transition, then settled idling."""
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    first = _857_tick(ns, _857_RESET - 2 * _857_TICK)
+    live = first.source_bundle.sources["codex"]
+    assert live.availability == "ok"
+    assert live.data["hero"]["cycle"] is not None
+    assert live.clock_data["codex_next_decision_at"] == _857_RESET
+
+    calls = _857_spy(monkeypatch, tui)
+    _857_tick(ns, _857_RESET - _857_TICK)
+    assert (calls["capture"], calls["build"]) == (0, 0)
+    crossing = _857_tick(ns, _857_RESET)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+    _857_assert_settled(crossing.source_bundle.sources["codex"])
+    for step in range(1, 31):
+        _857_assert_settled(
+            _857_tick(ns, _857_RESET + _857_TICK * step)
+            .source_bundle.sources["codex"])
+
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "the settled generation was rebuilt after the crossing")
+
+
+def test_857_frozen_future_start_evidence_becomes_usable_at_its_deadline(
+    tmp_path, monkeypatch,
+):
+    """A captured window whose nominal start lies ahead resolves strictly after
+    that start with NO new evidence. The settled generation before it must
+    record that instant, idle up to it, and rebuild exactly once there."""
+    import _lib_snapshot_cache as sc
+
+    start = _857_T0 + dt.timedelta(days=1)
+    reset = start + dt.timedelta(minutes=10_080)
+    ns, cache = _857_store(tmp_path, monkeypatch, resets_at=reset)
+    tui = ns["_cctally_tui"]
+    try:
+        first = _857_tick(ns, start - 2 * _857_TICK)
+        settled = first.source_bundle.sources["codex"]
+        _857_assert_settled(settled)
+        assert settled.clock_data["codex_next_decision_at"] == (
+            start + dt.timedelta(microseconds=1))
+
+        calls = _857_spy(monkeypatch, tui)
+        _857_tick(ns, start - _857_TICK)
+        _857_tick(ns, start)
+        assert (calls["capture"], calls["build"]) == (0, 0)
+        usable = _857_tick(ns, start + _857_TICK).source_bundle.sources["codex"]
+        assert (calls["capture"], calls["build"]) == (1, 1)
+        assert usable.availability == "ok"
+        assert usable.data["hero"]["cycle"] is not None
+        for step in range(2, 8):
+            _857_tick(ns, start + _857_TICK * step)
+        assert (calls["capture"], calls["build"]) == (1, 1)
+    finally:
+        sc.reset_dispatch_state()
+        tui._tui_reset_partial_retry_state()
+        cache.close()
+
+
+def _857_insert_raw_quota_row(ns, cache, monkeypatch):
+    """A quota row written with NO accounting or physical counter moving.
+
+    The manual-repair / writer-omission shape the trigger ledger exists for.
+    The window is a 5-hour one that expired before the tick, so the cycle
+    verdict itself does not change.
+    """
+    root_key = cache.execute(
+        "SELECT source_root_key FROM codex_source_roots").fetchone()[0]
+    cache.execute(
+        "INSERT INTO quota_window_snapshots "
+        "(source, source_root_key, source_path, line_offset, captured_at_utc, "
+        "observed_slot, logical_limit_key, limit_id, limit_name, window_minutes, "
+        "used_percent, resets_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("codex", root_key, "/private/857-raw.jsonl", 857,
+         (_857_T0 - dt.timedelta(hours=2)).isoformat(), "fixture-five-hour",
+         "fixture-five-hour-limit", "fixture-five-hour-limit",
+         "Fixture five-hour quota", 300, 5.0,
+         (_857_T0 + dt.timedelta(hours=3)).isoformat()),
+    )
+    cache.commit()
+    return cache
+
+
+def _857_bump_attribution_revision(ns, cache, monkeypatch):
+    cache.execute(
+        "INSERT INTO cache_meta(key, value) "
+        "VALUES ('codex_window_attribution_revision', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1"
+    )
+    cache.commit()
+    return cache
+
+
+def _857_rewrite_certificate(ns, cache, monkeypatch):
+    """Same meaning, different bytes: only the CONTENTS leg can see it."""
+    raw = cache.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_quota_projection_certificate'").fetchone()[0]
+    cache.execute(
+        "UPDATE cache_meta SET value=? "
+        "WHERE key='codex_quota_projection_certificate'",
+        (json.dumps(json.loads(raw), indent=1, sort_keys=True),),
+    )
+    cache.commit()
+    return cache
+
+
+def _857_delete_certificate(ns, cache, monkeypatch):
+    cache.execute(
+        "DELETE FROM cache_meta WHERE key='codex_quota_projection_certificate'")
+    cache.commit()
+    return cache
+
+
+def _857_replace_cache_file(ns, cache, monkeypatch):
+    """A restored cache.db: identical bytes, a different file."""
+    path = pathlib.Path(next(
+        str(row[2]) for row in cache.execute("PRAGMA database_list")
+        if str(row[1]) == "main"))
+    cache.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    cache.close()
+    replacement = path.with_name(path.name + ".857-replacement")
+    shutil.copyfile(path, replacement)
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    before = path.stat().st_ino
+    os.replace(replacement, path)
+    assert path.stat().st_ino != before, "precondition: a different file"
+    return ns["open_cache_db"]()
+
+
+def _857_change_registry(ns, cache, monkeypatch):
+    monkeypatch.setattr(
+        ns["_cctally_tui"], "accounts_identity_digest",
+        lambda _conn: "857registrychange")
+    return cache
+
+
+_857_INVALIDATIONS = (
+    # (id, mutate, expected Codex builds on the next tick)
+    ("raw_quota_row", _857_insert_raw_quota_row, 1),
+    ("attribution_revision", _857_bump_attribution_revision, 1),
+    ("certificate_rewritten", _857_rewrite_certificate, 1),
+    ("certificate_deleted", _857_delete_certificate, 1),
+    ("cache_file_replaced", _857_replace_cache_file, 1),
+    ("registry_changed", _857_change_registry, 1),
+)
+
+
+@pytest.mark.parametrize(
+    "mutate, expected_builds",
+    [(mutate, builds) for _id, mutate, builds in _857_INVALIDATIONS],
+    ids=[entry[0] for entry in _857_INVALIDATIONS],
+)
+def test_857_a_moved_codex_quota_input_leaves_the_settled_idle(
+    settled_store, monkeypatch, mutate, expected_builds,
+):
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    calls = _857_spy(monkeypatch, tui)
+    _857_tick(ns, _857_AFTER + _857_TICK)
+    assert (calls["capture"], calls["build"]) == (0, 0), (
+        "precondition: the unchanged settled generation idles")
+
+    handle["cache"] = mutate(ns, handle["cache"], monkeypatch)
+    moved = _857_tick(ns, _857_AFTER + 2 * _857_TICK)
+
+    assert (calls["capture"], calls["build"]) == (
+        expected_builds, expected_builds)
+    # Whatever the rebuild published is the authoritative verdict over the
+    # moved inputs; a verdict that is still the settled one idles again.
+    codex = moved.source_bundle.sources["codex"]
+    if [warning.code for warning in codex.warnings] == ["codex_cycle_unavailable"]:
+        _857_tick(ns, _857_AFTER + 3 * _857_TICK)
+        assert (calls["capture"], calls["build"]) == (
+            expected_builds, expected_builds), "a re-settled generation idles"
+
+
+def test_857_a_ledger_prune_does_not_leave_the_settled_idle(
+    settled_store, monkeypatch,
+):
+    """The projector's prune deletes CONSUMED entries: evidence already
+    reflected, not new evidence. The durable `sqlite_sequence` watermark does
+    not regress, so the identity — and the idle — must hold across it."""
+    import _lib_snapshot_cache as sc
+
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    # An entry the settled build will already have seen, so pruning it later
+    # removes nothing the build did not account for.
+    _857_insert_raw_quota_row(ns, cache, monkeypatch)
+    assert cache.execute(
+        "SELECT COUNT(*) FROM quota_window_change_log").fetchone()[0] > 0, (
+            "non-vacuity: there must be entries to prune")
+    settled = _857_tick(ns, _857_AFTER).source_bundle.sources["codex"]
+    _857_assert_settled(settled)
+    before = _857_identity_on(cache)
+    assert settled.clock_data["codex_quota_dependency"] == before
+    calls = _857_spy(monkeypatch, tui)
+    _857_tick(ns, _857_AFTER + _857_TICK)
+    assert (calls["capture"], calls["build"]) == (0, 0)
+
+    cache.execute("DELETE FROM quota_window_change_log")
+    cache.commit()
+    assert _857_identity_on(cache) == before
+    _857_tick(ns, _857_AFTER + 2 * _857_TICK)
+
+    assert (calls["capture"], calls["build"]) == (0, 0)
+
+
+def test_857_an_unreadable_codex_quota_identity_rebuilds_every_tick(
+    settled_store, monkeypatch,
+):
+    """No identity is not an unchanged identity."""
+    import _lib_snapshot_cache as sc
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    calls = _857_spy(monkeypatch, tui)
+    monkeypatch.setattr(
+        sc, "codex_quota_dependency_identity", lambda _conn, **_kw: None)
+    for step in (1, 2, 3):
+        _857_assert_settled(
+            _857_tick(ns, _857_AFTER + _857_TICK * step)
+            .source_bundle.sources["codex"])
+
+    assert (calls["capture"], calls["build"]) == (3, 3)
+
+
+def test_857_ingest_contention_bypasses_the_settled_idle(settled_store, monkeypatch):
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    calls = _857_spy(monkeypatch, tui)
+    monkeypatch.setitem(
+        ns, "sync_cache", lambda _conn: SimpleNamespace(lock_contended=False))
+    monkeypatch.setitem(
+        ns, "sync_codex_cache", lambda _conn: SimpleNamespace(lock_contended=True))
+    contended = _857_tick(ns, _857_AFTER + _857_TICK, skip_sync=False)
+
+    assert calls["source_bundle"] == 1
+    codex = contended.source_bundle.sources["codex"]
+    assert [warning.code for warning in codex.warnings] == [
+        "source_ingest_contended"]
+    assert codex.freshness == "stale"
+
+
+def test_857_a_projection_incoherent_composite_keeps_rebuilding(
+    settled_store, monkeypatch,
+):
+    """Only the SINGLETON cycle warning settles: the composite with an
+    incoherent projection is the certificate-recovery case, which must keep
+    retrying every tick."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    _857_delete_certificate(ns, handle["cache"], monkeypatch)
+    first = _857_tick(ns, _857_AFTER).source_bundle.sources["codex"]
+    assert sorted(warning.code for warning in first.warnings) == [
+        "codex_cycle_unavailable", "codex_projection_incoherent"]
+    calls = _857_spy(monkeypatch, tui)
+    for step in (1, 2, 3):
+        _857_tick(ns, _857_AFTER + _857_TICK * step)
+
+    assert (calls["capture"], calls["build"]) == (3, 3)
+
+
+def test_857_the_codex_quota_identity_is_stable_cheap_and_agrees_across_readers(
+    settled_store,
+):
+    """The idle decision compares an identity read on the dashboard's pinned
+    cache connection with one read at dispatch; they must agree on an
+    unchanged store, never move on their own, and read only O(1) rows."""
+    import _cctally_quota
+    import _lib_snapshot_cache as sc
+
+    # The kernel may not import the quota glue, so it spells the key itself.
+    assert sc._CODEX_PROJECTION_CERTIFICATE_KEY == (
+        _cctally_quota._DASHBOARD_PROJECTION_CERTIFICATE_KEY)
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    statements = []
+    cache.set_trace_callback(statements.append)
+    try:
+        pinned = _857_identity_on(cache)
+    finally:
+        cache.set_trace_callback(None)
+    assert pinned is not None
+    assert _857_identity_on(cache) == pinned
+    assert _857_current_identity(ns) == pinned
+    reader = ns["open_cache_db"]()
+    try:
+        assert _857_identity_on(reader) == pinned
+    finally:
+        reader.close()
+    assert statements, "non-vacuity: the trace must see the identity's reads"
+    scans = [
+        statement for statement in statements
+        if re.search(
+            r"\bfrom\s+(quota_window_snapshots|codex_session_entries|"
+            r"quota_window_change_log|codex_accounting_change_log)\b",
+            statement, re.IGNORECASE,
+        )
+    ]
+    assert scans == [], "the per-tick identity read a history relation"
+
+
+def test_857_a_race_retained_bundle_is_never_restamped_and_loses_its_provenance(
+    settled_store, monkeypatch,
+):
+    """A generation race returns the PRIOR bundle. It must never be restamped
+    with the identity of inputs it never read, or the next tick would idle on
+    it as though it were current — and (P1) it keeps no provenance at all:
+    the raced build may already have consumed accounting that neither the
+    Codex version nor the identity can see, so even its OWN older identity is
+    withdrawn and no identity, older or newer, admits it."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    stats = ns["open_db"]()
+    try:
+        prior = tui._tui_build_source_bundle(
+            stats_conn=stats, now_utc=_857_AFTER, display_tz_name="UTC",
+            codex_ingest_contended=False, claude_cost_usd=0.0,
+            claude_total_tokens=0, projects_envelope={}, raw_config={},
+        )
+        settled = prior.sources["codex"]
+        _857_assert_settled(settled)
+        older = settled.clock_data["codex_quota_dependency"]
+        assert older == _857_current_identity(ns)
+
+        _857_insert_raw_quota_row(ns, cache, monkeypatch)
+        newer = _857_current_identity(ns)
+        assert newer != older
+        digests = iter(("857-pre", "857-post"))
+        monkeypatch.setattr(
+            tui, "codex_stats_digest", lambda _conn: next(digests, "857-post"))
+        raced = tui._tui_build_source_bundle(
+            stats_conn=stats, now_utc=_857_AFTER + _857_TICK,
+            display_tz_name="UTC", codex_ingest_contended=False,
+            claude_cost_usd=0.0, claude_total_tokens=0, projects_envelope={},
+            raw_config={}, prior_bundle=prior,
+        )
+    finally:
+        stats.close()
+
+    # The prior generation, otherwise untouched.
+    assert raced.sources["claude"] is prior.sources["claude"]
+    assert raced.sources["codex"].data is settled.data
+    assert raced.sources["codex"].data_version == settled.data_version
+    assert raced.sources["codex"].clock_data["codex_quota_dependency"] is None
+    assert settled.clock_data["codex_quota_dependency"] == older, (
+        "withdrawal must not mutate the prior object")
+    for identity in (newer, older):
+        assert tui._tui_source_bundle_can_idle(
+            raced, codex_dependency=identity,
+            now_utc=_857_AFTER + 2 * _857_TICK,
+        ) is False
+
+
+def _857_variant(settled, name):
+    """One neighbouring state, derived from the REAL settled generation."""
+    import _lib_dashboard_sources as kernel
+
+    warning = kernel.SourceDashboardWarning
+    cycle = settled.warnings[0]
+    extra = {
+        "with_projection_incoherent": warning(
+            "codex_projection_incoherent",
+            "Codex quota projection is unavailable.", "hero"),
+        "with_account_scope_unresolved": warning(
+            "codex_account_scope_unresolved",
+            "Codex account registry could not be read.", "accounts"),
+        "with_metadata_incomplete": warning(
+            "codex_metadata_incomplete",
+            "1 Codex accounting row(s) lack project metadata.", "projects"),
+        "with_unknown_warning": warning(
+            "codex_some_future_cause", "Something new.", "hero"),
+    }
+    if name in extra:
+        return dataclasses.replace(settled, warnings=(extra[name], cycle))
+    if name == "no_stated_warning":
+        return dataclasses.replace(settled, warnings=())
+    if name == "stale":
+        return dataclasses.replace(settled, freshness="stale")
+    if name == "missing_data":
+        return dataclasses.replace(settled, data=None)
+    if name == "retryable_carrier":
+        return dataclasses.replace(
+            settled,
+            metadata_health=kernel.build_metadata_health("transient_read_failure"),
+        )
+    if name == "aggregate_failed":
+        scope = dict(settled.aggregate_scope)
+        scope[kernel.AGGREGATE_NAMES[0]] = {"state": "failed"}
+        return dataclasses.replace(settled, aggregate_scope=scope)
+    raise AssertionError(name)
+
+
+_857_REFUSED_VARIANTS = (
+    "with_projection_incoherent", "with_account_scope_unresolved",
+    "with_metadata_incomplete", "with_unknown_warning", "no_stated_warning",
+    "stale", "missing_data", "retryable_carrier", "aggregate_failed",
+)
+
+
+def test_857_only_the_singleton_settled_cycle_state_idles(settled_store):
+    """The safety matrix for the one Codex-only predicate and the idle gate."""
+    import _lib_dashboard_sources as kernel
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    bundle = _857_tick(ns, _857_AFTER).source_bundle
+    settled = bundle.sources["codex"]
+    claude = bundle.sources["claude"]
+    identity = _857_current_identity(ns)
+    assert identity is not None
+    assert settled.clock_data["codex_quota_dependency"] == identity
+
+    def with_codex(codex):
+        return dataclasses.replace(bundle, sources={
+            "claude": claude, "codex": codex,
+            "all": kernel.compose_all_state(claude, codex),
+        })
+
+    def can_idle(codex, **overrides):
+        kwargs = {"codex_dependency": identity, "now_utc": _857_AFTER}
+        kwargs.update(overrides)
+        return tui._tui_source_bundle_can_idle(with_codex(codex), **kwargs)
+
+    assert kernel.settled_codex_cycle_unavailable(settled) is True
+    assert can_idle(settled) is True
+    # Without the current identity, the old refusal stands.
+    assert tui._tui_source_bundle_can_idle(
+        bundle, codex_dependency=None) is False
+    assert can_idle(settled, codex_dependency=None) is False
+    assert can_idle(settled, codex_dependency=identity + ("moved",)) is False
+    assert can_idle(settled, codex_ingest_degraded=True) is False
+    past = dataclasses.replace(settled, clock_data={
+        **settled.clock_data, "codex_next_decision_at": _857_AFTER,
+    })
+    assert kernel.settled_codex_cycle_unavailable(past) is True
+    assert can_idle(past) is False, "an elapsed decision deadline rebuilds"
+    for name in _857_REFUSED_VARIANTS:
+        variant = _857_variant(settled, name)
+        assert kernel.settled_codex_cycle_unavailable(variant) is False, name
+        assert can_idle(variant) is False, name
+    assert kernel.settled_codex_cycle_unavailable(claude) is False
+
+
+# --------------------------------------------------------------------------
+# #857 fix round 2 — the settled idle's provenance, ordinary reuse and the
+# file-identity race.
+# --------------------------------------------------------------------------
+
+
+def _857_add_accounting_row(cache):
+    """Accounting moves while the quota dependency does not.
+
+    A copy of the newest Codex accounting row at a fresh offset: `MAX(id)` and
+    the accounting ledger advance, so the Codex version moves and the dispatch
+    key with it, but no quota row, ledger entry, attribution revision,
+    certificate or physical sequence changes — the certificate stays valid and
+    a rebuild still publishes the settled shape, over the new totals.
+    """
+    columns = [
+        str(row[1]) for row in cache.execute(
+            "PRAGMA table_info(codex_session_entries)")
+        if str(row[1]) not in ("id", "line_offset")
+    ]
+    names = ", ".join(columns)
+    cache.execute(
+        f"INSERT INTO codex_session_entries (line_offset, {names}) "
+        f"SELECT line_offset + 857000000, {names} FROM codex_session_entries "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    cache.commit()
+
+
+#: Where each Codex generation shape is built. A settled cycle-unavailable
+#: generation after the reset; an `ok` one before it, with every tick these
+#: tests take (at most seven more) still ahead of its decision deadline, the
+#: reset itself.
+_857_PHASE_START = {
+    "settled": _857_AFTER,
+    "ok": _857_RESET - 8 * _857_TICK,
+}
+
+
+def _857_assert_phase(codex, phase):
+    if phase == "settled":
+        _857_assert_settled(codex)
+    else:
+        assert codex.availability == "ok", [w.code for w in codex.warnings]
+        assert codex.freshness == "fresh"
+
+
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_failed_rebuild_cannot_leave_the_generation_idling(
+    settled_store, monkeypatch, phase,
+):
+    """C1: dispatch movement guarantees an ATTEMPTED rebuild, not a successful
+    one. Codex accounting moves while the quota dependency does not; the full
+    path's source build then raises and retains the prior bundle, and the
+    snapshot is memoized under the NEW dispatch key. The next tick sees that
+    key unchanged, so the idle gate must not treat the retained generation as
+    validated — neither through the settled exception nor, for an `ok`
+    generation, through ordinary idle admission (K1): it has to rebuild Codex
+    over the moved evidence rather than republish the old generation for the
+    life of the key."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    settled = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(settled, phase)
+    _857_add_accounting_row(handle["cache"])
+
+    original = tui._tui_build_source_bundle
+    remaining = {"failures": 1}
+
+    def fail_once(**kwargs):
+        if remaining["failures"]:
+            remaining["failures"] -= 1
+            raise RuntimeError("857 transient source build failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(tui, "_tui_build_source_bundle", fail_once)
+    failed = _857_tick(ns, start + _857_TICK)
+    assert remaining["failures"] == 0, (
+        "precondition: the moved accounting took the full path, which "
+        "attempted the rebuild")
+    assert (failed.source_bundle.sources["codex"].data_version
+            == settled.data_version), (
+        "precondition: the failed build retained the prior generation")
+
+    calls = _857_spy(monkeypatch, tui)
+    recovered = _857_tick(ns, start + 2 * _857_TICK)
+    codex = recovered.source_bundle.sources["codex"]
+
+    assert calls["forecast"] == 0, (
+        "precondition: the key the failure memoized is unchanged, so the idle "
+        "gate is what decided")
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "the tick after a failed rebuild idled on the retained generation")
+    assert codex.data_version != settled.data_version
+    _857_assert_phase(codex, phase)
+    # Recovered and re-validated: the idle resumes, and the retry was ONE
+    # rebuild, not one per tick.
+    _857_tick(ns, start + 3 * _857_TICK)
+    _857_tick(ns, start + 4 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+
+
+def _857_rewrite_accounting_in_place(cache):
+    """Accounting moves with no id, counter or quota input moving.
+
+    An in-place UPDATE of an existing accounting row — the shape
+    `apply_codex_window_spend_adoption` writes when it stamps `account_key`.
+    The accounting-ledger trigger advances `codex_accounting_mutation_seq`, so
+    the dispatch key moves and the process accounting cache is pending; but
+    `MAX(id)`, `codex_physical_mutation_seq` and every quota-dependency leg
+    stay put, so the Codex version and the identity are exactly those of the
+    generation built before the write.
+    """
+    before = cache.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_accounting_mutation_seq'").fetchone()
+    cache.execute(
+        "UPDATE codex_session_entries "
+        "SET output_tokens = output_tokens + 857000 "
+        "WHERE id = (SELECT MAX(id) FROM codex_session_entries)")
+    cache.commit()
+    after = cache.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_accounting_mutation_seq'").fetchone()
+    assert before != after, "precondition: the accounting ledger advanced"
+
+
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_generation_race_cannot_leave_the_prior_accounting_current(
+    settled_store, monkeypatch, phase,
+):
+    """P1: a source build that loses the stats generation race returns the
+    PRIOR bundle — but by then its Codex build has consumed the pending
+    accounting (the process accounting cache is published during the build,
+    before the race check). Accounting that moved in place (window-spend
+    adoption) moves neither the Codex version nor the quota-dependency
+    identity, so the next tick, which the stats movement puts on the full
+    path, sees the same version, the same identity and nothing pending: it
+    would reuse, or settle, the generation built BEFORE the accounting moved,
+    for as long as nothing else changes. The race return must not leave that
+    generation's provenance current."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    stale = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(stale, phase)
+    _857_rewrite_accounting_in_place(handle["cache"])
+
+    # Claude-side stats move DURING the Codex build: after the build has
+    # consumed the accounting, before the post-build reconciliation reads.
+    moved = {"stats": False}
+    real_digest = tui.claude_stats_digest
+    monkeypatch.setattr(
+        tui, "claude_stats_digest",
+        lambda conn: real_digest(conn) + (":857-moved" if moved["stats"] else ""))
+    real_build = tui.build_codex_source_state_from_capture
+
+    def build_then_move_stats(*args, **kwargs):
+        result = real_build(*args, **kwargs)
+        moved["stats"] = True
+        return result
+
+    monkeypatch.setattr(
+        tui, "build_codex_source_state_from_capture", build_then_move_stats)
+    raced = _857_tick(ns, start + _857_TICK)
+    assert moved["stats"], (
+        "precondition: the moved accounting took the full path and rebuilt Codex")
+    codex = raced.source_bundle.sources["codex"]
+    assert codex.data_version == stale.data_version
+    assert codex.data["periods"] == stale.data["periods"], (
+        "precondition: the race returned the prior generation")
+    monkeypatch.setattr(tui, "build_codex_source_state_from_capture", real_build)
+
+    calls = _857_spy(monkeypatch, tui)
+    current = _857_tick(ns, start + 2 * _857_TICK)
+    codex = current.source_bundle.sources["codex"]
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "the tick after a lost race republished the generation built before "
+        "the accounting moved")
+    assert codex.data["periods"] != stale.data["periods"], (
+        "the rebuild must publish the moved accounting")
+    _857_assert_phase(codex, phase)
+    # One rebuild per race, then the idle resumes.
+    _857_tick(ns, start + 3 * _857_TICK)
+    _857_tick(ns, start + 4 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+
+
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_race_over_a_reused_codex_generation_keeps_its_provenance(
+    settled_store, monkeypatch, phase,
+):
+    """The race return withdraws the Codex stamp only when the raced build
+    scheduled the Codex pass, the one way it can consume pending accounting.
+    Here Claude evidence moves and Codex evidence does not, so the raced build
+    reuses the Codex generation and consumes nothing; stats then move during
+    the build and it loses the race. The returned prior generation is exactly
+    as current as it was, so withdrawing its stamp would only buy a Codex
+    rebuild on the next tick — one per race, and races are likeliest during
+    active Claude use. A race whose build DID schedule the Codex pass still
+    withdraws (`test_857_a_generation_race_cannot_leave_the_prior_accounting_current`,
+    `test_857_a_race_retained_bundle_is_never_restamped_and_loses_its_provenance`)."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    start = _857_PHASE_START[phase]
+    first = _857_tick(ns, start).source_bundle
+    built = first.sources["codex"]
+    _857_assert_phase(built, phase)
+    stamped = built.clock_data["codex_quota_dependency"]
+    assert stamped is not None and stamped == _857_current_identity(ns)
+
+    # Claude evidence moves, so the next tick takes the full path.
+    cache.execute(
+        "INSERT OR REPLACE INTO cache_meta(key, value) "
+        "VALUES ('session_entries_mutation_seq', '1')"
+    )
+    cache.commit()
+    # Claude-side stats move DURING that build, right after its Codex reuse
+    # decision and before the post-build reconciliation reads.
+    moved = {"stats": False}
+    real_digest = tui.claude_stats_digest
+    monkeypatch.setattr(
+        tui, "claude_stats_digest",
+        lambda conn: real_digest(conn) + (":857-moved" if moved["stats"] else ""))
+    real_regime = tui._tui_note_codex_regime
+
+    def regime_then_move_stats(value):
+        real_regime(value)
+        moved["stats"] = True
+
+    monkeypatch.setattr(tui, "_tui_note_codex_regime", regime_then_move_stats)
+    calls = _857_spy(monkeypatch, tui)
+    raced = _857_tick(ns, start + _857_TICK)
+    assert moved["stats"] and calls["source_bundle"] == 1, (
+        "precondition: the Claude advance took the full path")
+    # A build that won would publish a REBUILT Claude generation, because its
+    # `entry_mutation_seq` moved; only the race return publishes tick 1's.
+    assert raced.source_bundle.sources["claude"] is first.sources["claude"], (
+        "precondition: the build lost the generation race")
+    assert calls["regimes"] == ["idle"] and (
+        calls["capture"], calls["build"]) == (0, 0), (
+        "precondition: the raced build reused Codex without running its pass")
+    codex = raced.source_bundle.sources["codex"]
+    assert codex.data_version == built.data_version
+    assert codex.data["periods"] is built.data["periods"], (
+        "precondition: the race returned the prior generation")
+    assert codex.clock_data["codex_quota_dependency"] == stamped, (
+        "a race over a reused Codex generation withdrew its stamp")
+
+    # The moved stats move the next dispatch key, so the next tick takes the
+    # full path again — and must reuse Codex rather than rebuild it.
+    after = _857_tick(ns, start + 2 * _857_TICK)
+    assert calls["source_bundle"] == 2, "precondition: the full path ran again"
+    assert (calls["capture"], calls["build"]) == (0, 0), (
+        "the tick after a race over a reused Codex generation rebuilt Codex")
+    codex = after.source_bundle.sources["codex"]
+    _857_assert_phase(codex, phase)
+    assert codex.data_version == built.data_version
+    assert codex.clock_data["codex_quota_dependency"] == stamped
+
+
+def _857_fail_after_the_codex_decision(monkeypatch, tui, exc):
+    """Fail the next source build once, on its first stats read after the
+    Codex reuse-or-rebuild decision (the post-build reconciliation) — so a
+    Codex pass it scheduled has completed, and published the process
+    accounting cache, by then."""
+    armed = {"decided": False, "failures": 1}
+    real_regime = tui._tui_note_codex_regime
+    real_digest = tui.codex_stats_digest
+
+    def regime_then_arm(value):
+        real_regime(value)
+        armed["decided"] = True
+
+    def fail_once_decided(conn):
+        if armed["decided"] and armed["failures"]:
+            armed["failures"] -= 1
+            raise exc
+        return real_digest(conn)
+
+    monkeypatch.setattr(tui, "_tui_note_codex_regime", regime_then_arm)
+    monkeypatch.setattr(tui, "codex_stats_digest", fail_once_decided)
+    return armed
+
+
+def _857_fail_the_next_idle_adapter(monkeypatch, tui, exc):
+    """Send the next idle tick to the bounded source adapter, and fail that
+    adapter once, on its first stats read after the Codex reuse-or-rebuild
+    decision (the post-build reconciliation) — so a Codex pass it scheduled
+    has completed by then. The idle gate's one refusal stands in for any
+    refusal that leaves Codex reusable, a failed Claude aggregate fold among
+    them."""
+    armed = _857_fail_after_the_codex_decision(monkeypatch, tui, exc)
+    armed["refuse"] = True
+    real_can_idle = tui._tui_source_bundle_can_idle
+
+    def refuse_once(*args, **kwargs):
+        if armed["refuse"]:
+            armed["refuse"] = False
+            return False
+        return real_can_idle(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "_tui_source_bundle_can_idle", refuse_once)
+    return armed
+
+
+def _857_adapter_failure(tui, failure):
+    """One exception per idle-adapter handler: the quota-projection refusal
+    has its own, ahead of the generic one a transient SQLite error reaches."""
+    if failure == "quota_projection":
+        return tui.QuotaProjectionIncomplete("857 quota projection incomplete")
+    return sqlite3.OperationalError("database is locked")
+
+
+@pytest.mark.parametrize("failure", ("sqlite", "quota_projection"))
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_failed_idle_adapter_cannot_leave_consumed_accounting_current(
+    settled_store, monkeypatch, phase, failure,
+):
+    """The idle path's bounded source adapter reads the cache on its OWN
+    snapshot, opened after the dispatch read that chose the idle path. An
+    in-place accounting write committing between the two leaves this tick's
+    key unchanged, but the adapter sees the accounting pending and runs the
+    Codex pass, which publishes the process accounting cache. A later read in
+    that adapter then fails, and the tick republishes the prior bundle. The
+    next key does move (the accounting ledger is in it), but by then nothing
+    reads as pending, and neither the Codex version nor the quota-dependency
+    identity moved, so that full tick would reuse, or settle, the generation
+    built BEFORE the write. A failed adapter that scheduled the Codex pass
+    must not leave that generation's provenance current."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    stale = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(stale, phase)
+
+    armed = _857_fail_the_next_idle_adapter(
+        monkeypatch, tui, _857_adapter_failure(tui, failure))
+    real_bundle = tui._tui_build_source_bundle
+    committed = {"write": False}
+
+    def commit_then_adapt(**kwargs):
+        # Another writer commits after this tick's dispatch read and before
+        # the adapter opens its own cache snapshot.
+        if not committed["write"]:
+            committed["write"] = True
+            _857_rewrite_accounting_in_place(handle["cache"])
+        return real_bundle(**kwargs)
+
+    monkeypatch.setattr(tui, "_tui_build_source_bundle", commit_then_adapt)
+    calls = _857_spy(monkeypatch, tui)
+    failed = _857_tick(ns, start + _857_TICK)
+    assert calls["forecast"] == 0 and calls["source_bundle"] == 1, (
+        "precondition: the unchanged key took the idle path's bounded adapter")
+    assert calls["regimes"] == ["active"] and (
+        calls["capture"], calls["build"]) == (1, 1), (
+        "precondition: the adapter saw the accounting pending and ran the "
+        "Codex pass")
+    assert armed["failures"] == 0, (
+        "precondition: the adapter failed after its Codex pass")
+    codex = failed.source_bundle.sources["codex"]
+    assert codex.data_version == stale.data_version
+    assert codex.data["periods"] == stale.data["periods"], (
+        "precondition: the failed adapter retained the prior generation")
+
+    calls = _857_spy(monkeypatch, tui)
+    current = _857_tick(ns, start + 2 * _857_TICK)
+    assert calls["forecast"], (
+        "precondition: the committed accounting moved the next key")
+    codex = current.source_bundle.sources["codex"]
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "the tick after a failed idle adapter republished the generation "
+        "built before the accounting moved")
+    assert codex.data["periods"] != stale.data["periods"], (
+        "the rebuild must publish the moved accounting")
+    _857_assert_phase(codex, phase)
+    # One rebuild per failure, then the idle resumes.
+    _857_tick(ns, start + 3 * _857_TICK)
+    _857_tick(ns, start + 4 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+
+
+@pytest.mark.parametrize("failure", ("sqlite", "quota_projection"))
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_failed_idle_adapter_that_reused_codex_keeps_its_provenance(
+    settled_store, monkeypatch, phase, failure,
+):
+    """The failed idle adapter withdraws the Codex stamp only when it
+    scheduled the Codex pass. Here nothing moved, so it reused Codex and
+    consumed nothing; the retained generation is exactly as current as
+    before, and withdrawing its stamp would buy a Codex rebuild on the next
+    tick — one per failed adapter tick for as long as a failure elsewhere in
+    the adapter persists. Both handlers: the quota-projection refusal has its
+    own, ahead of the generic one."""
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    built = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(built, phase)
+    stamped = built.clock_data["codex_quota_dependency"]
+    assert stamped is not None and stamped == _857_current_identity(ns)
+
+    armed = _857_fail_the_next_idle_adapter(
+        monkeypatch, tui, _857_adapter_failure(tui, failure))
+    calls = _857_spy(monkeypatch, tui)
+    failed = _857_tick(ns, start + _857_TICK)
+    assert calls["forecast"] == 0 and calls["source_bundle"] == 1, (
+        "precondition: the unchanged key took the idle path's bounded adapter")
+    assert calls["regimes"] == ["idle"] and (
+        calls["capture"], calls["build"]) == (0, 0), (
+        "precondition: the adapter reused Codex without running its pass")
+    assert armed["failures"] == 0, "precondition: the adapter failed"
+    legs = {entry.leg for entry in failed.sync_failures}
+    assert ("quota-projection" in legs) == (failure == "quota_projection"), (
+        "precondition: the failure reached the handler its case names")
+    codex = failed.source_bundle.sources["codex"]
+    assert codex.data_version == built.data_version
+    assert codex.clock_data["codex_quota_dependency"] == stamped, (
+        "a failed idle adapter that reused Codex withdrew its stamp")
+
+    # Nothing moved, so the key is unchanged and the real idle gate decides.
+    _857_tick(ns, start + 2 * _857_TICK)
+    assert calls["source_bundle"] == 1 and (
+        calls["capture"], calls["build"]) == (0, 0), (
+        "the tick after a failed idle adapter that reused Codex rebuilt Codex")
+
+
+# --------------------------------------------------------------------------
+# #857 — the accounting provenance token closes UNPUBLISHED CONSUMPTION as a
+# class. A build that consumed pending accounting (its Codex pass published the
+# process accounting cache) and then failed to publish what it built leaves
+# every retained generation older than the consumed population. The tests
+# below drive the two failure sites the per-site withdrawals never reached;
+# the token, not a withdrawal, is what refuses the retained generation there.
+# --------------------------------------------------------------------------
+
+
+def _857_escalate_as_stats_corruption(monkeypatch, tui):
+    """An exception the catch site attributes to a corrupt stats index, and a
+    heal that succeeds. `_tui_capture_sync_failure` then raises
+    `_StatsSnapshotCorruption` out of the handler — before the handler's own
+    withdrawal runs — and the build boundary retries the whole tick once from
+    the unchanged dispatch memo."""
+    fault = sqlite3.DatabaseError("857 stats index corruption")
+    real_attribute = tui._tui_attribute_corruption
+    heals = []
+
+    def attribute(conn, exc, *, database):
+        if exc is fault:
+            return "stats", True
+        return real_attribute(conn, exc, database=database)
+
+    def heal(exc):
+        heals.append(exc)
+        return True
+
+    monkeypatch.setattr(tui, "_tui_attribute_corruption", attribute)
+    monkeypatch.setattr(tui, "_tui_heal_post_query_stats", heal)
+    return fault, heals
+
+
+@pytest.mark.parametrize("site", ("idle_adapter", "full_path"))
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_corruption_escalation_cannot_leave_consumed_accounting_current(
+    settled_store, monkeypatch, phase, site,
+):
+    """B1: a build consumes an in-place accounting write — on the idle path's
+    bounded adapter, the write committing between the dispatch read and the
+    adapter's own snapshot, or on the full path, whose key the write moved —
+    and a later read then fails with an error attributed to stats corruption.
+    `_tui_capture_sync_failure` escalates it before any withdrawal, and the
+    heal's retry starts from the dispatch memo the failed attempt never
+    touched. The retry takes the full path over a moved key, where nothing
+    reads as pending any more and neither the Codex version nor the
+    quota-dependency identity moved: it must rebuild Codex and publish the
+    consumed accounting, not reuse, or settle, the generation built before."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    stale = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(stale, phase)
+
+    fault, heals = _857_escalate_as_stats_corruption(monkeypatch, tui)
+    if site == "idle_adapter":
+        armed = _857_fail_the_next_idle_adapter(monkeypatch, tui, fault)
+        real_bundle = tui._tui_build_source_bundle
+        committed = {"write": False}
+
+        def commit_then_adapt(**kwargs):
+            if not committed["write"]:
+                committed["write"] = True
+                _857_rewrite_accounting_in_place(handle["cache"])
+            return real_bundle(**kwargs)
+
+        monkeypatch.setattr(tui, "_tui_build_source_bundle", commit_then_adapt)
+    else:
+        _857_rewrite_accounting_in_place(handle["cache"])
+        armed = _857_fail_after_the_codex_decision(monkeypatch, tui, fault)
+    calls = _857_spy(monkeypatch, tui)
+    healed = _857_tick(ns, start + _857_TICK)
+
+    assert heals == [fault] and armed["failures"] == 0, (
+        "precondition: the failure after the Codex pass escalated to the heal")
+    assert calls["regimes"][:1] == ["active"], (
+        "precondition: the failed attempt ran the Codex pass")
+    assert calls["source_bundle"] == 2, (
+        "precondition: the heal retried the source build once")
+    codex = healed.source_bundle.sources["codex"]
+    assert (calls["capture"], calls["build"]) == (2, 2), (
+        "the heal's retry republished the generation built before the "
+        "consumed accounting")
+    assert codex.data["periods"] != stale.data["periods"], (
+        "the retry must publish the consumed accounting")
+    _857_assert_phase(codex, phase)
+    # One rebuild per failure, then the idle resumes.
+    _857_tick(ns, start + 2 * _857_TICK)
+    _857_tick(ns, start + 3 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (2, 2)
+
+
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_a_keyless_failed_build_cannot_leave_consumed_accounting_current(
+    settled_store, monkeypatch, phase,
+):
+    """B2: a transient dispatch-signature failure leaves the tick with no
+    dispatch key. Its source build still runs, consumes the in-place
+    accounting write, and fails in reconciliation, so the tick retains the
+    prior bundle untouched and memoizes nothing — the dispatch memo keeps the
+    older stamped snapshot. When the signature reads recover, the moved
+    accounting ledger sends the next tick down the full path, where nothing
+    reads as pending and the version and identity are unchanged: it must
+    rebuild Codex rather than reuse, or settle, the older generation."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    stale = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(stale, phase)
+    _857_rewrite_accounting_in_place(handle["cache"])
+
+    real_signature = tui._tui_compute_dispatch_signature
+    signature = {"failures": 1}
+
+    def fail_signature_once(*args, **kwargs):
+        if signature["failures"]:
+            signature["failures"] -= 1
+            raise sqlite3.OperationalError("database is locked")
+        return real_signature(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tui, "_tui_compute_dispatch_signature", fail_signature_once)
+    armed = _857_fail_after_the_codex_decision(
+        monkeypatch, tui, sqlite3.OperationalError("database is locked"))
+    calls = _857_spy(monkeypatch, tui)
+    failed = _857_tick(ns, start + _857_TICK)
+    assert signature["failures"] == 0 and armed["failures"] == 0, (
+        "precondition: the signature and then the build failed")
+    assert calls["regimes"] == ["active"] and (
+        calls["capture"], calls["build"]) == (1, 1), (
+        "precondition: the keyless build ran the Codex pass")
+    assert (failed.source_bundle.sources["codex"].data["periods"]
+            == stale.data["periods"]), (
+        "precondition: the failed build retained the prior generation")
+
+    current = _857_tick(ns, start + 2 * _857_TICK)
+    codex = current.source_bundle.sources["codex"]
+    assert (calls["capture"], calls["build"]) == (2, 2), (
+        "the tick after a keyless failed build republished the generation "
+        "built before the consumed accounting")
+    assert codex.data["periods"] != stale.data["periods"], (
+        "the rebuild must publish the consumed accounting")
+    _857_assert_phase(codex, phase)
+    _857_tick(ns, start + 3 * _857_TICK)
+    _857_tick(ns, start + 4 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (2, 2)
+
+
+@pytest.mark.parametrize("phase", ("settled", "ok"))
+def test_857_memory_eviction_of_the_accounting_cache_never_forces_a_codex_rebuild(
+    settled_store, monkeypatch, phase,
+):
+    """Snapshot memory enforcement discards the whole accelerator estate —
+    the process accounting cache with it — after every publisher build on a
+    store over the cap. The consumed provenance a retained Codex generation is
+    compared against lives OUTSIDE that estate, so an eviction alone must
+    never refuse the generation: comparing against the evictable state would
+    rebuild Codex on every tick of an unchanged, oversized store, which is the
+    idle CPU #857 exists to remove."""
+    import _lib_snapshot_cache as sc
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    start = _857_PHASE_START[phase]
+    built = _857_tick(ns, start).source_bundle.sources["codex"]
+    _857_assert_phase(built, phase)
+    stamped = built.clock_data[sc.CODEX_ACCOUNTING_PROVENANCE_KEY]
+    assert stamped is not None
+    assert stamped == sc.codex_accounting_consumed_provenance()
+
+    # Every build is over the cap: the publisher's own admission call evicts.
+    monkeypatch.setattr(sc, "_SNAPSHOT_ACCELERATOR_MAX_ENTRIES", 0)
+    sc.enforce_snapshot_accelerator_bounds(data_version="dashboard-publisher")
+    assert sc.checkpoint_codex_accounting_cache_state() == {}, (
+        "precondition: enforcement evicted the accounting cache")
+
+    calls = _857_spy(monkeypatch, tui)
+    for step in range(1, 6):
+        snapshot = _857_tick(ns, start + _857_TICK * step)
+        sc.enforce_snapshot_accelerator_bounds(
+            data_version="dashboard-publisher")
+        codex = snapshot.source_bundle.sources["codex"]
+        _857_assert_phase(codex, phase)
+        assert codex.data_version == built.data_version
+    assert calls["forecast"] == 0, "precondition: every tick took the idle dispatch"
+    assert (calls["source_bundle"], calls["capture"], calls["build"]) == (
+        0, 0, 0), "an eviction alone forced a Codex rebuild"
+    assert sc.codex_accounting_consumed_provenance() == stamped
+
+
+_857_OK_INVALIDATIONS = tuple(
+    entry for entry in _857_INVALIDATIONS if entry[0] != "registry_changed"
+)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [mutate for _id, mutate, _builds in _857_OK_INVALIDATIONS],
+    ids=[entry[0] for entry in _857_OK_INVALIDATIONS],
+)
+def test_857_a_moved_codex_quota_input_refuses_ordinary_reuse(
+    settled_store, monkeypatch, mutate,
+):
+    """C2: the quota-dependency identity moves the dispatch key, but the
+    ordinary exact-version reuse of an ``ok`` generation must not answer for
+    it: the version string carries none of these inputs, so reuse would hand
+    back the obsolete verdict and every later idle tick would retain it."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    live = _857_tick(ns, _857_RESET - 4 * _857_TICK).source_bundle.sources["codex"]
+    assert live.availability == "ok"
+    assert live.clock_data["codex_next_decision_at"] == _857_RESET
+    calls = _857_spy(monkeypatch, tui)
+    _857_tick(ns, _857_RESET - 3 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (0, 0), (
+        "precondition: the unchanged ok generation idles")
+
+    handle["cache"] = mutate(ns, handle["cache"], monkeypatch)
+    moved = _857_tick(ns, _857_RESET - 2 * _857_TICK)
+
+    assert calls["source_bundle"] >= 1, "precondition: the dispatch key moved"
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "exact-version reuse republished a generation whose quota inputs moved")
+    codex = moved.source_bundle.sources["codex"]
+    stamped = codex.clock_data["codex_quota_dependency"]
+    assert stamped is not None
+    assert stamped == _857_current_identity(ns)
+    codes = [w.code for w in codex.warnings]
+    if mutate in (_857_delete_certificate, _857_bump_attribution_revision):
+        # A lost or revision-stale certificate: the obsolete coherent verdict
+        # the reused generation would have kept publishing.
+        assert "codex_projection_incoherent" in codes
+        assert codex.availability == "partial"
+    else:
+        assert codex.availability == "ok", codes
+    # The rebuilt generation names the moved inputs. A coherent one idles
+    # again; the incoherent-projection composite is the certificate-recovery
+    # state, which retries every tick by design.
+    _857_tick(ns, _857_RESET - _857_TICK)
+    expected = 1 if codex.availability == "ok" else 2
+    assert (calls["capture"], calls["build"]) == (expected, expected)
+
+
+def test_857_an_unreadable_codex_quota_identity_refuses_ordinary_reuse(
+    settled_store, monkeypatch,
+):
+    """C2, unavailability: no identity is not an unchanged identity, on the
+    active path as much as on the idle one. The first unreadable tick moves
+    the key (the full path); every later one leaves it unchanged, so it is the
+    IDLE gate that must refuse the `ok` generation stamped with no identity
+    (K1) — admitting it would retain that generation for as long as the
+    identity stays unreadable."""
+    import _lib_snapshot_cache as sc
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    live = _857_tick(ns, _857_RESET - 4 * _857_TICK).source_bundle.sources["codex"]
+    assert live.availability == "ok"
+    calls = _857_spy(monkeypatch, tui)
+    monkeypatch.setattr(
+        sc, "codex_quota_dependency_identity", lambda _conn, **_kw: None)
+    unread = _857_tick(ns, _857_RESET - 3 * _857_TICK)
+
+    assert calls["source_bundle"] >= 1, "precondition: the dispatch key moved"
+    assert (calls["capture"], calls["build"]) == (1, 1)
+    assert unread.source_bundle.sources["codex"].clock_data[
+        "codex_quota_dependency"] is None
+
+    forecasts = calls["forecast"]
+    for step in (2, 1):
+        again = _857_tick(ns, _857_RESET - step * _857_TICK)
+        codex = again.source_bundle.sources["codex"]
+        assert codex.availability == "ok"
+        assert codex.clock_data["codex_quota_dependency"] is None
+    assert calls["forecast"] == forecasts, (
+        "precondition: an unchanged key took the idle dispatch")
+    assert (calls["capture"], calls["build"]) == (3, 3), (
+        "an ok generation stamped with no identity idled")
+
+
+def test_857_a_cache_file_replaced_under_a_pinned_build_stamps_no_identity(
+    settled_store, monkeypatch,
+):
+    """C3: `PRAGMA database_list` names a PATH, and a stat of that path need
+    not describe the file the connection opened. Replace the cache file after
+    the build has pinned its read of the old one: an identity stamped from the
+    NEW inode and the OLD rows would compare equal to every later read of a
+    replacement whose counters match, validating a generation built from a
+    file that is gone. It must fail closed instead."""
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    # Accounting moves, so the next tick rebuilds Codex on a pinned read.
+    _857_add_accounting_row(cache)
+    path = pathlib.Path(next(
+        str(row[2]) for row in cache.execute("PRAGMA database_list")
+        if str(row[1]) == "main"))
+    cache.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    replacement = path.with_name(path.name + ".857-race")
+    shutil.copyfile(path, replacement)
+
+    original_compute = ns["compute_signature"]
+    raced = {"done": False}
+
+    def compute_then_replace(cache_conn, *args, **kwargs):
+        result = original_compute(cache_conn, *args, **kwargs)
+        if not raced["done"] and cache_conn.in_transaction:
+            # The builder's first read has pinned the OLD file's snapshot.
+            raced["done"] = True
+            os.replace(replacement, path)
+            for suffix in ("-wal", "-shm"):
+                sidecar = path.with_name(path.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+        return result
+
+    monkeypatch.setitem(ns, "compute_signature", compute_then_replace)
+    rebuilt = _857_tick(ns, _857_AFTER + _857_TICK)
+    monkeypatch.setitem(ns, "compute_signature", original_compute)
+    assert raced["done"], "precondition: the replacement raced a pinned build"
+    codex = rebuilt.source_bundle.sources["codex"]
+    _857_assert_settled(codex)
+    assert codex.clock_data["codex_quota_dependency"] is None, (
+        "the identity described the replacement, not the file the build read")
+
+    # The next tick reads the replacement, so it must rebuild rather than
+    # validate the generation built from the replaced file, and then settle.
+    calls = _857_spy(monkeypatch, tui)
+    current = _857_tick(ns, _857_AFTER + 2 * _857_TICK).source_bundle
+    assert (calls["capture"], calls["build"]) == (1, 1)
+    assert (current.sources["codex"].clock_data["codex_quota_dependency"]
+            == _857_current_identity(ns))
+    _857_tick(ns, _857_AFTER + 3 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+
+
+def test_857_an_unobserved_pre_open_file_stamps_no_identity(
+    settled_store, monkeypatch,
+):
+    """K2: the stamp is bound to the file observed BEFORE the build's handle
+    opened, or it is nothing. A failed pre-open stat — a pathname absent for a
+    moment during a restore, or any stat error — does not show that the open
+    created the file, so a late bracket (two stats taken after the open) can
+    stat a replacement twice around reads from the replaced file and mint an
+    identity that the replacement then compares equal to on the next tick.
+    Here the build loses its pre-open observation and the file is replaced
+    after its read is pinned."""
+    import _lib_snapshot_cache as sc
+
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    cache = handle["cache"]
+    _857_assert_settled(
+        _857_tick(ns, _857_AFTER).source_bundle.sources["codex"])
+    # Accounting moves, so the next tick rebuilds Codex on a pinned read.
+    _857_add_accounting_row(cache)
+    path = pathlib.Path(sc.codex_main_database_path(cache))
+    cache.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    replacement = path.with_name(path.name + ".857-unobserved")
+    shutil.copyfile(path, replacement)
+
+    real_file_identity = sc.codex_cache_file_identity
+
+    def unobserved_by_the_build(file_path):
+        observer = sys._getframe(1)
+        if (
+            observer.f_code.co_name == "_tui_cache_file_before_open"
+            and observer.f_back is not None
+            and observer.f_back.f_code.co_name == "_tui_build_source_bundle"
+        ):
+            return None
+        return real_file_identity(file_path)
+
+    original_compute = ns["compute_signature"]
+    raced = {"done": False}
+
+    def compute_then_replace(cache_conn, *args, **kwargs):
+        result = original_compute(cache_conn, *args, **kwargs)
+        if not raced["done"] and cache_conn.in_transaction:
+            # The builder's first read has pinned the OLD file's snapshot.
+            raced["done"] = True
+            os.replace(replacement, path)
+            for suffix in ("-wal", "-shm"):
+                sidecar = path.with_name(path.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+        return result
+
+    monkeypatch.setattr(sc, "codex_cache_file_identity", unobserved_by_the_build)
+    monkeypatch.setitem(ns, "compute_signature", compute_then_replace)
+    rebuilt = _857_tick(ns, _857_AFTER + _857_TICK)
+    monkeypatch.setitem(ns, "compute_signature", original_compute)
+    monkeypatch.setattr(sc, "codex_cache_file_identity", real_file_identity)
+    assert raced["done"], "precondition: the replacement raced a pinned build"
+    codex = rebuilt.source_bundle.sources["codex"]
+    _857_assert_settled(codex)
+    assert codex.clock_data["codex_quota_dependency"] is None, (
+        "an unobserved pre-open file was bound by a late bracket")
+
+    calls = _857_spy(monkeypatch, tui)
+    current = _857_tick(ns, _857_AFTER + 2 * _857_TICK).source_bundle
+    assert (calls["capture"], calls["build"]) == (1, 1), (
+        "the replacement validated a generation built from the replaced file")
+    assert (current.sources["codex"].clock_data["codex_quota_dependency"]
+            == _857_current_identity(ns))
+    _857_tick(ns, _857_AFTER + 3 * _857_TICK)
+    assert (calls["capture"], calls["build"]) == (1, 1)
+
+
+def test_857_a_dispatch_read_with_no_pre_open_observation_has_no_identity(
+    settled_store, monkeypatch,
+):
+    """K2 at dispatch: the dispatch-time identity is compared against the
+    stamp and rides the dispatch key, so it is bound on the same terms. A
+    pre-open stat that fails yields NO identity — never a late bracket over
+    whatever file holds the name afterwards — while the signature is still
+    read, so the tick keeps its ordinary dispatch."""
+    import _lib_snapshot_cache as sc
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    real_file_identity = sc.codex_cache_file_identity
+
+    def unobservable(file_path):
+        if sys._getframe(1).f_code.co_name == "_tui_cache_file_before_open":
+            return None
+        return real_file_identity(file_path)
+
+    monkeypatch.setattr(sc, "codex_cache_file_identity", unobservable)
+    stats = ns["open_db"]()
+    try:
+        signature, identity = tui._tui_compute_dispatch_signature(
+            stats, with_codex_dependency=True)
+    finally:
+        stats.close()
+    assert signature is not None
+    assert identity is None
+
+
+def test_857_a_fresh_install_idles_from_its_second_tick(tmp_path, monkeypatch):
+    """The one legitimate absent-file case: on a fresh install the dispatch
+    read's own open CREATES cache.db, so no pre-open observation of it can
+    exist. The dispatch re-observes the file it created and binds the identity
+    on a second handle; without that, its first key would carry no identity,
+    the second tick's key would carry one, and every fresh install would pay a
+    second full rebuild."""
+    import _lib_snapshot_cache as sc
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    sc.reset_dispatch_state()
+    ns["_cctally_tui"]._tui_reset_partial_retry_state()
+    cache_path = pathlib.Path(sys.modules["_cctally_core"].CACHE_DB_PATH)
+    assert not cache_path.exists(), "precondition: a fresh install"
+    try:
+        first = _857_tick(ns, _857_AFTER)
+        codex = first.source_bundle.sources["codex"]
+        stamped = codex.clock_data["codex_quota_dependency"]
+        assert stamped is not None
+        assert stamped == _857_current_identity(ns)
+        calls = _857_spy(monkeypatch, ns["_cctally_tui"])
+        _857_tick(ns, _857_AFTER + _857_TICK)
+        assert (calls["source_bundle"], calls["forecast"]) == (0, 0), (
+            "a fresh install's second tick did not idle")
+    finally:
+        sc.reset_dispatch_state()
+        ns["_cctally_tui"]._tui_reset_partial_retry_state()
+
+
+def test_857_the_settled_generation_idles_with_the_per_tick_ingest_on(
+    settled_store, monkeypatch,
+):
+    """O1: production ingests on EVERY tick. Both provider ingests run, find
+    nothing new, and must leave the settled generation idling: no source
+    bundle, capture or build, the clock still running, the identity stable."""
+    from _lib_source_retry import PARTIAL_RETRY_INTERVAL
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    first = _857_tick(ns, _857_AFTER, skip_sync=False)
+    settled = first.source_bundle.sources["codex"]
+    _857_assert_settled(settled)
+    identity = settled.clock_data["codex_quota_dependency"]
+    assert identity is not None
+
+    ingests = {"claude": 0, "codex": 0}
+    for name, key in (("sync_cache", "claude"), ("sync_codex_cache", "codex")):
+        real = ns[name]
+
+        def counted(*args, _real=real, _key=key, **kwargs):
+            ingests[_key] += 1
+            return _real(*args, **kwargs)
+
+        monkeypatch.setitem(ns, name, counted)
+    calls = _857_spy(monkeypatch, tui)
+    steps = int(PARTIAL_RETRY_INTERVAL / _857_TICK) + 4
+    for step in range(1, steps + 1):
+        snapshot = _857_tick(ns, _857_AFTER + _857_TICK * step, skip_sync=False)
+        codex = snapshot.source_bundle.sources["codex"]
+        _857_assert_settled(codex)
+        assert codex.data_version == settled.data_version
+        assert snapshot.last_sync_error is None
+
+    assert ingests == {"claude": steps, "codex": steps}, (
+        "non-vacuity: both ingests must have run on every tick")
+    assert calls["forecast"] == 0, "every tick took the idle dispatch"
+    assert (calls["source_bundle"], calls["capture"], calls["build"]) == (
+        0, 0, 0), (
+        "the per-tick ingest took the settled generation off the idle path")
+    assert calls["clock"] >= steps
+    assert _857_current_identity(ns) == identity
+
+
+def test_857_a_stats_rebuild_never_publishes_a_generation_a_cold_build_disagrees_with(
+    settled_store, monkeypatch,
+):
+    """O2: `db rebuild --db stats` republishes the disposable stats index from
+    the journal. Whatever the ticks after it do — rebuild, refuse, or keep
+    idling because the relevant rebuilt contents are identical — the Codex
+    generation they publish once a tick completes cleanly must be the one a
+    COLD build over the rebuilt store publishes at the same instant."""
+    import importlib
+
+    import _cctally_core
+    import _lib_snapshot_cache as sc
+
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    jr = importlib.import_module("_cctally_journal")
+    settled = _857_tick(ns, _857_AFTER, skip_sync=False).source_bundle.sources[
+        "codex"]
+    _857_assert_settled(settled)
+    stats_path = pathlib.Path(_cctally_core.DB_PATH)
+    before = stats_path.stat()
+
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    after = stats_path.stat()
+    assert (after.st_ino, after.st_mtime_ns, after.st_size) != (
+        before.st_ino, before.st_mtime_ns, before.st_size), (
+            "non-vacuity: the rebuild must have written the stats file")
+
+    calls = _857_spy(monkeypatch, tui)
+    warm = None
+    at = _857_AFTER
+    for step in range(1, 7):
+        at = _857_AFTER + _857_TICK * step
+        snapshot = _857_tick(ns, at, skip_sync=False)
+        if snapshot.last_sync_error is None:
+            warm = snapshot.source_bundle.sources["codex"]
+            break
+    assert warm is not None, "the dashboard never recovered from the rebuild"
+    # This rebuild republishes identical RELEVANT contents: every digest the
+    # dispatch key carries re-derives to the same value over the new file, so
+    # the settled generation keeps idling — which is only correct because the
+    # cold build below agrees with it.
+    assert (calls["source_bundle"], calls["capture"], calls["build"]) == (
+        0, 0, 0)
+
+    sc.reset_dispatch_state()
+    tui._tui_reset_partial_retry_state()
+    cold = _857_tick(ns, at).source_bundle.sources["codex"]
+    assert warm.data_version == cold.data_version
+    assert [w.code for w in warm.warnings] == [w.code for w in cold.warnings]
+    assert warm.availability == cold.availability
+    assert (warm.clock_data["codex_quota_dependency"]
+            == cold.clock_data["codex_quota_dependency"])
+
+
+def test_857_the_dispatch_reads_the_identity_on_its_own_handle_in_one_snapshot(
+    settled_store, monkeypatch,
+):
+    """O3: the dispatch-time identity rides the signature's own cache handle —
+    no second connection per tick — and its reads share ONE read transaction,
+    so a commit landing between two legs cannot yield an identity no state
+    ever had (one spurious full-path tick)."""
+    ns, _handle = settled_store
+    tui = ns["_cctally_tui"]
+    real_open = ns["open_cache_db"]
+    traces = []
+
+    def traced_open():
+        conn = real_open()
+        statements = []
+        conn.set_trace_callback(statements.append)
+        traces.append(statements)
+        return conn
+
+    monkeypatch.setitem(ns, "open_cache_db", traced_open)
+    stats = ns["open_db"]()
+    try:
+        _signature, identity = tui._tui_compute_dispatch_signature(
+            stats, with_codex_dependency=True)
+    finally:
+        stats.close()
+
+    assert identity is not None
+    assert len(traces) == 1, "the identity must ride the signature's handle"
+    statements = [statement.strip().upper() for statement in traces[0]]
+    legs = [
+        index for index, statement in enumerate(statements)
+        if "QUOTA_WINDOW_CHANGE_LOG" in statement
+        or "CODEX_WINDOW_ATTRIBUTION_REVISION" in statement
+    ]
+    assert len(legs) >= 3, statements
+    signature_reads = [
+        index for index, statement in enumerate(statements)
+        if "CODEX_SESSION_ENTRIES" in statement
+    ]
+    assert signature_reads, "non-vacuity: the traced handle is the signature's own"
+    # K3: the WHOLE dispatch identity — the signature's cache legs and the
+    # quota-dependency legs — is read on one snapshot, so a commit between the
+    # signature and the identity cannot mint a key no state ever had.
+    first = min(signature_reads[0], legs[0])
+    last = max(signature_reads[-1], legs[-1])
+    begins = [
+        i for i, st in enumerate(statements) if st == "BEGIN" and i < first]
+    rollbacks = [
+        i for i, st in enumerate(statements) if st == "ROLLBACK" and i > last]
+    assert begins and rollbacks, (
+        "the dispatch identity was read outside one read transaction")
+    begin, rollback = begins[-1], rollbacks[0]
+    assert not any(
+        st in ("BEGIN", "ROLLBACK", "COMMIT")
+        for st in statements[begin + 1:rollback]
+    ), "every signature and identity leg must be read inside the SAME transaction"
+    # P6: the connection's file path is resolved ONCE per identity read.
+    assert sum("DATABASE_LIST" in st for st in statements) == 1, statements
+
+
+def test_857_the_dispatch_signature_and_identity_share_one_snapshot(
+    settled_store, monkeypatch,
+):
+    """K3, behaviourally: a quota commit landing between the dispatch
+    signature's read and the identity's must be invisible to the identity,
+    exactly as it is to the signature. Otherwise the key pairs an older
+    signature with a newer identity — a key no database state ever had — and
+    the next tick pays one unnecessary full rebuild."""
+    import _lib_snapshot_cache as sc
+
+    ns, handle = settled_store
+    tui = ns["_cctally_tui"]
+    before = _857_current_identity(ns)
+    assert before is not None
+    real_compute = sc.compute_signature
+    committed = {"done": False}
+
+    def compute_then_commit(cache_conn, *args, **kwargs):
+        result = real_compute(cache_conn, *args, **kwargs)
+        if not committed["done"]:
+            committed["done"] = True
+            # Another writer, on its own connection, commits a quota row.
+            _857_insert_raw_quota_row(ns, handle["cache"], monkeypatch)
+        return result
+
+    monkeypatch.setattr(sc, "compute_signature", compute_then_commit)
+    stats = ns["open_db"]()
+    try:
+        signature, identity = tui._tui_compute_dispatch_signature(
+            stats, with_codex_dependency=True)
+    finally:
+        stats.close()
+    monkeypatch.setattr(sc, "compute_signature", real_compute)
+
+    assert committed["done"], "precondition: the commit raced the dispatch read"
+    assert signature is not None
+    assert identity == before, (
+        "the identity saw a commit that landed after the signature's read")
+    assert _857_current_identity(ns) != before, (
+        "non-vacuity: the commit moved the identity")
+
+
+def test_857_the_identity_is_bound_to_the_opened_file_and_joins_a_pinned_read(
+    settled_store,
+):
+    """C3/O3/K2 at the kernel: the pre-open observation is REQUIRED, a
+    pre-open observation of any OTHER file — or a failed one — yields no
+    identity (there is no late-bracket fallback), and inside a caller's pinned
+    read the identity joins that transaction rather than ending it (the
+    build's capture must keep reading the snapshot the identity described)."""
+    import _lib_snapshot_cache as sc
+
+    _ns, handle = settled_store
+    cache = handle["cache"]
+    path = sc.codex_main_database_path(cache)
+    opened = sc.codex_cache_file_identity(path)
+    assert opened is not None
+    identity = sc.codex_quota_dependency_identity(cache, opened_file=opened)
+    assert identity is not None
+    assert identity[1:3] == opened
+    with pytest.raises(TypeError):
+        sc.codex_quota_dependency_identity(cache)  # no unbound form exists
+    assert sc.codex_quota_dependency_identity(
+        cache, opened_file=(opened[0], opened[1] + 1)) is None
+    assert sc.codex_quota_dependency_identity(cache, opened_file=None) is None
+    assert not cache.in_transaction, "the identity must leave no transaction"
+
+    cache.execute("BEGIN")
+    try:
+        cache.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+        assert sc.codex_quota_dependency_identity(
+            cache, opened_file=opened) == identity
+        assert cache.in_transaction, "the identity ended the caller's pinned read"
+    finally:
+        cache.rollback()

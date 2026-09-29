@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.112.0] - 2026-09-29
+
+### Added
+- Claude cost reports price `claude-sonnet-5-5` at its published input, output and cache rates instead of showing $0 for new usage.
+
+### Changed
+- `cctally dashboard` uses less CPU while idle on a large history.
+
+### Fixed
+- The Conversation Viewer keeps project-filtered browse working with any number of unreadable Codex project paths, avoids repeated metadata schema probes, and preserves SQLite alias ordering.
+- The TUI and dashboard clear a Codex metadata retry as soon as its transient partial generation is rejected, so the first healthy refresh recovers immediately instead of waiting through a stale retry delay.
+- `cctally db rederive` corrects costs recorded while a model had no rate card, including provably unpriced $0 five-hour blocks. A Codex budget alert that fallback pricing overstated is retired and can fire again when real spend crosses.
+- After `cctally db rederive --yes`, a still-crossed Claude budget, projected or project-budget alert no longer breaks every later stats ingest until the period ends, and fired five-hour alerts stay in Recent Alerts.
+- On phones, the dashboard's `Current Usage` dialog shows its full title and hides the onboarding hint while the dialog is open.
+- An idle `cctally dashboard` no longer rebuilds its Codex view on every refresh after a Codex weekly reset with no newer Codex activity, which cost steady CPU while nothing changed.
+- `cctally db rederive` no longer reprices the unchanged five-hour milestones of a closed block whose cost is frozen when a rate card changes: each keeps its recorded cumulative cost; its marginal changes only to follow the prior milestone.
+
 ## [1.111.0] - 2026-09-24
 
 ### Fixed

@@ -20,7 +20,7 @@ CCTALLY = REPO / "bin" / "cctally"
 def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
                 now_iso: "str | None" = "2026-05-13T14:22:31+00:00",
                 env_extra: "dict | None" = None,
-                pre_call: str = "") -> dict:
+                pre_call: str = "", post_call: str = "") -> dict:
     """Invoke the in-process gather via a one-liner driver script.
 
     If now_iso is None, the driver passes now_utc=None — exercising the
@@ -35,6 +35,7 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
     else:
         now_arg = f"dt.datetime.fromisoformat({now_iso!r})"
     pre_call_stmt = f"exec({pre_call!r})" if pre_call else ""
+    post_call_stmt = f"exec({post_call!r})" if post_call else ""
     driver = textwrap.dedent(f"""
         import sys, json, datetime as dt
         sys.path.insert(0, {str(REPO / 'bin')!r})
@@ -54,6 +55,7 @@ def _run_gather(home: pathlib.Path, *, runtime_bind: "str | None" = None,
         # Serialize the dataclass via dataclasses.asdict for assertion.
         import dataclasses
         d = dataclasses.asdict(st)
+        {post_call_stmt}
         # datetimes → isoformat for JSON-safety
         def _norm(v):
             if isinstance(v, dt.datetime):
@@ -217,6 +219,11 @@ def _seed_codex_project_metadata_cache(home: pathlib.Path):
             "total_tokens, source_root_key, conversation_key) VALUES "
             "('/codex/b.jsonl', 1, '2026-05-12T00:01:00Z', 'native-b', 'gpt-test', 1, 'root-a', NULL)"
         )
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES "
+            "('codex_physical_mutation_seq', '0') "
+            "ON CONFLICT(key) DO UPDATE SET value='0'"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -224,7 +231,59 @@ def _seed_codex_project_metadata_cache(home: pathlib.Path):
 
 def test_gather_codex_project_metadata_is_all_history_and_identity_safe(tmp_path):
     _seed_codex_project_metadata_cache(tmp_path)
-    state = _run_gather(tmp_path)
+    pre_call = textwrap.dedent("""
+        analytics = mod._load_sibling("_cctally_source_analytics")
+        real_metadata_health = analytics.load_codex_project_metadata_health
+        metadata_health_calls = []
+        def counted_metadata_health(*args, **kwargs):
+            metadata_health_calls.append(1)
+            return real_metadata_health(*args, **kwargs)
+        analytics.load_codex_project_metadata_health = counted_metadata_health
+    """)
+    # Each gather's cumulative loader-call count is MEASURED after it returns:
+    # the first computes, the second is served warm, the third recomputes after
+    # a Codex mutation advances the sequence, and the forced-cold fourth
+    # recomputes although nothing moved.
+    post_call = textwrap.dedent("""
+        import sqlite3
+        call_counts = [len(metadata_health_calls)]
+        second = mod.doctor_gather_state(
+            now_utc=dt.datetime.fromisoformat('2026-05-13T14:22:32+00:00'))
+        call_counts.append(len(metadata_health_calls))
+        cache = sqlite3.connect(str(mod._cctally_core.CACHE_DB_PATH))
+        try:
+            cache.execute(
+                "INSERT INTO codex_session_entries(source_path, line_offset, "
+                "timestamp_utc, session_id, model, total_tokens, "
+                "source_root_key, conversation_key) VALUES "
+                "('/codex/c.jsonl', 1, '2026-05-12T00:02:00Z', "
+                "'native-c', 'gpt-test', 1, 'root-a', NULL)"
+            )
+            cache.execute(
+                "INSERT INTO cache_meta(key, value) VALUES "
+                "('codex_physical_mutation_seq', '1') "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "value=CAST(value AS INTEGER) + 1"
+            )
+            cache.commit()
+        finally:
+            cache.close()
+        third = mod.doctor_gather_state(
+            now_utc=dt.datetime.fromisoformat('2026-05-13T14:22:33+00:00'))
+        call_counts.append(len(metadata_health_calls))
+        fourth = mod.doctor_gather_state(
+            now_utc=dt.datetime.fromisoformat('2026-05-13T14:22:34+00:00'),
+            force_cold_inputs=True)
+        call_counts.append(len(metadata_health_calls))
+        d['__metadata_memo_probe'] = {
+            'call_counts': call_counts,
+            'second_total': second.codex_project_metadata_health['total_rows'],
+            'third_total': third.codex_project_metadata_health['total_rows'],
+            'fourth_total': fourth.codex_project_metadata_health['total_rows'],
+        }
+    """)
+    state = _run_gather(
+        tmp_path, pre_call=pre_call, post_call=post_call)
     assert state["codex_project_metadata_health"] == {
         "total_rows": 2,
         "qualified_rows": 1,
@@ -235,6 +294,61 @@ def test_gather_codex_project_metadata_is_all_history_and_identity_safe(tmp_path
         "undecodable_metadata_rows": 0,
     }
     assert state["codex_project_metadata_error"] is None
+    assert state.pop("__metadata_memo_probe") == {
+        "call_counts": [1, 1, 2, 3],
+        "second_total": 2,
+        "third_total": 3,
+        "fourth_total": 3,
+    }
+
+
+def test_doctor_metadata_memo_keys_the_connections_own_file(tmp_path):
+    """The memo key must describe the file the passed connection reads.
+
+    Two stores holding the same physical mutation sequence differ in content;
+    a key built from the global ``CACHE_DB_PATH`` would hand the second the
+    first one's retained partition.
+    """
+    other_path = tmp_path / "other-cache.db"
+    post_call = textwrap.dedent(f"""
+        import sqlite3
+        doctor = mod._load_sibling("_cctally_doctor")
+        analytics = mod._load_sibling("_cctally_source_analytics")
+        analytics.load_codex_project_metadata_health = (
+            lambda *, cache_conn: cache_conn.execute(
+                "SELECT value FROM memo_marker").fetchone()[0])
+        doctor._CODEX_PROJECT_METADATA_MEMO.clear()
+
+        def store(path, marker):
+            import pathlib
+            pathlib.Path(str(path)).parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(path))
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS cache_meta "
+                "(key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES "
+                "('codex_physical_mutation_seq', '7') "
+                "ON CONFLICT(key) DO UPDATE SET value='7'")
+            conn.execute("CREATE TABLE memo_marker (value TEXT)")
+            conn.execute("INSERT INTO memo_marker VALUES (?)", (marker,))
+            conn.commit()
+            return conn
+
+        live = store(mod._cctally_core.CACHE_DB_PATH, "live")
+        other = store({str(other_path)!r}, "other")
+        try:
+            d['__metadata_memo_paths'] = [
+                doctor._load_codex_project_metadata_health_for_doctor(live),
+                doctor._load_codex_project_metadata_health_for_doctor(other),
+                doctor._load_codex_project_metadata_health_for_doctor(live),
+            ]
+        finally:
+            live.close()
+            other.close()
+    """)
+    state = _run_gather(tmp_path, post_call=post_call)
+    assert state.pop("__metadata_memo_paths") == ["live", "other", "live"]
 
 
 def test_gather_codex_project_metadata_query_failure_is_explicit(tmp_path):

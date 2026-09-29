@@ -241,7 +241,7 @@ def test_idle_snapshot_stats_corruption_reaches_the_heal_boundary(
             tui._tui_build_idle_snapshot(
                 _idle_prior(tui), now_utc=_NOW, precompute_envelope=False,
                 runtime_bind=None, raw_config={}, errors=errors,
-                source_stats_conn=conn,
+                source_stats_conn=conn, codex_dependency=None,
             )
     finally:
         conn.close()
@@ -265,6 +265,7 @@ def test_idle_snapshot_stats_corruption_never_emits_the_cache_envelope(
             _idle_prior(tui), now_utc=_NOW, precompute_envelope=False,
             runtime_bind=None, raw_config={}, errors=errors,
             source_stats_conn=conn, stats_heal_attempted=True,
+            codex_dependency=None,
         )
     finally:
         conn.close()

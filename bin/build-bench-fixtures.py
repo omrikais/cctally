@@ -1083,6 +1083,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_conversation_query.py",
     "bin/_lib_conversation_retention.py",
     "bin/_lib_conversation_watch.py",
+    "bin/_lib_cost_provenance.py",
     "bin/_lib_credit.py",
     "bin/_lib_dashboard_dates.py",
     "bin/_lib_dashboard_json.py",

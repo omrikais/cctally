@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import pathlib
 import sqlite3
+import time
 
 import pytest
 import _lib_dashboard_sources as source_kernel
@@ -861,8 +863,8 @@ def test_stale_or_unavailable_provider_state_is_not_reused_for_recovery(
     ) is None
 
 
-def _stats_digest_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+def _stats_digest_db(database=":memory:") -> sqlite3.Connection:
+    conn = sqlite3.connect(database)
     conn.executescript(
         """
         CREATE TABLE quota_projection_state (
@@ -946,7 +948,9 @@ def test_codex_stats_digest_tracks_only_selected_semantic_columns():
         conn.close()
 
 
-def test_codex_stats_digest_is_order_independent_but_detects_semantic_deletes():
+def test_codex_stats_digest_is_order_independent_but_detects_semantic_deletes(
+    tmp_path, monkeypatch,
+):
     first = _stats_digest_db()
     second = _stats_digest_db()
     try:
@@ -965,6 +969,54 @@ def test_codex_stats_digest_is_order_independent_but_detects_semantic_deletes():
     finally:
         first.close()
         second.close()
+
+    # The file was written a moment ago, so the settle window would keep the
+    # memo cold; move the clock past it. `test_stats_digest_memo_857.py` owns
+    # the window itself and the rest of the key's cold-path conditions.
+    monkeypatch.setattr(source_kernel, "_STATS_RELATIONS_DIGEST_MEMO", {})
+    monkeypatch.setattr(
+        source_kernel, "_stats_memo_now", lambda: time.time() + 3600.0)
+    memoed = _stats_digest_db(tmp_path / "stats.sqlite")
+    try:
+        statements = []
+        memoed.set_trace_callback(statements.append)
+        baseline = source_kernel.codex_stats_digest(memoed)
+
+        def relation_reads():
+            return sum(
+                " FROM QUOTA_" in statement.upper()
+                or " FROM BUDGET_MILESTONES" in statement.upper()
+                or " FROM PROJECTED_MILESTONES" in statement.upper()
+                or " FROM METER_RATE_CHANGE_EVENTS" in statement.upper()
+                for statement in statements
+            )
+
+        first_reads = relation_reads()
+        assert first_reads > 0
+        assert source_kernel.codex_stats_digest(memoed) == baseline
+        assert relation_reads() == first_reads
+
+        # No journal cursor exists or moves: the committed write alone must
+        # invalidate the entry.
+        stats_path = tmp_path / "stats.sqlite"
+        stamp = os.stat(stats_path)
+        memoed.execute(
+            "UPDATE quota_window_blocks SET orphaned_at=?",
+            ("2026-07-16T22:00:00Z",),
+        )
+        memoed.commit()
+        # The faked settle clock stands in for the window that guarantees
+        # production a newer stamp on a coarse-timestamp filesystem, so give
+        # this commit one explicitly when the filesystem did not.
+        moved = os.stat(stats_path)
+        if (moved.st_size, moved.st_mtime_ns, moved.st_ctime_ns) == (
+                stamp.st_size, stamp.st_mtime_ns, stamp.st_ctime_ns):
+            os.utime(stats_path, ns=(
+                moved.st_atime_ns, moved.st_mtime_ns + 1_000_000_000))
+        assert source_kernel.codex_stats_digest(memoed) != baseline
+        assert relation_reads() > first_reads
+    finally:
+        memoed.close()
 
 
 def test_projection_coherence_requires_every_active_root_to_match_physical_signature():

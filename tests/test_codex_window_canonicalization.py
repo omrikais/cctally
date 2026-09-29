@@ -1097,9 +1097,10 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     #750 S3 advances to 1013 for reset-event origin identity plus the
     transactional debounce state. #769 S2 advances to 1014 for the
     source-local five-hour credit confirmation state, and #769 S11 advances to
-    1015 for `weekly_usage_snapshots.weekly_observation_held`."""
+    1015 for `weekly_usage_snapshots.weekly_observation_held`, and #869 advances
+    to 1016 for `five_hour_blocks.pricing_provenance_json`."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1015
+    assert _cctally_core.STATS_INDEX_EPOCH == 1016
 
 
 # --------------------------------------------------------------------------

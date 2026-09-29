@@ -1818,6 +1818,56 @@
           "to": "tests/test_cache_report_seams.py::test_the_default_threshold_is_the_pricing_value_resolved_at_call_time"
         }
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0181",
+      "predecessorDigest": "5771e0989de91dc442e685d8000f45eeff0a0823ea0398ff600438816a6cb79b",
+      "profile": "public",
+      "reason": "#869 raises STATS_INDEX_EPOCH from 1015 to 1016 for the persisted pricing-provenance column. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1015]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1015-1015]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0183",
+      "predecessorDigest": "b3e29cf0173dc6b1235bb3d9985a1ee68c8f6d96f17754fc83797eb4edc3b796",
+      "profile": "public",
+      "reason": "#869 raises STATS_INDEX_EPOCH from 1015 to 1016 for the persisted pricing-provenance column. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed. Re-declared against the estate main carried after #860 landed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1015]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1015-1015]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0186",
+      "predecessorDigest": "6cf07fd0a4468e2e0654efd1226e894be2467a80b31cc6020ab25cb75ee6533b",
+      "profile": "public",
+      "reason": "The old test expected a successful soak to remove its replay template. The #857 artifact preservation rule now requires that exact stamped template to remain for read-back, and the replacement test also proves that reusing its output path is refused. The old deletion assertion is intentionally withdrawn rather than silently lost.",
+      "renames": [
+        {
+          "from": "tests/test_bench.py::test_dashboard_soak_success_removes_replay_template",
+          "to": "tests/test_bench.py::test_dashboard_soak_retains_replay_template_and_refuses_output_reuse"
+        }
+      ]
     }
   ],
   "schemaVersion": 1
