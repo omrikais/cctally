@@ -29406,7 +29406,7 @@
       "runner": "vitest"
     }
   ],
-  "generatedFrom": "c81ded7fe6584d44e0af30a1edbd16f6fe6aa6ce",
+  "generatedFrom": "2255740f547bdca01a37f3138f3852c032fb0d37",
   "pytestExecution": {
     "legs": [
       {
@@ -33014,6 +33014,8 @@
     "tests/test_codex_56_pricing.py::test_session_metrics_alias_map_mirrors_every_alias_it_can_price",
     "tests/test_codex_56_pricing.py::test_session_metrics_normalizes_the_gpt_56_alias",
     "tests/test_codex_56_pricing.py::test_session_metrics_rate_card_matches_the_authoritative_table",
+    "tests/test_codex_56_pricing.py::test_session_metrics_uses_each_sol_models_cached_input_rate[gpt-6-sol-2.1]",
+    "tests/test_codex_56_pricing.py::test_session_metrics_uses_each_sol_models_cached_input_rate[gpt-6.1-sol-2.05]",
     "tests/test_codex_56_pricing.py::test_sol_alias_bills_the_fast_tier_at_the_canonical_multiplier[gpt-5.6]",
     "tests/test_codex_56_pricing.py::test_sol_alias_bills_the_fast_tier_at_the_canonical_multiplier[gpt-daybreak-blue-latest]",
     "tests/test_codex_56_pricing.py::test_sol_alias_resolves_to_the_canonical_card[gpt-5.6]",
@@ -33088,6 +33090,13 @@
     "tests/test_codex_astra_pricing.py::test_litellm_scope_keeps_astra_for_future_drift_detection",
     "tests/test_codex_astra_pricing.py::test_pricing_coverage_accepts_astra_as_directly_priced",
     "tests/test_codex_astra_pricing.py::test_pricing_coverage_accepts_sol_as_directly_priced",
+    "tests/test_codex_astra_pricing.py::test_pricing_coverage_and_drift_scope_accept_sol_61_as_directly_priced",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[100000-40000-10000-fast-0.448]",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[100000-40000-10000-standard-0.224]",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[272000-272000-10000-standard-0.1272]",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[272001-272001-10000-standard-0.2044002]",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[400000-100000-20000-fast-3.04]",
+    "tests/test_codex_astra_pricing.py::test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary[400000-100000-20000-standard-1.52]",
     "tests/test_codex_astra_pricing.py::test_sol_has_the_standard_vendor_card_without_fallback",
     "tests/test_codex_astra_pricing.py::test_sol_prices_standard_cached_output_and_fast_tokens[fast-0.456]",
     "tests/test_codex_astra_pricing.py::test_sol_prices_standard_cached_output_and_fast_tokens[standard-0.228]",
@@ -46010,6 +46019,10 @@
     {
       "count": 1,
       "key": "tests/test_codex_56_pricing.py::test_session_metrics_rate_card_matches_the_authoritative_table::shared_mark::not SESSION_METRICS.exists()"
+    },
+    {
+      "count": 1,
+      "key": "tests/test_codex_56_pricing.py::test_session_metrics_uses_each_sol_models_cached_input_rate::shared_mark::not SESSION_METRICS.exists()"
     },
     {
       "count": 1,

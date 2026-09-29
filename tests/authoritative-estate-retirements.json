@@ -1868,6 +1868,17 @@
           "to": "tests/test_bench.py::test_dashboard_soak_retains_replay_template_and_refuses_output_reuse"
         }
       ]
+    },
+    {
+      "axis": "suppressions",
+      "cause": "retired",
+      "id": "R-0188",
+      "predecessorDigest": "80ce7af0b97b54bf33878b2968686d78c443cd40d7be964cedf226a6afce02bf",
+      "profile": "public",
+      "reason": "The GPT 6.1 Sol cache-rate regression exercises bin/codex-session-metrics, a maintainer-only script excluded from public installs. Reuse its existing file-existence skip condition so the public suite does not require a private script; the private suite executes the real estimator when the script is present.",
+      "rows": [
+        "tests/test_codex_56_pricing.py::test_session_metrics_uses_each_sol_models_cached_input_rate::shared_mark::not SESSION_METRICS.exists()"
+      ]
     }
   ],
   "schemaVersion": 1

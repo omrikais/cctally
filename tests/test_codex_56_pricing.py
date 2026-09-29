@@ -277,6 +277,7 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
     ) == pytest.approx(3.375)
     assert metrics.PRICING[ASTRA] == (10.0, 50.0)
     assert metrics.PRICING["gpt-6-sol"] == (2.0, 10.0)
+    assert metrics.PRICING["gpt-6.1-sol"] == (2.0, 10.0)
     assert metrics.PRICING[LUNA] == (0.1, 0.5)
     for model, (input_per_mtok, output_per_mtok) in metrics.PRICING.items():
         card = pricing.CODEX_MODEL_PRICING[pricing._canonical_codex_model(model)]
@@ -285,15 +286,32 @@ def test_session_metrics_rate_card_matches_the_authoritative_table():
         assert output_per_mtok == pytest.approx(
             card["output_cost_per_token"] * 1e6), model
         # The estimator DERIVES its cached-input rate as the input rate times
-        # CACHED_INPUT_FACTOR instead of storing one, so the ratio is itself a
-        # rate that can drift from the card. It holds for every model today; a
-        # model whose cached input is not a tenth of its input would silently
-        # estimate wrong without this. approx is required on both sides of the
+        # model-specific factor instead of storing one, so the ratio is itself
+        # a rate that can drift from the card. GPT-6.1 Sol uses 5% instead of
+        # the default 10%. approx is required on both sides of the
         # scaling: gpt-5.6-terra derives 0.2 against a card that scales to
         # 0.19999999999999998, and gpt-5.6-luna derives 0.020000000000000004
         # against a card that scales to 0.02.
-        assert input_per_mtok * metrics.CACHED_INPUT_FACTOR == pytest.approx(
+        factor = metrics.CACHED_INPUT_FACTORS.get(
+            model, metrics.CACHED_INPUT_FACTOR,
+        )
+        assert input_per_mtok * factor == pytest.approx(
             card["cache_read_input_token_cost"] * 1e6), model
+
+
+@requires_session_metrics
+@pytest.mark.parametrize(
+    ("model", "expected"), [("gpt-6.1-sol", 2.05), ("gpt-6-sol", 2.10)],
+)
+def test_session_metrics_uses_each_sol_models_cached_input_rate(model, expected):
+    metrics = _load_session_metrics()
+    totals = {
+        "input_tokens": 1_000_000,
+        "cached_input_tokens": 500_000,
+        "output_tokens": 100_000,
+    }
+
+    assert metrics._est_cost({model: 10}, totals) == expected
 
 
 @requires_session_metrics

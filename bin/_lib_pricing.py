@@ -63,7 +63,7 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-09-29"
+PRICING_SNAPSHOT_DATE = "2026-09-30"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -762,6 +762,11 @@ _unknown_model_warnings: set[str] = set()
 #   card at $12.50 input / $1.25 cached input / $75.00 output per MTok.
 #   The current OpenAI table lists its 5.6 successor instead. LiteLLM does
 #   not publish an above-272K rate for 5.5 Cyber, so do not infer that tier.
+#   2026-09-29: added gpt-6.1-sol from OpenAI's model and pricing pages:
+#   Standard $2.00 input / $0.10 cached input / $10.00 output per MTok;
+#   above 272K, $4.00 / $0.20 / $15.00. Fast mode is 2x. LiteLLM does not
+#   yet carry this identifier. The snapshot date advances to 2026-09-30
+#   because the Sonnet 5.5 sync already used 2026-09-29 (#705).
 #
 # Billing rules:
 # - reasoning_output_tokens is billed at the *output* rate (matches
@@ -925,6 +930,17 @@ CODEX_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 1e-05,
         "input_cost_per_token_above_272k_tokens": 4e-06,
         "cache_read_input_token_cost_above_272k_tokens": 4e-07,
+        "output_cost_per_token_above_272k_tokens": 1.5e-05,
+    },
+    "gpt-6.1-sol": {
+        # Source: https://developers.openai.com/api/docs/models/gpt-6.1-sol
+        # Standard $2.00/M input, $0.10/M cached input, $10.00/M output;
+        # above 272K input, rates are 2x input/cache and 1.5x output.
+        "input_cost_per_token": 2e-06,
+        "cache_read_input_token_cost": 1e-07,
+        "output_cost_per_token": 1e-05,
+        "input_cost_per_token_above_272k_tokens": 4e-06,
+        "cache_read_input_token_cost_above_272k_tokens": 2e-07,
         "output_cost_per_token_above_272k_tokens": 1.5e-05,
     },
     "gpt-6-luna": {

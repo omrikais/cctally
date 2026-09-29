@@ -13,6 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 MODEL = "gpt-6-astra"
 SOL = "gpt-6-sol"
+SOL_61 = "gpt-6.1-sol"
 
 ASTRA_CARD = {
     "input_cost_per_token": 1e-05,
@@ -184,3 +185,41 @@ def test_pricing_coverage_accepts_sol_as_directly_priced():
     )
 
     assert gaps == []
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "cached_tokens", "output_tokens", "speed", "expected"),
+    [
+        (100_000, 40_000, 10_000, "standard", 0.224),
+        (100_000, 40_000, 10_000, "fast", 0.448),
+        (400_000, 100_000, 20_000, "standard", 1.52),
+        (400_000, 100_000, 20_000, "fast", 3.04),
+        (272_000, 272_000, 10_000, "standard", 0.1272),
+        (272_001, 272_001, 10_000, "standard", 0.2044002),
+    ],
+)
+def test_sol_61_prices_its_five_percent_cache_rate_and_context_boundary(
+    input_tokens, cached_tokens, output_tokens, speed, expected, capsys,
+):
+    # OpenAI's 6.1 card halves cached-input rates, retaining the 6.0 input
+    # and output rates. Reasoning tokens are already included in output.
+    pricing._unknown_codex_model_warnings.discard(SOL_61)
+    cost = pricing._calculate_codex_entry_cost(
+        SOL_61, input_tokens, cached_tokens, output_tokens, 2_000, speed=speed,
+    )
+
+    assert cost == pytest.approx(expected)
+    assert pricing._is_codex_fallback(SOL_61) is False
+    assert "unknown model" not in capsys.readouterr().err
+
+
+def test_pricing_coverage_and_drift_scope_accept_sol_61_as_directly_priced():
+    gaps = pricing_check.classify_coverage(
+        [("codex", SOL_61, 3, 123_456)],
+        lambda _model: None,
+        pricing._is_codex_fallback,
+    )
+    assert gaps == []
+    assert SOL_61 in pricing_check.scope_litellm({
+        SOL_61: {"litellm_provider": "openai", "input_cost_per_token": 2e-06},
+    })

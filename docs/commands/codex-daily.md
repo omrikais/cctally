@@ -120,6 +120,8 @@ rendered table's Input column shows non-cached (`input - cached`).
 
 ### Unknown models
 
+`gpt-6.1-sol` uses its own [OpenAI Standard rate card](https://developers.openai.com/api/docs/models/gpt-6.1-sol): $2 input, $0.10 cached input and $10 output per million tokens. Prompts above 272,000 cache-inclusive input tokens use $4 / $0.20 / $15 for the full request; `--speed fast` doubles the applicable rates. `gpt-6-sol` retains its separate $0.20 cached-input rate.
+
 Unknown Codex model names fall back to
 `CODEX_LEGACY_FALLBACK_MODEL = "gpt-5"` pricing with `isFallback: true`
 in JSON output. One stderr warning per unknown name per process.

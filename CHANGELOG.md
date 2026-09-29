@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.113.0] - 2026-09-29
+
+### Added
+- Codex cost reports price `gpt-6.1-sol` at its published input, cached-input and output rates, including long-context and Fast pricing, instead of using fallback rates.
+
 ## [1.112.0] - 2026-09-29
 
 ### Added
