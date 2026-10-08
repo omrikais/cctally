@@ -44,8 +44,8 @@ PER_MIGRATION_ROOT = (
 # Pinned registry sizes. Bump the matching one when a migration ships (see
 # module docstring).
 EXPECTED_STATS_COUNT = 13
-EXPECTED_CACHE_COUNT = 46
-EXPECTED_CONVERSATIONS_COUNT = 10
+EXPECTED_CACHE_COUNT = 48
+EXPECTED_CONVERSATIONS_COUNT = 11
 
 # migration name -> its per-migration golden TEST MODULE (stem). The module must
 # declare ``IDEMPOTENCY_COVERED = True``. The historical mixed naming is why this
@@ -115,6 +115,8 @@ MANIFEST = {
     "044_codex_accounting_change_ledger": "test_cache_migration_044_per_migration_goldens",
     "045_conversation_render_revision_columns": "test_cache_migration_045_per_migration_goldens",
     "046_codex_source_file_identity": "test_cache_migration_046_per_migration_goldens",
+    "047_spill_free_read_paths": "test_cache_migration_047_per_migration_goldens",
+    "048_codex_quota_physical_group_order": "test_cache_migration_048_per_migration_goldens",
     # ── conversations registry (DB journal redesign spec §7.2) ──
     "001_adopt_schema_version_marker": "test_conversations_migration_001_per_migration_goldens",
     "002_codex_thread_source_inference_replay": "test_conversations_migration_002_per_migration_goldens",
@@ -126,6 +128,7 @@ MANIFEST = {
     "008_conversation_render_revision": "test_conversations_migration_008_per_migration_goldens",
     "009_conversation_title_staging_and_account_stamps": "test_conversations_migration_009_per_migration_goldens",
     "010_codex_conversation_source_file_identity": "test_conversations_migration_010_per_migration_goldens",
+    "011_conversation_latest_meta_indexes": "test_conversations_migration_011_per_migration_goldens",
 }
 
 # Golden dir names for conversations migrations carry a ``conversations_``

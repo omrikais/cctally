@@ -204,53 +204,58 @@ export function AccountHeroCards() {
     : null;
 
   return (
-    <div
-      ref={railRef}
-      className="account-hero-cards"
-      data-testid="account-hero-cards"
-      data-scroll-cue={showScrollCue ? 'visible' : 'hidden'}
-    >
-      {groups.map((group) => {
-        const groupFocused = resolveViewAccountFocus(
-          env, activeSource, group.source, focusState,
-        );
-        // All → every card stays on screen and the focused one is merely
-        // highlighted. A provider tab keeps its filtering behaviour.
-        const visible = combined || groupFocused == null
-          ? group.accounts
-          : group.accounts.filter((card) => card.accountKey === groupFocused);
-        return (
-          <div className="account-hero-provider-group" data-source={group.source} key={group.source}>
-            {combined && (
-              <p className="account-hero-caption" data-testid="account-hero-caption">
-                {group.source === 'claude' ? 'Claude' : 'Codex'} accounts — each has its own quota cycle.
-              </p>
-            )}
-            <div className="account-hero-card-row">
-              {visible.map((card) => {
-                const idx = group.accounts.findIndex((item) => item.accountKey === card.accountKey);
-                return (
-                  <AccountHeroCard
-                    key={card.accountKey}
-                    card={card}
-                    color={ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length]}
-                    focused={groupFocused === card.accountKey}
-                  />
-                );
-              })}
+    <div className="account-hero-cards-wrap">
+      <div
+        // A new selection must not retain the browser's previously snapped
+        // card. Routine updates keep this key and the user's scroll position.
+        key={`${activeSource}:${visibleAccountKeys}`}
+        ref={railRef}
+        className="account-hero-cards"
+        data-testid="account-hero-cards"
+        data-scroll-cue={showScrollCue ? 'visible' : 'hidden'}
+      >
+        {groups.map((group) => {
+          const groupFocused = resolveViewAccountFocus(
+            env, activeSource, group.source, focusState,
+          );
+          // All → every card stays on screen and the focused one is merely
+          // highlighted. A provider tab keeps its filtering behaviour.
+          const visible = combined || groupFocused == null
+            ? group.accounts
+            : group.accounts.filter((card) => card.accountKey === groupFocused);
+          return (
+            <div className="account-hero-provider-group" data-source={group.source} key={group.source}>
+              {combined && (
+                <p className="account-hero-caption" data-testid="account-hero-caption">
+                  {group.source === 'claude' ? 'Claude' : 'Codex'} accounts — each has its own quota cycle.
+                </p>
+              )}
+              <div className="account-hero-card-row">
+                {visible.map((card) => {
+                  const idx = group.accounts.findIndex((item) => item.accountKey === card.accountKey);
+                  return (
+                    <AccountHeroCard
+                      key={card.accountKey}
+                      card={card}
+                      color={ACCOUNT_COLORS[(idx < 0 ? 0 : idx) % ACCOUNT_COLORS.length]}
+                      focused={groupFocused === card.accountKey}
+                    />
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        );
-      })}
-      {emptyNote != null && (
-        <p
-          className="account-hero-empty"
-          data-testid="account-hero-empty"
-          role="status"
-        >
-          {emptyNote}
-        </p>
-      )}
+          );
+        })}
+        {emptyNote != null && (
+          <p
+            className="account-hero-empty"
+            data-testid="account-hero-empty"
+            role="status"
+          >
+            {emptyNote}
+          </p>
+        )}
+      </div>
       <span
         className="account-hero-scroll-cue"
         data-testid="account-hero-scroll-cue"

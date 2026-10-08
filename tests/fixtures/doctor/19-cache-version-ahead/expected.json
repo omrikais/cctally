@@ -189,12 +189,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 46,
+                        "registry_size": 48,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 46 known",
+                    "summary": "version 99 / 48 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,11 +212,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 46,
+                            "registry_size": 48,
                             "user_version": 99
                         },
                         "stats.db": {
-                            "epoch": 1016,
+                            "epoch": 1017,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -225,7 +225,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v46) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v48) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -280,7 +280,9 @@
                                     "043_codex_window_attributions",
                                     "044_codex_accounting_change_ledger",
                                     "045_conversation_render_revision_columns",
-                                    "046_codex_source_file_identity"
+                                    "046_codex_source_file_identity",
+                                    "047_spill_free_read_paths",
+                                    "048_codex_quota_physical_group_order"
                                 ],
                                 "skipped": []
                             },
@@ -308,7 +310,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/59 applied",
+                    "summary": "0/61 applied",
                     "title": "Migrations"
                 },
                 {
@@ -549,13 +551,21 @@
                             [
                                 "cache.db",
                                 "046_codex_source_file_identity"
+                            ],
+                            [
+                                "cache.db",
+                                "047_spill_free_read_paths"
+                            ],
+                            [
+                                "cache.db",
+                                "048_codex_quota_physical_group_order"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "59 pending",
+                    "summary": "61 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -608,7 +618,15 @@
                         "conversations_db_free_ratio": null,
                         "conversations_db_freelist_count": null,
                         "conversations_db_page_count": null,
-                        "warn_ratio": 0.25
+                        "conversations_db_page_size": null,
+                        "reclaim_ceiling_bytes": 17179869184,
+                        "reclaim_episode_active": null,
+                        "reclaim_failure": null,
+                        "reclaim_start_bytes": 2147483648,
+                        "reclaim_start_ratio": 0.2,
+                        "reclaim_stop_bytes": 1073741824,
+                        "reclaim_stop_ratio": 0.1,
+                        "reclaimable_bytes": null
                     },
                     "id": "db.conversations_reclaimable",
                     "severity": "ok",
@@ -1110,6 +1128,33 @@
             "id": "telemetry",
             "severity": "ok",
             "title": "Telemetry"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
+                        "instances": [],
+                        "maintenance": {
+                            "allowance_bytes": 6136266752,
+                            "charged_bytes": 0,
+                            "largest_charge_bytes": 0,
+                            "verdict": "ok",
+                            "window_end": "2026-05-13T14:22:31Z",
+                            "window_minutes": 1462,
+                            "window_start": "2026-05-12T14:00:00Z"
+                        },
+                        "mode": "discovery",
+                        "policy_version": 1
+                    },
+                    "id": "performance.dashboard_disk_writes",
+                    "severity": "ok",
+                    "summary": "No dashboard is running.",
+                    "title": "Dashboard disk writes"
+                }
+            ],
+            "id": "performance",
+            "severity": "ok",
+            "title": "Performance"
         }
     ],
     "cctally_version": "<redacted>",
@@ -1117,7 +1162,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 61,
+            "ok": 62,
             "warn": 5
         },
         "severity": "warn"

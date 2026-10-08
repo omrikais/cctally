@@ -199,9 +199,8 @@ def test_the_charge_fidelity_declaration_covers_every_owner():
     closed = {
         name for name, value in fidelity.items() if value != "walked"}
     assert closed == {
-        "project_wire", "entry_adapters", "visible_population",
-        "project_labels"}, (
-        "a fifth owner became a closed-form under-charge without the "
+        "entry_adapters", "visible_population", "project_labels"}, (
+        "a fourth owner became a closed-form under-charge without the "
         "declaration saying so, and the budget is compared against a sum that "
         "includes it")
     for name in closed:
@@ -321,17 +320,14 @@ def test_the_label_cache_owns_its_copies_without_recharging_their_rows():
     assert charged >= sys.getsizeof(labelled)
 
 
-def test_the_project_wire_groups_cost_shells_not_their_populations():
-    """A tick must not become proportional to the whole population again."""
+def test_the_project_wire_entry_charges_its_signature_and_wire():
+    """#872: the entry is `(signature, wire)`; a larger wire costs more."""
     module = sources
-    rows = tuple(_sample_row(index) for index in range(64))
-    small = ("signature", {"rows": ()}, {("root", "p"): rows[:1]})
-    large = ("signature", {"rows": ()}, {("root", "p"): rows})
-    small_charge = module._charge_project_wire_entry("k", small)
-    large_charge = module._charge_project_wire_entry("k", large)
-    # The tuple shell grows by eight bytes a slot and nothing else does.
-    assert large_charge - small_charge == (
-        sys.getsizeof(rows) - sys.getsizeof(rows[:1]))
+    small = (("signature",), {"rows": ()})
+    large = (("signature",), {"rows": tuple({"key": f"k{i}"} for i in range(64))})
+    assert module._charge_project_wire_entry("k", large) > (
+        module._charge_project_wire_entry("k", small))
+    assert module._charge_project_wire_entry("k", small) >= sys.getsizeof(small)
 
 
 def _sample_row(index: int = 1):

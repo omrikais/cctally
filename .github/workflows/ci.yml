@@ -10,13 +10,22 @@ on:
     # CHANGELOG / README / CLAUDE.md / docs/**/*.md churn doesn't change
     # any test outcome. `paths-ignore` evaluates per push: if EVERY
     # changed file matches, the workflow is skipped; a mixed code+docs
-    # push still runs.
+    # push still runs. The shared memory publication set (#899 S2) is never
+    # read by any job here either: a memory-only publication runs only the
+    # fast main-push observer, and its exact tree is certified before the push.
+    # `.agentmem/config.json` is configuration, not memory, and still runs CI.
     paths-ignore:
       - '**/*.md'
+      - '.claude-memory/**'
+      - '.agentmem/codex-memory/**'
+      - '.agentmem/topics.json'
   pull_request:
     types: [opened, synchronize, reopened]
     paths-ignore:
       - '**/*.md'
+      - '.claude-memory/**'
+      - '.agentmem/codex-memory/**'
+      - '.agentmem/topics.json'
 
 # #630 S4 (F25). One superseded push no longer occupies the single primary
 # cctally runner while a newer commit waits behind it. Measured over 100 pushes, 15 were
@@ -335,6 +344,11 @@ jobs:
           # GITHUB_RUN_ID plus the attempt and job name do not distinguish a
           # matrix leg, so every lane states its own identity explicitly.
           CCTALLY_TEST_RUN_ID: macos-${{ github.run_id }}-${{ github.run_attempt }}
+          # #899 S2. The suite's structured outcome record, at a per-run,
+          # per-attempt path. This is the path the evidence root already
+          # defaults it to, so the failure extract upload below still carries
+          # it; naming it here lets the classifier step read it.
+          CCTALLY_TEST_ALL_OUTCOME_FILE: ${{ runner.temp }}/cctally-test-evidence/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
         run: |
           set -e
           python3 --version
@@ -359,7 +373,36 @@ jobs:
           # every lane that sets CCTALLY_AUTHORITATIVE_RUN.
           python3 -m pip install --no-deps -r tests/requirements-dev.txt
           python3 -m pip check
-          bin/cctally-test-all
+          # The same physical-host reservation used by manual wrapper runs.
+          # Waiting consumes the existing 60-minute job timeout; it changes no
+          # suite deadline, fan-out, normalized budget, or outcome classifier.
+          # Raw host observations persist in the runner's private cache,
+          # outside runner.temp (which Actions clears) and uploaded export/.
+          python3 bin/_lib_runner_reservation.py run \
+            --run-id "$CCTALLY_TEST_RUN_ID" \
+            --evidence "$HOME/.cache/cctally-runner-reservation/observations/$CCTALLY_TEST_RUN_ID.jsonl" \
+            -- bin/cctally-test-all
+
+      # #899 S2 (operator decision D1(b)). A scheduled run whose suite failed
+      # ONLY on the runtime budget, with every test passing, is not a failed
+      # background verification. The classifier reads the outcome record; the
+      # marker step runs only when it says so. The job still concludes
+      # `failure`, and the marker is provisional: background-health readers
+      # also require that the suite step is the job's only failed step, so a
+      # failure in any later step (the extract validation, the upload, a
+      # post-job step) keeps the run a failure. Schedule only: a dispatched or
+      # pushed run never receives the exception.
+      - name: Classify the suite outcome
+        id: suite_outcome
+        if: failure() && github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          CCTALLY_TEST_ALL_OUTCOME_FILE: ${{ runner.temp }}/cctally-test-evidence/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
+        run: python3 .github/scripts/classify_suite_outcome.py "$CCTALLY_TEST_ALL_OUTCOME_FILE"
+
+      - name: Runtime budget is the only failure
+        if: failure() && steps.suite_outcome.outcome == 'success'
+        run: echo "runtime budget is the only failure"
 
       # Failure-only, and BOUNDED: only the two export files, never logs/.
       # `export/` is a sibling of `logs/` and never a parent, so this path
@@ -502,21 +545,30 @@ jobs:
         run: |
           export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           python3 --version
-          # Reap any dashboard server a prior HARD-FAILED run leaked on the
-          # dedicated e2e port before Playwright's reuseExistingServer:false probe
-          # (which runs BEFORE e2e/serve.sh) turns the occupied port into a red
-          # build unrelated to the code under test. See e2e/free-port.sh.
-          bash e2e/free-port.sh
-          npx playwright test
+          # Retain each run outside the checkout that Actions cleans. An
+          # existing run directory or occupied port refuses without cleanup.
+          evidence_parent="$HOME/.cache/cctally-ui-qa-evidence/ci"
+          mkdir -p "$evidence_parent"
+          export CCTALLY_E2E_EVIDENCE_DIR="$evidence_parent/e2e-reader-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$CCTALLY_E2E_EVIDENCE_DIR"
+          export CCTALLY_E2E_SAFE_EVIDENCE=1
+          export CCTALLY_E2E_RUNTIME_DIR="$CCTALLY_E2E_EVIDENCE_DIR/runtime"
+          export PLAYWRIGHT_JSON_OUTPUT_NAME="$CCTALLY_E2E_EVIDENCE_DIR/playwright.json"
+          export PLAYWRIGHT_HTML_OUTPUT_DIR="$CCTALLY_E2E_EVIDENCE_DIR/playwright-report"
+          export PLAYWRIGHT_HTML_OPEN=never
+          unset TEST_WORKER_INDEX TEST_PARALLEL_INDEX
+          echo "CCTALLY_E2E_EVIDENCE_DIR=$CCTALLY_E2E_EVIDENCE_DIR" >> "$GITHUB_ENV"
+          npx playwright test --reporter=list,html,json
 
       - name: Upload Playwright artifacts
-        if: failure()
+        if: failure() && env.CCTALLY_E2E_EVIDENCE_DIR != ''
         uses: actions/upload-artifact@v4
         with:
           name: e2e-reader-artifacts
           path: |
-            dashboard/web/playwright-report/
-            dashboard/web/test-results/
+            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/playwright-report/
+            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/test-results/
+            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/playwright.json
           retention-days: 7
 
   test-pr:

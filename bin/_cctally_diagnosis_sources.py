@@ -1984,10 +1984,12 @@ _CODEX_THREADS_BY_NATIVE_SQL = """
 # reading `cache_create_tokens` off `session_entries` carries the split
 # column, because a missed site does not raise and does not move a golden — it
 # silently under-prices — and this map is one keystroke away from feeding a
-# cost fold.
+# cost fold. `input_tokens` (#929) is appended LAST so the existing row
+# indexes stay valid: a flagged turn's wasted estimate selects its pricing card
+# from the request's real prompt, input + creation + read.
 _CLAUDE_TURN_TOKENS_SQL = (
     "SELECT msg_id, req_id, cache_create_tokens, cache_read_tokens, "
-    "       cache_create_1h_tokens, speed "
+    "       cache_create_1h_tokens, speed, input_tokens "
     "FROM session_entries WHERE "
 )
 
@@ -2148,7 +2150,8 @@ def _placeholders(count: int) -> str:
 def _claude_turn_token_map(conn: sqlite3.Connection,
                            keys: Sequence[tuple], account_key: str | None
                            ) -> dict[tuple, dict]:
-    """`{(msg_id, req_id): {"cache_creation", "cache_read", "speed"}}`.
+    """`{(msg_id, req_id): {"cache_creation", "cache_read", "cache_1h",
+    "speed", "input"}}`.
 
     The cache-churn walk begins BEFORE the window, and those turns are state:
     their tokens move the running maximum and they contribute no support,
@@ -2171,6 +2174,7 @@ def _claude_turn_token_map(conn: sqlite3.Connection,
                 "cache_read": int(row[3] or 0),
                 "cache_1h": row[4],
                 "speed": row[5],
+                "input": int(row[6] or 0),
             }
     return usage
 
@@ -2432,8 +2436,13 @@ def _evaluate_cache_churn(scope: DiagnosisScope, bundle: StoreBundle,
                 continue
             flagged_keys.add(key)
             flagged_sessions.add(session)
+            # #929: the flagged request's real prompt selects the card.
+            turn = usage.get(key) or {}
             wasted.append(query._cache_failure_wasted_usd(
-                model, lost, speed=speed))
+                model, lost, speed=speed,
+                prompt_tokens=(turn.get("input", 0)
+                               + turn.get("cache_creation", 0)
+                               + turn.get("cache_read", 0))))
 
     known = set(all_sessions)
     seeded = set(streams)
@@ -4412,6 +4421,15 @@ def _start_forked_provider(args) -> tuple[int, int]:
             with os.fdopen(write_fd, "wb") as stream:
                 pickle.dump(payload, stream, protocol=5)
         finally:
+            # #901 W9 (Q14): `os._exit` skips `atexit`; a provider task that
+            # synced a store hands its frames to the checkpoint policy's
+            # finalizer. With nothing armed it does nothing.
+            try:
+                import _lib_wal_checkpoint
+
+                _lib_wal_checkpoint.finalize()
+            except BaseException:  # noqa: BLE001
+                pass
             os._exit(0)
     os.close(write_fd)
     return pid, read_fd

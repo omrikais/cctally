@@ -2083,13 +2083,18 @@ _FILE_ACCOUNT_INSERT = (
 # to reach this statement for a record the map insert dropped, so the two guards
 # are belt-and-suspenders over disjoint failure modes: this one covers any
 # constraint the incarnation table might gain that the map table lacks.
+#
+# #901 §5.3c (W8): the MAX-set writes only when the incarnation advances, like
+# its ingest twin `_cctally_cache.set_codex_file_incarnation`, so replaying a
+# decision the store already holds issues no write.
 _FILE_INCARNATION_INSERT = (
     "INSERT OR IGNORE INTO codex_file_incarnations "
     "(file_identity, incarnation, updated_at_utc) "
     "VALUES (?,?,?) "
     "ON CONFLICT(file_identity) DO UPDATE SET "
-    "  incarnation = MAX(codex_file_incarnations.incarnation, excluded.incarnation), "
-    "  updated_at_utc = excluded.updated_at_utc"
+    "  incarnation = excluded.incarnation, "
+    "  updated_at_utc = excluded.updated_at_utc "
+    "WHERE excluded.incarnation > codex_file_incarnations.incarnation"
 )
 
 
@@ -2496,6 +2501,14 @@ _QUOTA_SNAPSHOT_UPSERT_CLAUSE = (
 )
 
 _QUOTA_SNAPSHOT_UPSERT = _QUOTA_SNAPSHOT_INSERT + _QUOTA_SNAPSHOT_UPSERT_CLAUSE
+
+# The natural key of `_QUOTA_SNAPSHOT_UPSERT_CLAUSE`, read before a replay
+# inserts (#901 W11): `(source, source_path, line_offset, logical_limit_key)`.
+_QUOTA_SNAPSHOT_STORED_ACCOUNT = (
+    "SELECT account_key FROM quota_window_snapshots "
+    "WHERE source = ? AND source_path = ? AND line_offset = ? "
+    "AND logical_limit_key = ?"
+)
 _QUOTA_SNAPSHOT_UPSERT_LEGACY = (
     _QUOTA_SNAPSHOT_INSERT_LEGACY + _QUOTA_SNAPSHOT_UPSERT_CLAUSE
 )
@@ -2695,8 +2708,20 @@ def _apply_quota_records(
         row_values = _quota_snapshot_values(rec, anchor)
         if not has_anchor:
             row_values = row_values[:-1]
+        # #901 §5.3c (W11, Q14): an INSERT into this AUTOINCREMENT table
+        # rewrites `sqlite_sequence` even when every row it carries is
+        # rejected, so replaying observations the walk already materialized
+        # wrote a page per ingest cycle. The stored row is read first and an
+        # insert that would change nothing is not issued; a genuine
+        # correction (a decision now governing a row stamped otherwise) still
+        # runs. AUTOINCREMENT and the sequence values are untouched.
+        stored = cache.execute(
+            _QUOTA_SNAPSHOT_STORED_ACCOUNT,
+            (row_values[0], row_values[2], row_values[3], row_values[6]),
+        ).fetchone()
         if not covered:
-            cache.execute(insert_sql, row_values)
+            if stored is None:
+                cache.execute(insert_sql, row_values)
             continue
         observed = rec.get("account")
         payload = rec.get("payload") or {}
@@ -2719,6 +2744,8 @@ def _apply_quota_records(
                 )
         values = list(row_values)
         values[16] = decided
+        if stored is not None and stored[0] == decided:
+            continue  # the upsert's guarded DO UPDATE would change nothing
         cache.execute(upsert_sql, tuple(values))
 
 
@@ -3259,7 +3286,12 @@ def _cache_applier(decoded, *, cursor=None, covered_to=None,
             return stop_idx
         try:
             import _cctally_cache
+            import _cctally_store
             cache.execute("PRAGMA busy_timeout=15000")
+            # #901 §4.7 (Q11): a raw cache writer, so it holds its statement
+            # journals in memory like the store openers' writers do. Only the
+            # temp store; locks and transaction order are unchanged.
+            _cctally_store.apply_writer_temp_store(cache)
             # Read and check the predecessor BEFORE the transaction opens
             # (spec §4.3, as corrected). `prior_is_extendable` checks contiguity
             # against this cycle's STARTING cursor — a predecessor applied
@@ -8117,6 +8149,8 @@ _REBUILD_REQUIRED_TABLES = frozenset(
 )
 _REBUILD_REQUIRED_INDEXES = frozenset(
     {
+        "idx_budget_milestones_alert_digest",
+        "idx_budget_milestones_codex_digest",
         "idx_budget_milestones_journal_id",
         "idx_budget_milestones_journal_id_null",
         "idx_cost_week_start_at_time",
@@ -8128,6 +8162,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_five_hour_blocks_block_start",
         "idx_five_hour_blocks_journal_id",
         "idx_five_hour_blocks_journal_id_null",
+        "idx_five_hour_milestones_alert_digest",
         "idx_five_hour_milestones_block",
         "idx_five_hour_milestones_journal_id",
         "idx_five_hour_milestones_journal_id_null",
@@ -8135,17 +8170,36 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_five_hour_reset_events_journal_id_null",
         "idx_journal_protocol_violations_batch",
         "idx_meter_rate_change_events_key",
+        "idx_percent_milestones_alert_digest",
         "idx_percent_milestones_journal_id",
         "idx_percent_milestones_journal_id_null",
+        "idx_percent_milestones_week_date",
+        "idx_project_budget_milestones_alert_digest",
         "idx_project_budget_milestones_journal_id",
         "idx_project_budget_milestones_journal_id_null",
+        "idx_projected_milestones_alert_digest",
+        "idx_projected_milestones_codex_digest",
         "idx_projected_milestones_journal_id",
         "idx_projected_milestones_journal_id_null",
         "idx_quota_blocks_active",
+        "idx_quota_blocks_digest",
+        "idx_quota_blocks_root_group_pairs",
+        "idx_quota_blocks_weekly_reset_order",
+        "idx_quota_blocks_weekly_single_root_order",
         "idx_quota_milestones_active",
+        "idx_quota_milestones_digest",
+        "idx_quota_milestones_root",
+        "idx_quota_projection_state_digest",
         "idx_quota_threshold_events_active",
+        "idx_quota_threshold_events_digest",
+        "idx_quota_threshold_events_root",
+        "idx_usage_subscription_anchor_order",
+        "idx_usage_subscription_anchor_pick",
+        "idx_usage_week_boundary_group",
+        "idx_usage_week_date_group",
         "idx_usage_week_start_at_time",
         "idx_usage_week_time",
+        "idx_week_reset_events_effective_order",
         "idx_week_reset_events_journal_id",
         "idx_week_reset_events_journal_id_null",
         "idx_week_reset_events_legacy_tuple",
@@ -8161,7 +8215,7 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "e0f2225f00843952b4887fa8afb046edacd3da0642d0f402ebaa5219a6e30697"
+    "2ef6dab067703e612360245f9fbe4522290046dc6d8d7b009798a384cb5c27b8"
 )
 
 
@@ -9006,7 +9060,11 @@ def _open_publication_connection(destination) -> sqlite3.Connection:
         recover_interruptions=False,
     )
     try:
-        _cctally_store.apply_policy(conn, "stats")
+        # #901 §4.7 does not enumerate this writer, so it keeps SQLite's
+        # default temp store: the publication rewrites whole relations inside
+        # one transaction, and an in-memory statement journal for that would
+        # be proportional to the index.
+        _cctally_store.apply_policy(conn, "stats", memory_temp_store=False)
     except BaseException:
         try:
             conn.close()
@@ -10527,6 +10585,10 @@ def _run_bounded_recovery(
             try:
                 cache = sqlite3.connect(str(cache_path), timeout=15.0)
                 cache.execute("PRAGMA busy_timeout=15000")
+                # #901 §4.7 (Q11): statement journals in memory, before the
+                # chunk's transaction; nothing else about the chunk changes.
+                import _cctally_store
+                _cctally_store.apply_writer_temp_store(cache)
                 cache.execute("BEGIN IMMEDIATE")
                 if chunk_index > 0:
                     seq, digest = _recovery_state(cache)

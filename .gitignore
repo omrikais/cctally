@@ -30,6 +30,8 @@ __pycache__/
 .claude/*
 !.claude/skills/
 !.claude/agents/
+# A tracked file under .claude/ (such as settings.json) needs no re-include here:
+# ignore rules never affect tracked files, and an untracked local one stays ignored.
 # Re-include fixture scaffolding under setup test fixtures (gitignore '.claude/' matches anywhere)
 !tests/fixtures/setup/*/input/.claude/
 !tests/fixtures/setup/*/input/.claude/**

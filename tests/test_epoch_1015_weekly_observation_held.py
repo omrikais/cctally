@@ -32,7 +32,7 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1014
-NEW_EPOCH = 1016  # current head; the column was introduced at 1015
+NEW_EPOCH = 1017  # current head; the column was introduced at 1015
 TABLE = "weekly_usage_snapshots"
 COLUMN = "weekly_observation_held"
 
@@ -144,6 +144,18 @@ def test_the_column_change_moves_no_table_or_index_contract():
         jr._REBUILD_REQUIRED_INDEXES)
 
 
+def _drop_column(conn) -> None:
+    """Give the store the previous epoch's shape: no column. A later epoch's
+    index that names the column (#901's epoch-1017 current-week read indexes)
+    did not exist at the previous epoch either, and SQLite refuses to drop a
+    column an index still names, so those indexes go first."""
+    for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name=? AND sql LIKE ?", (TABLE, f"%{COLUMN}%")).fetchall():
+        conn.execute(f"DROP INDEX {name}")
+    conn.execute(f"ALTER TABLE {TABLE} DROP COLUMN {COLUMN}")
+
+
 def test_the_schema_fingerprint_moved_with_the_epoch(ns):
     """The name-set contracts cannot see a column, so the fingerprint is the
     only contract this epoch moves. Asserted in both directions: the shipped
@@ -154,7 +166,7 @@ def test_the_schema_fingerprint_moved_with_the_epoch(ns):
     try:
         assert jr._stats_schema_fingerprint(conn) == (
             jr._REBUILD_SCHEMA_FINGERPRINT)
-        conn.execute(f"ALTER TABLE {TABLE} DROP COLUMN {COLUMN}")
+        _drop_column(conn)
         assert jr._stats_schema_fingerprint(conn) != (
             jr._REBUILD_SCHEMA_FINGERPRINT), (
             "the committed fingerprint does not cover the new column")
@@ -170,7 +182,7 @@ def test_the_column_reaches_an_upgraded_install_via_rebuild(ns):
     _seed_journal()
     conn = ns["open_db"]()
     try:
-        conn.execute(f"ALTER TABLE {TABLE} DROP COLUMN {COLUMN}")
+        _drop_column(conn)
         conn.execute(f"PRAGMA user_version = {PREVIOUS_EPOCH}")
         conn.commit()
     finally:

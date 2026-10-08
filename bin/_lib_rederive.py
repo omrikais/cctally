@@ -194,7 +194,15 @@ def validate_family_registry(*, evt_kinds: set[str],
     )
 
 
+# #874: the contract is structural. It names every column any planner reader
+# of the table reads (`_validate_cache_rows`, `_cache_fingerprint`,
+# `_joined_entries`, `iter_entries`), not only those the current journal
+# reaches, so whether a cache is accepted never depends on journal or pricing
+# state, and a missing column is a typed gap rather than a raw sqlite error.
 _SESSION_ENTRY_COLUMNS = frozenset({
+    "id",
+    "source_path",
+    "line_offset",
     "timestamp_utc",
     "model",
     "input_tokens",
@@ -202,7 +210,8 @@ _SESSION_ENTRY_COLUMNS = frozenset({
     "cache_create_tokens",
     "cache_read_tokens",
     "cache_create_1h_tokens",
-    "source_path",
+    "cost_usd_raw",
+    "speed",
     "account_key",
 })
 _SESSION_FILE_COLUMNS = frozenset({"path", "session_id", "project_path"})
@@ -225,6 +234,37 @@ def validate_claude_cache_contract(tables: Mapping[str, set[str]]) -> None:
     if missing_files:
         raise RederiveDataGap(
             "missing cache.db session_files column(s): " + ", ".join(missing_files)
+        )
+
+
+# #874: the Codex columns `_cache_fingerprint(include_codex=True)` and the
+# Codex budget re-pricing reader (`iter_codex_entries`) read. Required only
+# when the planner reads the Codex cache at all.
+_CODEX_SESSION_ENTRY_COLUMNS = frozenset({
+    "source_path",
+    "line_offset",
+    "timestamp_utc",
+    "session_id",
+    "model",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "account_key",
+})
+
+
+def validate_codex_cache_contract(tables: Mapping[str, set[str]]) -> None:
+    """Fail before planning if the Codex cost inputs the planner reads are gone."""
+    if "codex_session_entries" not in tables:
+        raise RederiveDataGap("missing cache.db table codex_session_entries")
+    missing = sorted(
+        _CODEX_SESSION_ENTRY_COLUMNS - set(tables["codex_session_entries"]))
+    if missing:
+        raise RederiveDataGap(
+            "missing cache.db codex_session_entries column(s): "
+            + ", ".join(missing)
         )
 
 
@@ -1272,7 +1312,7 @@ def _reconcile_snapshot_identities(
 
 def _preserve_reviewed_hold_dependencies(
     current: Mapping[str, Mapping], desired: dict[str, Mapping],
-    reviewed_weekly_hold_ids=(),
+    reviewed_weekly_hold_ids=(), historical_close_markers=None,
 ) -> None:
     """Keep frozen five-hour facts reached from exact reviewed holds.
 
@@ -1413,7 +1453,9 @@ def _preserve_reviewed_hold_dependencies(
 
     held_windows = set()
     for snapshot_id in snapshot_ids:
-        payload = (current.get(snapshot_id) or {}).get("payload") or {}
+        # #885: only final support may freeze a close. A current snapshot
+        # absent from this dependency-closed target is retired by this plan.
+        payload = (desired.get(snapshot_id) or {}).get("payload") or {}
         if payload.get("kind") != "snapshot_accept":
             continue
         account_key = payload.get("account_key")
@@ -1449,6 +1491,21 @@ def _preserve_reviewed_hold_dependencies(
                 merged_payload[field] = proposed_payload[field]
         merged = dict(record)
         merged["payload"] = merged_payload
+        marker = (historical_close_markers or {}).get(event_id)
+        if marker is not None and not _same_child_population(
+            payload, proposed_payload,
+        ):
+            # Hold merging must not hide a failed population proof from the
+            # close resolver. Leave the unmarked frozen fact uncertain.
+            historical_close_markers.pop(event_id, None)
+            marker = None
+        if (marker is not None and not payload.get("_pricing")
+                and payload.get("pricing_provenance_json") is None):
+            # #885: the proof already checked replay's retained population.
+            # Compose its marker with the hold's money-preserving weekly-axis
+            # correction now, rather than waiting for structure to match on
+            # the next invocation. The hold still keeps every monetary byte.
+            merged = _with_close_marker(merged, marker)
         desired[event_id] = merged
 
 
@@ -1602,6 +1659,7 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
     are decided by :func:`_resolve_closed_block_milestones` before the diff,
     the same way closes are decided before milestones."""
     conflicted_event_ids = frozenset(conflicted_event_ids or ())
+    historical_close_markers = dict(historical_close_markers or {})
     desired = _desired_by_id(desired_events)
     current = {
         event_id: selected.record
@@ -1615,7 +1673,7 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         snapshot_identity_decisions,
     )
     _preserve_reviewed_hold_dependencies(
-        current, desired, reviewed_weekly_hold_ids,
+        current, desired, reviewed_weekly_hold_ids, historical_close_markers,
     )
     retained_event_count = sum(
         1 for selected in selection.by_id.values()
@@ -1634,7 +1692,6 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         for kind in sorted(_EVT_CLASSIFICATIONS)
     }
     actions: list[PlanAction] = []
-    historical_close_markers = dict(historical_close_markers or {})
     drifted_close_ids: set = set()
 
     def _kind(record):
@@ -1855,8 +1912,8 @@ def _replaced_block_closure(
     current content, whatever its total), or a money-preserving correction.
     A tombstone carries no payload; its block is read from its current
     record. Only reviewed actions are ever added, each once. The reverse
-    direction, a causal close action whose milestones are identical in both
-    plans, is #883's.
+    direction also applies (#883): an included replacing close brings its
+    milestone actions, even when B and R make those actions identically.
     """
     def block(action):
         if action.disposition == "tombstone":
@@ -1902,7 +1959,7 @@ def _replaced_block_closure(
         replacing.pop(key, None)
     triggered = {
         block(action) for action in included
-        if action.kind == "five_hour_milestone"
+        if action.kind in {"five_hour_milestone", "five_hour_block_close"}
         and block(action) in replacing
     }
     if not triggered:
@@ -1923,6 +1980,152 @@ def _replaced_block_closure(
     return expanded
 
 
+def _monetary_chain_closure(
+    included: list, reviewed_actions, current_events: Mapping[str, Mapping],
+) -> list:
+    """#883: retain the reviewed final predecessor basis of causal marginals.
+
+    An action can change a row's occupied threshold, segment or block cost.
+    The nearest-lower threshold group is then a dependency of every present
+    marginal above it, in both the current and reviewed final populations.
+    Filtering can otherwise leave behind a retired or moved successor with
+    its old marginal. Changed rows entering or leaving either interval are
+    dependencies too: keeping one would select the wrong predecessor.
+    Include dependencies in both directions, even when a
+    successor needs no action itself. A marginal-only correction therefore
+    brings a changed predecessor, but cannot propagate through its unchanged
+    block cost to unrelated siblings. Null marginals have no monetary edge.
+
+    Only reviewed actions are added. Frozen crossing costs have already been
+    settled by the full planner, so closing these edges never reprices them.
+    """
+    final = dict(current_events)
+    for action in reviewed_actions:
+        if action.disposition == "tombstone":
+            final.pop(action.event_id, None)
+        else:
+            final[action.event_id] = {"payload": action.payload or {}}
+
+    def monetary_position(record):
+        payload = (record or {}).get("payload") or {}
+        if payload.get("kind") != "five_hour_milestone":
+            return None
+        threshold = _usable_threshold(payload.get("percent_threshold"))
+        if threshold is None:
+            return None
+        return (_milestone_segment_key(payload), threshold,
+                payload.get("block_cost_usd"))
+
+    changed = {
+        action.event_id for action in reviewed_actions
+        if action.kind == "five_hour_milestone"
+        and monetary_position(current_events.get(action.event_id))
+        != monetary_position(final.get(action.event_id))
+    }
+    if not changed:
+        return included
+    def occupied_thresholds(events, event_ids):
+        occupied: dict[tuple, dict[int, set[str]]] = {}
+        for event_id in event_ids:
+            position = monetary_position(events.get(event_id))
+            if position is not None:
+                segment, threshold, _cost = position
+                occupied.setdefault(segment, {}).setdefault(
+                    threshold, set()).add(event_id)
+        return occupied
+
+    edges: dict[str, set[str]] = {}
+    for population, other in ((final, current_events), (current_events, final)):
+        occupied = occupied_thresholds(population, population)
+        changed_other = occupied_thresholds(other, changed)
+        for event_id, record in population.items():
+            payload = record.get("payload") or {}
+            position = monetary_position(record)
+            if (position is None or payload.get("marginal_cost_usd") is None
+                    or not _usable_amount(payload.get("block_cost_usd"))):
+                continue
+            segment, threshold, _cost = position
+            lower = [value for value in occupied[segment] if value < threshold]
+            nearest = max(lower) if lower else None
+            dependencies = (
+                occupied[segment][nearest] & changed if nearest is not None
+                else set()
+            )
+            for prior_threshold, prior_ids in changed_other.get(segment, {}).items():
+                if (prior_threshold < threshold
+                        and (nearest is None or prior_threshold >= nearest)):
+                    dependencies.update(prior_ids)
+            if dependencies:
+                edges.setdefault(event_id, set()).update(dependencies)
+                for dependency_id in dependencies:
+                    edges.setdefault(dependency_id, set()).add(event_id)
+    # Retained rows participate as dependency nodes too, although there is no
+    # reviewed action to emit for them. Visit each monetary edge once rather
+    # than rescanning the full graph for every later threshold in a chain.
+    required_ids = {action.event_id for action in included}
+    pending = list(required_ids)
+    while pending:
+        event_id = pending.pop()
+        added = edges.get(event_id, set()) - required_ids
+        required_ids.update(added)
+        pending.extend(added)
+    return [action for action in reviewed_actions
+            if action.event_id in required_ids]
+
+
+def _causal_snapshot_closure(actions, reviewed_by_id, current_events):
+    """Close explicit references, keeping a selected dependency if needed."""
+    action_by_id = {action.event_id: action for action in actions}
+    dependency_tombstones = set()
+    for action in actions:
+        if (action.disposition == "tombstone"
+                or action.kind not in _SNAPSHOT_DEPENDENT_KINDS):
+            continue
+        for field, expected_kind in _milestone_dependencies(action.kind).items():
+            reference = (action.payload or {}).get(field)
+            if reference in _EMPTY_REFERENCE_SENTINELS:
+                continue
+            dependency_action = action_by_id.get(reference)
+            if (dependency_action is not None
+                    and dependency_action.disposition == "tombstone"):
+                current = current_events.get(reference)
+                if ((current or {}).get("payload") or {}).get("kind") \
+                        != expected_kind:
+                    raise RederiveConflict(
+                        "causal milestone dependency cannot be retained: "
+                        + action.event_id)
+                dependency_tombstones.add(reference)
+    actions = [action for action in actions
+               if action.event_id not in dependency_tombstones]
+    target_events = dict(current_events)
+    for action in actions:
+        if action.disposition == "tombstone":
+            target_events.pop(action.event_id, None)
+        else:
+            target_events[action.event_id] = {"payload": action.payload or {}}
+    # Appending to this list intentionally visits newly required dependencies.
+    for action in actions:
+        if (action.disposition == "tombstone"
+                or action.kind not in _SNAPSHOT_DEPENDENT_KINDS):
+            continue
+        for field, expected_kind in _milestone_dependencies(action.kind).items():
+            reference = (action.payload or {}).get(field)
+            if reference in _EMPTY_REFERENCE_SENTINELS:
+                continue
+            target = target_events.get(reference)
+            if ((target or {}).get("payload") or {}).get("kind") == expected_kind:
+                continue
+            dependency = reviewed_by_id.get(reference)
+            if (dependency is None or dependency.disposition == "tombstone"
+                    or dependency.kind != expected_kind
+                    or (dependency.payload or {}).get("kind") != expected_kind):
+                raise RederiveConflict(
+                    "causal milestone dependency is missing: " + action.event_id)
+            actions.append(dependency)
+            target_events[reference] = {"payload": dependency.payload or {}}
+    return actions
+
+
 def causal_delta_plan(
     baseline: RederivePlan, reviewed: RederivePlan, *,
     current_events: Mapping[str, Mapping],
@@ -1939,8 +2142,8 @@ def causal_delta_plan(
     #875 (spec §4.5): a five-hour block whose close R replaces, by §4.1's
     money rule, is applied whole whenever the subset changes one of its
     milestones, and a block R holds frozen never is; see
-    :func:`_replaced_block_closure`. The snapshot-dependency closure then runs
-    over that expanded set.
+    :func:`_replaced_block_closure`. Monetary predecessor/successor edges and
+    snapshot references are closed with it until the final graph stabilizes.
     """
     if (
         baseline.journal_high_water != reviewed.journal_high_water
@@ -1971,73 +2174,18 @@ def causal_delta_plan(
             )
         )
     ]
-    actions = _replaced_block_closure(
-        actions, reviewed.actions, current_events)
-    action_by_id = {action.event_id: action for action in actions}
-    dependency_tombstones = set()
-    for action in actions:
-        if (action.disposition == "tombstone"
-                or action.kind not in _SNAPSHOT_DEPENDENT_KINDS):
-            continue
-        payload = action.payload or {}
-        for field, expected_kind in _milestone_dependencies(
-            action.kind
-        ).items():
-            reference = payload.get(field)
-            if reference in _EMPTY_REFERENCE_SENTINELS:
-                continue
-            dependency_action = action_by_id.get(reference)
-            if (dependency_action is not None
-                    and dependency_action.disposition == "tombstone"):
-                current = current_events.get(reference)
-                if ((current or {}).get("payload") or {}).get("kind") \
-                        != expected_kind:
-                    raise RederiveConflict(
-                        "causal milestone dependency cannot be retained: "
-                        + action.event_id
-                    )
-                dependency_tombstones.add(reference)
-    if dependency_tombstones:
-        actions = [
-            action for action in actions
-            if action.event_id not in dependency_tombstones
-        ]
-
-    target_events = dict(current_events)
-    for action in actions:
-        if action.disposition == "tombstone":
-            target_events.pop(action.event_id, None)
-        else:
-            target_events[action.event_id] = {"payload": action.payload or {}}
-    for action in actions:
-        if (action.disposition == "tombstone"
-                or action.kind not in _SNAPSHOT_DEPENDENT_KINDS):
-            continue
-        payload = action.payload or {}
-        for field, expected_kind in _milestone_dependencies(
-            action.kind
-        ).items():
-            reference = payload.get(field)
-            if reference in _EMPTY_REFERENCE_SENTINELS:
-                continue
-            target = target_events.get(reference)
-            if ((target or {}).get("payload") or {}).get("kind") \
-                    != expected_kind:
-                dependency = reviewed_by_id.get(reference)
-                if (
-                    dependency is None
-                    or dependency.disposition == "tombstone"
-                    or dependency.kind != expected_kind
-                    or (dependency.payload or {}).get("kind") != expected_kind
-                ):
-                    raise RederiveConflict(
-                        "causal milestone dependency is missing: "
-                        + action.event_id
-                    )
-                actions.append(dependency)
-                target_events[reference] = {
-                    "payload": dependency.payload or {},
-                }
+    # Close block, monetary and explicit-reference edges to a fixed point.
+    # A dependency introduced by one phase must be seen by every other phase.
+    while True:
+        previous_ids = {action.event_id for action in actions}
+        actions = _replaced_block_closure(
+            actions, reviewed.actions, current_events)
+        actions = _monetary_chain_closure(
+            actions, reviewed.actions, current_events)
+        actions = _causal_snapshot_closure(
+            actions, reviewed_by_id, current_events)
+        if {action.event_id for action in actions} == previous_ids:
+            break
     included_ids = {action.event_id for action in actions}
     actions = tuple(
         action for action in reviewed.actions

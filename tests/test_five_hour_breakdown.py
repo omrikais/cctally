@@ -2750,6 +2750,15 @@ def test_835_r9_a_pre_column_store_resolves_the_capture_record(t1_store):
     raw = sqlite3.connect(_cctally_core.DB_PATH)
     raw.row_factory = sqlite3.Row
     try:
+        # #901 epoch 1017's current-week read indexes name the column, and
+        # SQLite refuses to drop a column an index still reads. A pre-column
+        # store has neither: `_apply_stats_read_indexes` creates an index only
+        # over columns that exist, so drop exactly the ones naming it.
+        for (name,) in raw.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'index' "
+                "AND tbl_name = 'weekly_usage_snapshots' "
+                "AND sql LIKE '%weekly_observation_held%'").fetchall():
+            raw.execute(f"DROP INDEX {name}")
         raw.execute("ALTER TABLE weekly_usage_snapshots "
                     "DROP COLUMN weekly_observation_held")
         raw.commit()

@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import { fulfilJson } from './utils';
+import { e2eRuntimePath, fulfilJson } from './utils';
 
 const MATRIX = [
   { width: 1440, height: 900 },
@@ -12,8 +12,9 @@ const FIXTURE = JSON.parse(readFileSync(
   'utf8',
 )) as Record<string, any>;
 
-const EVIDENCE_DIR = process.env.ISSUE_469_EVIDENCE_DIR
-  ?? 'e2e/.runtime/issue-469-evidence';
+const EVIDENCE_DIR = process.env.CCTALLY_E2E_SAFE_EVIDENCE === '1'
+  ? e2eRuntimePath('issue-469-evidence')
+  : process.env.ISSUE_469_EVIDENCE_DIR ?? e2eRuntimePath('issue-469-evidence');
 const PHASE = process.env.ISSUE_469_CAPTURE_PHASE ?? 'acceptance';
 
 async function installIdleTodayReport(page: Page) {

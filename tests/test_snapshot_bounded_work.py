@@ -770,6 +770,12 @@ def test_same_path_cache_replacement_cold_rebuilds_the_source_population(
     finally:
         replacement.close()
     cache.close()
+    # #901 W9 (Q14): this process keeps an idle keeper on the store it synced,
+    # so closing `cache` no longer folds the WAL into the main file. Replacing
+    # the main file alone would leave that WAL beside the new file; drain it
+    # first, as the last close used to.
+    import _lib_wal_checkpoint
+    _lib_wal_checkpoint.finalize()
     replacement_path.replace(live_path)
     replaced = sqlite3.connect(live_path)
     try:
@@ -848,32 +854,39 @@ def test_folded_codex_entries_are_safe_to_alias_between_parent_and_child(
 
 
 def test_the_doctor_quota_summary_reads_the_table_once(source_env):
-    ns, cache, stats, module = source_env
-    import _cctally_quota
+    """#901 W1: the latest read is one seek join against the maintained summary.
 
-    statements: list[str] = []
-    cache.set_trace_callback(statements.append)
-    try:
-        _cctally_quota.load_codex_quota_observations(
-            cache_conn=cache, latest_per_identity=True)
-    finally:
-        cache.set_trace_callback(None)
-
-    selects = [s for s in statements if "quota_window_snapshots" in s
-               and s.lstrip().upper().startswith("SELECT")]
-    assert len(selects) == 1, statements
-    sql = selects[0]
-    assert "_group_latest_capture" in sql
-    plan = " ".join(
-        str(row[3]) for row in cache.execute("EXPLAIN QUERY PLAN " + sql)
-    )
-    # One pass over the table. A correlated per-row maximum would visit it
-    # twice and turn an all-history summary quadratic. Matched on the plan
-    # VERBS, because the autoindex name also contains the table name.
+    Exactly one statement reads ``quota_window_snapshots``. It scans
+    ``codex_quota_partition_latest`` (one row per raw partition) and seeks
+    ``idx_qws_partition_capture`` once per partition for the rows tied at its
+    maximum second, with no sorter and no window over history. Matched on the
+    plan VERBS, because the index name also contains the table name.
+    """
     import re
+    import sqlite3
 
-    visits = re.findall(r"(?:SCAN|SEARCH) quota_window_snapshots\b", plan)
-    assert len(visits) == 1, plan
+    import _cctally_quota
+    import _sql_plan_guard as guard
+
+    ns, cache, stats, module = source_env
+    path = cache.execute("PRAGMA database_list").fetchone()[2]
+    with guard.capture_sql_plans() as recorder:
+        conn = sqlite3.connect(path)
+        try:
+            _cctally_quota.load_codex_quota_observations(
+                cache_conn=conn, latest_per_identity=True)
+        finally:
+            conn.close()
+    reads = [s for s in recorder.statements if "quota_window_snapshots" in s.sql]
+    assert len(reads) == 1, [s.sql for s in reads]
+    (read,) = reads
+    assert "FROM codex_quota_partition_latest AS s" in read.sql
+    assert "_group_latest_capture" not in read.sql
+    visits = [d for d in read.plan if re.match(r"(?:SCAN|SEARCH) q\b", d)]
+    assert len(visits) == 1 and "idx_qws_partition_capture" in visits[0], (
+        read.plan)
+    assert not any(marker in detail for detail in read.plan
+                   for marker in guard.TEMP_MARKERS), read.plan
 
 
 def test_one_bounded_quota_load_per_source_build(source_env, monkeypatch):
@@ -1734,15 +1747,22 @@ def test_the_cold_reset_covers_every_cache_the_build_checkpoints(source_env):
     """
     ns, cache, stats, module = source_env
     caches = module._codex_source_caches()
-    assert len(caches) == 11, caches
+    assert len(caches) == 12, caches
     assert module._CODEX_VISIBLE_POPULATION_CACHE in caches
     assert module._CODEX_ACCOUNT_CARD_TOTALS_CACHE in caches
+    # #872: the derived-layer coherence record is checkpointed with the
+    # caches it describes, and the quota memo stays first for the reset's
+    # `[1:]` slice.
+    assert module._CODEX_DERIVED_COHERENCE in caches
+    assert caches[0] is module._CODEX_QUOTA_OBSERVATION_CACHE
     module.build_codex_source_state(
         _context(module, cache, stats), data_version="warm")
     assert any(caches), "non-vacuity: a build must populate at least one cache"
     module.reset_codex_source_caches()
     assert not any(caches), (
         "reset_codex_source_caches left a checkpointed cache populated")
+    assert module._CODEX_DERIVED_COHERENCE.get("state") is None, (
+        "the coherence record survived the cold reset")
 
 
 def test_complete_source_accelerator_owner_bounds_the_entry_count(

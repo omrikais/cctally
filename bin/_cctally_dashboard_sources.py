@@ -2865,21 +2865,55 @@ def _codex_cache_report_wire(
     )
 
 
-#: Per-file terminal thread aliases, joined to their first accounting entry.
-#: The ``(source_root_key, source_path)`` join predicate needs the composite
-#: ``idx_codex_entries_root_path`` to stay linear: a single-column root index
-#: cannot discriminate when every rollout resolves to one provider root, so the
-#: join degenerates to files x entries. Module-level so the query-plan
-#: regression asserts THIS text rather than a copy that can drift from it.
+#: Per-file terminal thread aliases, each with its file's first accounting
+#: instant.
+#:
+#: #901 W2 (spec §5.2, T2). The pre-#901 form LEFT JOINed every accounting row
+#: and GROUPed the join back to one row per file, which needed two temp b-trees
+#: over the joined history (168 MB of temp-file writes per Codex-active build on
+#: the measured store). ``codex_session_files.path`` is the primary key, so the
+#: grouping only ever collapsed one file's joined rows; a correlated MIN per
+#: file answers the same question with one covering seek of
+#: ``idx_codex_entries_root_path_time``, and ``idx_codex_files_alias_recent``
+#: (partial on the same filter, in the final order) removes the sorter. A file
+#: with no accounting row still yields NULL, and the root qualification is
+#: unchanged. Module-level so the plan tests assert THIS text rather than a
+#: copy that can drift from it.
 _CODEX_FILE_ALIAS_SQL = (
     "SELECT f.source_root_key, f.path, f.last_native_thread_id, "
-    "f.last_session_id, MIN(e.timestamp_utc) "
+    "f.last_session_id, "
+    "(SELECT MIN(e.timestamp_utc) FROM codex_session_entries AS e "
+    "WHERE e.source_root_key=f.source_root_key AND e.source_path=f.path) "
     "FROM codex_session_files AS f "
-    "LEFT JOIN codex_session_entries AS e "
-    "ON e.source_root_key=f.source_root_key AND e.source_path=f.path "
     "WHERE f.last_native_thread_id IS NOT NULL AND f.last_native_thread_id != '' "
-    "GROUP BY f.source_root_key, f.path, f.last_native_thread_id, f.last_session_id "
     "ORDER BY f.last_ingested_at DESC, f.path DESC"
+)
+
+#: Conversation threads with their accounting session and first accounting
+#: instant (#901 W2, spec §5.2, T2).
+#:
+#: Two INDEPENDENT correlated lookups replace the pre-#901 ``WITH accounting``
+#: CTE, which grouped every accounting row (materialized, then probed through
+#: an automatic index, then sorted). The accounting session is the row with the
+#: minimum ``id`` (``idx_codex_entries_root_path``, whose trailing rowid makes it
+#: a seek) and ``started_at`` is the minimum ``timestamp_utc``
+#: (``idx_codex_entries_root_path_time``); they need not be the same row, which
+#: is exactly what the CTE's two independent minima computed.
+#: ``idx_codex_threads_recent`` serves the final order. A thread with no
+#: accounting rows still yields NULL for both.
+_CODEX_CONVERSATION_METADATA_CORE_SQL = (
+    "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
+    "(SELECT e.session_id FROM codex_session_entries AS e WHERE e.id = ("
+    "SELECT MIN(f.id) FROM codex_session_entries AS f "
+    "WHERE f.source_root_key=t.source_root_key AND f.source_path=t.source_path"
+    ")) AS accounting_session_id, "
+    "CAST(t.cwd AS BLOB) AS cwd_blob, "
+    "CAST(t.git_json AS BLOB) AS git_json_blob, "
+    "(SELECT MIN(s.timestamp_utc) FROM codex_session_entries AS s "
+    "WHERE s.source_root_key=t.source_root_key AND s.source_path=t.source_path"
+    ") AS started_at, t.last_seen_utc "
+    "FROM codex_conversation_threads AS t "
+    "ORDER BY t.last_seen_utc DESC, t.conversation_key DESC"
 )
 
 
@@ -3015,23 +3049,7 @@ def _codex_conversation_metadata(
     metadata: dict[tuple[str, str], dict[str, object]] = {}
     try:
         core_rows = tuple(cache_conn.execute(
-            "WITH accounting AS ("
-            " SELECT source_root_key, source_path, MIN(id) AS first_id,"
-            " MIN(timestamp_utc) AS started_at"
-            " FROM codex_session_entries"
-            " GROUP BY source_root_key, source_path"
-            ") "
-            "SELECT t.source_root_key, t.source_path, t.native_thread_id, "
-            "e.session_id AS accounting_session_id, "
-            "CAST(t.cwd AS BLOB) AS cwd_blob, "
-            "CAST(t.git_json AS BLOB) AS git_json_blob, "
-            "a.started_at, t.last_seen_utc "
-            "FROM codex_conversation_threads AS t "
-            "LEFT JOIN accounting AS a "
-            "ON a.source_root_key=t.source_root_key AND a.source_path=t.source_path "
-            "LEFT JOIN codex_session_entries AS e ON e.id=a.first_id "
-            "ORDER BY t.last_seen_utc DESC, t.conversation_key DESC"
-        ))
+            _CODEX_CONVERSATION_METADATA_CORE_SQL))
         from _cctally_cache import _codex_conversation_project_attribution
 
         def _attribution(root_key, cwd_blob, git_json_blob):
@@ -4535,6 +4553,28 @@ _CODEX_PROJECT_LABEL_CACHE: dict[object, dict[str, object]] = _ObservedDict()
 _CODEX_PROJECT_LABEL_ALGORITHM_VERSION = "collision-safe-labels-v1"
 
 
+def _codex_visible_population_name(
+    signature: tuple | None,
+    token: int | None,
+    visible_start: dt.datetime,
+) -> tuple | None:
+    """#872: the exact in-process name of one VISIBLE Codex population.
+
+    The carrier signature alone repeats across a cleared state (its
+    generation leg restarts at one, #857), and it names the CARRIER window,
+    which a configured budget widens below the visible lower bound. The
+    never-reused provenance token closes the first gap and the visible lower
+    bound the second. `None` — no signature (no ledger) or no token (metadata
+    incomplete) — names nothing, so it can be neither a hit nor a base.
+    """
+    if signature is None or token is None:
+        return None
+    return (
+        *signature, ("provenance", int(token)),
+        ("visible-start", visible_start),
+    )
+
+
 def _codex_project_label_signature(base: tuple | None) -> tuple | None:
     """Extend one accounting population name with the labelling algorithm's.
 
@@ -4553,6 +4593,9 @@ def _codex_project_label_signature(base: tuple | None) -> tuple | None:
 
 def _codex_project_population_signature() -> tuple | None:
     """The identity the project and label caches compare instead of scanning.
+
+    Test-facing since #872: a build names its population from its OWN capture
+    (`_codex_visible_population_name`), never from this process-wide reading.
 
     `None` means the accounting carrier could not establish an identity, and
     every consumer must then prove its hit the old way rather than assume one.
@@ -4722,124 +4765,41 @@ def _cached_projects_wire(
     semantic_signature: object,
     population_signature: tuple | None = None,
 ) -> dict[str, object]:
-    """Rebuild only project groups touched by accounting changes.
+    """Reuse the project wire only under a name that identifies the population.
 
-    The population half of the key is the accounting carrier's own signature
-    when it can name one, and the per-entry `(project_key, project_label)`
-    multiset only when it cannot. The multiset answered the same question by
-    visiting every row, which made the nominal reuse path proportional to the
-    whole population on every tick.
+    The name is `(semantic_signature, population_signature)`, where the
+    population half is the visible population's #872 name (provenance token
+    and visible start included). An equal name therefore means an unchanged
+    population, so a hit returns the retained value as it stands. A miss
+    rebuilds through `_projects_wire`, whose label cache advances by the delta
+    when G1 has kept the layer coherent. `None` names nothing: no reuse.
+
+    The former group splice applied a delta onto retained groups under a
+    matching key and read labels from the label cache's state. With a sound
+    name it was reachable only through a reused name or the signature-less
+    pair-set key, and there it raised or double-counted (#872 D3).
     """
     values = tuple(entries)
-    changed_old = tuple(changed_old)
-    changed_new = tuple(changed_new)
-    if population_signature is not None:
-        population_key: object = population_signature
-    else:
-        population_key = frozenset(
-            (str(entry.project_key), str(entry.project_label))
-            for entry in values
-        )
-    # `entries` is already the complete half-open population for the advancing
-    # upper bound.  A moving wall clock is therefore not an aggregation
-    # semantic: `build_cached_codex_accounting` emits newly-visible rows in the
-    # delta when its upper bound advances.  Keeping `accounting_end` here made
-    # every live dirty tick discard every project group before that delta could
-    # be spliced.
-    signature = (semantic_signature, population_key, context.range_start)
-    state = _CODEX_PROJECT_WIRE_CACHE.get(cache_key)
-    if state is None or state[0] != signature:
-        value = _projects_wire(
+    if population_signature is None:
+        _CODEX_PROJECT_WIRE_CACHE.pop(cache_key, None)
+        return _projects_wire(
             context, quota_observations, values,
             accounting_end=accounting_end, cache_key=cache_key,
-            population_signature=population_signature,
+            population_signature=None,
             changed_old=changed_old, changed_new=changed_new,
         )
-        groups: dict[tuple[str, str], list[object]] = {}
-        for entry in values:
-            groups.setdefault(
-                (str(entry.source_root_key), str(entry.project_key)), [],
-            ).append(entry)
-        _CODEX_PROJECT_WIRE_CACHE[cache_key] = (
-            signature, value,
-            {key: tuple(group) for key, group in groups.items()},
-        )
-        return value
-
-    _CODEX_PROJECT_WIRE_CACHE.touch(cache_key)
-    affected = {
-        (str(entry.source_root_key), str(entry.project_key))
-        for entry in (*changed_old, *changed_new)
-    }
-    if not affected:
+    signature = (semantic_signature, population_signature)
+    state = _CODEX_PROJECT_WIRE_CACHE.get(cache_key)
+    if state is not None and state[0] == signature:
+        _CODEX_PROJECT_WIRE_CACHE.touch(cache_key)
         return state[1]
-    label_state = _CODEX_PROJECT_LABEL_CACHE.get(cache_key) or {}
-    labels = label_state.get("labels") or {}
-    old_ids = {
-        int(getattr(entry, "cache_entry_id", 0) or 0)
-        for entry in changed_old
-    }
-    groups = dict(state[2])
-    for key in affected:
-        groups[key] = tuple(
-            entry for entry in groups.get(key, ())
-            if int(getattr(entry, "cache_entry_id", 0) or 0) not in old_ids
-        )
-    for entry in changed_new:
-        key = (str(entry.source_root_key), str(entry.project_key))
-        groups[key] = (*groups.get(key, ()), entry)
-    for key in affected:
-        if groups.get(key):
-            groups[key] = tuple(sorted(
-                groups[key], key=_codex_incremental_entry_order,
-            ))
-        else:
-            groups.pop(key, None)
-    partial_entries = tuple(
-        replace(entry, display_label=labels[str(entry.project_key)])
-        for key in sorted(affected) for entry in groups.get(key, ())
+    value = _projects_wire(
+        context, quota_observations, values,
+        accounting_end=accounting_end, cache_key=cache_key,
+        population_signature=population_signature,
+        changed_old=changed_old, changed_new=changed_new,
     )
-    result = build_codex_project_result(
-        partial_entries,
-        range_start=context.range_start,
-        range_end=accounting_end,
-        as_of=context.now_utc,
-    )
-    partial_rows = () if result.data is None else tuple({
-        "key": dashboard_resource_key("project", "codex", row.project_key),
-        "source": "codex",
-        "label": row.display_label,
-        "session_count": row.session_count,
-        "first_seen": row.first_seen.astimezone(UTC).isoformat(),
-        "last_seen": row.last_seen.astimezone(UTC).isoformat(),
-        "cost_usd": row.totals.cost_usd,
-        "input_tokens": row.totals.input_tokens,
-        "cached_input_tokens": row.totals.cached_input_tokens,
-        "output_tokens": row.totals.output_tokens,
-        "reasoning_output_tokens": row.totals.reasoning_output_tokens,
-        "total_tokens": row.totals.total_tokens,
-    } for row in result.data.projects)
-    affected_keys = {
-        dashboard_resource_key("project", "codex", project_key)
-        for _root_key, project_key in affected
-    }
-    rows = tuple(sorted(
-        (
-            *(row for row in state[1]["rows"] if row["key"] not in affected_keys),
-            *partial_rows,
-        ),
-        key=lambda row: (
-            float(row["cost_usd"]), str(row["label"]), str(row["key"]),
-        ),
-        reverse=True,
-    ))
-    value = {
-        "rows": rows,
-        "total_cost_usd": stable_sum(
-            float(row["cost_usd"]) for row in rows),
-        "total_tokens": sum(int(row["total_tokens"]) for row in rows),
-    }
-    _CODEX_PROJECT_WIRE_CACHE[cache_key] = (signature, value, groups)
+    _CODEX_PROJECT_WIRE_CACHE[cache_key] = (signature, value)
     return value
 
 
@@ -5648,6 +5608,12 @@ def _codex_fold_visible_rows(
 
 
 _CODEX_VISIBLE_POPULATION_MAX_BYTES = 128 * 1024 * 1024
+#: #872 (review F7): every per-account visible version comes from this
+#: allocator, which nothing rewinds. `_CODEX_ACCOUNT_CARD_TOTALS_CACHE` keys
+#: card totals on these versions, and the two caches are evicted
+#: independently; a reconstruction that restarted at one would re-issue a
+#: version a surviving card-total entry still holds and serve its old spend.
+_CODEX_VISIBLE_ACCOUNT_VERSIONS = itertools.count(1)
 _CODEX_VISIBLE_POPULATION_CACHE: dict[str, object] = _ObservedDict()
 _CODEX_ACCOUNT_CARD_TOTALS_MAX_BYTES = 256 * 1024
 _CODEX_ACCOUNT_CARD_TOTAL_ESTIMATED_BYTES = 1024
@@ -5780,7 +5746,9 @@ def _cached_codex_visible_rows(
             "entries_by_id": entry_by_id,
             "rows_by_account": dict(rows_by_account),
             "entries_by_account": dict(entries_by_account),
-            "account_versions": {key: 1 for key in rows_by_account},
+            "account_versions": {
+                key: next(_CODEX_VISIBLE_ACCOUNT_VERSIONS)
+                for key in rows_by_account},
             "estimated_bytes": estimated_bytes,
             "entry_count": len(rows),
             "account_count": len(rows_by_account),
@@ -5848,7 +5816,7 @@ def _cached_codex_visible_rows(
         else:
             rows_by_account.pop(key, None)
             entries_by_account.pop(key, None)
-        account_versions[key] = int(account_versions.get(key, 0)) + 1
+        account_versions[key] = next(_CODEX_VISIBLE_ACCOUNT_VERSIONS)
 
     try:
         entries = tuple(
@@ -5895,13 +5863,59 @@ _CODEX_ACCOUNT_SCOPE_CACHE: dict[
 ] = _ObservedDict()
 
 
-def reset_codex_account_scope_cache() -> None:
-    """Test/process reset for #582's immutable finalized account scopes."""
+@dataclass(frozen=True)
+class _CodexDerivedCoherence:
+    """#872: the population every delta-advanced derived Codex cache reflects.
+
+    `name` is the visible-population name the whole derived layer was last
+    advanced to, or `None` when that cannot be stated; `account_keys` is
+    every account whose per-account derived state was built since the last
+    discard. ONE immutable value under ONE key, so the two are written,
+    journaled, charged and evicted together and can never disagree.
+    """
+
+    name: tuple | None
+    account_keys: frozenset
+
+
+_CODEX_DERIVED_COHERENCE_KEY = "state"
+_CODEX_DERIVED_COHERENCE: dict[str, _CodexDerivedCoherence] = _ObservedDict()
+
+
+def _codex_derived_coherence() -> _CodexDerivedCoherence:
+    """The current record; an absent or evicted slot names nothing."""
+    record = _CODEX_DERIVED_COHERENCE.get(_CODEX_DERIVED_COHERENCE_KEY)
+    if isinstance(record, _CodexDerivedCoherence):
+        return record
+    return _CodexDerivedCoherence(None, frozenset())
+
+
+def reset_codex_account_scope_cache(*, keep_counters: bool = False) -> None:
+    """Discard every delta-advanced derived Codex cache and the #872 record.
+
+    The complete derived reset: a test/process reset, the metadata-incomplete
+    fold's reset, and — with `keep_counters=True` — #872's G1 discard, which
+    runs in production on every base mismatch. G1 must not zero the
+    cumulative fallback counters `bin/cctally-snapshot-measure` reads (the
+    card-totals fallbacks and the visible population's `fallback_count`), so
+    it keeps them; the caches themselves are discarded either way.
+    """
     global _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS
+    visible_fallbacks = int(
+        _CODEX_VISIBLE_POPULATION_CACHE.get("fallback_count", 0) or 0)
     _CODEX_ACCOUNT_SCOPE_CACHE.clear()
     _CODEX_VISIBLE_POPULATION_CACHE.clear()
+    if keep_counters and visible_fallbacks:
+        # The over-size shape `_cached_codex_visible_rows` already writes:
+        # counters only, nothing reusable.
+        _CODEX_VISIBLE_POPULATION_CACHE.update({
+            "fallback_count": visible_fallbacks,
+            "estimated_bytes": 0,
+            "entry_count": 0,
+        })
     _CODEX_ACCOUNT_CARD_TOTALS_CACHE.clear()
-    _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 0
+    if not keep_counters:
+        _CODEX_ACCOUNT_CARD_TOTALS_FALLBACKS = 0
     _CODEX_ENTRY_ADAPTER_CACHE.clear()
     _CODEX_PROJECT_LABEL_CACHE.clear()
     _CODEX_PERIOD_VIEW_CACHE.clear()
@@ -5909,6 +5923,7 @@ def reset_codex_account_scope_cache() -> None:
     _CODEX_CACHE_REPORT_ROWS.clear()
     _CODEX_SESSION_VIEW_CACHE.clear()
     _CODEX_PROJECT_WIRE_CACHE.clear()
+    _CODEX_DERIVED_COHERENCE.clear()
 
 
 def _codex_account_scopes_wire(
@@ -6494,6 +6509,7 @@ def _codex_source_caches() -> tuple[dict, ...]:
         _CODEX_ACCOUNT_CARD_TOTALS_CACHE,
         _CODEX_WEEKLY_VIEW_CACHE,
         _CODEX_ACCOUNT_SCOPE_CACHE,
+        _CODEX_DERIVED_COHERENCE,
     )
 
 
@@ -6525,7 +6541,7 @@ def _codex_source_caches() -> tuple[dict, ...]:
 # incremental byte estimate of its own, and a second charge computed here would
 # be the same number derived twice. Those readers are named beside the owner.
 #
-# WHAT THE TOTAL IS, AND WHAT IT IS NOT. It is the sum of eleven DECLARED
+# WHAT THE TOTAL IS, AND WHAT IT IS NOT. It is the sum of twelve DECLARED
 # CHARGES. It is not a measurement of process memory, and
 # `_CODEX_SOURCE_ACCELERATOR_MAX_BYTES` is not a cap on process memory: it is a
 # budget over these charges, and the charges depart from the retained graph in
@@ -6553,8 +6569,8 @@ def _codex_source_caches() -> tuple[dict, ...]:
 # `tests/test_source_cache_ownership.py` holds the WALKED owners to a two-sided
 # band against one walk of their own cache — the upper half is what caught the
 # adapter walking its row's strings once per row — while asserting only the
-# upper bound for the four closed-form owners and asserting that the
-# closed-form set is exactly the four named here.
+# upper bound for the three closed-form owners and asserting that the
+# closed-form set is exactly the three named here.
 
 
 def _is_codex_accounting_row(obj) -> bool:
@@ -6626,23 +6642,13 @@ def _charge_project_label_entry(_key, value) -> int:
 
 
 def _charge_project_wire_entry(_key, value) -> int:
-    """`(signature, wire, groups)` — the wire is owned, the groups are shells.
-
-    `groups` maps a project identity to a tuple of BORROWED accounting rows.
-    Its own charge is the mapping plus one tuple shell per project, which is
-    constant in the number of projects; descending into the tuples to ask about
-    each row would make an ordinary tick proportional to the whole population
-    again, which is the cost this tranche exists to remove.
-    """
-    signature, wire, groups = value[0], value[1], value[2]
-    total = sys.getsizeof(value)
-    total += retained_size_bytes(
-        signature, borrowed=_is_borrowed_codex_payload)
-    total += retained_size_bytes(wire, borrowed=_is_borrowed_codex_payload)
-    total += sys.getsizeof(groups)
-    for key, group in groups.items():
-        total += sys.getsizeof(key) + sys.getsizeof(group)
-    return total
+    """`(signature, wire)` — both owned; borrowed payloads are excluded."""
+    signature, wire = value[0], value[1]
+    return (
+        sys.getsizeof(value)
+        + retained_size_bytes(signature, borrowed=_is_borrowed_codex_payload)
+        + retained_size_bytes(wire, borrowed=_is_borrowed_codex_payload)
+    )
 
 
 #: How faithfully each owner's declared charge tracks what one walk of that
@@ -6652,9 +6658,9 @@ def _charge_project_wire_entry(_key, value) -> int:
 #: formula that DELIBERATELY UNDERSTATES, with no stated bound on the gap; the
 #: value beside the name is why that trade was taken.
 #:
-#: The budget is compared against a sum that includes the four closed-form
+#: The budget is compared against a sum that includes the three closed-form
 #: owners, so the budget is a heuristic over declared charges rather than a cap
-#: on memory. Adding a fifth closed-form owner without adding it here is a
+#: on memory. Adding a fourth closed-form owner without adding it here is a
 #: test failure, which is the only reason this constant exists.
 CODEX_SOURCE_CHARGE_FIDELITY = MappingProxyType({
     "quota_observations": "walked",
@@ -6666,10 +6672,7 @@ CODEX_SOURCE_CHARGE_FIDELITY = MappingProxyType({
         "string each, because a labelled copy is `replace(row, "
         "display_label=...)` and every other field is the borrowed row's own "
         "object"),
-    "project_wire": (
-        "closed-form: the group containers, never the borrowed rows inside "
-        "them, because descending into them makes an ordinary tick "
-        "proportional to the whole population"),
+    "project_wire": "walked",
     "entry_adapters": (
         "closed-form: two object shells and one float, because the adapted "
         "entry shares every string with the row beside it and walking it "
@@ -6681,6 +6684,7 @@ CODEX_SOURCE_CHARGE_FIDELITY = MappingProxyType({
     "account_card_totals": "walked",
     "weekly_views": "walked",
     "account_scopes": "walked",
+    "derived_coherence": "walked",
 })
 
 
@@ -6834,8 +6838,9 @@ def _declare_codex_source_cache_owners() -> tuple[_CodexCacheOwner, ...]:
         _CodexCacheOwner(
             "project_wire", _CODEX_PROJECT_WIRE_CACHE,
             _charge_project_wire_entry, None,
-            owns="the rendered project wire and the group container shells",
-            borrows="the accounting rows inside those groups",
+            owns="the rendered project wire and the population name it was "
+                 "built for (#872 removed the retained group splice)",
+            borrows="nothing; borrowed payloads are excluded from its charge",
         ),
         _CodexCacheOwner(
             "entry_adapters", _CODEX_ENTRY_ADAPTER_CACHE,
@@ -6872,6 +6877,13 @@ def _declare_codex_source_cache_owners() -> tuple[_CodexCacheOwner, ...]:
             owns="the finalized per-account scope mappings",
             borrows="accounting rows and adapted entries",
         ),
+        _CodexCacheOwner(
+            "derived_coherence", _CODEX_DERIVED_COHERENCE,
+            _charge_borrowing_payloads, None,
+            owns="the one immutable record naming the population every "
+                 "delta-advanced derived cache reflects",
+            borrows="nothing",
+        ),
     )
     caches = _codex_source_caches()
     if tuple(owner.cache for owner in owners) != caches:
@@ -6888,10 +6900,10 @@ _CODEX_SOURCE_CACHE_OWNERS = _declare_codex_source_cache_owners()
 
 
 def codex_source_retained_bytes() -> int:
-    """The eleven Codex source caches' DECLARED CHARGES, summed.
+    """The twelve Codex source caches' DECLARED CHARGES, summed.
 
     Read it as "what these caches say they cost", not as "how much memory
-    these caches hold". FOUR of the eleven are charged in closed form and
+    these caches hold". THREE of the twelve are charged in closed form and
     understate without a stated bound — see `CODEX_SOURCE_CHARGE_FIDELITY` —
     so this figure is the input to a heuristic budget rather than a
     measurement of the retained graph.
@@ -6907,8 +6919,8 @@ def codex_source_retained_bytes() -> int:
 
 
 #: The budget the declared charges are held to. NOT a bound on process memory:
-#: it is compared against `codex_source_retained_bytes()`, four of whose
-#: eleven terms are closed-form under-charges with no stated bound on the gap.
+#: it is compared against `codex_source_retained_bytes()`, three of whose
+#: twelve terms are closed-form under-charges with no stated bound on the gap.
 #: See `CODEX_SOURCE_CHARGE_FIDELITY`.
 _CODEX_SOURCE_ACCELERATOR_MAX_BYTES = 768 * 1024 * 1024
 _CODEX_SOURCE_ACCELERATOR_MAX_ENTRIES = 500_000
@@ -6995,15 +7007,16 @@ def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
 
     Returns `(evicted_entries, saw_an_indivisible_oversized_bucket)`.
 
-    Ten of the eleven caches are already keyed by stable semantic units —
+    Eleven of the twelve caches are keyed by stable semantic units —
     `("account", key)`, `("parent",)`, a project identity, a session identity,
-    a physical row id — so those keys ARE the buckets and no new partition is
-    needed. The eleventh is declared indivisible and is evicted whole; see
+    a physical row id, the #872 coherence record's single key — so those keys
+    ARE the buckets and no new partition is needed. The visible population is
+    declared indivisible and is evicted whole; see
     `CODEX_VISIBLE_POPULATION_INDIVISIBLE_REASON`.
 
     Cold buckets go first and everything else stays resident, which is what
     makes an above-cap steady state rebuild only what it lost. Clearing all
-    eleven caches, which is what this replaced, made a population permanently
+    the caches, which is what this replaced, made a population permanently
     above a cap rebuild and discard on every generation: measured on the sealed
     #786 v3 `current` corpus, one run cleared 222,932 entries at a stroke.
 
@@ -7022,7 +7035,7 @@ def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
     # budget leaves the next build one entry over it again, and every tick then
     # pays the candidate build below over every resident key — 222,932 of them
     # on the measurement corpus. Freeing headroom instead lets the early return
-    # above answer the next several ticks for eleven integer reads.
+    # above answer the next several ticks for twelve integer reads.
     if count >= int(_CODEX_SOURCE_ACCELERATOR_LOW_WATER_MIN_ENTRIES):
         low_water = min(
             budget, int(budget * _CODEX_SOURCE_ACCELERATOR_LOW_WATER))
@@ -7058,7 +7071,7 @@ def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
             # proportional to the whole population. Together they mean the
             # owner with the largest under-charge is also the last one this
             # pass will ever reach, so freeing memory by lowering the budget
-            # acts on the other ten owners first.
+            # acts on the other eleven owners first.
             candidates.append((
                 max(recency for recency, _key, _bytes in entries),
                 index, position, _CACHE_MISSING, owner.retained_bytes(),
@@ -7102,7 +7115,7 @@ def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
             continue
         evicted += removed
         count -= removed
-        # Re-read ONE owner rather than summing all eleven after every single
+        # Re-read ONE owner rather than summing all twelve after every single
         # eviction. A charged owner's total moves by exactly this bucket, and a
         # self-reported one answers for itself; either way the arithmetic below
         # is checked against a full re-read once, after the loop.
@@ -7127,17 +7140,17 @@ def _evict_codex_source_buckets(caches) -> tuple[int, bool]:
 def enforce_codex_source_accelerator_bounds() -> None:
     """Apply byte and entry admission from the incrementally maintained total.
 
-    The byte total is a sum of eleven integers each owner keeps current, so
+    The byte total is a sum of twelve integers each owner keeps current, so
     admission is a read. It used to be a background traversal of two full
     container copies of the whole cache set, once per generation, in a worker
     limited to a quarter of one core — which on the measurement corpus never
     finished a generation at all, so the caches were admitted against a byte
     figure that stayed at zero until the walk finally returned the over-budget
-    sentinel and cleared all eleven at once.
+    sentinel and cleared every cache at once.
 
     Publication is unconditional now rather than gated on the dirty flag,
     because there is nothing left to schedule: an unchanged generation costs
-    the same eleven reads and publishes the same number.
+    the same twelve reads and publishes the same number.
     """
     caches = _codex_source_caches()
     global _CODEX_SOURCE_ACCELERATOR_ESTIMATED_BYTES
@@ -7271,7 +7284,7 @@ _CODEX_SOURCE_PUBLISH_LOCK = threading.Lock()
 
 
 class _CodexSourceBuildOverlay:
-    """One build's tentative generation over the eleven source caches.
+    """One build's tentative generation over the twelve source caches.
 
     THE JOURNAL IS THE OVERLAY. Rather than hold changed keys in a separate
     mapping every read would have to consult, each mutation records the key's
@@ -7463,6 +7476,11 @@ class _CodexAccountingCapture:
     #: qualified accounting read: such a generation names no population, and
     #: borrowing the process's current token would name one it never read.
     provenance_token: int | None = None
+    #: #872: the name of the population this capture's delta is relative to,
+    #: from the accounting result (`None` on a cold result and whenever the
+    #: capture bypassed the qualified read, exactly like the fields above).
+    base_population_signature: tuple | None = None
+    base_provenance_token: int | None = None
 
 
 #: The detail routes' horizon: one year ending at the generation instant. The
@@ -7556,6 +7574,9 @@ def _capture_codex_accounting(
     population_signature: tuple | None = None
     # #857: set only by a qualified read that returned; every bypass keeps it.
     provenance_token: int | None = None
+    # #872: the delta's base, under the same rule.
+    base_population_signature: tuple | None = None
+    base_provenance_token: int | None = None
 
     def fallback_entries() -> tuple[object, ...]:
         nonlocal metadata_read_failed, failed_legs
@@ -7625,6 +7646,9 @@ def _capture_codex_accounting(
             changed_new = cached_accounting.changed_new
             population_signature = cached_accounting.population_signature
             provenance_token = cached_accounting.provenance_token
+            base_population_signature = (
+                cached_accounting.base_population_signature)
+            base_provenance_token = cached_accounting.base_provenance_token
             entries: tuple[object, ...] = qualified_entries
         except QualifiedMetadataUnavailable as exc:
             _lib_log.get_logger("dashboard").warning(
@@ -7671,6 +7695,10 @@ def _capture_codex_accounting(
             None if metadata_incomplete else population_signature),
         provenance_token=(
             None if metadata_incomplete else provenance_token),
+        base_population_signature=(
+            None if metadata_incomplete else base_population_signature),
+        base_provenance_token=(
+            None if metadata_incomplete else base_provenance_token),
     )
 
 
@@ -7797,7 +7825,7 @@ def _drop_codex_source_generation(
     builds and replaying it would overwrite whatever the other build
     legitimately published.
 
-    ALL ELEVEN CACHES GO, not only the ones this build wrote to, and that is a
+    ALL TWELVE CACHES GO, not only the ones this build wrote to, and that is a
     correctness requirement rather than caution. Ten of them are fed by the
     accounting carrier's DELTA lists, not by its population: a build hands
     `_cached_codex_period_view` and its siblings `changed_old` and
@@ -8320,6 +8348,23 @@ def _build_codex_source_state(
     accounting_changed_new = accounting_capture.changed_new
     accounting_entries = accounting_capture.entries
     metadata_incomplete = accounting_capture.metadata_incomplete
+    # #872 G1: a delta reaches the derived layer only while the layer's
+    # coherence record names the delta's BASE. A cold carrier result has no
+    # base, and a record that names anything else — an overflow-cleared or
+    # reset carrier, a moved visible start, a skipped generation, a vanished
+    # account — means the retained state is not what the delta is relative
+    # to. Every delta-advanced derived cache is then discarded, and each
+    # consumer derives from the full population through its own cold path.
+    derived_base_name = _codex_visible_population_name(
+        accounting_capture.base_population_signature,
+        accounting_capture.base_provenance_token, context.range_start)
+    derived_current_name = _codex_visible_population_name(
+        accounting_capture.population_signature,
+        accounting_capture.provenance_token, context.range_start)
+    prior_coherence = _codex_derived_coherence()
+    if derived_base_name is None or prior_coherence.name != derived_base_name:
+        reset_codex_account_scope_cache(keep_counters=True)
+        prior_coherence = _CodexDerivedCoherence(None, frozenset())
 
     conversation_metadata_read = (
         capture.conversation_metadata
@@ -8557,24 +8602,13 @@ def _build_codex_source_state(
     period_signature = _codex_accounting_period_signature(
         context.cache_conn, context.range_start, metadata_incomplete,
     )
-    # The accounting carrier's own exact name for the population these domains
-    # are built from. The project and label caches compare it instead of
-    # scanning every row to prove a hit; `None` means it could not establish
-    # one, and they then prove the hit the old way.
-    # Taken from THIS build's own accounting capture where there is one, and
-    # only re-read from the process-wide module global on the uncaptured path.
-    # See `_CodexAccountingCapture.population_signature`.
-    if capture is not None:
-        project_population_signature = (
-            None if metadata_incomplete
-            else _codex_project_label_signature(
-                capture.accounting.population_signature)
-        )
-    else:
-        project_population_signature = (
-            None if metadata_incomplete
-            else _codex_project_population_signature()
-        )
+    # The project caches' name for this build's population: the visible
+    # population name G1 computed from THIS build's own capture (sound across
+    # a cleared carrier and a moved visible start, #872), plus the label
+    # algorithm version. `None` when the population cannot be named, and then
+    # nothing is reused. See `_CodexAccountingCapture.population_signature`.
+    project_population_signature = _codex_project_label_signature(
+        derived_current_name)
     daily = _cached_codex_period_view(
         entries, changed_old=changed_old_entries,
         changed_new=changed_new_entries, kind="daily", cache_key=("parent",),
@@ -8796,6 +8830,8 @@ def _build_codex_source_state(
     hero_cycles_wire: list[dict[str, object]] = []
     combined_accounting: dict[str, object] | None = None
     account_scopes: dict[str, dict[str, object]] = {}
+    # #872 G2 input: whether the per-account scopes were built this build.
+    account_scope_status = "not-built"
     # #556 S5 §3.8: bound OUTSIDE the try, because the degrade path below has to
     # be able to clear it, and the retained `clock_data` reads it either way.
     budget_events_by_account: dict[str, tuple[tuple[dt.datetime, float], ...]] = {}
@@ -8941,6 +8977,7 @@ def _build_codex_source_state(
                 scope_signature=period_signature,
                 project_population_signature=project_population_signature,
             )
+            account_scope_status = "built"
             # #416 QA P1-A — the "All accounts" Blocks panel is the UNION of
             # every account's 5-hour blocks. `_quota_wire` filters
             # `str(root_key) not in cycle.source_root_keys` against a single
@@ -8997,6 +9034,7 @@ def _build_codex_source_state(
             ))
             quota = {**quota, "blocks": merged_blocks}
         except (sqlite3.Error, QualifiedMetadataUnavailable):
+            account_scope_status = "degraded"
             # A per-account wire failure must never fail the whole source build;
             # degrade to the byte-stable undecorated shape.
             accounts_wire = []
@@ -9129,6 +9167,31 @@ def _build_codex_source_state(
                         {name: operands[name] for name in _HERO_CARD_OPERANDS
                          if name in operands}
                     )
+    # #872 G2: the record advances to this build's population only when the
+    # build advanced EVERY delta-advanced consumer over the capture's whole
+    # delta. Completeness is stated positively: metadata complete and not
+    # transient (a transient generation skips both project legs), scopes not
+    # degraded, and every account that holds per-account state still live
+    # (an account that left the live set kept a stale state the delta never
+    # reached). Anything else records `None`, so the next build's G1 discards.
+    scope_keys = frozenset(str(key) for key in account_scopes)
+    coherent = (
+        derived_current_name is not None
+        and not metadata_incomplete
+        and not metadata_transient
+        and account_scope_status != "degraded"
+        and prior_coherence.account_keys <= scope_keys
+    )
+    record = _CodexDerivedCoherence(
+        name=derived_current_name if coherent else None,
+        account_keys=prior_coherence.account_keys | scope_keys,
+    )
+    if _CODEX_DERIVED_COHERENCE.get(_CODEX_DERIVED_COHERENCE_KEY) == record:
+        # Unchanged (a warm-clean tick on the same ledger head): say it was
+        # used without rewriting it, so an idle tick dirties nothing.
+        _CODEX_DERIVED_COHERENCE.touch(_CODEX_DERIVED_COHERENCE_KEY)
+    else:
+        _CODEX_DERIVED_COHERENCE[_CODEX_DERIVED_COHERENCE_KEY] = record
     return SourceDashboardState(
         source="codex",
         availability=availability,

@@ -441,6 +441,14 @@ class DoctorState:
     # known file-level backup/sync root. Only provider/status are retained so
     # reports never expose the machine-specific data path.
     backup_sync_state: Optional[dict] = None
+    # #901: transcript-store page size, so `db.conversations_reclaimable`
+    # judges the paced-reclaim thresholds on observed bytes.
+    conversations_db_page_size: Optional[int] = None
+    # #901 §5.6: running dashboards' write telemetry, gathered read-only —
+    # the local instance's own snapshot in the dashboard process, or
+    # descriptor discovery plus one bounded loopback probe per live
+    # instance elsewhere. {"mode", "instances": [...]}; None = not gathered.
+    dashboard_disk_writes: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1011,7 +1019,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1016
+            epoch = 1017
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -2916,90 +2924,117 @@ def _check_db_reclaimable(s: DoctorState) -> CheckResult:
 
 
 def _check_db_conversations_reclaimable(s: DoctorState) -> CheckResult:
-    """Surface transcript-store free pages without mutating the DB (#320)."""
+    """Transcript free space against the paced-reclaim policy (#320, #780,
+    #901). Read-only; judged on the OBSERVED freelist, never on a record.
+
+    OK for retained slack below the reclaim start threshold — reusable pages
+    kept on purpose (operator decision Q2). WARN for an eligible backlog being
+    paced, including one whose attempts are failing (`reclaim_failure`); a
+    scheduled wait is not "stuck". FAIL at the hard ceiling, where transcript
+    rebuilds are refused."""
+    import _lib_conversation_retention as _conv_retention
+
     page_count = s.conversations_db_page_count
     freelist_count = s.conversations_db_freelist_count
-    ratio = None
-    if (
-        isinstance(page_count, int)
-        and not isinstance(page_count, bool)
-        and page_count > 0
-        and isinstance(freelist_count, int)
-        and not isinstance(freelist_count, bool)
+    page_size = s.conversations_db_page_size
+    measured = (
+        all(isinstance(v, int) and not isinstance(v, bool)
+            for v in (page_count, freelist_count, page_size))
+        and page_count > 0 and page_size > 0
         and 0 <= freelist_count <= page_count
-    ):
-        ratio = freelist_count / page_count
+    )
+    geometry = (
+        _conv_retention.StoreGeometry(page_count, freelist_count, page_size)
+        if measured else None)
+    record = (s.conversations_reclaim_pending
+              if isinstance(s.conversations_reclaim_pending, dict) else None)
+    episode = bool(record and record.get("eligible") is True)
+    failure = record.get("last_failure") if record else None
+    if not isinstance(failure, dict):
+        failure = None
+    free_bytes = geometry.free_bytes if geometry is not None else None
     details = {
         "conversations_db_page_count": page_count,
         "conversations_db_freelist_count": freelist_count,
-        "conversations_db_free_ratio": ratio,
-        "warn_ratio": DOCTOR_RECLAIMABLE_WARN_RATIO,
+        "conversations_db_page_size": page_size,
+        "conversations_db_free_ratio": (
+            freelist_count / page_count if geometry is not None else None),
+        "reclaimable_bytes": free_bytes,
+        "reclaim_start_bytes": _conv_retention.RECLAIM_START_BYTES,
+        "reclaim_start_ratio": _conv_retention.RECLAIM_START_RATIO,
+        "reclaim_stop_bytes": _conv_retention.RECLAIM_STOP_BYTES,
+        "reclaim_stop_ratio": _conv_retention.RECLAIM_STOP_RATIO,
+        "reclaim_ceiling_bytes": _conv_retention.RECLAIM_CEILING_BYTES,
+        "reclaim_episode_active": episode if record is not None else None,
+        "reclaim_failure": failure,
     }
-    # #780: the reclaim backlog rides on this check rather than adding a new
-    # check id, and it contributes NOTHING — no detail key, no severity change
-    # — on a store with no pending record. That is every store that has never
-    # fallen behind, so an install in the ordinary state renders exactly what
-    # it rendered before.
-    pending = s.conversations_reclaim_pending
-    if pending:
-        import _lib_conversation_retention as _conv_retention
-
-        backlog = _conv_retention.reclaim_backlog_bytes(pending)
-        details["reclaim_pending"] = pending
-        details["reclaim_backlog_bytes"] = backlog
-        details["reclaim_ceiling_bytes"] = _conv_retention.RECLAIM_CEILING_BYTES
-        if _conv_retention.reclaim_backlog_over_ceiling(pending):
-            return CheckResult(
-                id="db.conversations_reclaimable",
-                title="Reclaimable transcript space",
-                severity="fail",
-                summary=(
-                    f"reclaim backlog {_gib_text(backlog)} is at or over the "
-                    f"{_gib_text(_conv_retention.RECLAIM_CEILING_BYTES)} "
-                    "ceiling; transcript rebuilds are refused"
-                ),
-                remediation=(
-                    "Run `cctally db vacuum --db conversations` to drain the "
-                    "backlog, then `cctally db checkpoint --db conversations`."
-                ),
-                details=details,
-            )
-        if _conv_retention.reclaim_backlog_escalated(pending):
-            return CheckResult(
-                id="db.conversations_reclaimable",
-                title="Reclaimable transcript space",
-                severity="warn",
-                summary=(
-                    f"reclaim backlog {_gib_text(backlog)} is draining across "
-                    "continuation passes"
-                ),
-                remediation=(
-                    "No action is required unless it keeps growing; "
-                    "`cctally db vacuum --db conversations` drains it now."
-                ),
-                details=details,
-            )
-    if ratio is not None and ratio >= DOCTOR_RECLAIMABLE_WARN_RATIO:
+    title = "Reclaimable transcript space"
+    if _conv_retention.backlog_over_ceiling(free_bytes):
         return CheckResult(
-            id="db.conversations_reclaimable",
-            title="Reclaimable transcript space",
-            severity="warn",
+            id="db.conversations_reclaimable", title=title, severity="fail",
             summary=(
-                f"high — {ratio * 100:.1f}% of conversations.db pages are free"
+                f"reclaim backlog {_gib_text(free_bytes)} is at or over the "
+                f"{_gib_text(_conv_retention.RECLAIM_CEILING_BYTES)} "
+                "ceiling; transcript rebuilds are refused"
             ),
             remediation=(
-                "Run `cctally db vacuum --db conversations` to reclaim disk space."
+                "Run `cctally db vacuum --db conversations` to drain the "
+                "backlog, then `cctally db checkpoint --db conversations`."
             ),
             details=details,
         )
+    if _conv_retention.reclaim_episode_active(geometry, episode):
+        # Q9: a paced wait is not a refused attempt. A planner refusal is an
+        # in-memory pass record of the running dashboard (it writes nothing
+        # durable), read from `writeIo.reclaimRefusal`; a connection-settings
+        # or SQLite failure stays the durable `reclaim_failure`, as before.
+        refusal = _latest_reclaim_refusal(s.dashboard_disk_writes)
+        wait = ("refused" if refusal is not None
+                else "failing" if failure is not None else "paced")
+        remediation = (
+            "No action is required unless it keeps growing; "
+            "`cctally db vacuum --db conversations` drains it now.")
+        if refusal is not None:
+            remediation = (
+                "Reclaim attempts are being refused "
+                f"({refusal['reason'].replace('_', ' ')}); "
+                "`cctally db vacuum --db conversations` reclaims the space "
+                "at once.")
+        return CheckResult(
+            id="db.conversations_reclaimable", title=title, severity="warn",
+            summary=(
+                f"Reclaiming {_gib_text(free_bytes)} of free transcript "
+                "space at a paced rate."
+            ),
+            remediation=remediation,
+            details={**details, "reclaim_wait": wait,
+                     "reclaim_refusal": refusal},
+        )
     return CheckResult(
-        id="db.conversations_reclaimable",
-        title="Reclaimable transcript space",
-        severity="ok",
-        summary="below threshold",
-        remediation=None,
-        details=details,
+        id="db.conversations_reclaimable", title=title, severity="ok",
+        summary="below threshold", remediation=None, details=details,
     )
+
+
+def _latest_reclaim_refusal(gathered) -> "dict | None":
+    """The newest planner refusal any running dashboard reports in its
+    `writeIo.reclaimRefusal`, with that dashboard's port; None when none
+    does (or no dashboard runs)."""
+    latest = None
+    entries = gathered.get("instances") if isinstance(gathered, dict) else None
+    for entry in entries or ():
+        if not isinstance(entry, dict) or entry.get("probe") != "ok":
+            continue
+        refusal = (entry.get("write_io") or {}).get("reclaimRefusal")
+        if (not isinstance(refusal, dict)
+                or not isinstance(refusal.get("reason"), str)
+                or not isinstance(refusal.get("at"), str)):
+            continue
+        candidate = {"reason": refusal["reason"], "at": refusal["at"],
+                     "port": entry.get("port")}
+        if latest is None or candidate["at"] > latest["at"]:
+            latest = candidate
+    return latest
 
 
 #: A stuck reclaim entry has persisted past this, so no pass will clear it.
@@ -4149,6 +4184,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
     ("telemetry", "Telemetry", (
         ("telemetry.state", "_check_telemetry"),
     )),
+    # #901 §5.6. Never FAILs, so `doctor`'s exit code is unaffected. Last, so
+    # every existing check keeps its order.
+    ("performance", "Performance", (
+        ("performance.dashboard_disk_writes",
+         "_check_performance_dashboard_disk_writes"),
+    )),
 )
 
 
@@ -4320,6 +4361,159 @@ def _check_quota_meter_drift(s: DoctorState) -> CheckResult:
         remediation=remediation,
         details=details,
     )
+
+
+_DISK_WRITES_ID = "performance.dashboard_disk_writes"
+_DISK_WRITES_TITLE = "Dashboard disk writes"
+_DISK_WRITES_REMEDIATION = (
+    "Run `cctally dashboard-perf` for the breakdown, and report it if it "
+    "persists."
+)
+
+
+def _words(reason) -> str:
+    return str(reason or "unavailable").replace("_", " ")
+
+
+#: PR-9: probe failures doctor cannot overcome from here (it sends no token
+#: and probes over loopback only), each with its sentence fragment.
+_NOT_MEASURABLE_FROM_HERE = {
+    "authentication_required": "needs its access token",
+    "not_loopback_reachable": "is not reachable over loopback",
+}
+
+
+def _check_performance_dashboard_disk_writes(s: DoctorState) -> CheckResult:
+    """Running dashboards' disk writes against the write budget, and
+    transcript maintenance against its allowance (#901 §5.6, §5.7).
+
+    WARN when a measured running dashboard is over budget, when a live
+    instance cannot supply valid telemetry, or when the durable maintenance
+    ledger is over its allowance (so that leg needs no running dashboard).
+    OK otherwise: none running, within budget, a statistic that has no
+    verdict yet (named by its reason), a dashboard doctor cannot measure from
+    here (a token-mode or non-loopback bind), or a platform with no counter.
+    Never FAIL."""
+    import _lib_write_budget as wb
+
+    gathered = (s.dashboard_disk_writes
+                if isinstance(s.dashboard_disk_writes, dict)
+                else {"mode": "error", "instances": []})
+    record = (s.conversations_reclaim_pending
+              if isinstance(s.conversations_reclaim_pending, dict) else {})
+    maintenance = wb.maintenance_statistic(record.get("ledger"), s.now_utc)
+    rows, over, cannot, within, warming, platform = [], [], [], [], [], []
+    unmeasured = []
+    for entry in gathered.get("instances") or ():
+        if not isinstance(entry, dict):
+            continue
+        port = entry.get("port")
+        write_io = entry.get("write_io") if entry.get("probe") == "ok" else None
+        budget = (write_io or {}).get("budget") or {}
+        if write_io is None:
+            verdict, reason = "unavailable", entry.get("reason") or "unreachable"
+            if reason in _NOT_MEASURABLE_FROM_HERE:
+                # PR-9: doctor sends no token and probes over loopback only,
+                # so these never answer it: a note, not a warning.
+                unmeasured.append((port, reason))
+            else:
+                cannot.append((port, reason))
+        elif write_io.get("status") != "ok":
+            verdict = "unavailable"
+            reason = write_io.get("reason") or "counter_error"
+            if reason == "unsupported_platform":
+                platform.append((port, reason))
+            else:
+                cannot.append((port, reason))
+        else:
+            verdict, reason = budget.get("verdict"), None
+            if verdict == "over":
+                over.append((port, write_io, budget))
+            elif verdict == "ok":
+                within.append((port, write_io))
+            else:
+                verdict = "insufficient"
+                reason = (budget.get("reasons") or ["warming_up"])[0]
+                warming.append((port, reason))
+        rows.append({
+            "instance_id": entry.get("instance_id"),
+            "port": port,
+            "pid": entry.get("pid"),
+            "verdict": verdict,
+            "reason": reason,
+            "bytes_per_minute": (write_io or {}).get("bytesPerMinute"),
+            "mean_bytes_per_publication": (write_io or {}).get(
+                "meanBytesPerTick"),
+            "bytes_per_minute_limit": budget.get("bytesPerMinuteLimit"),
+            "mean_bytes_per_publication_limit": budget.get(
+                "meanBytesPerTickLimit"),
+        })
+    rows.sort(key=lambda row: (row["port"] is None, row["port"] or 0))
+    details = {
+        "policy_version": wb.POLICY_VERSION,
+        "mode": gathered.get("mode"),
+        "instances": rows,
+        "maintenance": maintenance.as_details(),
+    }
+    warn = []
+    for port, write_io, budget in sorted(over, key=lambda item: item[0] or 0):
+        reasons = budget.get("reasons") or []
+        if ("publication_over_limit" in reasons
+                and "rate_over_limit" not in reasons):
+            warn.append(
+                f"The running dashboard (port {port}) is writing "
+                f"{wb.format_mib(write_io.get('meanBytesPerTick') or 0)} per "
+                f"publication, over its "
+                f"{wb.format_mib(budget.get('meanBytesPerTickLimit') or 0)} "
+                f"per publication budget.")
+        else:
+            warn.append(
+                f"The running dashboard (port {port}) is writing "
+                f"{wb.format_mib(write_io.get('bytesPerMinute') or 0)}/min, "
+                f"over its "
+                f"{wb.format_mib(budget.get('bytesPerMinuteLimit') or 0)}/min "
+                f"budget.")
+    for port, reason in sorted(cannot, key=lambda item: item[0] or 0):
+        warn.append(f"The running dashboard (port {port}) cannot report its "
+                    f"disk writes ({_words(reason)}).")
+    if maintenance.verdict == "over":
+        warn.append(
+            f"Transcript maintenance was charged "
+            f"{wb.format_size(maintenance.charged_bytes)} over the last "
+            f"{wb.format_window_hm(maintenance.window_minutes)}, over its "
+            f"{wb.format_size(maintenance.allowance_bytes)} allowance.")
+    if warn:
+        return CheckResult(
+            id=_DISK_WRITES_ID, title=_DISK_WRITES_TITLE, severity="warn",
+            summary=" ".join(warn), remediation=_DISK_WRITES_REMEDIATION,
+            details=details)
+    if within:
+        port, write_io = sorted(within, key=lambda item: item[0] or 0)[0]
+        summary = (f"Within budget: "
+                   f"{wb.format_mib(write_io.get('bytesPerMinute') or 0)}/min "
+                   f"over the last 5 minutes.")
+    elif warming:
+        # PR-8: the first instance's own reason; only `warming_up` is
+        # "no samples yet".
+        _port, reason = sorted(warming, key=lambda item: item[0] or 0)[0]
+        summary = f"Disk writes: {wb.statistic_reason_phrase(reason)}."
+    elif unmeasured:
+        port, reason = sorted(unmeasured, key=lambda item: item[0] or 0)[0]
+        summary = (f"Disk writes: the dashboard on port {port} "
+                   f"{_NOT_MEASURABLE_FROM_HERE[reason]}, so it is not "
+                   "measured from here.")
+    elif platform:
+        summary = f"Disk writes: unavailable ({_words(platform[0][1])})."
+    elif gathered.get("mode") == "error":
+        summary = "Disk writes: unavailable (gather failed)."
+    elif gathered.get("mode") == "not_probed":
+        summary = ("Disk writes: not measured here; run `cctally doctor` to "
+                   "check running dashboards.")
+    else:
+        summary = "No dashboard is running."
+    return CheckResult(
+        id=_DISK_WRITES_ID, title=_DISK_WRITES_TITLE, severity="ok",
+        summary=summary, remediation=None, details=details)
 
 
 def _evaluate_one(check_id: str, check_fn_name: str,

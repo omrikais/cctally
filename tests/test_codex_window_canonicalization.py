@@ -1098,9 +1098,10 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     transactional debounce state. #769 S2 advances to 1014 for the
     source-local five-hour credit confirmation state, and #769 S11 advances to
     1015 for `weekly_usage_snapshots.weekly_observation_held`, and #869 advances
-    to 1016 for `five_hour_blocks.pricing_provenance_json`."""
+    to 1016 for `five_hour_blocks.pricing_provenance_json`, and #901 advances
+    to 1017 for read indexes."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1016
+    assert _cctally_core.STATS_INDEX_EPOCH == 1017
 
 
 # --------------------------------------------------------------------------

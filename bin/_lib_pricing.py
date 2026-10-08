@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import math
 import re
 import sys
 from typing import Any
@@ -29,6 +30,34 @@ def _eprint(*args: Any) -> None:
 
 
 TIERED_THRESHOLD = 200_000
+
+# #929: Claude Haiku 5.5 is priced by prompt length. A card that declares
+# `whole_request_prompt_threshold_tokens` selects ONE card per request from its
+# prompt (input + flat cache creation + cache read): over the threshold every
+# class of that request, output included, bills at the `_above_100k_tokens`
+# rates. This is a different mechanism from the per-class MARGINAL
+# `_above_200k_tokens` split older Sonnet cards carry, and a card never mixes
+# the two. A legacy card carries neither the marker nor any 100K field.
+CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY = "whole_request_prompt_threshold_tokens"
+CLAUDE_WHOLE_REQUEST_THRESHOLD = 100_000
+CLAUDE_WHOLE_REQUEST_TIER_FIELDS = (
+    ("input_cost_per_token", "input_cost_per_token_above_100k_tokens"),
+    ("output_cost_per_token", "output_cost_per_token_above_100k_tokens"),
+    ("cache_creation_input_token_cost",
+     "cache_creation_input_token_cost_above_100k_tokens"),
+    ("cache_read_input_token_cost",
+     "cache_read_input_token_cost_above_100k_tokens"),
+)
+CLAUDE_WHOLE_REQUEST_TIER_SUFFIX = "_above_100k_tokens"
+# The marker plus the four recognised tier fields. A card sharing none of them
+# is legacy; the hot path decides that with one `isdisjoint` call. A card that
+# carries some OTHER `_above_100k_tokens` field is malformed: the selector
+# refuses it when the card is otherwise whole-request, and
+# `check_table_shapes` refuses it on any card (`claude_whole_request_
+# declaration_problems`), so it can never silently price at the base card.
+_CLAUDE_WHOLE_REQUEST_KEYS = frozenset(
+    (CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY,
+     *(tier for _, tier in CLAUDE_WHOLE_REQUEST_TIER_FIELDS)))
 
 
 def _chip_for_model(name: str) -> str:
@@ -63,7 +92,7 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-09-30"
+PRICING_SNAPSHOT_DATE = "2026-10-07"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -516,6 +545,21 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "output_cost_per_token": 5e-06,
         "cache_creation_input_token_cost": 1.25e-06,
         "cache_read_input_token_cost": 1e-07,
+    },
+    "claude-haiku-5-5": {
+        # Source: https://platform.claude.com/docs/en/models/haiku-5-5/overview
+        # Priced by prompt length (#929): over 100,000 prompt tokens the WHOLE
+        # request bills at the _above_100k_tokens card. The 1h write stays
+        # derived (selected input x CACHE_WRITE_1H_MULTIPLIER).
+        "input_cost_per_token": 1e-07,
+        "output_cost_per_token": 5e-07,
+        "cache_creation_input_token_cost": 1.25e-07,
+        "cache_read_input_token_cost": 1e-08,
+        "input_cost_per_token_above_100k_tokens": 5e-07,
+        "output_cost_per_token_above_100k_tokens": 2.5e-06,
+        "cache_creation_input_token_cost_above_100k_tokens": 6.25e-07,
+        "cache_read_input_token_cost_above_100k_tokens": 5e-08,
+        "whole_request_prompt_threshold_tokens": 100_000,
     },
     "claude-mythos-5": {
         "input_cost_per_token": 1e-05,
@@ -1274,6 +1318,118 @@ def claude_usage_dict(*, cache_1h_tokens, speed, input_tokens=0, output_tokens=0
     return usage
 
 
+def _finite_positive_rate(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def _is_whole_request_card(card) -> bool:
+    """True when ``card`` declares (or half-declares) a whole-request tier:
+    it carries the marker or one of the four recognised tier fields. This is
+    on every Claude request's pricing path, so it is one set operation; the
+    scan for unrecognised ``_above_100k_tokens`` fields lives in
+    ``claude_whole_request_declaration_problems``."""
+    return not _CLAUDE_WHOLE_REQUEST_KEYS.isdisjoint(card)
+
+
+def _unrecognised_whole_request_fields(card) -> list:
+    return sorted(k for k in card
+                  if k.endswith(CLAUDE_WHOLE_REQUEST_TIER_SUFFIX)
+                  and k not in _CLAUDE_WHOLE_REQUEST_KEYS)
+
+
+def claude_whole_request_declaration_problems(card) -> list:
+    """Every reason ``card``'s whole-request declaration is malformed (#929).
+
+    ``[]`` for a legacy card (neither the marker nor any
+    ``_above_100k_tokens`` field) and for a well-formed declaration. Shared by
+    the selector and ``check_table_shapes`` so the two can never disagree
+    about what is well formed. Any ``_above_100k_tokens`` field other than the
+    four recognised ones is a problem, with or without the marker.
+    """
+    unrecognised = _unrecognised_whole_request_fields(card)
+    if not unrecognised and not _is_whole_request_card(card):
+        return []
+    problems = []
+    key = CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY
+    threshold = card.get(key)
+    if key not in card:
+        problems.append(f"missing {key}")
+    elif (isinstance(threshold, bool) or not isinstance(threshold, int)
+          or threshold != CLAUDE_WHOLE_REQUEST_THRESHOLD):
+        problems.append(
+            f"{key} must be the integer {CLAUDE_WHOLE_REQUEST_THRESHOLD} the "
+            f"_above_100k_tokens fields name (got {threshold!r})")
+    for _, tier in CLAUDE_WHOLE_REQUEST_TIER_FIELDS:
+        if tier not in card:
+            problems.append(f"missing {tier}")
+        elif not _finite_positive_rate(card[tier]):
+            problems.append(
+                f"{tier} not a finite positive number ({card[tier]!r})")
+    mixed = sorted(k for k in card if k.endswith("_above_200k_tokens"))
+    if mixed:
+        problems.append("mixes whole-request and marginal tiers: "
+                        + ", ".join(mixed))
+    if unrecognised:
+        problems.append("unrecognised _above_100k_tokens fields: "
+                        + ", ".join(unrecognised))
+    return problems
+
+
+def _select_claude_request_card(card, *, input_tokens, cache_creation_tokens,
+                                cache_read_tokens, prompt_tokens_for_tier=None):
+    """The card that prices ONE request (#929). Pure: never writes ``card``.
+
+    A legacy card (neither the marker nor any of the four recognised tier
+    fields) is returned unchanged (the same object) without reading a count.
+    A whole-request card must be well formed, which includes carrying no
+    unrecognised ``_above_100k_tokens`` field, or this raises
+    ``ValueError``. Its prompt is ``prompt_tokens_for_tier`` when given (a
+    caller pricing a synthetic subset of a real request), else input + FLAT
+    cache creation + cache read; output and the 1h sub-split never count. At or
+    under the threshold the stored card itself is returned; over it, a NEW dict
+    whose four base slots hold the higher rates and which carries neither the
+    marker nor any tier field.
+    """
+    if not _is_whole_request_card(card):
+        return card
+    problems = claude_whole_request_declaration_problems(card)
+    if problems:
+        raise ValueError("malformed whole-request pricing declaration: "
+                         + "; ".join(problems))
+    if prompt_tokens_for_tier is None:
+        prompt = ((input_tokens or 0) + (cache_creation_tokens or 0)
+                  + (cache_read_tokens or 0))
+    else:
+        prompt = prompt_tokens_for_tier
+    if prompt <= card[CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY]:
+        return card
+    # No marker and no `_above_100k_tokens` field survives into the selected
+    # card (a well-formed card carries no unrecognised one, but the filter
+    # does not rely on that).
+    selected = {k: v for k, v in card.items()
+                if k != CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY
+                and not k.endswith(CLAUDE_WHOLE_REQUEST_TIER_SUFFIX)}
+    for base, tier in CLAUDE_WHOLE_REQUEST_TIER_FIELDS:
+        selected[base] = card[tier]
+    return selected
+
+
+def _whole_request_cache_create_cost(card, flat, h_raw) -> float:
+    """Cache-creation USD on a whole-request card: direct flat arithmetic
+    (#929 spec §5), never the legacy 200K band partition, which is not
+    float-identical to it."""
+    if flat <= 0:
+        return 0.0
+    rate_5m = card.get("cache_creation_input_token_cost", 0.0)
+    h = 0 if h_raw is None else max(0, min(int(h_raw), flat))
+    if h == 0:
+        return flat * rate_5m
+    rate_1h = (card.get("input_cost_per_token", 0.0)
+               * current_pricing_snapshot().cache_write_1h_multiplier)
+    return (flat - h) * rate_5m + h * rate_1h
+
+
 def _cache_create_cost(pricing: dict, flat: int, h_raw, tiered) -> float:
     """USD for one entry's cache-CREATION tokens, priced by TTL (#195).
 
@@ -1320,8 +1476,15 @@ def _calculate_entry_cost(
     usage: dict[str, Any],
     mode: str = "auto",
     cost_usd: float | None = None,
+    *,
+    prompt_tokens_for_tier: int | None = None,
 ) -> float:
-    """Calculate USD cost for a single API call entry."""
+    """Calculate USD cost for a single API call entry.
+
+    ``prompt_tokens_for_tier`` only feeds whole-request card selection (#929):
+    a caller pricing a synthetic subset of a real request passes that
+    request's real prompt total so the subset bills at the request's card.
+    """
     if mode == "display":
         return cost_usd if cost_usd is not None else 0.0
     if mode == "auto" and cost_usd is not None:
@@ -1330,6 +1493,18 @@ def _calculate_entry_cost(
     pricing = _resolve_model_pricing(model)
     if pricing is None:
         return 0.0
+    # #929: a whole-request card selects ONE card for this request. A legacy
+    # card skips selection entirely and runs the pre-#929 expressions below
+    # byte-for-byte (the selector would return it unchanged anyway).
+    whole_request = _is_whole_request_card(pricing)
+    if whole_request:
+        pricing = _select_claude_request_card(
+            pricing,
+            input_tokens=usage.get("input_tokens", 0),
+            cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+            prompt_tokens_for_tier=prompt_tokens_for_tier,
+        )
 
     def _tiered(tokens: int, base_key: str, tiered_key: str) -> float:
         base_rate = pricing.get(base_key, 0.0)
@@ -1361,12 +1536,22 @@ def _calculate_entry_cost(
     # arithmetic or comparison, and the `h_raw` side does its own `int()`
     # inside the clamp (which IS load-bearing there: `min(int(h_raw), flat)`
     # is what pins the 1h portion to whole tokens).
-    cache_create_cost = _cache_create_cost(
-        pricing,
-        usage.get("cache_creation_input_tokens", 0),
-        usage.get("cache_creation_1h_input_tokens"),
-        _tiered,
-    )
+    if not whole_request:
+        cache_create_cost = _cache_create_cost(
+            pricing,
+            usage.get("cache_creation_input_tokens", 0),
+            usage.get("cache_creation_1h_input_tokens"),
+            _tiered,
+        )
+    else:
+        # The selected card has no `_above_200k_tokens` key, so `_tiered`
+        # prices input, output and cache read as tokens x selected rate; cache
+        # creation takes the direct flat form, not the 200K band partition.
+        cache_create_cost = _whole_request_cache_create_cost(
+            pricing,
+            usage.get("cache_creation_input_tokens", 0),
+            usage.get("cache_creation_1h_input_tokens"),
+        )
     cache_read_cost = _tiered(
         usage.get("cache_read_input_tokens", 0),
         "cache_read_input_token_cost",

@@ -153,18 +153,45 @@ _QUALIFIED_CODEX_ENTRIES_SQL = """
 
 
 def _qualified_codex_path_entries_sql(identity_count: int) -> str:
-    """Return the qualified read constrained to physical cache identities."""
+    """Return the qualified read constrained to physical cache identities.
+
+    Unordered: ``_load_qualified_codex_rows`` orders its rows (#901
+    Amendment 19 T1). Seeking ``idx_codex_entries_root_path`` cannot also
+    deliver the window read's order, so the old ``ORDER BY`` sorted every
+    entry of the dirty rollouts through a temp b-tree, and one rollout file is
+    not a bound.
+    """
     predicates = " OR ".join(
         "(entries.source_root_key = ? AND entries.source_path = ?)"
         for _ in range(identity_count)
     )
-    return _QUALIFIED_CODEX_ENTRIES_SQL.replace(
+    head, order_by, _tail = _QUALIFIED_CODEX_ENTRIES_SQL.partition(
+        "     ORDER BY entries.timestamp_utc ASC")
+    if not order_by:
+        raise RuntimeError(
+            "_QUALIFIED_CODEX_ENTRIES_SQL no longer carries its ORDER BY")
+    return head.replace(
         "INDEXED BY idx_codex_entries_ts_root_conversation",
         "INDEXED BY idx_codex_entries_root_path",
-    ).replace(
-        "     ORDER BY entries.timestamp_utc ASC",
-        f"       AND ({predicates})\n     ORDER BY entries.timestamp_utc ASC",
-    )
+    ) + f"       AND ({predicates})\n"
+
+
+def _qualified_codex_row_order(row) -> tuple:
+    """The window read's ``ORDER BY entries.timestamp_utc,
+    entries.source_root_key, entries.conversation_key, entries.id`` as a Python
+    key: NULL first, text by UTF-8 bytes (SQLite's BINARY collation). ``id``
+    is unique, so the order is total."""
+    def collate(value):
+        if value is None:
+            return (0, b"")
+        if isinstance(value, str):
+            return (2, value.encode("utf-8"))
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return (3, bytes(value))
+        return (1, value)
+
+    return (collate(row[0]), collate(row[3]), collate(row[4]),
+            collate(row[16]))
 
 
 #: The thread leg of the decode inventory (§4.3 item 1). ``{threads}`` is the
@@ -1184,6 +1211,32 @@ def _require_joined_metadata(row: sqlite3.Row) -> tuple[str, str]:
     return root_key, conversation_key
 
 
+def _load_qualified_codex_rows(
+    conn: sqlite3.Connection, start: dt.datetime, end: dt.datetime,
+    identities: "tuple[tuple[str, str], ...] | None",
+) -> tuple:
+    """The qualified accounting rows of ``[start, end)``, in
+    ``(timestamp_utc, source_root_key, conversation_key, id)`` order: the whole
+    window, or only the given dirty ``(root, path)`` identities.
+
+    The window read streams in that order from
+    ``idx_codex_entries_ts_root_conversation``. The dirty-path read seeks
+    ``idx_codex_entries_root_path`` instead and is ordered here, in Python, over
+    the rows it returns whole anyway (#901 Amendment 19 T1); the rows keep the
+    connection's row factory.
+    """
+    params: tuple[object, ...] = (
+        start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(),
+        *(value for identity in (identities or ()) for value in identity),
+    )
+    if identities is None:
+        return tuple(conn.execute(_QUALIFIED_CODEX_ENTRIES_SQL, params))
+    rows = conn.execute(
+        _qualified_codex_path_entries_sql(len(identities)), params).fetchall()
+    rows.sort(key=_qualified_codex_row_order)
+    return tuple(rows)
+
+
 def load_qualified_codex_entries(
     start: dt.datetime,
     end: dt.datetime,
@@ -1241,15 +1294,7 @@ def load_qualified_codex_entries(
             if stats.lock_contended:
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
         conn.row_factory = sqlite3.Row
-        sql = (
-            _QUALIFIED_CODEX_ENTRIES_SQL if identities is None
-            else _qualified_codex_path_entries_sql(len(identities))
-        )
-        params: tuple[object, ...] = (
-            start.astimezone(UTC).isoformat(), end.astimezone(UTC).isoformat(),
-            *(value for identity in (identities or ()) for value in identity),
-        )
-        rows = tuple(conn.execute(sql, params))
+        rows = _load_qualified_codex_rows(conn, start, end, identities)
         # §4.3: one inventory read per build. The caller supplies the build's
         # own inventory when it has one; its alias leg is unbounded, which is a
         # SUPERSET of the `paths=identities` leg this read would have loaded,

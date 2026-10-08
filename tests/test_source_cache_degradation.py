@@ -196,6 +196,16 @@ def test_the_coldest_bucket_is_evicted_first_across_owners(env, monkeypatch):
     """
     _ns, cache, stats, module = env
     module.reset_codex_source_caches()
+    # #872 G1: the first build after a reset gets a COLD accounting result,
+    # which has no base, so it discards every delta-advanced derived cache —
+    # an entry planted outside a build included. Warm the layer first, so the
+    # build below is an ordinary warm tick that keeps the planted bucket.
+    module.build_codex_source_state(
+        _context(module, cache, stats), data_version="eviction-warmup")
+    # A warm tick re-adapts nothing it already holds, so the warm-up's adapter
+    # entries would be older than the bucket planted next. Start the adapters
+    # fresh so that bucket is the genuinely coldest entry in the process.
+    module._CODEX_ENTRY_ADAPTER_CACHE.clear()
 
     # Coldest: written first, never read again.
     module._CODEX_PERIOD_VIEW_CACHE["stale-period"] = ("payload",) * 8
@@ -213,11 +223,33 @@ def test_the_coldest_bucket_is_evicted_first_across_owners(env, monkeypatch):
     assert module._CODEX_VISIBLE_POPULATION_CACHE.get("signature") is not None, (
         "non-vacuity: the build must have retained a visible population")
 
+    # Recency is read BEFORE `_eviction_order`, which empties what it measures.
+    # The indivisible owner has no per-key stamp here, so it is absent from
+    # this map and can never pass as "older" below.
+    recency = {
+        (owner.name, key): int(owner.cache._cache_entry_recency.get(key, 0))
+        for owner in module._CODEX_SOURCE_CACHE_OWNERS
+        for key in owner.cache
+        if hasattr(owner.cache, "_cache_entry_recency")
+        and owner.name != "visible_population"
+    }
     order = _eviction_order(module)
     assert order, "non-vacuity: something must be evictable"
-    first_owner, first_key = order[0]
-    assert (first_owner, first_key) == ("period_views", "stale-period"), (
-        f"the coldest bucket must be evicted first; order was {order[:4]}")
+    stale = ("period_views", "stale-period")
+    assert stale in order, "non-vacuity: the planted bucket must be evictable"
+    # #872: a warm tick legitimately leaves untouched what it does not read (a
+    # wire hit never reads the label state), so such buckets can be older than
+    # the planted one. The rule is recency: nothing NEWER than the planted
+    # bucket may be evicted ahead of it.
+    ahead = order[: order.index(stale)]
+    assert recency[stale] > 0, "the planted bucket was never stamped"
+    assert all(
+        entry in recency and 0 < recency[entry] < recency[stale]
+        for entry in ahead
+    ), f"a bucket newer than the coldest planted one went first; order was {order[:6]}"
+    assert {name for name, _key in ahead} <= {"project_labels"}, (
+        "only the label state, which a wire hit never reads, may be older "
+        f"than the planted bucket; order was {order[:6]}")
 
     positions: dict[str, int] = {}
     for index, (name, _key) in enumerate(order):
@@ -596,12 +628,9 @@ def test_a_population_signature_miss_publishes_identical_envelope_bytes(env):
 
     The miss is forced the way production forces one — by regressing the
     accounting ledger head, which is what a rebuilt store looks like and what
-    `build_cached_codex_accounting` answers with a cold reconstruction. That
-    reconstruction reports the PRIOR population as `changed_old` and the new
-    one as `changed_new`, so the derived caches subtract what they held and add
-    what arrived. Resetting the accounting state outright instead would leave
-    `changed_old` empty against caches still holding a complete generation, and
-    that is not a signature miss — see the invariant test below.
+    `build_cached_codex_accounting` answers with a cold reconstruction. A cold
+    result names no base (#872), so the fold's G1 discards every derived cache
+    and they rebuild from the full population; the bytes must still match.
     """
     _ns, cache, stats, module = env
 
@@ -629,17 +658,15 @@ def test_a_population_signature_miss_publishes_identical_envelope_bytes(env):
 def test_resetting_the_accounting_state_alone_is_never_done_alone(env):
     """The coherence rule a partial cache clear breaks, stated as a test.
 
-    Ten of the eleven accelerators are fed by the accounting carrier's DELTA
-    lists, not by its population. A reset accounting state reports its next
+    The derived accelerators are fed by the accounting carrier's DELTA lists,
+    not by its population. A reset accounting state reports its next
     reconstruction as cold with `changed_old` EMPTY and `changed_new` the whole
-    population, so any derived cache that survived the reset adds the entire
-    population to a generation it already holds. Measured: an earlier
-    remediation cleared only the caches one build had written to, and the
+    population. Measured before #872: a derived cache that survived such a
+    reset added the entire population to a generation it already held, and the
     published envelope carried `cost_usd` and every token count at twice their
-    value.
-
-    So `reset_codex_source_caches` has to do BOTH, and this is what holds it
-    there.
+    value. Since #872 a cold result names no base, so the fold's G1 discards
+    the derived layer first; `reset_codex_source_caches` still resets BOTH, and
+    this still holds it there.
     """
     _ns, cache, stats, module = env
     import _lib_snapshot_cache as snapshot

@@ -168,25 +168,100 @@ def open_index(store: str) -> sqlite3.Connection:
     return conn
 
 
-def apply_policy(conn: sqlite3.Connection, store: str) -> None:
+#: `PRAGMA auto_vacuum`'s numeric report for each policy value.
+_AUTO_VACUUM_MODES = {"NONE": 0, "FULL": 1, "INCREMENTAL": 2}
+
+
+def apply_policy(
+    conn: sqlite3.Connection, store: str, *, memory_temp_store: bool = True,
+) -> None:
     """Apply the §6.1 PRAGMA policy for ``store`` to an open connection.
 
     ``auto_vacuum`` (when set) is emitted first: it only takes effect before the
     first page is written, so it must precede ``journal_mode`` / any DDL.
+    ``memory_temp_store`` is forwarded to ``apply_connection_policy``.
+
+    #901 W9 (Q14): the pragma is emitted only when the database does not
+    already report the policy's mode. Setting INCREMENTAL or FULL rewrites
+    page 1 (a write transaction) even when the value is unchanged, so a
+    current-schema conversations.db open wrote a WAL frame on every pass.
+    Creation (an empty file reports 0) and a database in another mode still
+    receive it, the latter so a later ``VACUUM`` on that connection converts.
     """
     policy = STORE_POLICY[store]
     if policy.auto_vacuum is not None:
-        conn.execute(f"PRAGMA auto_vacuum={policy.auto_vacuum}")
+        wanted = _AUTO_VACUUM_MODES[policy.auto_vacuum.upper()]
+        current = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if int(current) != wanted:
+            conn.execute(f"PRAGMA auto_vacuum={policy.auto_vacuum}")
     conn.execute(f"PRAGMA journal_mode={policy.journal_mode}")
-    apply_connection_policy(conn, store)
+    apply_connection_policy(conn, store, memory_temp_store=memory_temp_store)
 
 
-def apply_connection_policy(conn: sqlite3.Connection, store: str) -> None:
-    """Apply non-schema connection settings without changing journal mode."""
+def apply_connection_policy(
+    conn: sqlite3.Connection, store: str, *, memory_temp_store: bool = True,
+) -> None:
+    """Apply non-schema connection settings without changing journal mode.
+
+    Every ordinary writable opener calls this once at open, before any
+    transaction, so it also carries the #901 writer temp-store policy
+    (``apply_writer_temp_store``). ``memory_temp_store=False`` is for a
+    writer §4.7 does not enumerate, which keeps SQLite's default.
+    """
     policy = STORE_POLICY[store]
     conn.execute(f"PRAGMA synchronous={policy.synchronous}")
     conn.execute(f"PRAGMA busy_timeout={policy.busy_timeout}")
     conn.execute(f"PRAGMA journal_size_limit={policy.journal_size_limit}")
+    if memory_temp_store:
+        apply_writer_temp_store(conn)
+
+
+# #901 §5.3a (Q11, design answer dc7 D1): the sync and ingest writers keep
+# their statement journals in memory. A statement that dirties more than 64 KiB
+# of pages that existed when it started (an FTS5 segment write behind the
+# conversation-message trigger, a quota insert maintaining eight indexes and
+# two trigger tables) otherwise spills its journal to an `etilqs_*` file, which
+# SQLite unlinks at creation, so nothing in the data directory shows it.
+# Measured on the revision-5 candidate: 3.7-10 MB of such files per dashboard
+# window and per Codex hook.
+#
+# Set once per connection at open, never toggled per pass. The bound is per
+# statement (the original images of the pages that one statement dirties), not
+# a fixed cap; the cache size is unchanged. It is NOT a licence for sorts:
+# G1 (tests/test_901_sql_plan_guard.py) judges every recurring plan regardless
+# of this setting, so moving a history-sized sort into memory never satisfies
+# I1. Openers outside spec §4.7 keep SQLite's default: read-only, state,
+# backup, checkpoint and vacuum connections (VACUUM builds its copy in the temp
+# store, so MEMORY there would hold the whole database in memory), and the
+# stats publication connection. The deletion connection keeps its own Q5
+# MEMORY/FILE selection and reclaim its own settings
+# (`_lib_conversation_retention`).
+#
+#: The temp store every ordinary writable opener selects. A test sets "FILE"
+#: or "DEFAULT" for the file-temp control (tests/test_901_connection_policy.py).
+WRITER_TEMP_STORE = "MEMORY"
+
+
+def apply_writer_temp_store(conn: sqlite3.Connection) -> None:
+    """Select ``WRITER_TEMP_STORE`` on a writable connection, outside any
+    transaction (SQLite ignores the change inside one)."""
+    conn.execute(f"PRAGMA temp_store = {WRITER_TEMP_STORE}")
+
+
+#: PR-3: the temp store an opener selects for the duration of PENDING schema
+#: and migration work (a first open, an upgrade, a cutover), then restores
+#: ``WRITER_TEMP_STORE``. A one-time index build or a migration over a
+#: history-sized table sorts and journals in the temp store, which under MEMORY
+#: is a RAM spike as large as that table; before #901 no temp store was
+#: selected, so this is the base behaviour for that work. A current-schema open
+#: never selects it, so the steady state is unchanged.
+SCHEMA_WORK_TEMP_STORE = "FILE"
+
+
+def apply_schema_work_temp_store(conn: sqlite3.Connection) -> None:
+    """Select ``SCHEMA_WORK_TEMP_STORE`` before pending schema work, outside
+    any transaction; the opener selects the writer temp store again after."""
+    conn.execute(f"PRAGMA temp_store = {SCHEMA_WORK_TEMP_STORE}")
 
 
 # --------------------------------------------------------------------------

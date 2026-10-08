@@ -1,10 +1,8 @@
 import { test, expect } from '@playwright/test';
 import { appendFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { e2eRuntimePath } from './utils';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const MODERN_ROLLOUT = resolve(HERE, '.runtime/scratch/codex-main/sessions/2026/07/20/modern-full.jsonl');
+const MODERN_ROLLOUT = e2eRuntimePath('scratch/codex-main/sessions/2026/07/20/modern-full.jsonl');
 
 test('qualified Codex browse and shared reader preserve native meaning', async ({ page }) => {
   await page.goto('/#/conversations');

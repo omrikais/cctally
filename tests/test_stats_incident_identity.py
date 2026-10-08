@@ -158,6 +158,13 @@ def test_backstop_path_preserves_the_rebuild_schema_fingerprint(ns, tmp_path):
         assert "account_key" in _projection_columns(raw), (
             "the pre-#341 widening backstop did not run"
         )
+        # #901 epoch 1017: the fingerprinted schema also carries the read
+        # indexes `_apply_stats_read_indexes` creates, one of which is on
+        # `quota_projection_state` and goes with the table the backstop drops.
+        # `open_db` runs that helper right after this one on every path that
+        # reaches the backstop (beside the schema apply, and again after the
+        # migration dispatcher), so the fingerprint is the pair's result.
+        _cctally_core._apply_stats_read_indexes(raw)
         assert (
             _cctally_journal._stats_schema_fingerprint(raw)
             == _cctally_journal._REBUILD_SCHEMA_FINGERPRINT

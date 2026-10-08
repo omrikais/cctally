@@ -198,6 +198,12 @@ POSITIONAL_ONLY_BUDGET_CALLEES = frozenset({"settimeout", "select"})
 #: a callee the estate uses and this file does not classify fails the guard by
 #: name, so a new blocking helper cannot be dropped in silence.
 BLOCKING_CALLEES = {
+    "validate_snapshot": (
+        "`session_memory.validate_snapshot` waits for native snapshot validation "
+        "and its supplemental checker within the supplied bound"),
+    "check": (
+        "`session_memory.AgentmemAdapter.check` waits for native agentmem and "
+        "the supplemental corpus subprocess within the supplied bound"),
     "result": "`Future.result` waits for a worker result or its timeout",
     "run": "`subprocess.run` waits for the child to exit",
     "wait": "`Popen.wait`, `Event.wait` and `Condition.wait` all block",
@@ -226,11 +232,47 @@ BLOCKING_CALLEES = {
         "wake-up thread, so its `timeout=` is a real wait"),
     "retention_shared": "takes the retention flock and waits for the holder",
     "AppServerClient": "connects to the app server before it returns",
+    "wait_until": (
+        "`tests/_session_loop_fixtures.wait_until` polls its predicate until it "
+        "holds or its `timeout_s` budget expires"),
+    "flocked": (
+        "`workflow_common.flocked` waits for an exclusive flock until its "
+        "`timeout_s` budget expires"),
+    "mutex": (
+        "`session_queue.Queue.mutex` takes the named operation flock through "
+        "`flocked`, waiting up to its `timeout_s`"),
+    "_request": (
+        "`_cctally_dashboard_perf._request` performs one loopback HTTP round "
+        "trip through `urlopen` with its `timeout=` (#901)"),
+    "_fetch_dashboard_write_io": (
+        "`_cctally_doctor._fetch_dashboard_write_io` probes a discovered "
+        "dashboard through `_request`, spending its `timeout_s` (#901)"),
+    "_drain_before_admission": (
+        "`bench/dashboard-soak.py`'s drain runs `catchup.py` for up to its "
+        "`deadline_s` (plus a 60 s margin) before it returns (#901 HR-21)"),
+    "_await_warm_publication": (
+        "`bench/dashboard-soak.py` polls a live dashboard until a warm tick "
+        "publishes or its `deadline` passes (#901 HR-21)"),
+    "receipts": (
+        "`session_memory.WrapperGateRunner.receipts` fetches the receipt refs "
+        "from the remote and reads them with local Git, every step bounded by "
+        "its `timeout_s`"),
+    "finish": (
+        "`tests/_session_loop_fixtures.finish` waits for a holder process to "
+        "exit through `Popen.communicate(timeout=timeout_s)`"),
+    "prepare_isolated": (
+        "`session_queue.TaskAdmission.prepare_isolated` runs the isolated "
+        "checkout's Git steps, each bounded by what its `timeout_s` callable "
+        "reports is left"),
 }
 
 #: The other half of the same decision, closed for the same reason. Each names a
 #: callee that takes a number spelled like a budget and waits for nothing.
 NON_BLOCKING_CALLEES = {
+    "launch": (
+        "`tests/test_runner_reservation.launch` starts Popen and returns "
+        "without waiting; its deadline configures child admission, and "
+        "the separate finish helper owns the blocking wait"),
     "Namespace": (
         "`argparse.Namespace(timeout=…)` stores a configuration value the code "
         "under test reads later; the test itself waits for nothing"),
@@ -239,6 +281,10 @@ NON_BLOCKING_CALLEES = {
     "TimeoutExpired": (
         "`subprocess.TimeoutExpired(cmd, timeout=…)` REPORTS a budget that has "
         "already expired; constructing it spends nothing"),
+    "copy_whole": (
+        "`frozen_roots.copy_whole(…, deadline=…)` bounds the RETRIES of a stable "
+        "whole-file read of a file the test controls; it waits on no other party, "
+        "and a stable file returns on its first attempt"),
 }
 
 #: Clocks a deadline is computed from.

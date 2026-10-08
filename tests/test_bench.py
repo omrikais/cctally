@@ -1549,13 +1549,13 @@ def test_dashboard_soak_prior_schema_artifacts_must_reach_current_heads(tmp_path
             "regressionCount": 0, "durationMs": 1.0,
         })
     soak._validate_external_metrics("upgrade", "cache-044", {
-        "schemaBefore": 44, "schemaAfter": 46,
-        "migrationAppliedCount": 2, "integrityCheckOk": True,
+        "schemaBefore": 44, "schemaAfter": 48,
+        "migrationAppliedCount": 4, "integrityCheckOk": True,
         "regressionCount": 0, "durationMs": 1.0,
     })
     soak._validate_external_metrics("upgrade", "conversations-009", {
-        "schemaBefore": 9, "schemaAfter": 10,
-        "migrationAppliedCount": 1, "integrityCheckOk": True,
+        "schemaBefore": 9, "schemaAfter": 11,
+        "migrationAppliedCount": 2, "integrityCheckOk": True,
         "regressionCount": 0, "durationMs": 1.0,
     })
     fixture = tmp_path / "fixture"
@@ -1566,8 +1566,8 @@ def test_dashboard_soak_prior_schema_artifacts_must_reach_current_heads(tmp_path
         upgrade_temp_parent=tmp_path,
     )
     for name, expected in {
-        "cache-044": (44, 46, 2),
-        "conversations-009": (9, 10, 1),
+        "cache-044": (44, 48, 4),
+        "conversations-009": (9, 11, 2),
     }.items():
         probe = soak._run_upgrade_probe(args, name)
         assert probe["provenance"]["command"]["exitCode"] == 0
@@ -1709,11 +1709,11 @@ def test_dashboard_soak_supplemental_evidence_is_verified_only_with_raw_executio
         if name in ("claudeActive", "codexActive", "bothActive"):
             metrics["processCpuPercent"] += index / 10
     upgrades = {
-        "cache-044": {"schemaBefore": 44, "schemaAfter": 46,
-                      "migrationAppliedCount": 2, "integrityCheckOk": True,
+        "cache-044": {"schemaBefore": 44, "schemaAfter": 48,
+                      "migrationAppliedCount": 4, "integrityCheckOk": True,
                       "regressionCount": 0, "durationMs": 200.0},
-        "conversations-009": {"schemaBefore": 9, "schemaAfter": 10,
-                              "migrationAppliedCount": 1,
+        "conversations-009": {"schemaBefore": 9, "schemaAfter": 11,
+                              "migrationAppliedCount": 2,
                               "integrityCheckOk": True,
                               "regressionCount": 0, "durationMs": 250.0},
     }
@@ -2108,8 +2108,8 @@ def test_dashboard_soak_evidence_producer_executes_and_emits_all_artifacts(
                       "stdout": "upgrade ok", "stderr": ""},
         "measurements": {
             "schemaBefore": 44 if name == "cache-044" else 9,
-            "schemaAfter": 46 if name == "cache-044" else 10,
-            "migrationAppliedCount": 2 if name == "cache-044" else 1,
+            "schemaAfter": 48 if name == "cache-044" else 11,
+            "migrationAppliedCount": 4 if name == "cache-044" else 2,
             "integrityCheckOk": True, "regressionCount": 0,
             "durationMs": 1000.0,
         },
@@ -2337,7 +2337,7 @@ def test_dashboard_soak_compaction_drains_backlog_production_reclaim_cannot(
 ):
     soak = _load_dashboard_soak()
     data = tmp_path / "data"
-    escalated = soak.RETENTION_RECLAIM_ESCALATION_BYTES
+    escalated = soak.LEGACY_RECLAIM_ESCALATION_BYTES
     db = _reclaim_backlog_store(data, pending_bytes=escalated)
     before = soak._reclaim_backlog_snapshot(data)
     assert before["freelistBytes"] > 0
@@ -2469,7 +2469,7 @@ def test_dashboard_soak_retention_prepass_compacts_what_production_cannot_drain(
 ):
     soak = _load_dashboard_soak()
     data = tmp_path / "root" / "data"
-    inherited_record = 2 * soak.RETENTION_RECLAIM_ESCALATION_BYTES
+    inherited_record = 2 * soak.LEGACY_RECLAIM_ESCALATION_BYTES
     db = _reclaim_backlog_store(data, pending_bytes=inherited_record)
     with contextlib.closing(sqlite3.connect(db)) as conn:
         inherited_freelist = (
@@ -3202,7 +3202,7 @@ def test_dashboard_soak_idle_readiness_requires_settled_maintenance(
             "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
             ("conversation_retention_reclaim_pending", json.dumps({
                 "unreclaimed_bytes": (
-                    soak.RETENTION_RECLAIM_ESCALATION_BYTES + 1),
+                    soak.LEGACY_RECLAIM_ESCALATION_BYTES + 1),
                 "made_progress": True,
                 "deadline_hit": True,
             })),
@@ -3263,8 +3263,8 @@ def test_dashboard_soak_idle_readiness_accepts_dormant_reclaim_backlog(
     """Production defers a sub-escalation backlog to the next daily pass."""
     soak = _load_dashboard_soak()
     retention = importlib.import_module("_lib_conversation_retention")
-    assert (soak.RETENTION_RECLAIM_ESCALATION_BYTES
-            == retention.RECLAIM_ESCALATION_BYTES)
+    assert soak.LEGACY_RECLAIM_ESCALATION_BYTES == 256 * 1024 * 1024, (
+        "the pre-#901 threshold, kept only to read a legacy record")
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     with contextlib.closing(
@@ -3275,7 +3275,7 @@ def test_dashboard_soak_idle_readiness_accepts_dormant_reclaim_backlog(
             "INSERT INTO cache_meta(key, value) VALUES (?, ?)",
             ("conversation_retention_reclaim_pending", json.dumps({
                 "unreclaimed_bytes": (
-                    soak.RETENTION_RECLAIM_ESCALATION_BYTES - 1),
+                    soak.LEGACY_RECLAIM_ESCALATION_BYTES - 1),
                 "made_progress": True,
                 "deadline_hit": True,
             })),
@@ -5061,3 +5061,852 @@ def test_the_committed_baseline_is_contract_shaped():
     # that it is present and carries the run's identity.
     assert written["receipt"]["cctally_version"]
     assert written["receipt"]["machine_label"]
+
+
+# --- #901 §5.4 / §6.4: the paced reclaim policy and the write-budget leg ---
+
+def test_dashboard_soak_reclaim_policy_matches_the_product():
+    soak = _load_dashboard_soak()
+    retention = importlib.import_module("_lib_conversation_retention")
+    assert soak.RETENTION_RECLAIM_START_BYTES == retention.RECLAIM_START_BYTES
+    assert soak.RETENTION_RECLAIM_START_RATIO == retention.RECLAIM_START_RATIO
+    assert soak.RETENTION_RECLAIM_STOP_BYTES == retention.RECLAIM_STOP_BYTES
+    assert soak.RETENTION_RECLAIM_STOP_RATIO == retention.RECLAIM_STOP_RATIO
+    assert soak.RETENTION_POLICY_VERSION == retention.RETENTION_POLICY_VERSION
+    assert not hasattr(retention, "RECLAIM_ESCALATION_BYTES"), (
+        "#901 retired the escalation trigger; only legacy records carry it")
+    assert soak.LEGACY_RECLAIM_ESCALATION_BYTES == 256 * 1024 * 1024
+
+
+def _record_store(data, record):
+    data.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(data / "conversations.db")) as conn:
+        conn.execute("CREATE TABLE cache_meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, ?)",
+                     ("conversation_retention_reclaim_pending",
+                      json.dumps(record)))
+        conn.commit()
+
+
+def test_dashboard_soak_reads_a_current_record_by_its_episode(tmp_path):
+    soak = _load_dashboard_soak()
+    idle = {"policy_version": 1, "eligible": False,
+            "unreclaimed_bytes": 10 * 1024 ** 3, "balance_bytes": -5,
+            "ledger": []}
+    _record_store(tmp_path / "idle", idle)
+    assert soak._require_no_reclaim_backlog(tmp_path / "idle") == {
+        "pendingBytes": 0, "freelistBytes": 0}
+    assert soak._idle_reclaim_is_dormant(tmp_path / "idle") is True
+    assert soak._reclaim_backlog_snapshot(tmp_path / "idle")["pendingBytes"] \
+        is None
+    _record_store(tmp_path / "paced", {**idle, "eligible": True})
+    with pytest.raises(ValueError, match="reclaim backlog remains"):
+        soak._require_no_reclaim_backlog(tmp_path / "paced")
+    assert soak._idle_reclaim_is_dormant(tmp_path / "paced") is False
+    assert soak._reclaim_backlog_snapshot(tmp_path / "paced")["pendingBytes"] \
+        == 10 * 1024 ** 3
+
+
+def test_dashboard_soak_a_malformed_record_fails_closed(tmp_path):
+    soak = _load_dashboard_soak()
+    _record_store(tmp_path / "bad", {"freelist_count": 1})
+    with pytest.raises(ValueError, match="malformed"):
+        soak._require_no_reclaim_backlog(tmp_path / "bad")
+    assert soak._idle_reclaim_is_dormant(tmp_path / "bad") is False
+
+
+MIB_901 = 1024 * 1024
+
+
+def _write_budget_leg(soak):
+    metrics = {
+        "counterStatus": "ok", "steady": {"valid": True, "problems": []},
+        "worstBytesPerMinute": 2 * MIB_901,
+        "worstBytesPerPublication": 512 * 1024, "windows": 3,
+        "operations": [], "fullBuildP50Ms": 1000.0, "fullBuildP95Ms": 3000.0,
+        "apiP95Ms": 50.0, "rssMaxBytes": 500 * MIB_901,
+        "rssSlopeBytesPerSecond": 0.0, "appendedEvents": 0,
+        "start": 0.0, "end": 300.0,
+    }
+    full_build = {"samplesMs": [1000.0, 1000.0, 3000.0, 3000.0], "n": 4,
+                  "p50Ms": 1000.0, "p95Ms": 3000.0, "complete": True,
+                  "problems": []}
+    arms = {name: {"arm": name, "setup": {},
+                   "metrics": {**metrics, "fullBuild": dict(full_build)}}
+            for name in soak.WRITE_BUDGET_ARMS}
+    arms["backlog"]["maintenance"] = {"problems": []}
+    # Q18 (dc15 F1): a qualified, arm-matched 56e66f07a reference at ratio 1.
+    reference = {"valid": True, "problems": [],
+                 "arms": {name: {"n": 4, "p50Ms": 1000.0, "p95Ms": 3000.0}
+                          for name in ("append", "backlog")}}
+    return {"limits": {"bytesPerMinute": 16 * MIB_901,
+                       "bytesPerPublication": 8 * MIB_901}, "arms": arms,
+            "baselineReference": reference}
+
+
+def test_write_budget_leg_passes_inside_every_ceiling():
+    soak = _load_dashboard_soak()
+    assert soak.evaluate_write_budget_leg(_write_budget_leg(soak)) == []
+
+
+@pytest.mark.parametrize("field, value, fragment", [
+    ("worstBytesPerMinute", 16 * MIB_901 + 1, "B/min over"),
+    ("worstBytesPerPublication", 8 * MIB_901 + 1, "B/publication over"),
+    ("worstBytesPerMinute", None, "no five-minute window"),
+    ("counterStatus", "unsupported_platform", "write counter"),
+    ("rssMaxBytes", 1536 * MIB_901 + 1, "RSS"),
+    ("fullBuildP95Ms", 10_001.0, "fullBuildP95Ms"),
+    ("apiP95Ms", 3_001.0, "apiP95Ms"),
+])
+def test_write_budget_leg_gates_every_arm(field, value, fragment):
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    leg["arms"]["append"]["metrics"][field] = value
+    problems = soak.evaluate_write_budget_leg(leg)
+    assert len(problems) == 1 and problems[0].startswith("append: ")
+    assert fragment in problems[0]
+
+
+def test_write_budget_leg_without_operation_records_is_invalid():
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    leg["arms"]["backlog"]["invalid"] = "0 deletion and 2 reclaim operations"
+    del leg["arms"]["idle"]
+    problems = soak.evaluate_write_budget_leg(leg)
+    assert "idle: arm missing" in problems
+    assert any(p.startswith("backlog: INVALID") for p in problems)
+
+
+class _Reservations:
+    @staticmethod
+    def recompute_charge(op):
+        units = op["rows"] if op["phase"] == "delete" else op["pages_reclaimed"]
+        return 64 * 1024 + units * 12 * 1024
+
+
+def _maintenance_op(phase, op_id, second, units, **extra):
+    stamp = dt.datetime(2026, 10, 3, 12, 0, tzinfo=dt.timezone.utc) + \
+        dt.timedelta(seconds=second)
+    op = {"phase": phase, "op_id": op_id, "outcome": "ok",
+          "started_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+          "rows": units if phase == "delete" else 0,
+          "pages_reclaimed": units if phase == "reclaim" else 0,
+          "charged_bytes": 64 * 1024 + units * 12 * 1024,
+          "balance_before_bytes": 0}
+    op.update(extra)
+    return op
+
+
+def test_write_budget_backlog_conditions():
+    soak = _load_dashboard_soak()
+    start = dt.datetime(2026, 10, 3, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    ops = [_maintenance_op("delete", 1, 60, 6000)] + [
+        _maintenance_op("reclaim", n, 60 * n, 16) for n in range(2, 6)]
+    clean = soak._maintenance_conditions(ops, start, start + 1800, _Reservations)
+    assert clean["problems"] == [] and clean["deletions"] == 1
+    assert "invalid" in soak._maintenance_conditions(
+        ops[:4], start, start + 1800, _Reservations)
+    ops[1]["charged_bytes"] = 1
+    ops[2]["balance_before_bytes"] = -1
+    problems = soak._maintenance_conditions(
+        ops, start, start + 1800, _Reservations)["problems"]
+    assert any("charge != reservation" in p for p in problems)
+    assert any("started in debt" in p for p in problems)
+
+
+def test_write_budget_backlog_needs_a_large_expiring_group():
+    soak = _load_dashboard_soak()
+    small = {"claude": {"largest": 4_999}, "codex": {"largest": 10}}
+    assert "5000 rows" in soak._expiring_group_problem(small)
+    assert soak._expiring_group_problem(
+        {"claude": {"largest": 10}, "codex": {"largest": 5_000}}) is None
+
+
+def _wb_window(*, failed_at=None, start=0.0, end=600.0, deletion=None):
+    """A measured window as `_measure_write_window` returns it: a counter
+    sample every 15 s (`failed_at`: one failed read) and the diagnostics
+    polled beside each, whose tick_seq counts publications."""
+    samples, diags = [], []
+    for t in range(int(start) - 15, int(end) + 16, 15):
+        failed = failed_at is not None and t == failed_at
+        extra = 50_000 if deletion and t >= deletion[1] else 0
+        samples.append({"t": float(t), "bytes": None if failed else t * 1000 + extra,
+                        "status": "permission_denied" if failed else "ok"})
+        diags.append({"tick": {"tick_seq": t // 5, "maintenance": [] if not deletion
+                               else [{"phase": "delete", "op_id": 1, "outcome": "ok",
+                                      "started_at": dt.datetime.fromtimestamp(
+                                          deletion[0], dt.timezone.utc
+                                      ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                      "duration_ns": int((deletion[1] - deletion[0]) * 1e9),
+                                      "process_write_bytes": 50_000, "rows": 10}]}})
+    return {"start": start, "end": end, "warm": start - 30, "samples": samples,
+            "diagnostics": diags}
+
+
+def test_write_budget_steady_statistic_is_the_candidate_kernels():
+    """Amendment 19 HR-8: `_rolling_write_rates` re-implemented the I2
+    statistic without the kernel's rules; the leg now feeds
+    `_lib_write_budget.steady_statistic` through the harness's one feed,
+    deletion bytes subtracted only as far as the samples prove them."""
+    soak = _load_dashboard_soak()
+    assert not hasattr(soak, "_rolling_write_rates")
+    steady = soak._write_budget_steady(_wb_window(deletion=(400, 410)), {
+        ("delete", 1): _wb_window(deletion=(400, 410))["diagnostics"][0]["tick"][
+            "maintenance"][0]})
+    assert steady["valid"] is True, steady
+    assert steady["kernel"] == "bin/_lib_write_budget.steady_statistic"
+    assert steady["worstBytesPerMinute"] <= 60_000 + 60 * 50_000 / 300
+    failed = soak._write_budget_steady(_wb_window(failed_at=450), {})
+    assert failed["valid"] is False
+    assert "invalid_samples" in " ".join(failed["problems"])
+
+
+def test_write_budget_a_failed_counter_or_kernel_window_is_invalid():
+    """HR-21: a counter failure was reported as a FAIL; missing evidence is
+    INVALID."""
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    leg["arms"]["append"]["metrics"]["counterStatus"] = "unsupported_platform"
+    assert any(r.startswith("append: write counter")
+               for r in soak.write_budget_invalid_reasons(leg))
+    leg = _write_budget_leg(soak)
+    leg["arms"]["idle"]["metrics"]["steady"] = {
+        "valid": False, "problems": ["the kernel's statistic at 300 s is "
+                                     "insufficient (insufficient_coverage)"]}
+    assert any(r.startswith("idle: ") and "insufficient_coverage" in r
+               for r in soak.write_budget_invalid_reasons(leg))
+    assert any("INVALID" in p for p in soak.evaluate_write_budget_leg(leg))
+
+
+def test_write_budget_backlog_pacing_needs_every_operation_record():
+    """HR-18: the ring holds 16 records polled every 15 s; a lost record
+    under-counts the charges. op_seq and the charged ledger bracket the
+    window and must equal what the ring showed."""
+    soak = _load_dashboard_soak()
+    start = dt.datetime(2026, 10, 3, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    ops = [dict(_maintenance_op("reclaim", n, 60 * n, 16), duration_ns=10 ** 9)
+           for n in range(1, 6)]
+    charged = sum(o["charged_bytes"] for o in ops)
+    begin = {"t": start, "opSeq": 10, "charged": 1000}
+    good = {"t": start + 1800, "opSeq": 15, "charged": 1000 + charged}
+    assert soak._maintenance_completeness(ops, begin, good) == []
+    problems = soak._maintenance_completeness(ops[:4], begin, good)
+    assert any("op_seq advanced 5, 4" in p for p in problems), problems
+    assert soak._maintenance_completeness(ops, None, good) == [
+        "no record snapshots bracket the window (op_seq)"]
+
+
+def test_write_budget_drain_and_warm_admission_share_one_deadline(tmp_path):
+    """HR-21: the drain had its own 900 s and the warm wait its own timeout;
+    one 900 s admission deadline covers both, as in §6.3."""
+    import inspect
+    soak = _load_dashboard_soak()
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        pathlib.Path(cmd[cmd.index("--out") + 1]).write_text(
+            json.dumps({"admitted": True}))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    receipt, problem = soak._drain_before_admission(
+        tmp_path, {}, tmp_path, run=run, deadline_s=30)
+    assert problem is None
+    cmd, kwargs = calls[0]
+    assert cmd[cmd.index("--deadline-s") + 1] == "30"
+    assert kwargs["timeout"] == 90
+    assert soak._drain_before_admission(tmp_path, {}, tmp_path, run=run,
+                                        deadline_s=0)[1].startswith(
+        "the admission deadline expired")
+    with pytest.raises(RuntimeError, match="did not publish a warm tick"):
+        soak._await_warm_publication(0, "x", deadline=soak.time.monotonic() - 1)
+    source = inspect.getsource(soak._run_write_budget_arm)
+    assert "deadline=admit_deadline" in source
+    assert "deadline_s=admit_deadline - time.monotonic()" in source
+
+
+def test_write_budget_idle_not_applicable_needs_both_window_edges():
+    """HR-20: the idle arm's "not applicable" lacked frozen-C's coverage
+    checks: no record before the window, or the last record further than a
+    publish period from the last poll, is incomplete evidence."""
+    soak = _load_dashboard_soak()
+    diags, start, end = _wb_diagnostics([], idle=6)
+    assert soak._warm_full_builds(diags, start, end)["complete"] is True
+    no_pre = [{"tick": {"records": [r for r in d["tick"]["records"]
+                                    if r["seq"] != 2]}} for d in diags]
+    out = soak._warm_full_builds(no_pre, start, end)
+    assert out["complete"] is False
+    assert any("before the window" in p for p in out["problems"])
+    out = soak._warm_full_builds(diags, start, end, polled_at=[end + 60])
+    assert out["complete"] is False
+    assert any("last poll" in p for p in out["problems"])
+
+
+def test_write_budget_leg_requires_a_fixture_copy(tmp_path, capsys):
+    soak = _load_dashboard_soak()
+    with pytest.raises(SystemExit) as caught:
+        soak.main(["--root", str(tmp_path / "root"), "--write-budget-leg"])
+    assert caught.value.code == 2
+    assert "--write-budget-leg requires --fixture-copy" in capsys.readouterr().err
+
+
+class _FakeLive:
+    port = 0
+
+    class proc:
+        pid = 0
+
+        @staticmethod
+        def poll():
+            return None
+
+
+class _FakeCounter:
+    def read(self):
+        import types
+        return types.SimpleNamespace(value=1, status="ok")
+
+
+def test_write_budget_backlog_rewinds_once_ten_minutes_into_its_window(
+        monkeypatch):
+    """§6.4 (Q8): the backlog arm admits due deletion only after warm
+    admission by rewinding the stamp ten minutes into its 30 minutes, as
+    §6.3 C does; the window records when and what the rewind made due."""
+    soak = _load_dashboard_soak()
+    assert soak.WRITE_BUDGET_REWIND_AFTER_SECONDS == 600
+    clock = {"t": 0.0}
+    monkeypatch.setattr(soak.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(soak.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(soak, "_live_debug", lambda port: ({}, 1.0))
+    monkeypatch.setattr(soak, "_process_sample", lambda pid: {"rssBytes": 1})
+    calls = []
+    window = soak._measure_write_window(
+        _FakeLive(), 1800, _FakeCounter(),
+        midway=lambda: calls.append(clock["t"]) or {"claude": {"groups": 3}},
+        midway_after=soak.WRITE_BUDGET_REWIND_AFTER_SECONDS)
+    assert len(calls) == 1 and 600 <= calls[0] < 600 + soak.WRITE_BUDGET_SAMPLE_SECONDS
+    assert window["midway"]["result"] == {"claude": {"groups": 3}}
+
+
+def test_write_budget_leg_says_i4_is_not_certified(monkeypatch):
+    """§6.4 (Q10): the soak receipt says so instead of carrying an I4
+    verdict; I4 is certified by C-op, R-cov and C."""
+    import types
+
+    soak = _load_dashboard_soak()
+    monkeypatch.setattr(
+        soak, "_run_write_budget_arm",
+        lambda args, name, checkout: _write_budget_leg(soak)["arms"][name])
+    import importlib as _importlib
+
+    if str(BIN) not in sys.path:
+        sys.path.insert(0, str(BIN))
+    monkeypatch.setattr(soak, "_candidate_module", lambda checkout, name:
+                        _importlib.import_module(name))
+    leg = soak.run_write_budget_leg(types.SimpleNamespace(
+        checkout=str(BIN.parent), write_budget_arms="idle,append,backlog"),
+        "abc")
+    assert leg["i4"] == "I4 not certified (Q10)"
+    assert soak.WRITE_BUDGET_I4_NOTE == "I4 not certified (Q10)"
+    assert "i4Verdict" not in json.dumps(leg)
+
+
+
+def test_write_budget_arms_drain_before_warm_admission(tmp_path, monkeypatch):
+    """§6.4 (Q11): an arm whose fixture backlog the certifiable-sync drain
+    does not clear is INVALID before any dashboard starts."""
+    soak = _load_dashboard_soak()
+    calls = []
+
+    def refuse(cmd, **kwargs):
+        calls.append(cmd)
+        out = pathlib.Path(cmd[cmd.index("--out") + 1])
+        out.write_text(json.dumps({"admitted": False, "problems": [
+            "sync_cache is not certifiable as a full walk"]}))
+        return types.SimpleNamespace(returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(soak.subprocess, "run", refuse)
+    receipt, problem = soak._drain_before_admission(
+        tmp_path, {"CCTALLY_DATA_DIR": str(tmp_path)}, tmp_path)
+    assert "not certifiable" in problem and receipt["admitted"] is False
+    assert calls and calls[0][1].endswith("catchup.py")
+    assert soak.WRITE_BUDGET_ADMISSION_SECONDS == 900
+
+
+# ── Amendment 16 (Q18, dc15 F1): the §6.4 leg's arm-matched baseline ────────
+
+def _wb_tick(seq, at, *, dispatch="full", cold=False, ms=1000.0):
+    return {"seq": seq, "dispatch": dispatch, "cold": cold,
+            "duration_ns": int(ms * 1e6), "period_ns": 20_000_000_000,
+            "published_at": dt.datetime.fromtimestamp(
+                at, dt.timezone.utc).isoformat()}
+
+
+def _wb_diagnostics(full_ms, *, idle=0, start=1_000.0, step=20.0):
+    """Polled `/api/debug/backend` bodies over one arm window: a cold startup
+    build and a warm build before the window, the window's warm full builds
+    `full_ms` then `idle` idle ticks, and one build after the window. Every
+    poll returns the ring so far, so sequence numbers repeat across polls."""
+    rows = [_wb_tick(1, start - 50, cold=True, ms=99_999),
+            _wb_tick(2, start - 10, ms=88_888)]
+    at = start
+    for ms in full_ms:
+        at += step
+        rows.append(_wb_tick(len(rows) + 1, at, ms=ms))
+    for _ in range(idle):
+        at += step
+        rows.append(_wb_tick(len(rows) + 1, at, dispatch="idle", ms=3))
+    end = at + step
+    rows.append(_wb_tick(len(rows) + 1, end + 30, ms=77_777))
+    return ([{"tick": {"records": rows[:k]}} for k in range(2, len(rows) + 1)],
+            start, end)
+
+
+def _wb_qualification():
+    return {
+        "fixture": {"fingerprint": "f" * 64, "preparation": {"version": 1}},
+        "host": {"hostname": "studio", "machine": "arm64",
+                 "model": "Mac15,14", "cpuCount": 24, "memoryBytes": 1 << 36},
+        "runtime": {"os": "Darwin", "osRelease": "27.0.0",
+                    "osVersion": "27.0.1", "python": "3.14.8",
+                    "pythonExecutable": "/opt/homebrew/bin/python3.14",
+                    "sqlite": "3.53.4"},
+        "storage": {"class": "external", "mountPoint": "/Volumes/X",
+                    "fsType": "apfs"},
+        "instrumentation": {"collector": "warm-in-window/1",
+                            "percentile": "nearest-rank", "sampleSeconds": 15,
+                            "writeCounter": "proc_pid_rusage"},
+        "workload": {"syncIntervalSeconds": 5.0, "appendIntervalSeconds": 0.5,
+                     "armSeconds": {"append": 300, "backlog": 1800},
+                     "rewindAfterSeconds": 600, "retentionDays": 90,
+                     "warmWindow": "warm, in-window, distinct seq"},
+    }
+
+
+def _wb_fake_arm(soak, calls, arms_ms, *, invalid=None):
+    """A synthetic `_run_write_budget_arm`: no clone, no dashboard."""
+    def run(args, name, checkout, *, capture=False):
+        calls.append((name, capture, pathlib.Path(checkout).name))
+        if invalid and name in invalid:
+            return {"arm": name, "invalid": invalid[name]}
+        diags, start, end = _wb_diagnostics(arms_ms[name])
+        full = soak._warm_full_builds(diags, start, end)
+        return {"arm": name, "mode": "reference" if capture else "candidate",
+                "window": {"start": start, "end": end},
+                "metrics": {"fullBuild": full,
+                            "fullBuildP50Ms": full["p50Ms"],
+                            "fullBuildP95Ms": full["p95Ms"]},
+                "teardown": {"survivors": []}, "diagnostics": diags}
+    return run
+
+
+def _wb_capture(soak, tmp_path, monkeypatch, arms_ms, *, invalid=None,
+                output=None, storage="external"):
+    calls, materialized = [], []
+    root = tmp_path / "ref-root"
+    monkeypatch.setattr(soak, "_run_write_budget_arm",
+                        _wb_fake_arm(soak, calls, arms_ms, invalid=invalid))
+
+    def materialize(ref, destination):
+        materialized.append(ref)
+        pathlib.Path(destination).mkdir(parents=True)
+        return pathlib.Path(destination)
+
+    monkeypatch.setattr(soak, "materialize_checkout_ref", materialize)
+    monkeypatch.setattr(soak, "_storage_identity",
+                        lambda path: {"class": storage, "mountPoint": "/V",
+                                      "fsType": "apfs"})
+    monkeypatch.setattr(soak, "_write_budget_qualification",
+                        lambda args: _wb_qualification())
+    args = types.SimpleNamespace(
+        root=str(root), fixture_copy=str(tmp_path / "fixture"),
+        output=str(output or root / "reference.json"), sync_interval=5.0)
+    reference, code = soak.capture_write_budget_reference(args, "c" * 40)
+    return reference, code, calls, materialized, pathlib.Path(args.output)
+
+
+def test_write_budget_full_build_is_non_regression_not_an_absolute_ceiling():
+    """Q18 RED: an append arm whose warm full builds exceed the retired
+    5 s / 10 s ceilings but stay within 1.2 x its arm-matched 56e66f07a
+    reference passes, and the gate reports absolute values and ratios."""
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    metrics = leg["arms"]["append"]["metrics"]
+    metrics.update(fullBuildP50Ms=6_000.0, fullBuildP95Ms=11_000.0)
+    leg["baselineReference"]["arms"]["append"].update(
+        p50Ms=5_500.0, p95Ms=10_000.0)
+    assert soak.evaluate_write_budget_leg(leg) == []
+    gate = soak.full_build_gate(leg)["append"]
+    assert gate["gated"] is True and gate["valid"] is True
+    assert gate["candidate"]["p50Ms"] == 6_000.0
+    assert gate["reference"]["p95Ms"] == 10_000.0
+    assert gate["ratios"]["p50Ms"] == pytest.approx(6_000 / 5_500)
+    assert gate["factor"] == 1.2 and gate["failures"] == []
+
+
+@pytest.mark.parametrize("arm", ["append", "backlog"])
+@pytest.mark.parametrize("p50, p95, failing", [
+    (1_201.0, 3_000.0, ["fullBuildP50Ms"]),
+    (1_000.0, 3_601.0, ["fullBuildP95Ms"]),
+    (1_200.0, 3_600.0, []),
+])
+def test_write_budget_full_build_ratio_gate_per_arm(arm, p50, p95, failing):
+    """Append against append and backlog against backlog, p50 and p95 each
+    on its own; equality at exactly 1.2 passes."""
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    leg["arms"][arm]["metrics"].update(fullBuildP50Ms=p50, fullBuildP95Ms=p95)
+    problems = soak.evaluate_write_budget_leg(leg)
+    assert len(problems) == len(failing)
+    for field in failing:
+        assert any(p.startswith(f"{arm}: {field} ") and "1.2 x" in p
+                   for p in problems), problems
+    assert soak.write_budget_invalid_reasons(leg) == []
+
+
+def test_write_budget_idle_reports_full_build_not_applicable():
+    """Idle is not gated: complete tick evidence with no warm full build
+    reports not applicable, zero samples and null percentiles; incomplete
+    instrumentation is INVALID, never not applicable."""
+    soak = _load_dashboard_soak()
+    leg = _write_budget_leg(soak)
+    diags, start, end = _wb_diagnostics([], idle=6)
+    full = soak._warm_full_builds(diags, start, end)
+    assert full["complete"] is True and full["n"] == 0
+    leg["arms"]["idle"]["metrics"].update(
+        fullBuild=full, fullBuildP50Ms=None, fullBuildP95Ms=None)
+    gate = soak.full_build_gate(leg)["idle"]
+    assert gate == {"gated": False, "valid": True, "applicable": False, "n": 0,
+                    "p50Ms": None, "p95Ms": None,
+                    "reason": "no warm full build in the idle window "
+                              "(complete tick evidence)"}
+    assert soak.evaluate_write_budget_leg(leg) == []
+    assert soak.write_budget_invalid_reasons(leg) == []
+    leg["arms"]["idle"]["metrics"]["fullBuild"] = {
+        **full, "complete": False, "problems": ["the tick evidence has gaps"]}
+    reasons = soak.write_budget_invalid_reasons(leg)
+    assert any(r.startswith("idle: full build:") and "gaps" in r
+               for r in reasons), reasons
+
+
+def test_write_budget_collector_excludes_cold_and_out_of_window_records():
+    """Sequence deduplication alone does not establish warm-window
+    membership: the cold startup build, the warm build before the window and
+    the build after it are excluded; idle ticks are not full builds."""
+    soak = _load_dashboard_soak()
+    diags, start, end = _wb_diagnostics([4_000.0, 6_000.0, 5_000.0], idle=2)
+    full = soak._warm_full_builds(diags, start, end)
+    assert full["samplesMs"] == [4_000.0, 6_000.0, 5_000.0]
+    assert full["seqs"] == [3, 4, 5]
+    assert full["excluded"] == {"cold": 1, "outOfWindow": 2, "unstamped": 0}
+    assert (full["n"], full["p50Ms"], full["p95Ms"]) == (3, 5_000.0, 6_000.0)
+    assert full["complete"] is True and full["problems"] == []
+    # The unwindowed collector counts all six distinct full builds.
+    assert len(soak._tick_measurements([], diags)["fullBuildMs"]) == 6
+    gap = [{"tick": {"records": [r for r in d["tick"]["records"]
+                                 if r["seq"] != 4]}} for d in diags]
+    assert "gaps" in " ".join(soak._warm_full_builds(gap, start, end)["problems"])
+    lost = diags[:3] + [{"error": "unavailable"}] + diags[3:]
+    assert soak._warm_full_builds(lost, start, end)["complete"] is False
+    unstamped = [{"tick": {"records": [{k: v for k, v in r.items()
+                                        if not (k == "cold" and r["seq"] == 4)}
+                                       for r in d["tick"]["records"]]}}
+                 for d in diags]
+    out = soak._warm_full_builds(unstamped, start, end)
+    assert out["complete"] is False and out["excluded"]["unstamped"] == 1
+
+
+def test_write_budget_existing_rss_slope_and_api_ceilings_are_unchanged():
+    soak = _load_dashboard_soak()
+    assert soak.PROCESS_CEILING_BYTES == 1536 * MIB_901
+    assert soak.RSS_SLOPE_CEILING_BYTES_PER_SECOND == 4 * MIB_901 / 60
+    assert soak.API_P95_CEILING_MS == 3000
+    for field, value, fragment in (
+            ("rssMaxBytes", 1536 * MIB_901 + 1, "RSS"),
+            ("rssSlopeBytesPerSecond", 4 * MIB_901 / 60 + 1, "RSS slope"),
+            ("apiP95Ms", 3_001.0, "apiP95Ms")):
+        for arm in soak.WRITE_BUDGET_ARMS:
+            leg = _write_budget_leg(soak)
+            leg["arms"][arm]["metrics"][field] = value
+            problems = soak.evaluate_write_budget_leg(leg)
+            assert len(problems) == 1 and problems[0].startswith(f"{arm}: ")
+            assert fragment in problems[0]
+
+
+def test_write_budget_capture_records_one_append_and_one_backlog_reference(
+        tmp_path, monkeypatch):
+    """The capture mode materializes 56e66f07a under the caller's root,
+    measures one append and one backlog reference serially, once each, in
+    reference mode, and writes a digest-bound reference that qualifies."""
+    soak = _load_dashboard_soak()
+    reference, code, calls, materialized, output = _wb_capture(
+        soak, tmp_path, monkeypatch,
+        {"append": [5_000.0, 6_000.0], "backlog": [7_000.0, 9_000.0]})
+    assert code == 0 and reference["valid"] is True, reference["problems"]
+    assert materialized == [soak.WRITE_BUDGET_BASELINE_SHA]
+    assert soak.WRITE_BUDGET_BASELINE_SHA != soak.PRE_EPIC_BASELINE
+    assert calls == [("append", True, "baseline-checkout"),
+                     ("backlog", True, "baseline-checkout")]
+    assert reference["baselineSha"] == soak.WRITE_BUDGET_BASELINE_SHA
+    assert reference["capturedWithSha"] == "c" * 40
+    assert output.parent == tmp_path / "ref-root" and output.is_file()
+    for name in ("append", "backlog"):
+        arm = reference["arms"][name]
+        assert "diagnostics" not in arm
+        artifact = output.parent / arm["artifacts"]["diagnostics"]["path"]
+        assert artifact.is_file()
+        assert hashlib.sha256(artifact.read_bytes()).hexdigest() == \
+            arm["artifacts"]["diagnostics"]["sha256"]
+    assert reference["arms"]["backlog"]["fullBuild"]["samplesMs"] == \
+        [7_000.0, 9_000.0]
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is True, loaded["problems"]
+    assert loaded["arms"]["append"]["p95Ms"] == 6_000.0
+    assert loaded["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+
+
+def test_write_budget_capture_never_runs_backlog_after_an_invalid_append(
+        tmp_path, monkeypatch):
+    soak = _load_dashboard_soak()
+    reference, code, calls, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [], "backlog": [1.0]},
+        invalid={"append": "the fixture's backlog was not drained"})
+    assert code == 2 and reference["valid"] is False
+    assert [c[0] for c in calls] == ["append"]
+    assert "backlog" not in reference["arms"]
+    assert soak.load_write_budget_reference(
+        output, _wb_qualification())["valid"] is False
+
+
+@pytest.mark.parametrize("case", ["outside", "internal", "exists"])
+def test_write_budget_capture_refuses_before_any_work(
+        tmp_path, monkeypatch, case):
+    """Stores, temp files and evidence go on the external drive under the
+    caller's root, and a reference is never overwritten."""
+    soak = _load_dashboard_soak()
+    output = {"outside": tmp_path / "elsewhere" / "reference.json",
+              "internal": None, "exists": tmp_path / "ref-root" / "ref.json"}[case]
+    if case == "exists":
+        output.parent.mkdir(parents=True)
+        output.write_text("{}")
+    reference, code, calls, materialized, _out = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [1.0], "backlog": [1.0]},
+        output=output, storage="internal" if case == "internal" else "external")
+    assert code == 2 and reference["status"] == "refused"
+    assert calls == [] and materialized == []
+
+
+@pytest.mark.parametrize("path", [
+    ("fixture", "fingerprint"), ("fixture", "preparation", "version"),
+    ("host", "hostname"), ("host", "model"), ("host", "memoryBytes"),
+    ("runtime", "os"), ("runtime", "python"), ("runtime", "sqlite"),
+    ("storage", "class"), ("instrumentation", "collector"),
+    ("workload", "syncIntervalSeconds"), ("workload", "appendIntervalSeconds"),
+    ("workload", "warmWindow"), ("workload", "retentionDays"),
+])
+def test_write_budget_reference_qualification_mismatch_is_invalid(
+        tmp_path, monkeypatch, path):
+    """Every qualification field binds reuse; a mismatch requires a new
+    capture and is never silently substituted."""
+    soak = _load_dashboard_soak()
+    _ref, code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [1.0], "backlog": [2.0]})
+    assert code == 0
+    run = _wb_qualification()
+    node = run
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = "something else"
+    loaded = soak.load_write_budget_reference(output, run)
+    assert loaded["valid"] is False
+    dotted = ".".join(path)
+    assert any(dotted in p for p in loaded["problems"]), loaded["problems"]
+
+
+def test_write_budget_reference_candidate_sha_is_recorded_not_a_cache_key(
+        tmp_path, monkeypatch):
+    soak = _load_dashboard_soak()
+    _ref, _code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [1.0], "backlog": [2.0]})
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is True and loaded["capturedWithSha"] == "c" * 40
+    assert "capturedWithSha" not in json.dumps(_wb_qualification())
+
+
+def test_write_budget_missing_reference_is_invalid_and_runs_no_arm(
+        tmp_path, monkeypatch):
+    """A leg with a gated arm and no reference is INVALID before any arm
+    spends the fixture's writes; the exit status follows (`leg["invalid"]`)."""
+    soak = _load_dashboard_soak()
+    calls = []
+    monkeypatch.setattr(soak, "_run_write_budget_arm",
+                        lambda *a, **k: calls.append(a) or {})
+    monkeypatch.setattr(soak, "_write_budget_qualification",
+                        lambda args: _wb_qualification())
+    if str(BIN) not in sys.path:
+        sys.path.insert(0, str(BIN))
+    import importlib as _importlib
+    monkeypatch.setattr(soak, "_candidate_module", lambda checkout, name:
+                        _importlib.import_module(name))
+    for reference in (None, str(tmp_path / "absent.json")):
+        leg = soak.run_write_budget_leg(types.SimpleNamespace(
+            checkout=str(BIN.parent), write_budget_arms="idle,append,backlog",
+            baseline_reference=reference), "abc")
+        assert calls == []
+        assert "baselineReference" in leg["invalid"]
+        assert any(p.startswith("baseline reference INVALID")
+                   for p in leg["problems"]), leg["problems"]
+    leg = _write_budget_leg(soak)
+    del leg["baselineReference"]
+    reasons = soak.write_budget_invalid_reasons(leg)
+    assert any(r.startswith("baselineReference:") for r in reasons), reasons
+
+
+@pytest.mark.parametrize("mutate, fragment", [
+    (lambda arm: arm["fullBuild"].update(samplesMs=[], n=0), "empty"),
+    (lambda arm: arm["fullBuild"].update(samplesMs=[0.0], n=1, p50Ms=0.0,
+                                         p95Ms=0.0), "nonpositive"),
+    (lambda arm: arm["fullBuild"].update(samplesMs=[-5.0], n=1, p50Ms=-5.0,
+                                         p95Ms=-5.0), "nonpositive"),
+    (lambda arm: arm["fullBuild"].update(n=7), "n 7"),
+    (lambda arm: arm["fullBuild"].update(p50Ms=12.5), "p50Ms"),
+    (lambda arm: arm.update(valid=False), "not valid"),
+])
+def test_write_budget_reference_population_must_be_valid(
+        tmp_path, monkeypatch, mutate, fragment):
+    soak = _load_dashboard_soak()
+    _ref, _code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [10.0, 20.0], "backlog": [5.0]})
+    reference = json.loads(output.read_text())
+    mutate(reference["arms"]["append"])
+    output.write_text(json.dumps(reference))
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False
+    assert any(p.startswith("append:") and fragment in p
+               for p in loaded["problems"]), loaded["problems"]
+
+
+def test_write_budget_reference_nonfinite_values_are_invalid(
+        tmp_path, monkeypatch):
+    soak = _load_dashboard_soak()
+    _ref, _code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [10.0], "backlog": [5.0]})
+    text = output.read_text().replace('"p95Ms": 10.0', '"p95Ms": NaN', 1)
+    assert "NaN" in text
+    output.write_text(text)
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False
+    assert "nonfinite" in " ".join(loaded["problems"])
+
+
+def test_write_budget_reference_artifacts_are_digest_bound(
+        tmp_path, monkeypatch):
+    """The raw evidence is bound by digest, and the recorded warm samples
+    must be what the collector recomputes from it."""
+    soak = _load_dashboard_soak()
+    _ref, _code, _c, _m, output = _wb_capture(
+        soak, tmp_path, monkeypatch, {"append": [10.0, 20.0], "backlog": [5.0]})
+    reference = json.loads(output.read_text())
+    artifact = output.parent / reference["arms"]["append"]["artifacts"][
+        "diagnostics"]["path"]
+    original = artifact.read_bytes()
+    artifact.write_bytes(original + b" ")
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False
+    assert "digest" in " ".join(loaded["problems"])
+    artifact.write_bytes(original)
+    reference["arms"]["append"]["fullBuild"].update(
+        samplesMs=[10.0, 21.0], p95Ms=21.0)
+    output.write_text(json.dumps(reference))
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False
+    assert "recomputed" in " ".join(loaded["problems"])
+    reference["arms"]["append"]["artifacts"]["diagnostics"]["path"] = \
+        "../outside.json"
+    output.write_text(json.dumps(reference))
+    loaded = soak.load_write_budget_reference(output, _wb_qualification())
+    assert loaded["valid"] is False
+
+
+_FAMILY_CHILD = r"""
+import subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+open(sys.argv[1], "w").write(str(child.pid))
+if sys.argv[2] == "hang":
+    import time
+    time.sleep(60)
+"""
+
+
+def _wb_gone(pid):
+    for _ in range(500):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+@pytest.mark.parametrize("mode", ["exit", "hang"])
+def test_write_budget_measured_run_reaps_the_process_family(tmp_path, mode):
+    """A setup child runs in its own session under a finite deadline; on
+    exit or timeout its whole group is killed and its final write counter is
+    read before it is reaped (synthetic children, never a dashboard)."""
+    soak = _load_dashboard_soak()
+    # `_MeasuredRun` has `subprocess.run`'s shape and blocks the same way.
+    run = soak._MeasuredRun(log_dir=tmp_path / "logs")
+    marker = tmp_path / "grandchild.pid"
+    cmd = [sys.executable, "-c", _FAMILY_CHILD, str(marker), mode]
+    if mode == "exit":
+        done = run(cmd, env=dict(os.environ), capture_output=True,
+                   text=True, timeout=60)
+        assert done.returncode == 0
+    else:
+        with pytest.raises(subprocess.TimeoutExpired):
+            # timing-budget: the deadline is the claim - a child that never exits is stopped at it and its family reaped
+            run(cmd, env=dict(os.environ), capture_output=True, text=True,
+                timeout=3)
+    record = run.records[-1]
+    assert record["timedOut"] is (mode == "hang")
+    assert record["group"]["survivors"] == []
+    assert "writeStatus" in record and "writeBytes" in record
+    assert _wb_gone(int(marker.read_text()))
+    assert all(p.parent == tmp_path / "logs"
+               for p in map(pathlib.Path, record["logs"].values()))
+
+
+_FAKE_DASHBOARD = r"""
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+open(MARKER, "w").write(str(child.pid))
+print("serving on http://localhost:1/", flush=True)
+time.sleep(60)
+"""
+
+
+def test_write_budget_dashboard_teardown_reaps_the_group(tmp_path):
+    """The leg's dashboard runs in its own session; teardown signals it,
+    reads its terminal write counter while it is a zombie, kills what is
+    left of its group and records the evidence (a synthetic stand-in)."""
+    soak = _load_dashboard_soak()
+    script = tmp_path / "fake-cctally.py"
+    script.write_text(_FAKE_DASHBOARD.replace(
+        "MARKER", repr(str(tmp_path / "grandchild.pid"))))
+    reads = []
+    with soak._live_regime_dashboard(
+            tmp_path, script, dict(os.environ), 5.0, admit_initial_sync=False,
+            reap_family=True,
+            final_write_bytes=lambda pid: reads.append(pid) or
+            types.SimpleNamespace(value=4096, status="ok")) as live:
+        assert live.port == 1
+        pid = live.proc.pid
+    assert reads == [pid]
+    assert live.teardown["finalWriteBytes"] == 4096
+    assert live.teardown["group"]["survivors"] == []
+    marker = tmp_path / "grandchild.pid"
+    for _ in range(500):
+        if marker.exists() and marker.read_text():
+            break
+        time.sleep(0.01)
+    assert _wb_gone(int(marker.read_text()))

@@ -126,7 +126,7 @@ export function ProjectsPanel() {
             Monthly, Blocks and Daily now use the SAME class for the same
             reason, which is why it is named for panels and not for this
             panel. */}
-        <h2>
+        <h2 className={projected.state === 'available' && !showLoadingSub ? 'has-count' : undefined}>
           Projects{' '}
           <span className="sub">
             {showLoadingSub
@@ -137,7 +137,7 @@ export function ProjectsPanel() {
                   ? '(unavailable)'
                   : activeSource === 'claude'
                     ? `(${rows.length} this week)`
-                    : `(${rows.length} projects)`}
+                    : `(${rows.length} ${rows.length === 1 ? 'project' : 'projects'})`}
           </span>
         </h2>
         {projectWarning && <DegradedChip gate={{ mode: 'degraded', warning: projectWarning, noSuccessYet: false }} />}

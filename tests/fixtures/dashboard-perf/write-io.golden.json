@@ -1,0 +1,42 @@
+{
+  "budget": {
+    "bytesPerMinuteLimit": 16777216,
+    "meanBytesPerTickLimit": 8388608,
+    "policyVersion": 1,
+    "reasons": [
+      "within_limits"
+    ],
+    "verdict": "ok"
+  },
+  "bytesPerMinute": 6041600,
+  "bytesWritten": 30208000,
+  "coldStartup": {
+    "admitted": true,
+    "bytes": 512000
+  },
+  "excludedDeletions": {
+    "bytes": 5754880,
+    "lastEndedAt": "2026-10-03T12:30:00Z",
+    "operations": 1,
+    "rows": 1000
+  },
+  "instanceId": "0123456789abcdef",
+  "maintenance": {
+    "allowanceBytes": 6431965184,
+    "chargedBytes": 262144000,
+    "largestChargeBytes": 262144000,
+    "verdict": "ok",
+    "windowEnd": "2026-10-03T12:30:00Z",
+    "windowMinutes": 1470,
+    "windowStart": "2026-10-02T12:00:00Z"
+  },
+  "meanBytesPerTick": 512000,
+  "reason": null,
+  "reclaimRefusal": null,
+  "sampledAt": "2026-10-03T12:30:00Z",
+  "scope": "process",
+  "source": "proc_pid_rusage.ri_diskio_byteswritten",
+  "status": "ok",
+  "tickCount": 59,
+  "windowSeconds": 300.0
+}

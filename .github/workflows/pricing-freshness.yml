@@ -67,6 +67,33 @@ jobs:
           printf '%s\n' "$OUT" > /tmp/pricing.json
 
       - name: Manage the pricing-drift issue
+        id: manage
         run: |
           export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
           python3 .github/scripts/pricing_issue.py /tmp/pricing.json
+
+      # A run whose check failed before the issue manager ran created no
+      # issue, and records exactly that, so no finished run lacks a result.
+      - name: Record a run that created no issue
+        id: no_create
+        if: always() && steps.manage.outcome == 'skipped'
+        run: |
+          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
+          python3 .github/scripts/pricing_issue.py --no-create-record
+
+      # Per-attempt provenance. A `github.token` creation triggers no other
+      # workflow, so EVERY run attempt uploads the record the script wrote: its
+      # `result` (created, updated or no-create), run id and attempt, and for
+      # a created or updated issue its number and node id. An audit of issue
+      # openings requires one from every attempt, so the name carries the
+      # attempt: a re-run never collides with, or is covered by, an earlier
+      # attempt's record. The retention must cover the window that audit
+      # reads back over.
+      - name: Upload the run attempt's provenance record
+        if: always() && (steps.manage.outputs.provenance || steps.no_create.outputs.provenance) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pricing-provenance-attempt-${{ github.run_attempt }}
+          path: ${{ steps.manage.outputs.provenance || steps.no_create.outputs.provenance }}
+          retention-days: 90
+          if-no-files-found: error

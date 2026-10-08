@@ -206,6 +206,7 @@ def test_the_conversation_record_carries_no_free_text_field():
         "seq", "started_ns", "ended_ns", "duration_ns",
         "cpu_ns", "period_ns", "status", "claude_mode", "codex_mode",
         "claude_files", "codex_files",
+        "process_write_bytes", "write_status", "write_overlap",
     ]
 
 

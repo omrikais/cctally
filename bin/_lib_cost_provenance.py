@@ -122,7 +122,8 @@ def claude_card_rate_violations(snapshot) -> list:
     A closed amount of exactly $0 proves a missing card only while no Claude
     card prices a used token class at zero. Base rates, any present long-
     context tier, the derived 1-hour cache-write rate and any Fast multiplier
-    must all be positive; an empty list is that invariant.
+    must all be positive; an empty list is that invariant. A whole-request
+    (prompt-length) declaration must also be complete and well formed (#929).
     """
     _lib_pricing = _pricing()
     out = []
@@ -143,9 +144,45 @@ def claude_card_rate_violations(snapshot) -> list:
             _positive_rate(multiplier) and _positive_rate(tier_input)
         ):
             out.append((model, "cache_write_1h_above_200k_tokens"))
+        # Not the request hot path, so the unrecognised-field scan runs here
+        # too: a card carrying only such a field half-declares the tier (#929).
+        if (_lib_pricing._is_whole_request_card(card)
+                or _lib_pricing._unrecognised_whole_request_fields(card)):
+            out.extend(_whole_request_violations(
+                _lib_pricing, model, card, multiplier))
         stripped = _lib_pricing._strip_anthropic_model_prefix(model)
         if stripped in fast and not _positive_rate(fast[stripped]):
             out.append((model, "fast_multiplier"))
+    return out
+
+
+def _whole_request_violations(_lib_pricing, model, card, multiplier) -> list:
+    """The whole-request (prompt-length) tier's share of the invariant (#929).
+
+    Every higher rate must be present and positive, the threshold marker must
+    be the integer the `_above_100k_tokens` fields name, the card must not mix
+    in a marginal `_above_200k_tokens` tier, the derived higher 1-hour write
+    rate (higher input x multiplier) must be positive, and the card must carry
+    no `_above_100k_tokens` field other than the four recognised ones (the
+    selector and `check_table_shapes` refuse such a card too).
+    """
+    out = []
+    for _base, tier in _lib_pricing.CLAUDE_WHOLE_REQUEST_TIER_FIELDS:
+        if not _positive_rate(card.get(tier)):
+            out.append((model, tier))
+    key = _lib_pricing.CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY
+    threshold = card.get(key)
+    if (key not in card or isinstance(threshold, bool)
+            or not isinstance(threshold, int)
+            or threshold != _lib_pricing.CLAUDE_WHOLE_REQUEST_THRESHOLD):
+        out.append((model, key))
+    if any(k.endswith("_above_200k_tokens") for k in card):
+        out.append((model, "whole_request_mixed_tiers"))
+    if not (_positive_rate(multiplier) and _positive_rate(
+            card.get("input_cost_per_token_above_100k_tokens"))):
+        out.append((model, "cache_write_1h_above_100k_tokens"))
+    for field in _lib_pricing._unrecognised_whole_request_fields(card):
+        out.append((model, field))
     return out
 
 
@@ -155,11 +192,25 @@ def claude_entry_rates_positive(card, entry, snapshot) -> bool:
     Mirrors `_lib_pricing._calculate_entry_cost` term by term: each token class
     is priced below the long-context threshold at its base rate and above it at
     a present tier rate, and a known 1-hour cache-write split prices its share
-    at the derived input-times-multiplier rate.
+    at the derived input-times-multiplier rate. A whole-request card (#929) is
+    first resolved to the card the entry's prompt selects.
     """
     if card is None:
         return False
     _lib_pricing = _pricing()
+    # #929: a whole-request card prices this entry at the card its prompt
+    # selects, so judge THAT card; every check below then runs unchanged on
+    # it. A malformed declaration prices nothing reliably: refuse it.
+    if _lib_pricing._is_whole_request_card(card):
+        try:
+            card = _lib_pricing._select_claude_request_card(
+                card,
+                input_tokens=int(entry.input_tokens or 0),
+                cache_creation_tokens=int(entry.cache_creation_tokens or 0),
+                cache_read_tokens=int(entry.cache_read_tokens or 0),
+            )
+        except ValueError:
+            return False
     threshold = snapshot.tier_thresholds["claude"]
 
     def tiered(tokens, base_key, tier_key):

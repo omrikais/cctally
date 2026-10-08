@@ -153,6 +153,25 @@ def _shape_week_samples(rows, *, include_held: bool,
     return out
 
 
+def _week_rows_by_capture(cursor, *, by_id: bool) -> list:
+    """One week's sample rows in capture order: ``captured_at_utc`` ascending,
+    then ``id`` when ``by_id`` (the row's trailing column, which this strips).
+
+    #901 Amendment 19 T1 (spec I1): the reader returns every row of the week
+    anyway, so ordering them here costs no structure beyond its own result,
+    where ``ORDER BY captured_at_utc`` sorted the whole week through a temp
+    b-tree — and one subscription week is not a bound. ``list.sort`` is stable
+    over the same scan SQLite's in-memory sorter consumed, so rows tied on one
+    capture instant keep the order they had.
+    """
+    rows = cursor.fetchall()
+    if by_id:
+        rows.sort(key=lambda row: (row[0], row[-1]))
+        return [row[:-1] for row in rows]
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
 def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime,
                                   *, account_key: "str | None" = None,
                                   include_held: bool = False,
@@ -264,6 +283,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         we_date = dt.date.fromisoformat(drow[1])
         week_start_at = dt.datetime.combine(ws_date, dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
         week_end_at = dt.datetime.combine(we_date + dt.timedelta(days=1), dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
+        # One date: `idx_usage_week_time` (week_start_date, captured_at_utc
+        # DESC, id DESC) serves this order outright, with no sorter.
         rows = conn.execute(
             "SELECT captured_at_utc, weekly_percent, five_hour_percent, "
             "       weekly_observation_held" + _owner_column + " "
@@ -293,16 +314,16 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
             matching_texts.append(r[0])
     chosen_date = chosen[2]
     placeholders = ",".join("?" * len(matching_texts))
-    rows = conn.execute(
+    rows = _week_rows_by_capture(conn.execute(
         f"SELECT captured_at_utc, weekly_percent, five_hour_percent, "
-        f"       weekly_observation_held{_owner_column} "
+        f"       weekly_observation_held{_owner_column}"
+        f"{', id' if include_account else ''} "
         f"FROM weekly_usage_snapshots "
         f"WHERE (week_start_at IN ({placeholders}) "
         f"       OR (week_start_at IS NULL AND week_start_date = ?))"
-        f"{_acct_pred}{_held_pred} "
-        f"ORDER BY captured_at_utc{_sample_order}",
+        f"{_acct_pred}{_held_pred}",
         tuple(matching_texts) + (chosen_date,) + _acct_p,
-    ).fetchall()
+    ), by_id=include_account)
     samples = _shape_week_samples(rows, include_held=include_held,
                                   include_account=include_account)
     samples = [s for s in samples if s[0] <= now_utc]
@@ -2518,7 +2539,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                 m_rows: list[list[str]] = []
                 for idx, m in enumerate(milestone_rows, start=1):
                     pct = f"{int(m['percent_threshold'])}%"
-                    cum = f"${float(m['cumulative_cost_usd']):.6f}"
+                    cum = c._fmt_usd_accounting(float(m['cumulative_cost_usd']), 6)
                     marg = c.observation_gap_marginal_cell(
                         m["marginal_cost_usd"],
                         withheld=(idx - 1) in gap_disclosure.withheld_indexes,

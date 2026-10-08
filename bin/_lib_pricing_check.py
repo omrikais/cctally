@@ -1,9 +1,12 @@
 """Pure-fn kernel for the pricing-freshness check (spec 2026-05-29).
 
-No I/O, no import of `cctally`/`_lib_pricing` at module scope — every
-dependency (pricing predicates, tables, observed rows, LiteLLM snapshot)
-is passed in by the I/O glue in bin/cctally. Re-exported there like the
-other _lib_* kernels.
+No I/O, and no import of `cctally`/`_lib_pricing` at module scope. The
+tables, observed rows and LiteLLM snapshot are passed in by the I/O glue in
+bin/cctally, which re-exports this module like the other _lib_* kernels.
+The one exception is `check_table_shapes`, which resolves the pure
+`_lib_pricing` kernel per call through `_pricing()` (#929) so the
+whole-request declaration rule has a single definition shared with the
+cost engine's selector.
 """
 from __future__ import annotations
 
@@ -186,6 +189,13 @@ def expired_allowlist_entries(allowlist, as_of_date) -> list:
     ]
 
 
+def _pricing():
+    """The pricing kernel, resolved per call (never bound at module scope —
+    see this module's docstring). Mirrors ``_lib_cost_provenance._pricing``."""
+    import _lib_pricing
+    return _lib_pricing
+
+
 _CLAUDE_REQUIRED = ("input_cost_per_token", "output_cost_per_token",
                     "cache_creation_input_token_cost", "cache_read_input_token_cost")
 _CODEX_REQUIRED = ("input_cost_per_token", "cache_read_input_token_cost",
@@ -211,8 +221,14 @@ def check_table_shapes(claude_tbl, codex_tbl, zero_sentinels) -> list:
         if cost_fields and all(float(v) == 0.0 for v in cost_fields.values()) and not allow_zero:
             problems.append(f"{model}: all cost fields zero but not a documented sentinel")
 
+    # #929: a Claude whole-request (prompt-length) tier is all-or-nothing.
+    # The definition of "well formed" lives beside the selector that refuses a
+    # malformed card, so this check and the cost engine can never disagree.
+    declaration_problems = _pricing().claude_whole_request_declaration_problems
     for model, body in claude_tbl.items():
         _check(model, body, _CLAUDE_REQUIRED, allow_zero=False)
+        for p in declaration_problems(body):
+            problems.append(f"{model}: {p}")
     for model, body in codex_tbl.items():
         _check(model, body, _CODEX_REQUIRED, allow_zero=model in zero_sentinels)
     return problems

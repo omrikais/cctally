@@ -361,6 +361,13 @@ _SEMVER_RE = _lib_semver._SEMVER_RE
 
 _lib_pricing = _load_sibling("_lib_pricing")
 TIERED_THRESHOLD = _lib_pricing.TIERED_THRESHOLD
+# #929: the whole-request (prompt-length) tier Claude Haiku 5.5 declares.
+CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY = _lib_pricing.CLAUDE_WHOLE_REQUEST_THRESHOLD_KEY
+CLAUDE_WHOLE_REQUEST_THRESHOLD = _lib_pricing.CLAUDE_WHOLE_REQUEST_THRESHOLD
+CLAUDE_WHOLE_REQUEST_TIER_FIELDS = _lib_pricing.CLAUDE_WHOLE_REQUEST_TIER_FIELDS
+_select_claude_request_card = _lib_pricing._select_claude_request_card
+claude_whole_request_declaration_problems = (
+    _lib_pricing.claude_whole_request_declaration_problems)
 CLAUDE_MODEL_PRICING = _lib_pricing.CLAUDE_MODEL_PRICING
 CLAUDE_FAST_MULTIPLIER_OVERRIDES = _lib_pricing.CLAUDE_FAST_MULTIPLIER_OVERRIDES
 CODEX_TIERED_THRESHOLD = _lib_pricing.CODEX_TIERED_THRESHOLD
@@ -485,6 +492,7 @@ _supports_unicode_stdout = _lib_fmt._supports_unicode_stdout
 _display_width = _lib_fmt._display_width
 _boxed_table = _lib_fmt._boxed_table
 _fmt_num = _lib_fmt._fmt_num
+_fmt_usd_accounting = _lib_fmt._fmt_usd_accounting
 _truncate_num = _lib_fmt._truncate_num
 _ANSI_ESC_RE = _lib_fmt._ANSI_ESC_RE
 _truncate_display = _lib_fmt._truncate_display

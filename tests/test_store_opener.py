@@ -273,6 +273,9 @@ def test_pragma_policy_cache(tmp_path, monkeypatch):
         assert _pragma(conn, "busy_timeout") == 15000
         assert _pragma(conn, "journal_size_limit") == 128 * 1024 * 1024
         assert _pragma(conn, "auto_vacuum") == 2  # INCREMENTAL
+        # #901 §5.3a (Q11): statement journals in memory; cache size unchanged.
+        assert _pragma(conn, "temp_store") == 2  # MEMORY
+        assert _pragma(conn, "cache_size") == -2000
     finally:
         conn.close()
 
@@ -289,6 +292,8 @@ def test_pragma_policy_stats(tmp_path, monkeypatch):
         # stats auto_vacuum stays NONE on a normal open (§6.1: INCREMENTAL only
         # from the first epoch rebuild, never at in-place cutover).
         assert _pragma(conn, "auto_vacuum") == 0
+        assert _pragma(conn, "temp_store") == 2  # MEMORY (#901 Q11)
+        assert _pragma(conn, "cache_size") == -2000
         assert not Path(str(ns["DB_PATH"]) + "-wal").exists()
         assert not Path(str(ns["DB_PATH"]) + "-shm").exists()
     finally:
@@ -305,6 +310,8 @@ def test_pragma_policy_conversations(tmp_path, monkeypatch):
         assert _pragma(conn, "busy_timeout") == 15000
         assert _pragma(conn, "journal_size_limit") == 128 * 1024 * 1024
         assert _pragma(conn, "auto_vacuum") == 2
+        assert _pragma(conn, "temp_store") == 2  # MEMORY (#901 Q11)
+        assert _pragma(conn, "cache_size") == -2000
     finally:
         conn.close()
 

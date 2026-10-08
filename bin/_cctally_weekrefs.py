@@ -88,6 +88,131 @@ def _get_canonical_boundary_for_date(
     return None, None
 
 
+#: #901 (I1/G1, Amendment 1 item 8 and 1b): one leg per snapshot table of the
+#: recent-week read. Each groups ONE table's weeks newest first, streamed off a
+#: week-date-leading index, so neither leg sorts anything; `_recent_week_rows`
+#: merges the two. The usage leg reads the covering epoch-1017
+#: `idx_usage_week_date_group` (no table lookups), falling back to
+#: `idx_usage_week_time` on an index without it; the cost leg reads
+#: `idx_cost_week_time`.
+_RECENT_USAGE_WEEKS_SQL = (
+    "SELECT week_start_date, MAX(week_end_date) AS week_end_date "
+    "FROM weekly_usage_snapshots{hint}{account} "
+    "GROUP BY week_start_date ORDER BY week_start_date DESC"
+)
+_RECENT_COST_WEEKS_SQL = (
+    "SELECT week_start_date, MAX(week_end_date) AS week_end_date "
+    "FROM weekly_cost_snapshots{hint}{account} "
+    "GROUP BY week_start_date ORDER BY week_start_date DESC"
+)
+
+
+def _sqlite_sort_key(value) -> tuple:
+    """Rank a stored value the way SQLite's BINARY comparison ranks it.
+
+    NULL first, then numbers (integers and reals compared numerically), then
+    text in code-point order (which is UTF-8 byte order), then blobs.
+    """
+    if value is None:
+        return (0, 0)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value)
+    return (3, bytes(value))
+
+
+def _sqlite_max(left, right):
+    """SQLite's MAX() over two group maxima: NULL never wins."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left if _sqlite_sort_key(left) >= _sqlite_sort_key(right) else right
+
+
+def _recent_week_rows(
+    conn: sqlite3.Connection, limit: "int | None", *,
+    account_key: "str | None" = None,
+) -> "list[tuple[object, object]]":
+    """The newest ``limit`` week dates across both snapshot tables (#901).
+
+    Returns ``(week_start_date, week_end_date)`` pairs, newest date first, where
+    ``week_end_date`` is the latest end date EITHER table records for that
+    date: exactly the rows of the pre-#901 statement, which grouped the
+    ``UNION ALL`` of both tables through a temp b-tree over every snapshot ever
+    recorded and applied ``LIMIT`` only afterwards (Amendment 1 item 8,
+    ``c901-design-2``). Each table now streams its own groups in descending
+    date order; this merges the two cursors, combining equal dates with MAX,
+    holds one pending group per cursor, and stops at ``limit`` merged distinct
+    dates. ``None`` or a negative ``limit`` is unbounded and ``0`` returns
+    nothing, as SQL ``LIMIT`` did. The limit applies before any boundary
+    conversion or invalid-ref filtering, as it did.
+
+    Both cursors read one snapshot: inside the caller's transaction when there
+    is one (left open), otherwise inside a read transaction opened and closed
+    here. Each leg is pinned to its index only when the index exists; the
+    usage leg prefers the covering ``idx_usage_week_date_group`` (Amendment
+    1b) and keeps ``idx_usage_week_time`` as its compatibility fallback.
+    """
+    limit_n = -1 if limit is None else int(limit)
+    if limit_n == 0:
+        return []
+    present = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+            "('idx_usage_week_date_group', 'idx_usage_week_time', "
+            "'idx_cost_week_time')")
+    }
+    account = "" if account_key is None else " WHERE account_key = ?"
+    params: tuple = () if account_key is None else (account_key,)
+    usage_index = next(
+        (name for name in ("idx_usage_week_date_group", "idx_usage_week_time")
+         if name in present), None)
+    usage_sql = _RECENT_USAGE_WEEKS_SQL.format(
+        hint=f" INDEXED BY {usage_index}" if usage_index else "",
+        account=account)
+    cost_sql = _RECENT_COST_WEEKS_SQL.format(
+        hint=(" INDEXED BY idx_cost_week_time"
+              if "idx_cost_week_time" in present else ""),
+        account=account)
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    try:
+        usage = conn.execute(usage_sql, params)
+        cost = conn.execute(cost_sql, params)
+        try:
+            rows: "list[tuple[object, object]]" = []
+            pending_usage = usage.fetchone()
+            pending_cost = cost.fetchone()
+            while (pending_usage is not None or pending_cost is not None) and (
+                    limit_n < 0 or len(rows) < limit_n):
+                if pending_cost is None or (
+                        pending_usage is not None
+                        and _sqlite_sort_key(pending_usage[0])
+                        > _sqlite_sort_key(pending_cost[0])):
+                    rows.append((pending_usage[0], pending_usage[1]))
+                    pending_usage = usage.fetchone()
+                elif pending_usage is None or (
+                        _sqlite_sort_key(pending_cost[0])
+                        > _sqlite_sort_key(pending_usage[0])):
+                    rows.append((pending_cost[0], pending_cost[1]))
+                    pending_cost = cost.fetchone()
+                else:
+                    rows.append((pending_usage[0], _sqlite_max(
+                        pending_usage[1], pending_cost[1])))
+                    pending_usage = usage.fetchone()
+                    pending_cost = cost.fetchone()
+        finally:
+            usage.close()
+            cost.close()
+    finally:
+        if own_transaction:
+            conn.execute("COMMIT")
+    return rows
+
+
 def get_recent_weeks(
     conn: sqlite3.Connection, limit: "int | None", *,
     account_key: "str | None" = None,
@@ -100,33 +225,15 @@ def get_recent_weeks(
     # (today's byte-identical behavior); a real key / ``unattributed`` scopes both
     # snapshot legs to that account's weeks (the ``--account`` render consumers —
     # ``report`` — pass it explicitly).
-    limit_sql = -1 if limit is None else int(limit)
-    acct_pred = "" if account_key is None else " WHERE account_key = ?"
-    acct_p: tuple = () if account_key is None else (account_key,)
-    rows = conn.execute(
-        f"""
-        SELECT week_start_date, MAX(week_end_date) AS week_end_date
-        FROM (
-          SELECT week_start_date, week_end_date FROM weekly_usage_snapshots{acct_pred}
-          UNION ALL
-          SELECT week_start_date, week_end_date FROM weekly_cost_snapshots{acct_pred}
-        )
-        GROUP BY week_start_date
-        ORDER BY week_start_date DESC
-        LIMIT ?
-        """,
-        acct_p + acct_p + (limit_sql,),
-    ).fetchall()
-
     refs: list[WeekRef] = []
-    for row in rows:
-        date_str = row["week_start_date"]
+    for date_str, week_end_date in _recent_week_rows(
+            conn, limit, account_key=account_key):
         canon_start, canon_end = _get_canonical_boundary_for_date(
             conn, date_str, account_key=account_key)
         try:
             ref = make_week_ref(
                 week_start_date=date_str,
-                week_end_date=row["week_end_date"],
+                week_end_date=week_end_date,
                 week_start_at=canon_start,
                 week_end_at=canon_end,
             )

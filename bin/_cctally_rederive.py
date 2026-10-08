@@ -90,6 +90,13 @@ def _fingerprint(value) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+#: #874: the only tables the cache contract names. Inspecting any other table
+#: is not the planner's business, and on a virtual table whose module this
+#: SQLite build lacks (a legacy FTS5 index on a build without FTS5) even
+#: `PRAGMA table_info` raises before the contract could type the gap.
+_CONTRACT_TABLES = ("session_entries", "session_files", "codex_session_entries")
+
+
 def _cache_contract(cache_conn: sqlite3.Connection) -> dict[str, set[str]]:
     names = {
         row[0] for row in cache_conn.execute(
@@ -99,12 +106,18 @@ def _cache_contract(cache_conn: sqlite3.Connection) -> dict[str, set[str]]:
         name: {
             row[1] for row in cache_conn.execute(f"PRAGMA table_info({name})")
         }
-        for name in names
+        for name in _CONTRACT_TABLES
+        if name in names
     }
 
 
 def _cache_fingerprint(cache_conn: sqlite3.Connection, *, include_codex=False) -> str:
-    """Hash every cost-bearing Claude cache row and its project metadata."""
+    """Hash every cost-bearing Claude cache row and its project metadata.
+
+    The caller must have validated the cache contract first, including
+    ``validate_codex_cache_contract`` when ``include_codex`` is set (#874):
+    a missing column here is a raw sqlite error, not a typed data gap.
+    """
     entry_columns = (
         "source_path", "line_offset", "timestamp_utc", "model", "input_tokens",
         "output_tokens", "cache_create_tokens", "cache_read_tokens",
@@ -123,10 +136,6 @@ def _cache_fingerprint(cache_conn: sqlite3.Connection, *, include_codex=False) -
     ]
     basis = {"sessionEntries": entries, "sessionFiles": files}
     if include_codex:
-        if "codex_session_entries" not in _cache_contract(cache_conn):
-            raise _lib_rederive.RederiveDataGap(
-                "missing cache.db table codex_session_entries"
-            )
         basis["codexEntries"] = [
             list(row) for row in cache_conn.execute(
                 "SELECT source_path,line_offset,timestamp_utc,session_id,model,"
@@ -1088,15 +1097,20 @@ def plan_claude_usage(
             + ",".join(report.unclassified_evt_kinds)
             + " op=" + ",".join(report.unclassified_op_kinds)
         )
-    _lib_rederive.validate_claude_cache_contract(_cache_contract(cache_conn))
-    raw_records = _rederivable_raw_records(records)
-    _validate_cache_rows(cache_conn, raw_records)
+    tables = _cache_contract(cache_conn)
+    _lib_rederive.validate_claude_cache_contract(tables)
     codex_pricing_records = any(
         (record.get("payload") or {}).get("vendor") == "codex"
         and (record.get("payload") or {}).get("kind") == "budget"
         and (record.get("payload") or {}).get("_pricing")
         for record in records
     )
+    if codex_pricing_records:
+        # #874: the Codex fingerprint and re-pricing read the Codex cache only
+        # here, so its contract is required only here, and before any reader.
+        _lib_rederive.validate_codex_cache_contract(tables)
+    raw_records = _rederivable_raw_records(records)
+    _validate_cache_rows(cache_conn, raw_records)
     cache_fingerprint = _cache_fingerprint(
         cache_conn, include_codex=codex_pricing_records,
     )

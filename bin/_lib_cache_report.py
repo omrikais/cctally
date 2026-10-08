@@ -59,9 +59,13 @@ stable_sum = _import_stable_sum()
 
 
 def _import_pricing_kernel():
-    """Resolve the ``_lib_pricing`` symbols this kernel needs (#195/#413):
-    ``CACHE_WRITE_1H_MULTIPLIER`` (the derived 1-hour cache-write rate) and
-    ``claude_usage_dict`` (the single cost-feeding usage-dict constructor).
+    """Resolve the ``_lib_pricing`` symbols this kernel needs, returned in
+    this order: ``CACHE_WRITE_1H_MULTIPLIER`` (the derived 1-hour cache-write
+    rate, #195), ``_claude_fast_multiplier`` (the Fast-mode multiplier for a
+    model), ``claude_usage_dict`` (the single cost-feeding usage-dict
+    constructor, #413), ``TIERED_THRESHOLD`` (the legacy 200K marginal-tier
+    boundary) and ``_select_claude_request_card`` (the whole-request card
+    selector, #929).
 
     Same shape and same justification as ``_import_stable_sum`` above:
     ``_lib_pricing`` is a PURE stdlib leaf with no sibling imports, so binding
@@ -79,6 +83,7 @@ def _import_pricing_kernel():
             m._claude_fast_multiplier,
             m.claude_usage_dict,
             m.TIERED_THRESHOLD,
+            m._select_claude_request_card,
         )
     from pathlib import Path
     import importlib.util
@@ -99,11 +104,13 @@ def _import_pricing_kernel():
         m._claude_fast_multiplier,
         m.claude_usage_dict,
         m.TIERED_THRESHOLD,
+        m._select_claude_request_card,
     )
 
 
 (CACHE_WRITE_1H_MULTIPLIER, _claude_fast_multiplier,
- claude_usage_dict, DEFAULT_TIERED_THRESHOLD) = _import_pricing_kernel()
+ claude_usage_dict, DEFAULT_TIERED_THRESHOLD,
+ _select_claude_request_card) = _import_pricing_kernel()
 
 
 # ``DEFAULT_TIERED_THRESHOLD`` above is Anthropic's per-call >200K-tokens tier,
@@ -353,6 +360,7 @@ def _compute_entry_cache_dollars(
     cache_creation_tokens: int,
     cache_read_tokens: int,
     *,
+    input_tokens: int,
     pricing: dict,
     tiered_threshold: "int | None" = None,
     cache_1h_tokens: int | None = None,
@@ -384,12 +392,27 @@ def _compute_entry_cache_dollars(
     than in the signature. A default argument is evaluated once, at
     function-definition time, so a change to the module global would never
     reach the calls.
+
+    ``input_tokens`` (REQUIRED keyword, #929) is the entry's uncached input.
+    A whole-request card (Claude Haiku 5.5) selects ONE card per request from
+    its full prompt — input + cache creation + cache read — exactly as the
+    cost kernel does, so the card is selected once here, before any rate is
+    read. Selecting from the cache tokens alone would price a long request at
+    the base card. A legacy card is returned unchanged and every expression
+    below runs exactly as before.
     """
     if tiered_threshold is None:
         tiered_threshold = DEFAULT_TIERED_THRESHOLD
     p = _lookup_pricing(model, pricing) or {}
     if not p:
         return (0.0, 0.0, 0.0)
+    # The selected card carries no `_above_200k_tokens` key, so
+    # `_tiered_rate` returns its flat rates, and the wasted expression below
+    # is already the direct TTL form on the selected input rate.
+    p = _select_claude_request_card(
+        p, input_tokens=input_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens)
 
     def _tiered_rate(tokens: int, base_key: str, tiered_key: str) -> float:
         """Blended $/token rate for a single-call token count under tiered pricing."""
@@ -527,7 +550,9 @@ def _aggregate_cache_by_day(
             )
         else:
             saved, wasted, net = _compute_entry_cache_dollars(
-                entry.model, create_tok, read_tok, pricing=pricing,
+                entry.model, create_tok, read_tok,
+                input_tokens=entry.usage.get("input_tokens", 0),   # #929
+                pricing=pricing,
                 # #195: the normalized flat key the ingest chokepoint writes;
                 # absent on a pre-split row -> None -> unchanged pricing.
                 cache_1h_tokens=entry.usage.get("cache_creation_1h_input_tokens"),
@@ -703,6 +728,7 @@ def _aggregate_cache_by_session(
                 entry.model,
                 entry.cache_creation_tokens,
                 entry.cache_read_tokens,
+                input_tokens=entry.input_tokens,   # #929
                 pricing=pricing,
                 # #195: getattr, not attribute access. This is a PURE kernel with
                 # a duck-typed entry contract — callers pass `_JoinedClaudeEntry`
@@ -1156,6 +1182,7 @@ def _aggregate_cache_breakdown(
                 getattr(e, "model", ""),
                 getattr(e, "cache_creation_tokens", 0),
                 getattr(e, "cache_read_tokens", 0),
+                input_tokens=getattr(e, "input_tokens", 0),   # #929
                 pricing=pricing,
                 # #195: getattr default None == split unknown, so an entry type
                 # that does not carry the split prices exactly as before.
@@ -1270,7 +1297,9 @@ def aggregate_by_day_project(
         create_tok = getattr(e, "cache_creation_tokens", 0)
         read_tok = getattr(e, "cache_read_tokens", 0)
         _s, _w, net = _compute_entry_cache_dollars(
-            model, create_tok, read_tok, pricing=pricing,
+            model, create_tok, read_tok,
+            input_tokens=getattr(e, "input_tokens", 0),   # #929
+            pricing=pricing,
             cache_1h_tokens=getattr(e, "cache_1h_tokens", None),   # #195
             speed=getattr(e, "speed", None),
         )

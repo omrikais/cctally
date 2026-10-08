@@ -20,6 +20,7 @@ later column-only deltas.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import sqlite3
 
 import pytest
@@ -71,6 +72,18 @@ def _columns(conn, table):
     return [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")]
 
 
+def _drop_read_indexes(conn):
+    """Drop #901's epoch-1017 read indexes, which no store this module models
+    ever carried: a 1004 index and a legacy cut-over index both predate them.
+    One of them (`idx_quota_blocks_root_group_pairs`) reads the reverse-map
+    columns the downgrades below remove, and SQLite refuses to drop a column
+    an index still names. The rebuild and the cutover recreate every one."""
+    for _table, _columns_read, statement in _cctally_core._STATS_READ_INDEX_DDL:
+        name = re.match(
+            r"CREATE INDEX IF NOT EXISTS (\w+) ", statement).group(1)
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+
 def _resolve_epoch_transition():
     import _cctally_store as store
     return store.resolve_stats_epoch_mismatch()
@@ -80,6 +93,7 @@ def _downgrade_to_previous_epoch(ns):
     """Turn the live index into the shape a pre-public-#5 binary left behind."""
     conn = ns["open_db"]()
     try:
+        _drop_read_indexes(conn)
         for column in NEW_BLOCK_COLUMNS:
             conn.execute(
                 f"ALTER TABLE quota_window_blocks DROP COLUMN {column}")
@@ -238,6 +252,7 @@ def test_a_legacy_index_cuts_over_carrying_the_projection_schema(
     """
     conn = ns["open_db"]()
     try:
+        _drop_read_indexes(conn)
         for column in NEW_BLOCK_COLUMNS:
             conn.execute(
                 f"ALTER TABLE quota_window_blocks DROP COLUMN {column}")

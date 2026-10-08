@@ -5,6 +5,8 @@ import importlib
 import os
 import sys
 
+import pytest
+
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "bin")
 sys.path.insert(0, BIN)
@@ -81,14 +83,63 @@ def test_reclaimable_check_is_registered_in_database_category():
     ) in database
 
 
-def test_conversation_reclaimable_warns_with_targeted_remediation():
-    result = doctor._check_db_conversations_reclaimable(_state(
-        conversations_db_page_count=200,
-        conversations_db_freelist_count=50,
-    ))
+GiB = 1024 ** 3
+PAGE = 4096
+EPISODE = {"policy_version": 1, "eligible": True}
 
+
+@pytest.mark.parametrize("free, total, record, severity, summary", [
+    (300, 1000, None, "ok", "below threshold"),
+    (2 * GiB // PAGE + 1, 4 * GiB // PAGE, None, "warn",
+     "Reclaiming 2.0 GiB of free transcript space at a paced rate."),
+    (int(1.5 * GiB) // PAGE, 4 * GiB // PAGE, None, "ok", "below threshold"),
+    (int(1.5 * GiB) // PAGE, 4 * GiB // PAGE, EPISODE, "warn",
+     "Reclaiming 1.5 GiB of free transcript space at a paced rate."),
+    (GiB // PAGE, 4 * GiB // PAGE, EPISODE, "ok", "below threshold"),
+    (16 * GiB // PAGE, 32 * GiB // PAGE, None, "fail",
+     "reclaim backlog 16.0 GiB is at or over the 16.0 GiB ceiling; "
+     "transcript rebuilds are refused"),
+    (None, None, None, "ok", "below threshold"),
+])
+def test_conversation_reclaimable_remap_table(free, total, record, severity,
+                                              summary):
+    result = doctor._check_db_conversations_reclaimable(_state(
+        conversations_db_page_count=total,
+        conversations_db_freelist_count=free,
+        conversations_db_page_size=None if total is None else PAGE,
+        conversations_reclaim_pending=record))
     assert result.id == "db.conversations_reclaimable"
+    assert (result.severity, result.summary) == (severity, summary)
+    if severity == "ok":
+        assert result.remediation is None
+    else:
+        assert "cctally db vacuum --db conversations" in result.remediation
+    # #901 §5.4 (Q9): a paced WARN also says why it waits and names a
+    # planner refusal by reason, so only the WARN rows carry those two keys.
+    paced = {"reclaim_wait", "reclaim_refusal"} if severity == "warn" else set()
+    assert set(result.details) == {
+        "conversations_db_page_count", "conversations_db_freelist_count",
+        "conversations_db_page_size", "conversations_db_free_ratio",
+        "reclaimable_bytes", "reclaim_start_bytes", "reclaim_start_ratio",
+        "reclaim_stop_bytes", "reclaim_stop_ratio", "reclaim_ceiling_bytes",
+        "reclaim_episode_active", "reclaim_failure"} | paced
+    if severity == "warn":
+        # No running dashboard reports a refusal and no failure is recorded,
+        # so the wait is the paced one.
+        assert result.details["reclaim_wait"] == "paced"
+        assert result.details["reclaim_refusal"] is None
+    assert result.details["reclaim_ceiling_bytes"] == 16 * GiB
+
+
+def test_a_failing_eligible_reclaim_warns_with_its_reason():
+    result = doctor._check_db_conversations_reclaimable(_state(
+        conversations_db_page_count=4 * GiB // PAGE,
+        conversations_db_freelist_count=int(1.5 * GiB) // PAGE,
+        conversations_db_page_size=PAGE,
+        conversations_reclaim_pending={
+            **EPISODE, "last_failure": {
+                "reason": "no_checkpoint_on_close_unavailable",
+                "at": "2026-10-03T12:00:00Z"}}))
     assert result.severity == "warn"
-    assert result.summary == "high — 25.0% of conversations.db pages are free"
-    assert "cctally db vacuum --db conversations" in (result.remediation or "")
-    assert result.details["conversations_db_free_ratio"] == 0.25
+    assert result.details["reclaim_failure"]["reason"] == \
+        "no_checkpoint_on_close_unavailable"

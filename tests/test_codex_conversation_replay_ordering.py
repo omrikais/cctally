@@ -32,7 +32,8 @@ if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import _cctally_core  # noqa: E402
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)  # noqa: E402
 
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1"
 CONV_PRE = (
@@ -42,7 +43,8 @@ CONV_PRE = (
 
 def _stage(tmp_path, monkeypatch, scenario="modern-full"):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Replay ordering needs its fixed synthetic transcript to survive rebuilds.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollout = (
         provider_root / "sessions" / "2026" / "07" / "15" / "rollout.jsonl")

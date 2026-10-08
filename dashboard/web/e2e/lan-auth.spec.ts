@@ -3,11 +3,11 @@ import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:c
 import { createServer } from 'node:net';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadManifest } from './utils';
+import { e2eRuntimePath, loadManifest } from './utils';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '../../..');
-const RUNTIME = resolve(HERE, '.runtime');
+const RUNTIME = e2eRuntimePath();
 const CCTALLY = resolve(REPO_ROOT, 'bin/cctally');
 
 function isolatedEnv(): NodeJS.ProcessEnv {

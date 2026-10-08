@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { AccountHeroCards } from './AccountHeroCards';
 import { _resetForTests, dispatch, updateSnapshot } from '../store/store';
 import { makeSourceEnvelope } from '../test-utils/sourceEnvelope';
@@ -98,6 +98,63 @@ describe('AccountHeroCards (unified per-account view)', () => {
     expect(unattr.className).toContain('is-dimmed');
     expect(unattr.querySelector('.account-hero-card-bars')).toBeNull();
     expect(unattr.textContent).toContain('totals only');
+  });
+});
+
+describe('AccountHeroCards — selection scroll position (#897)', () => {
+  function renderAccounts() {
+    updateSnapshot(decoratedEnv([
+      card({ accountKey: A, label: 'alice', spendUsd: 1 }),
+      card({ accountKey: B, label: 'bob', spendUsd: 2 }),
+    ]));
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    render(<AccountHeroCards />);
+  }
+
+  it('starts All accounts at the first card after focusing the second account', () => {
+    renderAccounts();
+    act(() => dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: B }));
+    // Chromium preserves the previously snapped card when its predecessor
+    // returns. Retain that offset while changing the visible account set.
+    screen.getByTestId('account-hero-cards').scrollLeft = 111;
+    act(() => dispatch({ type: 'SET_ACCOUNT_FOCUS', source: 'codex', slot: 'provider', account: 'all' }));
+    expect(screen.getByTestId('account-hero-cards').scrollLeft).toBe(0);
+    expect(screen.getAllByTestId('account-hero-card')[0]).toHaveAttribute('data-account', A);
+  });
+
+  it('starts a newly selected source at the first account card', () => {
+    renderAccounts();
+    screen.getByTestId('account-hero-cards').scrollLeft = 111;
+    act(() => dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'all' }));
+    expect(screen.getByTestId('account-hero-cards').scrollLeft).toBe(0);
+  });
+
+  it('preserves the user scroll position on routine envelope updates', () => {
+    renderAccounts();
+    screen.getByTestId('account-hero-cards').scrollLeft = 55;
+    act(() => updateSnapshot(decoratedEnv([
+      card({ accountKey: A, label: 'alice', spendUsd: 3 }),
+      card({ accountKey: B, label: 'bob', spendUsd: 4 }),
+    ])));
+    expect(screen.getByTestId('account-hero-cards').scrollLeft).toBe(55);
+    expect(screen.getByText('$4.00')).toBeInTheDocument();
+  });
+
+  it('shows the cue at the start and mid-scroll, and hides it at the end', () => {
+    renderAccounts();
+    const rail = screen.getByTestId('account-hero-cards');
+    Object.defineProperties(rail, {
+      scrollWidth: { value: 500 },
+      clientWidth: { value: 390 },
+    });
+    fireEvent.scroll(rail);
+    expect(screen.getByTestId('account-hero-scroll-cue')).toHaveAttribute('aria-hidden', 'false');
+    rail.scrollLeft = 55;
+    fireEvent.scroll(rail);
+    expect(screen.getByTestId('account-hero-scroll-cue')).toHaveAttribute('aria-hidden', 'false');
+    rail.scrollLeft = 110;
+    fireEvent.scroll(rail);
+    expect(screen.getByTestId('account-hero-scroll-cue')).toHaveAttribute('aria-hidden', 'true');
   });
 });
 

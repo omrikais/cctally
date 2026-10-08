@@ -6,14 +6,16 @@ name: Doc lint
 # lint logic lives in bin/cctally-doc-lint-test (also glob-run by
 # cctally-test-all in every existing lane); this workflow just runs it on
 # md-touching events. Mixed code+md pushes run both workflows — a few
-# redundant seconds, accepted for trigger simplicity.
+# redundant seconds, accepted for trigger simplicity. The lint never reads
+# the shared memory publication set (#899 S2), so a memory-only push does not
+# trigger it; the negations follow the positive pattern (ordered semantics).
 on:
   push:
     branches: [main]
-    paths: ['**/*.md']
+    paths: ['**/*.md', '!.claude-memory/**', '!.agentmem/codex-memory/**', '!.agentmem/topics.json']
   pull_request:
     types: [opened, synchronize, reopened]
-    paths: ['**/*.md']
+    paths: ['**/*.md', '!.claude-memory/**', '!.agentmem/codex-memory/**', '!.agentmem/topics.json']
 
 jobs:
   doc-lint:

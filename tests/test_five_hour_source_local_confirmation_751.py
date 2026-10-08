@@ -100,7 +100,6 @@ def _ingest(jr, J, sequence):
         jr.append_record(
             _obs(J, at=at, source=source, five_hour_percent=pct,
                  weekly_percent=weekly),
-            now_utc=FIXED,
         )
         jr.run_stats_ingest(mode="authoritative")
 
@@ -157,6 +156,15 @@ INCIDENT = [
 def ns(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    # One clock for every journal line. The fixture's observations and the
+    # evt lines the ingester appends are both placed in a month segment by
+    # `_utc_now`; pinned on the fixture's side alone, the real clock put the
+    # ingester's lines in a later month, the ingest cursor moved past the
+    # fixture's segment, and every observation appended after the first
+    # ingest was never read. Placed after `load_script()`, which drops the
+    # sibling modules from `sys.modules`.
+    import _cctally_journal
+    monkeypatch.setattr(_cctally_journal, "_utc_now", lambda: FIXED)
     return ns
 
 
@@ -223,7 +231,7 @@ def test_replaying_the_arming_observation_cannot_confirm_it(ns):
     descent = _obs(J, at="2026-09-04T05:29:09Z", source="api",
                    five_hour_percent=7.0)
     for _ in range(2):
-        jr.append_record(descent, now_utc=FIXED)
+        jr.append_record(descent)
         jr.run_stats_ingest(mode="authoritative")
 
     assert _credit_events(ns) == [], (
@@ -536,7 +544,7 @@ def _recorded_sources(ns):
 
 
 def _ingest_one(jr, J, **kwargs):
-    jr.append_record(_obs(J, **kwargs), now_utc=FIXED)
+    jr.append_record(_obs(J, **kwargs))
     jr.run_stats_ingest(mode="authoritative")
 
 

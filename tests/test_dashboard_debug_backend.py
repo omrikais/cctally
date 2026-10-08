@@ -270,6 +270,7 @@ def test_debug_backend_reports_the_tick_record_with_tracing_off(
             "ingest_ns", "builder_ns", "dispatch", "codex_regime",
             "publication", "cold", "published_ns", "published_at", "period_ns",
             "cache_pin_ns", "cpu_ns",
+            "process_write_bytes", "write_status", "write_overlap",
         }, f"the wire names drifted from spec §1.1: {sorted(record)}"
         assert record["dispatch"] == "full"
         assert record["codex_regime"] == "active"
@@ -386,6 +387,7 @@ def test_debug_backend_publishes_conversation_passes_via_the_real_recorder(
                 "seq", "started_ns", "ended_ns", "duration_ns",
                 "cpu_ns", "period_ns", "status", "claude_mode", "codex_mode",
                 "claude_files", "codex_files",
+                "process_write_bytes", "write_status", "write_overlap",
             }, "no field may carry free text"
             for value in row.values():
                 assert isinstance(value, (int, str, type(None)))

@@ -61,9 +61,9 @@ def test_cache_read_dollars_apply_the_tiered_rate_above_200k():
     pricing = _pricing()
     threshold = crk.DEFAULT_TIERED_THRESHOLD
     below = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, threshold - 1, pricing=pricing)[0]
+        TIERED_MODEL, 0, threshold - 1, input_tokens=0, pricing=pricing)[0]
     above = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, threshold * 2, pricing=pricing)[0]
+        TIERED_MODEL, 0, threshold * 2, input_tokens=0, pricing=pricing)[0]
     rate_below = below / (threshold - 1)
     rate_above = above / (threshold * 2)
     assert rate_above != rate_below, (
@@ -77,9 +77,9 @@ def test_cache_write_dollars_apply_the_tiered_rate_above_200k():
     pricing = _pricing()
     threshold = crk.DEFAULT_TIERED_THRESHOLD
     below = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, threshold - 1, 0, pricing=pricing)[1]
+        TIERED_MODEL, threshold - 1, 0, input_tokens=0, pricing=pricing)[1]
     above = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, threshold * 2, 0, pricing=pricing)[1]
+        TIERED_MODEL, threshold * 2, 0, input_tokens=0, pricing=pricing)[1]
     rate_below = below / (threshold - 1)
     rate_above = above / (threshold * 2)
     assert rate_above != rate_below, (
@@ -109,9 +109,9 @@ def test_the_default_threshold_is_the_pricing_value_resolved_at_call_time(
     # caller makes, and it is the one a default-argument bind would have left
     # on the import-time value.
     below = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, 49_999, pricing=pricing)[0]
+        TIERED_MODEL, 0, 49_999, input_tokens=0, pricing=pricing)[0]
     above = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, 100_000, pricing=pricing)[0]
+        TIERED_MODEL, 0, 100_000, input_tokens=0, pricing=pricing)[0]
     assert above / 100_000 != below / 49_999, (
         "the 50,000 threshold never engaged, so the call did not read the "
         "module global")
@@ -123,9 +123,9 @@ def test_the_tier_boundary_itself_is_not_crossed_at_exactly_200k():
     pricing = _pricing()
     threshold = crk.DEFAULT_TIERED_THRESHOLD
     at = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, threshold, pricing=pricing)[0]
+        TIERED_MODEL, 0, threshold, input_tokens=0, pricing=pricing)[0]
     one_below = crk._compute_entry_cache_dollars(
-        TIERED_MODEL, 0, threshold - 1, pricing=pricing)[0]
+        TIERED_MODEL, 0, threshold - 1, input_tokens=0, pricing=pricing)[0]
     assert at / threshold == pytest.approx(one_below / (threshold - 1))
 
 

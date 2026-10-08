@@ -60,6 +60,7 @@ Spec: docs/superpowers/specs/2026-05-13-bin-cctally-split-design.md
 from __future__ import annotations
 
 import argparse
+import contextlib
 import contextvars
 import datetime as dt
 import enum
@@ -76,7 +77,7 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple
 
 
 def _cctally():
@@ -3876,12 +3877,28 @@ def _codex_quota_ledger_ddl() -> tuple[str, ...]:
 #: because SQLite only uses an expression index when the query's expression
 #: matches the indexed one — indexing the bare ``COALESCE`` while the reader
 #: wraps it in ``unixepoch`` silently buys nothing.
+#:
+#: #901 Q11 (spec §5.3a, 901-PA-001 a; cache migration 048): the four order
+#: columns after the five equality members are the loader's ``ORDER BY
+#: source_root_key, captured_at_utc, resets_at_utc, source_path, line_offset``
+#: minus its constant first term, so each physical-group shard streams from the
+#: seek. Without them every shard re-sorted its group's whole history ("USE TEMP
+#: B-TREE FOR LAST 4 TERMS OF ORDER BY"; 3.3, 12.5 and 5.4 MB of temp in three
+#: measured calls), and one window group is a week of activity, not a bound.
 _QUOTA_GROUP_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_qws_physical_group "
     "ON quota_window_snapshots("
     "  source_root_key, logical_limit_key, observed_slot, window_minutes,"
-    "  unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)))"
+    "  unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)),"
+    "  captured_at_utc, resets_at_utc, source_path, line_offset)"
     " WHERE source='codex'"
+)
+#: The key columns ``PRAGMA index_xinfo`` reports for the current definition
+#: (``None`` is the expression member). An index of the same name with any
+#: other key list is a pre-048 definition and is replaced.
+_QUOTA_GROUP_INDEX_KEY_COLUMNS = (
+    "source_root_key", "logical_limit_key", "observed_slot", "window_minutes",
+    None, "captured_at_utc", "resets_at_utc", "source_path", "line_offset",
 )
 
 
@@ -3916,6 +3933,16 @@ def _apply_codex_quota_group_index(conn: sqlite3.Connection) -> None:
     Guarded on ``canonical_resets_at_utc`` for the same reason the ledger is: a
     legacy-shape cache whose schema apply took the FTS early-return before that
     column add would raise ``no such column`` here.
+
+    #901 Q11 (cache migration 048) extends the key list with the loader's order
+    columns (see ``_QUOTA_GROUP_INDEX_DDL``). ``CREATE INDEX IF NOT EXISTS``
+    never reshapes an existing index, so an index of this name with any other
+    key list is dropped and recreated, and the two statements commit together
+    (its own ``BEGIN IMMEDIATE``, or a savepoint inside a caller's
+    transaction): the loader probes for the index by name and then pins it with
+    ``INDEXED BY``, so a reader must never find it missing in between. A
+    current index is left alone, so the helper is idempotent and costs one
+    ``PRAGMA`` on a current store.
     """
     cols = {
         str(row[1]) for row in conn.execute(
@@ -3923,8 +3950,34 @@ def _apply_codex_quota_group_index(conn: sqlite3.Connection) -> None:
     }
     if not cols or "canonical_resets_at_utc" not in cols:
         return
-    conn.execute(_QUOTA_GROUP_INDEX_DDL)
-    conn.execute("DROP INDEX IF EXISTS idx_qws_window_ident")
+    current = tuple(
+        row[2] for row in conn.execute(
+            "PRAGMA index_xinfo(idx_qws_physical_group)") if row[5])
+    retired = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index'"
+        " AND name='idx_qws_window_ident'").fetchone() is not None
+    if current == _QUOTA_GROUP_INDEX_KEY_COLUMNS and not retired:
+        return
+    own_transaction = not conn.in_transaction
+    conn.execute(
+        "BEGIN IMMEDIATE" if own_transaction
+        else "SAVEPOINT codex_quota_group_index")
+    try:
+        if current and current != _QUOTA_GROUP_INDEX_KEY_COLUMNS:
+            conn.execute("DROP INDEX IF EXISTS idx_qws_physical_group")
+        conn.execute(_QUOTA_GROUP_INDEX_DDL)
+        conn.execute("DROP INDEX IF EXISTS idx_qws_window_ident")
+    except BaseException:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO codex_quota_group_index")
+            conn.execute("RELEASE codex_quota_group_index")
+        raise
+    if own_transaction:
+        conn.commit()
+    else:
+        conn.execute("RELEASE codex_quota_group_index")
 
 
 #: Partial index over the rows the standing `observed_model` resolution can
@@ -4283,6 +4336,410 @@ def _apply_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# ── #901 W1: the maintained raw-partition maxima (spec §5.1, T1) ─────────────
+#
+# `load_codex_quota_observations(latest_per_identity=True)` computed
+# `MAX(unixepoch(captured_at_utc)) OVER (PARTITION BY <nine raw columns>)` across
+# every retained Codex quota row on every doctor refresh; on the measured store
+# that sorted 565K rows through ~1.1 GB of temp files per call (spec §1.2). The
+# table below holds exactly that window's per-partition maximum, maintained by
+# triggers in the same transaction as every mutation, so the latest read becomes
+# a scan of ~10^3 summary rows plus one index seek per partition for the rows
+# tied at its maximum second (tests/test_901_partition_latest_maintenance.py
+# holds it to the frozen window query after every writer class).
+#
+# Keys are `quote(<raw column>)`: NOT NULL, collision-free across NULL, '' and
+# storage classes, and equal exactly when the window's PARTITION BY puts two
+# rows in one partition (no collation on these columns; TEXT affinity stores
+# numbers as text and INTEGER affinity integral reals as integers, so value
+# equality and quote() equality coincide). The key columns are declared BLOB on
+# purpose: a TEXT key column gives `quote(q.col) = s.key` TEXT comparison
+# affinity, and SQLite then refuses the expression index (measured: the tie
+# fetch fell back to walking the whole `source` autoindex). The seek index leads
+# with `source` for the same measured reason.
+#
+# The triggers use built-in functions only (quote, trim, coalesce, unixepoch),
+# so an older binary that opens the store keeps them firing. They never upsert:
+# an outer statement's conflict policy propagates into trigger-body statements,
+# so every repair is a DELETE followed by an INSERT that cannot conflict. A
+# REPLACE against the snapshots table would delete rows without firing the
+# delete trigger (recursive_triggers is off); no writer issues one, and
+# test_no_writer_replaces_quota_rows fails if one appears.
+#
+# `unixepoch()` in an index expression throws on the literal 'now', so the seek
+# index refuses a Codex row whose capture is 'now' — the same property
+# idx_qws_physical_group already has for the reset. Ingest writes only
+# `_utc_iso` instants.
+
+#: Must equal `_cctally_quota._CODEX_QUOTA_REQUIRED_TEXT` (#500: the loader and
+#: every population derived for it agree on one required-text set);
+#: tests/test_901_partition_latest_maintenance.py pins the equality.
+_CODEX_QUOTA_LATEST_REQUIRED_TEXT = (
+    "source", "source_root_key", "source_path", "captured_at_utc",
+    "observed_slot", "logical_limit_key", "resets_at_utc",
+)
+
+#: (summary key column, raw column; None means the coalesced reset anchor), in
+#: the window query's PARTITION BY order.
+_CODEX_QUOTA_LATEST_KEYS = (
+    ("k_source_root_key", "source_root_key"),
+    ("k_logical_limit_key", "logical_limit_key"),
+    ("k_observed_slot", "observed_slot"),
+    ("k_window_minutes", "window_minutes"),
+    ("k_limit_id", "limit_id"),
+    ("k_limit_name", "limit_name"),
+    ("k_observed_model", "observed_model"),
+    ("k_account_key", "account_key"),
+    ("k_reset_anchor", None),
+)
+_CODEX_QUOTA_LATEST_KEY_COLUMNS = tuple(
+    key for key, _column in _CODEX_QUOTA_LATEST_KEYS)
+
+#: Every column a partition key or a validity predicate reads.
+_CODEX_QUOTA_LATEST_UPDATE_OF = (
+    "source", "source_root_key", "source_path", "captured_at_utc",
+    "observed_slot", "logical_limit_key", "resets_at_utc",
+    "canonical_resets_at_utc", "window_minutes", "limit_id", "limit_name",
+    "observed_model", "account_key",
+)
+
+#: The five objects whose joint presence means the summary has been maintained
+#: since it was bootstrapped. The reader uses it only when all five exist.
+_CODEX_QUOTA_LATEST_OBJECTS = (
+    ("table", "codex_quota_partition_latest"),
+    ("index", "idx_qws_partition_capture"),
+    ("trigger", "trg_qws_latest_ins"),
+    ("trigger", "trg_qws_latest_del"),
+    ("trigger", "trg_qws_latest_upd"),
+)
+
+
+def _codex_quota_latest_raw(column, prefix: str) -> str:
+    if column is None:
+        return (f"COALESCE({prefix}canonical_resets_at_utc, "
+                f"{prefix}resets_at_utc)")
+    return f"{prefix}{column}"
+
+
+def _codex_quota_latest_validity_sql(prefix: str = "") -> str:
+    """The loader's SQL-statable validity predicates, for one row image."""
+    terms = [f"{prefix}source='codex'", f"{prefix}source_root_key IS NOT NULL"]
+    terms += [f"trim(coalesce({prefix}{column}, '')) <> ''"
+              for column in _CODEX_QUOTA_LATEST_REQUIRED_TEXT]
+    terms += [f"unixepoch({prefix}captured_at_utc) IS NOT NULL",
+              f"unixepoch({prefix}resets_at_utc) IS NOT NULL"]
+    return " AND ".join(terms)
+
+
+def _codex_quota_latest_key_exprs(prefix: str = "") -> "tuple[str, ...]":
+    return tuple(
+        f"quote({_codex_quota_latest_raw(column, prefix)})"
+        for _key, column in _CODEX_QUOTA_LATEST_KEYS)
+
+
+def _codex_quota_latest_summary_match(image: str) -> str:
+    return " AND ".join(
+        f"{key} = {expr}" for key, expr in zip(
+            _CODEX_QUOTA_LATEST_KEY_COLUMNS,
+            _codex_quota_latest_key_exprs(f"{image}.")))
+
+
+def _codex_quota_latest_base_match(image: str) -> str:
+    return " AND ".join(
+        f"{base} = {expr}" for base, expr in zip(
+            _codex_quota_latest_key_exprs(""),
+            _codex_quota_latest_key_exprs(f"{image}.")))
+
+
+def _codex_quota_latest_recompute_sql(image: str, *, only_if_absent: bool) -> str:
+    """Re-derive one partition's maximum from the physical rows (one seek)."""
+    absent_clause = (
+        " AND NOT EXISTS (SELECT 1 FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match(image)})"
+        if only_if_absent else ""
+    )
+    return (
+        "INSERT INTO codex_quota_partition_latest ("
+        + ", ".join(_CODEX_QUOTA_LATEST_KEY_COLUMNS)
+        + ", latest_capture_epoch)"
+        f" SELECT {', '.join(_codex_quota_latest_key_exprs(image + '.'))},"
+        " latest FROM (SELECT MAX(unixepoch(captured_at_utc)) AS latest"
+        " FROM quota_window_snapshots"
+        f" WHERE {_codex_quota_latest_validity_sql('')}"
+        f" AND {_codex_quota_latest_base_match(image)})"
+        f" WHERE latest IS NOT NULL{absent_clause}"
+    )
+
+
+def _codex_quota_latest_bootstrap_select() -> str:
+    """Every valid raw partition's maximum second, streamed off the seek index."""
+    keys = ", ".join(_codex_quota_latest_key_exprs(""))
+    return (
+        f"SELECT {keys}, MAX(unixepoch(captured_at_utc))"
+        " FROM quota_window_snapshots INDEXED BY idx_qws_partition_capture"
+        f" WHERE {_codex_quota_latest_validity_sql('')}"
+        f" GROUP BY source, {keys}"
+    )
+
+
+def _codex_quota_latest_bootstrap_sql() -> str:
+    return (
+        "INSERT INTO codex_quota_partition_latest ("
+        + ", ".join(_CODEX_QUOTA_LATEST_KEY_COLUMNS)
+        + ", latest_capture_epoch) "
+        + _codex_quota_latest_bootstrap_select()
+    )
+
+
+def _codex_quota_latest_ddl() -> "tuple[str, ...]":
+    """DDL for the summary, its seek index and its three triggers.
+
+    The triggers are dropped and re-created on every apply, like the change
+    ledger's, so a definition change never leaves an older body behind; the
+    table keeps IF NOT EXISTS and its rows survive.
+    """
+    columns = ",\n".join(
+        f"            {key} BLOB NOT NULL"
+        for key in _CODEX_QUOTA_LATEST_KEY_COLUMNS)
+    keys = ", ".join(_CODEX_QUOTA_LATEST_KEY_COLUMNS)
+    index_columns = ", ".join((
+        "source", *_codex_quota_latest_key_exprs(""),
+        "unixepoch(captured_at_utc)"))
+    insert_new = (
+        f"INSERT INTO codex_quota_partition_latest ({keys}, latest_capture_epoch)"
+        f" SELECT {', '.join(_codex_quota_latest_key_exprs('NEW.'))},"
+        " unixepoch(NEW.captured_at_utc)"
+        " WHERE NOT EXISTS (SELECT 1 FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match('NEW')})"
+    )
+    return (
+        "CREATE TABLE IF NOT EXISTS codex_quota_partition_latest (\n"
+        f"{columns},\n"
+        "            latest_capture_epoch BLOB NOT NULL,\n"
+        f"            PRIMARY KEY ({keys})\n"
+        "        ) WITHOUT ROWID",
+        "CREATE INDEX IF NOT EXISTS idx_qws_partition_capture "
+        f"ON quota_window_snapshots({index_columns}) "
+        f"WHERE {_codex_quota_latest_validity_sql('')}",
+        "DROP TRIGGER IF EXISTS trg_qws_latest_ins",
+        "CREATE TRIGGER trg_qws_latest_ins\n"
+        "        AFTER INSERT ON quota_window_snapshots\n"
+        f"        WHEN {_codex_quota_latest_validity_sql('NEW.')}\n"
+        "        BEGIN\n"
+        "            DELETE FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match('NEW')}"
+        " AND latest_capture_epoch < unixepoch(NEW.captured_at_utc);\n"
+        f"            {insert_new};\n"
+        "        END",
+        "DROP TRIGGER IF EXISTS trg_qws_latest_del",
+        "CREATE TRIGGER trg_qws_latest_del\n"
+        "        AFTER DELETE ON quota_window_snapshots\n"
+        f"        WHEN {_codex_quota_latest_validity_sql('OLD.')}\n"
+        "        BEGIN\n"
+        "            DELETE FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match('OLD')}"
+        " AND latest_capture_epoch = unixepoch(OLD.captured_at_utc);\n"
+        "            "
+        f"{_codex_quota_latest_recompute_sql('OLD', only_if_absent=True)};\n"
+        "        END",
+        "DROP TRIGGER IF EXISTS trg_qws_latest_upd",
+        "CREATE TRIGGER trg_qws_latest_upd\n"
+        f"        AFTER UPDATE OF {', '.join(_CODEX_QUOTA_LATEST_UPDATE_OF)}"
+        " ON quota_window_snapshots\n"
+        "        WHEN OLD.source = 'codex' OR NEW.source = 'codex'\n"
+        "        BEGIN\n"
+        "            DELETE FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match('OLD')};\n"
+        "            "
+        f"{_codex_quota_latest_recompute_sql('OLD', only_if_absent=False)};\n"
+        "            DELETE FROM codex_quota_partition_latest"
+        f" WHERE {_codex_quota_latest_summary_match('NEW')};\n"
+        "            "
+        f"{_codex_quota_latest_recompute_sql('NEW', only_if_absent=False)};\n"
+        "        END",
+    )
+
+
+def _apply_codex_quota_latest_summary(
+    conn: sqlite3.Connection, *, rebootstrap: bool = False,
+) -> None:
+    """Install the latest-capture summary and keep it equal to the physical rows.
+
+    Atomic: the table, its seek index, the three triggers and, when needed, the
+    bootstrap commit together — as a savepoint inside the caller's open
+    transaction, or as an IMMEDIATE transaction of their own. The bootstrap runs
+    when any of the five objects was missing before this call (so a store that
+    carries all five has been maintained by the triggers since they were
+    created) or when ``rebootstrap`` asks for it, which migration 047 always
+    does, so a re-upgrade after an older binary trimmed its marker re-derives
+    the summary from the physical rows.
+
+    Guarded on the three columns the partition reads: a legacy-shape cache whose
+    schema apply took the FTS early-return before they existed keeps the
+    window-query fallback, which is correct, just not spill-free.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if not {"canonical_resets_at_utc", "observed_model", "account_key"} <= columns:
+        return
+    own_transaction = not conn.in_transaction
+    conn.execute(
+        "BEGIN IMMEDIATE" if own_transaction
+        else "SAVEPOINT codex_quota_latest_apply")
+    try:
+        present = {
+            (str(row[0]), str(row[1])) for row in conn.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')")
+        }
+        complete = all(item in present for item in _CODEX_QUOTA_LATEST_OBJECTS)
+        for statement in _codex_quota_latest_ddl():
+            conn.execute(statement)
+        if rebootstrap or not complete:
+            conn.execute("DELETE FROM codex_quota_partition_latest")
+            conn.execute(_codex_quota_latest_bootstrap_sql())
+    except BaseException:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO codex_quota_latest_apply")
+            conn.execute("RELEASE codex_quota_latest_apply")
+        raise
+    if own_transaction:
+        conn.commit()
+    else:
+        conn.execute("RELEASE codex_quota_latest_apply")
+
+
+def _apply_codex_quota_load_order_index(conn: sqlite3.Connection) -> None:
+    """The general loader's ORDER BY, served by an index (#901 §5.1, T1/T3).
+
+    Adoption (W3a, every Codex ingest including the hook), breakdown evidence,
+    the projection's root loads and the CLI commands all read complete
+    populations in ``source_root_key, captured_at_utc, resets_at_utc,
+    source_path, line_offset`` order; without this index each one sorted its
+    whole population through a temp b-tree. ``canonical_resets_at_utc`` rides
+    at the end so the adoption pass's canonical-reset bound is evaluated on the
+    index entry before any table row is fetched. Guarded on that column like
+    idx_qws_physical_group.
+    """
+    columns = {
+        str(row[1]) for row in conn.execute(
+            "PRAGMA table_info(quota_window_snapshots)")
+    }
+    if "canonical_resets_at_utc" not in columns:
+        return
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qws_codex_load_order "
+        "ON quota_window_snapshots(source_root_key, captured_at_utc, "
+        "resets_at_utc, source_path, line_offset, canonical_resets_at_utc) "
+        "WHERE source='codex'"
+    )
+
+
+def _apply_codex_metadata_lookup_indexes(conn: sqlite3.Connection) -> None:
+    """The W2 correlated lookups' indexes (#901 §5.2, T2).
+
+    ``idx_codex_entries_root_path_time`` answers each file's and each thread's
+    first accounting instant with one covering seek (the existing
+    ``idx_codex_entries_root_path`` keeps serving the minimum ``id``, because
+    the rowid trails its two columns). ``idx_codex_files_alias_recent`` and
+    ``idx_codex_threads_recent`` hold the two queries' final orders so neither
+    sorts. Each is guarded on its columns, because a legacy-shape cache can
+    lack the ALTER-added ones.
+    """
+    def _columns(table: str) -> "set[str]":
+        return {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", (table,))
+        }
+
+    if {"source_root_key", "source_path", "timestamp_utc"} <= _columns(
+            "codex_session_entries"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_entries_root_path_time "
+            "ON codex_session_entries(source_root_key, source_path, "
+            "timestamp_utc)"
+        )
+    if {"last_ingested_at", "path", "last_native_thread_id"} <= _columns(
+            "codex_session_files"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_files_alias_recent "
+            "ON codex_session_files(last_ingested_at, path) "
+            "WHERE last_native_thread_id IS NOT NULL "
+            "AND last_native_thread_id != ''"
+        )
+    if {"last_seen_utc", "conversation_key"} <= _columns(
+            "codex_conversation_threads"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_threads_recent "
+            "ON codex_conversation_threads(last_seen_utc, conversation_key)"
+        )
+
+
+def _apply_pricing_model_indexes(conn: sqlite3.Connection) -> None:
+    """Model-first covering indexes for ``_pricing_observed_models`` (#901 §5.3).
+
+    Both of its modes — doctor's trailing 30 days and pricing-check's whole
+    history — group by model over one entries table. Covering the token columns
+    lets SQLite stream the GROUP BY off the index with the timestamp filter
+    evaluated on the entry; a narrower ``(model, timestamp_utc)`` index streams
+    too but pays one table lookup per row, a latency regression the §6.3
+    per-call-site gate would catch.
+    """
+    def _columns(table: str) -> "set[str]":
+        return {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", (table,))
+        }
+
+    if {"model", "timestamp_utc", "input_tokens", "output_tokens",
+            "cache_create_tokens", "cache_read_tokens"} <= _columns(
+            "session_entries"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_model_time "
+            "ON session_entries(model, timestamp_utc, input_tokens, "
+            "output_tokens, cache_create_tokens, cache_read_tokens)"
+        )
+    if {"model", "timestamp_utc", "total_tokens"} <= _columns(
+            "codex_session_entries"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_entries_model_time "
+            "ON codex_session_entries(model, timestamp_utc, total_tokens)"
+        )
+
+
+def _apply_codex_window_attribution_read_index(conn: sqlite3.Connection) -> None:
+    """The window-attribution read's order, served by an index (#901 I1/G1).
+
+    ``_cctally_cache.load_active_window_attributions`` (every Codex ingest's
+    spend reconciliation, so the dashboard and the Codex hook, and the
+    attribution overlay of every quota load) returns every asserted or
+    retracted weekly attribution in ``asserted_at_utc, op_id`` order; without
+    this index it sorted all of them through a temp b-tree, a population that
+    grows by one assertion per attributed window. ``window_minutes`` leads
+    because the read's one equality filter is on it; the root, retraction and
+    account predicates are evaluated along the ordered scan. ``source_root_key``
+    is deliberately NOT ahead of the ordering columns: several roots share one
+    global assertion order (Amendment 1 item 1, ``c901-design-2``). Guarded on
+    the table's columns, because the conversations store drops the table and a
+    legacy-shape cache can predate it.
+    """
+    columns = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM pragma_table_info(?)",
+            ("codex_window_attributions",))
+    }
+    if {"window_minutes", "asserted_at_utc", "op_id"} <= columns:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_codex_window_attributions_read_order "
+            "ON codex_window_attributions(window_minutes ASC, asserted_at_utc ASC, "
+            "op_id ASC)"
+        )
+
+
 # === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
 
 
@@ -4451,7 +4908,7 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "031_codex_file_account_map"),
     SchemaDeliveryObject(
         "index", "idx_qws_physical_group", "_apply_codex_quota_group_index",
-        "040_codex_quota_physical_group_index"),
+        "048_codex_quota_physical_group_order"),
     SchemaDeliveryObject(
         "index", "idx_qws_unresolved_model",
         "_apply_codex_quota_unresolved_model_index",
@@ -4537,6 +4994,43 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "trigger", "trg_codex_accounting_upd",
         "_apply_codex_accounting_change_ledger",
         "044_codex_accounting_change_ledger"),
+    SchemaDeliveryObject(
+        "table", "codex_quota_partition_latest",
+        "_apply_codex_quota_latest_summary", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_qws_partition_capture",
+        "_apply_codex_quota_latest_summary", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_latest_del",
+        "_apply_codex_quota_latest_summary", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_latest_ins",
+        "_apply_codex_quota_latest_summary", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "trigger", "trg_qws_latest_upd",
+        "_apply_codex_quota_latest_summary", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_qws_codex_load_order",
+        "_apply_codex_quota_load_order_index", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_entries_root_path_time",
+        "_apply_codex_metadata_lookup_indexes", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_files_alias_recent",
+        "_apply_codex_metadata_lookup_indexes", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_threads_recent",
+        "_apply_codex_metadata_lookup_indexes", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_entries_model_time",
+        "_apply_pricing_model_indexes", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_entries_model_time",
+        "_apply_pricing_model_indexes", "047_spill_free_read_paths"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_window_attributions_read_order",
+        "_apply_codex_window_attribution_read_index",
+        "047_spill_free_read_paths"),
 )
 
 
@@ -5249,6 +5743,15 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     _apply_codex_quota_unresolved_model_index(conn)
     _apply_codex_quota_change_ledger(conn)
     _apply_codex_accounting_change_ledger(conn)
+    # #901 (spec §5.1-§5.3): the latest-capture summary, the general loader's
+    # ordering index, the W2 lookup indexes, the pricing model indexes and the
+    # window-attribution read order (Amendment 1 item 1). BEFORE the
+    # legacy-FTS early-return, so an old-shape cache.db gains them.
+    _apply_codex_quota_latest_summary(conn)
+    _apply_codex_quota_load_order_index(conn)
+    _apply_codex_metadata_lookup_indexes(conn)
+    _apply_pricing_model_indexes(conn)
+    _apply_codex_window_attribution_read_index(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_files_session_id "
         "ON session_files(session_id)"
@@ -5394,6 +5897,7 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         _apply_codex_find_projection_schema(conn)
         _apply_conversation_generation_schema(conn)
         _apply_codex_conversation_source_identity(conn)
+        _apply_conversation_latest_meta_indexes(conn)
         return
 
     _apply_cache_schema(conn)
@@ -5425,6 +5929,10 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- tests/test_conversations_transcripts_only.py, which derives its
         -- expectation from COVERAGE_CACHE_FAMILIES rather than restating a list.
         DROP TABLE IF EXISTS codex_window_attributions;
+        -- #901: the latest-capture summary is a cache.db read model over
+        -- quota_window_snapshots, which was dropped above together with its
+        -- triggers and seek index. Drop the table as well.
+        DROP TABLE IF EXISTS codex_quota_partition_latest;
 
         CREATE TABLE IF NOT EXISTS conversation_source_files (
             path             TEXT PRIMARY KEY,
@@ -5478,6 +5986,7 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
     _apply_codex_find_projection_schema(conn)
     _apply_conversation_generation_schema(conn)
     _apply_codex_conversation_source_identity(conn)
+    _apply_conversation_latest_meta_indexes(conn)
 
 
 def _ensure_codex_session_meta_provenance_index(
@@ -5654,6 +6163,36 @@ def _apply_codex_conversation_source_identity(conn: sqlite3.Connection) -> None:
         conn, "codex_conversation_source_files", "inode", "INTEGER")
 
 
+def _apply_conversation_latest_meta_indexes(conn: sqlite3.Connection) -> None:
+    """The latest-metadata lookups' partial indexes (#901 Q11, 901-PA-001 b).
+
+    ``_lib_conversation_query._session_latest_meta_map`` resolves a session's
+    latest non-NULL ``cwd`` and latest non-NULL ``git_branch`` with two
+    ``LIMIT 1`` lookups ordered ``timestamp_utc DESC, id DESC``. Each partial
+    index holds exactly the rows its lookup may return, in that order, so the
+    lookup is one seek however long the session is and however sparse its
+    metadata. The window query they replace sorted every touched session's
+    whole history through temp b-trees on each conversation-sync pass (9.56 MB
+    of temp in one measured call over a long session).
+
+    Called by the fresh-install schema apply and by conversations migration
+    011, so both shapes converge. Skipped when ``conversation_messages`` is
+    absent (a reachable state, not a corrupt one).
+    """
+    if not _table_exists(conn, "conversation_messages"):
+        return
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_session_latest_cwd "
+        "ON conversation_messages(session_id, timestamp_utc, id) "
+        "WHERE cwd IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_session_latest_git_branch "
+        "ON conversation_messages(session_id, timestamp_utc, id) "
+        "WHERE git_branch IS NOT NULL"
+    )
+
+
 def _apply_codex_find_projection_schema(conn: sqlite3.Connection) -> None:
     """Create #482's disposable visible-text projection tables.
 
@@ -5817,6 +6356,14 @@ CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "column", "codex_conversation_source_files.inode",
         "_apply_codex_conversation_source_identity",
         "010_codex_conversation_source_file_identity"),
+    SchemaDeliveryObject(
+        "index", "idx_conv_session_latest_cwd",
+        "_apply_conversation_latest_meta_indexes",
+        "011_conversation_latest_meta_indexes"),
+    SchemaDeliveryObject(
+        "index", "idx_conv_session_latest_git_branch",
+        "_apply_conversation_latest_meta_indexes",
+        "011_conversation_latest_meta_indexes"),
     SchemaDeliveryObject(
         "table", "claude_conversation_account_stamp_gaps",
         "_apply_conversation_generation_schema",
@@ -6451,6 +6998,36 @@ def _conv_010_codex_conversation_source_file_identity(
     if _table_exists(conn, "codex_conversation_source_files"):
         _apply_codex_conversation_source_identity(conn)
     conn.commit()
+
+
+@conversations_migration("011_conversation_latest_meta_indexes")
+def _conv_011_conversation_latest_meta_indexes(
+    conn: sqlite3.Connection,
+) -> None:
+    """Deliver the latest-metadata partial indexes (#901 Q11, 901-PA-001 b).
+
+    ``_session_latest_meta_map`` now resolves each touched session's latest
+    ``cwd`` and ``git_branch`` with two index-served ``LIMIT 1`` lookups; the
+    indexes and the reasoning live on ``_apply_conversation_latest_meta_indexes``,
+    the helper the fresh-install apply also calls. The schema apply that would
+    create them is version-gated, so this registration is what reaches an
+    already-current store.
+
+    Takes the Claude provider flock and defers cleanly on contention, like 009:
+    building the indexes holds SQLite's write lock for a sort of the Claude
+    transcript rows (one-time setup work), and a concurrent Claude transcript
+    writer then reports contention instead of exhausting its busy timeout.
+
+    Re-running is a no-op (``IF NOT EXISTS``). NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    held = _acquire_conversations_db_claude_provider_flock(
+        conn, migration="conversations 011 latest metadata indexes")
+    try:
+        _apply_conversation_latest_meta_indexes(conn)
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
 
 
 # #177 S6: the consolidated multi-column external-content FTS5 table that
@@ -9277,6 +9854,70 @@ def _046_codex_source_file_identity(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+@cache_migration("047_spill_free_read_paths")
+def _047_spill_free_read_paths(conn: sqlite3.Connection) -> None:
+    """#901 (spec §5.1-§5.3): deliver the spill-free read paths to existing stores.
+
+    ``_apply_cache_schema`` creates every object below for a new store, but that
+    pass is VERSION-GATED: ``open_cache_db`` runs it only when ``user_version``
+    differs from ``len(_CACHE_MIGRATIONS)``. Registering here bumps the head,
+    the mechanism migrations 029, 031, 044, 045 and 046 rely on.
+
+    The handler ALWAYS re-derives the latest-capture summary from the physical
+    rows (``rebootstrap=True``), so a re-upgrade after an older binary trimmed
+    this marker converges on the rows actually stored whatever happened to the
+    summary meanwhile. On a first upgrade the schema apply has already
+    bootstrapped it once; the second derivation is one ordered scan of the new
+    seek index, paid once.
+
+    It also delivers ``idx_codex_window_attributions_read_order`` (Amendment 1
+    item 1, ``c901-design-2``), the window-attribution read's assertion order.
+
+    Takes the Codex provider flock like handlers 024-027, 034 and 043, because
+    the summary is Codex-derived, and DEFERS (``MigrationGateNotMet``) before
+    any DDL when a Codex sync holds it. Idempotent: every object uses IF NOT
+    EXISTS or drop-then-create, and a re-derivation over its own output writes
+    the same rows. NO self-stamp — the dispatcher central-stamps on a clean
+    return (#140).
+    """
+    held = _acquire_cache_db_codex_provider_flock(
+        conn, migration="047 spill-free read paths")
+    try:
+        _apply_codex_quota_latest_summary(conn, rebootstrap=True)
+        _apply_codex_quota_load_order_index(conn)
+        _apply_codex_metadata_lookup_indexes(conn)
+        _apply_pricing_model_indexes(conn)
+        _apply_codex_window_attribution_read_index(conn)
+        conn.commit()
+    finally:
+        _release_cache_db_writer_flocks(held)
+
+
+@cache_migration("048_codex_quota_physical_group_order")
+def _048_codex_quota_physical_group_order(conn: sqlite3.Connection) -> None:
+    """#901 Q11 (spec §5.3a, 901-PA-001 a): stream every physical-group shard.
+
+    Replaces ``idx_qws_physical_group``'s five-member definition with the same
+    name, partial predicate and five equality members followed by the loader's
+    order columns ``captured_at_utc, resets_at_utc, source_path,
+    line_offset``. The shard SQL, its population and its order are unchanged;
+    only the sorter goes. The reasoning lives on
+    ``_apply_codex_quota_group_index``, which this delegates to so the
+    migration and the schema apply cannot drift, and which replaces the index
+    atomically.
+
+    Same version-gate reason as 040: the schema apply that converges the index
+    is skipped by a steady-state open, so registering here is what makes an
+    already-current install pick it up. The rebuild is a one-time sort of the
+    Codex quota rows (setup work, not a recurring path).
+
+    Re-running is a no-op: a current index is left alone. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_codex_quota_group_index(conn)
+    conn.commit()
+
+
 # === Region 7d: Stats migration 008_recompute_weekly_cost_snapshots_dedup_fix ===
 
 @stats_migration("008_recompute_weekly_cost_snapshots_dedup_fix")
@@ -10867,6 +11508,13 @@ def _repair_marker_path(path: pathlib.Path) -> pathlib.Path:
     return path.with_name(f"{path.name}.repairing")
 
 
+def _keeper_yield_request_path(path: pathlib.Path) -> pathlib.Path:
+    """#901 W9 (Q15): the store-scoped request that makes every process's
+    idle checkpoint keeper (`_lib_wal_checkpoint`) close. Its owner record is
+    the repair marker's, written, read and checked for liveness the same way."""
+    return path.with_name(f"{path.name}.keeper-yield")
+
+
 _REPAIR_OWNER_VERSION = 1
 _REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS = 30 * 60
 
@@ -11019,10 +11667,30 @@ def _claim_repair_marker(
     path: pathlib.Path,
 ) -> "tuple[RepairMarkerClaim | None, str]":
     """Atomically publish a complete owner record; reclaim stale ownership."""
-    marker = _repair_marker_path(path)
+    return _claim_owner_record(
+        _repair_marker_path(path),
+        lambda: _remove_stale_repair_marker(path),
+        owner="repair-owner",
+        record="repair marker",
+    )
+
+
+def _claim_owner_record(
+    marker: pathlib.Path,
+    remove_stale: "Callable[[], tuple[bool, str]]",
+    *,
+    owner: str,
+    record: str,
+) -> "tuple[RepairMarkerClaim | None, str]":
+    """Publish ``marker`` with a complete owner record by exclusive create.
+
+    The repair marker's discipline, shared with #901's keeper-yield request:
+    the record is written and fsynced under a private name and linked into
+    place, so it is complete or absent; an existing record is replaced only
+    when ``remove_stale`` proves its owner dead or its pid reused."""
     process_start = _process_start_identity(os.getpid())
     if process_start is None:
-        raise OSError("could not establish repair-owner process identity")
+        raise OSError(f"could not establish {owner} process identity")
     for _attempt in range(3):
         claim_id = f"{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}"
         temp = marker.with_name(f".{marker.name}.{claim_id}.tmp")
@@ -11041,7 +11709,7 @@ def _claim_repair_marker(
             try:
                 os.link(temp, marker)
             except FileExistsError:
-                removed, reason = _remove_stale_repair_marker(path)
+                removed, reason = remove_stale()
                 if not removed:
                     return None, reason
                 continue
@@ -11052,7 +11720,7 @@ def _claim_repair_marker(
                 temp.unlink()
             except FileNotFoundError:
                 pass
-    return None, f"could not claim repair marker {marker}"
+    return None, f"could not claim {record} {marker}"
 
 
 def _release_repair_marker(path: pathlib.Path, claim: RepairMarkerClaim) -> None:
@@ -11067,8 +11735,135 @@ def _release_repair_marker(path: pathlib.Path, claim: RepairMarkerClaim) -> None
     _fsync_directory(marker.parent)
 
 
+#: #901 W9 (Q15): the one monotonic deadline a process that needs a
+#: cache.db or conversations.db family exclusive or drained waits for the
+#: other processes' idle checkpoint keepers to close, per store: twice the
+#: keepers' 10 s timer interval. Never renewed per keeper, scan or retry.
+_KEEPER_YIELD_DEADLINE_SECONDS = 20.0
+#: The pause between two handle checks, or two exclusive acquisitions, while
+#: a requester waits under that deadline.
+_KEEPER_YIELD_RETRY_SECONDS = 0.25
+
+
+def _remove_stale_keeper_yield_request(
+    path: pathlib.Path,
+) -> "tuple[bool, str]":
+    """Remove a provably stale keeper-yield request (dead or reused-pid
+    owner), as `_remove_stale_repair_marker` does for the repair marker."""
+    request = _keeper_yield_request_path(path)
+    if not request.exists():
+        return True, ""
+    live, reason = _repair_marker_is_live(request)
+    if live:
+        return False, f"another {path.name} keeper-yield request owns {request} ({reason})"
+    try:
+        request.unlink()
+    except FileNotFoundError:
+        return True, ""
+    except OSError as exc:
+        return False, f"could not remove stale keeper-yield request {request}: {exc}"
+    _fsync_directory(request.parent)
+    return True, reason
+
+
+def _claim_keeper_yield_request(
+    path: pathlib.Path,
+) -> "tuple[RepairMarkerClaim | None, str]":
+    """Publish ``<store>.keeper-yield`` with this process as its owner."""
+    return _claim_owner_record(
+        _keeper_yield_request_path(path),
+        lambda: _remove_stale_keeper_yield_request(path),
+        owner="keeper-yield-owner",
+        record="keeper-yield request",
+    )
+
+
+def _release_keeper_yield_request(
+    path: pathlib.Path, claim: RepairMarkerClaim,
+) -> None:
+    """Remove the request; only its owner does, and a record someone else now
+    owns is left alone. Best effort: a request left behind fences keepers
+    only while this process lives, and it is stale once the process exits."""
+    request = _keeper_yield_request_path(path)
+    owner = _read_repair_owner(request)
+    if owner is not None and owner.get("claim_id") != claim.claim_id:
+        return
+    try:
+        request.unlink()
+    except OSError:
+        return
+    try:
+        _fsync_directory(request.parent)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _keeper_yield_request(path) -> "Iterator[float]":
+    """Ask every process's idle checkpoint keeper on the store to close (#901
+    W9, Q15) and yield the one monotonic deadline to wait for them.
+
+    The caller already holds its maintenance and provider locks, taken as
+    before and failing as promptly as before; the request grants no authority
+    of its own. It is published with the repair marker's owner record, this
+    process's own keeper is closed at once, and the request is removed when
+    the caller finishes or fails. The other processes observe it at their next
+    `arm`, timer round or exit and close their keepers without a checkpoint.
+    When it cannot be published the caller still waits, because a sync or a
+    reader may close in time; it then refuses at the deadline as before."""
+    path = pathlib.Path(path)
+    try:
+        claim, _reason = _claim_keeper_yield_request(path)
+    except OSError:
+        claim = None
+    try:
+        try:
+            import _lib_wal_checkpoint
+
+            _lib_wal_checkpoint.release(path)
+        except Exception:  # noqa: BLE001 — the drain check below decides
+            pass
+        yield time.monotonic() + _KEEPER_YIELD_DEADLINE_SECONDS
+    finally:
+        if claim is not None:
+            _release_keeper_yield_request(path, claim)
+
+
+def _await_family_drained(
+    path: pathlib.Path, deadline: float,
+) -> "set[int] | None":
+    """Repeat the family's handle check until it finds no open handle or the
+    deadline passes (#901 W9, Q15); return the last answer.
+
+    ``None`` (unknown) returns at once, as a refusal. Nothing is killed,
+    ignored or exempted: at the deadline the caller refuses with today's
+    message for whatever handle remains — a keeper that did not yield, a sync
+    in progress, a reader."""
+    while True:
+        open_pids = _db_family_open_pids(path)
+        if not open_pids:
+            return open_pids
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return open_pids
+        time.sleep(min(_KEEPER_YIELD_RETRY_SECONDS, remaining))
+
+
 def _db_family_open_pids(path: pathlib.Path) -> "set[int] | None":
-    """Return processes with any SQLite family member open; None if unknown."""
+    """Return processes with any SQLite family member open; None if unknown.
+
+    #901 W9 (Q14): this process's idle keeper for the store is released first,
+    without a checkpoint. It exists only to defer checkpoints, and every
+    caller asks this question before replacing or quarantining the family, so
+    the keeper must never be the handle that refuses this process's own store
+    recovery; the next sync's arm reopens it on whatever file is then there.
+    """
+    try:
+        import _lib_wal_checkpoint
+
+        _lib_wal_checkpoint.release(path)
+    except Exception:  # noqa: BLE001 — the drain check below still decides
+        pass
     family = [
         pathlib.Path(str(path) + suffix)
         for suffix in ("", "-journal", "-wal", "-shm")
@@ -12065,13 +12860,51 @@ def _vacuum_required_free_bytes(path) -> int:
     return 2 * db_bytes + wal_bytes
 
 
-def _run_vacuum_exclusive(path, label: str) -> int:
+def _acquire_vacuum_exclusion(
+    conn: sqlite3.Connection, deadline: "float | None",
+) -> None:
+    """Take a WAL store's EXCLUSIVE lock and keep it (#901 W9, Q15).
+
+    Under ``locking_mode=EXCLUSIVE`` a write transaction takes the database
+    file's EXCLUSIVE lock and the connection keeps it after the transaction
+    ends, so ``BEGIN IMMEDIATE`` then ``ROLLBACK`` acquires the exclusion
+    without writing anything, and the checkpoint and VACUUM that follow run
+    under one continuous hold (#386). Only this acquisition is retried — each
+    attempt under the existing busy timeout, a short pause between attempts —
+    until ``deadline``, the keepers' drain grace; the VACUUM is never retried.
+    ``deadline=None`` makes one attempt. The last busy error is raised at the
+    deadline, so the caller's refusal is today's."""
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            text = str(exc).lower()
+            if (
+                deadline is None
+                or ("lock" not in text and "busy" not in text)
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(max(0.0, min(_KEEPER_YIELD_RETRY_SECONDS,
+                                    deadline - time.monotonic())))
+            continue
+        conn.execute("ROLLBACK")
+        return
+
+
+def _run_vacuum_exclusive(
+    path, label: str, *, deadline: "float | None" = None,
+) -> int:
     """VACUUM ``path`` under EXCLUSIVE; checkpoint WAL-backed stores first.
 
     ``locking_mode=EXCLUSIVE`` + a short ``busy_timeout`` make a concurrent
-    reader/writer FAIL PROMPTLY (no TOCTOU gap — the exclusion is the DB's own
-    lock, which the advisory flocks do not provide against dashboard readers).
-    Exit 0 on success, 3 when the DB is in use."""
+    reader/writer fail rather than hang (no TOCTOU gap — the exclusion is the
+    DB's own lock, which the advisory flocks do not provide against dashboard
+    readers). On a WAL store (#901 W9, Q15) the exclusive acquisition comes
+    first and is retried until ``deadline`` while other processes' idle
+    checkpoint keepers yield to the caller's request; the checkpoint and the
+    VACUUM then run under that one hold. Exit 0 on success, 3 when the DB is
+    in use."""
     conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
     try:
         conn.execute(f"PRAGMA busy_timeout={_VACUUM_BUSY_TIMEOUT_MS}")
@@ -12080,6 +12913,7 @@ def _run_vacuum_exclusive(path, label: str) -> int:
         try:
             conn.execute("PRAGMA locking_mode=EXCLUSIVE")
             if label != "stats.db":
+                _acquire_vacuum_exclusion(conn, deadline)
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             conn.execute("VACUUM")
         except sqlite3.OperationalError as exc:
@@ -12189,7 +13023,13 @@ def _vacuum_one_db(path, label: str, provider_locked: bool) -> int:
                         "before retrying VACUUM."
                     )
                     return 3
-            return _run_vacuum_exclusive(path, label)
+                # stats.db has no checkpoint keeper: one attempt, as before.
+                return _run_vacuum_exclusive(path, label)
+            # #901 W9 (Q15): with both locks held, ask the other processes'
+            # idle checkpoint keepers to close, close this process's own, and
+            # retry only the exclusive acquisition within the drain grace.
+            with _keeper_yield_request(path) as deadline:
+                return _run_vacuum_exclusive(path, label, deadline=deadline)
         finally:
             for fh in held:
                 try:
@@ -12212,9 +13052,12 @@ def cmd_db_vacuum(args: argparse.Namespace) -> int:
 
     NEVER automatic. Holds the maintenance flock + (for cache.db) the provider
     flocks, then runs a checkpoint + VACUUM under a real SQLite EXCLUSIVE lock so
-    a concurrent dashboard reader fails promptly instead of racing. Refuses when
-    free disk is below ~2x the file + WAL. Exit 0 on success, 3 when a target is
-    in use or disk is short."""
+    a concurrent dashboard reader makes it refuse instead of racing. For
+    cache.db and conversations.db it first asks other processes' idle
+    checkpoint keepers to close (#901 W9, Q15) and retries the exclusive
+    acquisition for at most 20 s; a handle still open then gets the same
+    refusal. Refuses when free disk is below ~2x the file + WAL. Exit 0 on
+    success, 3 when a target is in use or disk is short."""
     which = getattr(args, "db", "cache")
     targets = []
     if which in ("cache", "all"):

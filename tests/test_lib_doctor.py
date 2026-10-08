@@ -83,6 +83,9 @@ def test_doctor_state_has_required_fields():
         "cache_repair_marker",
         # #411: file-level backup/sync classification.
         "backup_sync_state",
+        # #901: transcript-store page size for the paced-reclaim thresholds,
+        # and running dashboards' write telemetry.
+        "conversations_db_page_size", "dashboard_disk_writes",
         # #294 S2: root-qualified Codex quota/lifecycle doctor inputs.
         "codex_quota_windows", "codex_hook_roots",
         "codex_lifecycle_activity_24h",
@@ -1415,7 +1418,7 @@ def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry", "performance",
     }
 
 
@@ -1515,7 +1518,7 @@ def test_serialize_json_top_level_shape():
     cat_ids = [c["id"] for c in payload["categories"]]
     assert cat_ids == [
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry", "performance",
     ]
 
 

@@ -127,7 +127,10 @@ def test_the_overlay_bundle_names_every_piece_of_transactional_state():
     assert all(checkpointed), (
         "every checkpointed cache must carry a declared owner name")
     assert bundle["mappings"] == checkpointed
-    assert len(bundle["mappings"]) == 11
+    # Twelve since #872 added the coherence record that names the base every
+    # delta-advanced cache was built from; a discard must restore it with them.
+    assert len(bundle["mappings"]) == 12
+    assert "derived_coherence" in bundle["mappings"]
     for name in (
         "quota_observation_cache_stats",
         "account_card_totals_fallbacks",

@@ -66,14 +66,14 @@ def test_cache_hit_percent_pure_read():
 
 def test_cache_dollars_zero_when_no_tokens():
     saved, wasted, net = crk._compute_entry_cache_dollars(
-        "claude-sonnet-4-6", 0, 0, pricing=_PRICING_SONNET,
+        "claude-sonnet-4-6", 0, 0, input_tokens=0, pricing=_PRICING_SONNET,
     )
     assert (saved, wasted, net) == (0.0, 0.0, 0.0)
 
 
 def test_cache_dollars_unknown_model_returns_zeros():
     saved, wasted, net = crk._compute_entry_cache_dollars(
-        "unknown-model-x", 1000, 1000, pricing=_PRICING_SONNET,
+        "unknown-model-x", 1000, 1000, input_tokens=0, pricing=_PRICING_SONNET,
     )
     assert (saved, wasted, net) == (0.0, 0.0, 0.0)
 
@@ -81,7 +81,7 @@ def test_cache_dollars_unknown_model_returns_zeros():
 def test_cache_dollars_saved_when_cache_read():
     # Pure cache_read: saved = read * (base - read_rate), wasted = 0.
     saved, wasted, net = crk._compute_entry_cache_dollars(
-        "claude-sonnet-4-6", 0, 1000, pricing=_PRICING_SONNET,
+        "claude-sonnet-4-6", 0, 1000, input_tokens=0, pricing=_PRICING_SONNET,
     )
     # base=3e-6, read_rate=0.3e-6 → saved = 1000 * 2.7e-6 = 0.0027
     assert wasted == 0.0
@@ -92,7 +92,7 @@ def test_cache_dollars_saved_when_cache_read():
 def test_cache_dollars_wasted_when_cache_creation():
     # Pure cache_creation: wasted = creation * (create_rate - base).
     saved, wasted, net = crk._compute_entry_cache_dollars(
-        "claude-sonnet-4-6", 1000, 0, pricing=_PRICING_SONNET,
+        "claude-sonnet-4-6", 1000, 0, input_tokens=0, pricing=_PRICING_SONNET,
     )
     # base=3e-6, create=3.75e-6 → wasted = 1000 * 0.75e-6 = 0.00075
     assert saved == 0.0
@@ -104,13 +104,13 @@ def test_cache_dollars_resolves_anthropic_prefix_alias():
     """Models prefixed with ``anthropic/`` or ``anthropic.`` resolve to the
     bare model entry in the pricing dict (mirrors _lib_pricing behavior)."""
     saved_a, _, _ = crk._compute_entry_cache_dollars(
-        "anthropic/claude-sonnet-4-6", 0, 1000, pricing=_PRICING_SONNET,
+        "anthropic/claude-sonnet-4-6", 0, 1000, input_tokens=0, pricing=_PRICING_SONNET,
     )
     saved_b, _, _ = crk._compute_entry_cache_dollars(
-        "anthropic.claude-sonnet-4-6", 0, 1000, pricing=_PRICING_SONNET,
+        "anthropic.claude-sonnet-4-6", 0, 1000, input_tokens=0, pricing=_PRICING_SONNET,
     )
     saved_c, _, _ = crk._compute_entry_cache_dollars(
-        "claude-sonnet-4-6", 0, 1000, pricing=_PRICING_SONNET,
+        "claude-sonnet-4-6", 0, 1000, input_tokens=0, pricing=_PRICING_SONNET,
     )
     assert saved_a == saved_b == saved_c
 
@@ -909,7 +909,8 @@ def test_aggregate_by_day_project_two_level_matches_direct_stable_sum():
     by_day_proj: dict[tuple[str, str], list[float]] = defaultdict(list)
     for e in entries:
         _s, _w, net = crk._compute_entry_cache_dollars(
-            e.model, e.cache_creation_tokens, e.cache_read_tokens, pricing=pricing,
+            e.model, e.cache_creation_tokens, e.cache_read_tokens,
+            input_tokens=e.input_tokens, pricing=pricing,
         )
         day = e.timestamp.astimezone(tz).strftime("%Y-%m-%d")
         by_day_proj[(day, e.project_path)].append(net)
@@ -941,7 +942,7 @@ def test_aggregate_by_day_project_within_day_partial_uses_stable_sum():
     day1_a_nets = [
         crk._compute_entry_cache_dollars(
             e.model, e.cache_creation_tokens, e.cache_read_tokens,
-            pricing=_PRICING_SONNET,
+            input_tokens=e.input_tokens, pricing=_PRICING_SONNET,
         )[2]
         for e in entries
         if e.project_path == "/a"

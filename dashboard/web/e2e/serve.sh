@@ -11,11 +11,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # dashboard/web/e2e
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-RUNTIME="$SCRIPT_DIR/.runtime"
-
-# 1) Rebuild the runtime dir from scratch — no state bleed between runs.
-rm -rf "$RUNTIME"
-mkdir -p "$RUNTIME"
+if [ "${CCTALLY_E2E_SAFE_EVIDENCE:-0}" = 1 ]; then
+  # The gate/CI owns a newly claimed per-run evidence parent. Never reuse or
+  # remove an earlier runtime, even when its fixture build failed partway.
+  RUNTIME="${CCTALLY_E2E_RUNTIME_DIR:?safe evidence requires CCTALLY_E2E_RUNTIME_DIR}"
+  case "$RUNTIME" in
+    /*) ;;
+    *) echo "e2e/serve.sh: safe runtime must be absolute: $RUNTIME" >&2; exit 1 ;;
+  esac
+  if ! mkdir "$RUNTIME"; then
+    echo "e2e/serve.sh: runtime already exists or cannot be created: $RUNTIME" >&2
+    exit 1
+  fi
+else
+  RUNTIME="$SCRIPT_DIR/.runtime"
+  # Established standalone behavior; safe mode never reaches this cleanup.
+  rm -rf "$RUNTIME"
+  mkdir -p "$RUNTIME"
+fi
 
 # 2) Isolation env — pinned before ANY cctally call.
 export CCTALLY_DATA_DIR="$RUNTIME/scratch/data"

@@ -28,9 +28,11 @@ etc.) are proven at the kernel level in ``tests/test_codex_conversation_normaliz
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import base64
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -38,6 +40,8 @@ import sys
 import threading
 import urllib.parse as _u
 from http.client import HTTPConnection
+
+import pytest
 
 from conftest import load_script, redirect_paths_without_conversation_retention
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
@@ -48,6 +52,12 @@ if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
 
 import _lib_conversation_dispatch as disp  # noqa: E402
+from tests._provider_token_text import (  # noqa: E402
+    assert_export_attribution,
+    assert_token_carried,
+    assert_tokens_absent,
+    per_run_literals,
+)
 
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
 _MODEL = "claude-opus-4-8"
@@ -1528,6 +1538,113 @@ def _raw_string_lines(rollout_path):
 _S3_PROVIDER_SESSION_IDS = ("70001", "70002", "70003", "70004")
 
 
+_S3_ROUTE_ABSENT = ("card", "session_index", "payload_card", "anon_plan")
+
+
+def _collect_s3_route_surfaces(port, key):
+    """Boundary label -> served texts of the tool-legibility conversation.
+
+    Asserts the structural non-vacuity facts on the way: every route answers,
+    cards were examined, the session index publishes ordinal 1, every
+    write_stdin payload card is a `session_ref` (the `s3-fc-stdin-a` one with
+    ref "1"), and the anon-map plan offers tokens.
+    """
+    s, detail, _c = _get_json(port, _entity_path(key, ""))
+    assert s == 200 and detail["status"] == "ok"
+    assert detail["session_index"]["sessions"]["1"]["ordinal"] == 1
+    cards, args, stdin_blocks = [], [], []
+    for item in detail["items"]:
+        for block in item["blocks"]:
+            block_detail = block.get("detail") or {}
+            if block_detail.get("name") == "write_stdin":
+                stdin_blocks.append(block)
+            args.append(block_detail.get("args") or "")
+            for card in (block_detail.get("card"),
+                         ((block.get("output") or {}).get("detail") or {}).get("card")):
+                if card is not None:
+                    cards.append(json.dumps(card))
+    assert cards
+    assert any(b.get("call_id") == "s3-fc-stdin-a" for b in stdin_blocks)
+    payload_cards, payload_content = [], []
+    for block in stdin_blocks:
+        s_pay, payload, _c = _get_json(
+            port, _entity_path(key, "/payload")
+            + f"?block_key={_u.quote(block['block_key'])}&which=call")
+        assert s_pay == 200 and payload["status"] == "ok"
+        assert payload["card"]["type"] == "session_ref"
+        if block.get("call_id") == "s3-fc-stdin-a":
+            assert payload["card"]["ref"] == "1"
+        payload_cards.append(json.dumps(payload["card"]))
+        payload_content.append(payload["content"])
+    s_map, plan, _c = _get_json(port, _entity_path(key, "/anon-map"))
+    assert s_map == 200 and plan["tokens"]
+    s_exp, exported, _c = _get(port, _entity_path(key, "/export") + "?anonymize=1")
+    assert s_exp == 200
+    return {
+        "card": cards,
+        "session_index": [json.dumps(detail["session_index"])],
+        "payload_card": payload_cards,
+        "anon_plan": [json.dumps(plan)],
+        "args": args,
+        "payload_content": payload_content,
+        "export": exported.decode(),
+    }
+
+
+def _s3_route_surfaces(tmp_path, monkeypatch):
+    """Boot the tool-legibility conversation and collect its served texts,
+    with the per-run literals of the HOME the product itself reads."""
+    ns = load_script()
+    srv, _root, keys, _r = _boot(
+        ns, tmp_path, monkeypatch, codex_scenarios=("tool-legibility",),
+        claude_sids=())
+    try:
+        surfaces = _collect_s3_route_surfaces(
+            srv.server_address[1], keys["tool-legibility"])
+    finally:
+        stop(srv, srv._test_thread)
+    return surfaces, per_run_literals(os.path.expanduser("~"))
+
+
+def _check_s3_route_surfaces(surfaces, raw_lines, per_run):
+    """The S3 route privacy oracle over collected texts (spec §5).
+
+    ABSENT: every S3-derived surface — the cards, the session index, the
+    payload readback card and the anon-map plan.
+
+    Boundary 1 — `detail.args` is the pre-existing generic disclosure and is
+    stored at ingest, so rewriting it would break the read-time-only rule; it
+    still shows the provider's own argument JSON verbatim.
+
+    Boundary 2 — the payload readback serves the raw re-read record, which is
+    the route's entire purpose, so every readback `content` still carries it.
+
+    Boundary 3 — an anonymized export, which is a DIFFERENT code path from the
+    anon map: the export body is scrubbed server-side, while per-card copy is
+    scrubbed client-side through the plan, so a test of one is not a test of
+    the other. The export renders provider bytes verbatim and is byte-frozen,
+    so the token survives there — in the raw `exec` program source, in a
+    retained output's harness preamble and in the raw `write_stdin` arguments.
+    What is asserted is that every export line carrying it is provider bytes,
+    which no S3-derived field can produce (spec §4.3 of #463 S3: a short
+    integer cannot be scrubbed).
+    """
+    for label in _S3_ROUTE_ABSENT + ("args", "payload_content", "export"):
+        # A surface of only empty strings would make its arm pass vacuously.
+        assert any(surfaces.get(label) or ()), f"missing surface {label}"
+    for label in _S3_ROUTE_ABSENT:
+        assert_tokens_absent(surfaces[label], _S3_PROVIDER_SESSION_IDS, label, per_run)
+    assert_token_carried(surfaces["args"], _S3_PROVIDER_SESSION_IDS, "args", per_run)
+    assert_token_carried(surfaces["payload_content"], _S3_PROVIDER_SESSION_IDS,
+                         "payload_content", per_run, each=True)
+    assert_export_attribution(surfaces["export"], raw_lines,
+                              _S3_PROVIDER_SESSION_IDS, per_run)
+
+
+def _s3_raw_lines():
+    return _raw_string_lines(CORPUS / "tool-legibility.jsonl")
+
+
 def test_s3_no_raw_session_id_reaches_any_served_route(tmp_path, monkeypatch):
     """Spec §4.3 / §6.5, at the ROUTE boundary.
 
@@ -1547,99 +1664,144 @@ def test_s3_no_raw_session_id_reaches_any_served_route(tmp_path, monkeypatch):
     stopped carrying it would mean the recorded rule no longer describes the
     code. What is asserted as ABSENT is every S3-derived surface: the cards, the
     session index and the anon plan.
+
+    #887: the searches are digest-aware — a token inside a recognized opaque
+    key or the test's own per-run path is not a leak — through the shared
+    matcher in tests/_provider_token_text.py.
     """
-    ns = load_script()
-    srv, _root, keys, _r = _boot(
-        ns, tmp_path, monkeypatch, codex_scenarios=("tool-legibility",),
-        claude_sids=())
-    try:
-        port = srv.server_address[1]
-        key = keys["tool-legibility"]
+    surfaces, per_run = _s3_route_surfaces(tmp_path, monkeypatch)
+    _check_s3_route_surfaces(surfaces, _s3_raw_lines(), per_run)
 
-        s, detail, _c = _get_json(port, _entity_path(key, ""))
-        assert s == 200 and detail["status"] == "ok"
-        # Non-vacuity: the enrichment under test really is on this envelope.
-        assert detail["session_index"]["sessions"]["1"]["ordinal"] == 1
-        cards_seen = 0
-        stdin_block_keys = []
-        args_carrying_the_token = 0
-        for item in detail["items"]:
-            for block in item["blocks"]:
-                if (block.get("detail") or {}).get("name") == "write_stdin":
-                    stdin_block_keys.append(block["block_key"])
-                args = (block.get("detail") or {}).get("args") or ""
-                if any(token in args for token in _S3_PROVIDER_SESSION_IDS):
-                    args_carrying_the_token += 1
-                for card in ((block.get("detail") or {}).get("card"),
-                             ((block.get("output") or {}).get("detail") or {}).get("card")):
-                    if card is None:
-                        continue
-                    cards_seen += 1
-                    blob = json.dumps(card)
-                    for token in _S3_PROVIDER_SESSION_IDS:
-                        assert token not in blob, (token, card)
-        # Non-vacuity: the loop really did examine cards.
-        assert cards_seen > 0
+
+def _s3_key_embedding(token):
+    """A recognized `cbk1_` key whose 40-hex digest begins with `token`."""
+    return "cbk1_" + token + "a" * (40 - len(token))
+
+
+def _s3_keyify(text):
+    """Every raw token occurrence moved inside a recognized key."""
+    for token in _S3_PROVIDER_SESSION_IDS:
+        text = text.replace(token, " " + _s3_key_embedding(token) + " ")
+    return text
+
+
+def test_s3_route_oracle_discriminates_at_every_boundary(tmp_path, monkeypatch):
+    """#887 — each boundary's oracle, perturbed on the real collected texts.
+
+    A raw substring search left at any absence arm fails (a); left at any
+    positive arm, (d) passes when it must fail; left in the export
+    attribution's line selection, (g) fails; a missing tripwire fails (c)/(f).
+    """
+    surfaces, per_run = _s3_route_surfaces(tmp_path, monkeypatch)
+    raw_lines = _s3_raw_lines()
+
+    def check(s):
+        _check_s3_route_surfaces(s, raw_lines, per_run)
+
+    check(copy.deepcopy(surfaces))
+    for label in _S3_ROUTE_ABSENT:
         for token in _S3_PROVIDER_SESSION_IDS:
-            assert token not in json.dumps(detail["session_index"]), token
+            collided = copy.deepcopy(surfaces)
+            collided[label][0] += f' "{_s3_key_embedding(token)}"'
+            check(collided)                                                    # (a)
+            leaked = copy.deepcopy(surfaces)
+            leaked[label][0] += f" {token}"
+            with pytest.raises(AssertionError,
+                               match=rf"^provider token '{token}' leaked at {label}$"):
+                check(leaked)                                                  # (b)
+        drifted = copy.deepcopy(surfaces)
+        drifted[label][0] += ' "cbk2_' + "b" * 48 + '"'
+        with pytest.raises(AssertionError,
+                           match=rf"^unrecognized digest-shaped run at {label}: "):
+            check(drifted)                                                     # (c)
+    for label in ("args", "payload_content"):
+        keyed = copy.deepcopy(surfaces)
+        keyed[label] = [_s3_keyify(text) for text in keyed[label]]
+        with pytest.raises(AssertionError,
+                           match=rf"^no provider token outside opaque keys at {label}$"):
+            check(keyed)                                                       # (d)
+    # Boundary 2 needs EVERY readback to carry a token, not just one: keyify a
+    # single payload while the others keep their raw tokens.
+    assert len(surfaces["payload_content"]) >= 2
+    mixed = copy.deepcopy(surfaces)
+    mixed["payload_content"][0] = _s3_keyify(mixed["payload_content"][0])
+    with pytest.raises(AssertionError,
+                       match=r"^no provider token outside opaque keys at payload_content$"):
+        check(mixed)                                                           # (d), each
+    keyed = copy.deepcopy(surfaces)
+    keyed["export"] = _s3_keyify(keyed["export"])
+    with pytest.raises(AssertionError,
+                       match=r"^no provider token outside opaque keys at export$"):
+        check(keyed)                                                           # (d)
+    for token in _S3_PROVIDER_SESSION_IDS:
+        derived = copy.deepcopy(surfaces)
+        derived["export"] += f"\nderived summary {token}\n"
+        with pytest.raises(AssertionError,
+                           match=r"^export line carrying a provider token is not provider bytes: "):
+            check(derived)                                                     # (e)
+        collided = copy.deepcopy(surfaces)
+        collided["export"] += f"\nderived ref {_s3_key_embedding(token)}\n"
+        check(collided)                                                        # (g)
+    drifted = copy.deepcopy(surfaces)
+    drifted["export"] += "\nderived cbk2_" + "b" * 48 + "\n"
+    with pytest.raises(AssertionError, match=r"^unrecognized digest-shaped run at export: "):
+        check(drifted)                                                         # (f)
 
-        # Boundary 1 — `detail.args` is the pre-existing generic disclosure and
-        # is stored at ingest, so rewriting it would break the read-time-only
-        # rule. It still shows the provider's own argument JSON verbatim.
-        assert args_carrying_the_token > 0
 
-        # Boundary 2 — the payload readback serves the raw re-read record, which
-        # is the route's entire purpose. Its `card` is decoded by the same
-        # kernel the paged route uses, so it must still publish the ordinal.
-        assert stdin_block_keys
-        for block_key in stdin_block_keys:
-            s_pay, payload, _c = _get_json(
-                port, _entity_path(key, "/payload")
-                + f"?block_key={_u.quote(block_key)}&which=call")
-            assert s_pay == 200 and payload["status"] == "ok"
-            assert any(token in payload["content"] for token in _S3_PROVIDER_SESSION_IDS), payload["content"]
-            card_blob = json.dumps(payload.get("card"))
-            for token in _S3_PROVIDER_SESSION_IDS:
-                assert token not in card_blob, (token, card_blob)
+_S3_ALL_TOKENS_HEX = "".join(_S3_PROVIDER_SESSION_IDS)   # 20 decimal (hex) digits
 
-        # The anon-map plan: the token is never offered to the client as a
-        # replacement, because it was never published in the first place.
-        s_map, plan, _c = _get_json(port, _entity_path(key, "/anon-map"))
-        assert s_map == 200
-        for token in _S3_PROVIDER_SESSION_IDS:
-            assert token not in json.dumps(plan), token
 
-        # Boundary 3 — an anonymized export, which is a DIFFERENT code path
-        # from the anon map: the export body is scrubbed server-side, while
-        # per-card copy is scrubbed client-side through the plan above. A test
-        # of one is not a test of the other.
-        #
-        # The export renders the provider's own bytes verbatim and is
-        # byte-frozen, so the token DOES survive there — in the raw `exec`
-        # program source, in a retained output's harness preamble, and in the
-        # raw `write_stdin` arguments. That is the §8 boundary showing through
-        # a prose surface, not a leak S3 introduced, and it cannot be closed by
-        # scrubbing: the token is a short integer, so a rule that replaced a
-        # bare `70001` would corrupt arbitrary text elsewhere (spec §4.3).
-        #
-        # So the property asserted here is the one that is both true and worth
-        # having: every export line carrying the token is provider bytes
-        # rendered verbatim. No field S3 derives can put it there, because a
-        # derived field would produce a line the retained payload does not
-        # contain.
-        s_exp, exported, _c = _get(
-            port, _entity_path(key, "/export") + "?anonymize=1")
-        assert s_exp == 200
-        raw_lines = _raw_string_lines(CORPUS / "tool-legibility.jsonl")
-        hits = [line for line in exported.decode().splitlines()
-                if any(token in line for token in _S3_PROVIDER_SESSION_IDS)]
-        # Non-vacuity, in both directions: the export really did render this
-        # conversation, and the token really is present to be attributed.
-        assert hits, exported[:400]
-        for line in hits:
-            assert line.strip() in raw_lines, line
-    finally:
-        stop(srv, srv._test_thread)
+def _force_every_block_key_to_embed_every_token(monkeypatch):
+    """Wrap `codex_block_key` so every minted key is `cbk1_` + all four tokens
+    + the last 20 hex of the real digest: a real collision on every surface
+    that carries a block key, with no raw id served (#887)."""
+    import _lib_codex_conversation_query as cq
+    real = cq.codex_block_key
+    minted = []
+
+    def forced(*args, **kwargs):
+        key = "cbk1_" + _S3_ALL_TOKENS_HEX + real(*args, **kwargs)[-20:]
+        minted.append(key)
+        return key
+
+    monkeypatch.setattr(cq, "codex_block_key", forced)
+    return minted
+
+
+def test_s3_route_privacy_holds_when_every_block_key_embeds_every_token(tmp_path, monkeypatch):
+    """#887 — the real-path collision: every block key carries every token."""
+    minted = _force_every_block_key_to_embed_every_token(monkeypatch)
+    surfaces, per_run = _s3_route_surfaces(tmp_path, monkeypatch)
+    assert minted
+    for token in _S3_PROVIDER_SESSION_IDS:
+        assert token in surfaces["session_index"][0]
+        assert any(token in card for card in surfaces["card"])
+    _check_s3_route_surfaces(surfaces, _s3_raw_lines(), per_run)
+
+
+def test_s3_route_privacy_still_catches_a_raw_id_outside_a_key(tmp_path, monkeypatch):
+    """#887 — the stripped oracle still rejects a genuine leak on the real path."""
+    import _lib_codex_conversation_query as cq
+    real = cq._build_session_index
+
+    def leaking(rows):
+        envelope, ordinals = real(rows)
+        for session, ordinal in ordinals.items():
+            envelope["sessions"][ordinal]["provider_session"] = session
+        return envelope, ordinals
+
+    monkeypatch.setattr(cq, "_build_session_index", leaking)
+    surfaces, per_run = _s3_route_surfaces(tmp_path, monkeypatch)
+    with pytest.raises(AssertionError,
+                       match=r"^provider token '7000[1-4]' leaked at session_index$"):
+        _check_s3_route_surfaces(surfaces, _s3_raw_lines(), per_run)
+    # The injected field is the ONLY cause: without it every boundary passes
+    # under this test's own per-run literals.
+    index = json.loads(surfaces["session_index"][0])
+    removed = [entry.pop("provider_session", None) for entry in index["sessions"].values()]
+    assert any(removed)
+    surfaces["session_index"] = [json.dumps(index)]
+    _check_s3_route_surfaces(surfaces, _s3_raw_lines(), per_run)
 
 
 def test_s3_patch_card_paths_are_covered_by_the_anon_plan(tmp_path, monkeypatch):

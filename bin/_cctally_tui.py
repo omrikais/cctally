@@ -223,7 +223,7 @@ from _lib_display_tz import (
     _compute_display_block,
 )
 from _lib_aggregators import _aggregate_monthly, codex_path_scope
-from _lib_fmt import stable_sum
+from _lib_fmt import _fmt_usd_accounting, stable_sum
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
 # shared no-op singleton), so the _tui_build_snapshot seam wraps below cost
@@ -8401,8 +8401,9 @@ def _tui_modal_current_week(snap, runtime, width):
             ms.crossed_at, runtime.display_tz,
             fmt="%b %d %H:%M:%S", suffix=True,
         )
-        cumul_str = f"${ms.cumulative_cost_usd:.2f}".ljust(8)
-        marg_str = (f"${ms.marginal_cost_usd:.2f}" if ms.marginal_cost_usd is not None else "—").ljust(10)
+        cumul_str = _fmt_usd_accounting(ms.cumulative_cost_usd, 2).ljust(8)
+        marg_str = (_fmt_usd_accounting(ms.marginal_cost_usd, 2)
+                    if ms.marginal_cost_usd is not None else "—").ljust(10)
         line = f"   {{b}}{ms.percent:>3}{{/}} {{bright}}{ts_str:<22}{{/}} {{b}}{cumul_str}{{/}} {{b}}{marg_str}{{/}}"
         if show_5h:
             five_str = (f"{int(ms.five_hour_pct_at_crossing)}%"

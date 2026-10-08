@@ -599,7 +599,8 @@ def test_scoped_codex_cli_export_refuses_ambiguous_path(
         tmp_path, monkeypatch, capsysbinary):
     """The CLI must not emit an anonymized copy over unproven CWD ownership."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # The export refusal needs a retained transcript, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     provider = tmp_path / "provider"
     rollout = provider / "sessions" / "2026" / "08" / "04" / "modern-full.jsonl"
     rollout.parent.mkdir(parents=True)
@@ -748,7 +749,8 @@ def _claude_user_line(uuid: str, text: str, timestamp: str) -> str:
 def test_claude_delta_ingest_stamps_once_and_rebuild_preserves_accounts(
         tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Account attribution must survive replay regardless of fixture age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     import _cctally_core as core
 
     project = tmp_path / "data" / ".claude" / "projects" / "-switching"
@@ -807,7 +809,8 @@ def test_claude_delta_ingest_stamps_once_and_rebuild_preserves_accounts(
 def test_codex_conversation_replay_uses_durable_file_account_map(
         tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data-codex")
+    # Durable account attribution is tested independently of transcript age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data-codex")
     import _cctally_cache as cache_mod
 
     provider = tmp_path / "provider"

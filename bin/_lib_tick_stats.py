@@ -25,11 +25,14 @@ Bounds: at most ``RING_CAPACITY`` retained records and at most
 """
 from __future__ import annotations
 
+import array
 import dataclasses
 import sys
 import threading
 import time
 import types
+
+import _lib_write_io
 
 RING_CAPACITY = 64
 MEMORY_BUDGET_BYTES = 65536
@@ -58,6 +61,10 @@ PUBLICATIONS = ("final", "partial", "seed", "degraded")
 #: frozen field typed `str` enforces nothing on its own.
 CONVERSATION_STATUSES = ("ok", "store_unavailable", "error")
 CONVERSATION_MODES = ("caught_up", "targeted", "full", "not_observed")
+#: The write status of an interval (#901 §5.5): `ok`, a typed unavailable
+#: reason, or `not_sampled` when the recorder was given no observation. A
+#: number is published only with `ok`; it is never fabricated as zero.
+WRITE_STATUSES = _lib_write_io.WRITE_STATUSES
 
 _INGEST = "ingest"
 _BUILD = "build"
@@ -84,6 +91,9 @@ class TickRecord:
     period_ns: "int | None"
     cache_pin_ns: int
     cpu_ns: int
+    process_write_bytes: "int | None"
+    write_status: str
+    write_overlap: bool
 
     def as_wire(self) -> dict:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -125,6 +135,9 @@ class ConversationSyncRecord:
     codex_mode: str
     claude_files: int
     codex_files: int
+    process_write_bytes: "int | None"
+    write_status: str
+    write_overlap: bool
 
     def as_wire(self) -> dict:
         return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
@@ -147,16 +160,42 @@ MAINTENANCE_PHASES = ("delete", "reclaim", "checkpoint", "other")
 #: maintenance history at the throttled cadence, and many continuation passes
 #: at the escalated one.
 MAINTENANCE_RING_CAPACITY = 16
+#: #901: one record per maintenance OPERATION (a deletion group or a reclaim
+#: chunk) carries its own outcome. `gated` means the allowance was in debt,
+#: `skipped` that reclaim could not run without checkpointing.
+MAINTENANCE_OUTCOMES = ("ok", "deadline", "no_progress", "busy", "gated",
+                        "skipped")
+MAINTENANCE_MODES = ("", "spill_free", "fallback", "reclaim")
+STARTED_AT_MAX_CHARS = 32
+#: #901 Q9: the closed set of reclaim skip reasons and reader statuses a
+#: record may carry (`_lib_conversation_retention.RECLAIM_SKIP_REASONS`,
+#: pinned equal by `tests/test_tick_stats_write_io.py`); anything else is
+#: published as "unknown".
+MAINTENANCE_SKIP_REASONS = (
+    "no_checkpoint_on_close_unavailable", "connection_settings_unavailable",
+    "sqlite_error", "state_record_unnormalized", "state_record_oversize",
+    "helper_failed", "helper_timeout", "wal_index_unreadable",
+    "wal_checksum_mismatch", "wal_endpoint_mismatch", "read_budget_exhausted",
+    "unsupported_geometry", "malformed_page", "cyclic_freelist",
+    "identity_changed", "sqlite_unaudited")
+SQLITE_SOURCE_ID_MAX_CHARS = 96
+PLAN_DIGEST_MAX_CHARS = 16
+#: One shared object per distinct SQLite source id, so sixteen records of
+#: one runtime hold one string (the 65,536-byte budget).
+_SOURCE_IDS: "dict[str, str]" = {}
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class MaintenancePhaseRecord:
-    """One timed maintenance phase.
+    """One timed maintenance phase or operation (#780, #901).
 
-    `phase` is normalized against `MAINTENANCE_PHASES` in the recorder, for the
-    same reason `ConversationSyncRecord.status` is: a frozen field typed `str`
-    would accept `str(exc)` or a filesystem path and publish it through the
-    debug endpoint.
+    `phase`, `outcome`, `mode` and `write_status` are normalized against
+    closed sets in the recorder, for the same reason
+    `ConversationSyncRecord.status` is: a frozen field typed `str` would
+    accept `str(exc)` or a filesystem path and publish it through the debug
+    endpoint. The operation fields default so a legacy phase record stays
+    constructible; `charged_bytes` is the operation's reservation and
+    `process_write_bytes` is telemetry only.
     """
 
     seq: int
@@ -167,9 +206,63 @@ class MaintenancePhaseRecord:
     pages_reclaimed: int = 0
     bytes_returned: int = 0
     pending: bool = False
+    op_id: int = 0
+    started_at: str = ""
+    rows: int = 0
+    charged_bytes: int = 0
+    process_write_bytes: "int | None" = None
+    write_status: str = "not_sampled"
+    write_overlap: bool = False
+    balance_before_bytes: "int | None" = None
+    balance_after_bytes: "int | None" = None
+    mode: str = ""
+    # #901 Q9: a reclaim chunk's skip, its plan's identity and its reader.
+    skip_reason: "str | None" = None
+    sqlite_source_id: "str | None" = None
+    plan_digest: "str | None" = None
+    reader_status: "str | None" = None
+    # #901 Q8 (a deletion's reservation inputs) and Q9 (a reclaim chunk's
+    # plan and outcome, §5.5): `OPERATION_INT_FIELDS` packed into ONE
+    # array, -1 for "not recorded", because sixteen records of twenty
+    # separate int objects do not fit the frozen 65,536-byte budget. Read
+    # them by name (`record.page_count`); `as_wire` publishes them by name.
+    numbers: "array.array | None" = None   # typecode "i"
 
     def as_wire(self) -> dict:
-        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        wire = {f.name: getattr(self, f.name)
+                for f in dataclasses.fields(self) if f.name != "numbers"}
+        for name in OPERATION_INT_FIELDS:
+            wire[name] = getattr(self, name)
+        return wire
+
+
+#: Every packed value is a page count, a byte count bounded by the
+#: planner's read budget, or a small count: a C int holds each (a larger
+#: value is clamped rather than wrapped).
+_PACKED_MAX = 2 ** 31 - 1
+#: The packed numeric operation fields, in their fixed array order.
+OPERATION_INT_FIELDS = (
+    "page_count", "usable_size", "page_size", "pointer_map_cap",
+    "reservation_version", "planner_version", "freelist_count", "steps",
+    "kind_free", "kind_overflow", "kind_leaf", "kind_interior",
+    "identified_pages", "unidentified_pages", "fixed_bytes",
+    "inspected_bytes", "inspection_ms", "freelist_reduction",
+    "page_count_reduction")
+
+
+def _packed_field(index: int):
+    def read(record):
+        numbers = record.numbers
+        if numbers is None:
+            return None
+        value = numbers[index]
+        return None if value < 0 else value
+    return property(read)
+
+
+for _index, _name in enumerate(OPERATION_INT_FIELDS):
+    setattr(MaintenancePhaseRecord, _name, _packed_field(_index))
+del _index, _name
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -286,7 +379,8 @@ class TickContext:
     __slots__ = ("_now", "_cpu_now", "_standalone", "_started_ns",
                  "_started_cpu_ns", "_spans", "_finished",
                  "_ingest_ns", "_builder_ns", "_ingest_ran", "_dispatch",
-                 "_codex_regime", "_publication", "_cold", "_cache_pin_ns")
+                 "_codex_regime", "_publication", "_cold", "_cache_pin_ns",
+                 "_write")
 
     def __init__(self, *, monotonic_ns, thread_time_ns, standalone: bool):
         self._now = monotonic_ns
@@ -308,6 +402,7 @@ class TickContext:
         self._publication = "final"
         self._cold = False
         self._cache_pin_ns = 0
+        self._write = _lib_write_io.begin_interval("tick")
 
     # ── measurement ──────────────────────────────────────────────────────
 
@@ -444,6 +539,9 @@ class TickContext:
         ended_cpu_ns = self._cpu_now()
         if getattr(_tls, "tick", None) is self:
             _tls.tick = None
+        # #901: the interval's process write delta. It includes concurrent
+        # work (`write_overlap` says so) and is never summed across loops.
+        written = _lib_write_io.end_interval(self._write)
 
         global _STATE
         with _LOCK:
@@ -474,6 +572,9 @@ class TickContext:
                 period_ns=period,
                 cache_pin_ns=self._cache_pin_ns,
                 cpu_ns=max(0, ended_cpu_ns - self._started_cpu_ns),
+                process_write_bytes=written.process_write_bytes,
+                write_status=written.status,
+                write_overlap=written.overlap,
             )
             if self._standalone:
                 _STATE = dataclasses.replace(prior, standalone=record)
@@ -498,12 +599,30 @@ class TickContext:
                 # wiped it 128 times and the suite reported one record.
                 maintenance_records=prior.maintenance_records,
             )
+        # A completed main publication: the per-publication denominator,
+        # warm admission and the hysteresis step (outside this module's lock).
+        _lib_write_io.note_publication(cold=self._cold)
+
+
+def _safe_write(process_write_bytes, write_status) -> "tuple[int | None, str]":
+    """Coerce an interval's write fields: a number only with `ok`."""
+    status = write_status if write_status in WRITE_STATUSES else "not_sampled"
+    if status != "ok":
+        return None, status
+    try:
+        value = int(process_write_bytes)
+    except (TypeError, ValueError):
+        return None, "not_sampled"
+    if value < 0:
+        return None, "not_sampled"
+    return value, "ok"
 
 
 def record_conversation_pass(
     *, seq, started_ns, ended_ns, duration_ns, cpu_ns, status,
     claude_mode="not_observed", codex_mode="not_observed",
     claude_files=0, codex_files=0,
+    process_write_bytes=None, write_status="not_sampled", write_overlap=False,
 ) -> None:
     """Append one conversation sync pass to its ring, under the SHARED lock.
 
@@ -534,6 +653,8 @@ def record_conversation_pass(
         claude_mode if claude_mode in CONVERSATION_MODES else "not_observed")
     safe_codex_mode = (
         codex_mode if codex_mode in CONVERSATION_MODES else "not_observed")
+    safe_bytes, safe_write_status = _safe_write(
+        process_write_bytes, write_status)
     start = int(started_ns)
     record = ConversationSyncRecord(
         seq=int(seq),
@@ -547,6 +668,9 @@ def record_conversation_pass(
         codex_mode=safe_codex_mode,
         claude_files=max(0, int(claude_files)),
         codex_files=max(0, int(codex_files)),
+        process_write_bytes=safe_bytes,
+        write_status=safe_write_status,
+        write_overlap=bool(write_overlap),
     )
     with _LOCK:
         prior = _STATE
@@ -565,7 +689,8 @@ def record_conversation_pass(
 
 
 def record_maintenance_phase(phase: str, payload: "dict | None" = None) -> None:
-    """Append one maintenance phase to its own bounded ring (#780).
+    """Append one maintenance phase or operation to its own bounded ring
+    (#780, #901).
 
     Separate from the conversation-sync ring on purpose, so a two-second
     reclaim and a slow checkpoint each appear as their own timed phase with
@@ -592,8 +717,87 @@ def record_maintenance_phase(phase: str, payload: "dict | None" = None) -> None:
         duration_ns = max(0, int(float(duration_s) * 1_000_000_000))
     except (TypeError, ValueError):
         duration_ns = 0
-    pending = bool(data.get("pending"))
-    if safe_phase == "reclaim":
+
+    def _as_int(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _signed_or_none(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _count_or_none(value):
+        value = _signed_or_none(value)
+        return None if value is None or value < 0 else value
+
+    def _reason_or_none(value):
+        if value is None:
+            return None
+        return value if value in MAINTENANCE_SKIP_REASONS else "unknown"
+
+    def _status_or_none(value):
+        return "ok" if value == "ok" else _reason_or_none(value)
+
+    def _source_id(value):
+        if not isinstance(value, str) or not value:
+            return None
+        value = value[:SQLITE_SOURCE_ID_MAX_CHARS]
+        shared = _SOURCE_IDS.get(value)
+        if shared is None:
+            if len(_SOURCE_IDS) >= 4:
+                _SOURCE_IDS.clear()
+            shared = _SOURCE_IDS.setdefault(value, value)
+        return shared
+
+    def _packed(data):
+        values = [_count_or_none(data.get(name))
+                  for name in OPERATION_INT_FIELDS]
+        if all(v is None for v in values):
+            return None
+        return array.array("i", [
+            -1 if v is None else min(v, _PACKED_MAX) for v in values])
+
+    def _digest(value):
+        if not isinstance(value, str):
+            return None
+        value = value[:PLAN_DIGEST_MAX_CHARS]
+        return value if all(c in "0123456789abcdef" for c in value) else None
+
+    extra = {}
+    if "op_id" in data:
+        outcome = data.get("outcome")
+        outcome = outcome if outcome in MAINTENANCE_OUTCOMES else "ok"
+        mode = data.get("mode")
+        written, written_status = _safe_write(
+            data.get("process_write_bytes"), data.get("write_status"))
+        pending = (safe_phase == "reclaim" and outcome == "ok") or outcome in (
+            "gated", "skipped")
+        extra = dict(
+            op_id=_as_int(data.get("op_id")),
+            started_at=str(data.get("started_at") or "")[:STARTED_AT_MAX_CHARS],
+            rows=_as_int(data.get("rows")),
+            charged_bytes=_as_int(data.get("charged_bytes")),
+            process_write_bytes=written,
+            write_status=written_status,
+            write_overlap=bool(data.get("write_overlap")),
+            balance_before_bytes=_signed_or_none(
+                data.get("balance_before_bytes")),
+            balance_after_bytes=_signed_or_none(
+                data.get("balance_after_bytes")),
+            mode=mode if mode in MAINTENANCE_MODES else "",
+            skip_reason=_reason_or_none(data.get("skip_reason")),
+            sqlite_source_id=_source_id(data.get("sqlite_source_id")),
+            plan_digest=_digest(data.get("plan_digest")),
+            reader_status=_status_or_none(data.get("reader_status")),
+            numbers=_packed(data),
+        )
+    elif safe_phase == "reclaim":
         pending = bool(data.get("deadline_hit")) or not bool(
             data.get("made_progress", True))
         outcome = "deadline" if data.get("deadline_hit") else (
@@ -603,13 +807,8 @@ def record_maintenance_phase(phase: str, payload: "dict | None" = None) -> None:
         outcome = "ok" if (result and result[0] == 0) else "busy"
         pending = not (result and result[0] == 0 and result[1] == 0)
     else:
+        pending = bool(data.get("pending"))
         outcome = "ok"
-
-    def _as_int(value):
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
 
     record = MaintenancePhaseRecord(
         seq=0,
@@ -620,6 +819,7 @@ def record_maintenance_phase(phase: str, payload: "dict | None" = None) -> None:
         pages_reclaimed=_as_int(data.get("pages_reclaimed")),
         bytes_returned=_as_int(data.get("bytes_returned")),
         pending=pending,
+        **extra,
     )
     with _LOCK:
         prior = _STATE

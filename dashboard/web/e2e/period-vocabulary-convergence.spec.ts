@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
+import { e2eRuntimePath } from './utils';
 
 const MATRIX = [
   { width: 1440, height: 900 },
@@ -22,7 +23,7 @@ async function openPeriod(page: Page, label: 'Daily' | 'Weekly' | 'Monthly') {
 
 function screenshotPath(viewport: typeof MATRIX[number], name: string) {
   const phase = process.env.ISSUE_329_CAPTURE_PHASE ?? 'acceptance';
-  const dir = 'e2e/.runtime/issue-329-evidence';
+  const dir = e2eRuntimePath('issue-329-evidence');
   mkdirSync(dir, { recursive: true });
   return `${dir}/${phase}-${viewport.width}x${viewport.height}-${name}.png`;
 }

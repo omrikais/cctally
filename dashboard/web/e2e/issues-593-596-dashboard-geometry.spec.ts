@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import { fulfilJson } from './utils';
+import { e2eRuntimePath, fulfilJson } from './utils';
 
 const DECORATED_FIXTURE = JSON.parse(readFileSync(
   new URL('../../../tests/fixtures/dashboard/all-combined-decorated/golden-data.json', import.meta.url),
@@ -120,7 +120,7 @@ async function selectSource(page: Page, source: 'claude' | 'codex' | 'all') {
 
 for (const width of [390, 1440]) {
   test(`#773 — a credited Claude billing cycle is named as a cycle at ${width}px`, async ({ page }) => {
-    const screenshotDir = 'e2e/.runtime/issue-773-evidence';
+    const screenshotDir = e2eRuntimePath('issue-773-evidence');
     mkdirSync(screenshotDir, { recursive: true });
     await serveFixture(page, CREDITED_FIXTURE, (envelope) => {
       envelope.header.vs_last_week_delta = 0.05;
@@ -173,7 +173,7 @@ for (const width of [390, 1440]) {
 }
 
 test('#773 — independently bounded Claude account spend does not claim one current cycle', async ({ page }) => {
-  mkdirSync('e2e/.runtime/issue-773-evidence', { recursive: true });
+  mkdirSync(e2eRuntimePath('issue-773-evidence'), { recursive: true });
   await serveFixture(page, CREDITED_FIXTURE, (envelope) => {
     const base = {
       plan: 'max', active: true, weeklyPercent: 30, fiveHourPercent: null,
@@ -193,15 +193,15 @@ test('#773 — independently bounded Claude account spend does not claim one cur
   const hero = page.locator('[data-hero-strip]');
   await expect(hero.locator('.hs-label')).toHaveText('SPENT · ACCOUNT CYCLES');
   await expect(hero.locator('.hero-spent')).toHaveAttribute('aria-label', 'Spent across latest account cycles');
-  await hero.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-merged-account-hero.png' });
+  await hero.screenshot({ path: e2eRuntimePath('issue-773-evidence/390-merged-account-hero.png') });
   await page.getByRole('radio', { name: /personal/ }).click();
   await expect(hero.locator('.hs-label')).toHaveText('SPENT · ACCOUNT CYCLE');
   await expect(hero.locator('.hero-spent')).toHaveAttribute('aria-label', 'Spent over latest account cycle');
-  await hero.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-focused-account-hero.png' });
+  await hero.screenshot({ path: e2eRuntimePath('issue-773-evidence/390-focused-account-hero.png') });
 });
 
 test('#773 — failed historic detail does not borrow current-cycle figures', async ({ page }) => {
-  mkdirSync('e2e/.runtime/issue-773-evidence', { recursive: true });
+  mkdirSync(e2eRuntimePath('issue-773-evidence'), { recursive: true });
   await serveFixture(page, CREDITED_FIXTURE);
   await page.route('**/api/milestones/claude/week/**', async (route) => {
     await route.fulfill({ status: 503, contentType: 'application/json', body: '{"code":"unavailable"}' });
@@ -219,7 +219,7 @@ test('#773 — failed historic detail does not borrow current-cycle figures', as
   for (const id of ['mcw-bignum', 'mcw-spent', 'mcw-dpp', 'mcw-reset', 'mcw-pbar', 'mcw-ms-count']) {
     await expect(historic.locator(`#${id}`)).toHaveCount(0);
   }
-  await historic.screenshot({ path: 'e2e/.runtime/issue-773-evidence/390-prior-cycle-error.png' });
+  await historic.screenshot({ path: e2eRuntimePath('issue-773-evidence/390-prior-cycle-error.png') });
 });
 
 const LARGE_AMOUNT_CASES = [

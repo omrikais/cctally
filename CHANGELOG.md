@@ -5,6 +5,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.114.0] - 2026-10-08
+
+### Added
+- `cctally dashboard-perf` reports the dashboard's disk writes per minute and per publication against a write budget, and `cctally doctor` warns when a running dashboard or transcript maintenance exceeds it.
+- Claude cost reports price `claude-haiku-5-5` at its published rates, including the higher rates for a request whose prompt exceeds 100,000 tokens, instead of showing $0.
+
+### Changed
+- `cctally db vacuum --db cache` or `--db conversations` started while the dashboard runs now asks it to release the store and waits up to 20 seconds before vacuuming, or refusing with the same message as before.
+- `cctally doctor` no longer warns about modest free space in `conversations.db`; it warns only while a large backlog (over 2 GiB and 20% of the file) is being reclaimed at a paced rate, and says why when reclaim is refused.
+
+### Fixed
+- The `dashboard` block cost chart shows every trajectory sample when it exceeds a retained total.
+- The `dashboard` Sessions filter and sort icons keep their intended size on phones.
+- The `dashboard` keeps same-name project suffixes and panel counts readable, contains account status chips on phones, and keeps the swipe cue clear of spend details. Returning to All accounts starts at the first card.
+- `cctally db rederive` keeps five-hour milestone marginal costs consistent when applying reviewed weekly decisions, and resolves held-close corrections in one apply so the next preview needs no further correction on identical inputs.
+- `cctally dashboard` Codex panels now match a fresh rebuild after a memory-cache reset, a brief metadata or account-registry read error, a past-window share, or a window move under a Codex budget, instead of doubling, going stale or failing.
+- `cctally db rederive` now reports a `cache.db` that is missing a column it needs as `missing-source` (exit 2), naming the column, instead of failing with an internal error (exit 3).
+- `cctally db rederive` no longer fails with an internal error when `cache.db` still holds a transcript search index that this Python's SQLite cannot load.
+- Milestone tables put a negative amount's sign before the dollar sign: `−$71.21` in the dashboard cycle modal, `-$71.21` in the TUI, and `-$71.210000` in `five-hour-breakdown`, `percent-breakdown` and `report --detail`, not `$-71.21`.
+- `cctally dashboard` no longer writes about a gigabyte a minute to disk on a large history: steady-state writes now follow new transcript data, and removing expired transcripts and reclaiming their space are paced.
+- `cctally dashboard`, `cctally cache-sync` and the Codex hook no longer write SQLite temp files while syncing transcripts and quota data, and two background lookups no longer re-sort a whole session's or quota window's history.
+
 ## [1.113.0] - 2026-09-29
 
 ### Added

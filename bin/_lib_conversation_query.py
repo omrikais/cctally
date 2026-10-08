@@ -282,29 +282,32 @@ def _session_first_prompt_titles_map(conn, session_ids):
     to this helper's result dict): once a sid resolves a first-prompt title, later
     rows in its 12-row window do not overwrite it (Codex P1-3).
 
-    NOTE (Codex P1.2): the window ranks the full per-session human partition before
-    rn<=12 — confirmed index-ordered + bounded by the page (≤200 sessions);
-    per-session human counts are modest. Honors ``_reingest_pending(conn)``'s
-    skip_skill_titles gate: while 005's reingest is pending a stale ``human`` row
-    may actually be an injected skill body, so skip those as title candidates
-    (gated on the flag so a genuine post-reingest human prompt starting with the
-    preamble stays a normal title — Codex code-review P2)."""
+    #901 Amendment 19 T1 (spec I1): one index-served ``LIMIT 12`` lookup per
+    session, walking ``idx_conv_session_ts`` in ``(timestamp_utc, id)`` order —
+    a true top-12 with no sorter. The ``ROW_NUMBER()`` window it replaces
+    ranked the session's WHOLE human partition through a temp b-tree before
+    keeping twelve, and one session's history is not a bound. Same rows in the
+    same order: sessions in ascending id order (the window's
+    ``ORDER BY session_id``), each one's earliest twelve candidates by
+    ``(timestamp_utc, id)`` with NULL timestamps first. Honors
+    ``_reingest_pending(conn)``'s skip_skill_titles gate: while 005's reingest
+    is pending a stale ``human`` row may actually be an injected skill body, so
+    skip those as title candidates (gated on the flag so a genuine
+    post-reingest human prompt starting with the preamble stays a normal title
+    — Codex code-review P2)."""
     if not session_ids:
         return {}
     titles = {}
     skip_skill_titles = _reingest_pending(conn)
-    ph = ",".join("?" for _ in session_ids)
-    rows = conn.execute(
-        "SELECT session_id, text FROM ("
-        "  SELECT session_id, text, "
-        "         ROW_NUMBER() OVER (PARTITION BY session_id "
-        "                            ORDER BY timestamp_utc, id) AS rn "
-        f"  FROM conversation_messages "
-        f"  WHERE session_id IN ({ph}) AND entry_type='human' "
-        "        AND is_sidechain=0 AND COALESCE(text,'') <> ''"
-        ") WHERE rn <= 12 ORDER BY session_id, rn",
-        tuple(session_ids),
-    ).fetchall()
+    rows = []
+    for sid in sorted({s for s in session_ids if s is not None}, key=str):
+        rows.extend(conn.execute(
+            "SELECT session_id, text FROM conversation_messages "
+            "WHERE session_id = ? AND entry_type='human' "
+            "  AND is_sidechain=0 AND COALESCE(text,'') <> '' "
+            "ORDER BY timestamp_utc, id LIMIT 12",
+            (sid,),
+        ).fetchall())
     for sid, text in rows:
         if sid in titles:
             continue                 # first-wins: already resolved a title
@@ -578,7 +581,7 @@ _CACHE_FAILURE_CACHE_FLOOR = 20_000      # prior cache must be meaningful to "lo
 _CACHE_FAILURE_CREATE_FLOOR = 20_000     # the re-creation must be substantial / real cost
 
 
-def _cache_failure_wasted_usd(model, lost, *, speed):
+def _cache_failure_wasted_usd(model, lost, *, speed, prompt_tokens):
     """Marginal extra paid by re-creating `lost` previously-cached tokens at the
     cache-WRITE rate instead of reading them at the cache-READ rate. Reuses the
     pricing chokepoint `_calculate_entry_cost` (zero on unknown models — the
@@ -586,40 +589,54 @@ def _cache_failure_wasted_usd(model, lost, *, speed):
     any cost-snapshot / budget / reconciled figure — a display-only estimate.
     The lost-prefix subset has no authoritative mapping to the source row's
     5m/1h write buckets, so this preserves the existing 5m estimate while
-    applying the retained effective speed tier."""
+    applying the retained effective speed tier.
+
+    `prompt_tokens` (REQUIRED, #929) is the SOURCE request's real prompt total
+    (input + cache creation + cache read). Both synthetic calls pass it as
+    `prompt_tokens_for_tier`, so a prompt-length-priced card (Claude Haiku 5.5)
+    bills the subset at the card the real request selected, never at the card
+    the smaller subset would select on its own."""
     write = _calculate_entry_cost(
         model or "",
         claude_usage_dict(
             cache_1h_tokens=None, speed=speed, cache_creation_tokens=lost
         ),
+        prompt_tokens_for_tier=prompt_tokens,
     )
     read = _calculate_entry_cost(
         model or "",
         claude_usage_dict(
             cache_1h_tokens=None, speed=speed, cache_read_tokens=lost
         ),
+        prompt_tokens_for_tier=prompt_tokens,
     )
     return write - read
 
 
-def _cache_read_saved_usd(model, cache_read, *, speed):
+def _cache_read_saved_usd(model, cache_read, *, speed, prompt_tokens):
     """Marginal USD the cache SAVED this turn: the `cache_read` prefix priced at
     the full input rate minus its actual cache-READ rate. Display-only (same
     caveat as `_cache_failure_wasted_usd`): NEVER summed into a cost-snapshot /
     budget / reconciled figure. `input_tokens` and `cache_read_input_tokens` are
     independent keys in the Claude `_calculate_entry_cost` (no subset
-    subtraction), so passing each alone yields the two rates cleanly."""
+    subtraction), so passing each alone yields the two rates cleanly.
+
+    `prompt_tokens` (REQUIRED, #929) is the source request's real prompt total,
+    passed to both calls as `prompt_tokens_for_tier` exactly as in
+    `_cache_failure_wasted_usd`."""
     full = _calculate_entry_cost(
         model or "",
         claude_usage_dict(
             cache_1h_tokens=None, speed=speed, input_tokens=cache_read
         ),
+        prompt_tokens_for_tier=prompt_tokens,
     )
     read = _calculate_entry_cost(
         model or "",
         claude_usage_dict(
             cache_1h_tokens=None, speed=speed, cache_read_tokens=cache_read
         ),
+        prompt_tokens_for_tier=prompt_tokens,
     )
     return full - read
 
@@ -749,11 +766,17 @@ def _stamp_cache_failures(items):
     """
     events, sources = _cache_failure_events_from_items(items)
     for idx, prev_cached, lost, model, speed in _iter_cache_failures(events):
+        # #929: the flagged request's REAL prompt selects the pricing card, not
+        # the lost-prefix subset being priced.
+        tok = sources[idx].get("tokens") or {}
+        prompt_tokens = ((tok.get("input", 0) or 0)
+                         + (tok.get("cache_creation", 0) or 0)
+                         + (tok.get("cache_read", 0) or 0))
         sources[idx]["cache_failure"] = {
             "tokens_recreated": lost,
             "prev_cached": prev_cached,
             "est_wasted_usd": _cache_failure_wasted_usd(
-                model, lost, speed=speed
+                model, lost, speed=speed, prompt_tokens=prompt_tokens
             ),
         }
 
@@ -1037,18 +1060,24 @@ def _session_cost_map(conn, session_ids):
     shared ``_turn_costs_for_keys`` helper (cost-once per deduped session_entries
     row), summing into the owning session. (msg_id, req_id) is globally unique in
     session_entries and maps to exactly one session_id, so per-session sums are
-    clean and a turn replayed across files contributes once."""
+    clean and a turn replayed across files contributes once.
+
+    #901 Amendment 19 T1 (spec I1): the de-duplication runs in Python over the
+    streamed rows, keeping each key's FIRST occurrence in scan order — exactly
+    the rows, and the order, ``SELECT DISTINCT`` returned. The DISTINCT built a
+    temp b-tree of every turn of every touched session, and one session's
+    history is not a bound."""
     costs = {sid: 0.0 for sid in session_ids}
     if not session_ids:
         return costs
     placeholders = ",".join("?" for _ in session_ids)
-    pairs = conn.execute(
-        "SELECT DISTINCT session_id, msg_id, req_id "
+    pairs = list(dict.fromkeys(conn.execute(
+        "SELECT session_id, msg_id, req_id "
         "FROM conversation_messages "
         "WHERE session_id IN (%s) AND msg_id IS NOT NULL AND req_id IS NOT NULL"
         % placeholders,
         list(session_ids),
-    ).fetchall()
+    )))
     if not pairs:
         return costs
     key_cost = _turn_costs_for_keys(conn, [(m, r) for _, m, r in pairs])
@@ -1084,20 +1113,25 @@ def _models_main_first(rows):
 
 def _session_models_map(conn, session_ids):
     """{session_id: models ordered MAIN-session-first (subagent/sidechain-only
-    models last), alphabetical within each group — see _models_main_first}."""
+    models last), alphabetical within each group — see _models_main_first}.
+
+    #901 Amendment 19 T1 (spec I1): the de-duplication runs in Python over the
+    streamed rows (one entry per distinct tuple), where a ``SELECT DISTINCT``
+    built a temp b-tree over every touched session's whole history.
+    ``_models_main_first`` reads its input as sets, so the result is the same."""
     out = {sid: [] for sid in session_ids}
     if not session_ids:
         return out
     placeholders = ",".join("?" for _ in session_ids)
     sql = (
-        "SELECT DISTINCT session_id, model, source_path, is_sidechain "
+        "SELECT session_id, model, source_path, is_sidechain "
         "FROM conversation_messages "
         "WHERE session_id IN (%s) AND model IS NOT NULL AND model != ''"
         % placeholders
     )
     per_session = {}
-    for sid, model, source_path, is_sidechain in conn.execute(
-            sql, list(session_ids)):
+    for sid, model, source_path, is_sidechain in dict.fromkeys(
+            conn.execute(sql, list(session_ids))):
         per_session.setdefault(sid, []).append(
             (model, source_path, is_sidechain))
     for sid, rows in per_session.items():
@@ -1113,30 +1147,31 @@ def _session_latest_meta_map(conn, session_ids):
     latest non-null git_branch may land on DIFFERENT rows (the newest row can
     carry one but not the other), so each is resolved independently.
 
-    #217 S1 / U7b: consolidated from the prior TWIN correlated subqueries into a
-    SINGLE windowed scan — two ``FIRST_VALUE`` window functions over one
-    partition pass per column, each ordered ``(<col> IS NULL), timestamp_utc DESC,
-    id DESC`` so the most-recent non-null value sorts first (and an all-null
-    session yields NULL, exactly as the LIMIT-1 subquery did). Guarded by
-    ``test_session_latest_meta_map_parity_*`` against the prior semantics; if the
-    window form could not match it, the old correlated SQL would be kept (it
-    matched cleanly, so the consolidation lands)."""
+    #901 Q11 (spec §5.3a, 901-PA-001 b): two ``LIMIT 1`` lookups per session,
+    one per column, each ``WHERE <col> IS NOT NULL ORDER BY timestamp_utc DESC,
+    id DESC`` and served by its partial index on ``(session_id, timestamp_utc,
+    id)`` (conversations migration 011): one seek, however long the session.
+    The #217 S1 window query this replaces (two ``FIRST_VALUE`` windows over
+    each touched session) sorted the session's whole history through temp
+    b-trees on every conversation-sync pass, and one session is not a bound.
+    The semantics are unchanged: an empty string is a value, NULL timestamps
+    order below every real one, ties fall to the larger ``id``, an all-NULL
+    column or a missing session gives ``None``. Guarded by
+    ``test_session_latest_meta_map_parity_*`` and
+    ``tests/test_901_session_latest_meta.py`` (a Python reference and the
+    frozen window query, over sparse metadata in long histories)."""
     meta = {sid: (None, None) for sid in session_ids}
-    if not session_ids:
-        return meta
-    placeholders = ",".join("?" for _ in session_ids)
-    sql = (
-        "SELECT DISTINCT session_id, "
-        "  FIRST_VALUE(cwd) OVER ("
-        "    PARTITION BY session_id "
-        "    ORDER BY (cwd IS NULL), timestamp_utc DESC, id DESC), "
-        "  FIRST_VALUE(git_branch) OVER ("
-        "    PARTITION BY session_id "
-        "    ORDER BY (git_branch IS NULL), timestamp_utc DESC, id DESC) "
-        "FROM conversation_messages WHERE session_id IN (%s)" % placeholders
-    )
-    for sid, cwd, branch in conn.execute(sql, list(session_ids)):
-        meta[sid] = (cwd, branch)
+    for sid in meta:
+        cwd = conn.execute(
+            "SELECT cwd FROM conversation_messages "
+            "WHERE session_id = ? AND cwd IS NOT NULL "
+            "ORDER BY timestamp_utc DESC, id DESC LIMIT 1", (sid,)).fetchone()
+        branch = conn.execute(
+            "SELECT git_branch FROM conversation_messages "
+            "WHERE session_id = ? AND git_branch IS NOT NULL "
+            "ORDER BY timestamp_utc DESC, id DESC LIMIT 1", (sid,)).fetchone()
+        meta[sid] = (cwd[0] if cwd is not None else None,
+                     branch[0] if branch is not None else None)
     return meta
 
 
@@ -2982,8 +3017,12 @@ def get_conversation_outline(conn, session_id):
                     tokens[k] += tok.get(k, 0)
                 cr_tokens = tok.get("cache_read", 0) or 0
                 if cr_tokens > 0:
+                    # #929: the turn's real prompt selects the card.
                     cache_saved += _cache_read_saved_usd(
-                        it.get("model"), cr_tokens, speed=it.get("_speed")
+                        it.get("model"), cr_tokens, speed=it.get("_speed"),
+                        prompt_tokens=((tok.get("input", 0) or 0)
+                                       + (tok.get("cache_creation", 0) or 0)
+                                       + cr_tokens),
                     )
             # Copy the cache-failure marker onto the OutlineTurn exactly where
             # tokens is copied (assistant-only, rides the same source row) and

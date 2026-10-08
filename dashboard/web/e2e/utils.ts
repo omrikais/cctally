@@ -16,14 +16,19 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // #648 D9 — the estate collector supplies its own fixture runtime directory.
 // `loadManifest()` runs at module load in nine spec files, so a collector that
 // could only read the fixed in-tree path could never enumerate a tree it must
-// not write into. `e2e/serve.sh` leaves the variable unset, so a normal run
-// still resolves `e2e/.runtime`.
+// not write into. Safe gate/CI runs use the same seam for the fixture server,
+// spec imports and screenshots; standalone runs still resolve `e2e/.runtime`.
 //
 // `||` and not `??`: the nullish operator falls back on null and undefined
 // only, so `CCTALLY_E2E_RUNTIME_DIR=""` — which is what exporting the variable
 // empty, or clearing it in a wrapper, produces — resolved to the process
 // working directory instead of the in-tree runtime.
 const RUNTIME = resolve(process.env.CCTALLY_E2E_RUNTIME_DIR || resolve(HERE, '.runtime'));
+
+/** One runtime path for manifest reads, isolated subprocesses and evidence. */
+export function e2eRuntimePath(relative = ''): string {
+  return resolve(RUNTIME, relative);
+}
 
 // #583 S3 §7 — fulfil a mutated `/api/data` body without contradicting itself.
 //

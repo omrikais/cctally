@@ -68,6 +68,16 @@ function dailyRow(over: Partial<DailyPanelRow>): DailyPanelRow {
   };
 }
 
+describe('DailyPanel day count (#897)', () => {
+  it('uses the singular footer label for one day', () => {
+    const env = baseEnvelope();
+    env.daily = { rows: [dailyRow({})], quantile_thresholds: [], peak: null };
+    updateSnapshot(env);
+    const { container } = render(<DailyPanel />);
+    expect(container.querySelector('.daily-foot [data-total-cell] .lbl')).toHaveTextContent('Total (1 day)');
+  });
+});
+
 describe('DailyPanel cost-cell auto-fit hint (#208)', () => {
   // The cost cell sizes its font to the cell width via a container-query
   // formula keyed on `--c-len` (the rendered string's char count). JSDOM

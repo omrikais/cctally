@@ -473,7 +473,21 @@ _init_paths_from_env()
 # tick must carry that earlier evidence into the journal, even after this
 # binary learns a new model card. A pre-existing open projection that was
 # rebuilt without the marker remains unproven until a new tick recomputes it.
-STATS_INDEX_EPOCH = 1016
+# 1016 -> 1017 (#901 §5.3, T3): read indexes only. Every stats digest relation
+# (`_lib_dashboard_sources._CODEX_STATS_DIGEST_RELATIONS` and
+# `_CLAUDE_STATS_DIGEST_RELATIONS`) sorted its whole relation through a temp
+# b-tree on every dashboard build, and `_fetch_current_week_snapshots` grouped
+# every boundary-aware and legacy-date snapshot the same way; each now streams
+# through an index in its own order (`_STATS_READ_INDEX_DDL`). No table or
+# column changes and no digest byte moves. The same epoch carries Amendment 1's
+# history-read indexes (items 2-7 and 9, `c901-design-2`, with item 2's second
+# single-root index from Amendment 1c, `c901-design-3`): every full dashboard
+# build enumerated weekly blocks, milestone weeks, root keys, group pairs,
+# reset events and subscription anchors through temp b-trees. The mechanical
+# reason this is a bump and not a migration is unchanged: the registry is
+# frozen at 13, and an epoch-current open returns before any schema work, so a
+# schema helper alone would never run on an upgraded install.
+STATS_INDEX_EPOCH = 1017
 LEGACY_STATS_HEAD = 13
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
@@ -1861,6 +1875,207 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             "next_evaluation_by_root_json", "TEXT NOT NULL DEFAULT '{}'")
 
 
+#: #901 §5.3 (T3), epoch 1017: (table, columns the index reads, DDL). Each
+#: index's leading columns are the statement's equality filter (when it has
+#: one) followed by its ORDER BY / GROUP BY list, so the statement streams off
+#: the index with no sorter; the digest indexes are covering, because every
+#: digest relation selects exactly its ordering columns. SQLite stores each
+#: statement verbatim in `sqlite_schema`, which `_REBUILD_SCHEMA_FINGERPRINT`
+#: hashes: change the text and the fingerprint must move with it.
+_STATS_READ_INDEX_DDL: "tuple[tuple[str, tuple[str, ...], str], ...]" = (
+    ("quota_projection_state", ("source_root_key", "physical_signature"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_projection_state_digest "
+     "ON quota_projection_state(source_root_key, physical_signature)"),
+    ("quota_window_blocks",
+     ("source", "source_root_key", "logical_limit_key", "observed_slot",
+      "window_minutes", "limit_id", "limit_name", "resets_at_utc",
+      "nominal_start_at_utc", "first_observed_at_utc", "last_observed_at_utc",
+      "first_percent", "current_percent", "orphaned_at"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_blocks_digest "
+     "ON quota_window_blocks(source, source_root_key, logical_limit_key, "
+     "observed_slot, window_minutes, limit_id, limit_name, resets_at_utc, "
+     "nominal_start_at_utc, first_observed_at_utc, last_observed_at_utc, "
+     "first_percent, current_percent, orphaned_at) WHERE source='codex'"),
+    ("quota_percent_milestones",
+     ("source", "source_root_key", "logical_limit_key", "observed_slot",
+      "window_minutes", "resets_at_utc", "percent_threshold",
+      "captured_at_utc", "high_water_percent", "orphaned_at"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_milestones_digest "
+     "ON quota_percent_milestones(source, source_root_key, logical_limit_key, "
+     "observed_slot, window_minutes, resets_at_utc, percent_threshold, "
+     "captured_at_utc, high_water_percent, orphaned_at) WHERE source='codex'"),
+    ("quota_threshold_events",
+     ("source", "source_root_key", "logical_limit_key", "observed_slot",
+      "window_minutes", "resets_at_utc", "threshold", "qualifying_kind",
+      "qualifying_percent", "projected_percent", "severity", "created_at_utc",
+      "disposition", "alerted_at", "suppressed_at", "orphaned_at"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_digest "
+     "ON quota_threshold_events(source, source_root_key, logical_limit_key, "
+     "observed_slot, window_minutes, resets_at_utc, threshold, "
+     "qualifying_kind, qualifying_percent, projected_percent, severity, "
+     "created_at_utc, disposition, alerted_at, suppressed_at, orphaned_at) "
+     "WHERE source='codex'"),
+    ("budget_milestones",
+     ("vendor", "period_start_at", "period", "threshold", "budget_usd",
+      "spent_usd", "consumption_pct", "crossed_at_utc", "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_budget_milestones_codex_digest "
+     "ON budget_milestones(vendor, period_start_at, period, threshold, "
+     "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at) "
+     "WHERE vendor='codex'"),
+    ("projected_milestones",
+     ("metric", "week_start_at", "period", "threshold", "projected_value",
+      "denominator", "crossed_at_utc", "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_projected_milestones_codex_digest "
+     "ON projected_milestones(metric, week_start_at, period, threshold, "
+     "projected_value, denominator, crossed_at_utc, alerted_at) "
+     "WHERE metric='codex_budget_usd'"),
+    ("percent_milestones",
+     ("week_start_date", "percent_threshold", "reset_event_id", "account_key",
+      "captured_at_utc", "cumulative_cost_usd", "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_percent_milestones_alert_digest "
+     "ON percent_milestones(week_start_date, percent_threshold, "
+     "reset_event_id, account_key, captured_at_utc, cumulative_cost_usd, "
+     "alerted_at) WHERE alerted_at IS NOT NULL"),
+    ("five_hour_milestones",
+     ("five_hour_window_key", "percent_threshold", "reset_event_id",
+      "account_key", "captured_at_utc", "block_cost_usd", "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_five_hour_milestones_alert_digest "
+     "ON five_hour_milestones(five_hour_window_key, percent_threshold, "
+     "reset_event_id, account_key, captured_at_utc, block_cost_usd, "
+     "alerted_at) WHERE alerted_at IS NOT NULL"),
+    ("budget_milestones",
+     ("vendor", "period_start_at", "period", "threshold", "account_key",
+      "budget_usd", "spent_usd", "consumption_pct", "crossed_at_utc",
+      "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_budget_milestones_alert_digest "
+     "ON budget_milestones(vendor, period_start_at, period, threshold, "
+     "account_key, budget_usd, spent_usd, consumption_pct, crossed_at_utc, "
+     "alerted_at) WHERE vendor <> 'codex' AND alerted_at IS NOT NULL"),
+    ("projected_milestones",
+     ("week_start_at", "period", "metric", "threshold", "account_key",
+      "projected_value", "denominator", "crossed_at_utc", "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_projected_milestones_alert_digest "
+     "ON projected_milestones(week_start_at, period, metric, threshold, "
+     "account_key, projected_value, denominator, crossed_at_utc, alerted_at) "
+     "WHERE metric <> 'codex_budget_usd' AND alerted_at IS NOT NULL"),
+    ("project_budget_milestones",
+     ("week_start_at", "project_key", "threshold", "account_key",
+      "budget_usd", "spent_usd", "consumption_pct", "crossed_at_utc",
+      "alerted_at"),
+     "CREATE INDEX IF NOT EXISTS idx_project_budget_milestones_alert_digest "
+     "ON project_budget_milestones(week_start_at, project_key, threshold, "
+     "account_key, budget_usd, spent_usd, consumption_pct, crossed_at_utc, "
+     "alerted_at) WHERE alerted_at IS NOT NULL"),
+    ("weekly_usage_snapshots",
+     ("week_start_at", "week_end_at", "week_start_date", "account_key",
+      "weekly_observation_held", "captured_at_utc"),
+     "CREATE INDEX IF NOT EXISTS idx_usage_week_boundary_group "
+     "ON weekly_usage_snapshots(week_start_at, week_end_at, week_start_date, "
+     "account_key, weekly_observation_held, captured_at_utc) "
+     "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL"),
+    ("weekly_usage_snapshots",
+     ("week_start_date", "week_end_date", "account_key",
+      "weekly_observation_held", "captured_at_utc"),
+     "CREATE INDEX IF NOT EXISTS idx_usage_week_date_group "
+     "ON weekly_usage_snapshots(week_start_date, week_end_date, account_key, "
+     "weekly_observation_held, captured_at_utc)"),
+    # Amendment 1 (binding Codex answer `c901-design-2`): the recurring history
+    # reads the #901 plan guard escalated. Item 2: `_load_codex_cycles` orders
+    # every weekly block of the active roots by reset; the partial predicate
+    # deliberately keeps orphaned rows so `include_orphaned=True` streams too.
+    # Amendment 1b widened it past the reset second: `_canonicalize_codex_
+    # cluster` keeps the first maximal member, so the order of rows tied on one
+    # second is observable, and the trailing columns make it explicit. The
+    # table's UNIQUE constraint makes them unique within the population.
+    # Amendment 1c (`c901-design-3`): the legacy plan fed its sorter in two
+    # different orders. A read of two or more roots scanned
+    # `idx_quota_blocks_active` (ties by root, account, orphaned_at, limit,
+    # slot, reset spelling); a read of exactly one root seeked the UNIQUE
+    # autoindex (the same order without orphaned_at). The first index below
+    # serves the multi-root read, the second the single-root read, each in its
+    # legacy tie order.
+    ("quota_window_blocks",
+     ("source", "window_minutes", "resets_at_utc", "source_root_key",
+      "account_key", "orphaned_at", "logical_limit_key", "observed_slot"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_blocks_weekly_reset_order "
+     "ON quota_window_blocks(unixepoch(resets_at_utc) DESC, "
+     "source_root_key ASC, account_key ASC, orphaned_at ASC, "
+     "logical_limit_key ASC, observed_slot ASC, resets_at_utc ASC) "
+     "WHERE source='codex' AND window_minutes=10080"),
+    ("quota_window_blocks",
+     ("source", "window_minutes", "resets_at_utc", "source_root_key",
+      "account_key", "logical_limit_key", "observed_slot"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_blocks_weekly_single_root_order "
+     "ON quota_window_blocks(unixepoch(resets_at_utc) DESC, "
+     "source_root_key ASC, account_key ASC, "
+     "logical_limit_key ASC, observed_slot ASC, resets_at_utc ASC) "
+     "WHERE source='codex' AND window_minutes=10080"),
+    # Item 3: `_navigable_claude_refs` de-duplicates every milestone week; a
+    # full index, because the alert digest index cannot see unalerted rows.
+    ("percent_milestones", ("week_start_date",),
+     "CREATE INDEX IF NOT EXISTS idx_percent_milestones_week_date "
+     "ON percent_milestones(week_start_date ASC)"),
+    # Item 4: `_historic_root_keys` reads the complete relations.
+    ("quota_percent_milestones", ("source_root_key",),
+     "CREATE INDEX IF NOT EXISTS idx_quota_milestones_root "
+     "ON quota_percent_milestones(source_root_key ASC)"),
+    ("quota_threshold_events", ("source_root_key",),
+     "CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_root "
+     "ON quota_threshold_events(source_root_key ASC)"),
+    # Item 5 (and item 4's quota_window_blocks leg): one root's distinct
+    # (group key, group digest) pairs stream after three equality columns.
+    ("quota_window_blocks",
+     ("source_root_key", "source", "orphaned_at", "physical_group_key",
+      "physical_group_digest"),
+     "CREATE INDEX IF NOT EXISTS idx_quota_blocks_root_group_pairs "
+     "ON quota_window_blocks(source_root_key ASC, source ASC, orphaned_at ASC, "
+     "physical_group_key ASC, physical_group_digest ASC)"),
+    # Items 6 and 7: the WeekRef reset-event applier and
+    # `in_place_cut_instants` read every event in the chokepoint's order.
+    ("week_reset_events", ("effective_reset_at_utc", "id"),
+     "CREATE INDEX IF NOT EXISTS idx_week_reset_events_effective_order "
+     "ON week_reset_events(unixepoch(effective_reset_at_utc) DESC, id DESC)"),
+    # Item 9: `_compute_subscription_weeks` scans representative rows in
+    # (minimum start, date) order and picks and aggregates each date's
+    # qualifying population. The order index's predicate omits the answer's
+    # `week_start_date IS NOT NULL`: the column is NOT NULL, so SQLite drops
+    # that term from the outer scan's WHERE and then cannot prove the partial
+    # index usable ("no query solution" under INDEXED BY, measured). The
+    # indexed population is identical. The pick index keeps the term, because
+    # every lookup through it carries a date equality that implies it.
+    ("weekly_usage_snapshots",
+     ("week_start_at", "week_end_at", "week_start_date"),
+     "CREATE INDEX IF NOT EXISTS idx_usage_subscription_anchor_order "
+     "ON weekly_usage_snapshots(week_start_at ASC, week_start_date ASC) "
+     "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL"),
+    ("weekly_usage_snapshots",
+     ("week_start_date", "week_start_at", "week_end_at", "id"),
+     "CREATE INDEX IF NOT EXISTS idx_usage_subscription_anchor_pick "
+     "ON weekly_usage_snapshots(week_start_date ASC, week_start_at ASC, id ASC) "
+     "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
+     "AND week_start_date IS NOT NULL"),
+)
+
+
+def _apply_stats_read_indexes(conn: sqlite3.Connection) -> None:
+    """Create each #901 read index whose table and columns exist (epoch 1017).
+
+    ``open_db`` calls this twice: beside the quota projection schema, and
+    again after the stats migration dispatcher, because a legacy store being
+    cut over gains one indexed column (``reset_event_id``, migration 005) only
+    from the dispatcher. Every statement is IF NOT EXISTS, so the second call
+    creates exactly what the first had to skip, and an index is never attempted
+    over a column that is not there yet.
+    """
+    for table, required, statement in _STATS_READ_INDEX_DDL:
+        columns = {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", (table,))
+        }
+        if set(required) <= columns:
+            conn.execute(statement)
+
+
 def open_db(*, _target_path=None) -> sqlite3.Connection:
     # ``_target_path`` (internal, keyword-only) builds/opens the stats index at
     # an ALTERNATE path instead of the module-global ``DB_PATH`` — the seam
@@ -2129,6 +2344,10 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                     conn, _STATS_MIGRATIONS, "stats.db"
                 )
             return conn
+        # PR-3: everything below is pending schema, migration or cutover work;
+        # it sorts under FILE, and the writer temp store is selected again
+        # before the connection is returned.
+        _cctally_store.apply_schema_work_temp_store(conn)
         _fixups_current = _cctally_store.stats_open_fixups_current(conn)
         conn.execute(
             """
@@ -2854,6 +3073,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # without running its handler, so this open-time call is the sole creator).
         if not _fixups_current:
             _apply_quota_projection_schema(conn)
+        _apply_stats_read_indexes(conn)
 
         # Migration framework dispatcher. Replaces the prior inline gate stack
         # (has_blocks + _migration_done) with the framework's _run_pending_-
@@ -2871,6 +3091,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         _run_pending_migrations(
             conn, registry=_STATS_MIGRATIONS, db_label="stats.db",
         )
+        _apply_stats_read_indexes(conn)
 
         # One-time historical backfill of five_hour_blocks (rollup only;
         # milestones are forward-only per spec §4.3 / [Write-once milestones]).
@@ -3186,6 +3407,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                     except Exception:
                         pass
                     raise
+        _cctally_store.apply_writer_temp_store(conn)
         return conn
 
 

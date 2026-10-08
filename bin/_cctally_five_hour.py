@@ -2689,10 +2689,10 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
                 ])
                 continue
             m = ev
-            cum = f"${m['blockCostUSD']:.6f}"
+            cum = _c._fmt_usd_accounting(m['blockCostUSD'], 6)
             marg = (
                 "n/a" if m["marginalCostUSD"] is None
-                else f"${m['marginalCostUSD']:.6f}"
+                else _c._fmt_usd_accounting(m['marginalCostUSD'], 6)
             )
             # #834 S1 (#836): the EFFECTIVE weekly value, never the raw one. A
             # weekly-clamped tick stored a reading no reader ever saw, and this

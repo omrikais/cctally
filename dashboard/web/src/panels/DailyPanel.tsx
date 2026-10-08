@@ -290,7 +290,7 @@ export function DailyPanel() {
                   <use href="/static/icons.svg#pie-chart" />
                 </svg>
                 <div className="daily-foot-text">
-                  <span className="lbl">Total ({rows.length} days)</span>
+                  <span className="lbl">Total ({rows.length} {rows.length === 1 ? 'day' : 'days'})</span>
                   <span className="val">{fmt.usd2(total)}</span>
                 </div>
               </div>

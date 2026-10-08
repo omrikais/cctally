@@ -248,6 +248,9 @@ def test_applying_plan_through_task_a_seam_makes_next_plan_empty(cctally_module)
         (
             {
                 "session_entries": {
+                    "id",
+                    "source_path",
+                    "line_offset",
                     "timestamp_utc",
                     "model",
                     "input_tokens",
@@ -255,7 +258,8 @@ def test_applying_plan_through_task_a_seam_makes_next_plan_empty(cctally_module)
                     "cache_create_tokens",
                     "cache_read_tokens",
                     "cache_create_1h_tokens",
-                    "source_path",
+                    "cost_usd_raw",
+                    "speed",
                     "account_key",
                 }
             },
@@ -4237,10 +4241,10 @@ def test_875_kept_and_preserved_flips_freeze_the_same_block_cost(
     assert len(plans) == 2, summary
     assert _875_milestone_actions(first) == {}, summary
     if variant == "held-then-preserved":
-        # Kept through hold injection first (not preserved), then preserved.
+        # #885: lost hold support leaves this history preserved on both plans.
         assert _875_ids(first) == ["sa:o:875-held"], summary
         assert first.actions[0].disposition == "tombstone"
-        assert [plan.preserved_event_count for plan in plans] == [0, 1]
+        assert [plan.preserved_event_count for plan in plans] == [1, 1]
     else:
         assert _875_ids(first) == [_875_PRESERVED_CLOSE_ID], summary
         assert first.actions[0].revision == 2
@@ -4252,24 +4256,12 @@ def test_875_kept_and_preserved_flips_freeze_the_same_block_cost(
 def test_875_close_corrected_again_takes_no_milestone_pass_of_its_own(
     cctally_module, successor_marginal,
 ):
-    """Spec §6.1 test 22 (A3, §7.7): weekly-axis correction, then the marker.
+    """#885: hold-merged weekly axes and proven historical marker converge.
 
-    An unmarked, historically provable $0 close sits in a held window. The
-    reviewed hold first corrects only its weekly axes, and the next plan's
-    #869 historical-marker branch corrects the same close again: the close's
-    own decision takes a second pass. Every plan gets the same normally
-    derived markers and the same replay, and the held snapshot stays
-    supported throughout, because the predecessor that cites it keeps it
-    alive. The hold persists, so both corrections keep the held payload's $0
-    total: the close is frozen on both passes (spec §4.1, revision 13). The
-    successor is an unchanged crossing, so it keeps its $6 block cost
-    (replay says $14), and its marginal is 6 - 3 = 3 against the held
-    predecessor, which replay prices at $7. Copying replay would write 7,
-    and revision 11, which replaced the close, wrote (14, 11). With a
-    recorded marginal of 3 the first plan takes no milestone action; with 2
-    it writes (6, 3). The second plan's only action is the marker, and the
-    third is a no-op. The pre-#875 planner needs no fewer passes on the same
-    sequence.
+    One correction keeps the frozen $0 and stamps the normally derived
+    marker. The unchanged successor keeps $6, with its marginal resolved
+    against the retained $3 predecessor. The pre-#875 control still needs
+    two close corrections and a third, empty plan.
     """
     import types
 
@@ -4339,7 +4331,7 @@ def test_875_close_corrected_again_takes_no_milestone_pass_of_its_own(
     assert _875_ids(fixed[0])[0] == _875_CLOSE_ID, summary
     weekly = fixed[0].actions[0].payload
     assert (weekly["seven_day_pct_at_block_end"], weekly["total_cost_usd"],
-            "_pricing" in weekly) == (15.0, 0.0, False)
+            "_pricing" in weekly) == (15.0, 0.0, True)
     milestones = _875_milestone_actions(fixed[0])
     if successor_marginal == 3.0:
         assert milestones == {}, summary
@@ -4348,26 +4340,13 @@ def test_875_close_corrected_again_takes_no_milestone_pass_of_its_own(
         money = _875_money(milestones[_875_TWO])
         assert money == (6.0, 6.0 - 3.0), summary
         assert money[1] != replayed_successor["payload"]["marginal_cost_usd"]
-    # Second pass: the marker is the only change, the $0 total stays, and
-    # the frozen block takes no milestone action.
-    assert _875_ids(fixed[1]) == [_875_CLOSE_ID], summary
-    marked = fixed[1].actions[0].payload
-    assert marked["_pricing"] == markers[_875_CLOSE_ID]
-    assert marked["total_cost_usd"] == 0.0
-
-    def unmarked(payload):
-        return {key: value for key, value in payload.items()
-                if key not in {"_pricing", "pricing_provenance_json"}}
-
-    assert unmarked(marked) == unmarked(weekly), summary
-    assert _875_milestone_actions(fixed[1]) == {}, summary
-    assert len(fixed) == 3, summary
-    # The same close takes both passes under the pre-#875 planner too.
+    assert weekly["_pricing"] == markers[_875_CLOSE_ID], summary
+    assert fixed[1].actions == (), summary
+    assert len(fixed) == 2, summary
+    # The old planner remains the discriminating three-plan control.
     assert [_875_CLOSE_ID in _875_ids(plan) for plan in pre[:2]] == [
         True, True], summary
-    assert len(pre) >= len(fixed), summary
-    # §7.7 evidence: both planners reach the no-op at the third plan.
-    assert (len(pre), len(fixed)) == (3, 3), summary
+    assert len(pre) == 3, summary
 
 
 def _875_causal_plans(rederive, journal, records, baseline_desired,
@@ -4633,15 +4612,11 @@ def test_875_causal_closure_reads_a_milestone_tombstones_block_from_current(
 def test_875_hold_supported_close_tombstoned_next_takes_no_extra_pass(
     cctally_module,
 ):
-    """Spec §6.1 test 24 (A3, §7.7): the second pre-existing close sequence.
+    """#885: snapshot loss retires its unsupported close in the same plan.
 
-    An ordinary close is kept only because the reviewed hold injects it from
-    a held snapshot the same plan tombstones. The next plan no longer sees
-    the snapshot, so it tombstones the close: the close's own decision takes
-    a second pass. Its milestones are frozen while the close is kept and
-    follow replay once it is gone, so their actions accompany that close
-    tombstone and #875 adds no pass. The pre-#875 planner, which never froze
-    them, reaches its no-op after the same number of plans.
+    Final dependency state has no reason to retain this held snapshot. The
+    same correction retires it and the close, then updates both milestones.
+    The old planner still takes three plans over these exact inputs.
     """
     import _lib_journal as journal
     import _lib_rederive as rederive
@@ -4666,19 +4641,19 @@ def test_875_hold_supported_close_tombstoned_next_takes_no_extra_pass(
         "pre-875": [_875_action_summary(plan) for plan in pre],
     }
 
-    assert _875_ids(fixed[0]) == [held["id"]], summary
-    assert [(a.disposition, a.event_id) for a in fixed[1].actions] == [
+    assert [(a.disposition, a.event_id) for a in fixed[0].actions] == [
         ("tombstone", _875_CLOSE_ID),
         ("supersede", _875_ONE), ("supersede", _875_TWO),
+        ("tombstone", held["id"]),
     ], summary
-    assert [_875_money(a) for a in fixed[1].actions[1:]] == [
+    assert [_875_money(a) for a in fixed[0].actions[1:3]] == [
         (7.0, None), (14.0, 7.0),
     ], summary
+    assert fixed[1].actions == (), summary
     assert [(a.disposition, a.event_id) for a in pre[1].actions] == [
         ("tombstone", _875_CLOSE_ID),
     ], summary
-    # §7.7 evidence: both planners reach the no-op at the third plan.
-    assert (len(pre), len(fixed)) == (3, 3), summary
+    assert (len(pre), len(fixed)) == (3, 2), summary
 
 
 def _875_axis_close(journal, total, *, end, crossed, **overrides):
@@ -5134,3 +5109,187 @@ def test_875_causal_closure_skips_a_reaffirmed_close_with_an_unusable_total(
     _875_assert_only_the_successor_is_causal(
         baseline, reviewed, causal, current, [_875_CLOSE_ID, _875_THREE],
         card)
+
+
+def _883_row(journal, threshold, cost, marginal, *, event_id=None,
+             account=_875_ACCOUNT, window=_875_WINDOW, segment="0", **fields):
+    row = _875_milestone(journal, threshold, cost, marginal,
+                         event_id=event_id, reset_ref=segment)
+    row["payload"].update(account_key=account, five_hour_window_key=window,
+                          usage_snapshot_ref=None, **fields)
+    return row
+
+
+@pytest.mark.parametrize("change", ["cost", "cost-chain", "addition", "removal",
+                                    "successor-removal", "successor-movement",
+                                    "movement", "marginal-only"])
+def test_883_causal_monetary_chain_applies_and_repreviews_once(
+    cctally_module, change,
+):
+    """Apply actual correction records, including identical monetary siblings.
+
+    No close triggers #875's whole-block closure here. The causal predecessor
+    differs from baseline only in its crossing evidence; successors' actions
+    are identical. Reverse closure also brings an identical predecessor when
+    the causal action only changes a marginal. Movement must close both the
+    old segment and the final segment while isolating three unrelated axes.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    one = _883_row(journal, 1, 3.0, None)
+    two = _883_row(journal, 2, 6.0, 3.0)
+    records = [one, two]
+    baseline = [_883_row(journal, 1, 4.0, None, seven_day_pct_at_crossing=2.0),
+                _883_row(journal, 2, 6.0, 2.0)]
+    reviewed = [_883_row(journal, 1, 4.0, None, seven_day_pct_at_crossing=3.0),
+                _883_row(journal, 2, 6.0, 2.0)]
+    affected = {one["id"], two["id"]}
+    if change == "cost-chain":
+        third = _883_row(journal, 3, 9.0, 3.0)
+        records.append(third)
+        for desired in (baseline, reviewed):
+            desired[1] = _883_row(journal, 2, 8.0, 4.0)
+            desired.append(_883_row(journal, 3, 12.0, 4.0))
+        affected.add(third["id"])
+    elif change == "addition":
+        records = [two]
+    elif change == "removal":
+        baseline = [_883_row(journal, 1, 0.0, None),
+                    _883_row(journal, 2, 6.0, 6.0)]
+        reviewed = [_883_row(journal, 2, 6.0, 6.0)]
+    elif change == "successor-removal":
+        # F1: both complete plans retire this successor, but filtering its
+        # identical tombstone must not strand the old marginal beside M1=$4.
+        baseline.pop()
+        reviewed.pop()
+    elif change == "successor-movement":
+        # The same old-segment obligation applies when the successor leaves
+        # the segment by moving, rather than being retired altogether.
+        for desired in (baseline, reviewed):
+            desired[1] = _883_row(journal, 2, 6.0, 6.0, event_id=two["id"],
+                                  window=_875_WINDOW + 1200)
+    elif change == "movement":
+        # An existing identity moves credit segment while its old successor
+        # and the new segment's successor each need identical corrections.
+        other = _883_row(journal, 2, 8.0, 5.0, event_id="fhm:883-new-two",
+                         segment=None)
+        credit = journal.make_evt(kind="five_hour_credit", id="fhc:883",
+                                  at=AT, payload={})
+        other["payload"]["reset_event_ref"] = credit["id"]
+        records += [other, credit]
+        for desired, reading in ((baseline, 2.0), (reviewed, 3.0)):
+            desired[:] = [
+                _883_row(journal, 1, 4.0, None, event_id=one["id"],
+                         segment=credit["id"], seven_day_pct_at_crossing=reading),
+                _883_row(journal, 2, 6.0, 6.0),
+                {**other, "payload": {**other["payload"],
+                                      "marginal_cost_usd": 4.0}}, credit,
+            ]
+        affected.add(other["id"])
+    elif change == "marginal-only":
+        baseline = [_883_row(journal, 1, 4.0, None),
+                    _883_row(journal, 2, 7.0, 3.0)]
+        reviewed = [_883_row(journal, 1, 4.0, None),
+                    _883_row(journal, 2, 6.0, 2.0)]
+    unrelated_ids = set()
+    for index, axes in enumerate((dict(account="other"),
+                                  dict(window=_875_WINDOW + 600),
+                                  dict(segment="fhc:883-isolated"))):
+        if "segment" in axes:
+            credit = journal.make_evt(kind="five_hour_credit", at=AT,
+                                      id=axes["segment"], payload={})
+            records.append(credit)
+            baseline.append(credit)
+            reviewed.append(credit)
+        old = _883_row(journal, 1, 2.0, None,
+                       event_id=f"fhm:883-unrelated-{index}", **axes)
+        new = _883_row(journal, 1, 9.0, None, event_id=old["id"], **axes)
+        records.append(old)
+        baseline.append(new)
+        reviewed.append(new)
+        unrelated_ids.add(old["id"])
+    b, r, causal, current = _875_causal_plans(
+        rederive, journal, records, baseline, reviewed)
+    assert set(_875_ids(causal)) == affected, _875_action_summary(causal)
+    assert not unrelated_ids & set(_875_ids(causal))
+    assert _875_applied(current, causal.actions, affected) == \
+        _875_applied(current, r.actions, affected)
+    # Source ordering cannot change hashes or the correction action order.
+    _, _, reordered, _ = _875_causal_plans(
+        rederive, journal, reversed(records), reversed(baseline),
+        reversed(reviewed))
+    assert reordered.to_bytes() == causal.to_bytes()
+    corrected = [*records, *journal.make_correction_batch(
+        batch_id=f"rederive:claude-usage:883-{change}", family="claude-usage", at=AT,
+        actions=causal.to_correction_actions())]
+    _, _, next_plan, _ = _875_causal_plans(
+        rederive, journal, corrected, baseline, reviewed)
+    assert next_plan.actions == ()
+
+
+def test_883_causal_replaced_close_brings_identical_milestone_siblings(
+    cctally_module,
+):
+    """The replaced close itself triggers reverse whole-block closure."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records = [_875_priced_close(journal, 6.0),
+               _883_row(journal, 1, 3.0, None),
+               _883_row(journal, 2, 6.0, 3.0)]
+    baseline = [_875_moved_close(journal, 14.0),
+                _883_row(journal, 1, 7.0, None),
+                _883_row(journal, 2, 14.0, 7.0)]
+    reviewed = [{**baseline[0], "payload": {**baseline[0]["payload"],
+                                          "final_five_hour_percent": 44.0}},
+                *baseline[1:]]
+    _, full, causal, current = _875_causal_plans(
+        rederive, journal, records, baseline, reviewed)
+    assert _875_ids(causal) == [_875_CLOSE_ID, _875_ONE, _875_TWO]
+    assert _875_applied(current, causal.actions, _875_ids(causal)) == \
+        _875_applied(current, full.actions, _875_ids(causal))
+
+
+def test_885_hold_merge_does_not_hide_historical_population_drift(cctally_module):
+    """Entry proof alone cannot stamp a close with a different child population."""
+    import types
+
+    import _cctally_rederive as command
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    held = _875_snapshot(journal, "o:885-held")
+    close = _875_close(journal, total=0.0,
+        models=[{"model": _875_PRICED_MODEL, "cost_usd": 0.0,
+                 "input_tokens": 300}], seven_day_pct_at_block_end=63.0)
+    replayed = _875_close(journal, total=14.0,
+        models=[{"model": _875_PRICED_MODEL, "cost_usd": 14.0,
+                 "input_tokens": 350}], total_input_tokens=350,
+        seven_day_pct_at_block_end=15.0)
+    current = [close, held,
+               _875_referencing(_875_milestone(journal, 1, 3.0, None), held)]
+    desired = [replayed,
+               _875_referencing(_875_milestone(journal, 1, 7.0, None), held)]
+    source = types.SimpleNamespace(
+        source_account_key=_875_ACCOUNT, source_line_offset=0,
+        source_path="/synthetic/885-population.jsonl",
+        timestamp=dt.datetime(2026, 7, 26, 12, tzinfo=dt.timezone.utc),
+        model=_875_PRICED_MODEL, cost_usd=None, speed=None,
+        input_tokens=350, output_tokens=0, cache_creation_tokens=0,
+        cache_1h_tokens=None, cache_read_tokens=0)
+    markers = command._historical_close_markers(
+        journal.resolve_effective_events(current), desired,
+        {(_875_ACCOUNT, _875_WINDOW): [source]})
+    assert _875_CLOSE_ID in markers  # population check belongs to the planner
+    kwargs = dict(reviewed_weekly_hold_ids=("o:885-held",),
+                  historical_close_markers=markers)
+    plans = _875_run_passes(rederive, journal, current, desired, **kwargs)
+    assert len(plans) == 2
+    [action] = plans[0].actions
+    assert action.event_id == _875_CLOSE_ID
+    assert action.payload["total_cost_usd"] == 0.0
+    assert action.payload["seven_day_pct_at_block_end"] == 15.0
+    assert "_pricing" not in action.payload
+    assert plans[0].uncertain_cost_fact_count == 1
+    assert plans[1].actions == ()

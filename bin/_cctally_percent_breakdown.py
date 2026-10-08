@@ -262,7 +262,8 @@ def observation_gap_marginal_cell(marginal_value: Any, *, withheld: bool) -> str
     table already says what the code means.
     """
     if marginal_value is not None:
-        return f"${float(marginal_value):.6f}"
+        c = _cctally()
+        return c._fmt_usd_accounting(float(marginal_value), 6)
     return OBSERVATION_GAP_CAUSE if withheld else "n/a"
 
 
@@ -315,7 +316,7 @@ def _render_percent_breakdown_terminal(
         rows.append([
             str(idx),
             f"{percent}%",
-            f"${cumulative:.6f}",
+            c._fmt_usd_accounting(cumulative, 6),
             c.observation_gap_marginal_cell(
                 marginal_value, withheld=(idx - 1) in withheld),
             f"{float(five_hour_value):.0f}%" if five_hour_value is not None else "n/a",

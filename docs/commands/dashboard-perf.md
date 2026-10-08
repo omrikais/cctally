@@ -148,6 +148,8 @@ bound in [`backend-performance.md`](../backend-performance.md). An empty ring
 reads **`no samples yet`**, never a zero — and under `--no-sync` the thread is
 never started, so that is the correct and permanent reading in that mode.
 
+**Disk writes.** Six rows report the dashboard process's kernel-accounted disk writes (macOS `proc_pid_rusage` `ri_diskio_byteswritten`, Linux `/proc/self/io` `write_bytes`; process writes, not SSD NAND writes): `Disk writes (process)` is the rate over the trailing five minutes, `Per publication` the mean over completed publications in that window, `Newest tick` the newest tick's own interval, `Write budget` the verdict against the versioned limits (never above 16 MiB/min and 8 MiB per publication), `Excluded deletions` the expired-transcript deletion operations whose bytes are reported here instead of counted against the budget (the last one's time in your `display.tz` zone), and `Maintenance charged` the transcript-maintenance charges of the current UTC hour and the 24 before it against their allowance. A platform without the counter reads `Disk writes  unavailable (unsupported platform)`, and a window shorter than five minutes reads `Disk writes  no samples yet (needs 5 minutes)`, never a zero; a window that has no rate for another reason names it instead, for example `Disk writes  the last 5 minutes were not fully sampled` or `Disk writes  the write counter went backwards; measuring again`. A dashboard that predates this telemetry shows no rows.
+
 **Retained memory.** A numeric owner table reports estimated bytes, hard byte
 and entry ceilings, evictions, and oversize fallbacks for the process-local
 source/snapshot accelerators, conversation, outline-transfer, ingest-frontier,
@@ -218,6 +220,8 @@ passes `/api/debug/backend` through unchanged, and that surface is a
 diagnostic rather than a consumer contract — phase names, nesting and fields
 may change without a version bump. On a failure the same envelope is emitted
 with `"status": "error"`, an `error` message, and a null `diagnostic`.
+
+The diagnostic carries a camelCase `writeIo` object (`status`, `reason`, `source`, `scope`, `instanceId`, `sampledAt`, `windowSeconds`, `bytesWritten`, `bytesPerMinute`, `tickCount`, `meanBytesPerTick`, `excludedDeletions`, `coldStartup`, `maintenance`, `reclaimRefusal`, `budget`), and every tick and conversation-pass record carries `process_write_bytes`, `write_status` and `write_overlap`. An unavailable counter is `null` with a typed `reason` (`unsupported_platform`, `counter_error`, `counter_reset`). `reclaimRefusal` is `null` until this dashboard's transcript reclaim planner refuses an attempt, then `{reason, at}` until a later chunk runs; a refusal is kept in memory only, never written to the store. Each maintenance record in the diagnostic's tick block also carries its operation's charge inputs: a deletion's `page_count`, `usable_size`, `page_size`, `pointer_map_cap` and `reservation_version`, and a reclaim chunk's plan (`planner_version`, `sqlite_source_id`, `freelist_count`, `steps`, `kind_free`, `kind_overflow`, `kind_leaf`, `kind_interior`, `identified_pages`, `unidentified_pages`, `fixed_bytes`, `plan_digest`, `reader_status`, `inspected_bytes`, `inspection_ms`) with its outcome (`freelist_reduction`, `page_count_reduction`) or its `skip_reason`. The same object is served alone at `/api/debug/backend/write-io` behind the same loopback gate and bearer, which is how `cctally doctor` reads a running dashboard.
 
 ## Privacy
 

@@ -8,7 +8,7 @@ Hooks
       → No hook has fired yet. Restart Claude Code.
 Auth
 Database
-  ⚠ Pending migrations       59 pending
+  ⚠ Pending migrations       61 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ⚠ Reclaimable cache space  high — 97.1% of cache.db pages are free
       → Run `cctally db vacuum --db cache` to reclaim disk space.
@@ -21,5 +21,6 @@ Safety
   ⚠ update-state.json        absent (first run)
       → Run `cctally update --check` to populate
 Telemetry
+Performance
 
-Summary: 61 OK · 5 WARN · 0 FAIL
+Summary: 62 OK · 5 WARN · 0 FAIL

@@ -731,3 +731,45 @@ def test_an_old_server_without_the_key_still_renders():
     text = dp.render_dashboard_perf(payload)
     assert "Conversation sync loop" in text
     assert "no samples yet" in text
+
+
+@pytest.mark.parametrize("raised, reason", [
+    ("http401", "authentication_required"), ("http403", "refused"),
+    ("http404", "endpoint_missing"), ("http500", "http_error"),
+    ("timeout", "timeout"), ("refused", "unreachable")])
+def test_a_failed_request_carries_a_typed_reason(monkeypatch, raised, reason):
+    import io
+    import urllib.error
+
+    ns = load_script()
+    perf = ns["_cctally_dashboard_perf"]
+
+    def urlopen(request, timeout):
+        assert timeout == 1.5
+        if raised.startswith("http"):
+            raise urllib.error.HTTPError(request.full_url, int(raised[4:]),
+                                         "x", {}, io.BytesIO(b""))
+        if raised == "timeout":
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        raise urllib.error.URLError(ConnectionRefusedError(61, "refused"))
+
+    monkeypatch.setattr(perf.urllib.request, "urlopen", urlopen)
+    with pytest.raises(perf.DashboardPerfError) as caught:
+        perf._request("127.0.0.1", 9, perf.WRITE_IO_PATH, token=None,
+                      # timing-budget: `urlopen` is replaced above, so nothing waits; 1.5 is the value the stub asserts is passed through
+                      timeout=1.5)
+    assert caught.value.reason == reason
+
+
+def test_a_malformed_body_is_a_typed_failure(monkeypatch):
+    import contextlib
+    import io
+
+    ns = load_script()
+    perf = ns["_cctally_dashboard_perf"]
+    monkeypatch.setattr(perf.urllib.request, "urlopen",
+                        lambda request, timeout: contextlib.closing(
+                            io.BytesIO(b"{not json")))
+    with pytest.raises(perf.DashboardPerfError) as caught:
+        perf._request("127.0.0.1", 9, perf.WRITE_IO_PATH, token=None)
+    assert caught.value.reason == "malformed_response"

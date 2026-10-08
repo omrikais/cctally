@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -40,6 +41,7 @@ from _lib_dashboard_json import encode_dashboard_json, encode_dashboard_json_byt
 _TIMEOUT_SECONDS = 5.0
 _DIAGNOSTIC_PATH = "/api/debug/backend"
 _TRACE_PATH = "/api/debug/backend/trace"
+WRITE_IO_PATH = "/api/debug/backend/write-io"
 
 #: The two regimes the period is reported for. `not_observed` is discarded:
 #: a tick no build's Codex decision reached says nothing about either cost
@@ -55,7 +57,14 @@ def _cctally():
 
 
 class DashboardPerfError(Exception):
-    """A staged failure: exit 3. Carries the message the user sees."""
+    """A staged failure: exit 3. Carries the message the user sees and a
+    typed `reason` (`authentication_required`, `refused`, `endpoint_missing`,
+    `http_error`, `timeout`, `unreachable`, `malformed_response`) the doctor's
+    write-telemetry probe reports."""
+
+    def __init__(self, message: str, *, reason: str = "http_error"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def resolve_loopback_target(host: str) -> str:
@@ -86,7 +95,7 @@ def _authority(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
-def _request(host, port, path, *, token, body=None):
+def _request(host, port, path, *, token, body=None, timeout=_TIMEOUT_SECONDS):
     """One loopback HTTP round trip. Raises DashboardPerfError on any failure."""
     authority = _authority(host, port)
     url = f"http://{authority}{path}"
@@ -100,26 +109,35 @@ def _request(host, port, path, *, token, body=None):
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if data else "GET")
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         detail = {401: "authentication required — pass --token",
                   403: "refused by the loopback gate",
                   404: "this dashboard predates dashboard-perf"}.get(
                       exc.code, "unexpected response")
+        reason = {401: "authentication_required", 403: "refused",
+                  404: "endpoint_missing"}.get(exc.code, "http_error")
         raise DashboardPerfError(
-            f"{url} answered HTTP {exc.code}: {detail}") from None
+            f"{url} answered HTTP {exc.code}: {detail}", reason=reason) from None
     except urllib.error.URLError as exc:
+        timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
         raise DashboardPerfError(
             f"cannot reach {url}: {exc.reason}. Is a dashboard running on "
-            f"port {port}?") from None
+            f"port {port}?",
+            reason="timeout" if timed_out else "unreachable") from None
+    except (TimeoutError, socket.timeout) as exc:
+        raise DashboardPerfError(f"cannot reach {url}: {exc}",
+                                 reason="timeout") from None
     except OSError as exc:
-        raise DashboardPerfError(f"cannot reach {url}: {exc}") from None
+        raise DashboardPerfError(f"cannot reach {url}: {exc}",
+                                 reason="unreachable") from None
     try:
         return json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         raise DashboardPerfError(
-            f"{url} returned a malformed response") from None
+            f"{url} returned a malformed response",
+            reason="malformed_response") from None
 
 
 # ── the per-regime derivation (spec §3.3) ───────────────────────────────────
@@ -310,7 +328,7 @@ def _render_conversation_sync(tick: dict) -> list:
     return lines
 
 
-def render_dashboard_perf(payload: dict) -> str:
+def render_dashboard_perf(payload: dict, *, display_tz=None) -> str:
     """The human report. Pure — takes the decoded diagnostic, returns text."""
     tick = payload.get("tick") or {}
     tracing = payload.get("tracing") or {}
@@ -412,6 +430,12 @@ def render_dashboard_perf(payload: dict) -> str:
             f"  duty           {combined['combined'] * 100:.1f}% of one core · "
             f"ceiling {combined['ceiling'] * 100:.1f}% · {verdict}")
     lines.append("")
+    write_rows = render_write_io_rows(
+        payload.get("writeIo"), records[-1] if records else None,
+        display_tz=display_tz)
+    if write_rows:
+        lines.extend(write_rows)
+        lines.append("")
 
     counts = tick.get("dispatch_counts") or {}
     lines.append(
@@ -470,6 +494,100 @@ def render_dashboard_perf(payload: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── process disk writes (#901 spec §5.5, §5.7) ─────────────────────────────
+
+
+def _reason_words(reason) -> str:
+    return str(reason or "unavailable").replace("_", " ")
+
+
+def render_write_io_rows(write_io, newest_tick=None, *,
+                         display_tz=None) -> list:
+    """The §5.7 rows, in the approved wording. Pure; an older dashboard that
+    publishes no `writeIo` renders no rows rather than a guess.
+
+    ``display_tz`` is the resolved ``display.tz`` (``resolve_display_tz``:
+    a zone, or None for host-local). The excluded deletion's "at HH:MM" is
+    rendered in it (#901 Amendment 19 PR-12); the maintenance window's
+    "since 09:00 UTC" names its zone and stays UTC, as §5.7 states it."""
+    import _lib_write_budget as wb
+
+    if not isinstance(write_io, dict):
+        return []
+    lines = []
+    budget = write_io.get("budget") or {}
+    if write_io.get("status") != "ok":
+        lines.append(
+            f"Disk writes  unavailable ({_reason_words(write_io.get('reason'))})")
+    elif write_io.get("bytesPerMinute") is None:
+        # PR-8: the statistic's own reason; only warming up is "no samples".
+        reason = (budget.get("reasons") or ["warming_up"])[0]
+        lines.append(f"Disk writes  {wb.statistic_reason_phrase(reason)}")
+    else:
+        lines.append(
+            f"Disk writes (process)  {wb.format_mib(write_io['bytesPerMinute'])}"
+            f"/min over {wb.format_window_ms(write_io.get('windowSeconds') or 0)}")
+    mean = write_io.get("meanBytesPerTick")
+    publications = write_io.get("tickCount") or 0
+    if mean is None or publications < wb.MIN_PUBLICATIONS:
+        lines.append(
+            f"Per publication  no samples yet (needs {wb.MIN_PUBLICATIONS} "
+            "publications)")
+    else:
+        lines.append(f"Per publication  {wb.format_mib(mean)} (mean, "
+                     f"{publications} publications)")
+    if newest_tick is None:
+        lines.append("Newest tick  no samples yet")
+    elif newest_tick.get("process_write_bytes") is None:
+        lines.append("Newest tick  unavailable "
+                     f"({_reason_words(newest_tick.get('write_status'))})")
+    else:
+        lines.append(
+            f"Newest tick  {wb.format_mib(newest_tick['process_write_bytes'])}")
+    if budget:
+        lines.append(
+            f"Write budget  {budget.get('verdict')} (limits "
+            f"{wb.format_mib(budget.get('bytesPerMinuteLimit') or 0)}/min, "
+            f"{wb.format_mib(budget.get('meanBytesPerTickLimit') or 0)} per "
+            "publication)")
+    excluded = write_io.get("excludedDeletions") or {}
+    operations = int(excluded.get("operations") or 0)
+    if operations == 0:
+        lines.append("Excluded deletions  none")
+    else:
+        rows = int(excluded.get("rows") or 0)
+        written = int(excluded.get("bytes") or 0)
+        per_row = (f" ({wb.format_kib(written / rows)}/row)" if rows else "")
+        at = excluded.get("lastEndedAt")
+        when = ""
+        if isinstance(at, str):
+            from _lib_display_tz import format_display_dt
+
+            when = " at " + format_display_dt(
+                at, display_tz, fmt="%H:%M", suffix=False)
+        noun = "conversation" if operations == 1 else "conversations"
+        lines.append(
+            f"Excluded deletions  {operations} {noun}, {rows:,} rows, "
+            f"{wb.format_mib(written)}{per_row}{when}")
+    maintenance = write_io.get("maintenance")
+    if not isinstance(maintenance, dict):
+        lines.append("Maintenance charged  no ledger yet")
+    else:
+        import datetime as _dt
+
+        start = _dt.datetime.fromisoformat(
+            maintenance["windowStart"].replace("Z", "+00:00"))
+        end = _dt.datetime.fromisoformat(
+            maintenance["windowEnd"].replace("Z", "+00:00"))
+        lines.append(
+            f"Maintenance charged  {wb.format_size(maintenance['chargedBytes'])} "
+            f"over {wb.format_window_hm(maintenance['windowMinutes'])} "
+            f"(since {wb.format_since(start, end)}); allowance "
+            f"{wb.format_size(maintenance['allowanceBytes'])} incl. largest "
+            f"{wb.format_size(maintenance['largestChargeBytes'])}")
+    return lines
+
+
 # ── the command ─────────────────────────────────────────────────────────────
 
 
@@ -522,5 +640,6 @@ def cmd_dashboard_perf(args) -> int:
               f"(requested={trace_result.get('requested')}, "
               f"applied={trace_result.get('applied')}, "
               f"applies_at={trace_result.get('applies_at')})")
-    sys.stdout.write(render_dashboard_perf(payload))
+    sys.stdout.write(render_dashboard_perf(
+        payload, display_tz=c.resolve_display_tz(args, c.load_config())))
     return 0

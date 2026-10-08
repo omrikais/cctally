@@ -122,7 +122,8 @@ def test_file_alias_plan_constrains_source_path(cache_conn, cctally_module):
     provider root it visits every entry row per file. Asserting that
     ``source_path`` is constrained is the discriminator; asserting merely "not a
     SCAN" would pass on the broken plan, since the root-only index still
-    registers as a SEARCH.
+    registers as a SEARCH. Since #901 the join is a correlated MIN per file over
+    idx_codex_entries_root_path_time; the discriminator is unchanged.
     """
     import _cctally_dashboard_sources as ds
 
@@ -132,7 +133,11 @@ def test_file_alias_plan_constrains_source_path(cache_conn, cctally_module):
         "the codex_session_entries join must be constrained on source_path, "
         f"otherwise it degenerates to files x entries. plan node was: {node}"
     )
-    assert INDEX in node, f"expected the composite index in the plan, got: {node}"
+    # #901 W2: the alias read is now a correlated MIN per file, answered by a
+    # covering seek of the (root, path, timestamp) index; asserted by its exact
+    # name, because the 042 index's name is a prefix of it.
+    assert "USING COVERING INDEX idx_codex_entries_root_path_time (" in node, (
+        f"expected the #901 covering seek in the plan, got: {node}")
 
 
 def test_production_query_still_returns_the_alias_rows(cache_conn):

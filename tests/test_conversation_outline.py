@@ -471,7 +471,7 @@ def test_outline_cache_saved_usd_present_and_positive():
     stats = cq.get_conversation_outline(c, "cfo")["stats"]
     assert "cache_saved_usd" in stats
     expected = cq._cache_read_saved_usd(
-        _MODEL, 130_000, speed=None
+        _MODEL, 130_000, speed=None, prompt_tokens=10 + 1_000 + 130_000
     )   # a2 has cr=0 -> no add
     assert expected > 0
     assert abs(stats["cache_saved_usd"] - expected) < 1e-12

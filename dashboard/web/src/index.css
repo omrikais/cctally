@@ -3022,6 +3022,14 @@ button.mcw-weeknav-btn:disabled, button.mcw-blocknav-btn:disabled {
   gap: 6px;
   align-items: center;
 }
+/* Controls move outside .panel-header on phones. Keep their SVG viewport
+   sizing here so the browser's intrinsic 300x150 size cannot take over. */
+.sessions-ctrls .icon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
 .ctrl-btn {
   background: transparent;
   border: 1px solid var(--border-soft);
@@ -6982,13 +6990,30 @@ mark.current {
 
 .projects-row {
   display: grid;
-  grid-template-columns: 110px 1fr 56px 44px;
+  grid-template-columns: 128px 1fr 56px 44px;
   gap: 8px;
   align-items: center;
   font-size: 12.5px;
   padding: 4px 6px;
   border-radius: var(--radius-xs);
   cursor: pointer;
+}
+
+/* Counts are useful content: let these longer titles wrap before the action
+   cluster rather than ellipsizing their distinguishing count. */
+@media (min-width: 641px) {
+  #panel-projects .panel-header h2.has-count,
+  #panel-sessions .panel-header h2 {
+    white-space: normal;
+    overflow: visible;
+  }
+  #panel-projects .panel-header h2.has-count .sub,
+  #panel-sessions .panel-header h2 .sub {
+    display: inline-block;
+    white-space: nowrap;
+  }
+  #panel-projects .panel-header .icon,
+  #panel-sessions .panel-header .icon { flex-shrink: 0; }
 }
 .projects-row:hover { background: color-mix(in srgb, var(--accent-magenta) 6%, transparent); }
 .projects-row.tail { cursor: default; }
@@ -8424,16 +8449,15 @@ mark.current {
 /* #341 Task 4 — the unified per-account hero cards. A wrapping row of compact
    cards under the hero; each card's accent is the deterministic account color
    (--account-color). The unattributed card renders dimmed with totals only. */
+.account-hero-cards-wrap {
+  margin-top: var(--space-3);
+  grid-column: 1 / -1;
+  min-width: 0;
+}
 .account-hero-cards {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-3);
-  margin-top: var(--space-3);
-  position: relative;
-  /* #562 — this is the row UNDER the three hero zones, so it owns the full
-     hero width. Without an explicit placement the grid auto-placed it in the
-     first 1fr phone cell (186px at 390px), forcing every 200px card to stack. */
-  grid-column: 1 / -1;
 }
 .account-hero-provider-group { display: contents; }
 .account-hero-card-row { display: contents; }
@@ -8453,16 +8477,21 @@ mark.current {
 .account-hero-card.is-focused { box-shadow: inset 0 0 0 1px var(--account-color, var(--accent-blue)); }
 .account-hero-card-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
 }
 .account-hero-card-label {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
   font-family: var(--font-mono);
   font-weight: 700;
   font-size: 13px;
   color: var(--text);
 }
 .account-hero-card-plan {
+  flex-shrink: 0;
   font-size: 10.5px;
   font-weight: 600;
   text-transform: uppercase;
@@ -8472,6 +8501,8 @@ mark.current {
   border-radius: 4px;
   padding: 0 5px;
 }
+.account-hero-card-freshness,
+.account-hero-card-active { flex-shrink: 0; }
 .account-hero-card-active { color: var(--account-color, var(--accent-blue)); font-size: 9px; }
 .account-hero-card-bars { display: flex; flex-direction: column; gap: 4px; }
 .account-hero-bar {
@@ -8533,10 +8564,8 @@ mark.current {
   font-style: italic;
 }
 
-/* #757 — the phone rail remains directly touch/trackpad scrollable, while its
-   affordance sits above the edge of the content instead of becoming another
-   flex item or adding to the rail's scroll width. It is toggled by the
-   component only while cards remain offscreen. */
+/* The phone cue follows the rail in normal flow, clear of card footers and
+   outside the scroll width. It appears only while cards remain offscreen. */
 .account-hero-scroll-cue {
   display: none;
 }
@@ -8584,12 +8613,10 @@ mark.current {
   }
   .account-hero-caption { white-space: nowrap; }
   .account-hero-scroll-cue {
-    position: absolute;
-    right: 4px;
-    bottom: 4px;
-    z-index: 1;
     display: none;
     align-items: center;
+    width: max-content;
+    margin: 4px 4px 0 auto;
     padding: 3px 6px;
     border: 1px solid color-mix(in srgb, var(--accent-blue) 45%, var(--border-soft));
     border-radius: 999px;
@@ -8601,8 +8628,8 @@ mark.current {
     white-space: nowrap;
     pointer-events: none;
   }
-  .account-hero-cards[data-scroll-cue="visible"] .account-hero-scroll-cue {
-    display: inline-flex;
+  .account-hero-scroll-cue[aria-hidden="false"] {
+    display: flex;
   }
 }
 

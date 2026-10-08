@@ -1879,6 +1879,410 @@
       "rows": [
         "tests/test_codex_56_pricing.py::test_session_metrics_uses_each_sol_models_cached_input_rate::shared_mark::not SESSION_METRICS.exists()"
       ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0191",
+      "predecessorDigest": "b68fa174dbf570e2421b366b9077d5c662868e4e805faa937a9590a5e1d4cf95",
+      "profile": "public",
+      "reason": "Renamed by #872. The project wire cache no longer splices per-group cost shells over borrowed accounting populations (the splice applied deltas to a base it never proved it held), so the charge this test pinned no longer exists. Its successor in the same file, test_the_project_wire_entry_charges_its_signature_and_wire, pins the new per-entry charge (signature plus rendered wire), and tests/test_872_codex_derived_coherence.py covers the wire's coherence.",
+      "rows": [
+        "tests/test_source_cache_ownership.py::test_the_project_wire_groups_cost_shells_not_their_populations"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0197",
+      "predecessorDigest": "4e1ecabcff1181975c83a4282cb0331184f4cb491b18f2b52ceb35a63eace7da",
+      "profile": "public",
+      "reason": "These seven identities are pytest's auto-generated ids for test_current_generation_models_priced_at_vendor_rates, which parametrizes over sorted(_CURRENT_GENERATION_RATES.items()). #929 S1 pins the Claude Haiku 5.5 base rates in that map, and claude-haiku-5-5 sorts ahead of every listed model, so each later entry's positional `ratesN` suffix shifts by one. Not one test body, parameter value or assertion changed, and no coverage was retired: each listed identity is the same case under the id its new position produces. The genuinely new case, claude-haiku-5-5-rates3, is an addition and needs no declaration.",
+      "renames": [
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates3]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates4]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates4]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates5]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates5]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates6]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates6]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates7]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates7]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates8]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates9]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates9]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates10]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0199",
+      "predecessorDigest": "0e8cb8b7830740b274ba8686417a893a849eb668f017b9245df9c35f140e8dd0",
+      "profile": "public",
+      "reason": "These seven identities are pytest's auto-generated ids for test_current_generation_models_priced_at_vendor_rates, which parametrizes over sorted(_CURRENT_GENERATION_RATES.items()). #929 S1 pins the Claude Haiku 5.5 base rates in that map, and claude-haiku-5-5 sorts ahead of every listed model, so each later entry's positional `ratesN` suffix shifts by one. Not one test body, parameter value or assertion changed, and no coverage was retired: each listed identity is the same case under the id its new position produces. The genuinely new case, claude-haiku-5-5-rates3, is an addition and needs no declaration. Re-declared against the incoming main (merge base 1db3075cd, after #921 and #931) for the merge-queue publication: R-0197/R-0198 bind the same renames to the original merge base 66743ebc0's active set, and main's active set has since changed digest, so the merge's transition from main needs a declaration bound to main's digest.",
+      "renames": [
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates3]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates4]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates4]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates5]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates5]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates6]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates6]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates7]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates7]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates8]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates9]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates9]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates10]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0212",
+      "predecessorDigest": "93e56db019cf4dab87e06a8ac4e71e47f7cbc947383de9631f1d45ed5a917113",
+      "profile": "public",
+      "reason": "#901 raises STATS_INDEX_EPOCH from 1016 to 1017 for the spill-free read indexes. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1017]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1017-1017]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0214",
+      "predecessorDigest": "93e56db019cf4dab87e06a8ac4e71e47f7cbc947383de9631f1d45ed5a917113",
+      "profile": "public",
+      "reason": "#901 replaced escalation-driven, checkpointing reclaim with paced, reservation-charged maintenance and remapped db.conversations_reclaimable. Successors: the reclaim/escalation/pending cases by tests/test_retention_pacing.py (test_reclaim_is_attempted_at_most_once_a_minute_in_small_chunks, test_a_reclaim_attempt_stops_at_its_deadline, test_a_reclaim_chunk_frees_exactly_its_pages_in_one_transaction, test_an_empty_freelist_chunk_is_no_progress_and_uncharged, test_retained_slack_below_the_start_threshold_is_never_reclaimed, test_reclaim_never_checkpoints_even_as_the_last_connection); test_orchestrated_prune_reclaims_freed_pages by tests/test_retention_pacing.py::test_paced_deletion_finishes_across_visits_and_keeps_small_slack; the two doctor cases (test_no_pending_record_leaves_the_doctor_check_byte_identical, test_conversation_reclaimable_warns_with_targeted_remediation) by tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_remap_table.",
+      "rows": [
+        "tests/test_conversation_retention.py::test_a_below_escalation_backlog_still_waits_for_the_throttle",
+        "tests/test_conversation_retention.py::test_a_no_progress_pass_stays_pending",
+        "tests/test_conversation_retention.py::test_a_pass_with_no_new_deletion_still_continues_the_backlog",
+        "tests/test_conversation_retention.py::test_a_reclaim_pass_respects_its_wall_clock_deadline",
+        "tests/test_conversation_retention.py::test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending",
+        "tests/test_conversation_retention.py::test_an_escalated_backlog_does_not_wait_for_the_daily_throttle",
+        "tests/test_conversation_retention.py::test_no_pending_record_leaves_the_doctor_check_byte_identical",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_reclaims_freed_pages",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_retries_partial_incremental_vacuum",
+        "tests/test_conversation_retention.py::test_pending_reclaim_state_survives_to_the_next_pass",
+        "tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_warns_with_targeted_remediation"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0230",
+      "predecessorDigest": "672032ab8abeba21e46d495d75a996fe1cec6b49c7d99db9cbdd7bf496ee7c6e",
+      "profile": "public",
+      "reason": "#901 Q11 extends idx_qws_physical_group so a physical-group shard streams its order from the seek. The same shard-plan test now also rejects any temp structure, so its name says the shard streams rather than only seeks. No case was removed.",
+      "renames": [
+        {
+          "from": "tests/test_901_quota_latest_summary.py::test_group_shards_seek_the_physical_group_index",
+          "to": "tests/test_901_quota_latest_summary.py::test_group_shards_stream_from_the_physical_group_index"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0232",
+      "predecessorDigest": "01a7a09d81c31f95adad754e9c10906ac171e36e8a54c31fd20a7ff3960a34a1",
+      "profile": "public",
+      "reason": "#901 spec revision 6 replaced C-op's 12 KiB-per-row total with the deletion receipt's per-page I4 verdict, so the c-op verdict case for 10 KiB over one row has no rule left to test. Successors: the receipt cases in tests/test_write_attribution_tools.py (test_a_covered_deletion_that_violates_i4_fails, test_a_deletion_over_its_page_bounds_fails_i4_per_component, test_the_fallback_ceiling_includes_the_final_checkpoint).",
+      "rows": [
+        "tests/test_write_attribution_tools.py::test_the_c_op_verdict[bytes_3-1-False]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0202",
+      "predecessorDigest": "01a7a09d81c31f95adad754e9c10906ac171e36e8a54c31fd20a7ff3960a34a1",
+      "profile": "public",
+      "reason": "#901 spec revision 6: C's per-row process-counter check left c_conditions (a deletion's write bound is now its receipt's I4 verdict), so the case that rejected a wrong charge, debt and a fat deletion is renamed for the two rules it still asserts, and the c-op verdict case for a group of no rows moved up one parameter index when the per-row case before it retired. No other case was removed.",
+      "renames": [
+        {
+          "from": "tests/test_write_attribution_tools.py::test_c_conditions_reject_a_wrong_charge_debt_and_a_fat_deletion",
+          "to": "tests/test_write_attribution_tools.py::test_c_conditions_reject_a_wrong_charge_and_debt"
+        },
+        {
+          "from": "tests/test_write_attribution_tools.py::test_the_c_op_verdict[bytes_4-0-False]",
+          "to": "tests/test_write_attribution_tools.py::test_the_c_op_verdict[bytes_3-0-False]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0204",
+      "predecessorDigest": "46548a4c01dc3c2b788de64c45babcfb5d909c641273909037a0732c96e18945",
+      "profile": "public",
+      "reason": "#901 spec revision 15's precision correction (Q17, dc14 N1): the Codex state database is no longer frozen as a header-patched rollback copy - header patching and omitting committed WAL content are prohibited - so the case that asserted the patch retired. The derived capture's cases replace it: the WAL-only title, the partial backfill, the two per-file seams, replacement, WAL appearance and disappearance, retry exhaustion, recovery failure with the nonempty journal, and the derived size.",
+      "rows": [
+        "tests/test_write_attribution_tools.py::test_a_codex_state_database_is_frozen_as_a_rollback_copy"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0206",
+      "predecessorDigest": "46548a4c01dc3c2b788de64c45babcfb5d909c641273909037a0732c96e18945",
+      "profile": "public",
+      "reason": "#901 spec revision 15's precision correction (Q17, the operator's D7 decision): an exec of /bin/sh, and of npm through /usr/bin/env, with no launch record is no longer admitted on its executable or interpreter prefix alone, so these two family-verdict cases now expect INVALID and their parameter ids carry the expected problem fragment instead of None. No other case was removed.",
+      "renames": [
+        {
+          "from": "tests/test_write_attribution_tools.py::test_the_family_verdict_requires_complete_enforced_receipts[lines7-launches7-None]",
+          "to": "tests/test_write_attribution_tools.py::test_the_family_verdict_requires_complete_enforced_receipts[lines7-launches7-without a complete launch record]"
+        },
+        {
+          "from": "tests/test_write_attribution_tools.py::test_the_family_verdict_requires_complete_enforced_receipts[lines8-launches8-None]",
+          "to": "tests/test_write_attribution_tools.py::test_the_family_verdict_requires_complete_enforced_receipts[lines8-launches8-without a complete launch record]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0208",
+      "predecessorDigest": "aa6cfd1879ad98fb3d45068f629066cdd6150d1f47cf0aaba763f496b48a1e5b",
+      "profile": "public",
+      "reason": "#901 plan Amendment 10 (spec revision 15, \u00a76.3 \"Frozen input set\": symlinks are covered or refused): a directory link inside a root is no longer refused but covered as non-traversed, so this in-root symlink case lost its directory-link refusal half and was renamed for what it still asserts (an in-root file link covered, its rootmap L line). The directory-link behaviour moved to the new cases test_capture_covers_a_directory_link_the_walk_does_not_traverse and test_capture_covers_an_in_root_directory_link_and_refuses_one_used_as_a_file. No case was retired and no suppression was added.",
+      "renames": [
+        {
+          "from": "tests/test_write_attribution_tools.py::test_capture_covers_a_file_symlink_and_refuses_a_directory_symlink",
+          "to": "tests/test_write_attribution_tools.py::test_capture_covers_a_file_symlink_inside_a_root"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0210",
+      "predecessorDigest": "24eafeb3ce0ce0c771ef15af6f9a29601bcdffbc54a5cb4f19c2f9d33987dadc",
+      "profile": "public",
+      "reason": "#901 plan Amendment 19 HR-8 (stop rule sr5): the acceptance harness's own rolling_rates re-implementation of the I2 statistic, and the soak's _rolling_write_rates, were removed; both now feed the candidate kernel's steady_statistic (bin/_lib_write_budget.py) with its gap, sample-count, counter-reset and excluded-time rules. These two cases asserted the removed functions' deletion subtraction. The same behaviour is asserted against the kernel by the new cases tests/test_write_attribution_tools.py::test_the_kernel_statistic_subtracts_marked_deletions and tests/test_bench.py::test_write_budget_steady_statistic_is_the_candidate_kernels. No suppression was added.",
+      "rows": [
+        "tests/test_bench.py::test_write_budget_rolling_rates_subtract_marked_deletions",
+        "tests/test_write_attribution_tools.py::test_rolling_rates_subtract_marked_deletions"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0215",
+      "predecessorDigest": "7ee94eaa985ab31fbe375981321e345eff88533a4aef688b4e69e6efb25ea5c4",
+      "profile": "public",
+      "reason": "#901 PR-9 (084042474): doctor sends no token, so a token-mode dashboard answers authentication_required and could never clear the WARN; that reason is now an OK note, so its case left the WARN parametrization of test_a_live_instance_without_valid_telemetry_warns. The behaviour is asserted by its successor tests/test_doctor_dashboard_disk_writes.py::test_a_dashboard_doctor_cannot_measure_from_here_is_ok (the authentication_required and not_loopback_reachable cases). Bound to the branch's last recorded estate (3ba2508b6, carried unchanged to 22e22cdff), which predates PR-9; the merge of origin/main 66743ebc0 is the first regeneration since.",
+      "rows": [
+        "tests/test_doctor_dashboard_disk_writes.py::test_a_live_instance_without_valid_telemetry_warns[entry1-authentication required]"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0216",
+      "predecessorDigest": "7ee94eaa985ab31fbe375981321e345eff88533a4aef688b4e69e6efb25ea5c4",
+      "profile": "public",
+      "reason": "#901 PR-9 (084042474): removing the authentication_required case from the WARN parametrization of test_a_live_instance_without_valid_telemetry_warns moved the unchanged identity_mismatch case from parameter index 2 to index 1. No assertion changed. Bound to the branch's last recorded estate (3ba2508b6, carried unchanged to 22e22cdff), which predates PR-9; the merge of origin/main 66743ebc0 is the first regeneration since.",
+      "renames": [
+        {
+          "from": "tests/test_doctor_dashboard_disk_writes.py::test_a_live_instance_without_valid_telemetry_warns[entry2-identity mismatch]",
+          "to": "tests/test_doctor_dashboard_disk_writes.py::test_a_live_instance_without_valid_telemetry_warns[entry1-identity mismatch]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0221",
+      "predecessorDigest": "4e1ecabcff1181975c83a4282cb0331184f4cb491b18f2b52ceb35a63eace7da",
+      "profile": "public",
+      "reason": "Restates R-0214 against main's recorded estate at origin/main 66743ebc0, the second parent of the merge d35686d79 that integrates main into the #901 branch. R-0214 is bound to the public active set at the merge base 56e66f07a; main has since changed that estate (#899 S2, #891, #925, #917 and others), so the same removals checked from main's recorded set digest differently. The removals are the same ones R-0214 explains: #901 replaced escalation-driven, checkpointing reclaim with paced, reservation-charged maintenance and remapped db.conversations_reclaimable. Successors: the reclaim/escalation/pending cases by tests/test_retention_pacing.py (test_reclaim_is_attempted_at_most_once_a_minute_in_small_chunks, test_a_reclaim_attempt_stops_at_its_deadline, test_a_reclaim_chunk_frees_exactly_its_pages_in_one_transaction, test_an_empty_freelist_chunk_is_no_progress_and_uncharged, test_retained_slack_below_the_start_threshold_is_never_reclaimed, test_reclaim_never_checkpoints_even_as_the_last_connection); test_orchestrated_prune_reclaims_freed_pages by tests/test_retention_pacing.py::test_paced_deletion_finishes_across_visits_and_keeps_small_slack; the two doctor cases (test_no_pending_record_leaves_the_doctor_check_byte_identical, test_conversation_reclaimable_warns_with_targeted_remediation) by tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_remap_table.",
+      "rows": [
+        "tests/test_conversation_retention.py::test_a_below_escalation_backlog_still_waits_for_the_throttle",
+        "tests/test_conversation_retention.py::test_a_no_progress_pass_stays_pending",
+        "tests/test_conversation_retention.py::test_a_pass_with_no_new_deletion_still_continues_the_backlog",
+        "tests/test_conversation_retention.py::test_a_reclaim_pass_respects_its_wall_clock_deadline",
+        "tests/test_conversation_retention.py::test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending",
+        "tests/test_conversation_retention.py::test_an_escalated_backlog_does_not_wait_for_the_daily_throttle",
+        "tests/test_conversation_retention.py::test_no_pending_record_leaves_the_doctor_check_byte_identical",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_reclaims_freed_pages",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_retries_partial_incremental_vacuum",
+        "tests/test_conversation_retention.py::test_pending_reclaim_state_survives_to_the_next_pass",
+        "tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_warns_with_targeted_remediation"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0222",
+      "predecessorDigest": "4e1ecabcff1181975c83a4282cb0331184f4cb491b18f2b52ceb35a63eace7da",
+      "profile": "public",
+      "reason": "Restates R-0212 against main's recorded estate at origin/main 66743ebc0, the second parent of the merge d35686d79 that integrates main into the #901 branch. R-0212 is bound to the public active set at the merge base 56e66f07a; main has since changed that estate (#899 S2, #891, #925, #917 and others), so the same removals checked from main's recorded set digest differently. The removals are the same ones R-0212 explains: #901 raises STATS_INDEX_EPOCH from 1016 to 1017 for the spill-free read indexes. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1017]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1017-1017]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0225",
+      "predecessorDigest": "0e8cb8b7830740b274ba8686417a893a849eb668f017b9245df9c35f140e8dd0",
+      "profile": "public",
+      "reason": "Restates R-0221 (itself a restatement of R-0214) against main's recorded estate at origin/main b13c40265, the second parent of the merge b80f23e32 that integrates main into the #901 branch for queue admission t000067-93edd9c4. Main's #921 commits (af739f0d3, 13edec6f1) added three pytest nodes and regenerated the estate, so the same removals checked from main's new recorded set digest differently from the 66743ebc0 digest R-0221 is bound to. The removals are the same ones R-0214 explains: #901 replaced escalation-driven, checkpointing reclaim with paced, reservation-charged maintenance and remapped db.conversations_reclaimable. Successors: the reclaim/escalation/pending cases by tests/test_retention_pacing.py (test_reclaim_is_attempted_at_most_once_a_minute_in_small_chunks, test_a_reclaim_attempt_stops_at_its_deadline, test_a_reclaim_chunk_frees_exactly_its_pages_in_one_transaction, test_an_empty_freelist_chunk_is_no_progress_and_uncharged, test_retained_slack_below_the_start_threshold_is_never_reclaimed, test_reclaim_never_checkpoints_even_as_the_last_connection); test_orchestrated_prune_reclaims_freed_pages by tests/test_retention_pacing.py::test_paced_deletion_finishes_across_visits_and_keeps_small_slack; the two doctor cases (test_no_pending_record_leaves_the_doctor_check_byte_identical, test_conversation_reclaimable_warns_with_targeted_remediation) by tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_remap_table.",
+      "rows": [
+        "tests/test_conversation_retention.py::test_a_below_escalation_backlog_still_waits_for_the_throttle",
+        "tests/test_conversation_retention.py::test_a_no_progress_pass_stays_pending",
+        "tests/test_conversation_retention.py::test_a_pass_with_no_new_deletion_still_continues_the_backlog",
+        "tests/test_conversation_retention.py::test_a_reclaim_pass_respects_its_wall_clock_deadline",
+        "tests/test_conversation_retention.py::test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending",
+        "tests/test_conversation_retention.py::test_an_escalated_backlog_does_not_wait_for_the_daily_throttle",
+        "tests/test_conversation_retention.py::test_no_pending_record_leaves_the_doctor_check_byte_identical",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_reclaims_freed_pages",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_retries_partial_incremental_vacuum",
+        "tests/test_conversation_retention.py::test_pending_reclaim_state_survives_to_the_next_pass",
+        "tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_warns_with_targeted_remediation"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0226",
+      "predecessorDigest": "0e8cb8b7830740b274ba8686417a893a849eb668f017b9245df9c35f140e8dd0",
+      "profile": "public",
+      "reason": "Restates R-0222 (itself a restatement of R-0212) against main's recorded estate at origin/main b13c40265, the second parent of the merge b80f23e32 that integrates main into the #901 branch for queue admission t000067-93edd9c4. Main's #921 commits (af739f0d3, 13edec6f1) added three pytest nodes and regenerated the estate, so the same removals checked from main's new recorded set digest differently from the 66743ebc0 digest R-0222 is bound to. The removals are the same ones R-0212 explains: #901 raises STATS_INDEX_EPOCH from 1016 to 1017 for the spill-free read indexes. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1017]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1017-1017]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "retired",
+      "id": "R-0233",
+      "predecessorDigest": "04837e3e115f0d74f7b74022e4ed119f53c3c7f80be94f96caaeda6d72a8915f",
+      "profile": "public",
+      "reason": "Restates R-0225 against main's recorded estate at origin/main de6543f4a, the second parent of the merge a7a4d39f1 that integrates main into the #901 branch for queue admission t000067-93edd9c4. Main's #929 S1 and #931 commits regenerated the estate, so the same removals checked from main's new recorded set digest differently from the b13c40265 digest R-0225 is bound to. The removals are the same ones R-0214 explains: #901 replaced escalation-driven, checkpointing reclaim with paced, reservation-charged maintenance and remapped db.conversations_reclaimable. Successors: the reclaim/escalation/pending cases by tests/test_retention_pacing.py (test_reclaim_is_attempted_at_most_once_a_minute_in_small_chunks, test_a_reclaim_attempt_stops_at_its_deadline, test_a_reclaim_chunk_frees_exactly_its_pages_in_one_transaction, test_an_empty_freelist_chunk_is_no_progress_and_uncharged, test_retained_slack_below_the_start_threshold_is_never_reclaimed, test_reclaim_never_checkpoints_even_as_the_last_connection); test_orchestrated_prune_reclaims_freed_pages by tests/test_retention_pacing.py::test_paced_deletion_finishes_across_visits_and_keeps_small_slack; the two doctor cases (test_no_pending_record_leaves_the_doctor_check_byte_identical, test_conversation_reclaimable_warns_with_targeted_remediation) by tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_remap_table.",
+      "rows": [
+        "tests/test_conversation_retention.py::test_a_below_escalation_backlog_still_waits_for_the_throttle",
+        "tests/test_conversation_retention.py::test_a_no_progress_pass_stays_pending",
+        "tests/test_conversation_retention.py::test_a_pass_with_no_new_deletion_still_continues_the_backlog",
+        "tests/test_conversation_retention.py::test_a_reclaim_pass_respects_its_wall_clock_deadline",
+        "tests/test_conversation_retention.py::test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending",
+        "tests/test_conversation_retention.py::test_an_escalated_backlog_does_not_wait_for_the_daily_throttle",
+        "tests/test_conversation_retention.py::test_no_pending_record_leaves_the_doctor_check_byte_identical",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_reclaims_freed_pages",
+        "tests/test_conversation_retention.py::test_orchestrated_prune_retries_partial_incremental_vacuum",
+        "tests/test_conversation_retention.py::test_pending_reclaim_state_survives_to_the_next_pass",
+        "tests/test_doctor_reclaimable_315.py::test_conversation_reclaimable_warns_with_targeted_remediation"
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0234",
+      "predecessorDigest": "04837e3e115f0d74f7b74022e4ed119f53c3c7f80be94f96caaeda6d72a8915f",
+      "profile": "public",
+      "reason": "Restates R-0226 against main's recorded estate at origin/main de6543f4a, the second parent of the merge a7a4d39f1 that integrates main into the #901 branch for queue admission t000067-93edd9c4. Main's #929 S1 and #931 commits regenerated the estate, so the same removals checked from main's new recorded set digest differently from the b13c40265 digest R-0226 is bound to. The removals are the same ones R-0212 explains: #901 raises STATS_INDEX_EPOCH from 1016 to 1017 for the spill-free read indexes. The same maintenance-lock test and parameter values remain; pytest derives new node IDs from CURRENT_EPOCH. No case or assertion was removed.",
+      "renames": [
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[0-1017]"
+        },
+        {
+          "from": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1016-1016]",
+          "to": "tests/test_journal_revisions.py::test_live_ingest_acquires_maintenance_before_ingest_lock[1017-1017]"
+        }
+      ]
+    },
+    {
+      "axis": "pytestNodes",
+      "cause": "renamed",
+      "id": "R-0237",
+      "predecessorDigest": "602722ce43e91eada12c421cda1da1ff634de40658070ac69991b2e9f12dc071",
+      "profile": "public",
+      "reason": "Restates main's R-0199 (#929 S1) against the #901 branch's recorded estate at 278842958, the first parent of the merge a7a4d39f1 that integrates main de6543f4a into the #901 branch for queue admission t000067-93edd9c4. Main's own declaration stays untouched as published history; the branch's recorded set digests differently, so the same renames seen from it need their own declaration. R-0199's reason: These seven identities are pytest's auto-generated ids for test_current_generation_models_priced_at_vendor_rates, which parametrizes over sorted(_CURRENT_GENERATION_RATES.items()). #929 S1 pins the Claude Haiku 5.5 base rates in that map, and claude-haiku-5-5 sorts ahead of every listed model, so each later entry's positional `ratesN` suffix shifts by one. Not one test body, parameter value or assertion changed, and no coverage was retired: each listed identity is the same case under the id its new position produces. The genuinely new case, claude-haiku-5-5-rates3, is an addition and needs no declaration. Re-declared against the incoming main (merge base 1db3075cd, after #921 and #931) for the merge-queue publication: R-0197/R-0198 bind the same renames to the original merge base 66743ebc0's active set, and main's active set has since changed digest, so the merge's transition from main needs a declaration bound to main's digest.",
+      "renames": [
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates3]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-rates4]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates4]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-mythos-5-1-rates5]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates5]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-4-8-rates6]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates6]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-rates7]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates7]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-opus-5-5-rates8]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates8]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-rates9]"
+        },
+        {
+          "from": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates9]",
+          "to": "tests/test_pricing_check.py::test_current_generation_models_priced_at_vendor_rates[claude-sonnet-5-5-rates10]"
+        }
+      ]
     }
   ],
   "schemaVersion": 1

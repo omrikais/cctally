@@ -378,7 +378,14 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_lib_codex_conversation_query.py": 1,
     "_lib_conversation_query.py": 1,
-    "_lib_conversation_retention.py": 2,
+    # Four, not two, since #901's paced retention (`f2077468a`, spec §5.4):
+    # `group_row_count` counts the rows a deletion's reservation charges with
+    # `SELECT COUNT(*) FROM {table}` in its two shapes (by identity key, and by
+    # source path for a NULL-identity group). `{table}` comes from
+    # `_GROUP_TABLES`, a hardcoded pair (`conversation_messages`,
+    # `codex_conversation_events`); neither is a quota projection table, so no
+    # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_lib_conversation_retention.py": 4,
     # Five: `_target_has_cursor_gap` selects one of the two accounting source
     # tables, `_conversation_source_paths` and `_conversation_target_risk`
     # select one of the two transcript source tables, and #769 S6's
@@ -1307,6 +1314,107 @@ def _codex_quota_required_text_present(values: Iterable[object]) -> bool:
         value is None or not str(value).strip() for value in values)
 
 
+# ── #901 W1: reading the maintained raw-partition maxima (spec §5.1, T1) ─────
+
+#: The objects the latest-only read and the general loader's plan pins depend
+#: on, probed together once per load.
+_CODEX_QUOTA_READ_OBJECTS = (
+    "codex_quota_partition_latest", "idx_qws_partition_capture",
+    "trg_qws_latest_ins", "trg_qws_latest_del", "trg_qws_latest_upd",
+    "idx_qws_codex_load_order", "idx_qws_physical_group",
+)
+_CODEX_QUOTA_SUMMARY_OBJECTS = frozenset(_CODEX_QUOTA_READ_OBJECTS[:5])
+
+#: The latest path's SELECT list over the summary join, aliased so every name
+#: the interpretation loop reads resolves exactly as it does on the window path.
+_CODEX_QUOTA_LATEST_SELECT = ", ".join(
+    f"q.{column} AS {column}" for column in (
+        "source", "source_root_key", "source_path", "line_offset",
+        "captured_at_utc", "observed_slot", "logical_limit_key", "limit_id",
+        "limit_name", "window_minutes", "used_percent", "resets_at_utc",
+        "plan_type", "individual_limit_json", "reached_type",
+        "observed_model", "account_key", "canonical_resets_at_utc",
+    ))
+
+
+def _codex_quota_read_objects(conn: sqlite3.Connection) -> "frozenset[str]":
+    """Which of the read-path objects this store carries (one probe)."""
+    placeholders = ",".join("?" for _ in _CODEX_QUOTA_READ_OBJECTS)
+    return frozenset(
+        str(row[0]) for row in conn.execute(
+            f"SELECT name FROM sqlite_master WHERE name IN ({placeholders})",
+            _CODEX_QUOTA_READ_OBJECTS)
+    )
+
+
+def _codex_quota_latest_summary_ready(read_objects: "frozenset[str]") -> bool:
+    """True when the summary and everything that maintains it are present.
+
+    The five objects are created and bootstrapped in one transaction
+    (``_cctally_db._apply_codex_quota_latest_summary``), and SQLite drops a
+    table's triggers and indexes only together with the table, so their joint
+    presence means the summary has been maintained since its bootstrap.
+    Anything less — a read-only open of a store migration 047 has not reached,
+    or a legacy shape — keeps the window query, which selects the same rows.
+    """
+    return _CODEX_QUOTA_SUMMARY_OBJECTS <= read_objects
+
+
+def _sqlite_order_value(value) -> tuple:
+    """Rank a stored value the way SQLite's BINARY ORDER BY ranks it.
+
+    NULL first, then numbers (integers and reals compared numerically), then
+    text in code-point order (which is UTF-8 byte order), then blobs.
+    """
+    if value is None:
+        return (0, 0)
+    if isinstance(value, (int, float)):
+        return (1, value)
+    if isinstance(value, str):
+        return (2, value)
+    return (3, bytes(value))
+
+
+def _codex_quota_latest_rows(
+    conn: sqlite3.Connection, requested: "set[str] | None",
+) -> "list[sqlite3.Row]":
+    """Every valid physical row tied at its raw partition's maximum second.
+
+    One scan of the summary (one row per retained raw partition) and one
+    ``idx_qws_partition_capture`` seek per partition. ``CROSS JOIN`` fixes the
+    summary as the outer loop and ``INDEXED BY`` the inner seek, so the plan
+    cannot drift into walking the snapshots. The window path's ORDER BY
+    (``source_root_key, captured_at_utc, resets_at_utc, source_path,
+    line_offset``) is reproduced here in Python over this bounded set, so the
+    rows reach the interpretation loop in exactly the order they did before.
+    """
+    import _cctally_db
+
+    on = " AND ".join(
+        f"{expr} = s.{key}" for key, expr in zip(
+            _cctally_db._CODEX_QUOTA_LATEST_KEY_COLUMNS,
+            _cctally_db._codex_quota_latest_key_exprs("q.")))
+    sql = (
+        f"SELECT {_CODEX_QUOTA_LATEST_SELECT}"
+        " FROM codex_quota_partition_latest AS s"
+        " CROSS JOIN quota_window_snapshots AS q"
+        " INDEXED BY idx_qws_partition_capture"
+        f" ON {on} AND unixepoch(q.captured_at_utc) = s.latest_capture_epoch"
+        f" WHERE {_cctally_db._codex_quota_latest_validity_sql('q.')}"
+    )
+    params: "list[object]" = []
+    if requested is not None:
+        sql += (" AND s.k_source_root_key IN ("
+                + ",".join("quote(?)" for _ in requested) + ")")
+        params.extend(sorted(requested))
+    rows = conn.execute(sql, params).fetchall()
+    rows.sort(key=lambda row: tuple(
+        _sqlite_order_value(row[name]) for name in (
+            "source_root_key", "captured_at_utc", "resets_at_utc",
+            "source_path", "line_offset")))
+    return rows
+
+
 # --------------------------------------------------------------------------
 # #500 §6.4 — the fold-time operator attribution overlay
 # --------------------------------------------------------------------------
@@ -1449,6 +1557,56 @@ def _codex_attribution_stored_limit_keys(logical_limit_key: str) -> "list[str]":
     )
 
 
+def _codex_shard_axis_filter(axes: tuple) -> "tuple[str, tuple]":
+    """The WHERE clause and parameters selecting one attribution axis shard.
+
+    Rows are STORED under whichever length and key spelling the provider sent,
+    so the filter enumerates every equivalent rather than snapping in SQL —
+    which it could not do and still seek the index.
+    """
+    root_key, limit_key, slot, window_minutes = axes
+    limit_keys = _codex_attribution_stored_limit_keys(limit_key)
+    minutes = sorted({
+        int(value)
+        for value in codex_snap_equivalent_window_minutes(window_minutes)
+    })
+    axis_clause = (
+        " WHERE source='codex' AND source_root_key = ?"
+        "   AND logical_limit_key IN ("
+        + ",".join("?" * len(limit_keys)) + ")"
+        "   AND observed_slot = ?"
+        "   AND window_minutes IN (" + ",".join("?" * len(minutes)) + ")"
+    )
+    return axis_clause, (root_key, *limit_keys, slot, *minutes)
+
+
+def _codex_witness_anchors(
+    conn: sqlite3.Connection, anchor_expr: str, axis_clause: str,
+    axis_params: tuple, witnesses: "Sequence[str]",
+) -> "set[str]":
+    """Pass 1: the canonical anchors of the groups a witness reset reaches.
+
+    #901 Amendment 19 T1 (spec I1): the set is built in Python from the
+    streamed rows. ``SELECT DISTINCT`` sorted the anchors of every capture
+    carrying a witness reset through a temp b-tree — a window group's whole
+    activity — and one attribution axis shard is not a bound. The result is
+    the same set; the Python set holds one entry per distinct anchor.
+    """
+    pass_one = (
+        f"SELECT {anchor_expr} AS anchor"
+        "  FROM quota_window_snapshots"
+        + axis_clause
+        + "   AND unixepoch(resets_at_utc) IN ("
+        + ",".join("unixepoch(?)" for _ in witnesses) + ")"
+    )
+    anchors: "set[str]" = set()
+    for row in conn.execute(pass_one, (*axis_params, *witnesses)):
+        if row[0] is None or not str(row[0]).strip():
+            continue
+        anchors.add(str(row[0]))
+    return anchors
+
+
 def _load_codex_window_group_evidence(
     conn: sqlite3.Connection, assertions: "Sequence[Mapping[str, object]]",
 ) -> "tuple[_wa.WindowGroup, ...]":
@@ -1557,36 +1715,10 @@ def _load_codex_window_group_evidence(
     witness_texts: "dict[str, str]" = {}
     model_scoped: "dict[tuple, bool]" = {}
     for axes, shard_witnesses in sorted(shards.items()):
-        root_key, limit_key, slot, window_minutes = axes
-        # Rows are STORED under whichever length and key spelling the provider
-        # sent, so the filter enumerates every equivalent rather than snapping
-        # in SQL — which it could not do and still seek the index.
-        limit_keys = _codex_attribution_stored_limit_keys(limit_key)
-        minutes = sorted({
-            int(value)
-            for value in codex_snap_equivalent_window_minutes(window_minutes)
-        })
-        witnesses = sorted(shard_witnesses)
-        axis_clause = (
-            " WHERE source='codex' AND source_root_key = ?"
-            "   AND logical_limit_key IN ("
-            + ",".join("?" * len(limit_keys)) + ")"
-            "   AND observed_slot = ?"
-            "   AND window_minutes IN (" + ",".join("?" * len(minutes)) + ")"
-        )
-        axis_params = (root_key, *limit_keys, slot, *minutes)
-        anchors: "set[str]" = set()
-        pass_one = (
-            f"SELECT DISTINCT {anchor_expr} AS anchor"
-            "  FROM quota_window_snapshots"
-            + axis_clause
-            + "   AND unixepoch(resets_at_utc) IN ("
-            + ",".join("unixepoch(?)" for _ in witnesses) + ")"
-        )
-        for row in conn.execute(pass_one, (*axis_params, *witnesses)):
-            if row[0] is None or not str(row[0]).strip():
-                continue
-            anchors.add(str(row[0]))
+        axis_clause, axis_params = _codex_shard_axis_filter(axes)
+        anchors = _codex_witness_anchors(
+            conn, anchor_expr, axis_clause, axis_params,
+            sorted(shard_witnesses))
         if not anchors:
             continue
         # ONE SHARD PER GROUP, for the reason the loader states at its own group
@@ -1983,6 +2115,16 @@ def load_codex_quota_observations(
     and therefore the same verdict as the full load, on a store where the full
     load meant interpreting 266,337 rows to answer a question about 608 of them.
 
+    #901 W1 (spec §5.1, T1): on a store carrying cache migration 047's objects
+    the candidate rows come from ``codex_quota_partition_latest``, a
+    trigger-maintained table holding every raw partition's maximum whole-second
+    capture, joined back to every physical row tied at that second through
+    ``idx_qws_partition_capture``. The window query described below stays as the
+    fallback for a store without those objects (a read-only open before the
+    migration ran, or a legacy shape); both select exactly the same rows, and
+    tests/test_901_partition_latest_maintenance.py holds the summary to the
+    frozen pre-#901 window query after every writer class.
+
     SQL narrows to the rows that can possibly win, and Python still decides. The
     partition is the RAW spelling of every column the interpretation reads
     (root, limit key, slot, window minutes, limit id and name, observed model,
@@ -2106,6 +2248,8 @@ def load_codex_quota_observations(
             "canonical_resets_at_utc" if has_anchor
             else "NULL AS canonical_resets_at_utc"
         )
+        # #901: one probe for the summary and the two plan-pin indexes.
+        read_objects = _codex_quota_read_objects(conn)
         # Public #5: the model is read from THIS table alone. There used to be a
         # COALESCE onto the nearest preceding `codex_session_entries.model` at
         # or before the snapshot's byte offset, for rows written before the
@@ -2129,9 +2273,26 @@ def load_codex_quota_observations(
             model_expr=model_expr, account_expr=account_expr,
             anchor_expr=anchor_expr,
         )
+        # #901 W3 (spec §5.1, T1/T3): pin the plan. Unpinned, the planner sorts
+        # an unbounded or multi-root load through a temp b-tree via the
+        # `source` autoindex, and the load-order index hijacks the projector's
+        # per-group shards into a whole-root walk (both measured). A bounded
+        # `max_rows` read keeps its plan: its sorter holds at most `max_rows`
+        # rows. Each pin is applied only when its index exists, so a store
+        # without them keeps today's SQL.
+        if group_filter is not None:
+            table_hint = (
+                " INDEXED BY idx_qws_physical_group"
+                if "idx_qws_physical_group" in read_objects else "")
+        elif physical_signatures is None and max_rows is not None:
+            table_hint = ""
+        else:
+            table_hint = (
+                " INDEXED BY idx_qws_codex_load_order"
+                if "idx_qws_codex_load_order" in read_objects else "")
         sql = f"""
             SELECT {select_list}
-              FROM quota_window_snapshots
+              FROM quota_window_snapshots{table_hint}
              WHERE source='codex' AND source_root_key IS NOT NULL
         """
         params: list[object] = []
@@ -2271,9 +2432,16 @@ def load_codex_quota_observations(
             shard_sql = f"{head}{clause}{order_by}"
             for group in group_filter:
                 shards.append((shard_sql, (*params, *group)))
+        if latest_per_identity and _codex_quota_latest_summary_ready(
+                read_objects):
+            # #901 W1 (spec §5.1, T1): the maintained summary yields exactly
+            # the rows the window query above selects, without sorting history.
+            row_source = _codex_quota_latest_rows(conn, requested)
+        else:
+            row_source = _iter_shard_rows(conn, shards)
         result: list[QuotaObservation] = []
         signature_tuples: dict[str, dict[str, list[tuple[object, ...]]]] = {}
-        for row in _iter_shard_rows(conn, shards):
+        for row in row_source:
             if not _codex_quota_required_text_present(
                 row[name] for name in _CODEX_QUOTA_REQUIRED_TEXT
             ):

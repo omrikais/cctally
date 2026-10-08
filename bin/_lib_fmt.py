@@ -292,6 +292,17 @@ def _fmt_num(n: int) -> str:
     return f"{n:,}"
 
 
+def _fmt_usd_accounting(value: float, places: int) -> str:
+    """`-$71.21`: the sign goes before the currency symbol (#886).
+
+    The CLI convention shared with `_lib_diff_kernel` and `_lib_share`'s
+    MoneyCell: an ASCII hyphen, no `+` for a plain amount, and a sign only
+    when `value < 0` — so a negative zero prints unsigned.
+    """
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):.{places}f}"
+
+
 def _truncate_num(formatted: str, width: int) -> str:
     """Truncate a formatted number to fit width, replacing tail with '…'."""
     if len(formatted) <= width:

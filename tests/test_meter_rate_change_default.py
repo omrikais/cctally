@@ -193,9 +193,12 @@ def test_c4_the_category_inventory_is_pinned():
     """§13 requires `doctor`'s exact category inventory after adding
     `quota`, so the whole list is asserted rather than membership alone."""
     report = _report()
+    # `performance` is #901's `performance.dashboard_disk_writes`, the one new
+    # check spec §4.6 authorizes, appended last so every other category keeps
+    # its place.
     assert [c.id for c in report.categories] == [
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry"]
+        "pricing", "quota", "safety", "telemetry", "performance"]
 
 
 @pytest.mark.parametrize("rejection,expected", [

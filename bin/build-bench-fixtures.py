@@ -990,8 +990,9 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: rebuilds that were not strictly required; under-inclusion silently reuses a
 #: corpus another tree's ingest wrote, which is the defect being repaired.
 #:
-#: COST, stated rather than assumed: 140 files, and the 9.9 MB and 47 ms to
-#: digest were measured at 139, before #834 S2 added the 140th. The cost is
+#: COST, stated rather than assumed: 141 files, and the 9.9 MB and 47 ms to
+#: digest were measured at 139, before #834 S2 added the 140th and #901 W9's
+#: checkpoint policy the 141st. The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
 #: whose marker was written by the previous tree -- for `large` that is the
@@ -1115,6 +1116,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_quota_ledger.py",
     "bin/_lib_quota_model.py",
     "bin/_lib_rate_change_delivery.py",
+    "bin/_lib_reclaim_planner.py",
     "bin/_lib_record.py",
     "bin/_lib_rederive.py",
     "bin/_lib_render.py",
@@ -1128,6 +1130,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_source_analytics.py",
     "bin/_lib_source_identity.py",
     "bin/_lib_source_retry.py",
+    "bin/_lib_sqlite_close.py",
     "bin/_lib_stats_damage.py",
     "bin/_lib_stats_publish.py",
     "bin/_lib_stats_wal.py",
@@ -1137,6 +1140,9 @@ PRODUCER_SOURCES = (
     "bin/_lib_tick_stats.py",
     "bin/_lib_transcript_access.py",
     "bin/_lib_view_models.py",
+    "bin/_lib_wal_checkpoint.py",
+    "bin/_lib_write_budget.py",
+    "bin/_lib_write_io.py",
     "bin/build-bench-fixtures.py",
     "bin/cctally",
 )
@@ -1760,6 +1766,13 @@ def _build_fixture(*, scale: str, seed: int, root,
                     cctally.sync_codex_conversations(conn)
             finally:
                 conn.close()
+            # #901 W9 (Q14): a process that synced a store keeps an idle
+            # keeper on it, so the store's last frames stay in its WAL after
+            # the sync connections close. The corpus is complete only once
+            # they are in the main files, which consumers copy without their
+            # sidecars and open read-only: drain here as an orderly exit would.
+            import _lib_wal_checkpoint
+            _lib_wal_checkpoint.finalize()
             marker.write_text(json.dumps(want, sort_keys=True))
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

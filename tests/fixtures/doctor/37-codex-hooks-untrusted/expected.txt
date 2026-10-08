@@ -25,8 +25,8 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
-  ✓ Migrations               0/59 applied
-  ⚠ Pending migrations       59 pending
+  ✓ Migrations               0/61 applied
+  ⚠ Pending migrations       61 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -83,5 +83,7 @@ Safety
   ✓ Update available         no
 Telemetry
   ✓ State                    enabled (enabled)
+Performance
+  ✓ Dashboard disk writes    No dashboard is running.
 
-Summary: 60 OK · 5 WARN · 1 FAIL
+Summary: 61 OK · 5 WARN · 1 FAIL

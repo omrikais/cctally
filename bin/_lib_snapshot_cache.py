@@ -1315,6 +1315,15 @@ class CodexAccountingCacheResult:
     #: the generation this capture builds and admits a retained generation
     #: only while its stamp equals `codex_accounting_consumed_provenance()`.
     provenance_token: int | None = None
+    #: #872: the NAME of the population `changed_old` / `changed_new` are
+    #: relative to — the prior state's `population_signature` and provenance
+    #: token, read before this call mutated the state. `None` on every COLD
+    #: result: a cold delta replaces the whole population relative to nothing
+    #: a consumer can name (an empty state, a reset, an overflow clear, or a
+    #: semantic/start/end/sequence/overflow cold trigger), so a consumer must
+    #: derive from the full population instead of advancing retained state.
+    base_population_signature: tuple | None = None
+    base_provenance_token: int | None = None
 
 
 _CODEX_ACCOUNTING_CACHE_STATE: dict[str, object] = _ObservedSnapshotDict()
@@ -1551,6 +1560,14 @@ def build_cached_codex_accounting(
     attribution_revision = _codex_window_attribution_revision(cache_conn)
     state = _CODEX_ACCOUNTING_CACHE_STATE
     prior_cached_entries = tuple(state.get("entries", ())) if state else ()
+    # #872: the delta's base, read before any branch below mutates the state.
+    prior_signature = state.get("population_signature") if state else None
+    if not isinstance(prior_signature, tuple):
+        prior_signature = None
+    prior_token = (
+        state.get(_CODEX_ACCOUNTING_PROVENANCE_STATE_KEY) if state else None)
+    if not isinstance(prior_token, int):
+        prior_token = None
 
     def signature(generation: int) -> tuple | None:
         """The exact identity of the population this call is returning.
@@ -1683,6 +1700,8 @@ def build_cached_codex_accounting(
             population_signature=population_signature,
             provenance_token=_consume_codex_accounting_provenance(
                 provenance_token),
+            base_population_signature=prior_signature,
+            base_provenance_token=prior_token,
         )
 
     dirty_paths = tuple(sorted(dirty))
@@ -1736,6 +1755,8 @@ def build_cached_codex_accounting(
         entries, dirty_paths, dirty_accounts, False, changed_old, changed_new,
         population_signature=population_signature,
         provenance_token=_consume_codex_accounting_provenance(provenance_token),
+        base_population_signature=prior_signature,
+        base_provenance_token=prior_token,
     )
 
 

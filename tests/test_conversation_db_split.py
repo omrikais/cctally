@@ -13,7 +13,8 @@ import types
 
 import pytest
 
-from conftest import load_script, redirect_paths
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -344,7 +345,8 @@ def test_codex_core_and_transcript_cursors_advance_independently(
     tmp_path, monkeypatch,
 ):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Cursor independence needs fixed-date rows after transcript rebuild.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "codex-provider"
     rollout = provider_root / "sessions" / "2026" / "07" / "20" / "rollout.jsonl"
     rollout.parent.mkdir(parents=True)

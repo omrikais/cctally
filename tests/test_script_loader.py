@@ -2597,6 +2597,7 @@ _PRIVATE_CHILD_SITE_OWNERS = {
     # read or executed from here — mirror-private-ok.
     "test_rewrite_release_notes.py": "tests/test_rewrite_release_notes.py",
     "test_schema_delivery_parity.py": "tests/test_schema_delivery_parity.py",
+    "test_session_memory.py": "tests/test_session_memory.py",
 }
 
 _GENERATED_CHILD_SITES = {
@@ -2640,9 +2641,33 @@ _GENERATED_CHILD_SITES = {
     # file and cannot produce the site.
     "test_schema_delivery_parity.py": _estate.private_expectation(
         1, _PRIVATE_CHILD_SITE_OWNERS["test_schema_delivery_parity.py"]),
+    # `SLOW_RECEIPT_VALIDATOR` stands in for the receipt validator the engine
+    # launches as a separate interpreter: it sleeps, then hands over to the
+    # REAL `.github/scripts/classify_receipt.py` through `runpy.run_path` on a
+    # path read from `SLOW_VALIDATOR_REAL`, so the path is a subscript the
+    # detector cannot evaluate. The engine executes that script by its path, so
+    # the child cannot import a shared helper from `tests/` instead.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_session_memory.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS["test_session_memory.py"]),
     # The embedded validator shim loads whatever `EV_SHIM_REAL_KERNEL`
     # names, so the path is a subscript the detector cannot evaluate.
     "test_test_all_observability.py": 1,
+    # #901 G8: the `_CHILD` program loads bin/cctally in a fresh interpreter
+    # whose `SQLITE_TMPDIR`/`TMPDIR` point at a watched directory, because
+    # SQLite resolves its temp directory once per process; observing that the
+    # sync and ingest writers create no temp file needs a process of its own,
+    # which has no `tests/` on its path.
+    "test_901_connection_policy.py": 1,
+    # #901 G10 (k): `_HOOK_DRIVER` runs bin/cctally through `runpy.run_path`
+    # in a fresh interpreter as the real `hook-tick`, whose worker forks,
+    # detaches and ends with `os._exit(0)`. The driver wraps the W9 policy
+    # module before the run so the forked worker's exit attempt is
+    # observable; a pytest helper cannot reach a process that detached from
+    # its parent.
+    "test_901_wal_keeper.py": 1,
 }
 
 
@@ -2669,13 +2694,13 @@ def _generated_child_diff(found, known, *, profile):
 
 
 def test_generated_child_sites_are_named_rather_than_silently_left():
-    """Fifteen modules on the private profile, and thirteen on the public
+    """Eighteen modules on the private profile, and fifteen on the public
     one, embed a loader in source for a separate interpreter.
 
     A child program started by `subprocess` has no `tests/` on its path and no
     parent pytest helper to import, so it cannot call the primitive. They are
     listed here so that leaving them is a recorded decision rather than an
-    oversight, and so that a fourteenth appearing is a failing test rather than
+    oversight, and so that a nineteenth appearing is a failing test rather than
     a silent regression.
 
     Membership means the module embeds a loader the detector cannot prove is

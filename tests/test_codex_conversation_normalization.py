@@ -7,6 +7,7 @@ classes to the same file.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -18,7 +19,8 @@ import sys
 
 import pytest
 
-from conftest import load_script, redirect_paths
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -38,6 +40,11 @@ import _lib_conversation_query as lcq  # noqa: E402
 import _lib_jsonl as lj  # noqa: E402
 import _lib_pricing as pricing  # noqa: E402
 import _lib_source_identity as identity  # noqa: E402
+from tests._provider_token_text import (  # noqa: E402
+    assert_token_carried,
+    assert_tokens_absent,
+    per_run_literals,
+)
 
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1"
 ROOT_A = "/synthetic/root-a/project-red"
@@ -989,8 +996,8 @@ def test_session_a_injected_taxonomy_and_turn_correlation_kernel():
 # ── Task 4: ingest integration ───────────────────────────────────────────────
 
 
-def _split_namespace(ns):
-    """Expose the split stores through this legacy integration-test surface."""
+def _split_namespace(ns, monkeypatch):
+    """Expose split stores only until the integration user's fixture tears down."""
     open_core = ns["open_cache_db"]
     sync_core = ns["sync_codex_cache"]
     sync_claude_core = ns["sync_cache"]
@@ -1009,8 +1016,8 @@ def _split_namespace(ns):
         ns["sync_codex_conversations"](_conn, **kwargs)
         return stats
 
-    ns["open_cache_db"] = open_split
-    ns["sync_codex_cache"] = sync_split
+    monkeypatch.setitem(ns, "open_cache_db", open_split)
+    monkeypatch.setitem(ns, "sync_codex_cache", sync_split)
 
     def sync_claude_split(_conn, **kwargs):
         core = open_core()
@@ -1021,14 +1028,15 @@ def _split_namespace(ns):
         ns["sync_claude_conversations"](_conn, **kwargs)
         return stats
 
-    ns["sync_cache"] = sync_claude_split
+    monkeypatch.setitem(ns, "sync_cache", sync_claude_split)
     return ns
 
 
 def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
     """Stage one Codex provider root with the given scenarios as rollout files."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Normalization and replay assertions use fixed corpus dates, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollouts = {}
     for scenario in scenarios:
@@ -1037,7 +1045,7 @@ def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
         shutil.copyfile(CORPUS / "rollouts" / f"{scenario}.jsonl", rollout)
         rollouts[scenario] = rollout
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
-    return _split_namespace(ns), provider_root, rollouts
+    return _split_namespace(ns, monkeypatch), provider_root, rollouts
 
 
 def _codex_turn_records(tool_payloads, *, turn_id="turn-a"):
@@ -1076,7 +1084,35 @@ def _stage_codex_records(tmp_path, monkeypatch, records):
         for rec in records:
             fh.write(json.dumps(rec) + "\n")
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
-    return _split_namespace(ns), provider_root, rollout
+    return _split_namespace(ns, monkeypatch), provider_root, rollout
+
+
+@pytest.mark.parametrize("name", ["open_cache_db", "sync_codex_cache", "sync_cache"])
+def test_split_namespace_restores_shared_module_after_user(tmp_path, monkeypatch, name):
+    """A real split-store user must not leave shims for the next same-worker test."""
+    captured = {}
+    split_namespace = _split_namespace
+
+    def capture_originals(ns, *args, **kwargs):
+        captured["module"] = sys.modules["cctally"]
+        captured["original"] = ns[name]
+        assert captured["module"].__dict__ is ns
+        return split_namespace(ns, *args, **kwargs)
+
+    with monkeypatch.context() as user_patches:
+        user_patches.setattr(sys.modules[__name__], "_split_namespace", capture_originals)
+        test_collision_shared_uuid_claude_codex_content_isolated(tmp_path, user_patches)
+
+    # Check BEFORE a reload: load_script() alone replaces the module and hides
+    # the leak from a sibling that retains/imports the current cctally module.
+    shared = sys.modules["cctally"]
+    assert shared is captured["module"]
+    assert getattr(shared, name) is captured["original"], f"{name} leaked its split-store shim"
+
+    fresh = load_script()
+    assert fresh is sys.modules["cctally"].__dict__
+    assert fresh[name].__module__ == captured["original"].__module__
+    assert fresh[name].__qualname__ == captured["original"].__qualname__
 
 
 def test_ingest_writes_normalized_rows_rollup_touches(tmp_path, monkeypatch):
@@ -3747,7 +3783,7 @@ def test_collision_shared_uuid_claude_codex_content_isolated(tmp_path, monkeypat
 def test_collision_two_roots_shared_uuid_distinct_conversations(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
-    ns = _split_namespace(ns)
+    ns = _split_namespace(ns, monkeypatch)
     prov_a = tmp_path / "provA"
     prov_b = tmp_path / "provB"
     for prov, scenario in ((prov_a, "root-a-collision"), (prov_b, "root-b-collision")):
@@ -4004,7 +4040,7 @@ def test_browse_model_and_project_facets_and_filters(tmp_path, monkeypatch):
 def test_browse_project_facet_collision_safety_two_roots_same_label(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
-    ns = _split_namespace(ns)
+    ns = _split_namespace(ns, monkeypatch)
     prov_a = tmp_path / "provA"
     prov_b = tmp_path / "provB"
     for prov in (prov_a, prov_b):
@@ -6482,6 +6518,62 @@ def test_s3_session_index_binds_openers_and_assigns_stable_ordinals(
 _S3_PROVIDER_SESSION_IDS = ("70001", "70002", "70003", "70004")
 
 
+_S3_KERNEL_ABSENT = ("card", "session_index", "readback_card")
+
+
+def _s3_kernel_surfaces(tmp_path, monkeypatch):
+    """Boundary label -> kernel texts of the tool-legibility conversation."""
+    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
+    try:
+        body = _detail_of(conn, ck, tail=True, limit=500)
+        stdin_block = next(b for item in body["items"] for b in item["blocks"]
+                           if b.get("call_id") == "s3-fc-stdin-a")
+        readback = q.read_codex_payload(conn, ck, stdin_block["block_key"], "call")
+    finally:
+        conn.close()
+    assert body["session_index"]["sessions"]["1"]["ordinal"] == 1
+    # The READBACK route serves the same card family and must publish the same
+    # ordinal. Without this the field's meaning differed by route — the paged
+    # detail carried the conversation-local ordinal while
+    # `GET /api/conversation/<key>/payload` carried the provider's own id — and a
+    # client validator written against the ordinal meaning would be wrong for one
+    # of the two (spec sections 4.3 and 6.5 of #463 S3).
+    assert readback["status"] == "ok"
+    assert readback["card"]["type"] == "session_ref"
+    assert readback["card"]["ref"] == "1"
+    cards = [json.dumps(card) for item in body["items"] for b in item["blocks"]
+             for card in ((b.get("detail") or {}).get("card"),
+                          ((b.get("output") or {}).get("detail") or {}).get("card"))
+             if card is not None]
+    assert cards
+    stdin_call = next(b for item in body["items"] for b in item["blocks"]
+                      if (b.get("detail") or {}).get("name") == "write_stdin")
+    surfaces = {
+        "card": cards,
+        "session_index": [json.dumps(body["session_index"])],
+        "readback_card": [json.dumps(readback["card"])],
+        "args": [stdin_call["detail"]["args"]],
+        "readback_content": [readback["content"]],
+    }
+    return surfaces, per_run_literals(tmp_path)
+
+
+def _check_s3_kernel_surfaces(surfaces, per_run):
+    """The kernel S3 privacy oracle (spec §5). The token is ABSENT from every
+    card, the session index and the readback card. The boundary is asserted
+    rather than left implicit: the PRE-EXISTING generic disclosure
+    (`detail.args`, stored at ingest) and the raw payload the readback route
+    exists to serve still carry the provider's own arguments verbatim."""
+    for label in _S3_KERNEL_ABSENT + ("args", "readback_content"):
+        # A surface of only empty strings would make its arm pass vacuously.
+        assert any(surfaces.get(label) or ()), f"missing surface {label}"
+    for label in _S3_KERNEL_ABSENT:
+        assert_tokens_absent(surfaces[label], _S3_PROVIDER_SESSION_IDS, label, per_run)
+    assert_token_carried(surfaces["args"], _S3_PROVIDER_SESSION_IDS, "args", per_run)
+    assert_token_carried(surfaces["readback_content"], _S3_PROVIDER_SESSION_IDS,
+                         "readback_content", per_run, each=True)
+
+
 def test_s3_no_raw_session_id_reaches_any_card_or_the_index(tmp_path, monkeypatch):
     """Spec section 4.3 and 6.5.
 
@@ -6489,49 +6581,81 @@ def test_s3_no_raw_session_id_reaches_any_card_or_the_index(tmp_path, monkeypatc
     session id, because these are short integers that cannot be scrubbed without
     corrupting arbitrary text. So the token is REMOVED rather than scrubbed, and
     `build_anon_plan_for_sources` needs no new source.
+
+    #887: the searches are digest-aware through tests/_provider_token_text.py.
     """
-    conn, ck = _s3_tool_legibility_detail(tmp_path, monkeypatch)
-    try:
-        body = _detail_of(conn, ck, tail=True, limit=500)
-        stdin_block = next(b for item in body["items"] for b in item["blocks"]
-                           if b.get("call_id") == "s3-fc-stdin-a")
-        readback = q.read_codex_payload(
-            conn, ck, stdin_block["block_key"], "call")
-    finally:
-        conn.close()
-    cards = [(b.get("detail") or {}).get("card")
-             for item in body["items"] for b in item["blocks"]]
-    cards += [((b.get("output") or {}).get("detail") or {}).get("card")
-              for item in body["items"] for b in item["blocks"]]
-    for card in cards:
-        if card is None:
-            continue
-        for token in _S3_PROVIDER_SESSION_IDS:
-            assert token not in json.dumps(card), (token, card)
+    surfaces, per_run = _s3_kernel_surfaces(tmp_path, monkeypatch)
+    _check_s3_kernel_surfaces(surfaces, per_run)
+
+
+def _s3_key_embedding(token):
+    return "cbk1_" + token + "a" * (40 - len(token))
+
+
+def _s3_keyify(text):
     for token in _S3_PROVIDER_SESSION_IDS:
-        assert token not in json.dumps(body["session_index"]), token
+        text = text.replace(token, " " + _s3_key_embedding(token) + " ")
+    return text
 
-    # The READBACK route serves the same card family and must publish the same
-    # ordinal. Without this the field's meaning differed by route — the paged
-    # detail carried the conversation-local ordinal while
-    # `GET /api/conversation/<key>/payload` carried the provider's own id — and a
-    # client validator written against the ordinal meaning would be wrong for one
-    # of the two (spec sections 4.3 and 6.5).
-    assert readback["status"] == "ok"
-    assert readback["card"]["type"] == "session_ref"
-    assert readback["card"]["ref"] == "1"
-    assert "70001" not in json.dumps(readback["card"]), readback["card"]
 
-    # The boundary, asserted rather than left implicit: the PRE-EXISTING generic
-    # disclosure still shows the provider's own arguments verbatim, exactly as it
-    # does for every uncarded call today. S3 does not change `detail.args`, and
-    # it could not — `args` is stored at ingest, so rewriting it would break the
-    # read-time-only rule of spec section 3.0. The same is true of the raw
-    # payload the readback route exists to serve.
-    stdin_call = next(b for item in body["items"] for b in item["blocks"]
-                      if (b.get("detail") or {}).get("name") == "write_stdin")
-    assert "70001" in stdin_call["detail"]["args"]
-    assert "70001" in readback["content"]
+def test_s3_kernel_oracle_discriminates_at_every_boundary(tmp_path, monkeypatch):
+    """#887 — (a)-(d) of the route matrix over the kernel boundaries."""
+    surfaces, per_run = _s3_kernel_surfaces(tmp_path, monkeypatch)
+
+    def check(s):
+        _check_s3_kernel_surfaces(s, per_run)
+
+    check(copy.deepcopy(surfaces))
+    for label in _S3_KERNEL_ABSENT:
+        for token in _S3_PROVIDER_SESSION_IDS:
+            collided = copy.deepcopy(surfaces)
+            collided[label][0] += f' "{_s3_key_embedding(token)}"'
+            check(collided)                                                    # (a)
+            leaked = copy.deepcopy(surfaces)
+            leaked[label][0] += f" {token}"
+            with pytest.raises(AssertionError,
+                               match=rf"^provider token '{token}' leaked at {label}$"):
+                check(leaked)                                                  # (b)
+        drifted = copy.deepcopy(surfaces)
+        drifted[label][0] += ' "cbk2_' + "b" * 48 + '"'
+        with pytest.raises(AssertionError,
+                           match=rf"^unrecognized digest-shaped run at {label}: "):
+            check(drifted)                                                     # (c)
+    for label in ("args", "readback_content"):
+        keyed = copy.deepcopy(surfaces)
+        keyed[label] = [_s3_keyify(text) for text in keyed[label]]
+        with pytest.raises(AssertionError,
+                           match=rf"^no provider token outside opaque keys at {label}$"):
+            check(keyed)                                                       # (d)
+
+
+_S3_ALL_TOKENS_HEX = "".join(_S3_PROVIDER_SESSION_IDS)
+
+
+def _force_every_block_key_to_embed_every_token(monkeypatch):
+    """Wrap `codex_block_key` so every minted key is `cbk1_` + all four tokens
+    + the last 20 hex of the real digest (#887)."""
+    real = q.codex_block_key
+    minted = []
+
+    def forced(*args, **kwargs):
+        key = "cbk1_" + _S3_ALL_TOKENS_HEX + real(*args, **kwargs)[-20:]
+        minted.append(key)
+        return key
+
+    monkeypatch.setattr(q, "codex_block_key", forced)
+    return minted
+
+
+def test_s3_kernel_privacy_holds_when_every_block_key_embeds_every_token(tmp_path, monkeypatch):
+    """#887 — the real-path collision on the kernel path."""
+    minted = _force_every_block_key_to_embed_every_token(monkeypatch)
+    surfaces, per_run = _s3_kernel_surfaces(tmp_path, monkeypatch)
+    assert minted
+    for token in _S3_PROVIDER_SESSION_IDS:
+        assert token in surfaces["session_index"][0]
+        assert any(token in card for card in surfaces["card"])
+    _check_s3_kernel_surfaces(surfaces, per_run)
 
 
 def test_s3_session_ref_and_program_refs_carry_the_ordinal(tmp_path, monkeypatch):

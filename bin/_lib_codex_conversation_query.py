@@ -353,13 +353,19 @@ def _load_conversation_index_rows(
     """
     rows: list = []
     detail_bytes: dict[tuple[str, int], int] = {}
+    # #901 Amendment 19 T1: index order, each timestamp tie run then put in
+    # physical order in Python (``kern.in_physical_order``), not a sorter.
     for (source_path, line_offset, timestamp_utc, turn_id, call_id, kind,
          event_type, record_family, model, content_digest, content_len,
-         detail_json, detail_len) in conn.execute(
-        "SELECT " + _NARROW_ROW_COLS + " FROM codex_conversation_messages "
-        "WHERE conversation_key = ? "
-        "ORDER BY timestamp_utc, source_path, line_offset",
-        (conversation_key,),
+         detail_json, detail_len) in kern.in_physical_order(
+        conn.execute(
+            "SELECT " + _NARROW_ROW_COLS + " FROM codex_conversation_messages "
+            "WHERE conversation_key = ? "
+            "ORDER BY timestamp_utc, id",
+            (conversation_key,),
+        ),
+        timestamp=lambda row: row[2],
+        position=lambda row: (row[0], row[1]),
     ):
         rows.append(kern.CodexNormalizedRow(
             conversation_key=conversation_key, source_root_key="",
@@ -3872,34 +3878,165 @@ def _project_find_row(row, *, payload: dict | None = None, block: dict | None = 
     return project_plain((RenderLeaf("t0", text),))
 
 
-def materialize_codex_find_projection(
-    conn: sqlite3.Connection,
-    conversation_keys,
-) -> None:
-    """Replace #482 projection rows for the affected conversations.
+#: Every ``codex_find_projection`` column in one fixed order: the builder's row
+#: tuples, the stored-row read and the write statements below all use it.
+#: ``(message_id, surface)`` (positions 0 and 5) is the table's primary key;
+#: everything else is an attribute the difference compares (#901 §5.3b).
+_FIND_PROJECTION_COLUMNS = (
+    "message_id,conversation_key,item_key,block_key,container_block_key,"
+    "surface,render_order,projected_text,leaves_json,disclosure_json,"
+    "projection_version"
+)
+_FIND_PROJECTION_KEY = (0, 5)
+_FIND_PROJECTION_ORDER = 6
 
-    The existing item/block builder is the only authority for native folds.
-    Every searchable physical row keeps its own block key; a folded output or
-    completion separately records the visual call block that owns it.
+_FIND_PROJECTION_INSERT_SQL = (
+    "INSERT INTO codex_find_projection "
+    "(" + _FIND_PROJECTION_COLUMNS + ") "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+)
+#: An attribute change that keeps the row's place: the ordering index
+#: ``(conversation_key, render_order, message_id, surface)`` is untouched.
+_FIND_PROJECTION_UPDATE_IN_PLACE_SQL = (
+    "UPDATE codex_find_projection SET item_key=?,block_key=?,"
+    "container_block_key=?,projected_text=?,leaves_json=?,disclosure_json=?,"
+    "projection_version=? WHERE message_id=? AND surface=?"
+)
+#: A moved row (its dense ``render_order`` shifted): the index entry moves too.
+_FIND_PROJECTION_UPDATE_MOVED_SQL = (
+    "UPDATE codex_find_projection SET conversation_key=?,item_key=?,"
+    "block_key=?,container_block_key=?,render_order=?,projected_text=?,"
+    "leaves_json=?,disclosure_json=?,projection_version=? "
+    "WHERE message_id=? AND surface=?"
+)
+_FIND_PROJECTION_DELETE_SQL = (
+    "DELETE FROM codex_find_projection WHERE message_id=? AND surface=?"
+)
+_FIND_PROJECTION_GENERATION_SQL = (
+    "INSERT INTO cache_meta(key,value) VALUES"
+    "('codex_find_projection_generation','1') "
+    "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1"
+)
+
+
+def _write_codex_find_projection_difference(
+    conn: sqlite3.Connection,
+    conversation_key: str,
+    built: list[tuple],
+) -> int:
+    """Make the stored projection of one conversation equal ``built``.
+
+    ``built`` is the complete canonical projection in the builder's order. Both
+    sides are keyed by the primary key ``(message_id, surface)`` and compared
+    on every other column; only the difference is written. Returns the number
+    of rows deleted, inserted or updated (0 for an unchanged conversation).
     """
-    keys = sorted({key for key in conversation_keys if key})
-    if not keys:
-        return
-    for conversation_key in keys:
-        conn.execute(
-            "DELETE FROM codex_find_projection WHERE conversation_key=?",
+    built_by_key = {
+        (row[_FIND_PROJECTION_KEY[0]], row[_FIND_PROJECTION_KEY[1]]): row
+        for row in built
+    }
+    if len(built_by_key) != len(built):
+        # The whole-rewrite writer raised on a duplicate key at INSERT time;
+        # a difference must not silently keep only one of the two rows.
+        raise sqlite3.IntegrityError(
+            "UNIQUE constraint failed: codex_find_projection.message_id, "
+            "codex_find_projection.surface"
+        )
+    stored = {
+        (row[_FIND_PROJECTION_KEY[0]], row[_FIND_PROJECTION_KEY[1]]): row
+        for row in conn.execute(
+            "SELECT " + _FIND_PROJECTION_COLUMNS + " FROM codex_find_projection "
+            "WHERE conversation_key=?",
             (conversation_key,),
         )
-        rows = [
+    }
+    deletes = sorted(key for key in stored if key not in built_by_key)
+    inserts: list[tuple] = []
+    in_place: list[tuple] = []
+    moved: list[tuple] = []
+    for key, row in built_by_key.items():
+        old = stored.get(key)
+        if old is None:
+            inserts.append(row)
+            continue
+        if tuple(old) == row:
+            continue
+        message_id, conversation, item, block, container, surface, order, *rest = row
+        if old[1] == conversation and old[_FIND_PROJECTION_ORDER] == order:
+            in_place.append((item, block, container, *rest, message_id, surface))
+        else:
+            moved.append(
+                (conversation, item, block, container, order, *rest,
+                 message_id, surface)
+            )
+    if deletes:
+        conn.executemany(_FIND_PROJECTION_DELETE_SQL, deletes)
+    if in_place:
+        conn.executemany(_FIND_PROJECTION_UPDATE_IN_PLACE_SQL, in_place)
+    if moved:
+        conn.executemany(_FIND_PROJECTION_UPDATE_MOVED_SQL, moved)
+    if inserts:
+        conn.executemany(_FIND_PROJECTION_INSERT_SQL, inserts)
+    return len(deletes) + len(inserts) + len(in_place) + len(moved)
+
+
+def _load_conversation_rows(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> list:
+    """A conversation's WIDE normalized rows in physical order:
+    ``(timestamp_utc, source_path, line_offset)``.
+
+    #901 Amendment 19 T1: read in ``(timestamp_utc, id)`` index order and each
+    timestamp tie run put in physical order by ``kern.in_physical_order``; the
+    old ``ORDER BY`` left a partial sorter over every tie run, and one
+    conversation is not a bound."""
+    return kern.in_physical_order(
+        (
             kern.CodexNormalizedRow(*row)
             for row in conn.execute(
                 "SELECT " + _ROW_COLS + " FROM codex_conversation_messages "
                 "WHERE conversation_key=? "
-                "ORDER BY timestamp_utc,source_path,line_offset",
+                "ORDER BY timestamp_utc,id",
                 (conversation_key,),
             )
-        ]
+        ),
+        timestamp=lambda row: row.timestamp_utc,
+        position=lambda row: (row.source_path, row.line_offset),
+    )
+
+
+def materialize_codex_find_projection(
+    conn: sqlite3.Connection,
+    conversation_keys,
+    *,
+    cascaded: bool = False,
+) -> None:
+    """Bring #482 projection rows of the affected conversations up to date.
+
+    The existing item/block builder is the only authority for native folds.
+    Every searchable physical row keeps its own block key; a folded output or
+    completion separately records the visual call block that owns it.
+
+    #901 §5.3b (W6): each conversation's complete canonical projection is still
+    built in memory, exactly as before, but only its difference against the
+    stored rows is written, so an unchanged conversation writes no row.
+    ``codex_find_projection_generation`` advances exactly once per call that
+    changed a row, or when the caller says ``cascaded=True``: it deleted
+    messages of these conversations in the same transaction, so the message
+    trigger already cascaded their projection rows away and the builder may
+    find nothing left to change. A true no-op leaves the generation alone.
+    Callers make one call per transaction, so this is once per transaction.
+    """
+    keys = sorted({key for key in conversation_keys if key})
+    if not keys:
+        return
+    changed = 0
+    for conversation_key in keys:
+        built: list[tuple] = []
+        rows = _load_conversation_rows(conn, conversation_key)
         if not rows:
+            changed += _write_codex_find_projection_difference(
+                conn, conversation_key, built)
             continue
         kept, _suppressed = kern.pair_mirrors(rows)
         items = kern.canonical_items(kept)
@@ -3941,12 +4078,9 @@ def materialize_codex_find_projection(
                 if row.kind in {"reasoning", "meta"} or surface != "body"
                 else []
             )
-            conn.execute(
-                "INSERT INTO codex_find_projection "
-                "(message_id,conversation_key,item_key,block_key,"
-                "container_block_key,surface,render_order,projected_text,"
-                "leaves_json,disclosure_json,projection_version) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            # The builder collects complete rows; the difference below writes
+            # them (column order: `_FIND_PROJECTION_COLUMNS`).
+            built.append(
                 (
                     message_id,
                     conversation_key,
@@ -4032,11 +4166,11 @@ def materialize_codex_find_projection(
                 container = completion_owner.get(physical_key, physical_key)
                 store(row, container_block_key=container)
 
-    conn.execute(
-        "INSERT INTO cache_meta(key,value) VALUES"
-        "('codex_find_projection_generation','1') "
-        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1"
-    )
+        changed += _write_codex_find_projection_difference(
+            conn, conversation_key, built)
+
+    if changed or cascaded:
+        conn.execute(_FIND_PROJECTION_GENERATION_SQL)
 
 
 def _fts_query(query: str, column: str | None) -> str:

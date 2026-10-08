@@ -125,7 +125,7 @@ function msSub(ms: Milestone[]): string | null {
   const avg = marg.length ? marg.reduce((a, b) => a + b, 0) / marg.length : null;
   const latestPct = ms[ms.length - 1].percent;
   const parts: string[] = [];
-  if (avg != null) parts.push('avg marginal $' + avg.toFixed(2));
+  if (avg != null) parts.push('avg marginal ' + fmt.usd2Accounting(avg));
   if (latestPct != null) parts.push('latest at ' + latestPct + '%');
   return parts.length ? parts.join(' · ') : null;
 }
@@ -1560,12 +1560,12 @@ function ClaudeCurrentWeekModal({
                     {fmt.startedShort(row.m.crossed_at_utc, ctx, { noSuffix: true })}
                   </td>
                   <td className="num">
-                    {row.m.cumulative_usd != null ? '$' + row.m.cumulative_usd.toFixed(2) : '—'}
+                    {row.m.cumulative_usd != null ? fmt.usd2Accounting(row.m.cumulative_usd) : '—'}
                   </td>
                   <td className="num">
                     <span className="m-marginal">
                       {row.m.marginal_usd != null
-                        ? '$' + row.m.marginal_usd.toFixed(2)
+                        ? fmt.usd2Accounting(row.m.marginal_usd)
                         : (row.m.marginal_usd_withheld_cause
                           // #750 S4 §5.1: name the cause instead of a bare em
                           // dash. In words, not the CLI's bare token — that
@@ -1680,12 +1680,12 @@ function ClaudeCurrentWeekModal({
                           {fmt.startedShort(m.captured_at_utc, ctx, { noSuffix: true })}
                         </td>
                         <td className="num">
-                          {'$' + m.block_cost_usd.toFixed(2)}
+                          {fmt.usd2Accounting(m.block_cost_usd)}
                         </td>
                         <td className="num">
                           <span className="m-marginal">
                             {m.marginal_cost_usd != null
-                              ? '$' + m.marginal_cost_usd.toFixed(2)
+                              ? fmt.usd2Accounting(m.marginal_cost_usd)
                               : '—'}
                           </span>
                         </td>

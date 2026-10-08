@@ -766,7 +766,7 @@ contract_check_runtime_budget() {
             shown=$(contract_budget_format "${verdict%% *}" "$CONTRACT_BUDGET_MAX")
             raw_shown=${shown%% *}
             max_shown=${shown##* }
-            contract_note "runtime budget: $raw_shown seconds per 1,000 cases exceeds the committed maximum of $max_shown (tests/authoritative-runtime-budget.json). This is a NORMALIZED measure, so ordinary estate growth does not move it — a breach means the tree became more expensive PER CASE. Raise the committed budget deliberately if the cost is intended."
+            contract_note "runtime budget: $raw_shown seconds per 1,000 cases exceeds the committed maximum of $max_shown (tests/authoritative-runtime-budget.json). This NORMALIZED measure uses elapsed wall time and passed cases; a breach alone does not distinguish test cost, changed case mix, host contention, or other environmental delays. Inspect retained phase and host observations to establish the cause."
             contract_fail product runtime-budget-exceeded "$raw_shown > $max_shown" budget ;;
     esac
     return 0

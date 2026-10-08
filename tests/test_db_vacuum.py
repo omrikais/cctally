@@ -61,9 +61,17 @@ def test_vacuum_cache_shrinks_page_count(tmp_path, monkeypatch):
 
 
 def test_vacuum_fails_promptly_under_active_reader(tmp_path, monkeypatch, capsys):
+    """#901 W9 (Q15): a cache.db vacuum now waits up to the keepers' drain
+    grace (20 s) for other processes' idle checkpoint keepers to close before
+    it refuses; a reader that stays past it still gets the refusal, at the
+    grace plus one retry, never a hang. The grace is shortened here so the
+    bound stays a few seconds."""
     ns = _load(tmp_path, monkeypatch)
     _seed_and_free_pages(ns, n=200)
     import _cctally_core
+    import _cctally_db
+    grace = 1.0
+    monkeypatch.setattr(_cctally_db, "_KEEPER_YIELD_DEADLINE_SECONDS", grace)
     reader = sqlite3.connect(str(_cctally_core.CACHE_DB_PATH))
     reader.execute("BEGIN")
     reader.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()
@@ -72,6 +80,7 @@ def test_vacuum_fails_promptly_under_active_reader(tmp_path, monkeypatch, capsys
         rc = ns["cmd_db_vacuum"](argparse.Namespace(db="cache"))
         elapsed = time.monotonic() - t0
         assert rc == 3, "an in-use DB must fail, not silently succeed"
+        assert elapsed >= grace - 0.05, "refused before the drain grace"
         assert elapsed < 5.0, "must fail promptly, not hang"
         assert "in use" in capsys.readouterr().err.lower()
     finally:

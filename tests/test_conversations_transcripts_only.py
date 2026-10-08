@@ -30,14 +30,16 @@ import _cctally_db as db  # noqa: E402
 
 
 #: Accounting families dropped by `_apply_conversations_schema` that are NOT
-#: members of `COVERAGE_CACHE_FAMILIES` — the Claude/Codex session corpora and
-#: the public-#5 change ledger. Enumerated because no rule generates them.
+#: members of `COVERAGE_CACHE_FAMILIES` — the Claude/Codex session corpora,
+#: the public-#5 change ledger and the #901 latest-capture summary. Enumerated
+#: because no rule generates them.
 _UNCOVERED_ACCOUNTING_FAMILIES = (
     "session_entries",
     "session_files",
     "codex_session_entries",
     "codex_session_files",
     "quota_window_change_log",
+    "codex_quota_partition_latest",
 )
 
 

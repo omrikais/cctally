@@ -1,0 +1,53 @@
+{
+  "start_at": "2026-04-20T10:00:00+00:00",
+  "end_at": "2026-04-20T15:00:00+00:00",
+  "actual_end_at": "2026-04-20T13:45:00+00:00",
+  "anchor": "recorded",
+  "is_active": false,
+  "label": "10:00 Apr 20 UTC",
+  "entries_count": 7,
+  "cost_usd": 14.5,
+  "total_tokens": 12150000,
+  "input_tokens": 7000000,
+  "output_tokens": 900000,
+  "cache_creation_tokens": 250000,
+  "cache_read_tokens": 4000000,
+  "cache_hit_pct": 35.55555555555556,
+  "facts_source": "retained",
+  "models": [
+    {
+      "model": "claude-opus-4-1",
+      "display": "opus-4-1",
+      "chip": "opus",
+      "cost_usd": 27.5,
+      "cost_pct": 66.26506024096386
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "display": "sonnet-4-6",
+      "chip": "sonnet",
+      "cost_usd": 14,
+      "cost_pct": 33.734939759036145
+    }
+  ],
+  "burn_rate": null,
+  "projection": null,
+  "samples": [
+    {
+      "t": "2026-04-20T10:30:00+00:00",
+      "cum": 6
+    },
+    {
+      "t": "2026-04-20T11:15:00+00:00",
+      "cum": 9
+    },
+    {
+      "t": "2026-04-20T12:00:00+00:00",
+      "cum": 13
+    },
+    {
+      "t": "2026-04-20T13:45:00+00:00",
+      "cum": 17.81
+    }
+  ]
+}

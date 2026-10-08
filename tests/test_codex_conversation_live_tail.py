@@ -19,7 +19,8 @@ import sys
 
 import pytest
 
-from conftest import load_script, redirect_paths
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -39,7 +40,8 @@ def _rollout_bytes(scenario: str) -> bytes:
 def _setup(tmp_path, monkeypatch):
     """A live Codex cache seam with one provider root at ``<tmp>/provider``."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Live-tail assertions use retained synthetic transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     (provider_root / "sessions").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CODEX_HOME", str(provider_root))
@@ -206,13 +208,15 @@ def test_post_preflight_late_shrink_race(tmp_path, monkeypatch):
         a_before = _events(conn, a)
 
         def _shrink_b(path_str):
-            # Fires after each file commits. When A (sorted first) commits,
-            # truncate B below its committed cursor to simulate the race.
+            # Fires after each file is prepared. #901 W11 commits an
+            # unbudgeted call's files together, so B's turn begins with its
+            # preparation: once A (sorted first) is prepared, truncate B below
+            # its committed cursor to simulate the race.
             if path_str == str(a):
                 b.write_bytes(_rollout_bytes("modern-no-quota")[:20])
 
         stats = ns["sync_codex_cache"](
-            conn, only_paths={str(a), str(b)}, _on_file_committed=_shrink_b)
+            conn, only_paths={str(a), str(b)}, _on_file_prepared=_shrink_b)
         assert stats.targeted_clean is False        # call dirty
         assert _events(conn, a) > a_before          # A's commit STANDS
         assert stats.files_failed >= 1              # B declined at its turn

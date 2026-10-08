@@ -817,22 +817,75 @@ def _load_codex_cycles(stats_conn, root_keys, *, include_orphaned=False,
     if not roots:
         return []
     placeholders = ",".join("?" for _ in roots)
-    orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
-    # `quota_window_blocks.account_key` is NOT NULL DEFAULT 'unattributed'.
-    account_clause = "" if account_key is None else "AND account_key=? "
-    account_params = () if account_key is None else (account_key,)
     # BEFORE the SQL, per #496 S5b section 4.7.
     assert_projection_readable(stats_conn)
+    # #901 (I1/G1, Amendment 1 item 2, 1b and 1c): stream every weekly block
+    # in reset order through an epoch-1017 partial expression index. Unpinned,
+    # the planner seeks a root-leading index and sorts the whole weekly
+    # history through a temp b-tree (measured for every root/account/orphan
+    # variant).
+    #
+    # The ORDER BY names the tie order explicitly: `_canonicalize_codex_
+    # cluster` keeps the first maximal member, so rows tied on one reset
+    # second must arrive in the order the pre-#901 sorter received them, and
+    # that order came from the legacy plan, which differs by root count
+    # (Amendment 1c, measured on SQLite 3.53.4). With two or more roots the
+    # legacy plan scanned `idx_quota_blocks_active`, whose order includes
+    # orphaned_at; with exactly one it seeked the UNIQUE autoindex, which has
+    # no orphaned_at (its one exception, an account-scoped live-only read, has
+    # a constant orphaned_at, so the two orders agree there). The branch
+    # counts the NORMALIZED roots above, so duplicate or empty arguments take
+    # the single-root order, exactly as they took the single-root plan.
+    #
+    # Each branch pins its own index only when that index exists; on an
+    # older index the statement stays unpinned with ordinary predicates and
+    # the same explicit order. Under the pin, the root, account and orphan
+    # predicates carry a unary `+`: SQLite treats a column that a WHERE term
+    # fixes but the scan does not seek as satisfying its ORDER BY term and
+    # then cannot match that index column, so the later ORDER BY terms fell
+    # back to a tie-run sorter ("USE TEMP B-TREE FOR LAST n TERMS OF ORDER
+    # BY", measured). Limitation: a unary `+` keeps the operand's value but
+    # removes its column affinity. That is equivalent here ONLY because these
+    # comparisons are TEXT against TEXT: the root keys are filtered to `str`
+    # above, `account_key` is a TEXT key bound as a string, and `IS NULL`
+    # involves no affinity. It is not an equivalence for numeric parameters or
+    # any other affinity-dependent comparison; a caller binding a non-string
+    # account key would need the unpinned predicate.
+    if len(roots) == 1:
+        order_index = "idx_quota_blocks_weekly_single_root_order"
+        order_by = (
+            "ORDER BY unixepoch(resets_at_utc) DESC, source_root_key ASC, "
+            "account_key ASC, logical_limit_key ASC, observed_slot ASC, "
+            "resets_at_utc ASC")
+    else:
+        order_index = "idx_quota_blocks_weekly_reset_order"
+        order_by = (
+            "ORDER BY unixepoch(resets_at_utc) DESC, source_root_key ASC, "
+            "account_key ASC, orphaned_at ASC, logical_limit_key ASC, "
+            "observed_slot ASC, resets_at_utc ASC")
+    pinned = stats_conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+        (order_index,),
+    ).fetchone() is not None
+    order_hint = f"INDEXED BY {order_index} " if pinned else ""
+    plus = "+" if pinned else ""
+    orphan_clause = (
+        "" if include_orphaned else f"AND {plus}orphaned_at IS NULL ")
+    # `quota_window_blocks.account_key` is NOT NULL DEFAULT 'unattributed'.
+    account_clause = (
+        "" if account_key is None else f"AND {plus}account_key=? ")
+    account_params = () if account_key is None else (account_key,)
     rows = stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
         "       window_minutes, limit_id, limit_name, account_key, "
         "       resets_at_utc, nominal_start_at_utc, current_percent "
         "FROM quota_window_blocks "
+        f"{order_hint}"
         "WHERE source='codex' AND window_minutes=10080 "
         f"{orphan_clause}"
         f"{account_clause}"
-        f"AND source_root_key IN ({placeholders}) "
-        "ORDER BY unixepoch(resets_at_utc) DESC",
+        f"AND {plus}source_root_key IN ({placeholders}) "
+        f"{order_by}",
         (*account_params, *roots),
     ).fetchall()
 
@@ -952,10 +1005,20 @@ def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
     The widening is one-directional on purpose: an unattributed CYCLE never
     picks up another account's identified 5h rows, which would violate #341's
     never-combine rule.
+
+    #901 Amendment 19 T1 (spec I1): the rows are returned whole, so they are
+    ordered here, where ``ORDER BY unixepoch(nominal_start_at_utc)`` sorted
+    them through a temp b-tree. Each physical 5h block surfaces as many
+    jittered rows, so one weekly cycle is not a bound. The key is SQLite's own
+    ``unixepoch()`` of each distinct start spelling (a table-free scalar
+    query, memoized), so it is the old key exactly, and the rows keep the
+    caller's row factory. ``list.sort`` is stable over the same scan SQLite's
+    in-memory sorter consumed, so rows tied on one start second keep their
+    order. The WHERE clause admits no NULL start.
     """
     orphan_clause = "" if include_orphaned else "AND orphaned_at IS NULL "
     assert_projection_readable(stats_conn)
-    return stats_conn.execute(
+    rows = stats_conn.execute(
         "SELECT source_root_key, logical_limit_key, observed_slot, "
         "       window_minutes, limit_id, limit_name, account_key, "
         "       resets_at_utc, nominal_start_at_utc, current_percent "
@@ -964,12 +1027,22 @@ def _codex_five_hour_rows(stats_conn, cyc, *, include_orphaned=False) -> list:
         f"{orphan_clause}"
         "AND source_root_key=? AND account_key IN (?,?) "
         "AND unixepoch(nominal_start_at_utc) < unixepoch(?) "
-        "AND unixepoch(resets_at_utc) > unixepoch(?) "
-        "ORDER BY unixepoch(nominal_start_at_utc) ASC",
+        "AND unixepoch(resets_at_utc) > unixepoch(?)",
         (cyc.root, cyc.account_key, UNATTRIBUTED,
          cyc.end.astimezone(UTC).isoformat(),
          cyc.start.astimezone(UTC).isoformat()),
     ).fetchall()
+    epochs: dict = {}
+
+    def start_epoch(row):
+        text = row[8]
+        if text not in epochs:
+            epochs[text] = stats_conn.execute(
+                "SELECT unixepoch(?)", (text,)).fetchone()[0]
+        return epochs[text]
+
+    rows.sort(key=start_epoch)
+    return rows
 
 
 def _codex_five_hour_clusters(stats_conn, cyc, *, include_orphaned=False) -> list:

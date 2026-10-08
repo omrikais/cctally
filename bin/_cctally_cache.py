@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import collections
 import contextlib
 import datetime as dt
 import fcntl
@@ -109,6 +110,7 @@ import select
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -136,6 +138,9 @@ import _lib_quota
 # #496 S5b §4: the journal-to-cache coverage certificate kernel. Stdlib-only,
 # so it is circular-safe for the same reason.
 import _lib_cache_coverage
+# #901 §5.3c (W9): the writer-owned checkpoint policy. A stdlib-only leaf, so
+# it is circular-safe for the same reason.
+import _lib_wal_checkpoint as _wal_checkpoint
 # #845 §4.1: the decode helper is a stdlib-only leaf that imports nothing from
 # this package, so binding it here is circular-safe for the same reason.
 import _lib_codex_metadata
@@ -178,6 +183,7 @@ def _load_lib(name: str):
 
 
 _lib_jsonl = _load_lib("_lib_jsonl")
+_lib_sqlite_close = _load_lib("_lib_sqlite_close")
 UsageEntry = _lib_jsonl.UsageEntry
 CodexEntry = _lib_jsonl.CodexEntry
 _CodexIterState = _lib_jsonl._CodexIterState
@@ -742,6 +748,12 @@ def _maybe_truncate_wal(conn, db_path) -> None:
     PRECONDITION: ``conn`` has no active transaction — the caller has committed
     all ingest work by this point.
     """
+    # #901 §5.3c (W9): a failed shrink is not retried for
+    # ``_wal_checkpoint.SHRINK_RETRY_SECONDS``, and a successful one completes
+    # the writer's pending checkpoint. The test seam turns this off with the
+    # rest of W9.
+    policy = (None if _wal_checkpoint.disabled()
+              else _wal_checkpoint.policy_for_path(db_path))
     try:
         trigger = CACHE_WAL_CHECKPOINT_TRIGGER_BYTES
         test_trigger = os.environ.get("CCTALLY_TEST_CACHE_WAL_TRIGGER_BYTES")
@@ -752,17 +764,136 @@ def _maybe_truncate_wal(conn, db_path) -> None:
                 pass
         if _wal_file_size(db_path) <= trigger:
             return
+        if policy is not None and not policy.shrink_allowed():
+            return
         # After this point, resuming the private stopped process necessarily
         # enters a real TRUNCATE checkpoint rather than a threshold no-op.
         _cache_storm_test_pause("cache_precheckpoint")
         prior = conn.execute("PRAGMA busy_timeout").fetchone()[0]
         try:
             conn.execute(f"PRAGMA busy_timeout={CHECKPOINT_AUTO_BUSY_TIMEOUT_MS}")
-            _run_wal_truncate(conn, db_path, db_label="cache.db")
+            result = _run_wal_truncate(conn, db_path, db_label="cache.db")
         finally:
             conn.execute(f"PRAGMA busy_timeout={prior}")
+        if policy is not None:
+            policy.record_shrink(result.truncated)
     except sqlite3.DatabaseError:
-        pass  # best-effort; observability/hygiene must never fail a sync
+        if policy is not None:
+            policy.record_shrink(False)
+        # best-effort; observability/hygiene must never fail a sync
+
+
+def _set_cache_meta_if_changed(
+    conn: sqlite3.Connection, key: str, value: str,
+) -> None:
+    """Store ``value`` under ``key`` only when it differs (#901 §5.3c W8).
+
+    The upsert's ``WHERE`` makes an unchanged value a no-op, so a per-pass
+    marker that already holds its value writes no page: a write that would
+    store an unchanged value is not issued.
+    """
+    conn.execute(
+        "INSERT INTO cache_meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value "
+        "WHERE cache_meta.value IS NOT excluded.value",
+        (key, value),
+    )
+
+
+def _withdraw_cache_meta_marker(conn: sqlite3.Connection, key: str) -> None:
+    """Remove a walk-completion marker, writing only when it is present.
+
+    #901 §5.3c (W8). A completion marker certifies the most recent exhaustive
+    walk, so a walk that did not finish cleanly withdraws it. Withdrawing
+    replaces the old delete-at-start, which rewrote the marker on every
+    complete walk: a complete walk now leaves a present marker untouched and
+    writes nothing. Called on every exit of a walk that has not settled its
+    marker — an early return, an incomplete end, or an exception, where any
+    uncommitted partial work is rolled back first, as a crash would. Best
+    effort: a store too damaged to take the delete has larger problems, and
+    the original exception must keep propagating.
+    """
+    try:
+        if conn.in_transaction:
+            conn.rollback()
+        if conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?", (key,)
+        ).fetchone() is not None:
+            conn.execute("DELETE FROM cache_meta WHERE key=?", (key,))
+            conn.commit()
+    except sqlite3.DatabaseError:
+        try:
+            conn.rollback()
+        except sqlite3.DatabaseError:
+            pass
+
+
+_CODEX_FINALIZATION_SAVEPOINT = "SAVEPOINT codex_finalization_stage"
+_CODEX_FINALIZATION_RELEASE = "RELEASE SAVEPOINT codex_finalization_stage"
+_CODEX_FINALIZATION_ROLLBACK_TO = (
+    "ROLLBACK TO SAVEPOINT codex_finalization_stage")
+
+
+def _open_codex_finalization_step(conn: sqlite3.Connection) -> None:
+    """Open one step of ``sync_codex_cache``'s finalization transaction (W8).
+
+    Opens the transaction when it is not open yet (also after SQLite ended it
+    on its own), then the step's savepoint. Steps run one after another, each
+    released before the next opens, so at most one is ever open.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute(_CODEX_FINALIZATION_SAVEPOINT)
+
+
+def _undo_open_codex_finalization_step(conn: sqlite3.Connection) -> None:
+    """Undo the open step, if any, keeping the steps already released."""
+    if not conn.in_transaction:
+        return
+    try:
+        conn.execute(_CODEX_FINALIZATION_ROLLBACK_TO)
+        conn.execute(_CODEX_FINALIZATION_RELEASE)
+    except sqlite3.DatabaseError:
+        # No step is open ("no such savepoint"): nothing to undo.
+        pass
+
+
+@contextlib.contextmanager
+def _codex_finalization_stage(conn: sqlite3.Connection):
+    """One step of ``sync_codex_cache``'s finalization transaction (W8).
+
+    Runs the step inside its own savepoint. Any exception rolls back to the
+    savepoint, so the step's writes are undone while the earlier steps' stay,
+    and re-raises for the caller's existing failure handling. When SQLite has
+    already ended the whole transaction on its own, nothing is left to undo and
+    the next step opens a new one.
+    """
+    _open_codex_finalization_step(conn)
+    try:
+        yield
+    except BaseException:
+        _undo_open_codex_finalization_step(conn)
+        raise
+    conn.execute(_CODEX_FINALIZATION_RELEASE)
+
+
+def _commit_codex_finalization_so_far(conn: sqlite3.Connection) -> None:
+    """Commit the finalization steps that completed before an exception.
+
+    Before #901 W8 every step committed on its own, so a step that raised left
+    the earlier steps durable; this keeps that. The step that was open when the
+    exception struck is undone first, as its own uncommitted transaction was
+    before. Best effort: the exception being raised is the one that matters.
+    """
+    try:
+        _undo_open_codex_finalization_step(conn)
+        if conn.in_transaction:
+            conn.commit()
+    except sqlite3.DatabaseError:
+        try:
+            conn.rollback()
+        except sqlite3.DatabaseError:
+            pass
 
 
 _PARSE_HEALTH_SCHEMA = 1
@@ -777,6 +908,7 @@ def _update_parse_health_meta(
     lines_skipped: int,
     skip_reasons: dict,
     rebuild: bool,
+    commit: bool = True,
 ) -> None:
     """Anomaly-delta-gated rolling parse-health record (#279 S2 F1 /
     Codex P1-2). Writes ONLY when (a) this sync's malformed+skipped delta
@@ -829,6 +961,16 @@ def _update_parse_health_meta(
     for r, n in (skip_reasons or {}).items():
         reasons[r] = int(reasons.get(r, 0) or 0) + int(n)
     record["reasons"] = reasons
+    if not commit:
+        # #901 §5.3c (W8): inside ``sync_codex_cache``'s one finalization
+        # transaction the record is one savepoint, so a failed write undoes
+        # only itself and the caller's single commit carries it.
+        try:
+            with _codex_finalization_stage(conn):
+                _set_cache_meta(conn, key, json.dumps(record, sort_keys=True))
+        except sqlite3.DatabaseError:
+            pass  # observability must never fail the sync
+        return
     try:
         _set_cache_meta(conn, key, json.dumps(record, sort_keys=True))
         conn.commit()
@@ -1075,12 +1217,16 @@ def set_codex_file_incarnation(
     the per-file batch transaction that the ingest may roll back and retry —
     replaying an increment would double-bump, replaying a MAX-set converges.
     """
+    # #901 §5.3c (W8): the MAX-set writes only when the incarnation advances,
+    # so re-observing an unchanged identity issues no write.
+    # ``updated_at_utc`` is therefore the time the stored incarnation was set.
     conn.execute(
         "INSERT INTO codex_file_incarnations (file_identity, incarnation, updated_at_utc) "
         "VALUES (?,?,?) "
         "ON CONFLICT(file_identity) DO UPDATE SET "
-        "  incarnation = MAX(codex_file_incarnations.incarnation, excluded.incarnation), "
-        "  updated_at_utc = excluded.updated_at_utc",
+        "  incarnation = excluded.incarnation, "
+        "  updated_at_utc = excluded.updated_at_utc "
+        "WHERE excluded.incarnation > codex_file_incarnations.incarnation",
         (file_identity, incarnation, at_utc),
     )
 
@@ -1303,13 +1449,29 @@ def load_active_window_attributions(
     `idx_codex_window_attributions_root(source_root_key, window_minutes)`
     already anticipates the first. Task 2's overlay re-checks the model-scoped
     axis independently; this is defense in depth, not the only check.
+
+    #901 (I1/G1, Amendment 1 item 1): the read streams in assertion order
+    through `idx_codex_window_attributions_read_order(window_minutes,
+    asserted_at_utc, op_id)`, pinned with `INDEXED BY` when the index exists so
+    no planner statistics can put it back on the pre-#901 plan: a seek of the
+    root index followed by a temp b-tree sort of every matching assertion
+    (measured before the index existed), a population that grows by one
+    assertion per attributed window. The root, retraction and account
+    predicates are evaluated along the ordered scan, so the returned tuple is
+    unchanged; a store without the index keeps the unpinned SQL.
     """
+    read_order_index = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_codex_window_attributions_read_order'"
+    ).fetchone() is not None
     sql = (
         "SELECT op_id, account_key, source_root_key, logical_limit_key, "
         "       observed_slot, window_minutes, raw_resets_at_utc, "
         "       canonical_resets_at_utc, asserted_at_utc "
         "FROM codex_window_attributions "
-        "WHERE retracted_by_op_id IS "
+        + ("INDEXED BY idx_codex_window_attributions_read_order "
+           if read_order_index else "")
+        + "WHERE retracted_by_op_id IS "
         + ("NOT NULL " if retracted_only else "NULL ")
         + "  AND window_minutes = ? "
         "  AND account_key <> ?"
@@ -1487,15 +1649,24 @@ class CodexResetAnchorResolver:
             candidates = _lib_jsonl.codex_snap_equivalent_limit_keys(
                 str(logical_limit_key))
             placeholders = ",".join("?" for _ in candidates)
+            # #901 Q11: the unary `+` keeps the plan this read always had, a
+            # walk of the `(source, source_path, line_offset, ...)` unique
+            # index that sorts only one rollout line's tied rows. Cache
+            # migration 048 made `idx_qws_physical_group` covering for this
+            # SELECT list, and the planner then preferred seeking it and
+            # sorting the root's whole limit history (measured: "USE TEMP
+            # B-TREE FOR ORDER BY"). `+` removes the column's affinity, which
+            # is equivalent here only because the root key is TEXT bound as a
+            # `str`.
             try:
                 rows = self._conn.execute(
                     "SELECT source_path, line_offset, id, resets_at_utc "
                     "FROM quota_window_snapshots "
-                    "WHERE source = 'codex' AND source_root_key = ? "
+                    "WHERE source = 'codex' AND +source_root_key = ? "
                     "  AND observed_slot = ? "
                     f"  AND logical_limit_key IN ({placeholders}) "
                     "ORDER BY source_path, line_offset, id",
-                    (group[0], group[1], *candidates),
+                    (str(group[0]), group[1], *candidates),
                 ).fetchall()
             except sqlite3.DatabaseError:
                 # A cache that has not yet gained the column (an old binary
@@ -1553,6 +1724,20 @@ class CodexResetAnchorResolver:
 
     def mark_file_committed(self) -> None:
         self._pending_merges.clear()
+
+    def take_pending_merges(self) -> list:
+        """This file's queued merges, handed to the caller and cleared (W11).
+
+        An unbudgeted ``sync_codex_cache`` prepares several files before it
+        applies any, so each prepared file carries its own merges and the
+        apply hands them back with ``restore_pending_merges``."""
+        merges = list(self._pending_merges)
+        self._pending_merges.clear()
+        return merges
+
+    def restore_pending_merges(self, merges: list) -> None:
+        """Make ``merges`` the queue ``apply_pending_merges`` applies next."""
+        self._pending_merges = list(merges)
 
     def discard_uncommitted_file(self) -> None:
         """Forget buffered evidence after its file did not commit."""
@@ -2672,16 +2857,24 @@ def _load_codex_normalized_rows(
     conn: sqlite3.Connection, conversation_key: str,
 ) -> list:
     """Load a conversation's normalized rows (all files) in physical order as
-    kernel CodexNormalizedRow objects."""
-    return [
-        _lib_codex_conversation.CodexNormalizedRow(*row)
-        for row in conn.execute(
-            "SELECT " + _CODEX_NORM_COLS + " FROM codex_conversation_messages "
-            "WHERE conversation_key = ? "
-            "ORDER BY timestamp_utc, source_path, line_offset",
-            (conversation_key,),
-        )
-    ]
+    kernel CodexNormalizedRow objects.
+
+    #901 Amendment 19 T1: read in ``(timestamp_utc, id)`` index order, each
+    timestamp tie run put in physical order by
+    ``_lib_codex_conversation.in_physical_order`` (no partial sorter)."""
+    return _lib_codex_conversation.in_physical_order(
+        (
+            _lib_codex_conversation.CodexNormalizedRow(*row)
+            for row in conn.execute(
+                "SELECT " + _CODEX_NORM_COLS + " FROM codex_conversation_messages "
+                "WHERE conversation_key = ? "
+                "ORDER BY timestamp_utc, id",
+                (conversation_key,),
+            )
+        ),
+        timestamp=lambda row: row.timestamp_utc,
+        position=lambda row: (row.source_path, row.line_offset),
+    )
 
 
 def _insert_codex_normalized_rows(
@@ -2736,6 +2929,7 @@ def _recompute_codex_rollups(
     conversation_keys,
     *,
     advance_render_revision: bool = True,
+    inputs_changed: "bool | set[str] | frozenset[str]" = True,
 ) -> None:
     """Recompute-affected-or-delete the rollup for each conversation (§3.2).
 
@@ -2744,15 +2938,30 @@ def _recompute_codex_rollups(
     rollups, stamp item_count (rendered LOGICAL items), title, project attribution,
     times, and models. Called by every write/delete path so no stale rollup
     survives.
+
+    #901 §5.3b: ``inputs_changed`` names the conversations whose retained render
+    inputs (normalized message rows or events) this transaction inserted,
+    deleted or updated — ``True`` (the default, for callers that cannot tell)
+    means all of them. Such a conversation's row is always written with a fresh
+    ``render_revision``, even when its aggregate values come out equal, so the
+    outline memo keyed on it is never stale. Any other conversation's row is
+    written only when one of its stored values would change, so a true no-op
+    writes nothing (and reserves no revision).
     """
     kern = _lib_codex_conversation
     keys = {key for key in conversation_keys if key}
     if not keys:
         return
-    render_revision = (
-        _next_conversation_render_revision(conn)
-        if advance_render_revision else 0
-    )
+    reserved_revision: "int | None" = None
+
+    def render_revision() -> int:
+        nonlocal reserved_revision
+        if not advance_render_revision:
+            return 0
+        if reserved_revision is None:
+            reserved_revision = _next_conversation_render_revision(conn)
+        return reserved_revision
+
     for conversation_key in keys:
         rows = _load_codex_normalized_rows(conn, conversation_key)
         if not rows:
@@ -2808,6 +3017,19 @@ def _recompute_codex_rollups(
         else:
             project_key, project_label = _codex_conversation_project_attribution(
                 source_root_key, cwd, git_json)
+        values = (source_root_key, parent_thread_id, item_count, started,
+                  last_activity, project_key, project_label, models_json, title)
+        if inputs_changed is not True and conversation_key not in (
+                inputs_changed or ()):
+            stored = conn.execute(
+                "SELECT source_root_key, parent_thread_id, item_count, "
+                "started_utc, last_activity_utc, project_key, project_label, "
+                "models_json, title FROM codex_conversation_rollups "
+                "WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+            if stored is not None and tuple(stored) == values:
+                continue
         conn.execute(
             "INSERT INTO codex_conversation_rollups "
             "(conversation_key, source_root_key, parent_thread_id, item_count, "
@@ -2821,9 +3043,7 @@ def _recompute_codex_rollups(
             " project_key=excluded.project_key, project_label=excluded.project_label, "
             " models_json=excluded.models_json, title=excluded.title, "
             " render_revision=excluded.render_revision",
-            (conversation_key, source_root_key, parent_thread_id, item_count,
-             started, last_activity, project_key, project_label, models_json, title,
-             render_revision),
+            (conversation_key, *values, render_revision()),
         )
 
 
@@ -2891,7 +3111,10 @@ def _replay_codex_normalization(
     ).fetchone() is not None
     if projection_exists:
         import _lib_codex_conversation_query as query
-        query.materialize_codex_find_projection(conn, affected)
+        # The caller full-cleared every normalized message in this transaction
+        # (§3.4), so the projection rows went with them (#901 §5.3b): the
+        # generation must advance even where the rebuilt rows come out equal.
+        query.materialize_codex_find_projection(conn, affected, cascaded=True)
 
 
 def run_codex_find_projection_backfill(
@@ -2975,6 +3198,13 @@ def _repair_codex_turn_ids_for_source(
     or abort record exposes its turn id. Run this bounded per-file repair only
     when such a native proof arrives; ordinary append ticks remain delta-only.
     The physical log stays authoritative.
+
+    #901 Amendment 19 T1 (spec I1): the affected conversations are collected
+    from the one scan of the file's rows the repair already makes. A separate
+    ``SELECT DISTINCT conversation_key`` built a temp b-tree over the file's
+    whole message history, and one rollout file is not a bound. Same set:
+    every non-empty key on the path (``conversation_key`` is NOT NULL, and the
+    UPDATE below changes only ``turn_id``).
     """
     events = [
         _lib_jsonl.CodexPhysicalEvent(*row)
@@ -2988,20 +3218,14 @@ def _repair_codex_turn_ids_for_source(
     ]
     inferred, _terminal = _lib_codex_conversation.infer_codex_event_turns(events)
     expected = {event.line_offset: turn for event, turn in zip(events, inferred)}
-    affected = {
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
-            "WHERE source_path=?",
-            (source_path,),
-        )
-        if row[0]
-    }
-    for line_offset, stored_turn in conn.execute(
-        "SELECT line_offset, turn_id FROM codex_conversation_messages "
-        "WHERE source_path=?",
+    affected: set[str] = set()
+    for line_offset, stored_turn, conversation_key in conn.execute(
+        "SELECT line_offset, turn_id, conversation_key "
+        "FROM codex_conversation_messages WHERE source_path=?",
         (source_path,),
     ):
+        if conversation_key:
+            affected.add(conversation_key)
         inferred_turn = expected.get(line_offset)
         if stored_turn != inferred_turn:
             conn.execute(
@@ -3012,10 +3236,34 @@ def _repair_codex_turn_ids_for_source(
     return affected
 
 
-def _collect_retained_codex_paths_and_roots(
+@dataclass(frozen=True)
+class _RetainedCodexInventory:
+    """Every retained Codex source identity, from one scan of each family.
+
+    ``identities`` and ``root_keys`` are what
+    `_collect_retained_codex_paths_and_roots` returns. ``terminal_file_identities``
+    is every ``codex_session_files`` ``(path, source_root_key)`` row, relative
+    fixture rows included, which the inactive-path partition reads to send an
+    old terminal file at a currently discovered path to requalification.
+
+    #901 Amendment 20 W1 (dc18 S2): the ordinary prune path used to collect
+    the identities twice per pass and scan the terminal rows a third time,
+    and each collection is four history-sized family scans. It now collects
+    once and hands the result to both decisions. The collections ran back to
+    back under the cache writer and Codex provider flocks, which every writer
+    of these families takes, with only pure partitioning and the filesystem
+    prune-scope probe between them, so one collection sees what two did.
+    """
+
+    identities: tuple[tuple[str, str | None], ...]
+    root_keys: frozenset[str]
+    terminal_file_identities: frozenset[tuple[str, str | None]]
+
+
+def _collect_retained_codex_inventory(
     conn: sqlite3.Connection,
-) -> tuple[list[tuple[str, str | None]], set[str]]:
-    """Return every retained real source identity and provider root.
+) -> _RetainedCodexInventory:
+    """Collect every retained real source identity and provider root once.
 
     A failed/partial prior write can leave any S1 child family without its
     terminal ``codex_session_files`` row. Safety decisions must therefore see
@@ -3024,14 +3272,21 @@ def _collect_retained_codex_paths_and_roots(
     on-disk authority and remain outside filesystem pruning.
     """
     retained_identities: set[tuple[str, str | None]] = set()
-    family_queries = (
-        "SELECT path, source_root_key FROM codex_session_files",
+    terminal_file_identities: set[tuple[str, str | None]] = set()
+    for source_path, root_key in conn.execute(
+        "SELECT path, source_root_key FROM codex_session_files"
+    ):
+        terminal_file_identities.add((source_path, root_key))
+        if not os.path.isabs(source_path):
+            continue
+        retained_identities.add((source_path, root_key))
+    child_family_queries = (
         "SELECT source_path, source_root_key FROM codex_session_entries",
         "SELECT source_path, source_root_key FROM quota_window_snapshots "
         "WHERE source = 'codex'",
         "SELECT source_path, source_root_key FROM codex_conversation_threads",
     )
-    for query in family_queries:
+    for query in child_family_queries:
         for source_path, root_key in conn.execute(query):
             if not os.path.isabs(source_path):
                 continue
@@ -3045,28 +3300,41 @@ def _collect_retained_codex_paths_and_roots(
             "SELECT source_root_key FROM codex_source_roots"
         )
     )
-    return (
-        sorted(retained_identities, key=lambda item: (item[0], item[1] or "")),
-        retained_root_keys,
+    return _RetainedCodexInventory(
+        identities=tuple(sorted(
+            retained_identities, key=lambda item: (item[0], item[1] or ""),
+        )),
+        root_keys=frozenset(retained_root_keys),
+        terminal_file_identities=frozenset(terminal_file_identities),
     )
+
+
+def _collect_retained_codex_paths_and_roots(
+    conn: sqlite3.Connection,
+) -> tuple[list[tuple[str, str | None]], set[str]]:
+    """Return every retained real source identity and provider root."""
+    inventory = _collect_retained_codex_inventory(conn)
+    return list(inventory.identities), set(inventory.root_keys)
 
 
 def _collect_inactive_codex_paths_and_roots(
     conn: sqlite3.Connection,
     current_file_identities: set[tuple[str, str]],
     active_root_keys: set[str],
+    *,
+    inventory: "_RetainedCodexInventory | None" = None,
 ) -> tuple[list[tuple[str, str | None]], set[str]]:
-    """Return stale retained source identities and candidate root keys."""
-    retained_identities, retained_root_keys = (
-        _collect_retained_codex_paths_and_roots(conn)
-    )
+    """Return stale retained source identities and candidate root keys.
+
+    ``inventory`` is the pass's one collection (#901 Amendment 20 W1); without
+    it the function collects its own.
+    """
+    if inventory is None:
+        inventory = _collect_retained_codex_inventory(conn)
+    retained_identities = inventory.identities
+    retained_root_keys = inventory.root_keys
     current_paths = {path for path, _root_key in current_file_identities}
-    terminal_file_identities = {
-        (path, root_key)
-        for path, root_key in conn.execute(
-            "SELECT path, source_root_key FROM codex_session_files"
-        )
-    }
+    terminal_file_identities = inventory.terminal_file_identities
     stale_identities = {
         identity
         for identity in retained_identities
@@ -3087,6 +3355,81 @@ def _collect_inactive_codex_paths_and_roots(
         if root_key not in active_root_keys
     }
     return sorted(stale_identities, key=lambda item: (item[0], item[1] or "")), stale_root_keys
+
+
+@dataclass(frozen=True)
+class _OrdinaryCodexPrunePlan:
+    """The ordinary (non-targeted, non-rebuild) prune path's decisions.
+
+    ``safe_*`` / ``refused_orphan_*`` partition the inactive orphans;
+    ``refused_sources`` / ``refused_root_keys`` partition every retained
+    identity, so a refused path is protected from the per-file loop's
+    requalification even when it is not an orphan.
+    """
+
+    orphan_sources: list[tuple[str, str | None]]
+    orphan_root_keys: set[str]
+    safe_sources: list[tuple[str, str | None]]
+    refused_orphan_sources: list[tuple[str, str | None]]
+    safe_root_keys: set[str]
+    refused_orphan_root_keys: set[str]
+    retained_sources: list[tuple[str, str | None]]
+    refused_sources: list[tuple[str, str | None]]
+    refused_root_keys: set[str]
+
+
+def _plan_ordinary_codex_prune(
+    conn: sqlite3.Connection,
+    current_file_identities: set[tuple[str, str]],
+    active_root_keys: set[str],
+    prune_scope: "_CodexPruneScope",
+) -> _OrdinaryCodexPrunePlan:
+    """Decide one ordinary pass's orphan prune from ONE retained collection.
+
+    #901 Amendment 20 W1 (dc18 S2): the orphan partition and the protection
+    partition read the same `_collect_retained_codex_inventory` result instead
+    of collecting twice. Every family, the root registry, the relative-path
+    exclusion and the orphan detection of children without a terminal file
+    row are unchanged; only the duplicate scans are gone. The caller holds the
+    cache writer and Codex provider flocks across this call.
+    """
+    inventory = _collect_retained_codex_inventory(conn)
+    orphan_sources, orphan_root_keys = _collect_inactive_codex_paths_and_roots(
+        conn, current_file_identities, active_root_keys, inventory=inventory,
+    )
+    (
+        safe_sources,
+        refused_orphan_sources,
+        safe_root_keys,
+        refused_orphan_root_keys,
+    ) = _partition_codex_prune_candidates(
+        prune_scope, orphan_sources, orphan_root_keys
+    )
+    retained_sources = list(inventory.identities)
+    retained_source_root_keys = {
+        root_key
+        for _path, root_key in retained_sources
+        if root_key is not None
+    }
+    (
+        _safe_retained_sources,
+        refused_sources,
+        _safe_retained_roots,
+        refused_root_keys,
+    ) = _partition_codex_prune_candidates(
+        prune_scope, retained_sources, retained_source_root_keys
+    )
+    return _OrdinaryCodexPrunePlan(
+        orphan_sources=orphan_sources,
+        orphan_root_keys=orphan_root_keys,
+        safe_sources=safe_sources,
+        refused_orphan_sources=refused_orphan_sources,
+        safe_root_keys=safe_root_keys,
+        refused_orphan_root_keys=refused_orphan_root_keys,
+        retained_sources=retained_sources,
+        refused_sources=refused_sources,
+        refused_root_keys=refused_root_keys,
+    )
 
 
 def _prune_inactive_codex_source_roots(
@@ -3237,6 +3580,80 @@ def _append_codex_file_account_decision(
     ))
 
 
+#: #901 §5.3c (W11, Q14): an unbudgeted ``sync_codex_cache`` prepares its
+#: changed files (reads and parses their new records) with no write
+#: transaction open and applies them in one transaction, each file in its own
+#: savepoint. One transaction holds at most this many files and this many
+#: bytes of newly consumed input (a file's size minus its cursor, known before
+#: it is read); a file whose own new input exceeds the byte bound is applied
+#: alone. The hook's budgeted path keeps its per-file commits.
+CODEX_ACCOUNTING_BATCH_FILES = 64
+CODEX_ACCOUNTING_BATCH_BYTES = 4 * 1024 * 1024
+#: Test seam: False keeps an unbudgeted call on the pre-W11 per-file commits,
+#: the per-file control G10 (l) compares against.
+_CODEX_W11_ENABLED = True
+#: Test seam: prepare every file first and apply bounded slices afterwards. It
+#: exists only so G10 (l) can show its preparation-trace oracle fails it.
+_CODEX_W11_EAGER_PREPARE_FOR_TESTS = False
+#: Test seam: called with W11's preparation trace events: ``("prepare_start",
+#: path, new_bytes)``, ``("prepare_drop", path)``, ``("prepare_end", path,
+#: new_bytes)``, ``("commit", paths)`` and ``("release", paths, bytes)``.
+_CODEX_W11_TRACE = None
+#: Test seam: called immediately before each W11 commit (crash injection).
+_CODEX_BATCH_PRECOMMIT_HOOK = None
+_CODEX_W11_FILE_SAVEPOINT = "SAVEPOINT codex_w11_file"
+_CODEX_W11_FILE_RELEASE = "RELEASE SAVEPOINT codex_w11_file"
+_CODEX_W11_FILE_ROLLBACK_TO = "ROLLBACK TO SAVEPOINT codex_w11_file"
+#: 901-QI-001: held from the moment the last batch is deferred to W8's
+#: finalization transaction until just before its completion marker. A
+#: transaction SQLite ended on its own takes the savepoint with it, and a
+#: later stage's fresh BEGIN cannot recreate it, so releasing it proves the
+#: deferred files are still in the transaction that will commit.
+_CODEX_W11_DEFERRED_SAVEPOINT = "SAVEPOINT codex_w11_deferred"
+_CODEX_W11_DEFERRED_RELEASE = "RELEASE SAVEPOINT codex_w11_deferred"
+
+
+@dataclass
+class _CodexPreparedFile:
+    """One changed Codex file read and parsed, waiting for its batch (W11)."""
+
+    walk_index: int
+    discovered: Any
+    path_str: str
+    new_input: int
+    write_kwargs: dict
+    merges: list
+    reset_counted: bool
+    scan_target: int
+    final_offset: int
+    stopped_short: bool
+    accounting_rows: list
+    quota_rows: list
+    #: The parse counters this file folded into the sync's statistics.
+    lines_seen: int
+    lines_malformed: int
+    token_events_skipped: int
+    skip_reasons: dict
+    #: Accounting rows its apply inserted, once applied.
+    rows_changed: int = 0
+
+
+def _codex_w11_trace(*event) -> None:
+    hook = _CODEX_W11_TRACE
+    if hook is not None:
+        hook(*event)
+
+
+def _codex_batch_precommit() -> None:
+    """Immediately before a W11 commit that carries applied files: the
+    killed-writer harness's `codex_precommit` point (where the per-file path
+    pauses before its own commit) and the crash-injection seam."""
+    _cache_storm_test_pause("codex_precommit")
+    hook = _CODEX_BATCH_PRECOMMIT_HOOK
+    if hook is not None:
+        hook()
+
+
 def _write_codex_file_batch(
     conn: sqlite3.Connection,
     *,
@@ -3267,8 +3684,13 @@ def _write_codex_file_batch(
     ingest_complete: bool = True,
     device_id: "int | None" = None,
     inode: "int | None" = None,
+    commit: bool = True,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
+
+    ``commit=False`` (#901 W11) leaves the caller's transaction open: an
+    unbudgeted sync applies each file inside its own savepoint and commits the
+    batch once.
 
     ``prune_roots`` gates the whole-tree ``_prune_inactive_codex_source_roots``
     call: a targeted (only_paths) ingest passes ``False`` so it never deletes a
@@ -3283,10 +3705,11 @@ def _write_codex_file_batch(
 
     ``ingest_complete`` (public #5) records whether ingestion actually reached
     the ``size`` it is about to persist. It MUST be listed in the cursor upsert
-    below: ``INSERT OR REPLACE`` deletes and reinserts the row, so an omitted
-    column silently reverts to its schema DEFAULT of 1 — a budgeted stop would
-    have its own record erased by its own commit, the unread suffix would be
-    skipped as unchanged forever, and nothing would raise."""
+    below, in both its value list and its ``DO UPDATE SET``: an omitted column
+    keeps a stale value (it once reverted to its schema DEFAULT of 1 under the
+    former ``INSERT OR REPLACE``) — a budgeted stop would have its own record
+    erased by its own commit, the unread suffix would be skipped as unchanged
+    forever, and nothing would raise."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
     if reset_file:
         _delete_codex_file_derived_rows(conn, path_str)
@@ -3369,14 +3792,37 @@ def _write_codex_file_batch(
     # target, the final offset and the completion flag. A replacement can
     # therefore never leave a new identity paired with an old offset: either
     # the whole file batch commits or none of it does.
+    #
+    # #901 §5.3c (W8): an explicit upsert that sets exactly the columns the
+    # former ``INSERT OR REPLACE`` wrote. An existing file's offset-only advance
+    # is an UPDATE, which ``trg_codex_accounting_file_upd`` logs only when an
+    # identity-relevant field changes; the replace fired the INSERT trigger and
+    # logged an accounting change on every advance. A new file still fires the
+    # INSERT trigger, and an identity change still logs through the UPDATE one.
     conn.execute(
-        """INSERT OR REPLACE INTO codex_session_files
+        """INSERT INTO codex_session_files
            (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
             last_session_id, last_model, last_total_tokens, source_root_key,
             last_native_thread_id, last_root_thread_id, last_parent_thread_id,
             last_conversation_key, last_turn_id, account_key, ingest_complete,
             device_id, inode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(path) DO UPDATE SET
+            size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,
+            last_byte_offset=excluded.last_byte_offset,
+            last_ingested_at=excluded.last_ingested_at,
+            last_session_id=excluded.last_session_id,
+            last_model=excluded.last_model,
+            last_total_tokens=excluded.last_total_tokens,
+            source_root_key=excluded.source_root_key,
+            last_native_thread_id=excluded.last_native_thread_id,
+            last_root_thread_id=excluded.last_root_thread_id,
+            last_parent_thread_id=excluded.last_parent_thread_id,
+            last_conversation_key=excluded.last_conversation_key,
+            last_turn_id=excluded.last_turn_id,
+            account_key=excluded.account_key,
+            ingest_complete=excluded.ingest_complete,
+            device_id=excluded.device_id, inode=excluded.inode""",
         (
             path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
             last_model, last_total_tokens, discovered.source_root_key,
@@ -3393,8 +3839,9 @@ def _write_codex_file_batch(
     # facts as one physical unit. Keep the version bump in that same commit so
     # a rolled-back batch never appears newer to the dashboard signature.
     _bump_codex_physical_mutation_seq(conn)
-    _cache_storm_test_pause("codex_precommit")
-    conn.commit()
+    if commit:
+        _cache_storm_test_pause("codex_precommit")
+        conn.commit()
     return rows_changed
 
 
@@ -3982,6 +4429,10 @@ def sync_cache(
     _cctally_core.CACHE_LOCK_PATH.touch()
 
     lock_fh = open(_cctally_core.CACHE_LOCK_PATH, "w")
+    # #901 §5.3c (W8): True while this call owes the walk-complete marker a
+    # verdict. Settled by the clean end-of-walk write; every other exit
+    # withdraws a present marker in ``finally``.
+    walk_marker_owed = False
     try:
         with _perf.phase("flock") as _p_flock:
             _acquired = _acquire_cache_flock(lock_fh, timeout=lock_timeout)
@@ -3990,6 +4441,8 @@ def sync_cache(
             eprint("[cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
+        # #901 §5.3c (W9): a sync writer owns its checkpoints.
+        _wal_checkpoint.arm(conn)
 
         targeted = only_paths is not None
         if targeted:
@@ -4047,15 +4500,15 @@ def sync_cache(
         walk_clean = True
 
         # The marker certifies the MOST RECENT exhaustive walk, not merely some
-        # historical clean walk.  Retire it before an ordinary full pass too;
-        # any early return or per-file failure must leave the store visibly
-        # incomplete until this same call reaches the clean end-of-walk write.
-        if not targeted and not rebuild:
-            conn.execute(
-                "DELETE FROM cache_meta "
-                "WHERE key='claude_ingest_walk_complete'"
-            )
-            conn.commit()
+        # historical clean walk. Any early return, per-file failure or
+        # exception must leave the store visibly incomplete, and only this same
+        # call's clean end-of-walk write may keep it. #901 §5.3c (W8): the
+        # verdict is owed from here and settled at the exit, rather than
+        # retiring the marker with a delete-and-commit at the start, which made
+        # every complete walk rewrite it. Destructive paths (rebuild, the
+        # truncation reset, orphaned rows) still delete it atomically with
+        # their own writes.
+        walk_marker_owed = not targeted
 
         if rebuild:
             # Clear INSIDE the lock — a concurrent rebuild that lost the
@@ -4853,6 +5306,7 @@ def sync_cache(
                 )
                 _cache_storm_test_pause("claude_precommit")
                 conn.commit()
+                _wal_checkpoint.after_commit(conn)
                 stats.files_processed += 1
                 # Browse-rail rollup: record the session_ids this file just
                 # committed so the post-walk recompute can scope its DELETE+INSERT
@@ -4958,11 +5412,16 @@ def sync_cache(
         # completeness. A lock-contended sync returned early above and never
         # reaches here. Presence (not the timestamp) is the gate signal; the
         # value stores the completion instant for doctor/debugging.
+        #
+        # #901 §5.3c (W8): written only when absent, so a run of complete walks
+        # writes nothing after the first; the value is therefore the instant
+        # the current run of complete walks began. Any exit that does not reach
+        # here withdraws the marker (``walk_marker_owed`` in ``finally``).
         if walk_clean and applied_at_start and not targeted:
             conn.execute(
                 "INSERT INTO cache_meta(key, value) "
                 "VALUES('claude_ingest_walk_complete', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "ON CONFLICT(key) DO NOTHING",
                 (dt.datetime.now(dt.timezone.utc).isoformat(),),
             )
             # #195: the same clean-full-walk condition retires the split
@@ -4975,6 +5434,7 @@ def sync_cache(
             )
             conn.commit()
             stats.full_walk_complete = True
+            walk_marker_owed = False
         # #279 S2 F1: rolling parse-health record. Anomaly-delta-gated so
         # steady-state (incl. targeted live-tail) syncs stay zero-write;
         # targeted syncs still accumulate — they ingest real new bytes.
@@ -4998,6 +5458,10 @@ def sync_cache(
         # stalling the lock under heavy-reader contention.
         _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
     finally:
+        if walk_marker_owed:
+            _withdraw_cache_meta_marker(conn, "claude_ingest_walk_complete")
+        # #901 §5.3c (W9): the end of a cache sync is a checkpoint boundary.
+        _wal_checkpoint.at_boundary(conn)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -6907,7 +7371,8 @@ def _write_codex_backlog_record(
     forward rather than re-stamped: re-minting it on every tick would keep the
     age below an hour forever and the WARN would never fire.
     """
-    _set_cache_meta(conn, _CODEX_BACKLOG_KEY, json.dumps({
+    # #901 §5.3c (W8): an unchanged backlog is not written again.
+    _set_cache_meta_if_changed(conn, _CODEX_BACKLOG_KEY, json.dumps({
         "files": int(files),
         "bytes": int(owed_bytes),
         "since": since or dt.datetime.now(dt.timezone.utc).isoformat(
@@ -7145,6 +7610,7 @@ def sync_codex_cache(
     quota_reconcile: str = "auto",
     _on_first_file_rollback: Callable[[], None] | None = None,
     _on_file_committed: Callable[[str], None] | None = None,
+    _on_file_prepared: Callable[[str], None] | None = None,
 ) -> CodexIngestStats:
     """Read-through delta ingest of ~/.codex/sessions/**/*.jsonl.
 
@@ -7216,6 +7682,13 @@ def sync_codex_cache(
 
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     held_writer_flocks: list[int] = []
+    # #901 §5.3c (W8): True while this call owes the full-walk marker a
+    # verdict. Settled inside the finalization transaction; every other exit
+    # withdraws a present marker in ``finally``, under the flocks.
+    walk_marker_owed = False
+    # True while the one finalization transaction is open: an exception then
+    # keeps its completed steps, as their per-step commits used to.
+    finalizing = False
     try:
         with _perf.phase("flock") as _p_flock:
             acquired = acquire_cache_writer_flocks(
@@ -7230,6 +7703,8 @@ def sync_codex_cache(
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
             return stats
+        # #901 §5.3c (W9): a sync writer owns its checkpoints.
+        _wal_checkpoint.arm(conn)
 
         # #294 S7 targeted (only_paths) live-tail fast path (§5.1). Mutually
         # exclusive with rebuild (matches the Claude rule). Targeted mode
@@ -7258,14 +7733,12 @@ def sync_codex_cache(
                 "sync_codex_cache: budget_seconds is incompatible with rebuild")
 
         # As on the Claude side, this sentinel describes the latest exhaustive
-        # pass.  Clear it before any full-pass decline or walk can occur, then
-        # restore it only after every file and maintenance leg certifies clean.
-        if not targeted:
-            conn.execute(
-                "DELETE FROM cache_meta WHERE key=?",
-                (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
-            )
-            conn.commit()
+        # pass: any full-pass decline, failed walk or exception withdraws it,
+        # and only a walk whose every file and maintenance leg certifies clean
+        # keeps it. #901 §5.3c (W8): the verdict is owed from here and settled
+        # at the exit instead of retiring the marker with a delete-and-commit
+        # here, which made every complete walk rewrite it.
+        walk_marker_owed = not targeted
 
         # A pending byte-zero replay is consumed HERE, not by the migration that
         # armed it, so the rebuild path below captures `rebuild_known_identities`
@@ -7559,35 +8032,17 @@ def sync_codex_cache(
             # with no on-disk JSONL to scope against; pruning it would wipe a
             # cache meant to be read as-is (issue #108).
             active_root_keys = {item.source_root_key for item in files}
-            orphan_sources, orphan_root_keys = _collect_inactive_codex_paths_and_roots(
-                conn, current_file_identities, active_root_keys,
-            )
             prune_scope = _codex_prune_scope(files)
             ordinary_prune_scope = prune_scope
-            (
-                safe_sources,
-                _refused_orphan_sources,
-                safe_root_keys,
-                _refused_orphan_root_keys,
-            ) = _partition_codex_prune_candidates(
-                prune_scope, orphan_sources, orphan_root_keys
+            # #901 Amendment 20 W1: one retained collection serves both the
+            # orphan partition and the protection partition.
+            prune_plan = _plan_ordinary_codex_prune(
+                conn, current_file_identities, active_root_keys, prune_scope,
             )
-            retained_sources, _retained_root_keys = (
-                _collect_retained_codex_paths_and_roots(conn)
-            )
-            retained_source_root_keys = {
-                root_key
-                for _path, root_key in retained_sources
-                if root_key is not None
-            }
-            (
-                _safe_retained_sources,
-                refused_sources,
-                _safe_retained_roots,
-                refused_root_keys,
-            ) = _partition_codex_prune_candidates(
-                prune_scope, retained_sources, retained_source_root_keys
-            )
+            safe_sources = prune_plan.safe_sources
+            safe_root_keys = prune_plan.safe_root_keys
+            refused_sources = prune_plan.refused_sources
+            refused_root_keys = prune_plan.refused_root_keys
             protected_paths = {path for path, _root in refused_sources}
             if safe_sources or safe_root_keys:
                 before_prune = conn.total_changes
@@ -7779,12 +8234,282 @@ def sync_codex_cache(
         # "first sight wins and the anchor never moves" across sync boundaries,
         # not just within one.
         anchor_resolver = CodexResetAnchorResolver(conn)
+        # #901 §5.3c (W11, Q14): every call without the hook's budget prepares
+        # its delta with no write transaction open and applies it in one
+        # transaction, each file in its own savepoint, at most
+        # CODEX_ACCOUNTING_BATCH_FILES files and CODEX_ACCOUNTING_BATCH_BYTES
+        # of new input per transaction; the last batch shares W8's
+        # finalization transaction and its one COMMIT. The budgeted (hook)
+        # path keeps today's per-file commits and continuation exactly.
+        w11 = deadline is None and _CODEX_W11_ENABLED
+        w11_eager = w11 and _CODEX_W11_EAGER_PREPARE_FOR_TESTS
+        w11_batch: "list[_CodexPreparedFile]" = []
+        # The applied files of the batch that rides the finalization
+        # transaction: published only after its COMMIT.
+        w11_deferred: "list[_CodexPreparedFile]" = []
+        # Attribution decisions this call journaled for a file it had to
+        # prepare again: the durable decision is reused, never re-decided.
+        w11_journaled: "dict[tuple[str, int], tuple[int, str | None]]" = {}
+        # Whole-transaction losses per file, so a persistent one ends.
+        w11_losses: "dict[str, int]" = {}
+        walk_queue = collections.deque(enumerate(walk))
+
+        def _w11_batch_bytes() -> int:
+            return sum(item.new_input for item in w11_batch)
+
+        def _w11_unfold(prepared: _CodexPreparedFile) -> None:
+            """Take a prepared file's parse counters back out of the stats."""
+            stats.lines_seen -= prepared.lines_seen
+            stats.lines_malformed -= prepared.lines_malformed
+            stats.token_events_skipped -= prepared.token_events_skipped
+            for reason, count in prepared.skip_reasons.items():
+                left = stats.skip_reasons.get(reason, 0) - count
+                if left > 0:
+                    stats.skip_reasons[reason] = left
+                else:
+                    stats.skip_reasons.pop(reason, None)
+
+        def _w11_publish(applied: "list[_CodexPreparedFile]") -> None:
+            """After a COMMIT: release the batch, then the publication
+            callbacks the per-file path ran after each file's commit."""
+            paths = [item.path_str for item in applied]
+            _codex_w11_trace("commit", paths)
+            _codex_w11_trace(
+                "release", paths, sum(item.new_input for item in applied))
+            _wal_checkpoint.after_commit(conn)
+            for item in applied:
+                if _on_file_committed is not None:
+                    _on_file_committed(item.path_str)
+            if applied and progress is not None:
+                progress(stats)
+
+        def _w11_apply(batch: "list[_CodexPreparedFile]", *,
+                       final: bool) -> "list[tuple[int, Any]]":
+            """Apply one prepared batch; return the walk entries to prepare
+            again. ``final`` leaves the transaction open for W8's
+            finalization unless a file failed."""
+            applied: "list[_CodexPreparedFile]" = []
+            requeue: "list[tuple[int, Any]]" = []
+            index = 0
+            first_attempt_failed = False
+            while index < len(batch):
+                prepared = batch[index]
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")
+                conn.execute(_CODEX_W11_FILE_SAVEPOINT)
+                anchor_resolver.restore_pending_merges(prepared.merges)
+                try:
+                    file_rows_changed = _write_codex_file_batch(
+                        conn, anchor_resolver=anchor_resolver, commit=False,
+                        **prepared.write_kwargs)
+                except sqlite3.DatabaseError as exc:
+                    if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                        raise
+                    if not conn.in_transaction:
+                        # SQLite ended the whole transaction on its own: every
+                        # file applied in it is undone. Prepare them all again,
+                        # as a crash before the commit would leave them; a file
+                        # that ends a transaction twice fails alone.
+                        losses = w11_losses.get(prepared.path_str, 0) + 1
+                        w11_losses[prepared.path_str] = losses
+                        # OV-2: files an earlier final apply deferred (the
+                        # eager seam only) were in this transaction too.
+                        undone = list(w11_deferred) + applied
+                        for item in undone:
+                            stats.rows_changed -= item.rows_changed
+                            stats.files_processed -= 1
+                            if item.reset_counted:
+                                stats.files_reset_truncated -= 1
+                            committed_state.pop(item.path_str, None)
+                        for item in w11_deferred:
+                            _w11_unfold(item)
+                            requeue.append((item.walk_index, item.discovered))
+                            _codex_w11_trace("prepare_drop", item.path_str)
+                        w11_deferred.clear()
+                        for item in batch:
+                            if item is prepared and losses >= 2:
+                                eprint(f"[codex-cache] db error on "
+                                       f"{prepared.discovered.source_path}: "
+                                       f"{exc}")
+                                stats.files_failed += 1
+                            else:
+                                _w11_unfold(item)
+                                requeue.append(
+                                    (item.walk_index, item.discovered))
+                            _codex_w11_trace("prepare_drop", item.path_str)
+                        anchor_resolver.discard_uncommitted_file()
+                        return requeue
+                    conn.execute(_CODEX_W11_FILE_ROLLBACK_TO)
+                    conn.execute(_CODEX_W11_FILE_RELEASE)
+                    if not first_attempt_failed:
+                        first_attempt_failed = True
+                        # Private test seam, as on the per-file path: after
+                        # the failed file rolled back, before its one retry.
+                        if _on_first_file_rollback is not None:
+                            _on_first_file_rollback()
+                        continue
+                    eprint(f"[codex-cache] db error on "
+                           f"{prepared.discovered.source_path}: {exc}")
+                    stats.files_failed += 1
+                    anchor_resolver.discard_uncommitted_file()
+                    _codex_w11_trace("prepare_drop", prepared.path_str)
+                    # The files prepared after it used its anchor evidence;
+                    # a per-file walk would have prepared them without it.
+                    for item in batch[index + 1:]:
+                        _w11_unfold(item)
+                        requeue.append((item.walk_index, item.discovered))
+                        _codex_w11_trace("prepare_drop", item.path_str)
+                    break
+                except BaseException:
+                    # Leave only whole files in the transaction.
+                    if conn.in_transaction:
+                        try:
+                            conn.execute(_CODEX_W11_FILE_ROLLBACK_TO)
+                            conn.execute(_CODEX_W11_FILE_RELEASE)
+                        except sqlite3.DatabaseError:
+                            pass
+                    raise
+                conn.execute(_CODEX_W11_FILE_RELEASE)
+                anchor_resolver.mark_file_committed()
+                first_attempt_failed = False
+                prepared.rows_changed = file_rows_changed
+                stats.rows_changed += file_rows_changed
+                if prepared.reset_counted:
+                    stats.files_reset_truncated += 1
+                stats.files_processed += 1
+                committed_state[prepared.path_str] = (
+                    prepared.scan_target, prepared.final_offset,
+                    not prepared.stopped_short)
+                if not rebuild:
+                    if prepared.accounting_rows:
+                        for _extreme in (
+                            min(_r[2] for _r in prepared.accounting_rows),
+                            max(_r[2] for _r in prepared.accounting_rows),
+                        ):
+                            _extend_codex_touched_span(
+                                adoption_spans,
+                                prepared.discovered.source_root_key,
+                                _parse_anchor_iso(_extreme))
+                    for _qrow in prepared.quota_rows:
+                        _extend_codex_touched_span(
+                            adoption_spans, _qrow[1],
+                            _parse_anchor_iso(_qrow[17]))
+                applied.append(prepared)
+                index += 1
+            if final and not requeue:
+                if applied and conn.in_transaction:
+                    conn.execute(_CODEX_W11_DEFERRED_SAVEPOINT)
+                w11_deferred.extend(applied)
+                return requeue
+            if conn.in_transaction:
+                _codex_batch_precommit()
+                conn.commit()
+            # OV-2: this commit also carried any files an earlier final apply
+            # deferred (the eager seam only); they are published with it.
+            committed_now = list(w11_deferred) + applied
+            w11_deferred.clear()
+            _w11_publish(committed_now)
+            return requeue
+
+        def _w11_confirm_deferred() -> "list[_CodexPreparedFile]":
+            """The last batch's files withdrawn because they are no longer in
+            the finalization transaction (901-QI-001); empty when they are.
+
+            A finalization step can lose the whole transaction to SQLite (the
+            parse-health write and the best-effort maintenance stages swallow
+            the error), and the next step then opens a new one. The deferred
+            files' rows and cursors are gone with it, so they are withdrawn
+            as a crash before the commit would leave them, exactly as
+            `_w11_apply` withdraws a batch whose transaction ended: no
+            statistics, no committed state, no publication and no certified
+            walk. Each one counts as a failed file, so no caller reads the
+            sync as clean (`targeted_clean`, the frontier's certificate); the
+            next sync ingests them again. Whatever the later steps wrote in the
+            new transaction is rolled back too: the caller runs the
+            finalization again without the withdrawn files (901-QI-002)."""
+            if not w11_deferred:
+                return []
+            try:
+                conn.execute(_CODEX_W11_DEFERRED_RELEASE)
+                return []
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    raise
+            if conn.in_transaction:
+                conn.rollback()
+            withdrawn = list(w11_deferred)
+            for item in withdrawn:
+                stats.rows_changed -= item.rows_changed
+                stats.files_processed -= 1
+                if item.reset_counted:
+                    stats.files_reset_truncated -= 1
+                committed_state.pop(item.path_str, None)
+                _w11_unfold(item)
+                eprint(f"[codex-cache] db error on "
+                       f"{item.discovered.source_path}: the finalization "
+                       "transaction was lost")
+                stats.files_failed += 1
+                _codex_w11_trace("prepare_drop", item.path_str)
+            w11_deferred.clear()
+            return withdrawn
+
+        def _w11_flush(*, final: bool) -> "list[tuple[int, Any]]":
+            """Apply the prepared batch (bounded slices under the eager seam)
+            and forget its prepared records."""
+            batch = list(w11_batch)
+            w11_batch.clear()
+            if not batch:
+                return []
+            if not w11_eager:
+                return _w11_apply(batch, final=final)
+            # The eager seam: every file was prepared before the first commit.
+            # It commits bounded slices but releases nothing until the last.
+            slices: "list[list[_CodexPreparedFile]]" = [[]]
+            for item in batch:
+                current = slices[-1]
+                if current and (
+                    len(current) >= CODEX_ACCOUNTING_BATCH_FILES
+                    or sum(x.new_input for x in current) + item.new_input
+                    > CODEX_ACCOUNTING_BATCH_BYTES
+                ):
+                    slices.append([])
+                slices[-1].append(item)
+            saved_trace = _CODEX_W11_TRACE
+            requeue: "list[tuple[int, Any]]" = []
+            for number, chunk in enumerate(slices):
+                last = number == len(slices) - 1
+                globals()["_CODEX_W11_TRACE"] = None
+                try:
+                    requeue += _w11_apply(chunk, final=final and last)
+                finally:
+                    globals()["_CODEX_W11_TRACE"] = saved_trace
+                if not (final and last):
+                    _codex_w11_trace("commit", [x.path_str for x in chunk])
+            if not final:
+                _codex_w11_trace(
+                    "release", [x.path_str for x in batch],
+                    sum(x.new_input for x in batch))
+            return requeue
+
+        def _walk_items():
+            """The walk, refillable: a W11 batch that has to prepare files
+            again puts them back in walk order."""
+            while True:
+                while walk_queue:
+                    yield walk_queue.popleft()
+                if not (w11 and w11_batch):
+                    return
+                requeue = _w11_flush(final=True)
+                if not requeue:
+                    return
+                walk_queue.extend(requeue)
+
         # #279 S2 F4: ONE coarse `walk` phase bracketing the per-file loop
         # (count = files_processed, never per-row — §2 rule). Manual CM so
         # the loop stays flat, mirroring sync_cache's walk seam.
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
-        for _walk_index, discovered in enumerate(walk):
+        for _walk_index, discovered in _walk_items():
             # The budget is checked BEFORE a file is opened, so a tick either
             # commits a file whole (or to a recorded partial offset) or does not
             # touch it at all.
@@ -7935,6 +8660,24 @@ def sync_codex_cache(
                     initial_total_tokens = 0
                     prev_total_tokens = None
 
+            # #901 §5.3c (W11): a file's new input is known before it is read.
+            # Preparation stops before the file that would take the batch past
+            # either bound; that batch is applied and committed, and
+            # preparation resumes with this file. A file whose own new input
+            # exceeds the byte bound becomes a batch of its own.
+            new_input = max(0, int(scan_target) - int(start_offset))
+            if w11 and not w11_eager and w11_batch and (
+                len(w11_batch) >= CODEX_ACCOUNTING_BATCH_FILES
+                or _w11_batch_bytes() + new_input
+                > CODEX_ACCOUNTING_BATCH_BYTES
+            ):
+                requeue = _w11_flush(final=False)
+                walk_queue.extendleft(
+                    reversed(requeue + [(_walk_index, discovered)]))
+                continue
+            if w11:
+                _codex_w11_trace("prepare_start", path_str, new_input)
+
             # #416 spec §3: attribution is DECIDED ONCE at first ingest of a byte
             # range, journaled durably, and thereafter only REPLAYED. The live
             # auth.json is an input to that decision, never a source consulted
@@ -7954,6 +8697,17 @@ def sync_codex_cache(
             )
             account_ranges = load_codex_file_account_ranges(
                 conn, file_identity, incarnation)
+            # W11: a decision this call already journaled for a file it is
+            # preparing again (its batch had to be redone) is durable truth
+            # that cache.db does not hold yet: replay it, never re-decide.
+            memo_decision = (
+                w11_journaled.get((file_identity, incarnation)) if w11
+                else None)
+            if memo_decision is not None and memo_decision in account_ranges:
+                memo_decision = None
+            if memo_decision is not None:
+                account_ranges = sorted(
+                    account_ranges + [memo_decision], key=lambda r: r[0])
             covered, decided_key = codex_account_for_offset(
                 account_ranges, start_offset)
             pending_decision: "tuple[int, str | None] | None" = None
@@ -8006,6 +8760,8 @@ def sync_codex_cache(
                         stats.files_deferred_torn += 1
                         if targeted:
                             stats.files_failed += 1
+                        if w11:
+                            _codex_w11_trace("prepare_drop", path_str)
                         continue
                     if root_account.account_key != decided_key:
                         file_account_key = root_account.account_key
@@ -8053,6 +8809,8 @@ def sync_codex_cache(
                     stats.files_deferred_torn += 1
                     if targeted:
                         stats.files_failed += 1  # §5.1 deferred → call dirty
+                    if w11:
+                        _codex_w11_trace("prepare_drop", path_str)
                     continue
                 file_account_key = root_account.account_key
                 pending_decision = (start_offset, file_account_key)
@@ -8248,6 +9006,13 @@ def sync_codex_cache(
                         stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
+                if w11:
+                    _codex_w11_trace("prepare_drop", path_str)
+                    if w11_batch:
+                        # A per-file walk re-seeds the resolver from rows that
+                        # include every earlier file, so apply them first.
+                        walk_queue.extendleft(
+                            reversed(_w11_flush(final=False)))
                 anchor_resolver.discard_uncommitted_file()
                 stats.files_failed += 1
                 continue
@@ -8305,7 +9070,11 @@ def sync_codex_cache(
             # CLOSED. If the append cannot be made durable, the file is deferred
             # with zero mutations — a committed batch behind a lost decision
             # would be permanently un-replayable.
-            if pending_decision is not None:
+            decision_journaled = False
+            if pending_decision is None and memo_decision is not None:
+                pending_decision = memo_decision
+                decision_journaled = True
+            if pending_decision is not None and not decision_journaled:
                 decision_offset, decision_key = pending_decision
                 try:
                     _append_codex_file_account_decision(
@@ -8321,9 +9090,17 @@ def sync_codex_cache(
                     eprint(
                         f"[codex-cache] attribution decision journal append "
                         f"failed for {jp}: {exc}; deferring the file")
+                    if w11:
+                        _codex_w11_trace("prepare_drop", path_str)
+                        if w11_batch:
+                            walk_queue.extendleft(
+                                reversed(_w11_flush(final=False)))
                     stats.files_failed += 1
                     anchor_resolver.discard_uncommitted_file()
                     continue
+                if w11:
+                    w11_journaled[(file_identity, incarnation)] = (
+                        pending_decision)
 
             # Task 7 Item 1: journal the Codex quota observations BEFORE the cache
             # write (and before the offset advances), under the codex flock this
@@ -8335,6 +9112,65 @@ def sync_codex_cache(
             anchor_resolver.normalize_quota_rows(quota_rows)
             _append_codex_quota_obs(quota_rows)
 
+            if w11:
+                # W11: the file is prepared. Its rows wait for its batch;
+                # nothing is written while later files are read.
+                w11_batch.append(_CodexPreparedFile(
+                    walk_index=_walk_index,
+                    discovered=discovered,
+                    path_str=path_str,
+                    new_input=new_input,
+                    write_kwargs=dict(
+                        discovered=discovered,
+                        path_str=path_str,
+                        size=scan_target,
+                        mtime_ns=mtime_ns,
+                        final_offset=final_offset,
+                        last_session_id=new_last_session_id,
+                        last_model=new_last_model,
+                        last_total_tokens=new_last_total_tokens,
+                        last_native_thread_id=new_last_native_thread_id,
+                        last_root_thread_id=new_last_root_thread_id,
+                        last_parent_thread_id=new_last_parent_thread_id,
+                        last_conversation_key=new_last_conversation_key,
+                        last_turn_id=new_last_turn_id,
+                        reset_file=truncated or requalified,
+                        accounting_rows=accounting_rows,
+                        quota_rows=quota_rows,
+                        thread_rows=thread_rows,
+                        active_root_keys={
+                            item.source_root_key for item in files},
+                        prune_roots=not targeted,
+                        account_key=file_account_key,
+                        file_identity=file_identity,
+                        incarnation=incarnation,
+                        file_account_decision=pending_decision,
+                        ingest_complete=not stopped_short["value"],
+                        device_id=st.st_dev,
+                        inode=st.st_ino,
+                    ),
+                    merges=anchor_resolver.take_pending_merges(),
+                    reset_counted=bool(truncated or requalified),
+                    scan_target=scan_target,
+                    final_offset=final_offset,
+                    stopped_short=bool(stopped_short["value"]),
+                    accounting_rows=accounting_rows,
+                    quota_rows=quota_rows,
+                    lines_seen=iter_state.lines_seen,
+                    lines_malformed=iter_state.lines_malformed,
+                    token_events_skipped=iter_state.token_events_skipped,
+                    skip_reasons=dict(iter_state.skip_reasons),
+                ))
+                _codex_w11_trace("prepare_end", path_str, new_input)
+                # Private test seam: after a file is prepared and before the
+                # next file's preparation, which under W11 is where a later
+                # target's turn begins (its commit comes with its batch's).
+                if _on_file_prepared is not None:
+                    _on_file_prepared(path_str)
+                continue
+
+            if _on_file_prepared is not None:
+                _on_file_prepared(path_str)
             # Every derived row above was buffered before the first DML. A
             # late database failure therefore rolls the whole file back and
             # retries that same in-memory batch exactly once.
@@ -8413,6 +9249,8 @@ def sync_codex_cache(
                 anchor_resolver.discard_uncommitted_file()
                 continue
             anchor_resolver.mark_file_committed()
+            # #901 §5.3c (W9): the size trigger is evaluated after each commit.
+            _wal_checkpoint.after_commit(conn)
             committed_state[path_str] = (
                 scan_target, final_offset, not stopped_short["value"])
             if stopped_short["value"]:
@@ -8446,7 +9284,7 @@ def sync_codex_cache(
             if progress is not None:
                 progress(stats)
 
-        if progress is not None:
+        if progress is not None and not w11:
             progress(stats)
         _p_walk.__exit__(None, None, None)
         # public #5: did this walk actually reach every discovered file? The
@@ -8473,242 +9311,275 @@ def sync_codex_cache(
         # Runs for every whole-tree sync, budgeted or not: an explicit
         # `cache-sync` completes the walk and must therefore CLEAR the backlog
         # it just drained, or doctor and the dashboard would keep reporting it.
-        if not targeted:
-            # Two different questions. The CURSOR asks "where does the next
-            # tick resume", which is where the overall deadline landed:
-            # `partial_file` (the last stop-short) if there is one, else the
-            # first file the walk never opened. The BACKLOG asks "what is still
-            # owed", which is every stop-short plus everything unwalked.
-            cursor_head = (
-                partial_file if partial_file is not None
-                else (unwalked[0] if unwalked else None))
-            backlog_files, backlog_bytes = _codex_backlog_after(
-                partial_files + unwalked, existing, committed_state)
-            stats.backlog_files = backlog_files
-            stats.backlog_bytes = backlog_bytes
-            if cursor_head is not None:
-                head = cursor_head
-                ordinal = 0
-                head_key = _codex_walk_key(head)
-                for index, item in enumerate(files):
-                    # Qualified by root, exactly like the cursor it records: two
-                    # configured roots can resolve to the same canonical path,
-                    # and matching on the path alone would then store the wrong
-                    # ordinal for the fallback.
-                    if _codex_walk_key(item) == head_key:
-                        ordinal = index
-                        break
-                _set_cache_meta(conn, _CODEX_RESUME_CURSOR_KEY, json.dumps({
-                    "root_key": head.source_root_key,
-                    "path": str(head.physical_path),
-                    "ordinal": ordinal,
-                }, sort_keys=True))
-            else:
-                # A complete cycle: the next tick starts at the top again.
-                conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                             (_CODEX_RESUME_CURSOR_KEY,))
-            if backlog_files:
-                prior = _load_codex_backlog_record(conn)
-                _write_codex_backlog_record(
-                    conn, files=backlog_files, owed_bytes=backlog_bytes,
-                    since=None if prior is None else prior.get("since"))
-            else:
-                conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                             (_CODEX_BACKLOG_KEY,))
-            conn.commit()
-        # #279 S2 F1: rolling parse-health record (codex half). Same
-        # anomaly-delta gate as the Claude tail; the global writer flock
-        # excludes a concurrent Claude sync.
-        _update_parse_health_meta(
-            conn, "parse_health_codex",
-            lines_seen=stats.lines_seen,
-            lines_malformed=stats.lines_malformed,
-            lines_skipped=stats.token_events_skipped,
-            skip_reasons=stats.skip_reasons,
-            rebuild=rebuild,
-        )
-        # #416 fix-round review B4: make a persistently torn `auth.json`
-        # VISIBLE. The defer itself is correct (spec §3.6 stable-read protocol
-        # — never guess an account), but since a growing DECIDED file also
-        # consults auth.json, a truncated/half-written auth.json now halts every
-        # rollout under that root, not just the never-decided ones. `cache-sync`
-        # still exits 0, so without a durable record the operator sees Codex
-        # spend and quota silently freeze. This marker is what `doctor` reads.
         #
-        # Whole-tree syncs only: a targeted (`only_paths`) call looks at a
-        # handful of files, so its zero deferral count says nothing about the
-        # rest of the tree and must never clear the marker.
-        #
-        # NOT R8-gated. This is a health signal, not account decoration — it
-        # names no account and adds no per-account column, the same carve-out
-        # `alerts.log`'s runtime state has (docs/accounts-gotchas.md).
-        #
-        # Clearing it requires a walk that actually reached every file
-        # (`walk_complete`). A budgeted walk that stopped before the torn file
-        # defers nothing and would otherwise clear a marker describing a real,
-        # ongoing condition — `doctor` would stop reporting the frozen login
-        # while every rollout under that root stayed stalled.
-        if not targeted:
-            if stats.files_deferred_torn:
-                _set_cache_meta(conn, "codex_torn_auth_deferred", json.dumps({
-                    "files": stats.files_deferred_torn,
-                    "at": dt.datetime.now(dt.timezone.utc).isoformat(
-                        timespec="seconds").replace("+00:00", "Z"),
-                }, sort_keys=True))
-            elif walk_complete:
-                conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                             ("codex_torn_auth_deferred",))
-            # Consume the byte-zero replay marker only after a clean full walk,
-            # and only when THIS call observed it. A contended call returned
-            # long before here, and a walk that failed or deferred a file leaves
-            # the marker standing — a surviving marker is what makes the repair
-            # retry on the next sync, and it is also what keeps
-            # `sync_codex_conversations` deferred until the cache side genuinely
-            # holds the replayed thread rows (§4.2). The `replay_pending` guard
-            # is defense in depth: `open_cache_db` and this walk share an
-            # exclusive lock today, so nothing can arm the marker in between —
-            # but the conversations side has no such exclusion, and the two
-            # clears must keep the same shape.
-            #
-            # `walk_complete` is the third term for the same reason the torn
-            # marker needs it: a budget-truncated walk fails nothing and defers
-            # nothing, so the zero-count condition alone would consume a marker
-            # (and erase a blocked record) on a walk that reached almost no
-            # file. It is defense in depth today — a budgeted tick declines a
-            # pending replay outright above — but the two clears must keep the
-            # same shape.
-            if (
-                walk_complete
-                and stats.files_failed == 0
-                and stats.files_deferred_torn == 0
-            ):
-                recovery_scope = rebuild_prune_scope or ordinary_prune_scope
-                if (
-                    recovery_scope is not None
-                    and recovery_scope.recognized_root_keys
-                    and not stats.prune_refused
-                    and (
-                        stats.files_processed + stats.files_skipped_unchanged
-                        == stats.files_total
-                    )
-                ):
-                    _clear_codex_prune_refusal(conn)
-                if replay_pending:
+        # #901 §5.3c (W8): from here to the completion marker is ONE
+        # finalization transaction, committed once at the end: the resume and
+        # backlog state, parse health, the torn/replay/prune-refusal markers,
+        # the ordered maintenance stages (each in its own savepoint, keeping its
+        # recoverable-failure behaviour) and the completion marker. A value that
+        # is already stored is not written again. Success notes are printed
+        # only after that commit.
+        finalization_notes: list[str] = []
+        finalizing = True
+
+        def _finalization_steps(
+            walk_complete: bool,
+            withdrawn: "list[_CodexPreparedFile]",
+        ) -> None:
+            """The finalization steps up to the completion marker. Run
+            once, and again without the last batch when it was withdrawn
+            (901-QI-002): ``withdrawn`` files are owed, and a walk that
+            withdrew files is not complete."""
+            if not targeted:
+                _open_codex_finalization_step(conn)
+                # Two different questions. The CURSOR asks "where does the next
+                # tick resume", which is where the overall deadline landed:
+                # `partial_file` (the last stop-short) if there is one, else the
+                # first file the walk never opened. The BACKLOG asks "what is still
+                # owed", which is every stop-short plus everything unwalked.
+                cursor_head = (
+                    partial_file if partial_file is not None
+                    else (unwalked[0] if unwalked else None))
+                backlog_files, backlog_bytes = _codex_backlog_after(
+                    partial_files + unwalked
+                    + [item.discovered for item in withdrawn],
+                    existing, committed_state)
+                stats.backlog_files = backlog_files
+                stats.backlog_bytes = backlog_bytes
+                if cursor_head is not None:
+                    head = cursor_head
+                    ordinal = 0
+                    head_key = _codex_walk_key(head)
+                    for index, item in enumerate(files):
+                        # Qualified by root, exactly like the cursor it records: two
+                        # configured roots can resolve to the same canonical path,
+                        # and matching on the path alone would then store the wrong
+                        # ordinal for the fallback.
+                        if _codex_walk_key(item) == head_key:
+                            ordinal = index
+                            break
+                    _set_cache_meta_if_changed(
+                        conn, _CODEX_RESUME_CURSOR_KEY, json.dumps({
+                            "root_key": head.source_root_key,
+                            "path": str(head.physical_path),
+                            "ordinal": ordinal,
+                        }, sort_keys=True))
+                else:
+                    # A complete cycle: the next tick starts at the top again.
                     conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                                 (CODEX_REPLAY_FROM_ZERO_KEY,))
-                conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                             (CODEX_REPLAY_BLOCKED_KEY,))
-                # The budgeted-decline record is cleared by the same walk, for
-                # the same reason: an unbudgeted walk reaching here is exactly
-                # the caller whose absence the record was reporting.
-                conn.execute("DELETE FROM cache_meta WHERE key = ?",
-                             (CODEX_REPLAY_DEFERRED_KEY,))
-            elif replay_pending and walk_complete:
-                # A full walk ran and could NOT consume the marker, so the
-                # replay — and with it every Codex transcript ingest, which
-                # defers behind this marker — is stalled rather than merely
-                # not-yet-run. `doctor` reads this; the deferral itself stays,
-                # because running ahead is what stamps "(unassigned)" (§4.2).
-                _set_cache_meta(conn, CODEX_REPLAY_BLOCKED_KEY, json.dumps({
-                    "at": dt.datetime.now(dt.timezone.utc).isoformat(
-                        timespec="seconds").replace("+00:00", "Z"),
-                    "files_failed": stats.files_failed,
-                    "files_deferred_torn": stats.files_deferred_torn,
-                }, sort_keys=True))
-            conn.commit()
-        # Public #5: resolve any still-unstamped `quota_window_snapshots.
-        # observed_model` from the accounting corpus, using the exact expression
-        # the read path used before the fallback was removed. Cache migration
-        # 039 is the one-time leg; this is the standing one, because `db skip
-        # 039_…` and a fresh journal-repopulated cache both bypass the migration
-        # and would then classify a Spark window as account weekly quota (#373).
-        # Ordered BEFORE the spend adoption below, which reads the model to
-        # decide `model_scoped` and must not see a stale NULL. A row it changes
-        # is real interpretation drift, so the physical mutation sequence
-        # advances with it — otherwise the projection certificate would still
-        # read as current and the reconcile would short-circuit past the ledger
-        # entries the triggers just wrote. Best-effort, like the adoption below:
-        # the resolution is fully re-derivable on the next sync.
-        try:
-            with _perf.phase("accounting"):
-                resolved_models = _cctally_db_sib.backfill_codex_quota_observed_model(
-                    conn)
-            if resolved_models:
-                _bump_codex_physical_mutation_seq(conn)
-            conn.commit()
-        except sqlite3.DatabaseError as exc:
-            conn.rollback()
-            if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                raise
-            stats.maintenance_failed = True
-            eprint("[cache-sync] could not resolve Codex quota model "
-                   f"attribution: {exc}")
-        # Window-scoped spend adoption (spec
-        # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
-        # Runs AFTER the walk committed and while both cache writer flocks are
-        # still held, so the observation evidence and the accounting rows it
-        # stamps are the same committed generation. Cache-only — no stats.db read
-        # — so the lock-order law is untouched. A failure here is never fatal:
-        # the stamp is fully re-derivable, so the next sync (or the migration)
-        # repeats it.
-        try:
-            with _perf.phase("accounting"):
-                adopted = apply_codex_window_spend_adoption(
-                    conn, touched=None if rebuild else adoption_spans)
-            conn.commit()
-            # Terse, and silent on zero: a rebuild re-derives every row and so
-            # legitimately re-stamps the same population each time, which would
-            # otherwise read as a recurring anomaly rather than convergence.
-            if adopted:
-                eprint(f"[cache-sync] attributed {adopted} Codex row(s) "
-                       "from quota windows")
-        except sqlite3.DatabaseError as exc:
-            conn.rollback()
-            if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                # Classified family corruption belongs to the shared recovery
-                # boundary, never to a best-effort local except.
-                raise
-            stats.maintenance_failed = True
-            eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
-        # #500 §7.1: the STANDING half of operator attribution. The condition it
-        # repairs is created by ordinary ingest, not only by an operator command
-        # — native evidence arriving for an attributed group, a second assertion,
-        # a component split, a window re-materializing as model-scoped — so it
-        # has to run wherever ingest runs, not only where `account attribute`
-        # does. Ordered AFTER the pass above so the reconciliation has the last
-        # word on any row that pass could also have touched, and inside the same
-        # flocks for the same reason: the observation evidence and the accounting
-        # rows it restores are one committed generation. Costs a store with no
-        # attribution records one indexed read; best-effort, like the pass above.
-        try:
-            with _perf.phase("accounting"):
-                restored, readopted = reconcile_codex_window_attribution_spend(conn)
-            conn.commit()
-            if restored:
-                eprint(f"[cache-sync] restored {restored} Codex row(s) whose "
-                       "operator attribution no longer resolves; "
-                       f"re-attributed {readopted}")
-        except sqlite3.DatabaseError as exc:
-            conn.rollback()
-            if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                raise
-            stats.maintenance_failed = True
-            eprint("[cache-sync] could not reconcile Codex window "
-                   f"attribution spend: {exc}")
-        # #582: keep only a generous mutation-sequence tail. A dashboard that
-        # falls behind it detects the gap and cold-loads, preserving truth.
-        if _prune_codex_accounting_change_log(conn):
-            conn.commit()
-        # Codex creates/extends cache.db sidecars independently of Claude's
-        # sync path. Harden them while both cache flocks are still held and
-        # after all Codex writes, before the optional checkpoint can rotate a
-        # WAL.
-        _harden_cache_sidecars()
-        # #297/#344: forced end-of-sync WAL drain (Codex half). The global
-        # writer flock excludes every Claude write/checkpoint until this
-        # checkpoint finishes. All Codex ingest work is committed here (no
-        # active transaction).
-        _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
+                                 (_CODEX_RESUME_CURSOR_KEY,))
+                if backlog_files:
+                    prior = _load_codex_backlog_record(conn)
+                    _write_codex_backlog_record(
+                        conn, files=backlog_files, owed_bytes=backlog_bytes,
+                        since=None if prior is None else prior.get("since"))
+                else:
+                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                 (_CODEX_BACKLOG_KEY,))
+                conn.execute(_CODEX_FINALIZATION_RELEASE)
+            # #279 S2 F1: rolling parse-health record (codex half). Same
+            # anomaly-delta gate as the Claude tail; the global writer flock
+            # excludes a concurrent Claude sync.
+            _update_parse_health_meta(
+                conn, "parse_health_codex",
+                lines_seen=stats.lines_seen,
+                lines_malformed=stats.lines_malformed,
+                lines_skipped=stats.token_events_skipped,
+                skip_reasons=stats.skip_reasons,
+                rebuild=rebuild,
+                commit=False,
+            )
+            # #416 fix-round review B4: make a persistently torn `auth.json`
+            # VISIBLE. The defer itself is correct (spec §3.6 stable-read protocol
+            # — never guess an account), but since a growing DECIDED file also
+            # consults auth.json, a truncated/half-written auth.json now halts every
+            # rollout under that root, not just the never-decided ones. `cache-sync`
+            # still exits 0, so without a durable record the operator sees Codex
+            # spend and quota silently freeze. This marker is what `doctor` reads.
+            #
+            # Whole-tree syncs only: a targeted (`only_paths`) call looks at a
+            # handful of files, so its zero deferral count says nothing about the
+            # rest of the tree and must never clear the marker.
+            #
+            # NOT R8-gated. This is a health signal, not account decoration — it
+            # names no account and adds no per-account column, the same carve-out
+            # `alerts.log`'s runtime state has (docs/accounts-gotchas.md).
+            #
+            # Clearing it requires a walk that actually reached every file
+            # (`walk_complete`). A budgeted walk that stopped before the torn file
+            # defers nothing and would otherwise clear a marker describing a real,
+            # ongoing condition — `doctor` would stop reporting the frozen login
+            # while every rollout under that root stayed stalled.
+            if not targeted:
+                _open_codex_finalization_step(conn)
+                if stats.files_deferred_torn:
+                    _set_cache_meta(conn, "codex_torn_auth_deferred", json.dumps({
+                        "files": stats.files_deferred_torn,
+                        "at": dt.datetime.now(dt.timezone.utc).isoformat(
+                            timespec="seconds").replace("+00:00", "Z"),
+                    }, sort_keys=True))
+                elif walk_complete:
+                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                 ("codex_torn_auth_deferred",))
+                # Consume the byte-zero replay marker only after a clean full walk,
+                # and only when THIS call observed it. A contended call returned
+                # long before here, and a walk that failed or deferred a file leaves
+                # the marker standing — a surviving marker is what makes the repair
+                # retry on the next sync, and it is also what keeps
+                # `sync_codex_conversations` deferred until the cache side genuinely
+                # holds the replayed thread rows (§4.2). The `replay_pending` guard
+                # is defense in depth: `open_cache_db` and this walk share an
+                # exclusive lock today, so nothing can arm the marker in between —
+                # but the conversations side has no such exclusion, and the two
+                # clears must keep the same shape.
+                #
+                # `walk_complete` is the third term for the same reason the torn
+                # marker needs it: a budget-truncated walk fails nothing and defers
+                # nothing, so the zero-count condition alone would consume a marker
+                # (and erase a blocked record) on a walk that reached almost no
+                # file. It is defense in depth today — a budgeted tick declines a
+                # pending replay outright above — but the two clears must keep the
+                # same shape.
+                if (
+                    walk_complete
+                    and stats.files_failed == 0
+                    and stats.files_deferred_torn == 0
+                ):
+                    recovery_scope = rebuild_prune_scope or ordinary_prune_scope
+                    if (
+                        recovery_scope is not None
+                        and recovery_scope.recognized_root_keys
+                        and not stats.prune_refused
+                        and (
+                            stats.files_processed + stats.files_skipped_unchanged
+                            == stats.files_total
+                        )
+                    ):
+                        _clear_codex_prune_refusal(conn)
+                    if replay_pending:
+                        conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                     (CODEX_REPLAY_FROM_ZERO_KEY,))
+                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                 (CODEX_REPLAY_BLOCKED_KEY,))
+                    # The budgeted-decline record is cleared by the same walk, for
+                    # the same reason: an unbudgeted walk reaching here is exactly
+                    # the caller whose absence the record was reporting.
+                    conn.execute("DELETE FROM cache_meta WHERE key = ?",
+                                 (CODEX_REPLAY_DEFERRED_KEY,))
+                elif replay_pending and walk_complete:
+                    # A full walk ran and could NOT consume the marker, so the
+                    # replay — and with it every Codex transcript ingest, which
+                    # defers behind this marker — is stalled rather than merely
+                    # not-yet-run. `doctor` reads this; the deferral itself stays,
+                    # because running ahead is what stamps "(unassigned)" (§4.2).
+                    _set_cache_meta(conn, CODEX_REPLAY_BLOCKED_KEY, json.dumps({
+                        "at": dt.datetime.now(dt.timezone.utc).isoformat(
+                            timespec="seconds").replace("+00:00", "Z"),
+                        "files_failed": stats.files_failed,
+                        "files_deferred_torn": stats.files_deferred_torn,
+                    }, sort_keys=True))
+                conn.execute(_CODEX_FINALIZATION_RELEASE)
+            # Public #5: resolve any still-unstamped `quota_window_snapshots.
+            # observed_model` from the accounting corpus, using the exact expression
+            # the read path used before the fallback was removed. Cache migration
+            # 039 is the one-time leg; this is the standing one, because `db skip
+            # 039_…` and a fresh journal-repopulated cache both bypass the migration
+            # and would then classify a Spark window as account weekly quota (#373).
+            # Ordered BEFORE the spend adoption below, which reads the model to
+            # decide `model_scoped` and must not see a stale NULL. A row it changes
+            # is real interpretation drift, so the physical mutation sequence
+            # advances with it — otherwise the projection certificate would still
+            # read as current and the reconcile would short-circuit past the ledger
+            # entries the triggers just wrote. Best-effort, like the adoption below:
+            # the resolution is fully re-derivable on the next sync.
+            try:
+                with _codex_finalization_stage(conn):
+                    with _perf.phase("accounting"):
+                        resolved_models = (
+                            _cctally_db_sib.backfill_codex_quota_observed_model(conn))
+                    if resolved_models:
+                        _bump_codex_physical_mutation_seq(conn)
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    raise
+                stats.maintenance_failed = True
+                eprint("[cache-sync] could not resolve Codex quota model "
+                       f"attribution: {exc}")
+            # Window-scoped spend adoption (spec
+            # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
+            # Runs AFTER the walk committed and while both cache writer flocks are
+            # still held, so the observation evidence and the accounting rows it
+            # stamps are the same committed generation. Cache-only — no stats.db read
+            # — so the lock-order law is untouched. A failure here is never fatal:
+            # the stamp is fully re-derivable, so the next sync (or the migration)
+            # repeats it.
+            try:
+                with _codex_finalization_stage(conn):
+                    with _perf.phase("accounting"):
+                        adopted = apply_codex_window_spend_adoption(
+                            conn, touched=None if rebuild else adoption_spans)
+                # Terse, and silent on zero: a rebuild re-derives every row and so
+                # legitimately re-stamps the same population each time, which would
+                # otherwise read as a recurring anomaly rather than convergence.
+                if adopted:
+                    finalization_notes.append(
+                        f"[cache-sync] attributed {adopted} Codex row(s) "
+                        "from quota windows")
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    # Classified family corruption belongs to the shared recovery
+                    # boundary, never to a best-effort local except.
+                    raise
+                stats.maintenance_failed = True
+                eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
+            # #500 §7.1: the STANDING half of operator attribution. The condition it
+            # repairs is created by ordinary ingest, not only by an operator command
+            # — native evidence arriving for an attributed group, a second assertion,
+            # a component split, a window re-materializing as model-scoped — so it
+            # has to run wherever ingest runs, not only where `account attribute`
+            # does. Ordered AFTER the pass above so the reconciliation has the last
+            # word on any row that pass could also have touched, and inside the same
+            # flocks for the same reason: the observation evidence and the accounting
+            # rows it restores are one committed generation. Costs a store with no
+            # attribution records one indexed read; best-effort, like the pass above.
+            try:
+                with _codex_finalization_stage(conn):
+                    with _perf.phase("accounting"):
+                        restored, readopted = (
+                            reconcile_codex_window_attribution_spend(conn))
+                if restored:
+                    finalization_notes.append(
+                        f"[cache-sync] restored {restored} Codex row(s) whose "
+                        "operator attribution no longer resolves; "
+                        f"re-attributed {readopted}")
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    raise
+                stats.maintenance_failed = True
+                eprint("[cache-sync] could not reconcile Codex window "
+                       f"attribution spend: {exc}")
+            # #582: keep only a generous mutation-sequence tail. A dashboard that
+            # falls behind it detects the gap and cold-loads, preserving truth.
+            # A failure here propagates exactly as before, with the finalization
+            # so far committed (``finalizing`` in ``finally``), as it was when
+            # every earlier step committed alone.
+            with _codex_finalization_stage(conn):
+                _prune_codex_accounting_change_log(conn)
+        _finalization_steps(walk_complete, [])
+        # 901-QI-001: before anything is decided or certified from them, the
+        # last batch's files must still be in this transaction.
+        w11_withdrawn = _w11_confirm_deferred() if w11 else []
+        w11_lost = bool(w11_withdrawn)
+        if w11_lost:
+            # 901-QI-002: the withdrawal rolled back the finalization owed by
+            # the batches that did commit, among it the window spend adoption
+            # over their spans, which the next sync would never revisit. Run
+            # it again without the withdrawn files: they count as backlog,
+            # and an incomplete walk clears and consumes no marker. Notes and
+            # failures from the undone pass go with it (OV-3).
+            stats.maintenance_failed = False
+            finalization_notes.clear()
+            _finalization_steps(False, w11_withdrawn)
         # Projection intentionally runs only after this function releases the
         # Codex cache flock in ``finally`` below.  cache.db and stats.db are not
         # cross-database atomic: after this committed ingest, a projection
@@ -8780,18 +9651,75 @@ def sync_codex_cache(
             and stats.files_deferred_torn == 0
             and not stats.prune_refused
             and not stats.maintenance_failed
+            and not w11_lost
             and (
                 stats.files_processed + stats.files_skipped_unchanged
                 == stats.files_total
             )
         )
-        if stats.full_walk_complete:
-            conn.execute(
-                "INSERT OR IGNORE INTO cache_meta(key,value) VALUES(?, '1')",
-                (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
-            )
+        if not targeted:
+            with _codex_finalization_stage(conn):
+                if stats.full_walk_complete:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO cache_meta(key,value) "
+                        "VALUES(?, '1')",
+                        (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM cache_meta WHERE key=?",
+                        (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
+                    )
+        # #901 §5.3c (W8): the one commit of the finalization transaction:
+        # resume and backlog state, parse health, the walk's markers, the
+        # ordered maintenance stages and the completion marker — and, under
+        # W11, the last batch's files.
+        if conn.in_transaction:
+            if w11 and w11_deferred:
+                _codex_batch_precommit()
             conn.commit()
+        finalizing = False
+        if w11:
+            # Publication follows the commit it describes.
+            _w11_publish(w11_deferred)
+            w11_deferred.clear()
+            if progress is not None:
+                progress(stats)
+        walk_marker_owed = False
+        for note in finalization_notes:
+            eprint(note)
+        # Codex creates/extends cache.db sidecars independently of Claude's
+        # sync path. Harden them while both cache flocks are still held and
+        # after all Codex writes, before the optional checkpoint can rotate a
+        # WAL.
+        _harden_cache_sidecars()
+        # #297/#344: forced end-of-sync WAL drain (Codex half). The global
+        # writer flock excludes every Claude write/checkpoint until this
+        # checkpoint finishes. All Codex ingest work is committed here (no
+        # active transaction).
+        _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
     finally:
+        if finalizing:
+            _commit_codex_finalization_so_far(conn)
+        elif conn.in_transaction:
+            # #901 Amendment 19 PR-5: an exception outside the finalization —
+            # a W11 batch that raised, SQLite corruption included — leaves
+            # only uncommitted partial work, which is undone as a crash would
+            # undo it, before the writer flocks are released. A whole-tree walk
+            # did this in `_withdraw_cache_meta_marker`; a targeted
+            # (`only_paths`) call owes no marker and left the batch open on the
+            # caller's connection. Best effort: the exception propagating is
+            # the one that matters.
+            try:
+                conn.rollback()
+            except sqlite3.DatabaseError:
+                pass
+        if walk_marker_owed:
+            _withdraw_cache_meta_marker(
+                conn, _ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY)
+        if held_writer_flocks:
+            # #901 §5.3c (W9): the end of a cache sync is a boundary.
+            _wal_checkpoint.at_boundary(conn)
         release_cache_writer_flocks(held_writer_flocks)
 
     if deferred_cert_roots is not None:
@@ -9620,6 +10548,44 @@ def _harden_cache_sidecars() -> None:
 # === Region 6: open_cache_db (was bin/cctally:9040-9155) ===
 
 
+def _path_mode_state(
+    path, mode: int, *, directory: bool = False,
+) -> "tuple[bool, bool]":
+    """``(present, already exactly mode)`` for ``path`` from one ``os.stat``.
+
+    #901 Amendment 20 W2 (a): the cache opener asks this before re-creating
+    the data directory or re-applying a permission, so a steady open does
+    neither. A path that cannot be stat'ed reports ``(False, False)`` and the
+    caller falls back to creating and hardening it as before. ``directory``
+    requires a directory for "present"; ``os.stat`` follows symlinks, as
+    ``Path.mkdir``'s existence check and ``os.chmod`` do.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False, False
+    if directory and not stat.S_ISDIR(st.st_mode):
+        return False, False
+    return True, stat.S_IMODE(st.st_mode) == mode
+
+
+def _open_maintenance_lock_fd(lock_path: pathlib.Path) -> int:
+    """Open (creating) a maintenance flock file as a raw descriptor.
+
+    #901 Amendment 20 W2 (a): the flags and mode are exactly what
+    ``open(path, "a+")`` passes (non-inheritable, as Python makes every
+    descriptor it opens), without the buffered text wrapper the flock never
+    used; the parent directory is created only when the open reports it
+    missing, instead of on every open.
+    """
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(lock_path, flags, 0o666)
+    except FileNotFoundError:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(lock_path, flags, 0o666)
+
+
 def _cache_open_guarded() -> sqlite3.Connection:
     """Open cache.db while excluding a destructive recovery handshake.
 
@@ -9631,9 +10597,12 @@ def _cache_open_guarded() -> sqlite3.Connection:
     path = pathlib.Path(_cctally_core.CACHE_DB_PATH)
     marker = _cctally_db_sib._repair_marker_path(path)
     pending = _cctally_db_sib._quarantine_pending_path(path)
+    # The marker and pending-quarantine lookups stay ``Path.exists`` (#901
+    # Amendment 20 review W-004): on Python 3.11 and 3.12 it raises an error
+    # other than "absent" (EIO, EACCES, ...), where ``os.path.exists`` would
+    # return False and admit a connection while a repair may be running.
     lock_path = pathlib.Path(_cctally_core.CACHE_LOCK_MAINTENANCE_PATH)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fh = open(lock_path, "a+")
+    lock_fh = _open_maintenance_lock_fd(lock_path)
     try:
         for _attempt in range(2):
             conn = None
@@ -9662,30 +10631,37 @@ def _cache_open_guarded() -> sqlite3.Connection:
                         )
                 if pending.exists():
                     try:
-                        open_pids = _cctally_db_sib._db_family_open_pids(
+                        # #901 W9 (Q15): other processes' idle checkpoint
+                        # keepers close on request; wait for them within the
+                        # drain grace, then resume under the same request.
+                        with _cctally_db_sib._keeper_yield_request(
                             path
-                        )
-                        if open_pids is None:
-                            raise OSError(
-                                "could not verify that the database family "
-                                "has no open handles"
+                        ) as deadline:
+                            open_pids = _cctally_db_sib._await_family_drained(
+                                path, deadline
                             )
-                        if open_pids:
-                            raise OSError(
-                                "database family is still open in process(es) "
-                                + ", ".join(
-                                    str(pid) for pid in sorted(open_pids)
+                            if open_pids is None:
+                                raise OSError(
+                                    "could not verify that the database "
+                                    "family has no open handles"
                                 )
-                            )
-                        # #496 S6 §5.3: a resume publishes the incident's final
-                        # manifest, so it is a producer too.
-                        import _cctally_retention as _retention_sib
-                        with _retention_sib.retention_shared(
-                            label="cache quarantine resume"
-                        ):
-                            _cctally_db_sib.quarantine_db_family(
-                                path, strict=True,
-                            )
+                            if open_pids:
+                                raise OSError(
+                                    "database family is still open in "
+                                    "process(es) "
+                                    + ", ".join(
+                                        str(pid) for pid in sorted(open_pids)
+                                    )
+                                )
+                            # #496 S6 §5.3: a resume publishes the incident's
+                            # final manifest, so it is a producer too.
+                            import _cctally_retention as _retention_sib
+                            with _retention_sib.retention_shared(
+                                label="cache quarantine resume"
+                            ):
+                                _cctally_db_sib.quarantine_db_family(
+                                    path, strict=True,
+                                )
                     except OSError as exc:
                         fcntl.flock(lock_fh, fcntl.LOCK_UN)
                         raise sqlite3.DatabaseError(
@@ -9745,7 +10721,7 @@ def _cache_open_guarded() -> sqlite3.Connection:
             "cache.db stale maintenance marker could not be reclaimed"
         )
     finally:
-        lock_fh.close()
+        os.close(lock_fh)
 
 
 def _set_cache_no_checkpoint_on_close(
@@ -9753,61 +10729,19 @@ def _set_cache_no_checkpoint_on_close(
 ) -> None:
     """Set SQLite's per-connection checkpoint-on-close policy.
 
-    Python 3.12 added ``Connection.setconfig``. cctally still supports 3.11,
-    so CPython 3.11 reaches the same SQLite API through its supported-version
-    ``pysqlite_Connection`` layout and the stdlib extension's linked SQLite
-    symbol. This helper is reached only after a classified cache failure;
-    ordinary opens never depend on the implementation-specific adapter.
-    """
-    option = getattr(sqlite3, "SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE", None)
-    setconfig = getattr(conn, "setconfig", None)
-    if option is not None and setconfig is not None:
-        setconfig(option, bool(disabled))
-        return
-
-    _set_cache_no_checkpoint_on_close_cpython(conn, disabled)
+    The implementation is the connection-generic helper in
+    `_lib_sqlite_close` (#901 paced reclaim needs it for any connection);
+    this name keeps cache recovery's call sites, messages and test seam."""
+    _lib_sqlite_close.set_no_checkpoint_on_close(
+        conn, disabled, purpose="cache recovery")
 
 
 def _set_cache_no_checkpoint_on_close_cpython(
     conn: sqlite3.Connection, disabled: bool,
 ) -> None:
     """Python 3.11 compatibility adapter for sqlite3_db_config()."""
-    if sys.implementation.name != "cpython":
-        raise sqlite3.NotSupportedError(
-            "cache recovery requires SQLite no-checkpoint-on-close support"
-        )
-
-    # CPython 3.11's public sqlite3 module does not expose db_config(), but its
-    # connection layout begins with PyObject_HEAD followed by ``sqlite3 *db``.
-    # The layout and audit-visible handle are defined by Modules/_sqlite in
-    # every supported CPython release. Load sqlite3_db_config from the same
-    # extension dependency so we never bind a different SQLite instance.
-    import _sqlite3
-    import ctypes
-
-    sqlite_lib = ctypes.CDLL(_sqlite3.__file__)
-    db_config = sqlite_lib.sqlite3_db_config
-    db_config.argtypes = (ctypes.c_void_p, ctypes.c_int)
-    db_config.restype = ctypes.c_int
-    pointer_size = ctypes.sizeof(ctypes.c_void_p)
-    db_pointer = ctypes.c_void_p.from_address(
-        id(conn) + (2 * pointer_size)
-    ).value
-    if not db_pointer:
-        raise sqlite3.NotSupportedError(
-            "cache recovery could not resolve the SQLite connection handle"
-        )
-    current = ctypes.c_int()
-    rc = db_config(
-        ctypes.c_void_p(db_pointer),
-        1006,  # SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE
-        ctypes.c_int(1 if disabled else 0),
-        ctypes.byref(current),
-    )
-    if rc != sqlite3.SQLITE_OK or current.value != int(bool(disabled)):
-        raise sqlite3.NotSupportedError(
-            "cache recovery could not configure SQLite close checkpointing"
-        )
+    _lib_sqlite_close.set_no_checkpoint_on_close_cpython(
+        conn, disabled, purpose="cache recovery")
 
 
 @dataclass(frozen=True)
@@ -9946,12 +10880,18 @@ def _recover_corrupt_cache(
     # finally, below the maintenance flock it sits under in the lock order.
     import _cctally_retention as _retention_sib
     retention = contextlib.ExitStack()
+    # #901 W9 (Q15): the keeper-yield request, held from the drain check to
+    # the end of the recovery and removed before the maintenance flock.
+    keeper_yield = contextlib.ExitStack()
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         if active_conn is not None:
             _close_cache_trigger_connection(active_conn, path)
             active_conn = None
-        open_pids = _cctally_db_sib._db_family_open_pids(path)
+        deadline = keeper_yield.enter_context(
+            _cctally_db_sib._keeper_yield_request(path)
+        )
+        open_pids = _cctally_db_sib._await_family_drained(path, deadline)
         if open_pids is None:
             raise sqlite3.DatabaseError(
                 "cache.db recovery cannot verify that the database family has "
@@ -10040,6 +10980,7 @@ def _recover_corrupt_cache(
         return True
     finally:
         retention.close()
+        keeper_yield.close()
         if active_conn is not None:
             _close_cache_trigger_connection_best_effort(active_conn)
         try:
@@ -10120,15 +11061,23 @@ def open_cache_db() -> sqlite3.Connection:
     handle check prove replacement cannot invalidate a live WAL reader.
     """
     c = _cctally()
-    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     # cache.db holds plaintext conversation prose at rest (Plan 2, spec §5).
     # Harden the data dir to 0700 so the WAL window between connect and the
     # first write (which materializes the -wal/-shm sidecars, hardened in
     # sync_cache) is not world-readable. Best-effort: swallow OSError + continue.
-    try:
-        os.chmod(_cctally_core.APP_DIR, 0o700)
-    except OSError as exc:
-        eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
+    # #901 Amendment 20 W2 (a): one stat decides, so a steady open neither
+    # re-creates the directory nor re-applies an unchanged mode (a chmod still
+    # rewrites the inode's change time).
+    app_dir_present, app_dir_private = _path_mode_state(
+        _cctally_core.APP_DIR, 0o700, directory=True,
+    )
+    if not app_dir_present:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    if not app_dir_private:
+        try:
+            os.chmod(_cctally_core.APP_DIR, 0o700)
+        except OSError as exc:
+            eprint(f"[cache] could not chmod data dir 0700 ({exc}); continuing")
     recovered = False
     try:
         conn = _cache_open_guarded()
@@ -10149,11 +11098,13 @@ def open_cache_db() -> sqlite3.Connection:
         _cache_storm_test_pause("cache_repair_recreated")
 
     # Best-effort 0600 on cache.db itself (the 0700 dir above backstops the
-    # sidecars until the first write hardens them in sync_cache).
-    try:
-        os.chmod(_cctally_core.CACHE_DB_PATH, 0o600)
-    except OSError as exc:
-        eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
+    # sidecars until the first write hardens them in sync_cache). Applied only
+    # when the mode differs (#901 Amendment 20 W2 (a)).
+    if not _path_mode_state(_cctally_core.CACHE_DB_PATH, 0o600)[1]:
+        try:
+            os.chmod(_cctally_core.CACHE_DB_PATH, 0o600)
+        except OSError as exc:
+            eprint(f"[cache] could not chmod cache.db 0600 ({exc}); continuing")
 
     schema_current = _cctally_store.schema_current(conn, "cache")
     compatibility_current = conn.execute(
@@ -10218,6 +11169,11 @@ def open_cache_db() -> sqlite3.Connection:
             _cctally_store.apply_policy(conn, "cache")
         else:
             _cctally_store.apply_connection_policy(conn, "cache")
+        # PR-3: the schema and migration work below sorts under FILE, never
+        # in memory; the writer temp store is selected again after it.
+        schema_work = not schema_current or not compatibility_current
+        if schema_work:
+            _cctally_store.apply_schema_work_temp_store(conn)
 
         # §6.2 version gate: schema apply, ALTER/purge, and the complete cache
         # migration dispatcher all run under maintenance-exclusive → global writer
@@ -10243,6 +11199,8 @@ def open_cache_db() -> sqlite3.Connection:
             "SELECT 1 FROM sqlite_master WHERE name='conversation_messages'"
         ).fetchone() is None:
             _cctally_db_sib._apply_cache_schema(conn)
+        if schema_work:
+            _cctally_store.apply_writer_temp_store(conn)
     finally:
         release_cache_writer_flocks(held)
     return conn
@@ -10472,29 +11430,38 @@ def _conversations_open_guarded(
                             "both provider locks; retry shortly"
                         )
                     if pending.exists():
-                        open_pids = _cctally_db_sib._db_family_open_pids(path)
-                        if open_pids is None:
-                            raise sqlite3.DatabaseError(
-                                "conversations.db pending recovery could not "
-                                "verify that the family has no open handles"
+                        # #901 W9 (Q15): other processes' idle checkpoint
+                        # keepers close on request; wait for them within the
+                        # drain grace, then resume under the same request.
+                        with _cctally_db_sib._keeper_yield_request(
+                            path
+                        ) as deadline:
+                            open_pids = _cctally_db_sib._await_family_drained(
+                                path, deadline
                             )
-                        if open_pids:
-                            raise sqlite3.DatabaseError(
-                                "conversations.db pending recovery found open "
-                                "handles in process(es) "
-                                + ", ".join(
-                                    str(pid) for pid in sorted(open_pids)
+                            if open_pids is None:
+                                raise sqlite3.DatabaseError(
+                                    "conversations.db pending recovery could "
+                                    "not verify that the family has no open "
+                                    "handles"
                                 )
-                            )
-                        # #496 S6 §5.3: a resume publishes the incident's final
-                        # manifest, so it is a producer too.
-                        import _cctally_retention as _retention_sib
-                        with _retention_sib.retention_shared(
-                            label="conversations quarantine resume"
-                        ):
-                            _cctally_db_sib.quarantine_db_family(
-                                path, strict=True,
-                            )
+                            if open_pids:
+                                raise sqlite3.DatabaseError(
+                                    "conversations.db pending recovery found "
+                                    "open handles in process(es) "
+                                    + ", ".join(
+                                        str(pid) for pid in sorted(open_pids)
+                                    )
+                                )
+                            # #496 S6 §5.3: a resume publishes the incident's
+                            # final manifest, so it is a producer too.
+                            import _cctally_retention as _retention_sib
+                            with _retention_sib.retention_shared(
+                                label="conversations quarantine resume"
+                            ):
+                                _cctally_db_sib.quarantine_db_family(
+                                    path, strict=True,
+                                )
                     removed, reclaim_reason = (
                         _cctally_db_sib._remove_stale_repair_marker(path)
                     )
@@ -10621,7 +11588,10 @@ def _open_conversations_db_unlocked(
     # the head so the next open gates the schema apply out. On an existing
     # populated DB _apply_conversations_schema short-circuits on its own marker,
     # so no transcript row is touched even when the gate re-runs it.
-    if not _cctally_store.schema_current(conn, "conversations"):
+    schema_work = not _cctally_store.schema_current(conn, "conversations")
+    if schema_work:
+        # PR-3: pending schema and migration work sorts under FILE.
+        _cctally_store.apply_schema_work_temp_store(conn)
         _cctally_db_sib._apply_conversations_schema(conn)
     # Commit the schema apply BEFORE the dispatcher: _apply_conversations_schema
     # can leave an open implicit transaction (its trailing marker INSERT), and
@@ -10637,6 +11607,8 @@ def _open_conversations_db_unlocked(
         conn, registry=_CONVERSATIONS_MIGRATIONS, db_label="conversations.db",
         recover_version_ahead=True,
     )
+    if schema_work:
+        _cctally_store.apply_writer_temp_store(conn)
 
     if attach_cache:
         # Ensure the compact schema exists before opening it read-only.  This
@@ -11217,6 +12189,10 @@ def _probe_conversation_rebuild(
     maintenance_fh = open(maintenance_path, "a+")
     provider_locks: list[Any] | None = None
     probe: sqlite3.Connection | None = None
+    # #901 W9 (Q15): the keeper-yield request, held from the drain check to
+    # the end of the probe and removed before the provider and maintenance
+    # flocks.
+    keeper_yield = contextlib.ExitStack()
     try:
         if not _acquire_cache_flock(
             maintenance_fh, timeout=lock_timeout,
@@ -11233,7 +12209,10 @@ def _probe_conversation_rebuild(
                 "conversations.db recovery could not claim both provider "
                 "locks; leaving the live family untouched"
             )
-        open_pids = _cctally_db_sib._db_family_open_pids(path)
+        deadline = keeper_yield.enter_context(
+            _cctally_db_sib._keeper_yield_request(path)
+        )
+        open_pids = _cctally_db_sib._await_family_drained(path, deadline)
         if open_pids is None:
             raise sqlite3.DatabaseError(
                 "conversations.db recovery cannot verify that the database "
@@ -11269,6 +12248,7 @@ def _probe_conversation_rebuild(
         except sqlite3.DatabaseError as exc:
             return exc
     finally:
+        keeper_yield.close()
         if provider_locks is not None:
             _release_conversation_provider_locks(provider_locks)
         try:
@@ -11309,6 +12289,10 @@ def _recover_corrupt_conversations(
     # #496 S6 §5.3, same span as the cache producer above.
     import _cctally_retention as _retention_sib
     retention = contextlib.ExitStack()
+    # #901 W9 (Q15): the keeper-yield request, held from the drain check to
+    # the end of the recovery and removed before the provider and maintenance
+    # flocks.
+    keeper_yield = contextlib.ExitStack()
     try:
         lock_path = pathlib.Path(
             _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
@@ -11328,7 +12312,10 @@ def _recover_corrupt_conversations(
                 "conversations.db recovery could not claim both provider "
                 "locks; leaving the live family untouched"
             ) from exc
-        open_pids = _cctally_db_sib._db_family_open_pids(path)
+        deadline = keeper_yield.enter_context(
+            _cctally_db_sib._keeper_yield_request(path)
+        )
+        open_pids = _cctally_db_sib._await_family_drained(path, deadline)
         if open_pids is None:
             raise sqlite3.DatabaseError(
                 "conversations.db recovery cannot verify that the database "
@@ -11421,6 +12408,7 @@ def _recover_corrupt_conversations(
         return True
     finally:
         retention.close()
+        keeper_yield.close()
         if provider_locks is not None:
             _release_conversation_provider_locks(provider_locks)
         if lock_fh is not None:
@@ -12321,6 +13309,8 @@ def sync_claude_conversations(
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             stats.lock_contended = True
             return stats
+        # #901 §5.3c (W9): a sync writer owns its checkpoints.
+        _wal_checkpoint.arm(conn)
 
         # #347 observe-and-stamp mirrors the accounting ingest boundary.  A
         # torn credential read is undecided, not unattributed: defer before any
@@ -12426,13 +13416,12 @@ def sync_claude_conversations(
                     < _conversation_rebuild_free_bytes_required(conn)):
                 stats.deferred_reason = "insufficient_free_space"
                 return stats
-            # #780: refuse a new rebuild while the reclaim backlog is over its
-            # hard ceiling. A rebuild adds a whole staged generation of churn
-            # to a store that is already failing to return the space it freed,
-            # so starting one makes the condition worse rather than better.
+            # #780 / #901: refuse a new rebuild while the OBSERVED reclaim
+            # backlog is at or over its hard ceiling. A rebuild adds a whole
+            # staged generation of churn to a store already holding that much
+            # free space. Reaching the ceiling never accelerates reclaim.
             _retention_sib = _load_lib("_lib_conversation_retention")
-            if _retention_sib.reclaim_backlog_over_ceiling(
-                    _retention_sib.read_reclaim_pending(conn)):
+            if _retention_sib.observed_backlog_over_ceiling(conn):
                 stats.deferred_reason = "reclaim_backlog_over_ceiling"
                 return stats
             # Commit the retry marker before the destructive clear. A killed
@@ -12747,6 +13736,7 @@ def sync_claude_conversations(
                     ),
                 )
                 conn.commit()
+                _wal_checkpoint.after_commit(conn)
                 stats.files_processed += 1
                 touched_sessions.update(
                     row[0] for row in conv_rows if row[0] is not None
@@ -12929,6 +13919,8 @@ def sync_claude_conversations(
         did_from_zero_replay = (
             rebuild or stats.files_reset_truncated > 0 or maintenance_replayed)
     finally:
+        # #901 §5.3c (W9): the end of a conversation-sync pass is a boundary.
+        _wal_checkpoint.at_boundary(conn)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -12964,6 +13956,126 @@ def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM codex_conversation_events")
     _codex_conversation_fts_full_clear(conn)
     conn.execute("DELETE FROM codex_conversation_source_files")
+
+
+# #901 §5.3c (W7, Q13): the bounds of one batch inside a Codex
+# conversation-sync pass. Consecutive changed files share one transaction, up to
+# this many files and this much newly consumed input in total; a file whose own
+# new input exceeds the byte bound runs alone. The bound limits the work in one
+# transaction, not its elapsed time. Module constants so a test can inject a
+# one-file control (spec G10 (a)).
+CODEX_CONVERSATION_BATCH_FILES = 4
+CODEX_CONVERSATION_BATCH_BYTES = 256 * 1024
+
+
+@dataclass
+class _CodexConversationBatch:
+    """The open W7 batch of one Codex conversation-sync pass (#901 §5.3c).
+
+    Holds exactly the bookkeeping of the files whose writes have been released
+    into the batch's open transaction and not yet committed. A file joins only
+    after its savepoint is released, so a file that rolled back to its savepoint
+    contributes nothing here, and the pass statistics only learn about the
+    batch's files once ``_commit_codex_conversation_batch`` has committed them.
+    """
+
+    files: int = 0
+    consumed_bytes: int = 0
+    reset_truncated: int = 0
+    cascaded: bool = False
+    affected_keys: set = field(default_factory=set)
+    inputs_changed: set = field(default_factory=set)
+    paths: list = field(default_factory=list)
+
+
+def _codex_conversation_batch_admits(
+    batch: _CodexConversationBatch, consumed: int,
+) -> bool:
+    """Whether a changed file with ``consumed`` new bytes may join ``batch``."""
+    if batch.files == 0:
+        return True
+    return (
+        batch.files < CODEX_CONVERSATION_BATCH_FILES
+        and consumed <= CODEX_CONVERSATION_BATCH_BYTES
+        and batch.consumed_bytes + consumed <= CODEX_CONVERSATION_BATCH_BYTES
+    )
+
+
+def _codex_conversation_batch_full(batch: _CodexConversationBatch) -> bool:
+    return (
+        batch.files >= CODEX_CONVERSATION_BATCH_FILES
+        or batch.consumed_bytes >= CODEX_CONVERSATION_BATCH_BYTES
+    )
+
+
+def _commit_codex_conversation_batch(
+    conn: sqlite3.Connection,
+    batch: _CodexConversationBatch,
+    stats: "CodexIngestStats",
+    progress: "Callable[[str, CodexIngestStats], None] | None",
+) -> None:
+    """Finish one W7 batch: derived state once, then commit (#901 §5.3c).
+
+    The rollups and the search projection are recomputed once, over the union
+    of the batch's affected conversations, after its last file, so the
+    projection generation advances at most once for the transaction (§5.3b).
+    Events, normalized rows, repairs, projection, rollups, render revision and
+    every file's cursor then commit together or not at all: a database error
+    here rolls the whole batch back and counts each of its files as failed
+    once, and their unchanged cursors make the next pass retry them. Progress
+    and statistics are reported only after the commit.
+    """
+    if batch.files == 0:
+        # Only rolled-back savepoints can be open here; end that empty
+        # transaction rather than leave it on the caller's connection.
+        if conn.in_transaction:
+            conn.rollback()
+        return
+    try:
+        _recompute_codex_rollups(
+            conn, batch.affected_keys, inputs_changed=batch.inputs_changed)
+        import _lib_codex_conversation_query as query
+        query.materialize_codex_find_projection(
+            conn, batch.affected_keys, cascaded=batch.cascaded)
+        conn.commit()
+        _wal_checkpoint.after_commit(conn)
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
+        for path in batch.paths:
+            eprint(f"[codex-conversations] db error on {path}: {exc}")
+        stats.files_failed += batch.files
+    else:
+        stats.files_processed += batch.files
+        stats.files_reset_truncated += batch.reset_truncated
+    _report_conversation_progress(progress, "ingest", stats)
+
+
+_CODEX_FILE_SAVEPOINT = "SAVEPOINT codex_conversation_file"
+_CODEX_FILE_RELEASE = "RELEASE SAVEPOINT codex_conversation_file"
+_CODEX_FILE_ROLLBACK_TO = "ROLLBACK TO SAVEPOINT codex_conversation_file"
+
+
+def _rollback_codex_file_savepoint(conn: sqlite3.Connection) -> bool:
+    """Undo one file's writes inside its batch (#901 §5.3c W7).
+
+    True when the file's savepoint was rolled back and released, leaving the
+    batch's earlier files in place. False when SQLite had already ended the
+    whole transaction (some errors roll it back on their own), or the savepoint
+    cannot be undone: the batch's earlier files are then gone too, and the
+    connection is left with no open transaction.
+    """
+    if conn.in_transaction:
+        try:
+            conn.execute(_CODEX_FILE_ROLLBACK_TO)
+            conn.execute(_CODEX_FILE_RELEASE)
+            return True
+        except sqlite3.DatabaseError:
+            pass
+    try:
+        conn.rollback()
+    except sqlite3.DatabaseError:
+        pass
+    return False
 
 
 def sync_codex_conversations(
@@ -13007,6 +14119,8 @@ def sync_codex_conversations(
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             stats.lock_contended = True
             return stats
+        # #901 §5.3c (W9): a sync writer owns its checkpoints.
+        _wal_checkpoint.arm(conn)
         targeted = only_paths is not None
         pending_rebuild = conn.execute(
             "SELECT 1 FROM cache_meta "
@@ -13166,22 +14280,31 @@ def sync_codex_conversations(
                 prune_scope, retained_sources, set()
             )
             protected_paths = {path for path, _root in refused_sources}
+            # #901 §5.3b: the whole prune is one transaction, so its rollups
+            # and projection are repaired once, over every conversation it
+            # touched, after all of its deletes. Each is a pure function of the
+            # surviving rows, so the result equals the old per-path repair; the
+            # projection generation advances once for the transaction, and the
+            # cascade signal covers a surviving conversation whose rebuilt rows
+            # come out equal (the deleted file held only its final messages).
+            prune_affected: set[str] = set()
+            prune_deleted_messages = 0
             for stale_path, _stale_root_key in safe_sources:
-                affected = {
+                prune_affected.update(
                     row[0] for row in conn.execute(
                         "SELECT DISTINCT conversation_key "
                         "FROM codex_conversation_messages WHERE source_path=?",
                         (stale_path,),
                     ) if row[0]
-                }
+                )
                 conn.execute(
                     "DELETE FROM codex_conversation_file_touches WHERE source_path=?",
                     (stale_path,),
                 )
-                conn.execute(
+                prune_deleted_messages += max(0, conn.execute(
                     "DELETE FROM codex_conversation_messages WHERE source_path=?",
                     (stale_path,),
-                )
+                ).rowcount)
                 conn.execute(
                     "DELETE FROM codex_conversation_events WHERE source_path=?",
                     (stale_path,),
@@ -13190,9 +14313,11 @@ def sync_codex_conversations(
                     "DELETE FROM codex_conversation_source_files WHERE path=?",
                     (stale_path,),
                 )
-                _recompute_codex_rollups(conn, affected)
+            if prune_affected:
+                _recompute_codex_rollups(conn, prune_affected)
                 import _lib_codex_conversation_query as query
-                query.materialize_codex_find_projection(conn, affected)
+                query.materialize_codex_find_projection(
+                    conn, prune_affected, cascaded=prune_deleted_messages > 0)
             stats.files_pruned = len({path for path, _root in safe_sources})
             if refused_sources:
                 _codex_prune_refusal_record(
@@ -13207,7 +14332,14 @@ def sync_codex_conversations(
                     path for path, _root in refused_sources
                 })
             conn.commit()
+            # #901 §5.3c (W9): the end of the stale-source prune is a boundary.
+            _wal_checkpoint.at_boundary(conn)
 
+        # #901 §5.3c (W7): consecutive changed files share one transaction,
+        # bounded by CODEX_CONVERSATION_BATCH_FILES and _BYTES. Unchanged,
+        # unreadable and declined files write nothing, so they neither join nor
+        # break a batch.
+        batch = _CodexConversationBatch()
         for discovered in files:
             jp = discovered.source_path
             path_str = str(jp)
@@ -13256,6 +14388,8 @@ def sync_codex_conversations(
                     else "source_replaced" if replaced
                     else "truncation"
                 )
+                # The files already ingested keep today's committed result.
+                _commit_codex_conversation_batch(conn, batch, stats, progress)
                 return stats
             start_offset = 0 if prev is None or reset_file else int(prev[2])
             initial_session_id = prev[4] if prev else None
@@ -13394,6 +14528,9 @@ def sync_codex_conversations(
                 )
             except Exception as exc:  # noqa: BLE001
                 if not targeted:
+                    # The batch's earlier files keep today's committed result.
+                    _commit_codex_conversation_batch(
+                        conn, batch, stats, progress)
                     raise
                 eprint(
                     f"[codex-conversations] normalization failed for {jp}: {exc}"
@@ -13401,6 +14538,10 @@ def sync_codex_conversations(
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
+            consumed = max(0, int(final_offset) - int(start_offset))
+            if not _codex_conversation_batch_admits(batch, consumed):
+                _commit_codex_conversation_batch(conn, batch, stats, progress)
+                batch = _CodexConversationBatch()
             affected_keys = {
                 row[0]
                 for row in conn.execute(
@@ -13410,22 +14551,36 @@ def sync_codex_conversations(
                 )
                 if row[0]
             } if reset_file else set()
+            # #901 §5.3c (W7): the batch's transaction is opened explicitly,
+            # so releasing a file's savepoint never commits it on its own.
+            if not conn.in_transaction:
+                conn.execute("BEGIN")
+            conn.execute(_CODEX_FILE_SAVEPOINT)
             try:
+                # #901 §5.3b: what this file's writes changed decides what its
+                # batch's derived state must write. Any inserted, deleted or
+                # updated event or message row (counted before the rollup and
+                # the projection run) is a change to the affected
+                # conversations' retained render inputs; deleted messages also
+                # cascaded their projection rows away, which the projector must
+                # count as a find-visible change even when it finds no
+                # difference.
+                changes_before_inputs = conn.total_changes
+                deleted_messages = 0
                 if reset_file:
                     conn.execute(
                         "DELETE FROM codex_conversation_file_touches "
                         "WHERE source_path=?",
                         (path_str,),
                     )
-                    conn.execute(
+                    deleted_messages = max(0, conn.execute(
                         "DELETE FROM codex_conversation_messages WHERE source_path=?",
                         (path_str,),
-                    )
+                    ).rowcount)
                     conn.execute(
                         "DELETE FROM codex_conversation_events WHERE source_path=?",
                         (path_str,),
                     )
-                    stats.files_reset_truncated += 1
                 if event_rows:
                     conn.executemany(
                         "INSERT OR IGNORE INTO codex_conversation_events "
@@ -13449,9 +14604,10 @@ def sync_codex_conversations(
                     affected_keys.update(
                         _repair_codex_turn_ids_for_source(conn, path_str)
                     )
-                _recompute_codex_rollups(conn, affected_keys)
-                import _lib_codex_conversation_query as query
-                query.materialize_codex_find_projection(conn, affected_keys)
+                inputs_changed = (
+                    set(affected_keys)
+                    if conn.total_changes != changes_before_inputs else set()
+                )
                 terminal = state.thread
                 conn.execute(
                     "INSERT INTO codex_conversation_source_files "
@@ -13496,14 +14652,30 @@ def sync_codex_conversations(
                         int(st.st_ino),
                     ),
                 )
-                conn.commit()
-                stats.files_processed += 1
-                _report_conversation_progress(progress, "ingest", stats)
+                conn.execute(_CODEX_FILE_RELEASE)
             except sqlite3.DatabaseError as exc:
-                conn.rollback()
+                # This file alone rolls back: its rows, cursor and bookkeeping
+                # never reached the batch, whose other files still commit.
                 eprint(f"[codex-conversations] db error on {jp}: {exc}")
+                if not _rollback_codex_file_savepoint(conn):
+                    # SQLite ended the whole transaction, so the batch's
+                    # earlier files rolled back with it.
+                    stats.files_failed += batch.files
+                    batch = _CodexConversationBatch()
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
+                continue
+            batch.files += 1
+            batch.consumed_bytes += consumed
+            batch.reset_truncated += 1 if reset_file else 0
+            batch.cascaded = batch.cascaded or deleted_messages > 0
+            batch.affected_keys.update(affected_keys)
+            batch.inputs_changed.update(inputs_changed)
+            batch.paths.append(jp)
+            if _codex_conversation_batch_full(batch):
+                _commit_codex_conversation_batch(conn, batch, stats, progress)
+                batch = _CodexConversationBatch()
+        _commit_codex_conversation_batch(conn, batch, stats, progress)
 
         run_codex_find_projection_backfill(conn)
         _report_conversation_progress(progress, "finalize", stats)
@@ -13519,12 +14691,12 @@ def sync_codex_conversations(
                 )
             ):
                 _clear_codex_prune_refusal(conn)
-            conn.execute(
-                "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
-                (
-                    "codex_conversation_contract_version",
-                    _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION,
-                ),
+            # #901 §5.3c (W8): written only when it changes; deleting an
+            # absent row below already writes nothing.
+            _set_cache_meta_if_changed(
+                conn,
+                "codex_conversation_contract_version",
+                _lib_codex_conversation.CODEX_CONVERSATION_CONTRACT_VERSION,
             )
             conn.execute(
                 "DELETE FROM cache_meta "
@@ -13546,7 +14718,19 @@ def sync_codex_conversations(
         _harden_conversation_sidecars()
         _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
         did_from_zero_replay = rebuild or stats.files_reset_truncated > 0
+    except BaseException:
+        # #901 §5.3c (W7): an exception that escapes the pass must not leave an
+        # open batch on the caller's connection. Its files' cursors roll back
+        # with their rows, so the next pass retries them, as after a crash.
+        if conn.in_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.DatabaseError:
+                pass
+        raise
     finally:
+        # #901 §5.3c (W9): the end of a conversation-sync pass is a boundary.
+        _wal_checkpoint.at_boundary(conn)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -13694,6 +14878,13 @@ def _run_transcript_rebuild_worker(
                     conn.close()
                 except Exception:
                     pass
+            # #901 W9 (Q14): `os._exit` skips `atexit`; the checkpoint
+            # policy's finalizer attempts one PASSIVE per armed store and
+            # closes the keepers before the child ends.
+            try:
+                _wal_checkpoint.finalize()
+            except Exception:  # noqa: BLE001
+                pass
             os.close(write_fd)
             os._exit(0)
 
@@ -13943,6 +15134,13 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             f"{result.codex_events} event(s). "
             f"Run `cctally db vacuum --db conversations` to reclaim the freed space."
         )
+        if not result.complete:
+            eprint(
+                "[cache-sync] stopped early: the transcript maintenance "
+                "allowance (4 MiB/min) is spent; the remaining expired "
+                "transcripts are pruned on later runs or by a running "
+                "dashboard."
+            )
         conn.close()
         return 0
 

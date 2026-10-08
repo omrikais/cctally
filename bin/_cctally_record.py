@@ -6596,6 +6596,16 @@ def _record_dashboard_activity(provider: str, transcript_path: str) -> None:
         pass
 
 
+def _finalize_wal_checkpoints() -> None:
+    """The W9 finalizer before a detached worker's ``os._exit`` (#901 Q14)."""
+    try:
+        import _lib_wal_checkpoint
+
+        _lib_wal_checkpoint.finalize()
+    except Exception:  # noqa: BLE001 — a hook must exit 0 whatever happens
+        pass
+
+
 def cmd_hook_tick(args: argparse.Namespace) -> int:
     """Per-fire hook runtime (Section 3 of onboarding spec).
 
@@ -6831,6 +6841,10 @@ def cmd_hook_tick(args: argparse.Namespace) -> int:
         # Forked child: skip Python's atexit / argparse / cleanup paths
         # (they may try to flush already-redirected stdio handles).
         if forked:
+            # #901 W9 (Q14): `os._exit` skips `atexit`, so the checkpoint
+            # policy's finalizer runs here: one PASSIVE per armed store, then
+            # the keepers close (the last close drains the WAL).
+            _finalize_wal_checkpoints()
             os._exit(0)
         return 0
     # --explain mapping (Section 3 of spec)

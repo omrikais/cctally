@@ -51,7 +51,7 @@ def _nets():
     out = []
     for cc, cr in SPECS:
         _s, _w, net = crk._compute_entry_cache_dollars(
-            MODEL, cc, cr, pricing=_pricing(),
+            MODEL, cc, cr, input_tokens=0, pricing=_pricing(),
         )
         out.append(net)
     return out

@@ -40,7 +40,7 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
   const display = useDisplayTz();
   const ctx: FmtCtx = { tz: display.resolvedTz, offsetLabel: display.offsetLabel };
   // A frozen block's headline is served from retained facts while `samples` is
-  // always computed from the current cache, so the chart can fall short of the
+  // always computed from the current cache, so the chart can differ from the
   // headline without either being wrong (#769 S2). The empty-`samples` arm
   // below is defensive: a block exists only where entries grouped into it, so
   // the route answers 404 rather than serving one with no samples.
@@ -50,7 +50,10 @@ export function BlockTimeline({ detail }: { detail: BlockDetail }) {
   const span    = endMs - startMs || 1;
   const xOf = (iso: string) =>
     PAD.left + ((Date.parse(iso) - startMs) / span) * (VB_W - PAD.left - PAD.right);
-  const yMax = Math.max(detail.cost_usd, detail.projection?.total_cost_usd ?? 0);
+  const yMax = detail.samples.reduce(
+    (maximum, sample) => Math.max(maximum, sample.cum),
+    Math.max(detail.cost_usd, detail.projection?.total_cost_usd ?? 0),
+  );
   const yOf = (cost: number) => {
     const top = PAD.top;
     const bot = VB_H - PAD.bottom;

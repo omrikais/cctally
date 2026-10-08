@@ -470,6 +470,78 @@ def _gather_writer_guard_log(now_utc: dt.datetime):
     }
 
 
+#: Bounded per-instance probe of a running dashboard's write telemetry.
+DASHBOARD_WRITE_IO_TIMEOUT_SECONDS = 2.0
+
+
+def _fetch_dashboard_write_io(descriptor: dict, *, timeout_s: float) -> dict:
+    """One loopback probe of a discovered dashboard (#901 §5.6).
+
+    Reuses `dashboard-perf`'s client — IP-literal loopback target, an
+    `Origin` matching the `Host` — and sends NO token, so an instance that
+    requires one answers 401 and is reported `authentication_required`: no
+    authentication bypass exists. The instance id in the answer must equal
+    the descriptor's, or the probe is an `identity_mismatch`."""
+    import _lib_write_io as wio
+
+    perf = _cctally()._cctally_dashboard_perf
+    base = {"instance_id": descriptor["instanceId"],
+            "port": descriptor["port"], "pid": descriptor["pid"]}
+    host = wio.loopback_target(descriptor.get("host"))
+    if host is None:
+        return {**base, "probe": "failed", "reason": "not_loopback_reachable",
+                "write_io": None}
+    try:
+        payload = perf._request(host, descriptor["port"], perf.WRITE_IO_PATH,
+                                token=None, timeout=timeout_s)
+    except perf.DashboardPerfError as exc:
+        return {**base, "probe": "failed", "reason": exc.reason,
+                "write_io": None}
+    write_io = payload.get("writeIo") if isinstance(payload, dict) else None
+    if not isinstance(write_io, dict):
+        return {**base, "probe": "failed", "reason": "malformed_response",
+                "write_io": None}
+    if write_io.get("instanceId") != descriptor["instanceId"]:
+        return {**base, "probe": "failed", "reason": "identity_mismatch",
+                "write_io": None}
+    return {**base, "probe": "ok", "reason": None, "write_io": write_io}
+
+
+def _gather_dashboard_disk_writes(
+    *, fetch=None, timeout_s: float = DASHBOARD_WRITE_IO_TIMEOUT_SECONDS,
+    discover: bool = True,
+) -> dict:
+    """Running dashboards' write telemetry for `performance.dashboard_disk_
+    writes` (#901 §5.6).
+
+    In the dashboard process the local instance's own snapshot is read
+    directly — no self-HTTP and no recursive gather. Anywhere else (the CLI,
+    the TUI) instances are discovered through their owner-readable
+    descriptors; a stale one (dead or reused pid) is ignored and never
+    deleted, because doctor is read-only. Discovery runs only for the
+    `cctally doctor` CLI (PR-11); with ``discover`` false nothing is probed and
+    the mode is ``not_probed``."""
+    import _lib_write_io as wio
+
+    local = wio.local_instance()
+    if local is not None:
+        return {"mode": "in_process", "instances": [{
+            "instance_id": local["instanceId"], "port": local["port"],
+            "pid": local["pid"], "probe": "ok", "reason": None,
+            "write_io": wio.write_io_payload(),
+        }]}
+    if not discover:
+        return {"mode": "not_probed", "instances": []}
+    probe = fetch or _fetch_dashboard_write_io
+    instances = [
+        probe(descriptor, timeout_s=timeout_s)
+        for descriptor in wio.read_instance_descriptors(_cctally_core.APP_DIR)
+        if wio.descriptor_is_live(descriptor)
+    ]
+    instances.sort(key=lambda entry: (entry["port"], entry["instance_id"]))
+    return {"mode": "discovery", "instances": instances}
+
+
 def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
     """Read the #318 statusline pipeline without creating or pruning files."""
     now_epoch = int(now_utc.timestamp())
@@ -874,6 +946,26 @@ def _gather_codex_window_attribution_state() -> "dict | None":
         conn.close()
 
 
+def _journal_protocol_violation_rows(conn: sqlite3.Connection) -> list:
+    """Every stored protocol violation, parsed, in (batch, kind, fingerprint)
+    order: the doctor's shallow journal leg.
+
+    #901 Amendment 19 T1 (spec I1): the doctor holds every violation anyway,
+    so they are ordered here, in Python, where ``ORDER BY batch_id, kind,
+    fingerprint`` left a partial sorter over each batch's rows — and one batch
+    is not a bound. ``fingerprint`` is the primary key, so the order is total
+    and identical (text compared as UTF-8 bytes, SQLite's BINARY collation).
+    """
+    rows = conn.execute(
+        "SELECT batch_id, kind, fingerprint, violation_json "
+        "FROM journal_protocol_violations"
+    ).fetchall()
+    rows.sort(key=lambda row: tuple(
+        (value is not None, str(value or "").encode("utf-8"))
+        for value in row[:3]))
+    return [json.loads(str(row[3])) for row in rows]
+
+
 def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
     """Best-effort account-attribution state for the doctor `accounts.*` legs
     (#341). Never raises: identity + registry reads are read-only and each guard
@@ -936,14 +1028,21 @@ def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
         cutoff = (now_utc - dt.timedelta(days=7)).astimezone(
             dt.timezone.utc).isoformat()
         try:
-            for account_key, cnt in conn.execute(
-                "SELECT account_key, COUNT(*) FROM weekly_usage_snapshots "
-                "WHERE captured_at_utc >= ? GROUP BY account_key", (cutoff,)
-            ).fetchall():
+            # #901 Amendment 19 T1 (spec I1): counted in Python over the
+            # streamed rows, one total per class, where `GROUP BY
+            # account_key` sorted the trailing week's every snapshot through a
+            # temp b-tree — and a week of activity is not a bound.
+            attributed = unattributed = 0
+            for (account_key,) in conn.execute(
+                "SELECT account_key FROM weekly_usage_snapshots "
+                "WHERE captured_at_utc >= ?", (cutoff,)
+            ):
                 if account_key and account_key != "unattributed":
-                    state["recent_attributed"] += int(cnt)
+                    attributed += 1
                 else:
-                    state["recent_unattributed"] += int(cnt)
+                    unattributed += 1
+            state["recent_attributed"] += attributed
+            state["recent_unattributed"] += unattributed
         except sqlite3.DatabaseError:
             pass
     finally:
@@ -961,9 +1060,13 @@ def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
 # contains no ingest and is not a whole tick; a whole tick is ingest plus
 # builder, and the builder is 70.5% of one measured live. Against a whole tick
 # the same probe is therefore 14%. It is one all-history
-# `load_codex_quota_observations` call whose SQL runs a `MAX(...) OVER
-# (PARTITION BY ...)` across every retained row (277,207 on that store) to
-# return one row per identity (16).
+# `load_codex_quota_observations(latest_per_identity=True)` call. Its SQL used
+# to run a `MAX(...) OVER (PARTITION BY ...)` across every retained row
+# (277,207 on that store; 565K and ~1.1 GB of temp-file writes per call on the
+# #901 live store); since #901 it reads the trigger-maintained
+# `codex_quota_partition_latest` summary plus one indexed seek per raw
+# partition. The memo below therefore remains a CPU optimisation and is no
+# longer load-bearing for disk writes.
 #
 # Only the ROWS are retained, and only while their evidence is unmoved. Every
 # `now`-derived interpretation over them is recomputed on every gather:
@@ -1249,6 +1352,7 @@ def doctor_gather_state(
     runtime_bind: "str | None" = None,
     deep: bool = False,
     force_cold_inputs: bool = False,
+    discover_dashboards: bool = False,
 ):
     """Gather doctor state while excluding cache-family replacement.
 
@@ -1262,6 +1366,11 @@ def doctor_gather_state(
     caller can obtain a genuinely fresh gather at a chosen instant. It exists
     for the equality gate that compares a reusing gather against a fresh one at
     an identical ``now_utc``; production callers leave it false.
+
+    ``discover_dashboards`` (PR-11) lets the gather probe other running
+    dashboards for their disk writes. Only the `cctally doctor` CLI passes it:
+    the TUI and every snapshot build gather on each rebuild, where serial
+    2-second probes of every live descriptor do not belong.
     """
     cache_lock = None
     cache_probe_allowed = not _cctally_core.CACHE_DB_PATH.exists()
@@ -1317,6 +1426,7 @@ def doctor_gather_state(
                 _cache_probe_allowed=cache_probe_allowed,
                 _cache_repair_marker=cache_repair_marker,
                 _force_cold_inputs=force_cold_inputs,
+                _discover_dashboards=discover_dashboards,
             )
     finally:
         if cache_lock is not None:
@@ -1334,6 +1444,7 @@ def _doctor_gather_state_impl(
     _cache_probe_allowed: bool,
     _cache_repair_marker: dict,
     _force_cold_inputs: bool = False,
+    _discover_dashboards: bool = False,
 ):
     """I/O chokepoint for `cctally doctor` (spec §7.2).
 
@@ -1727,6 +1838,7 @@ def _doctor_gather_state_impl(
         conv_rollup_sync_in_progress = False
         conversations_db_page_count = None
         conversations_db_freelist_count = None
+        conversations_db_page_size = None
         conversations_reclaim_pending = None
         codex_prune_refusals: list[dict] = []
         conversation_rollup_pricing_refusal: "dict | None" = None
@@ -1751,6 +1863,9 @@ def _doctor_gather_state_impl(
                         row = conn.execute("PRAGMA freelist_count").fetchone()
                         if row and row[0] is not None:
                             conversations_db_freelist_count = int(row[0])
+                        row = conn.execute("PRAGMA page_size").fetchone()
+                        if row and row[0] is not None:
+                            conversations_db_page_size = int(row[0])
                     except sqlite3.Error:
                         pass
                     try:
@@ -2407,14 +2522,8 @@ def _doctor_gather_state_impl(
                     if _cctally_core.DB_PATH.exists():
                         pc = _stats_ro_guarded()
                         try:
-                            protocol_rows = [
-                                json.loads(str(row[0]))
-                                for row in pc.execute(
-                                    "SELECT violation_json "
-                                    "FROM journal_protocol_violations "
-                                    "ORDER BY batch_id, kind, fingerprint"
-                                )
-                            ]
+                            protocol_rows = (
+                                _journal_protocol_violation_rows(pc))
                             journal_protocol_violations = [
                                 item for item in protocol_rows
                                 if not item.get("auditId")
@@ -2696,6 +2805,13 @@ def _doctor_gather_state_impl(
             _gather_codex_window_attribution_state()
             if _cache_probe_allowed else None)
 
+    # #901 §5.6: running dashboards' disk writes. Read-only; degrades.
+    try:
+        with _lib_perf.phase("doctor.dashboard_disk_writes"):
+            dashboard_disk_writes = _gather_dashboard_disk_writes(
+                discover=_discover_dashboards)
+    except Exception:  # noqa: BLE001 — a probe failure must not fail doctor
+        dashboard_disk_writes = {"mode": "error", "instances": []}
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,
         path_includes_local_bin=path_includes,
@@ -2792,6 +2908,8 @@ def _doctor_gather_state_impl(
         cache_db_freelist_count=cache_db_freelist_count,
         conversations_db_page_count=conversations_db_page_count,
         conversations_db_freelist_count=conversations_db_freelist_count,
+        conversations_db_page_size=conversations_db_page_size,
+        dashboard_disk_writes=dashboard_disk_writes,
         conversations_reclaim_pending=conversations_reclaim_pending,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,
@@ -2846,7 +2964,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # #279 S2 F5b: deep=True runs PRAGMA quick_check(1) — CLI-only (the
     # dashboard/TUI gather callers stay deep=False so their per-rebuild
     # gather never pays the multi-second cost on a large cache.db).
-    state = c.doctor_gather_state(deep=True)
+    state = c.doctor_gather_state(deep=True, discover_dashboards=True)
     report = _lib_doctor.run_checks(state)
     if getattr(args, "json", False):
         print(encode_dashboard_json(

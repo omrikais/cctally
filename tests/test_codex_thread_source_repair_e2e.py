@@ -29,7 +29,8 @@ if str(BIN_DIR) not in sys.path:
 if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)  # noqa: E402
 
 ROLLOUTS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
 
@@ -41,7 +42,8 @@ def _stage(tmp_path, monkeypatch, scenario, *, lines=None):
     real delta resume across a cursor boundary rather than a fresh walk.
     """
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Identity repair and resume parity need durable fixed-date transcripts.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollout = (
         provider_root / "sessions" / "2026" / "07" / "16" / "rollout.jsonl")

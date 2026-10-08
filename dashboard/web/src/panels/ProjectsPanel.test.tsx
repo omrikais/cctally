@@ -69,6 +69,15 @@ function envelopeWithProjects(rowCount: number): Envelope {
 }
 
 describe('<ProjectsPanel />', () => {
+  it('uses the singular count for one Codex project (#897)', () => {
+    const env = structuredClone(fixture) as unknown as Envelope;
+    env.sources!.codex.data!.projects!.rows = env.sources!.codex.data!.projects!.rows.slice(0, 1);
+    updateSnapshot(env);
+    dispatch({ type: 'SET_ACTIVE_SOURCE', source: 'codex' });
+    const { container } = render(<ProjectsPanel />);
+    expect(container.querySelector('.panel-header h2 .sub')).toHaveTextContent('(1 project)');
+  });
+
   it('renders top-5 rows when there are exactly 5 projects', () => {
     updateSnapshot(envelopeWithProjects(5));
     render(<ProjectsPanel />);

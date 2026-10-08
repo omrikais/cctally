@@ -1314,6 +1314,21 @@ def _preliminary_decision() -> "_candidates.ReductionDecision | None":
     )
 
 
+def _finalize_wal_checkpoints() -> None:
+    """The W9 finalizer before a forked child's ``os._exit`` (#901 Q14).
+
+    `os._exit` skips `atexit`. The persist child records usage and the OAuth
+    child may too, and either can reach a cache sync that arms a store; the
+    finalizer then attempts one PASSIVE per armed store and closes the
+    keepers. With nothing armed it does nothing."""
+    try:
+        import _lib_wal_checkpoint
+
+        _lib_wal_checkpoint.finalize()
+    except BaseException:  # noqa: BLE001 — the child exits regardless
+        pass
+
+
 def _fork_persist(parent_lock_fd: int) -> None:
     """Run the revalidated spool reducer in a detached serialized child."""
     try:
@@ -1375,6 +1390,7 @@ def _fork_persist(parent_lock_fd: int) -> None:
     except BaseException:
         pass
     finally:
+        _finalize_wal_checkpoints()
         os._exit(0)
 
 
@@ -1487,6 +1503,7 @@ def _fork_statusline_oauth_refresh(lock_fd: int) -> bool:
         pass
     finally:
         _release_statusline_oauth_lock(lock_fd)
+        _finalize_wal_checkpoints()
         os._exit(0)
 
 

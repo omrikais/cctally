@@ -7566,6 +7566,258 @@ def build_per_migration_046_codex_source_file_identity(
     _build_post(pre, post)
 
 
+def build_per_migration_047_spill_free_read_paths(scenario_dir: Path) -> None:
+    """Per-migration goldens for #901's spill-free read paths.
+
+    ``pre.sqlite`` is a genuine 046-head install: the current schema apply
+    creates every 047 object, so they are dropped again after it to reproduce
+    the shape an already-current store carries, and the quota rows are seeded
+    afterwards so no trigger has seen them. Two raw partitions, a whole-second
+    tie spelled two ways and one refused row (blank slot) make the post golden
+    show the bootstrap keeping every tied winner, one maximum per partition,
+    and nothing for the refused row.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "047_spill_free_read_paths"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            for statement in (
+                "DROP TRIGGER IF EXISTS trg_qws_latest_ins",
+                "DROP TRIGGER IF EXISTS trg_qws_latest_del",
+                "DROP TRIGGER IF EXISTS trg_qws_latest_upd",
+                "DROP INDEX IF EXISTS idx_qws_partition_capture",
+                "DROP TABLE IF EXISTS codex_quota_partition_latest",
+                "DROP INDEX IF EXISTS idx_qws_codex_load_order",
+                "DROP INDEX IF EXISTS idx_codex_entries_root_path_time",
+                "DROP INDEX IF EXISTS idx_codex_files_alias_recent",
+                "DROP INDEX IF EXISTS idx_codex_threads_recent",
+                "DROP INDEX IF EXISTS idx_entries_model_time",
+                "DROP INDEX IF EXISTS idx_codex_entries_model_time",
+                "DROP INDEX IF EXISTS idx_codex_window_attributions_read_order",
+            ):
+                conn.execute(statement)
+            _seed_public5_quota_rows(conn)
+            conn.executemany(
+                "INSERT INTO quota_window_snapshots "
+                "(source, source_root_key, source_path, line_offset, "
+                " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
+                " limit_name, window_minutes, used_percent, resets_at_utc, "
+                " plan_type, individual_limit_json, reached_type, "
+                " observed_model, account_key, canonical_resets_at_utc) "
+                "VALUES ('codex',?,?,?,?,?,?,'codex',NULL,?,?,?,'pro',NULL,NULL,"
+                "        ?,?,?)",
+                [
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 30,
+                     "2026-07-31T11:00:00+00:00", "primary", "limit-primary",
+                     300, 13.0, "2026-07-31T15:00:00Z", None, None,
+                     "2026-07-31T15:00:00Z"),
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 40,
+                     "2026-07-31T09:00:00Z", "secondary", "limit-secondary",
+                     10080, 40.0, "2026-08-03T00:00:00Z", "gpt-5", "a" * 32,
+                     "2026-08-03T00:00:00Z"),
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 50,
+                     "2026-07-31T12:00:00Z", " ", "limit-primary", 300, 14.0,
+                     "2026-07-31T15:00:00Z", None, None,
+                     "2026-07-31T15:00:00Z"),
+                ],
+            )
+            # Fixture setup is not a mutation the projector should chase.
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute(
+                "DELETE FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'")
+            conn.execute("PRAGMA user_version=46")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=47")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+def build_per_migration_048_codex_quota_physical_group_order(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #901 Q11's extended physical-group index.
+
+    ``pre.sqlite`` is a genuine 047-head install whose ``idx_qws_physical_group``
+    is the five-member definition 040 shipped (the current schema apply builds
+    the extended one, so it is replaced again here). Two physical groups of the
+    same root carry rows whose order needs every new key column: captures tied
+    to the second in two spellings, a reset spelled ``Z`` and ``+00:00``, and
+    two lines of one file. ``post.sqlite`` is that store after the handler.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "048_codex_quota_physical_group_order"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            # The 047-head shape: 040's five-member definition.
+            conn.execute("DROP INDEX IF EXISTS idx_qws_physical_group")
+            conn.execute(
+                "CREATE INDEX idx_qws_physical_group "
+                "ON quota_window_snapshots("
+                "  source_root_key, logical_limit_key, observed_slot,"
+                "  window_minutes,"
+                "  unixepoch(COALESCE(canonical_resets_at_utc, resets_at_utc)))"
+                " WHERE source='codex'"
+            )
+            _seed_public5_quota_rows(conn)
+            conn.executemany(
+                "INSERT INTO quota_window_snapshots "
+                "(source, source_root_key, source_path, line_offset, "
+                " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
+                " limit_name, window_minutes, used_percent, resets_at_utc, "
+                " plan_type, individual_limit_json, reached_type, "
+                " observed_model, account_key, canonical_resets_at_utc) "
+                "VALUES ('codex',?,?,?,?,?,?,'codex',NULL,?,?,?,'pro',NULL,NULL,"
+                "        NULL,NULL,?)",
+                [
+                    # Group 1 (the 5h window _seed_public5_quota_rows filled):
+                    # a capture tied to the second in another spelling, from an
+                    # earlier file, and a reset spelled +00:00.
+                    ("r" * 32, "/roots/rk/sessions/0.jsonl", 70,
+                     "2026-07-31T10:00:00+00:00", "primary", "limit-primary",
+                     300, 11.5, "2026-07-31T15:00:00+00:00",
+                     "2026-07-31T15:00:00+00:00"),
+                    ("r" * 32, "/roots/rk/sessions/a.jsonl", 5,
+                     "2026-07-31T10:30:00Z", "primary", "limit-primary",
+                     300, 11.7, "2026-07-31T15:00:00Z",
+                     "2026-07-31T15:00:00Z"),
+                    # Group 2 (the weekly window): two lines of one file at one
+                    # capture, inserted out of order.
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 60,
+                     "2026-07-31T09:00:00Z", "secondary", "limit-secondary",
+                     10080, 40.5, "2026-08-03T00:00:00Z",
+                     "2026-08-03T00:00:00Z"),
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 40,
+                     "2026-07-31T09:00:00Z", "secondary", "limit-secondary",
+                     10080, 40.0, "2026-08-03T00:00:00Z",
+                     "2026-08-03T00:00:00Z"),
+                    ("r" * 32, "/roots/rk/sessions/b.jsonl", 50,
+                     "2026-07-31T08:00:00Z", "secondary", "limit-secondary",
+                     10080, 39.0, "2026-08-03T00:00:00+00:00",
+                     "2026-08-03T00:00:00+00:00"),
+                ],
+            )
+            # Fixture setup is not a mutation the projector should chase.
+            conn.execute("DELETE FROM quota_window_change_log")
+            conn.execute(
+                "DELETE FROM sqlite_sequence "
+                "WHERE name='quota_window_change_log'")
+            conn.execute("PRAGMA user_version=47")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=48")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_conversations_010_codex_conversation_source_file_identity(
     scenario_dir: Path,
 ) -> None:
@@ -7641,6 +7893,98 @@ def build_per_migration_conversations_010_codex_conversation_source_file_identit
             (migration, TS_STATS_FIVE_APPLIED),
         )
         conn.execute("PRAGMA user_version=10")
+        conn.commit()
+    finally:
+        conn.close()
+    for suffix in (".lock", ".codex.lock"):
+        lock = post.with_name(post.name + suffix)
+        if lock.exists():
+            lock.unlink()
+
+
+def build_per_migration_conversations_011_conversation_latest_meta_indexes(
+    scenario_dir: Path,
+) -> None:
+    """Per-migration goldens for #901 Q11's latest-metadata partial indexes.
+
+    ``pre.sqlite`` is a genuine 010-head conversations store (the current
+    schema apply builds both indexes, so they are dropped again) holding one
+    session whose metadata is sparse: cwd on its first rows only, a git branch
+    on one middle row, the newest rows carrying neither. ``post.sqlite`` is
+    that store after the handler.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "011_conversation_latest_meta_indexes"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+            "007_codex_find_projection_v2_meta",
+            "008_conversation_render_revision",
+            "009_conversation_title_staging_and_account_stamps",
+            "010_codex_conversation_source_file_identity",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute("DROP INDEX IF EXISTS idx_conv_session_latest_cwd")
+        conn.execute("DROP INDEX IF EXISTS idx_conv_session_latest_git_branch")
+        conn.executemany(
+            "INSERT INTO conversation_messages (session_id, uuid, source_path,"
+            " byte_offset, timestamp_utc, entry_type, cwd, git_branch)"
+            " VALUES ('golden-session', ?, '/fixtures/claude/s.jsonl', ?, ?,"
+            " 'human', ?, ?)",
+            [
+                (f"u{i}", i * 100, f"2026-09-10T00:00:{i:02d}.000Z",
+                 "/early" if i < 2 else None,
+                 "branch-mid" if i == 3 else None)
+                for i in range(8)
+            ],
+        )
+        conn.execute("PRAGMA user_version=10")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        (m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration),
+        None,
+    )
+    if handler is None:
+        raise SystemExit(f"conversations migration {migration} not registered")
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=11")
         conn.commit()
     finally:
         conn.close()
@@ -8406,9 +8750,21 @@ def main() -> int:
         FIXTURES_ROOT / "per-migration"
         / "046_codex_source_file_identity"
     )
+    build_per_migration_047_spill_free_read_paths(
+        FIXTURES_ROOT / "per-migration"
+        / "047_spill_free_read_paths"
+    )
+    build_per_migration_048_codex_quota_physical_group_order(
+        FIXTURES_ROOT / "per-migration"
+        / "048_codex_quota_physical_group_order"
+    )
     build_per_migration_conversations_010_codex_conversation_source_file_identity(
         FIXTURES_ROOT / "per-migration"
         / "conversations_010_codex_conversation_source_file_identity"
+    )
+    build_per_migration_conversations_011_conversation_latest_meta_indexes(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_011_conversation_latest_meta_indexes"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

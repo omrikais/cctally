@@ -14,7 +14,8 @@ import pathlib
 import shutil
 
 import pytest
-from conftest import load_script, redirect_paths
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)
 from test_conversation_endpoints import _boot, _get_ct
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -306,7 +307,8 @@ def test_export_v1_codex_default_runs_and_emits_markdown(tmp_path, monkeypatch,
     """Qualified default (anonymized) export runs and emits byte-exact Markdown
     (the anonymize/raw byte-parity vs HTTP is proven in the parity test below)."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     key, _r = _seed_codex(ns, tmp_path, monkeypatch, scenario="root-a-collision")
     rc = ns["cmd_transcript"](_ns_export(key))
     assert rc == 0
@@ -317,7 +319,8 @@ def test_export_v1_codex_default_runs_and_emits_markdown(tmp_path, monkeypatch,
 
 def test_export_v1_codex_speed_fast_ok(tmp_path, monkeypatch, capsysbinary):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     key, _r = _seed_codex(ns, tmp_path, monkeypatch)
     rc = ns["cmd_transcript"](_ns_export(key, raw=True, speed="fast"))
     assert rc == 0
@@ -384,7 +387,8 @@ def test_export_codex_cli_http_byte_parity(tmp_path, monkeypatch, capsysbinary):
 
 def test_search_codex_table_columns(tmp_path, monkeypatch, capsys):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     _seed_codex(ns, tmp_path, monkeypatch)
     rc = ns["cmd_transcript"](_ns_search("Synthetic", source="codex"))
     assert rc == 0
@@ -468,7 +472,8 @@ def test_search_codex_cursor_roundtrip_via_subprocess(tmp_path, monkeypatch):
     import os
     import subprocess
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     _seed_codex(ns, tmp_path, monkeypatch)
     binp = str(pathlib.Path(ns["__file__"]).resolve())
     env = dict(os.environ)
@@ -561,7 +566,8 @@ def test_850_a23_anonymized_codex_export_fails_closed_scoped_or_not(
     planner sees an EMPTY view, so it would have counted zero.
     """
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     key = _a23_two_account_store(ns, tmp_path, monkeypatch)
 
     for account in (None, "a23-label-0"):
@@ -613,7 +619,8 @@ def test_850_anonymized_export_writes_nothing_when_the_count_read_fails(
     one-line message, not a traceback.
     """
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # CLI export/search assertions need fixed-date transcripts, independent of age.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     key, _rollout = _seed_codex(ns, tmp_path, monkeypatch)
     _break_the_fail_closed_count(monkeypatch)
 

@@ -64,12 +64,16 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
 # than the 0.1x every other current model uses, and pinning that fourth column
 # is the only thing that stops a later edit normalizing it back. Mythos Preview
 # retains its historical
-# Project Glasswing rate even though Mythos 5 succeeded it. Extend this map when
-# Anthropic ships a model.
+# Project Glasswing rate even though Mythos 5 succeeded it. Haiku 5.5 is the
+# one current model with a whole-request 100K prompt-length card (#929): these
+# are its base rates, and its four higher `_above_100k_tokens` rates and the
+# threshold marker are pinned in tests/test_haiku_55_pricing.py. Extend this map
+# when Anthropic ships a model.
 _CURRENT_GENERATION_RATES = {
     "claude-fable-5":   (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-fable-5-1": (1e-05,  5e-05,   1.25e-05, 2.5e-07),
     "claude-haiku-4-5": (1e-06,  5e-06,   1.25e-06, 1e-07),
+    "claude-haiku-5-5": (1e-07,  5e-07,   1.25e-07, 1e-08),
     "claude-mythos-5":  (1e-05,  5e-05,   1.25e-05, 1e-06),
     "claude-mythos-5-1": (1e-05, 5e-05,   1.25e-05, 2.5e-07),
     "claude-opus-4-8":  (5e-06,  2.5e-05, 6.25e-06, 5e-07),

@@ -69,9 +69,12 @@ def test_doctor_json_mode_valid_schema(tmp_path):
     )
     payload = json.loads(r.stdout, parse_constant=reject_nonfinite)
     assert payload["schema_version"] == 1
+    # `performance` holds #901's `performance.dashboard_disk_writes`, the one
+    # new check spec §4.6 authorizes (the other pinned category sets gained it
+    # in the same change).
     assert {c["id"] for c in payload["categories"]} == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry",
+        "pricing", "quota", "safety", "telemetry", "performance",
     }
     data = next(
         category for category in payload["categories"]

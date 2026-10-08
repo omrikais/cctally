@@ -149,7 +149,8 @@ def _stack():
 
 
 class Phase:
-    __slots__ = ("name", "elapsed_ms", "count", "meta", "children", "_start", "_stack")
+    __slots__ = ("name", "elapsed_ms", "count", "meta", "children", "_start",
+                 "_stack", "write_bytes", "_write_start")
 
     def __init__(self, name, stack):
         self.name = name
@@ -159,6 +160,8 @@ class Phase:
         self.children = []
         self._start = 0.0
         self._stack = stack
+        self.write_bytes = None
+        self._write_start = None
 
     def set_count(self, n):
         self.count = int(n)
@@ -169,12 +172,17 @@ class Phase:
         self.meta.update(kw)
 
     def __enter__(self):
+        self._write_start = _write_counter_value()
         self._start = time.perf_counter()
         self._stack.append(self)
         return self
 
     def __exit__(self, *exc):
         self.elapsed_ms = (time.perf_counter() - self._start) * 1000.0
+        end = _write_counter_value()
+        if (self._write_start is not None and end is not None
+                and end >= self._write_start):
+            self.write_bytes = end - self._write_start
         # Identity-aware unwind. If a nested phase leaked (its __exit__ was
         # skipped — e.g. an exception escaped a manually CM-bracketed region),
         # drop the leaked frames sitting above us so we never append a phase to
@@ -203,6 +211,8 @@ class Phase:
             d["count"] = self.count
         if self.meta:
             d["meta"] = dict(self.meta)
+        if self.write_bytes is not None:
+            d["write_bytes"] = self.write_bytes
         if self.children:
             d["children"] = [c.to_dict() for c in self.children]
         return d
@@ -225,6 +235,22 @@ class _NullPhase:
 
 
 _NULL_PHASE = _NullPhase()
+
+
+def _write_counter_value():
+    """The process write counter for an armed phase (#901 §5.5), or None.
+
+    Deep-phase samples are optional: they ride an armed trace only, and the
+    always-on totals never depend on them. The counter module is used only
+    when the process already loaded it, so this stays stdlib-only."""
+    module = sys.modules.get("_lib_write_io")
+    if module is None:
+        return None
+    try:
+        reading = module.read_counter()
+    except Exception:  # noqa: BLE001 — a diagnostic must not raise
+        return None
+    return reading.value if reading.status == "ok" else None
 
 
 def phase(name):

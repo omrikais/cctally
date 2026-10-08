@@ -1,6 +1,6 @@
 import { mkdirSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
-import { fulfilJson } from './utils';
+import { e2eRuntimePath, fulfilJson } from './utils';
 
 const MATRIX = [
   { width: 1440, height: 900 },
@@ -19,7 +19,7 @@ async function selectSource(page: Page, source: 'claude' | 'codex' | 'all') {
 
 function screenshotPath(viewport: typeof MATRIX[number], name: string) {
   const phase = process.env.ISSUE_329_CAPTURE_PHASE ?? 'acceptance';
-  const dir = 'e2e/.runtime/issue-329-task-b-evidence';
+  const dir = e2eRuntimePath('issue-329-task-b-evidence');
   mkdirSync(dir, { recursive: true });
   return `${dir}/${phase}-${viewport.width}x${viewport.height}-${name}.png`;
 }

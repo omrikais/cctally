@@ -529,6 +529,11 @@ def _quiesce_stores(home: Path) -> None:
     the corpus openable by the builder and not by the thing that consumes it.
     """
     share = home / ".local" / "share" / "cctally"
+    # #901 W9 (Q14): this builder synced cache.db in-process, so the W9 policy
+    # keeps an idle keeper on it; `journal_mode=DELETE` needs the store to
+    # itself. Release it as an orderly exit would (one PASSIVE, then close).
+    import _lib_wal_checkpoint
+    _lib_wal_checkpoint.finalize()
     for name in ("cache.db", "stats.db"):
         path = share / name
         if not path.is_file():

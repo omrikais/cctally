@@ -15,7 +15,11 @@ from conftest import load_script, redirect_paths
 
 _NOW = dt.datetime(2026, 1, 4, 10, 0, tzinfo=dt.timezone.utc)
 _RESET = int(dt.datetime(2026, 1, 8, tzinfo=dt.timezone.utc).timestamp())
-_CORRUPT_INDEX = "issue_407_current_week_index"
+#: The index the dashboard's current-week read selects. Since #901's epoch
+#: 1017 that is the product's own covering `idx_usage_week_boundary_group`
+#: (`_STATS_READ_INDEX_DDL`), so the test damages it rather than adding an
+#: index of its own that the planner no longer chooses.
+_CORRUPT_INDEX = "idx_usage_week_boundary_group"
 
 
 @pytest.fixture
@@ -55,12 +59,6 @@ def _corrupt_current_week_index(core):
     """Damage only one index B-tree page; leave the DB header/schema readable."""
     conn = core.open_db()
     try:
-        conn.execute(
-            f"CREATE INDEX {_CORRUPT_INDEX} "
-            "ON weekly_usage_snapshots("
-            "week_start_at, week_end_at, week_start_date, captured_at_utc)"
-        )
-        conn.commit()
         plan = " ".join(
             str(row[3])
             for row in conn.execute(
@@ -192,10 +190,30 @@ def test_index_only_stats_corruption_heals_once_after_handle_drain(
         assert live.execute(
             "SELECT COUNT(*) FROM weekly_usage_snapshots"
         ).fetchone()[0] == 1
+        # The rebuilt index carries the read index again, intact (the
+        # integrity check above covers its pages), and the read selects it.
         assert live.execute(
             "SELECT 1 FROM sqlite_schema WHERE name = ?",
             (_CORRUPT_INDEX,),
-        ).fetchone() is None
+        ).fetchone() is not None
+        assert _CORRUPT_INDEX in " ".join(
+            str(row[3])
+            for row in live.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT week_start_at, week_end_at, week_start_date, "
+                "MAX(captured_at_utc) "
+                "FROM weekly_usage_snapshots "
+                "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
+                "GROUP BY week_start_at, week_end_at, week_start_date"
+            )
+        )
+        assert live.execute(
+            "SELECT week_start_at, week_end_at, week_start_date, "
+            "MAX(captured_at_utc) "
+            "FROM weekly_usage_snapshots "
+            "WHERE week_start_at IS NOT NULL AND week_end_at IS NOT NULL "
+            "GROUP BY week_start_at, week_end_at, week_start_date"
+        ).fetchall()
     finally:
         live.close()
     incidents = sorted((core.APP_DIR / "quarantine").glob("stats.db-*"))

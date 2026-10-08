@@ -393,6 +393,22 @@ def _guard_real_prod_migration_log(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _w9_process_state():
+    """#901 W9 (Q14): forget the checkpoint policy module's process state.
+
+    `_lib_wal_checkpoint` keeps, per process, one idle keeper connection per
+    armed store, a timer thread and the policies' timing. A pytest worker is
+    one process for many tests, so without this reset a keeper (three open
+    file descriptors) would outlive every test that armed a store, and one
+    test's policy timing would leak into the next.
+    """
+    yield
+    wal = sys.modules.get("_lib_wal_checkpoint")
+    if wal is not None:
+        wal.reset_policies()
+
+
+@pytest.fixture(autouse=True)
 def _stats_write_sanction(request):
     """#386: a pytest process is itself a sanctioned stats.db writer.
 

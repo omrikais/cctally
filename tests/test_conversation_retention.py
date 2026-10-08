@@ -165,73 +165,6 @@ def test_fresh_cache_uses_incremental_auto_vacuum(tmp_path, monkeypatch):
     assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
 
 
-def test_orchestrated_prune_reclaims_freed_pages(tmp_path, monkeypatch):
-    """The throttled/orchestrated prune reclaims freed pages (incremental vacuum)
-    so the file physically shrinks — deleting rows alone only grows the freelist.
-    Regression for the bloat that pegged the dashboard (8.7 GB cache.db)."""
-    ns, conn, retention = _env(tmp_path, monkeypatch)
-    # Enough old, sizeable messages that deleting them frees many pages.
-    for i in range(2000):
-        _seed_msg(conn, f"old-{i}", OLD, text="x" * 500)
-    _seed_msg(conn, "fresh", FRESH)
-    conn.commit()
-    pages_before = conn.execute("PRAGMA page_count").fetchone()[0]
-
-    stats = retention._maybe_prune_conversation_retention(
-        conn, now_utc=NOW, retention_days=180, force=True)
-
-    assert stats is not None and stats.claude_messages == 2000
-    # incremental_vacuum returned the freed pages to the OS: no freelist backlog
-    # remains and page_count drops. Without the reclaim page_count stays flat.
-    assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
-    assert conn.execute("PRAGMA page_count").fetchone()[0] < pages_before
-
-
-class _PartialVacuumConnection:
-    """Model Python 3.11 stopping after one zero-column vacuum row."""
-
-    def __init__(self, conn):
-        self._conn = conn
-        self.script_calls = 0
-
-    def execute(self, sql, *args, **kwargs):
-        if sql.strip().rstrip(";").lower() == "pragma incremental_vacuum":
-            return self._conn.execute("PRAGMA incremental_vacuum(1)")
-        return self._conn.execute(sql, *args, **kwargs)
-
-    def executescript(self, sql):
-        self.script_calls += 1
-        if self.script_calls == 1:
-            return self._conn.executescript("PRAGMA incremental_vacuum(1);")
-        return self._conn.executescript(sql)
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-
-def test_orchestrated_prune_retries_partial_incremental_vacuum(
-    tmp_path, monkeypatch
-):
-    """A partial zero-column pragma step is retried until reclaim completes."""
-    ns, conn, retention = _env(tmp_path, monkeypatch)
-    for i in range(2000):
-        _seed_msg(conn, f"old-{i}", OLD, text="x" * 500)
-    _seed_msg(conn, "fresh", FRESH)
-    conn.commit()
-    partial = _PartialVacuumConnection(conn)
-
-    stats = retention._maybe_prune_conversation_retention(
-        partial, now_utc=NOW, retention_days=180, force=True)
-
-    assert stats is not None and stats.claude_messages == 2000
-    # The partial step is retried rather than accepted. The exact call count is
-    # no longer fixed at two: #780 sizes each chunk from measured throughput
-    # instead of asking for 4096 pages every time, so what is pinned is that a
-    # step which reclaimed one page did not end the pass.
-    assert partial.script_calls >= 2
-    assert conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
-
-
 def test_codex_events_pruned_threads_retained(tmp_path, monkeypatch):
     """F5: prune only codex_conversation_events; keep codex_conversation_threads
     (and codex_session_entries) so source_analytics's range still resolves."""
@@ -365,33 +298,32 @@ class _CommitCountingConnection:
 def test_orchestrator_commits_each_pruned_conversation_separately(
     tmp_path, monkeypatch
 ):
-    """#315: bound WAL growth with one commit per whole conversation.
-
-    The final extra commit carries only the 24-hour throttle stamp. Provider and
-    maintenance locks stay held by the orchestrator across every boundary.
-    """
+    """#315 + #901: one commit per whole conversation on the visit's own
+    deletion connection, then the stamp. Every flock stays held."""
     ns, conn, retention = _env(tmp_path, monkeypatch)
     for session_id in ("claude-a", "claude-b", "claude-c"):
         _seed_msg(conn, session_id, OLD)
     for index, conversation_key in enumerate(("codex-a", "codex-b"), start=1):
         _seed_codex_event(
-            conn,
-            conversation_key,
-            OLD,
-            source_path=f"/{conversation_key}.jsonl",
-            line_offset=index,
-        )
+            conn, conversation_key, OLD,
+            source_path=f"/{conversation_key}.jsonl", line_offset=index)
     conn.commit()
-    counted = _CommitCountingConnection(conn)
+    opened = []
+    real_open = retention._open_deletion_connection
 
+    def counting_open(path):
+        proxy = _CommitCountingConnection(real_open(path))
+        opened.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(retention, "_open_deletion_connection", counting_open)
     stats = retention._maybe_prune_conversation_retention(
-        counted, now_utc=NOW, retention_days=180, force=True
-    )
+        conn, now_utc=NOW, retention_days=180, force=True)
 
-    assert stats is not None
+    assert stats is not None and stats.complete
     assert stats.claude_sessions == 3
     assert stats.codex_conversations == 2
-    assert counted.commit_calls == 6  # five whole groups + final stamp
+    assert [proxy.commit_calls for proxy in opened] == [6]  # 5 groups + stamp
     assert conn.execute(
         "SELECT COUNT(*) FROM cache_meta "
         "WHERE key='conversation_retention_last_prune_at'"
@@ -402,32 +334,29 @@ def test_orchestrator_commits_each_pruned_conversation_separately(
 def test_intermediate_commit_failure_keeps_completed_groups_and_retries_rest(
     tmp_path, monkeypatch
 ):
-    """#315 partial-progress contract.
-
-    A completed conversation remains durably pruned, the active conversation
-    rolls back whole, and no throttle stamp suppresses the next retry.
-    """
+    """#315 partial-progress contract, on the per-visit deletion connection:
+    a completed conversation stays pruned AND charged, the active one rolls
+    back whole, and no stamp suppresses the retry."""
     import pytest
 
     ns, conn, retention = _env(tmp_path, monkeypatch)
     _seed_msg(conn, "a-first", OLD, text="FirstUnique")
     _seed_msg(conn, "b-second", OLD, text="SecondUnique")
     conn.commit()
-    failing = _CommitCountingConnection(conn, fail_on_commit=2)
+    real_open = retention._open_deletion_connection
+    monkeypatch.setattr(
+        retention, "_open_deletion_connection",
+        lambda path: _CommitCountingConnection(real_open(path),
+                                               fail_on_commit=2))
 
     with pytest.raises(RuntimeError, match="synthetic intermediate commit failure"):
         retention._maybe_prune_conversation_retention(
-            failing, now_utc=NOW, retention_days=180, force=True
-        )
+            conn, now_utc=NOW, retention_days=180, force=True)
+    monkeypatch.setattr(retention, "_open_deletion_connection", real_open)
 
-    remaining_sessions = {
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT session_id FROM conversation_messages"
-        )
-    }
-    assert len(remaining_sessions) == 1
-    assert remaining_sessions <= {"a-first", "b-second"}
+    remaining = {row[0] for row in conn.execute(
+        "SELECT DISTINCT session_id FROM conversation_messages")}
+    assert remaining == {"b-second"}
     assert conn.execute(
         "SELECT COUNT(*) FROM cache_meta "
         "WHERE key='conversation_retention_last_prune_at'"
@@ -436,10 +365,9 @@ def test_intermediate_commit_failure_keeps_completed_groups_and_retries_rest(
     conn.commit()
 
     retry = retention._maybe_prune_conversation_retention(
-        conn, now_utc=NOW, retention_days=180, force=True
-    )
+        conn, now_utc=NOW, retention_days=180, force=True)
 
-    assert retry is not None and retry.claude_sessions == 1
+    assert retry is not None and retry.claude_sessions == 1 and retry.complete
     assert conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 0
     assert conn.execute(
         "SELECT COUNT(*) FROM cache_meta "
@@ -525,38 +453,30 @@ class _MaintenanceFlockProbingConnection:
 def test_prune_pass_does_not_starve_shared_maintenance_readers(
     tmp_path, monkeypatch
 ):
-    """A running prune must stay invisible to the dashboard Sessions card.
-
-    ``read_session_titles_bounded`` is a fail-CLOSED panel reader: it takes the
-    conversations maintenance flock ``LOCK_SH | LOCK_NB`` and returns ``{}`` on
-    any contention, so every Claude session title blanks for as long as anything
-    holds that flock EXCLUSIVE. The prune used to hold it exclusive for its whole
-    pass — deletes plus the post-commit ``_reclaim_incremental_vacuum`` tail —
-    which on a large store is minutes, not milliseconds.
-
-    The prune is a WRITER, not a family replacement, and the flock's job here is
-    only to serialize prune-vs-prune and prune-vs-vacuum. So it claims the flock
-    exclusively (that claim is what wins the race) and then holds it SHARED,
-    which readers tolerate and any rival ``LOCK_EX | LOCK_NB`` claim still does
-    not.
-    """
+    """A running visit stays invisible to the fail-CLOSED panel readers: it
+    claims the maintenance flock exclusively, then holds it SHARED, which a
+    reader tolerates and a rival `LOCK_EX | LOCK_NB` claim still does not.
+    Sampled at every commit of the visit's deletion connection."""
     ns, conn, retention = _env(tmp_path, monkeypatch)
     for session_id in ("old1", "old2", "old3"):
         _seed_msg(conn, session_id, OLD)
     conn.commit()
-    probed = _MaintenanceFlockProbingConnection(conn)
+    probes = []
+    real_open = retention._open_deletion_connection
 
+    def probing_open(path):
+        proxy = _MaintenanceFlockProbingConnection(real_open(path))
+        probes.append(proxy)
+        return proxy
+
+    monkeypatch.setattr(retention, "_open_deletion_connection", probing_open)
     stats = retention._maybe_prune_conversation_retention(
-        probed, now_utc=NOW, retention_days=180, force=True
-    )
+        conn, now_utc=NOW, retention_days=180, force=True)
 
     assert stats is not None and stats.claude_sessions == 3
-    # Non-vacuous: the samples were actually taken, mid-pass, more than once.
+    [probed] = probes
     assert len(probed.shared) >= 3
-    # THE regression: a shared reader is never locked out while a prune runs.
     assert all(probed.shared), probed.shared
-    # ...and the mutual exclusion the flock exists for is unchanged: a rival
-    # prune / `db vacuum` still cannot claim it.
     assert not any(probed.exclusive), probed.exclusive
 
 
@@ -978,27 +898,18 @@ def _fill_and_free_pages(conn, rows=2000):
 
 def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
         tmp_path, monkeypatch):
-    """The deterministic reproduction (#780, spec §4d).
-
-    A test replacement for the chunk seam takes the REAL SQLite write lock,
-    signals a barrier and holds it while a second thread runs the reader
-    opener. The failing statement is RECORDED, never predicted: the spec's
-    candidates are the first write-capable ones, but the instrumentation is
-    what says which loses.
-
-    The maintenance flock is explicitly NOT the cause and cannot be — it is
-    downgraded to SHARED before reclaim, and the reader takes it SHARED too.
-    """
+    """The deterministic reproduction (#780, spec §4d), on a #901 reclaim
+    chunk: the chunk already holds the real write lock (its own BEGIN
+    IMMEDIATE), so the seam only signals and waits while a second thread runs
+    the old full opener. The failing statement is RECORDED, never predicted."""
     import threading
 
     ns, conn = _readonly_env(tmp_path, monkeypatch)
-    # The store module the OPENER uses, not a second import of the same name:
-    # `load_script` builds its own sibling namespace, and arming a trace hook on
-    # a different instance records nothing.
     store_mod = ns["_cctally_cache"]._cctally_store
     retention = importlib.import_module("_lib_conversation_retention")
     freed = _fill_and_free_pages(conn)
     assert freed > 0, "the fixture must really have a freelist to reclaim"
+    db_path = retention._resolve_main_db_path(conn)
     conn.close()
 
     holding = threading.Event()
@@ -1007,12 +918,8 @@ def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
     real_chunk = retention._run_incremental_vacuum_chunk
 
     def locking_chunk(chunk_conn, pages):
-        # BEGIN IMMEDIATE takes the real write lock, which is what a reclaim
-        # holds while it moves pages.
-        chunk_conn.execute("BEGIN IMMEDIATE")
         holding.set()
         release.wait(10)
-        chunk_conn.commit()
         return real_chunk(chunk_conn, pages)
 
     def read_under_the_lock():
@@ -1021,8 +928,16 @@ def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
         store_mod._TRACE_HOOK = observed["statements"].append
         writer = None
         try:
-            # The OLD reader route: the full mutation-capable opener.
             writer = ns["open_conversations_db"]()
+            # #901 Q14: the full opener writes nothing on a current schema, so
+            # it no longer needs the write lock (its `PRAGMA auto_vacuum` was
+            # the statement that used to lose). The reader takes the lock
+            # with a deliberately write-requiring statement instead, with no
+            # busy wait, so it loses while the chunk holds the lock.
+            writer.execute("PRAGMA busy_timeout=0")
+            writer.execute(
+                "INSERT INTO cache_meta(key, value) VALUES ('g780-probe', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         except sqlite3.OperationalError as exc:
             observed["error"] = str(exc)
             observed["failed_on"] = (
@@ -1039,37 +954,75 @@ def test_the_reader_that_loses_the_write_lock_is_named_by_instrumentation(
                         locking_chunk)
     reader = threading.Thread(target=read_under_the_lock, daemon=True)
     reader.start()
-    prune_conn = ns["open_conversations_db"]()
+    reclaim = retention.open_reclaim_connection(db_path)
+    retention.normalize_reclaim_record(reclaim, NOW)
     try:
-        retention.run_reclaim_pass(
-            prune_conn, now_utc=NOW, deadline_seconds=0.5)
+        retention.reclaim_chunk(reclaim, now_utc=NOW, pages=16)
     finally:
         release.set()
         reader.join(20)
-        prune_conn.close()
+        reclaim.close()
 
     assert holding.is_set(), "the chunk seam must really have held the lock"
-    # Record what was observed. This assertion is deliberately about the SHAPE
-    # of the evidence, because the spec forbids asserting a predicted loser.
     assert observed["statements"], (
         "the reader opener must have executed at least one statement under "
         f"the held write lock; error was {observed['error']!r}"
     )
     if observed["failed_on"] is not None:
-        # Not the maintenance flock, and it cannot be: reclaim downgrades it to
-        # SHARED and the reader takes it SHARED too.
         assert "flock" not in str(observed["failed_on"]).lower()
-    # What the instrumentation ACTUALLY reported, recorded rather than
-    # predicted: `PRAGMA auto_vacuum=INCREMENTAL`, with `database is locked`.
-    # That is the first statement `_cctally_store.apply_policy` emits, and it
-    # is write-capable, so a read route that routes through the full opener is
-    # a writer that loses the SQLite write lock to a reclaim pass. The spec
-    # listed it as a candidate; this is the measurement.
-    assert observed["failed_on"] == "PRAGMA auto_vacuum=INCREMENTAL", (
+    assert "PRAGMA auto_vacuum=INCREMENTAL" not in observed["statements"], (
+        "a current-schema open reissued the write-capable auto_vacuum pragma")
+    assert str(observed["failed_on"]).startswith(
+        "INSERT INTO cache_meta(key, value) VALUES ('g780-probe'"), (
         f"the instrumentation reported {observed['failed_on']!r} — record the "
         "new loser here rather than keeping a stale one"
     )
     assert "locked" in (observed["error"] or "")
+
+
+def test_a_current_schema_open_writes_nothing(tmp_path, monkeypatch):
+    """#901 Q14: opening a store whose schema is current writes no page.
+
+    A pinned reader keeps every frame in the WAL, so the WAL's growth across
+    one more open-and-close of each full writable opener is what it wrote;
+    `PRAGMA auto_vacuum` rewrote page 1 on every conversations.db open."""
+    ns, conn = _readonly_env(tmp_path, monkeypatch)
+    conn.close()
+    store_mod = ns["_cctally_cache"]._cctally_store
+    core = sys.modules["_cctally_core"]
+    paths = {
+        "conversations.db": Path(core.CONVERSATIONS_DB_PATH),
+        "cache.db": Path(core.CACHE_DB_PATH),
+    }
+    pinned = []
+    for path in paths.values():
+        reader = sqlite3.connect(path)
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+        pinned.append(reader)
+    statements: list[str] = []
+    previous = store_mod._TRACE_HOOK
+    try:
+        before = {name: _wal_bytes(path) for name, path in paths.items()}
+        store_mod._TRACE_HOOK = statements.append
+        try:
+            for opener in ("open_conversations_db", "open_cache_db"):
+                ns[opener]().close()
+        finally:
+            store_mod._TRACE_HOOK = previous
+        after = {name: _wal_bytes(path) for name, path in paths.items()}
+    finally:
+        for reader in pinned:
+            reader.rollback()
+            reader.close()
+    assert after == before, (after, before)
+    assert not any(s.startswith("PRAGMA auto_vacuum=") for s in statements), (
+        statements)
+
+
+def _wal_bytes(path: Path) -> int:
+    wal = Path(f"{path}-wal")
+    return wal.stat().st_size if wal.exists() else 0
 
 
 def test_the_readonly_opener_does_not_execute_the_two_write_pragmas(
@@ -1118,159 +1071,24 @@ def test_the_readonly_opener_does_not_execute_the_two_write_pragmas(
         reader.close()
 
 
-def test_a_reclaim_pass_respects_its_wall_clock_deadline(tmp_path, monkeypatch):
-    ns, conn = _readonly_env(tmp_path, monkeypatch)
-    retention = importlib.import_module("_lib_conversation_retention")
-    assert _fill_and_free_pages(conn) > 0
-    ticks = {"n": 0}
-
-    def fake_clock():
-        # Every reading advances by a second, so the second chunk is past a
-        # 2s budget however fast the disk is.
-        ticks["n"] += 1
-        return float(ticks["n"])
-
-    outcome = retention._reclaim_incremental_vacuum(
-        conn, deadline_seconds=2.0, clock=fake_clock)
-    assert outcome.deadline_hit
-    assert outcome.freelist_after > 0, "the pass stopped short, by design"
-    conn.close()
-
-
-def test_pending_reclaim_state_survives_to_the_next_pass(tmp_path, monkeypatch):
-    ns, conn = _readonly_env(tmp_path, monkeypatch)
-    retention = importlib.import_module("_lib_conversation_retention")
-    assert _fill_and_free_pages(conn) > 0
-    ticks = {"n": 0}
-
-    def fake_clock():
-        ticks["n"] += 1
-        return float(ticks["n"])
-
-    first = retention.run_reclaim_pass(
-        conn, now_utc=NOW, deadline_seconds=2.0, clock=fake_clock)
-    assert first["complete"] is False
-    state = retention.read_reclaim_pending(conn)
-    assert state is not None
-    assert state["freelist_count"] > 0
-    assert state["unreclaimed_bytes"] > 0
-    second = retention.run_reclaim_pass(conn, now_utc=NOW)
-    assert second["complete"] is True
-    assert retention.read_reclaim_pending(conn) is None
-    conn.close()
-
-
-def test_a_zero_freelist_with_a_busy_checkpoint_does_not_clear_pending(
-        tmp_path, monkeypatch):
-    """Completion is physical. `incremental_vacuum` drops `page_count` while
-    the bytes are still in the WAL, so a zero freelist alone is not success."""
-    ns, conn = _readonly_env(tmp_path, monkeypatch)
-    retention = importlib.import_module("_lib_conversation_retention")
-    _fill_and_free_pages(conn)
-    monkeypatch.setattr(retention, "_checkpoint_truncate",
-                        lambda c: (1, 42, 0))
-    result = retention.run_reclaim_pass(conn, now_utc=NOW)
-    assert result["complete"] is False
-    assert retention.read_reclaim_pending(conn) is not None
-    conn.close()
-
-
-def test_a_no_progress_pass_stays_pending(tmp_path, monkeypatch):
-    ns, conn = _readonly_env(tmp_path, monkeypatch)
-    retention = importlib.import_module("_lib_conversation_retention")
-    assert _fill_and_free_pages(conn) > 0
-    monkeypatch.setattr(
-        retention, "_run_incremental_vacuum_chunk",
-        lambda c, pages: int(c.execute("PRAGMA freelist_count").fetchone()[0]))
-    result = retention.run_reclaim_pass(conn, now_utc=NOW)
-    assert result["complete"] is False
-    assert result["reclaim"]["pages_reclaimed"] == 0
-    assert result["reclaim"]["made_progress"] is False
-    assert retention.read_reclaim_pending(conn) is not None
-    conn.close()
-
-
-def test_a_pass_with_no_new_deletion_still_continues_the_backlog(
-        tmp_path, monkeypatch):
-    """The old reclaim ran only when the prune had deleted something, so a
-    store that fell behind had no way to catch up."""
-    ns, conn, retention = _env(tmp_path, monkeypatch)
-    _seed_msg(conn, "fresh", FRESH)
-    conn.commit()
-    retention._write_reclaim_pending(conn, {
-        "freelist_count": 5, "unreclaimed_bytes": 5 * 4096,
-        "attempted_at": NOW.isoformat(), "made_progress": True,
-        "deadline_hit": True,
-    })
-    conn.commit()
-    ran = []
-    real = retention.run_reclaim_pass
-    monkeypatch.setattr(
-        retention, "run_reclaim_pass",
-        lambda c, **kw: (ran.append(1), real(c, **kw))[1])
-    stats = retention._maybe_prune_conversation_retention(
-        conn, now_utc=NOW, retention_days=180, force=True)
-    assert stats is not None and stats.total_rows == 0
-    assert ran == [1], "an outstanding backlog is continued with no new deletion"
-
-
-def test_an_escalated_backlog_does_not_wait_for_the_daily_throttle(
-        tmp_path, monkeypatch):
-    ns, conn, retention = _env(tmp_path, monkeypatch)
-    _seed_msg(conn, "fresh", FRESH)
-    retention._stamp_retention_prune(conn, NOW)
-    retention._write_reclaim_pending(conn, {
-        "freelist_count": 1_000_000,
-        "unreclaimed_bytes": retention.RECLAIM_ESCALATION_BYTES + 1,
-        "attempted_at": NOW.isoformat(), "made_progress": True,
-        "deadline_hit": True,
-    })
-    conn.commit()
-    ran = []
-    monkeypatch.setattr(
-        retention, "run_reclaim_pass",
-        lambda c, **kw: (ran.append(1), {
-            "reclaim": {}, "checkpoint": {}, "pending": None, "complete": True,
-        })[1])
-    stats = retention._maybe_prune_conversation_retention(
-        conn, now_utc=NOW, retention_days=180)
-    assert stats is None, "deletion stays throttled"
-    assert ran == [1], "reclaim continues anyway"
-
-
-def test_a_below_escalation_backlog_still_waits_for_the_throttle(
-        tmp_path, monkeypatch):
-    ns, conn, retention = _env(tmp_path, monkeypatch)
-    _seed_msg(conn, "fresh", FRESH)
-    retention._stamp_retention_prune(conn, NOW)
-    retention._write_reclaim_pending(conn, {
-        "freelist_count": 1, "unreclaimed_bytes": 4096,
-        "attempted_at": NOW.isoformat(), "made_progress": True,
-        "deadline_hit": False,
-    })
-    conn.commit()
-    ran = []
-    monkeypatch.setattr(
-        retention, "run_reclaim_pass",
-        lambda c, **kw: (ran.append(1), {})[1])
-    assert retention._maybe_prune_conversation_retention(
-        conn, now_utc=NOW, retention_days=180) is None
-    assert ran == []
-
-
 def test_the_backlog_ceiling_refuses_a_new_rebuild(tmp_path, monkeypatch):
+    """#780 + #901: judged on the OBSERVED freelist; a stale record alone
+    refuses nothing."""
     ns, conn, retention = _env(tmp_path, monkeypatch)
     conv = ns["open_conversations_db"]()
     try:
-        retention._write_reclaim_pending(conv, {
-            "freelist_count": 9_999_999,
-            "unreclaimed_bytes": retention.RECLAIM_CEILING_BYTES,
-            "attempted_at": NOW.isoformat(), "made_progress": False,
-            "deadline_hit": True,
-        })
-        conv.commit()
+        monkeypatch.setattr(retention, "observed_reclaim_backlog_bytes",
+                            lambda c: retention.RECLAIM_CEILING_BYTES)
         stats = ns["sync_claude_conversations"](conv, rebuild=True)
         assert stats.deferred_reason == "reclaim_backlog_over_ceiling"
+        monkeypatch.setattr(retention, "observed_reclaim_backlog_bytes",
+                            lambda c: retention.RECLAIM_CEILING_BYTES - 1)
+        retention._write_reclaim_pending(conv, {
+            "freelist_count": 9_999_999,
+            "unreclaimed_bytes": retention.RECLAIM_CEILING_BYTES})
+        conv.commit()
+        stats = ns["sync_claude_conversations"](conv, rebuild=True)
+        assert stats.deferred_reason != "reclaim_backlog_over_ceiling"
     finally:
         conv.close()
 
@@ -1293,25 +1111,56 @@ def test_the_backlog_ceiling_raises_a_doctor_fail(tmp_path, monkeypatch):
     import _lib_doctor as doctor
 
     retention = importlib.import_module("_lib_conversation_retention")
-    over = {"freelist_count": 1, "unreclaimed_bytes":
-            retention.RECLAIM_CEILING_BYTES, "attempted_at": NOW.isoformat()}
-    escalated = {"freelist_count": 1, "unreclaimed_bytes":
-                 retention.RECLAIM_ESCALATION_BYTES, "attempted_at":
-                 NOW.isoformat()}
-    fail = doctor._check_db_conversations_reclaimable(
-        _doctor_state(conversations_reclaim_pending=over))
+    pages = retention.RECLAIM_CEILING_BYTES // 4096
+    fail = doctor._check_db_conversations_reclaimable(_doctor_state(
+        conversations_db_page_count=pages * 2,
+        conversations_db_freelist_count=pages,
+        conversations_db_page_size=4096))
     assert fail.severity == "fail"
-    warn = doctor._check_db_conversations_reclaimable(
-        _doctor_state(conversations_reclaim_pending=escalated))
-    assert warn.severity == "warn"
+    stale_record_only = doctor._check_db_conversations_reclaimable(_doctor_state(
+        conversations_db_page_count=1000, conversations_db_freelist_count=10,
+        conversations_db_page_size=4096,
+        conversations_reclaim_pending={
+            "freelist_count": 1,
+            "unreclaimed_bytes": retention.RECLAIM_CEILING_BYTES}))
+    assert stale_record_only.severity == "ok"
 
 
-def test_no_pending_record_leaves_the_doctor_check_byte_identical(tmp_path):
-    """The backlog rides on an existing check id, and contributes nothing on a
-    store that has never fallen behind — which is every doctor fixture."""
+def _reclaim_warn_state(**kw):
+    pages = 4 * 1024 * 1024 * 1024 // 4096          # 4 GiB free, 40%
+    return _doctor_state(conversations_db_page_count=int(pages * 2.5),
+                         conversations_db_freelist_count=pages,
+                         conversations_db_page_size=4096, **kw)
+
+
+def test_the_reclaim_warn_distinguishes_a_paced_wait_from_a_refusal():
+    """#901 Q9 (§5.4 Doctor): a planner refusal is named by reason, never
+    reported as pacing progress; the §5.7 summary is unchanged."""
     import _lib_doctor as doctor
 
-    plain = doctor._check_db_conversations_reclaimable(_doctor_state())
-    assert plain.severity == "ok"
-    assert "reclaim_pending" not in plain.details
-    assert "reclaim_backlog_bytes" not in plain.details
+    paced = doctor._check_db_conversations_reclaimable(_reclaim_warn_state())
+    assert paced.severity == "warn"
+    assert paced.summary == (
+        "Reclaiming 4.0 GiB of free transcript space at a paced rate.")
+    assert (paced.details["reclaim_wait"], paced.details["reclaim_refusal"]) \
+        == ("paced", None)
+    refused = doctor._check_db_conversations_reclaimable(_reclaim_warn_state(
+        dashboard_disk_writes={"mode": "discovery", "instances": [
+            {"port": 8789, "probe": "ok", "write_io": {"reclaimRefusal": {
+                "reason": "wal_checksum_mismatch",
+                "at": "2026-10-03T12:31:00Z"}}},
+            {"port": 8790, "probe": "ok", "write_io": {"reclaimRefusal": {
+                "reason": "read_budget_exhausted",
+                "at": "2026-10-03T12:35:00Z"}}}]}))
+    assert refused.severity == "warn"
+    assert refused.summary == paced.summary
+    assert refused.details["reclaim_wait"] == "refused"
+    assert refused.details["reclaim_refusal"] == {
+        "reason": "read_budget_exhausted", "at": "2026-10-03T12:35:00Z",
+        "port": 8790}
+    assert "refused (read budget exhausted)" in refused.remediation
+    failing = doctor._check_db_conversations_reclaimable(_reclaim_warn_state(
+        conversations_reclaim_pending={"eligible": True, "last_failure": {
+            "reason": "no_checkpoint_on_close_unavailable",
+            "at": "2026-10-03T12:00:00Z"}}))
+    assert failing.details["reclaim_wait"] == "failing"

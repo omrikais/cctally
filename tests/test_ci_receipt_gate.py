@@ -12,7 +12,9 @@ The two halves are not interchangeable. An exact-string assertion cannot say
 what the string means, and an evaluator over a condition nobody pinned would
 happily certify a rewritten one.
 """
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -337,6 +339,52 @@ def test_only_test_macos_carries_the_receipt_conjunct():
         needs = _ci()["jobs"][job]["needs"]
         needs = [needs] if isinstance(needs, str) else needs
         assert GATE_JOB not in needs, needs
+
+
+def test_e2e_reader_does_not_reap_unowned_port_listeners(tmp_path):
+    """#897: publication must use the same non-destructive browser gate.
+
+    A safe local certification alone is insufficient if the ensuing exact-SHA
+    CI run still invokes the legacy reaper against an unowned listener.
+    """
+    commands = "\n".join(
+        line for step in _ci()["jobs"]["e2e-reader"]["steps"]
+        for line in step.get("run", "").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert "free-port.sh" not in commands
+    run = next(
+        step["run"] for step in _ci()["jobs"]["e2e-reader"]["steps"]
+        if step.get("name") == "Run reader e2e suite"
+    )
+    # Execute the actual CI launcher with only the expensive browser command
+    # replaced. CLI reporter selection drops config reporter options, so its
+    # retained HTML path and non-opening mode must reach that command via env.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    npx = fake_bin / "npx"
+    npx.write_text("#!/bin/sh\n/usr/bin/env\n")
+    npx.chmod(0o755)
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("CCTALLY_E2E_", "PLAYWRIGHT_", "PW_TEST_HTML_"))
+    }
+    environment.update(
+        HOME=str(tmp_path), PATH=f"{fake_bin}:{os.environ['PATH']}",
+        GITHUB_RUN_ID="897", GITHUB_RUN_ATTEMPT="1",
+        GITHUB_ENV=str(tmp_path / "github-env"),
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", run], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=True,
+    )
+    exported = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    evidence = tmp_path / ".cache/cctally-ui-qa-evidence/ci/e2e-reader-897-1"
+    assert exported.get("PLAYWRIGHT_HTML_OUTPUT_DIR") == str(evidence / "playwright-report")
+    assert exported.get("PLAYWRIGHT_HTML_OPEN") == "never"
+    assert exported.get("PLAYWRIGHT_JSON_OUTPUT_NAME") == str(evidence / "playwright.json")
 
 
 def test_test_macos_declares_both_gates_in_needs():

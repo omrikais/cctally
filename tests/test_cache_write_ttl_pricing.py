@@ -209,7 +209,7 @@ _CRSPEC.loader.exec_module(cache_report)
 
 def _dollars(cc, cr, h):
     return cache_report._compute_entry_cache_dollars(
-        OPUS5, cc, cr, pricing=pricing.CLAUDE_MODEL_PRICING, cache_1h_tokens=h)
+        OPUS5, cc, cr, input_tokens=0, pricing=pricing.CLAUDE_MODEL_PRICING, cache_1h_tokens=h)
 
 
 def test_wasted_uses_the_1h_rate_for_the_1h_portion():
@@ -226,7 +226,7 @@ def test_wasted_is_unchanged_for_an_all_5m_entry():
 
 def test_wasted_is_unchanged_when_the_split_is_unknown():
     baseline = cache_report._compute_entry_cache_dollars(
-        OPUS5, 1_000_000, 0, pricing=pricing.CLAUDE_MODEL_PRICING)
+        OPUS5, 1_000_000, 0, input_tokens=0, pricing=pricing.CLAUDE_MODEL_PRICING)
     assert _dollars(1_000_000, 0, None) == baseline
 
 

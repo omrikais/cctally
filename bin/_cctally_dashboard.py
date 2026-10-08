@@ -764,6 +764,7 @@ from _lib_snapshot_cache import (
     _reset_sig as _snapshot_reset_sig,
 )
 import _lib_tick_stats
+import _lib_write_io
 
 
 # === F22a: count the silent Group A cache-open failures (#583 S1 §1.6) =====
@@ -2855,11 +2856,13 @@ def _conversation_sync_loop(
     while not stop.is_set():
         t0 = monotonic()
         cpu0 = thread_time_ns()
+        written = _lib_write_io.begin_interval("conversation")
         try:
             status = run_iteration() or "ok"
         except Exception:  # noqa: BLE001 — the worker must outlive one bad pass
             _log_sync_iteration_failure()
             status = "error"
+        observation = _lib_write_io.end_interval(written)
         work = max(0.0, monotonic() - t0)
         cpu_ns = max(0, thread_time_ns() - cpu0)
         seq += 1
@@ -2882,6 +2885,12 @@ def _conversation_sync_loop(
                     "codex", "not_observed"),
                 claude_files=getattr(status, "files", {}).get("claude", 0),
                 codex_files=getattr(status, "files", {}).get("codex", 0),
+                # #901 §5.5: the pass's process write delta. It includes the
+                # main loop's concurrent work, which `write_overlap` flags; it
+                # is never summed with a tick's.
+                process_write_bytes=observation.process_write_bytes,
+                write_status=observation.status,
+                write_overlap=observation.overlap,
             )
         deadline = _conversation_next_deadline(t0, interval, work)
         remaining = deadline - monotonic()
@@ -6894,6 +6903,38 @@ def _assemble_projects_via_cache(
     return buckets, total_cost_by_week, key_by_bucket
 
 
+def _projects_week_usage_rows(
+    conn: "sqlite3.Connection", since_date: str, end_date: str,
+) -> list:
+    """The anchored, non-NULL weekly readings of the projects window, oldest
+    capture first: ``(week_start_date, week_start_at, weekly_percent,
+    captured_at_utc, id)`` for every week date in ``[since_date, end_date)``.
+
+    The window holds ``weeks_back`` weeks of status-line readings, which is
+    not a bound on a sorter, so the rows are ordered here rather than by an
+    ``ORDER BY`` that built a temp b-tree over all of them on every build
+    (#901 Q11). ``(captured_at_utc, id)`` is a total order — ``id`` is the
+    primary key and ``captured_at_utc`` is NOT NULL TEXT, which Python
+    compares in the same code-point order as SQLite's BINARY collation — so
+    the result is exactly the former ``ORDER BY captured_at_utc ASC, id ASC``.
+    """
+    rows = conn.execute(
+        " SELECT week_start_date, week_start_at, weekly_percent,"
+        " captured_at_utc, id"
+        " FROM weekly_usage_snapshots"
+        # Held rows excluded: these rows feed `latest_usage_by_segment`, which
+        # is a weekly read, and the pre-fetch must select the same population
+        # the reducer would select for itself (#769 S11, #824).
+        " WHERE week_start_date >= ? AND week_start_date < ?"
+        " AND date(week_start_date) IS NOT NULL"
+        " AND weekly_percent IS NOT NULL"
+        + _cctally_core.weekly_held_exclusion(conn),
+        (since_date, end_date),
+    ).fetchall()
+    rows.sort(key=lambda row: (row[3], row[4]))
+    return rows
+
+
 def _build_projects_envelope(
     conn: "sqlite3.Connection",
     *,
@@ -7165,24 +7206,8 @@ def _build_projects_envelope(
     # valid rendered-week row (#620 S1 A3).
     weekly_pct_by_week: dict[dt.datetime, float] = {}
     try:
-        cur = conn.execute(
-            " SELECT week_start_date, week_start_at, weekly_percent,"
-            " captured_at_utc, id"
-            " FROM weekly_usage_snapshots"
-            # Held rows excluded: these rows feed `latest_usage_by_segment`,
-            # which is a weekly read, and the pre-fetch must select the same
-            # population the reducer would select for itself (#769 S11, #824).
-            " WHERE week_start_date >= ? AND week_start_date < ?"
-            " AND date(week_start_date) IS NOT NULL"
-            " AND weekly_percent IS NOT NULL"
-            + _cctally_core.weekly_held_exclusion(conn) +
-            " ORDER BY captured_at_utc ASC, id ASC",
-            (
-                since_dt.date().isoformat(),
-                cw_end.date().isoformat(),
-            ),
-        )
-        rows = cur.fetchall()
+        rows = _projects_week_usage_rows(
+            conn, since_dt.date().isoformat(), cw_end.date().isoformat())
     except sqlite3.OperationalError:
         # No weekly_usage_snapshots table — leaves attributed_pct = None
         # throughout (acceptable per spec §2.7).
@@ -8086,6 +8111,15 @@ class _DiagnosisSelectorError(Exception):
 
 
 # ── /api/debug/backend on-demand cache-state helpers (issue #276, Session A) ──
+
+def _debug_write_io() -> dict:
+    """`writeIo` for the debug surfaces (#901 §5.5). A telemetry fault never
+    takes the diagnostic down, and is never reported as a zero."""
+    try:
+        return _lib_write_io.write_io_payload()
+    except Exception:  # noqa: BLE001 — diagnostics fail closed
+        return {"status": "unavailable", "reason": "counter_error"}
+
 # All read-only, cheap, and privacy-safe: they leak ONLY row counts, signature
 # legs (ints/tuples), pending-flag names, and the tool version — never prompt /
 # prose / paths. Computed on demand so cache_state is available even with
@@ -8494,6 +8528,7 @@ _GET_ROUTES = (
     ("exact", "/api/diagnosis", "_handle_get_diagnosis",
      ("scope", "endpoint.diagnosis"), False),
     ("exact", "/api/debug/backend", "_handle_get_debug_backend", None, False),
+    ("exact", "/api/debug/backend/write-io", "_handle_get_debug_backend_write_io", None, False),
     ("exact", "/api/conversations/facets", "_handle_get_conversations_facets",
      ("scope", "endpoint.conversations_facets"), False),
     ("exact", "/api/conversations", "_handle_get_conversations",
@@ -9224,10 +9259,25 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             # stats failure reported as a cache one sends the user to
             # `cctally cache-sync --rebuild`.
             "stats_faults": stats_faults,
+            # #901 §5.5: kernel-accounted process writes, the trailing
+            # five-minute statistic and its budget verdict. Additive camelCase.
+            "writeIo": _debug_write_io(),
         }
         if body["phases"] is None:
             body["note"] = "tracing_disabled"
         self._respond_json(200, body)
+
+    def _handle_get_debug_backend_write_io(self) -> None:
+        """GET ``/api/debug/backend/write-io`` — the ``writeIo`` object alone
+        (#901 §5.6): what ``cctally doctor`` reads from a running dashboard
+        inside its bounded timeout, without ``/api/debug/backend``'s
+        on-demand cache-table counts. Same gates, same order: the bearer
+        (``_require_api_auth``, before dispatch), then the loopback TCP peer
+        and the IP-literal ``Host``. No bypass exists."""
+        if not self._require_debug_backend_allowed():
+            return
+        self._respond_json(200, {"schemaVersion": 1,
+                                 "writeIo": _debug_write_io()})
 
     def _handle_post_debug_backend_trace(self) -> None:
         """POST ``/api/debug/backend/trace`` — arm the deep phase trace (§3.2).
@@ -12485,6 +12535,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
                 **_make_sync_loop_collaborators(ref=ref, hub=hub),
             )
 
+    # #901 §5.6: this process's write-telemetry identity, registered before
+    # the first build so the in-process doctor reads its own snapshot from the
+    # first tick; the bound port replaces the requested one once known.
+    write_instance_id = _lib_write_io.new_instance_id()
+    _lib_write_io.register_local_instance(
+        instance_id=write_instance_id, host=args.host,
+        port=_resolve_dashboard_port(args.port))
     sync_thread = (
         None if args.no_sync
         else _DashboardSyncThread(
@@ -12566,6 +12623,20 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     http_thread = threading.Thread(target=srv.serve_forever, daemon=True,
                                    name="dashboard-http")
     http_thread.start()
+    # The owner-readable descriptor `cctally doctor` discovers this instance
+    # through: written once now, removed at clean shutdown. A crash leaves it
+    # for the next startup to remove; doctor ignores a dead or reused pid's.
+    _lib_write_io.register_local_instance(
+        instance_id=write_instance_id, host=bind_host, port=bind_port)
+    write_descriptor_written = False
+    try:
+        _lib_write_io.remove_stale_descriptors(_cctally_core.APP_DIR)
+        _lib_write_io.write_instance_descriptor(
+            _cctally_core.APP_DIR, instance_id=write_instance_id,
+            host=bind_host, port=bind_port)
+        write_descriptor_written = True
+    except OSError as exc:
+        eprint(f"[dashboard] instance descriptor not written ({exc})")
 
     # Surface any pending migration errors at server startup. Browser is a
     # separate UI surface (out of scope for this fix); this prints once to
@@ -12609,6 +12680,13 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     finally:
         # First, so a shutdown can never be followed by an automatic restart.
         _stop_install_watch()
+        if write_descriptor_written:
+            try:
+                _lib_write_io.remove_instance_descriptor(
+                    _cctally_core.APP_DIR, write_instance_id)
+            except OSError:
+                pass
+        _lib_write_io.clear_local_instance()
         if sync_thread is not None:
             sync_thread.stop()
         conversation_sync_stop.set()

@@ -19,18 +19,24 @@ import concurrent.futures
 import contextlib
 import datetime as dt
 import fcntl
+import fractions
 import hashlib
 import http.client
+import importlib
 import io
 import json
 import math
 import os
 import pathlib
+import platform
+import plistlib
+import pwd
 import re
 import selectors
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import stat
@@ -53,6 +59,7 @@ COMBINED_CPU_DUTY_CEILING = 0.25
 API_P95_CEILING_MS = 3000
 THREAD_COUNT_CEILING = 64
 DISK_IO_OPS_PER_SECOND_CEILING = 500
+# Counts I/O operations, not bytes: it passed through the #901 defect, so it is kept as a separate, non-discriminating gate; byte volume is the write-budget leg's.
 PROCESS_CPU_PERCENT_CEILING = 50.0
 IDLE_CPU_PERCENT_CEILING = 5.0
 IDLE_READINESS_TIMEOUT_SECONDS = 3 * 60 * 60
@@ -74,9 +81,17 @@ STATS_INDEX_REBUILD_TIMEOUT_SECONDS = 60 * 60
 # Measured about 43 s on the full-size source on 2026-09-26 (#857 Task B); the
 # bound sits outside every measured interval.
 ACTIVE_WARM_ADMISSION_TIMEOUT_SECONDS = 10 * 60
-# Keep this benchmark-side copy pinned to the production retention policy with
-# ``test_dashboard_soak_idle_readiness_accepts_dormant_reclaim_backlog``.
-RETENTION_RECLAIM_ESCALATION_BYTES = 256 * 1024 * 1024
+# The pre-#901 binary's next-cycle escalation threshold. #901 retired it as a
+# trigger; the harness keeps it only to read a LEGACY reclaim record that a
+# baseline binary wrote (the pre-epic baseline arms).
+LEGACY_RECLAIM_ESCALATION_BYTES = 256 * 1024 * 1024
+# #901 §5.4 paced reclaim. Pinned copies of the product policy, kept equal by
+# ``test_dashboard_soak_reclaim_policy_matches_the_product``.
+RETENTION_RECLAIM_START_BYTES = 2 * 1024 ** 3
+RETENTION_RECLAIM_START_RATIO = 0.20
+RETENTION_RECLAIM_STOP_BYTES = 1024 ** 3
+RETENTION_RECLAIM_STOP_RATIO = 0.10
+RETENTION_POLICY_VERSION = 1
 PUBLISH_P95_CEILING_MS = 10_000.0
 CONVERSATION_P95_CEILING_MS = 10_000.0
 PUBLICATION_GAP_CEILING_MS = 15_000.0
@@ -1117,24 +1132,63 @@ def _make_retention_due(
         conn.commit()
 
 
-def _require_no_reclaim_backlog(data_dir: pathlib.Path) -> dict:
-    """Fail closed unless the copied conversation store has fully reclaimed."""
+def _reclaim_record_pending(state) -> "tuple[bool, int]":
+    """Whether a durable reclaim record still asks for reclaim, and its
+    backlog. A #901 record (`policy_version`) carries the pacing ledger for
+    good, so its presence means nothing: it is pending only while its episode
+    is eligible. A legacy record (a pre-#901 binary) is pending whenever it
+    exists. Malformed records raise, so callers fail closed."""
+    if not isinstance(state, dict):
+        raise ValueError("malformed reclaim backlog")
+    if state.get("policy_version") is not None:
+        raw = state.get("unreclaimed_bytes", 0)
+        pending = state.get("eligible") is True
+    else:
+        if "unreclaimed_bytes" not in state:
+            raise ValueError("malformed reclaim backlog")
+        raw = state["unreclaimed_bytes"]
+        pending = True
+    try:
+        backlog = int(raw or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("malformed reclaim backlog") from exc
+    if backlog < 0:
+        raise ValueError("malformed reclaim backlog")
+    return pending, backlog
+
+
+def _read_reclaim_record(conn) -> "dict | None":
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        ("conversation_retention_reclaim_pending",),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("malformed reclaim backlog") from exc
+
+
+def _reclaim_record_is_legacy(data_dir: pathlib.Path) -> bool:
     path = data_dir / "conversations.db"
     uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
     with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
-        row = conn.execute(
-            "SELECT value FROM cache_meta WHERE key=?",
-            ("conversation_retention_reclaim_pending",),
-        ).fetchone()
-        if row is not None and row[0]:
-            try:
-                state = json.loads(row[0])
-                pending = int(state["unreclaimed_bytes"])
-            except (TypeError, ValueError, KeyError, AttributeError) as exc:
-                raise ValueError("malformed reclaim backlog") from exc
-            if pending < 0:
-                raise ValueError("malformed reclaim backlog")
-            raise ValueError(f"reclaim backlog remains: {pending} bytes")
+        state = _read_reclaim_record(conn)
+    return isinstance(state, dict) and state.get("policy_version") is None
+
+
+def _require_no_reclaim_backlog(data_dir: pathlib.Path) -> dict:
+    """Fail closed unless the copied conversation store has no reclaim
+    backlog: an empty freelist and no durable record still asking for one."""
+    path = data_dir / "conversations.db"
+    uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
+    with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+        state = _read_reclaim_record(conn)
+        if state is not None:
+            pending, backlog = _reclaim_record_pending(state)
+            if pending:
+                raise ValueError(f"reclaim backlog remains: {backlog} bytes")
         page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
         freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     if freelist:
@@ -1145,25 +1199,19 @@ def _require_no_reclaim_backlog(data_dir: pathlib.Path) -> dict:
 def _reclaim_backlog_snapshot(data_dir: pathlib.Path) -> dict:
     """Record the copied store's reclaim state without judging it.
 
-    ``pendingBytes`` is the product's durable record (None when absent) and
-    ``freelistBytes`` the physical freelist; the two differ once a compaction
-    has emptied the freelist behind a record the product has not yet cleared.
+    ``pendingBytes`` is the durable record's backlog while that record still
+    asks for reclaim (None otherwise) and ``freelistBytes`` the physical
+    freelist; the two differ once a compaction has emptied the freelist
+    behind a record the product has not yet updated.
     """
     path = data_dir / "conversations.db"
     uri = f"file:{urllib.parse.quote(str(path))}?mode=ro"
     with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
-        row = conn.execute(
-            "SELECT value FROM cache_meta WHERE key=?",
-            ("conversation_retention_reclaim_pending",),
-        ).fetchone()
+        state = _read_reclaim_record(conn)
         pending = None
-        if row is not None and row[0]:
-            try:
-                pending = int(json.loads(row[0])["unreclaimed_bytes"])
-            except (TypeError, ValueError, KeyError, AttributeError) as exc:
-                raise ValueError("malformed reclaim backlog") from exc
-            if pending < 0:
-                raise ValueError("malformed reclaim backlog")
+        if state is not None:
+            asks, backlog = _reclaim_record_pending(state)
+            pending = backlog if asks else None
         page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
         freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     return {"pendingBytes": pending, "freelistBytes": freelist * page_size}
@@ -1171,12 +1219,13 @@ def _reclaim_backlog_snapshot(data_dir: pathlib.Path) -> dict:
 
 def _compact_reclaim_backlog(
     binary: pathlib.Path, env: dict[str, str], data_dir: pathlib.Path, *,
-    timeout_seconds: float,
+    timeout_seconds: float, run=None,
 ) -> dict:
     """Drain a copied store's reclaim backlog with the product's compaction.
 
-    Production reclaim is budgeted to two seconds a pass and goes dormant below
-    ``RETENTION_RECLAIM_ESCALATION_BYTES`` until the next daily retention run,
+    Production reclaim is paced (#901: at most 4 MiB of maintenance writes a
+    minute, and only above 2 GiB and 20% free), and the pre-#901 binary went
+    dormant below ``LEGACY_RECLAIM_ESCALATION_BYTES`` until its next daily run,
     so it cannot bring a multi-GB clone to zero inside any setup bound: the
     2026-09-24 full-size copy drained about 143 pages a second and needed about
     19 hours just to reach dormancy. ``cctally db vacuum --db conversations`` is
@@ -1195,8 +1244,9 @@ def _compact_reclaim_backlog(
     before = _reclaim_backlog_snapshot(data_dir)
     family_before = _conversation_family_bytes(data_dir)
     started = time.monotonic()
+    runner = subprocess.run if run is None else run
     try:
-        result = subprocess.run(
+        result = runner(
             [str(binary), "db", "vacuum", "--db", "conversations"],
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             text=True, timeout=timeout_seconds,
@@ -1213,8 +1263,9 @@ def _compact_reclaim_backlog(
     if after["freelistBytes"]:
         raise RuntimeError(
             f"conversation compaction left {after['freelistBytes']} freelist bytes")
-    made_due = (after["pendingBytes"] is not None and
-                after["pendingBytes"] < RETENTION_RECLAIM_ESCALATION_BYTES)
+    made_due = (_reclaim_record_is_legacy(data_dir)
+                and after["pendingBytes"] is not None
+                and after["pendingBytes"] < LEGACY_RECLAIM_ESCALATION_BYTES)
     if made_due:
         _make_retention_due(data_dir, dt.datetime.now(dt.timezone.utc))
     return {
@@ -2589,8 +2640,16 @@ def _live_regime_dashboard(
     sync_interval: float, *, diagnostic_path: pathlib.Path | None = None,
     diagnostic_phase: str | None = None,
     admit_initial_sync: bool = True,
+    reap_family: bool = False,
+    final_write_bytes=None,
 ):
-    """Keep one real isolated dashboard alive for a named regime measurement."""
+    """Keep one real isolated dashboard alive for a named regime measurement.
+
+    ``reap_family`` (#901 Q18, the write-budget leg): the dashboard starts in
+    its own session; teardown signals it, reads ``final_write_bytes(pid)``
+    while it is an unreaped zombie (its terminal write volume), reaps it and
+    kills whatever is left of its process group, and leaves the evidence on
+    the yielded namespace's ``teardown``."""
     log_path = root / "regime-dashboard.log"
     log = log_path.open("w+", encoding="utf-8")
     proc = subprocess.Popen(
@@ -2598,7 +2657,9 @@ def _live_regime_dashboard(
          "--host", "127.0.0.1", "--no-browser", "--sync-interval",
          str(sync_interval), "--tz", "Etc/UTC"],
         stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1, env=env,
+        start_new_session=reap_family,
     )
+    live = types.SimpleNamespace(proc=proc, port=None, teardown=None)
     selector = selectors.DefaultSelector()
     assert proc.stdout is not None
     selector.register(proc.stdout, selectors.EVENT_READ)
@@ -2632,17 +2693,23 @@ def _live_regime_dashboard(
                 _wait_for_initial_sync(
                     port, diagnostics=diagnostics, proc=proc,
                     data_dir=root / "data")
-        yield types.SimpleNamespace(proc=proc, port=port)
+        live.port = port
+        yield live
     finally:
         try:
             selector.close()
-            if proc.poll() is None:
-                proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            if reap_family:
+                live.teardown = _terminate_family(
+                    proc, grace=FAMILY_TERM_GRACE_SECONDS,
+                    final_reader=final_write_bytes)
+            else:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
             if proc.stdout is not None:
                 proc.stdout.close()
             log.close()
@@ -2771,7 +2838,8 @@ def _await_published_mutations(
         f"{name} mutation was not visible in a published dashboard tick")
 
 
-def _await_warm_publication(port: int, name: str) -> None:
+def _await_warm_publication(port: int, name: str, *,
+                            deadline: "float | None" = None) -> None:
     """Admit an active probe only once a warm tick has published.
 
     The live dashboard's first tick is a cold build, and the product then
@@ -2780,8 +2848,11 @@ def _await_warm_publication(port: int, name: str) -> None:
     publication waited 21.6 s for any tick at all (#857 Task B, 2026-09-26):
     that measures the startup build, not the cadence the probe is for. The
     measured interval still starts at the mutation; this wait is setup.
+    `deadline` (a monotonic instant) replaces the active-regime timeout when
+    the caller owns one admission deadline (the write-budget leg).
     """
-    deadline = time.monotonic() + ACTIVE_WARM_ADMISSION_TIMEOUT_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + ACTIVE_WARM_ADMISSION_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         debug, _latency = _live_debug(port)
         records = (debug.get("tick") or {}).get("records") or []
@@ -3231,14 +3302,14 @@ def _measure_request_overload(
 
 
 def _idle_reclaim_is_dormant(data_dir: pathlib.Path) -> bool:
-    """Whether durable reclaim is intentionally waiting for its daily pass.
+    """Whether durable reclaim is intentionally not running.
 
-    Production continues a backlog on every conversation cycle only while it
-    is at or above the escalation threshold.  A smaller positive backlog that
-    made progress and exhausted its per-pass deadline remains durably pending
-    until the next daily retention pass; requiring that record to disappear
-    makes same-day idle readiness impossible by construction.  Malformed,
-    no-progress, checkpoint-only, locked, and escalated states all fail closed.
+    A #901 record is dormant exactly when its episode is not eligible: the
+    product reclaims at most once a minute and only above 2 GiB and 20% free,
+    so retained slack below that is the steady state, not a pending tail. A
+    legacy record keeps the pre-#901 rule: positive, progress-making,
+    deadline-limited, and below the old escalation threshold. Malformed,
+    locked and pending states fail closed.
     """
     path = data_dir / "conversations.db"
     try:
@@ -3246,21 +3317,19 @@ def _idle_reclaim_is_dormant(data_dir: pathlib.Path) -> bool:
         with contextlib.closing(
             sqlite3.connect(uri, uri=True, timeout=0.1)
         ) as conn:
-            row = conn.execute(
-                "SELECT value FROM cache_meta WHERE key=?",
-                ("conversation_retention_reclaim_pending",),
-            ).fetchone()
-    except sqlite3.Error:
+            state = _read_reclaim_record(conn)
+    except (sqlite3.Error, ValueError):
         return False
-    if row is None or not row[0]:
+    if state is None:
         return True
     try:
-        state = json.loads(row[0])
-        backlog = int(state.get("unreclaimed_bytes") or 0)
-    except (AttributeError, TypeError, ValueError):
+        pending, backlog = _reclaim_record_pending(state)
+    except ValueError:
         return False
+    if state.get("policy_version") is not None:
+        return not pending
     return (
-        0 < backlog < RETENTION_RECLAIM_ESCALATION_BYTES
+        0 < backlog < LEGACY_RECLAIM_ESCALATION_BYTES
         and state.get("made_progress") is True
         and state.get("deadline_hit") is True
     )
@@ -4264,8 +4333,8 @@ def _validate_external_metrics(kind: str, name: str, metrics: dict) -> None:
 
     if kind == "upgrade":
         before, current = {
-            "cache-044": (44, 46),
-            "conversations-009": (9, 10),
+            "cache-044": (44, 48),
+            "conversations-009": (9, 11),
         }[name]
         number("schemaBefore", before, before, integer=True)
         number("schemaAfter", current, current, integer=True)
@@ -4606,6 +4675,1533 @@ def _summary(receipt: dict) -> dict:
     }
 
 
+# ── #901 §6.4: the full-size write-budget leg ─────────────────────────────
+# A dedicated leg, NOT a change to #857's `bothActive` contract: idle and
+# small-append arms on a compacted clone of the full-size fixture, and a
+# backlog arm that KEEPS its free pages (no compaction) and admits due
+# deletion only after warm admission by rewinding the retention stamp 25 h.
+# Gated on the candidate's own `_lib_write_budget.LIMITS` (never above the I2
+# caps) and the soak's existing process ceilings. `diskIoOpsPerSecond` stays a
+# separate, non-discriminating gate: it counts I/O operations, not bytes, and
+# it passed through the #901 defect.
+WRITE_BUDGET_ARMS = ("idle", "append", "backlog")
+WRITE_BUDGET_SECONDS = {"idle": 300, "append": 300, "backlog": 1800}
+WRITE_BUDGET_SAMPLE_SECONDS = 15
+WRITE_BUDGET_APPEND_INTERVAL_SECONDS = 0.5
+WRITE_BUDGET_EXPIRING_GROUP_MIN_ROWS = 5_000
+WRITE_BUDGET_MIN_RECLAIMS = 4
+#: §6.4 (Q8): the backlog arm rewinds the retention stamp this far into its
+#: 30 measured minutes, as §6.3 C does, so reclaim progresses first.
+WRITE_BUDGET_REWIND_AFTER_SECONDS = 600
+#: §6.4 (Q10): the soak certifies pacing, the limits, the ceilings and the
+#: operation records - never the per-deletion I4 bound, which C-op, R-cov
+#: and C certify with deletion receipts and G3s/G3v guard in every gate.
+WRITE_BUDGET_I4_NOTE = "I4 not certified (Q10)"
+#: §6.4 (Q11): each arm drains its fixture's ingest backlog before warm
+#: admission with §6.3's certifiable-sync predicates, inside this deadline.
+WRITE_BUDGET_ADMISSION_SECONDS = 900
+_CATCHUP_TOOL = (pathlib.Path(__file__).resolve().parent / "write-attribution"
+                 / "catchup.py")
+_MIB = 1024 * 1024
+# ── Q18 (dc15 F1): the leg's full-build gate is non-regression ─────────────
+# Append is gated against append and backlog against backlog, each at p50
+# and p95 on its own: candidate <= 1.2 x a recorded, qualified `56e66f07a`
+# reference for that arm (equality passes). The absolute 5 s / 10 s ceilings
+# are #881's and #857 Task B's: reported, never gated here. Idle has no full
+# build to gate and reports it as not applicable on complete evidence.
+#
+# Capture the reference once per host and full-size fixture (it runs the
+# baseline's append for five minutes and its backlog for thirty, serially,
+# once each, and writes only under --root):
+#   dashboard-soak.py --write-budget-leg --capture-baseline-reference \
+#       --fixture-copy FIXTURE --root /Volumes/EXT/ROOT \
+#       --output /Volumes/EXT/ROOT/reference.json
+# then reuse it for every candidate leg while it still qualifies:
+#   dashboard-soak.py --write-budget-leg --fixture-copy FIXTURE \
+#       --root /Volumes/EXT/RUN --baseline-reference .../reference.json --gate
+# A missing, mismatched, empty, nonfinite or nonpositive reference makes the
+# leg INVALID (exit 2) before any arm runs; a qualification mismatch needs a
+# new capture, never another host's, baseline's or historical percentile.
+WRITE_BUDGET_BASELINE_SHA = "56e66f07aacacc4b2d90b378190e99724064c1b4"
+WRITE_BUDGET_GATED_ARMS = ("append", "backlog")
+WRITE_BUDGET_FULL_BUILD_FACTOR = 1.2
+_WRITE_BUDGET_FACTOR = fractions.Fraction(6, 5)
+WRITE_BUDGET_REFERENCE_KIND = "writeBudgetBaselineReference"
+#: The warm-build collector's identity; bump it when its selection changes.
+WRITE_BUDGET_COLLECTOR = "warm-in-window/1"
+WRITE_BUDGET_WARM_WINDOW = (
+    "after the first warm final publication, the arm's measured window "
+    "[start, end]: distinct tick seq, dispatch full, cold false, "
+    "published_at inside the window")
+#: The per-arm preparation contract a reference is bound to (version it
+#: whenever `_run_write_budget_arm`'s setup changes).
+WRITE_BUDGET_PREPARATION = {
+    "version": 1,
+    "clone": "one APFS clone of --fixture-copy per arm",
+    "offline": "update.check.enabled=false",
+    "idle": "db vacuum --db conversations; retention stamp now",
+    "append": "db vacuum --db conversations; retention stamp now",
+    "backlog": ("retention_days - 1 with its free pages kept; retention "
+                "stamp now; rewound 25 h at 600 s"),
+    "admission": ("catchup.py drain and verification inside 900 s, then "
+                  "the first warm final publication"),
+    "environment": ("HOME, CLAUDE_CONFIG_DIR, CODEX_HOME and TMPDIR under "
+                    "the clone; PYTHONDONTWRITEBYTECODE=1"),
+}
+#: Teardown bounds for every process family the leg starts.
+FAMILY_TERM_GRACE_SECONDS = 15.0
+FAMILY_KILL_WAIT_SECONDS = 10.0
+
+
+def _positive_finite(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def _iso_epoch(value) -> "float | None":
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        return None
+    return stamp.timestamp()
+
+
+def _warm_full_builds(diagnostics, start: float, end: float, *,
+                      polled_at=None) -> dict:
+    """The leg's full-build collector (Q18, dc15 F1): distinct ticks across
+    the polled diagnostics, then only warm (`cold` false) full builds
+    published inside [start, end]. Sequence deduplication alone does not
+    establish warm-window membership, so cold and out-of-window records are
+    excluded and counted. Complete only when every poll carried tick records,
+    every record is stamped, the window's sequence numbers have no gap, and
+    (Amendment 19 HR-20, the frozen-C coverage rule) the window's edges are
+    covered: its first record's predecessor was published before the
+    window, and its last record is within the window's longest publish
+    period of the last poll (`polled_at`, else the window's end) - a
+    sampling outage at an edge could hide a full build, so the idle arm's
+    "not applicable" needs both."""
+    records, problems, missing = {}, [], 0
+    for diagnostic in diagnostics or ():
+        tick = diagnostic.get("tick") if isinstance(diagnostic, dict) else None
+        rows = tick.get("records") if isinstance(tick, dict) else None
+        if not isinstance(rows, list):
+            missing += 1
+            continue
+        for row in rows:
+            if isinstance(row, dict) and row.get("seq") is not None:
+                records[int(row["seq"])] = row
+    if missing:
+        problems.append(f"{missing} diagnostic sample(s) carried no tick records")
+    excluded = {"cold": 0, "outOfWindow": 0, "unstamped": 0}
+    window_seqs, samples, seqs = [], [], []
+    for seq, row in sorted(records.items()):
+        at = _iso_epoch(row.get("published_at"))
+        if at is None:
+            excluded["unstamped"] += 1
+            continue
+        inside = start <= at <= end
+        if inside:
+            window_seqs.append(seq)
+        if row.get("cold") is True:
+            excluded["cold"] += 1
+            continue
+        if not inside:
+            excluded["outOfWindow"] += 1
+            continue
+        if row.get("cold") is not False:
+            excluded["unstamped"] += 1
+            continue
+        if row.get("dispatch") != "full":
+            continue
+        duration = row.get("duration_ns")
+        if (not isinstance(duration, (int, float)) or isinstance(duration, bool)
+                or not math.isfinite(duration)):
+            excluded["unstamped"] += 1
+            continue
+        samples.append(float(duration) / 1_000_000)
+        seqs.append(seq)
+    if excluded["unstamped"]:
+        problems.append(f"{excluded['unstamped']} tick record(s) without a "
+                        "publication time, cold flag or duration")
+    if not window_seqs:
+        problems.append("no tick records in the window")
+    else:
+        if window_seqs[-1] - window_seqs[0] + 1 != len(window_seqs):
+            problems.append("the tick evidence has gaps (missing seq numbers "
+                            "in the window)")
+        before = records.get(window_seqs[0] - 1)
+        before_at = _iso_epoch((before or {}).get("published_at"))
+        if before_at is None or before_at >= start:
+            problems.append("incomplete window coverage: no tick record "
+                            "published before the window precedes its first")
+        periods = [records[q]["period_ns"] / 1e9 for q in window_seqs
+                   if isinstance(records[q].get("period_ns"), (int, float))]
+        edge = max(polled_at) if polled_at else end
+        tail = edge - (_iso_epoch(records[window_seqs[-1]].get("published_at"))
+                       or start)
+        if not periods or tail > max(periods):
+            problems.append(f"incomplete window coverage: the last tick record "
+                            f"is {tail:.1f} s before the last poll, longer "
+                            "than the window's longest publish period")
+    return {"samplesMs": samples, "seqs": seqs, "n": len(samples),
+            "p50Ms": percentile(samples, 0.50),
+            "p95Ms": percentile(samples, 0.95), "ticks": len(window_seqs),
+            "excluded": excluded, "complete": not problems,
+            "problems": problems}
+
+
+def _reference_population_problems(full) -> "list[str]":
+    """A reference population: complete, nonempty, every sample finite and
+    positive, and n, p50 and p95 exactly what the samples give."""
+    if not isinstance(full, dict):
+        return ["no full-build population"]
+    problems = []
+    if full.get("complete") is not True:
+        problems.append("incomplete tick evidence: "
+                        + "; ".join(full.get("problems") or ["unknown"]))
+    samples = full.get("samplesMs")
+    if not isinstance(samples, list) or not samples:
+        problems.append("empty warm full-build population")
+        return problems
+    if not all(_positive_finite(value) for value in samples):
+        problems.append("a nonfinite or nonpositive warm sample")
+        return problems
+    if full.get("n") != len(samples):
+        problems.append(f"n {full.get('n')!r} does not match {len(samples)} "
+                        "samples")
+    for q, rank in (("p50Ms", 0.50), ("p95Ms", 0.95)):
+        value = full.get(q)
+        if not _positive_finite(value):
+            problems.append(f"{q} {value!r} is nonfinite or nonpositive")
+        elif value != percentile(samples, rank):
+            problems.append(f"{q} {value} is not the samples' nearest-rank "
+                            f"percentile {percentile(samples, rank)}")
+    return problems
+
+
+def _harness_write_io():
+    """The write counter is harness instrumentation: always this tree's,
+    never the measured checkout's (the baseline has none)."""
+    return _candidate_module(REPO, "_lib_write_io")
+
+
+def _sysctl(name: str) -> "str | None":
+    try:
+        done = subprocess.run(["sysctl", "-n", name], capture_output=True,
+                              text=True, timeout=30, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() or None
+
+
+def _host_identity() -> dict:
+    memory = None
+    if sys.platform == "darwin":
+        model, raw = _sysctl("hw.model"), _sysctl("hw.memsize")
+        memory = int(raw) if raw and raw.isdigit() else None
+    else:
+        model = platform.processor() or None
+        try:
+            memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            memory = None
+    return {"hostname": socket.gethostname(), "machine": platform.machine(),
+            "model": model, "cpuCount": os.cpu_count(), "memoryBytes": memory}
+
+
+def _runtime_identity() -> dict:
+    return {"os": platform.system(), "osRelease": platform.release(),
+            "osVersion": platform.mac_ver()[0] or platform.version(),
+            "python": platform.python_version(),
+            "pythonExecutable": os.path.realpath(sys.executable),
+            "sqlite": sqlite3.sqlite_version}
+
+
+def _storage_identity(path) -> dict:
+    """{class: internal|external, mountPoint, fsType} of the volume `path`
+    (or its nearest existing ancestor) lives on."""
+    identity = {"class": None, "mountPoint": None, "fsType": None}
+    if not path:
+        return identity
+    here = pathlib.Path(path).expanduser().resolve()
+    while not here.exists() and here != here.parent:
+        here = here.parent
+    mount = here
+    while not os.path.ismount(mount) and mount != mount.parent:
+        mount = mount.parent
+    identity["mountPoint"] = str(mount)
+    if sys.platform == "darwin":
+        try:
+            info = plistlib.loads(subprocess.run(
+                ["diskutil", "info", "-plist", str(mount)],
+                capture_output=True, check=True, timeout=60).stdout)
+        except (OSError, subprocess.SubprocessError, ValueError,
+                plistlib.InvalidFileException):
+            info = None
+        if isinstance(info, dict) and "Internal" in info:
+            identity["class"] = "internal" if info["Internal"] else "external"
+            identity["fsType"] = info.get("FilesystemType")
+            return identity
+    internal = {os.stat("/").st_dev}
+    try:
+        internal.add(os.stat(pwd.getpwuid(os.getuid()).pw_dir).st_dev)
+    except (KeyError, OSError):
+        pass
+    identity["class"] = ("internal" if here.stat().st_dev in internal
+                         else "external")
+    return identity
+
+
+def _write_budget_qualification(args) -> dict:
+    """Everything a reference must match to be reused (dc15 F1): the fixture
+    fingerprint and preparation contract, host and hardware, OS, Python and
+    SQLite, storage class, instrumentation and the workload protocol. The
+    candidate SHA is deliberately absent: it is recorded, never a key."""
+    fixture = getattr(args, "fixture_copy", None)
+    source = pathlib.Path(fixture).expanduser().resolve() if fixture else None
+    fingerprint = days = None
+    if source is not None and source.is_dir():
+        fingerprint = _fixture_source_fingerprint(source)
+        days = _retention_days_of(source / "data")
+    sync = getattr(args, "sync_interval", None)
+    qualification = {
+        "fixture": {"fingerprint": fingerprint,
+                    "preparation": WRITE_BUDGET_PREPARATION},
+        "host": _host_identity(),
+        "runtime": _runtime_identity(),
+        "storage": _storage_identity(getattr(args, "root", None)),
+        "instrumentation": {
+            "collector": WRITE_BUDGET_COLLECTOR, "percentile": "nearest-rank",
+            "diagnostic": "/api/debug/backend tick.records",
+            "sampleSeconds": WRITE_BUDGET_SAMPLE_SECONDS,
+            "writeCounter": _harness_write_io().ProcessWriteCounter().source},
+        "workload": {
+            "syncIntervalSeconds": None if sync is None else float(sync),
+            "armSeconds": dict(WRITE_BUDGET_SECONDS),
+            "appendIntervalSeconds": WRITE_BUDGET_APPEND_INTERVAL_SECONDS,
+            "appendProviders": ["claude", "codex"],
+            "rewindAfterSeconds": WRITE_BUDGET_REWIND_AFTER_SECONDS,
+            "rewindHours": 25, "retentionDays": days,
+            "backlogRetentionDays": None if days is None else max(1, days - 1),
+            "expiringGroupMinRows": WRITE_BUDGET_EXPIRING_GROUP_MIN_ROWS,
+            "admissionSeconds": WRITE_BUDGET_ADMISSION_SECONDS,
+            "warmWindow": WRITE_BUDGET_WARM_WINDOW},
+    }
+    return json.loads(json.dumps(qualification))
+
+
+def _qualification_mismatches(reference, run) -> "list[str]":
+    """Every leaf of either qualification whose value differs or is absent
+    on the other side, as `dotted.path: reference X, this run Y`."""
+    if not isinstance(reference, dict) or not reference:
+        return ["the reference records no qualification"]
+    if not isinstance(run, dict) or not run:
+        return ["this run has no qualification"]
+
+    def flatten(node, prefix, out):
+        if isinstance(node, dict) and node:
+            for key, value in node.items():
+                flatten(value, f"{prefix}.{key}" if prefix else str(key), out)
+        else:
+            out[prefix] = node
+
+    left, right = {}, {}
+    flatten(reference, "", left)
+    flatten(json.loads(json.dumps(run)), "", right)
+    absent = object()
+    return [f"{key}: reference {left.get(key, '<absent>')!r}, this run "
+            f"{right.get(key, '<absent>')!r}"
+            for key in sorted(set(left) | set(right))
+            if left.get(key, absent) != right.get(key, absent)]
+
+
+# ── bounded, reaped process families (Q18: every exit reaps the family) ────
+
+def _exited_unreaped(pid: int) -> bool:
+    """True once `pid` (our child) has exited, without reaping it."""
+    try:
+        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return True
+    return info is not None and info.si_pid == pid
+
+
+def _await_exit(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not _exited_unreaped(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _signal_group(pgid: int, sig) -> bool:
+    if pgid == os.getpgrp():
+        return False
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _group_members(pgid: int) -> "list[int] | None":
+    """Live (non-zombie) processes in group `pgid`; None when `ps` fails."""
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="],
+                                 capture_output=True, text=True, timeout=30,
+                                 check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    members = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if (len(fields) >= 3 and fields[1] == str(pgid)
+                and not fields[2].startswith("Z")):
+            members.append(int(fields[0]))
+    return members
+
+
+def _reap_group(pgid: int) -> dict:
+    """Kill whatever is left of a child's own process group and prove it."""
+    found = _group_members(pgid)
+    if found:
+        _signal_group(pgid, signal.SIGKILL)
+    survivors = found
+    deadline = time.monotonic() + FAMILY_KILL_WAIT_SECONDS
+    while survivors:
+        survivors = _group_members(pgid)
+        if not survivors or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    return {"pgid": pgid, "killed": found or [],
+            "survivors": survivors, "verified": survivors is not None}
+
+
+def _terminate_family(proc, *, grace: float, final_reader=None,
+                      group_term: bool = False) -> dict:
+    """Stop a child started in its own session and reap its whole family:
+    SIGTERM (the child, or with `group_term` its group), SIGKILL to the group
+    after `grace`, the child's terminal counter read while it is an unreaped
+    zombie, then the reap and a verified kill of the group's remainder."""
+    pid = proc.pid
+    evidence = {"pid": pid, "signal": None, "exitCode": None,
+                "finalWriteBytes": None, "finalWriteStatus": "not read"}
+    if proc.returncode is not None:
+        evidence.update(exitCode=proc.returncode,
+                        finalWriteStatus="reaped before teardown")
+    else:
+        exited = _exited_unreaped(pid)
+        if not exited:
+            evidence["signal"] = "SIGTERM"
+            if group_term:
+                _signal_group(pid, signal.SIGTERM)
+            else:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.send_signal(signal.SIGTERM)
+            exited = _await_exit(pid, grace)
+        if not exited:
+            evidence["signal"] = "SIGKILL"
+            _signal_group(pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            exited = _await_exit(pid, FAMILY_KILL_WAIT_SECONDS)
+        if exited and final_reader is not None:
+            try:
+                reading = final_reader(pid)
+                evidence.update(finalWriteBytes=reading.value,
+                                finalWriteStatus=reading.status)
+            except Exception as exc:  # evidence, never a teardown failure
+                evidence["finalWriteStatus"] = f"error: {exc}"
+        try:
+            evidence["exitCode"] = proc.wait(timeout=FAMILY_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            evidence["exitCode"] = None
+    evidence["group"] = _reap_group(pid)
+    return evidence
+
+
+def _child_label(cmd) -> str:
+    parts = [str(part) for part in cmd]
+    if (len(parts) > 1 and pathlib.Path(parts[0]).name.startswith("python")
+            and not parts[1].startswith("-")):
+        label = pathlib.Path(parts[1]).name
+    else:
+        label = "-".join([pathlib.Path(parts[0]).name] + parts[1:3])
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64] or "child"
+
+
+class _MeasuredRun:
+    """`subprocess.run`'s shape for one setup child of the leg: it runs in
+    its own session with stdin closed and stdout/stderr in files under
+    `log_dir`, under a finite deadline; on exit or timeout its final write
+    counter is read before the reap and its whole group is killed. Each call
+    leaves a record (label, exit, timeout, duration, write bytes, group)."""
+
+    def __init__(self, *, log_dir, counter_factory=None):
+        self.log_dir = pathlib.Path(log_dir)
+        self.records: list[dict] = []
+        self._counter_factory = counter_factory
+
+    def _read_final(self, pid):
+        if self._counter_factory is not None:
+            return self._counter_factory(pid).read()
+        return _harness_write_io().ProcessWriteCounter(pid=pid).read()
+
+    def __call__(self, cmd, *, env=None, cwd=None, stdout=None, stderr=None,
+                 capture_output=False, text=False, timeout=None, check=False,
+                 **_ignored):
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        label = _child_label(cmd)
+        stem = self.log_dir / f"{len(self.records):02d}-{label}"
+        out_path, err_path = (stem.with_name(stem.name + ".stdout"),
+                              stem.with_name(stem.name + ".stderr"))
+        started = time.monotonic()
+        with open(out_path, "wb") as out_fh, open(err_path, "wb") as err_fh:
+            proc = subprocess.Popen(
+                [str(part) for part in cmd], env=env, cwd=cwd,
+                stdin=subprocess.DEVNULL, stdout=out_fh, stderr=err_fh,
+                start_new_session=True)
+        timed_out = False
+        teardown = None
+        try:
+            deadline = None if timeout is None else started + float(timeout)
+            while not _exited_unreaped(proc.pid):
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.05)
+        finally:
+            teardown = _terminate_family(
+                proc, grace=FAMILY_TERM_GRACE_SECONDS,
+                final_reader=self._read_final, group_term=True)
+            self.records.append({
+                "label": label, "returncode": teardown["exitCode"],
+                "timedOut": timed_out,
+                "durationS": round(time.monotonic() - started, 3),
+                "writeBytes": teardown["finalWriteBytes"],
+                "writeStatus": teardown["finalWriteStatus"],
+                "group": teardown["group"],
+                "logs": {"stdout": str(out_path), "stderr": str(err_path)}})
+
+        def captured(path, wanted):
+            if not wanted:
+                return None
+            data = path.read_bytes()
+            return data.decode(errors="replace") if text else data
+        out_value = captured(out_path, capture_output or stdout == subprocess.PIPE)
+        err_value = captured(err_path, capture_output or stderr == subprocess.PIPE)
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out_value,
+                                            stderr=err_value)
+        code = teardown["exitCode"]
+        if check and code:
+            raise subprocess.CalledProcessError(code, cmd, out_value, err_value)
+        return subprocess.CompletedProcess(cmd, code, out_value, err_value)
+
+
+def _is_family_command(pid: int) -> "tuple[bool, str]":
+    try:
+        command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output=True, text=True,
+                                 timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    lowered = command.lower()
+    return ("python" in lowered or "cctally" in lowered), command
+
+
+def _sweep_clone_holders(data_dir) -> dict:
+    """The last teardown check of an arm: any process still holding one of
+    the clone's store files open. Detached product workers leave the
+    dashboard's group, but not its stores. Python/cctally holders are the
+    arm's family and are killed; anything else is recorded, never touched."""
+    data_dir = pathlib.Path(data_dir)
+    try:
+        files = sorted(str(path) for path in data_dir.iterdir()
+                       if path.is_file())
+    except OSError as exc:
+        return {"verified": False, "error": str(exc), "killed": [],
+                "survivors": [], "otherHolders": []}
+
+    def holders():
+        if not files:
+            return []
+        try:
+            done = subprocess.run(["lsof", "-t", "--", *files],
+                                  capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode not in (0, 1):
+            return None
+        return sorted({int(x) for x in done.stdout.split() if x.isdigit()}
+                      - {os.getpid()})
+
+    found = holders()
+    if found is None:
+        return {"verified": False, "error": "lsof could not list the holders",
+                "files": len(files), "killed": [], "survivors": [],
+                "otherHolders": []}
+    family, others = [], []
+    for pid in found:
+        member, command = _is_family_command(pid)
+        (family if member else others).append(
+            pid if member else {"pid": pid, "command": command[:200]})
+    for pid in family:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+    survivors = family
+    deadline = time.monotonic() + FAMILY_KILL_WAIT_SECONDS
+    while survivors:
+        now = holders()
+        if now is None:
+            break
+        survivors = [pid for pid in now if pid in family]
+        if not survivors or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    return {"verified": True, "files": len(files), "killed": family,
+            "survivors": survivors, "otherHolders": others}
+
+
+def _teardown_problems(teardown: dict) -> "list[str]":
+    problems = []
+    groups = [child.get("group") for child in teardown.get("setupChildren") or ()]
+    dashboard = teardown.get("dashboard")
+    if dashboard:
+        groups.append(dashboard.get("group"))
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        if group.get("survivors") is None:
+            problems.append(f"process group {group.get('pgid')} could not be "
+                            "verified empty")
+        elif group["survivors"]:
+            problems.append(f"process group {group.get('pgid')} kept "
+                            f"{group['survivors']} alive")
+    sweep = teardown.get("sweep") or {}
+    if sweep.get("verified") is not True:
+        problems.append("the clone's holder sweep could not run: "
+                        f"{sweep.get('error')}")
+    elif sweep.get("survivors"):
+        problems.append(f"{sweep['survivors']} still hold the clone's stores")
+    return problems
+
+
+def _candidate_module(checkout: pathlib.Path, name: str):
+    """Import `name` from the CANDIDATE checkout's bin/, never this tree's."""
+    bin_dir = str(pathlib.Path(checkout).resolve() / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    return importlib.import_module(name)
+
+
+def _clone_tree(source: pathlib.Path, target: pathlib.Path) -> None:
+    """An APFS clone where the platform has one, else a plain copy."""
+    if sys.platform == "darwin":
+        result = subprocess.run(["cp", "-c", "-R", str(source), str(target)],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+    shutil.copytree(source, target)
+
+
+def _retention_days_of(data_dir: pathlib.Path) -> int:
+    try:
+        config = json.loads((data_dir / "config.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    block = config.get("conversation") if isinstance(config, dict) else None
+    days = block.get("retention_days", 90) if isinstance(block, dict) else 90
+    return int(days)
+
+
+def _set_retention_days(data_dir: pathlib.Path, days: int) -> None:
+    path = data_dir / "config.json"
+    config = json.loads(path.read_text()) if path.exists() else {}
+    config.setdefault("conversation", {})["retention_days"] = int(days)
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def _set_retention_stamp(data_dir: pathlib.Path, when: dt.datetime) -> None:
+    with contextlib.closing(sqlite3.connect(data_dir / "conversations.db")) as conn:
+        conn.execute(
+            "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("conversation_retention_last_prune_at", when.isoformat()))
+        conn.commit()
+
+
+def _expiry_batch(data_dir: pathlib.Path, days: int) -> dict:
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+              ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    uri = f"file:{urllib.parse.quote(str(data_dir / 'conversations.db'))}?mode=ro"
+    batch = {"cutoff": cutoff, "days": days}
+    with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+        for provider, table, key in (
+                ("claude", "conversation_messages", "session_id"),
+                ("codex", "codex_conversation_events", "conversation_key")):
+            rows = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {key} IS NOT NULL "
+                f"GROUP BY {key} HAVING MAX(timestamp_utc) < ?",
+                (cutoff,)).fetchall()
+            batch[provider] = {"groups": len(rows),
+                               "rows": sum(r[0] for r in rows),
+                               "largest": max((r[0] for r in rows), default=0)}
+    return batch
+
+
+def _expiring_group_problem(batch: dict) -> "str | None":
+    largest = max(batch["claude"]["largest"], batch["codex"]["largest"])
+    if largest < WRITE_BUDGET_EXPIRING_GROUP_MIN_ROWS:
+        return (f"the fixture's due batch has no group of at least "
+                f"{WRITE_BUDGET_EXPIRING_GROUP_MIN_ROWS} rows (largest {largest})")
+    return None
+
+
+_WA_WORKLOAD = None
+
+
+def _wa_workload():
+    """bench/write-attribution/workload.py, which owns the one I2 feed of
+    the candidate kernel (Amendment 19 HR-8): `steady_evaluate` and
+    `kernel_deletions` over `_lib_write_budget` from this tree's bin/."""
+    global _WA_WORKLOAD
+    if _WA_WORKLOAD is None:
+        import importlib.util
+        path = (pathlib.Path(__file__).resolve().parent / "write-attribution"
+                / "workload.py")
+        spec = importlib.util.spec_from_file_location("soak_wa_workload", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WA_WORKLOAD = module
+    return _WA_WORKLOAD
+
+
+def _write_budget_steady(window: dict, ops: dict) -> dict:
+    """The arm's I2 statistic from the candidate kernel (HR-8): every
+    counter sample (a failed read is a sample without bytes, never dropped)
+    with the publication count polled beside it, and the marked deletion
+    operations bounded conservatively from the samples around them."""
+    wa = _wa_workload()
+    budget = wa._candidate("_lib_write_budget")
+    samples = []
+    for sample, debug in zip(window["samples"], window["diagnostics"]):
+        ok = sample.get("status") == "ok" and sample.get("bytes") is not None
+        samples.append(budget.CounterSample(
+            int(round(float(sample["t"]) * 1e9)),
+            int(sample["bytes"]) if ok else None,
+            int(((debug or {}).get("tick") or {}).get("tick_seq") or 0)))
+    deletion_ops = []
+    for op in ops.values():
+        if op.get("phase") != "delete" or op.get("outcome") != "ok":
+            continue
+        begun = _iso_epoch(op.get("started_at"))
+        if begun is None:
+            continue
+        deletion_ops.append({
+            "began": begun,
+            "ended": begun + float(op.get("duration_ns") or 0) / 1e9,
+            "process_write_bytes": op.get("process_write_bytes"),
+            "rows": op.get("rows") or 0})
+    deletions = wa.kernel_deletions(samples, deletion_ops)
+    return wa.steady_evaluate(samples, deletions, start=window["start"],
+                              end=window["end"],
+                              warm=window.get("warm", window["start"]))
+
+
+def _maintenance_completeness(ops: list, start_snap, end_snap) -> "list[str]":
+    """Amendment 19 HR-18: the backlog arm's operations come from a
+    16-record ring polled every 15 s, which can lose records. The #780
+    record's op_seq and charged ledger, read at the window's start and end,
+    must equal the committed operations the polls saw ending between them -
+    a lost record would under-count the paced charges."""
+    if not start_snap or not end_snap or start_snap.get("opSeq") is None \
+            or end_snap.get("opSeq") is None:
+        return ["no record snapshots bracket the window (op_seq)"]
+    committed = []
+    for op in ops:
+        begun = _iso_epoch(op.get("started_at"))
+        if op.get("outcome") != "ok" or begun is None:
+            continue
+        ended = begun + float(op.get("duration_ns") or 0) / 1e9
+        if start_snap["t"] <= ended <= end_snap["t"]:
+            committed.append(op)
+    problems = []
+    advance = int(end_snap["opSeq"]) - int(start_snap["opSeq"])
+    if advance != len(committed):
+        problems.append(f"op_seq advanced {advance}, {len(committed)} "
+                        "operations seen in the ring (records were lost)")
+    charged = sum(int(op.get("charged_bytes") or 0) for op in committed)
+    if int(end_snap.get("charged") or 0) - int(start_snap.get("charged") or 0) \
+            != charged:
+        problems.append("the ledger's charged delta differs from the charges "
+                        "the ring showed")
+    return problems
+
+
+def _record_seq_snapshot(data_dir: pathlib.Path) -> dict:
+    """The #780 record's op_seq and charged ledger, read-only."""
+    conn = sqlite3.connect(f"file:{data_dir / 'conversations.db'}?mode=ro",
+                           uri=True)
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key = "
+            "'conversation_retention_reclaim_pending'").fetchone()
+    finally:
+        conn.close()
+    record = json.loads(row[0]) if row and row[0] else {}
+    return {"t": time.time(), "opSeq": record.get("op_seq"),
+            "charged": sum(b.get("charged", 0)
+                           for b in record.get("ledger") or [])}
+
+
+def _maintenance_conditions(ops: list, start: float, end: float,
+                            retention) -> dict:
+    """§6.3 C conditions over the published operation records."""
+    def epoch(iso):
+        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+    inside = [op for op in ops if start <= epoch(op["started_at"]) <= end]
+    deletions = [op for op in inside if op["phase"] == "delete"
+                 and op["outcome"] == "ok"]
+    reclaims = [op for op in inside if op["phase"] == "reclaim"
+                and op["outcome"] == "ok" and op["pages_reclaimed"] > 0]
+    if not deletions or len(reclaims) < WRITE_BUDGET_MIN_RECLAIMS:
+        return {"invalid": (f"{len(deletions)} deletion and {len(reclaims)} "
+                            "reclaim operations inside the interval")}
+    charged = [op["charged_bytes"] for op in inside if op["outcome"] == "ok"]
+    allowance = 4 * _MIB * ((end - start) / 60 + 1) + max(charged)
+    problems = []
+    if sum(charged) > allowance:
+        problems.append(f"charged {sum(charged)} > allowance {int(allowance)}")
+    for op in inside:
+        if op["outcome"] != "ok":
+            continue
+        # Q8/Q9: the charge is recomputed from the record's own inputs.
+        expected = retention.recompute_charge(op)
+        if expected is None or op["charged_bytes"] != expected:
+            problems.append(f"op {op['op_id']} charge != reservation")
+        if (op.get("balance_before_bytes") or 0) < 0:
+            problems.append(f"op {op['op_id']} started in debt")
+    return {"deletions": len(deletions), "reclaims": len(reclaims),
+            "chargedBytes": sum(charged), "allowanceBytes": int(allowance),
+            "problems": problems}
+
+
+def _measure_write_window(live, seconds: float, counter, *,
+                          append_root: "pathlib.Path | None" = None,
+                          midway=None, midway_after: float = 0.0) -> dict:
+    samples, diagnostics, rss, latencies = [], [], [], []
+    stop = threading.Event()
+    appended = {"events": 0}
+
+    def appender():
+        while not stop.wait(WRITE_BUDGET_APPEND_INTERVAL_SECONDS):
+            for provider in ("claude", "codex"):
+                _append_provider_event(append_root, provider,
+                                       f"wb-{secrets.token_hex(6)}")
+                appended["events"] += 1
+
+    thread = (threading.Thread(target=appender, daemon=True)
+              if append_root is not None else None)
+    started = time.time()
+    began = time.monotonic()
+    deadline = began + seconds
+    midway_result = None
+    if thread is not None:
+        thread.start()
+    try:
+        while True:
+            if live.proc.poll() is not None:
+                raise RuntimeError("write-budget dashboard exited")
+            if (midway is not None and midway_result is None
+                    and time.monotonic() - began >= midway_after):
+                midway_result = {"at": time.time(), "result": midway()}
+            reading = counter.read()
+            debug, latency = _live_debug(live.port)
+            now = time.time()
+            samples.append({"t": now, "bytes": reading.value,
+                            "status": reading.status})
+            diagnostics.append(debug)
+            latencies.append(latency)
+            rss.append({"t": now, **_process_sample(live.proc.pid)})
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(WRITE_BUDGET_SAMPLE_SECONDS)
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(5)
+    return {"start": started, "end": time.time(), "samples": samples,
+            "diagnostics": diagnostics, "rss": rss,
+            "apiLatenciesMs": latencies, "appendedEvents": appended["events"],
+            "midway": midway_result}
+
+
+def _drain_before_admission(checkout: pathlib.Path, env: dict,
+                            root: pathlib.Path, *, run=None,
+                            deadline_s: float = WRITE_BUDGET_ADMISSION_SECONDS
+                            ) -> "tuple[dict, str | None]":
+    """§6.4 (Q11): the same drained admission as §6.3 - the candidate's
+    unbudgeted `cache-sync --source all` plus a verification pass, admitted
+    only on the certifiable-sync predicates (`catchup.py`). Returns the
+    receipt and the reason the arm is invalid, if it is. `deadline_s` is
+    what remains of the arm's one admission deadline (Amendment 19 HR-21:
+    the drain and the warm admission share it)."""
+    out = root / "catchup.json"
+    runner = subprocess.run if run is None else run
+    if deadline_s <= 0:
+        return {}, "the admission deadline expired before the drain"
+    try:
+        child = runner(
+            [sys.executable, str(_CATCHUP_TOOL), "--tree", str(checkout),
+             "--out", str(out), "--deadline-s", str(int(deadline_s))],
+            env=env, capture_output=True, text=True,
+            timeout=deadline_s + 60)
+    except subprocess.TimeoutExpired:
+        return {}, "the drain overran its admission deadline"
+    receipt = json.loads(out.read_text()) if out.exists() else {}
+    if child.returncode != 0 or not receipt.get("admitted"):
+        return receipt, ("the fixture's backlog was not drained: "
+                         + "; ".join(receipt.get("problems") or
+                                     [child.stderr.strip()[-200:]]))
+    return receipt, None
+
+
+def _write_budget_metrics(window: dict) -> dict:
+    bad = [s["status"] for s in window["samples"] if s["status"] != "ok"]
+    ops = {}
+    for debug in window["diagnostics"]:
+        for row in (debug.get("tick") or {}).get("maintenance") or ():
+            if row.get("op_id"):
+                ops[(row["phase"], row["op_id"])] = row
+    # Amendment 19 HR-8: the candidate kernel's statistic and its rules.
+    steady = _write_budget_steady(window, ops)
+    # Q18: warm, in-window full builds only (cold and out-of-window records
+    # excluded), with their raw samples, counts and completeness.
+    full = _warm_full_builds(window["diagnostics"], window["start"],
+                             window["end"],
+                             polled_at=[s["t"] for s in window["samples"]])
+    return {
+        "counterStatus": bad[0] if bad else "ok",
+        "steady": steady,
+        "worstBytesPerMinute": steady["worstBytesPerMinute"],
+        "worstBytesPerPublication": steady["worstBytesPerPublication"],
+        "windows": steady["qualified"],
+        "operations": sorted(ops.values(), key=lambda o: o["op_id"]),
+        "fullBuild": full,
+        "fullBuildP50Ms": full["p50Ms"],
+        "fullBuildP95Ms": full["p95Ms"],
+        "apiP95Ms": percentile(window["apiLatenciesMs"], 0.95),
+        "rssMaxBytes": max(r["rssBytes"] for r in window["rss"]),
+        "rssSlopeBytesPerSecond": linear_slope(window["rss"], "t", "rssBytes"),
+        "appendedEvents": window["appendedEvents"],
+        "start": window["start"], "end": window["end"],
+    }
+
+
+def _write_budget_env(root: pathlib.Path) -> dict:
+    """The arm's environment: the fixture's isolated roots, and TMPDIR under
+    the clone so temp files stay on the clone's (external) volume."""
+    env = _fixture_env(root, production_shaped=True)
+    tmp = root / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(tmp) + os.sep
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def _write_volumes(window: "dict | None", children: list,
+                   dashboard: "dict | None") -> dict:
+    """Setup, measured and terminal write volume, recorded separately: the
+    setup children's own counters (read at exit) and the dashboard's bytes
+    before the window; the window's bytes; the dashboard's bytes from the
+    window's last sample to its exit."""
+    ok = [s["bytes"] for s in (window or {}).get("samples") or ()
+          if s.get("status") == "ok"]
+    first, last = (ok[0], ok[-1]) if ok else (None, None)
+    final = (dashboard or {}).get("finalWriteBytes")
+    setup = [{"label": c["label"], "writeBytes": c["writeBytes"],
+              "writeStatus": c["writeStatus"]} for c in children]
+    return {"setup": {"children": setup,
+                      "childrenBytes": (None if any(c["writeBytes"] is None
+                                                    for c in setup)
+                                        else sum(c["writeBytes"] for c in setup)),
+                      "dashboardBeforeWindowBytes": first},
+            "measuredBytes": None if first is None else last - first,
+            "terminalBytes": (None if final is None or last is None
+                              else final - last),
+            "terminalStatus": (dashboard or {}).get("finalWriteStatus")}
+
+
+def _run_write_budget_arm(args, name: str, checkout: pathlib.Path, *,
+                          capture: bool = False) -> dict:
+    """One arm on its own clone. `capture` measures the `56e66f07a`
+    reference (Q18): no candidate module is imported from that checkout, the
+    candidate-specific maintenance gates are not applied, and the raw
+    diagnostics are returned for the reference's evidence."""
+    root = pathlib.Path(args.root).expanduser().resolve() / f"write-budget-{name}"
+    if root.exists():
+        raise RuntimeError(f"{root} exists; use a fresh --root")
+    _clone_tree(pathlib.Path(args.fixture_copy).expanduser().resolve(), root)
+    binary = checkout / "bin" / "cctally"
+    env = _write_budget_env(root)
+    data_dir = root / "data"
+    record = {"arm": name, "mode": "reference" if capture else "candidate",
+              "root": str(root), "setup": {}, "admission": {}}
+    wio = _harness_write_io()
+    runner = _MeasuredRun(log_dir=root / "logs")
+    live = window = None
+    days = None
+    try:
+        _set_offline_config(env, binary)
+        if name in ("idle", "append"):
+            record["setup"]["compaction"] = _compact_reclaim_backlog(
+                binary, env, data_dir,
+                timeout_seconds=RECLAIM_COMPACTION_TIMEOUT_SECONDS, run=runner)
+        else:
+            days = max(1, _retention_days_of(data_dir) - 1)
+            _set_retention_days(data_dir, days)
+        _set_retention_stamp(data_dir, dt.datetime.now(dt.timezone.utc))
+        retention = (None if capture else
+                     _candidate_module(checkout, "_lib_conversation_retention"))
+        # Amendment 19 HR-21: ONE 900 s deadline covers the drain and the
+        # warm admission, as in §6.3.
+        admit_deadline = time.monotonic() + WRITE_BUDGET_ADMISSION_SECONDS
+        receipt, problem = _drain_before_admission(
+            checkout, env, root, run=runner,
+            deadline_s=admit_deadline - time.monotonic())
+        record["setup"]["catchUp"] = receipt
+        record["admission"].update({
+            "deadlineSeconds": WRITE_BUDGET_ADMISSION_SECONDS,
+            "catchUpAdmitted": bool(receipt.get("admitted")),
+            "catchUpElapsedS": receipt.get("elapsedS"),
+            "catchUpProblems": receipt.get("problems") or []})
+        if problem:
+            record["invalid"] = problem
+            return record
+        with _live_regime_dashboard(
+                root, binary, env, args.sync_interval, reap_family=True,
+                final_write_bytes=lambda pid: wio.ProcessWriteCounter(
+                    pid=pid).read()) as live:
+            try:
+                _await_warm_publication(live.port, f"write-budget {name}",
+                                        deadline=admit_deadline)
+            except RuntimeError as exc:
+                record["invalid"] = (f"no warm admission inside the "
+                                     f"{WRITE_BUDGET_ADMISSION_SECONDS} s "
+                                     f"admission deadline ({exc})")
+                return record
+            record["admission"]["warmAdmittedAt"] = time.time()
+            midway = None
+            if name == "backlog":
+                # The batch the rewind will make due is checked now (an arm
+                # without a large expiring group is invalid before it
+                # measures) and recorded again at the rewind (Q8).
+                problem = _expiring_group_problem(_expiry_batch(data_dir, days))
+                if problem:
+                    record["invalid"] = problem
+                    return record
+
+                def midway():
+                    batch = _expiry_batch(data_dir, days)
+                    _set_retention_stamp(
+                        data_dir,
+                        dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25))
+                    return batch
+            seq_start = (_record_seq_snapshot(data_dir)
+                         if name == "backlog" else None)
+            window = _measure_write_window(
+                live, WRITE_BUDGET_SECONDS[name],
+                wio.ProcessWriteCounter(pid=live.proc.pid),
+                append_root=root if name == "append" else None,
+                midway=midway, midway_after=WRITE_BUDGET_REWIND_AFTER_SECONDS)
+            window["warm"] = record["admission"]["warmAdmittedAt"]
+            if name == "backlog":
+                window["recordSnapshots"] = {
+                    "start": seq_start, "end": _record_seq_snapshot(data_dir)}
+    finally:
+        record["teardown"] = {
+            "setupChildren": [{key: child[key] for key in
+                               ("label", "returncode", "timedOut", "durationS",
+                                "group")} for child in runner.records],
+            "dashboard": getattr(live, "teardown", None),
+            "sweep": _sweep_clone_holders(data_dir)}
+        record["writes"] = _write_volumes(window, runner.records,
+                                          record["teardown"]["dashboard"])
+        problems = _teardown_problems(record["teardown"])
+        if problems and not record.get("invalid"):
+            record["invalid"] = "teardown: " + "; ".join(problems)
+    metrics = _write_budget_metrics(window)
+    record["metrics"] = metrics
+    record["window"] = {"start": window["start"], "end": window["end"]}
+    if name == "backlog":
+        record["setup"]["batch"] = (window.get("midway") or {}).get("result")
+        record["setup"]["rewoundAt"] = (window.get("midway") or {}).get("at")
+        if capture:
+            record["maintenance"] = {
+                "applies": False, "problems": [],
+                "reason": "candidate-specific maintenance gates do not bind "
+                          "the 56e66f07a reference (dc15)"}
+        else:
+            conditions = _maintenance_conditions(
+                metrics["operations"], window["start"], window["end"],
+                retention)
+            if "invalid" in conditions and not record.get("invalid"):
+                record["invalid"] = conditions["invalid"]
+            snaps = window.get("recordSnapshots") or {}
+            lost = _maintenance_completeness(
+                metrics["operations"], snaps.get("start"), snaps.get("end"))
+            conditions["completeness"] = {"complete": not lost,
+                                          "problems": lost,
+                                          "recordSnapshots": snaps}
+            if lost and not record.get("invalid"):
+                record["invalid"] = "operation records: " + "; ".join(lost)
+            record["maintenance"] = conditions
+        record["i4"] = WRITE_BUDGET_I4_NOTE
+    if capture:
+        record["diagnostics"] = window["diagnostics"]
+    return record
+
+
+def _requested_arms(leg: dict) -> list:
+    requested = leg.get("requestedArms")
+    return list(requested if requested is not None else (leg.get("arms") or {}))
+
+
+def full_build_gate(leg: dict) -> dict:
+    """Per arm, the Q18 full-build evaluation. Pure: `leg` is the receipt.
+    Gated arms compare the candidate's warm p50/p95 with the qualified
+    reference's for the same arm (exact rational compare: <= 6/5, equality
+    passes); idle reports not applicable on complete evidence."""
+    reference = leg.get("baselineReference")
+    reference_ok = isinstance(reference, dict) and reference.get("valid") is True
+    out = {}
+    for name, arm in (leg.get("arms") or {}).items():
+        if not isinstance(arm, dict) or arm.get("invalid") or "metrics" not in arm:
+            continue
+        metrics = arm["metrics"]
+        full = metrics.get("fullBuild")
+        if name not in WRITE_BUDGET_GATED_ARMS:
+            if not isinstance(full, dict) or full.get("complete") is not True:
+                out[name] = {"gated": False, "valid": False, "problems": list(
+                    (full or {}).get("problems")
+                    or ["no full-build instrumentation"])}
+            elif not full.get("n"):
+                out[name] = {"gated": False, "valid": True,
+                             "applicable": False, "n": 0, "p50Ms": None,
+                             "p95Ms": None,
+                             "reason": "no warm full build in the idle window "
+                                       "(complete tick evidence)"}
+            else:
+                out[name] = {"gated": False, "valid": True, "applicable": True,
+                             "n": full["n"],
+                             "p50Ms": metrics.get("fullBuildP50Ms"),
+                             "p95Ms": metrics.get("fullBuildP95Ms"),
+                             "reason": "idle is not a gated arm; absolute "
+                                       "values reported"}
+            continue
+        candidate = {"n": (full or {}).get("n"),
+                     "p50Ms": metrics.get("fullBuildP50Ms"),
+                     "p95Ms": metrics.get("fullBuildP95Ms")}
+        problems = []
+        if not isinstance(full, dict):
+            problems.append("no full-build instrumentation")
+        else:
+            if full.get("complete") is not True:
+                problems.extend(full.get("problems") or ["incomplete tick evidence"])
+            if not full.get("n"):
+                problems.append("no warm full build in the window")
+        for q in ("p50Ms", "p95Ms"):
+            if not _positive_finite(candidate[q]):
+                problems.append(f"candidate {q} {candidate[q]!r} is missing, "
+                                "nonfinite or nonpositive")
+        ref_arm = ((reference.get("arms") or {}).get(name)
+                   if reference_ok else None)
+        matched = None
+        if not isinstance(ref_arm, dict):
+            problems.append("no qualified 56e66f07a reference for this arm")
+        else:
+            matched = {key: ref_arm.get(key) for key in ("n", "p50Ms", "p95Ms")}
+            for q in ("p50Ms", "p95Ms"):
+                if not _positive_finite(matched[q]):
+                    problems.append(f"reference {q} {matched[q]!r} is missing, "
+                                    "nonfinite or nonpositive")
+        entry = {"gated": True, "valid": not problems, "problems": problems,
+                 "factor": WRITE_BUDGET_FULL_BUILD_FACTOR,
+                 "candidate": candidate, "reference": matched,
+                 "ratios": None, "failures": []}
+        if not problems:
+            entry["ratios"] = {q: candidate[q] / matched[q]
+                               for q in ("p50Ms", "p95Ms")}
+            entry["failures"] = [
+                q for q in ("p50Ms", "p95Ms")
+                if fractions.Fraction(candidate[q])
+                > _WRITE_BUDGET_FACTOR * fractions.Fraction(matched[q])]
+        out[name] = entry
+    return out
+
+
+def write_budget_invalid_reasons(leg: dict) -> "list[str]":
+    """Why the leg cannot carry a verdict ([] when it can): an invalid arm,
+    a missing or unqualified reference while a gated arm is requested, or
+    incomplete or empty full-build evidence. Pure."""
+    reasons = [f"{name}: {arm['invalid']}"
+               for name, arm in (leg.get("arms") or {}).items()
+               if isinstance(arm, dict) and arm.get("invalid")]
+    # Amendment 19 HR-21 / HR-8: a failed write counter, or a window the
+    # candidate kernel cannot qualify, is missing evidence - INVALID, never
+    # a FAIL.
+    reasons.extend(_steady_invalid_reasons(leg))
+    if any(name in WRITE_BUDGET_GATED_ARMS for name in _requested_arms(leg)):
+        reference = leg.get("baselineReference")
+        if not isinstance(reference, dict):
+            reasons.append("baselineReference: missing (capture one with "
+                           "--capture-baseline-reference; dc15 F1)")
+        elif reference.get("valid") is not True:
+            reasons.append("baselineReference: " + "; ".join(
+                reference.get("problems") or ["invalid"]))
+    for name, gate in full_build_gate(leg).items():
+        if not gate["valid"]:
+            reasons.append(f"{name}: full build: "
+                           + "; ".join(gate["problems"]))
+    return reasons
+
+
+def _steady_invalid_reasons(leg: dict) -> "list[str]":
+    out = []
+    for name, arm in (leg.get("arms") or {}).items():
+        if not isinstance(arm, dict) or arm.get("invalid") or "metrics" not in arm:
+            continue
+        metrics = arm["metrics"]
+        if metrics.get("counterStatus") != "ok":
+            out.append(f"{name}: write counter {metrics.get('counterStatus')}")
+            continue
+        steady = metrics.get("steady")
+        if not isinstance(steady, dict):
+            out.append(f"{name}: no kernel steady statistic")
+        elif not steady.get("valid"):
+            out.append(f"{name}: " + "; ".join(steady.get("problems")
+                                                 or ["the kernel's statistic "
+                                                     "is invalid"]))
+    return out
+
+
+def evaluate_write_budget_leg(leg: dict) -> list:
+    """Every gate the leg applies. Pure: `leg` is the receipt."""
+    limits = leg["limits"]
+    problems = []
+    if any(name in WRITE_BUDGET_GATED_ARMS for name in _requested_arms(leg)):
+        reference = leg.get("baselineReference")
+        if not isinstance(reference, dict) or reference.get("valid") is not True:
+            problems.append("baseline reference INVALID: " + "; ".join(
+                (reference or {}).get("problems") or ["missing"]))
+    gates = full_build_gate(leg)
+    for name in WRITE_BUDGET_ARMS:
+        arm = (leg.get("arms") or {}).get(name)
+        if arm is None:
+            problems.append(f"{name}: arm missing")
+            continue
+        if arm.get("invalid"):
+            problems.append(f"{name}: INVALID: {arm['invalid']}")
+            continue
+        metrics = arm["metrics"]
+        gate = gates.get(name)
+        if gate is not None and not gate["valid"]:
+            problems.append(f"{name}: INVALID: full build: "
+                            + "; ".join(gate["problems"]))
+        elif gate is not None and gate["gated"]:
+            for q in gate["failures"]:
+                field = "fullBuild" + q[0].upper() + q[1:]
+                problems.append(
+                    f"{name}: {field} {gate['candidate'][q]:.0f} over 1.2 x "
+                    f"the 56e66f07a reference {gate['reference'][q]:.0f} "
+                    f"(ratio {gate['ratios'][q]:.3f})")
+        if metrics["counterStatus"] != "ok":
+            problems.append(f"{name}: INVALID: write counter "
+                            f"{metrics['counterStatus']}")
+            continue
+        steady = metrics.get("steady")
+        if not isinstance(steady, dict) or not steady.get("valid"):
+            problems.append(f"{name}: INVALID: " + "; ".join(
+                (steady or {}).get("problems") or ["no kernel steady statistic"]))
+            continue
+        worst = metrics["worstBytesPerMinute"]
+        if worst is None:
+            problems.append(f"{name}: no five-minute window")
+        elif worst > limits["bytesPerMinute"]:
+            problems.append(f"{name}: {worst:.0f} B/min over the "
+                            f"{limits['bytesPerMinute']} B/min limit")
+        per_pub = metrics["worstBytesPerPublication"]
+        if per_pub is not None and per_pub > limits["bytesPerPublication"]:
+            problems.append(f"{name}: {per_pub:.0f} B/publication over the "
+                            f"{limits['bytesPerPublication']} limit")
+        if metrics["rssMaxBytes"] > PROCESS_CEILING_BYTES:
+            problems.append(f"{name}: RSS {metrics['rssMaxBytes']} over ceiling")
+        if metrics["rssSlopeBytesPerSecond"] > RSS_SLOPE_CEILING_BYTES_PER_SECOND:
+            problems.append(f"{name}: RSS slope over ceiling")
+        value = metrics.get("apiP95Ms")
+        if value is not None and value > API_P95_CEILING_MS:
+            problems.append(f"{name}: apiP95Ms {value:.0f} over "
+                            f"{API_P95_CEILING_MS:.0f}")
+        if name == "backlog":
+            problems.extend(f"backlog: {p}"
+                            for p in arm["maintenance"]["problems"])
+    return problems
+
+
+# ── the reference: capture once, reuse while it qualifies (dc15 F1) ───────
+
+def _reference_evidence_dir(output: pathlib.Path) -> pathlib.Path:
+    return output.with_name(output.name + ".evidence")
+
+
+def _reference_arm(record: dict, evidence: pathlib.Path,
+                   base: pathlib.Path) -> dict:
+    """One captured arm as the reference keeps it: the warm population, the
+    window, admission, teardown and write evidence, and its raw diagnostics
+    (and dashboard log) as digest-bound artifacts beside the reference."""
+    diagnostics = record.get("diagnostics")
+    arm = {key: value for key, value in record.items() if key != "diagnostics"}
+    arm["fullBuild"] = (record.get("metrics") or {}).get("fullBuild")
+    # dc15 F1: the baseline is expected to fail the write budget (that is
+    # the #901 defect); its write evidence is recorded, never judged, and
+    # never invalidates otherwise valid latency evidence.
+    arm["writeBudgetJudged"] = False
+    artifacts = {}
+
+    def keep(name, raw: bytes):
+        path = evidence / record["arm"] / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+        return {"path": path.relative_to(base).as_posix(),
+                "sha256": hashlib.sha256(raw).hexdigest()}
+    if diagnostics is not None:
+        artifacts["diagnostics"] = keep("diagnostics.json", json.dumps(
+            {"window": record.get("window"), "diagnostics": diagnostics},
+            sort_keys=True, allow_nan=False).encode())
+    log = pathlib.Path(record["root"]) / "regime-dashboard.log" \
+        if record.get("root") else None
+    if log is not None and log.is_file():
+        artifacts["dashboardLog"] = keep("regime-dashboard.log",
+                                         log.read_bytes())
+    arm["artifacts"] = artifacts
+    if record.get("invalid"):
+        problems = [str(record["invalid"])]
+    else:
+        problems = _reference_population_problems(arm["fullBuild"])
+        if diagnostics is None:
+            problems.append("no raw diagnostics were kept")
+    arm["valid"] = not problems
+    arm["problems"] = problems
+    return arm
+
+
+def capture_write_budget_reference(args, harness_sha: str) -> "tuple[dict, int]":
+    """Capture the qualified `56e66f07a` reference (dc15 F1): one five-minute
+    append and one thirty-minute backlog arm, serially, once each, with the
+    leg's unchanged setup, admission deadline and retention rewind, on
+    separately prepared clones under `--root` (never extra backlog). Refuses
+    before any work unless `--output` is a new file inside `--root` and the
+    root is on external storage. An invalid append stops the capture: the
+    expensive backlog is never run for a reference that is already invalid,
+    and nothing is ever repeated automatically. Exit 0 valid, 2 otherwise."""
+    root = pathlib.Path(args.root).expanduser().resolve()
+    output = (pathlib.Path(args.output).expanduser().resolve()
+              if getattr(args, "output", None) else None)
+    problems = []
+    if output is None:
+        problems.append("--output (the reference file, inside --root) is "
+                        "required")
+    else:
+        if root not in output.parents:
+            problems.append(f"the reference {output} is not inside --root "
+                            f"{root}: the capture writes only under its root")
+        if output.exists() or _reference_evidence_dir(output).exists():
+            problems.append(f"{output} or its evidence directory exists; a "
+                            "reference is never overwritten")
+    storage = _storage_identity(root)
+    if storage.get("class") != "external":
+        problems.append(f"--root {root} is on {storage.get('class')} storage "
+                        f"({storage.get('mountPoint')}); stores, temp files "
+                        "and evidence go on the external drive")
+    if problems:
+        return {"schemaVersion": 1, "kind": WRITE_BUDGET_REFERENCE_KIND,
+                "status": "refused", "problems": problems}, 2
+    root.mkdir(parents=True, exist_ok=True)
+    sys.dont_write_bytecode = True
+    started = dt.datetime.now(dt.timezone.utc).isoformat()
+    checkout = materialize_checkout_ref(WRITE_BUDGET_BASELINE_SHA,
+                                        root / "baseline-checkout")
+    reference = {
+        "schemaVersion": 1, "kind": WRITE_BUDGET_REFERENCE_KIND,
+        "baselineSha": WRITE_BUDGET_BASELINE_SHA,
+        "capturedWithSha": harness_sha, "capturedAt": started,
+        "command": {"argv": [str(arg) for arg in sys.argv]},
+        "factor": WRITE_BUDGET_FULL_BUILD_FACTOR,
+        "qualification": _write_budget_qualification(args), "arms": {},
+    }
+    evidence = _reference_evidence_dir(output)
+    for name in WRITE_BUDGET_GATED_ARMS:
+        try:
+            record = _run_write_budget_arm(args, name, checkout, capture=True)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error,
+                subprocess.SubprocessError) as exc:
+            record = {"arm": name, "invalid": f"the reference arm failed: {exc}"}
+        reference["arms"][name] = _reference_arm(record, evidence, output.parent)
+        if not reference["arms"][name]["valid"]:
+            break
+    reference["finishedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    reference["problems"] = (
+        [f"{name}: {problem}" for name, arm in reference["arms"].items()
+         for problem in arm["problems"]]
+        + [f"{name}: not captured (an earlier reference arm was invalid)"
+           for name in WRITE_BUDGET_GATED_ARMS if name not in reference["arms"]])
+    reference["valid"] = not reference["problems"]
+    output.write_text(json.dumps(reference, indent=2, sort_keys=True,
+                                 allow_nan=False) + "\n")
+    return reference, 0 if reference["valid"] else 2
+
+
+def _reference_artifact_problems(arm: dict, base: pathlib.Path) -> "list[str]":
+    """The diagnostics artifact must be a contained regular file whose digest
+    matches, and the collector must recompute the recorded samples from it."""
+    artifact = (arm.get("artifacts") or {}).get("diagnostics")
+    if not isinstance(artifact, dict):
+        return ["no raw diagnostics artifact"]
+    relative, digest = artifact.get("path"), artifact.get("sha256")
+    parts = pathlib.PurePosixPath(relative).parts if isinstance(relative, str) else ()
+    if (not parts or pathlib.PurePosixPath(relative).is_absolute()
+            or any(part in (".", "..") for part in parts)):
+        return ["the diagnostics artifact path must be relative and contained"]
+    path = base.joinpath(*parts)
+    if (any(node.is_symlink() for node in (path, *path.parents)
+            if base in node.parents) or not path.is_file()
+            or not path.resolve().is_relative_to(base)):
+        return ["the diagnostics artifact is not a contained regular file"]
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != digest:
+        return ["the diagnostics artifact digest does not match"]
+    try:
+        data = _strict_json(raw)
+    except ValueError as exc:
+        return [f"the diagnostics artifact is not valid JSON: {exc}"]
+    window = arm.get("window") or {}
+    if not all(isinstance(window.get(k), (int, float)) for k in ("start", "end")):
+        return ["the reference arm records no measured window"]
+    full = _warm_full_builds(data.get("diagnostics") or [], window["start"],
+                             window["end"])
+    recorded = arm.get("fullBuild") or {}
+    if (full["samplesMs"] != recorded.get("samplesMs")
+            or full["seqs"] != recorded.get("seqs")):
+        return ["the recorded warm samples differ from those recomputed from "
+                "the raw diagnostics"]
+    return []
+
+
+def load_write_budget_reference(path, qualification) -> dict:
+    """Read and qualify a reference for this run (dc15 F1). Valid only with
+    the schema, kind and `56e66f07a` identity, a valid capture, every
+    qualification field matched, and for append and backlog a complete,
+    nonempty, finite and positive population recomputed from its
+    digest-bound raw diagnostics."""
+    summary = {"path": None if path is None else str(path), "sha256": None,
+               "valid": False, "problems": [], "arms": {},
+               "qualification": None}
+    problems = summary["problems"]
+    if path is None:
+        problems.append("no baseline reference (--baseline-reference); "
+                        "capture one with --capture-baseline-reference on "
+                        "this host and fixture")
+        return summary
+    path = pathlib.Path(path).expanduser()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        problems.append(f"cannot read the reference {path}: {exc}")
+        return summary
+    summary["sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        reference = _strict_json(raw)
+    except ValueError as exc:
+        problems.append(f"the reference is not valid JSON: {exc}")
+        return summary
+    for key, expected in (("schemaVersion", 1),
+                          ("kind", WRITE_BUDGET_REFERENCE_KIND),
+                          ("baselineSha", WRITE_BUDGET_BASELINE_SHA)):
+        if reference.get(key) != expected:
+            problems.append(f"{key} {reference.get(key)!r} is not {expected!r}")
+    summary.update(baselineSha=reference.get("baselineSha"),
+                   capturedWithSha=reference.get("capturedWithSha"),
+                   capturedAt=reference.get("capturedAt"))
+    if reference.get("valid") is not True:
+        problems.append("the reference capture was not valid: " + "; ".join(
+            reference.get("problems") or ["unknown"]))
+    mismatches = _qualification_mismatches(reference.get("qualification"),
+                                           qualification)
+    summary["qualification"] = {"matched": not mismatches,
+                                "mismatches": mismatches}
+    problems.extend(f"qualification mismatch (a new capture is required): {m}"
+                    for m in mismatches)
+    arms = reference.get("arms") if isinstance(reference.get("arms"), dict) else {}
+    base = path.resolve().parent
+    for name in WRITE_BUDGET_GATED_ARMS:
+        arm = arms.get(name)
+        if not isinstance(arm, dict):
+            problems.append(f"{name}: no reference arm")
+            continue
+        arm_problems = []
+        if arm.get("valid") is not True:
+            arm_problems.append("the reference arm is not valid")
+        full = arm.get("fullBuild")
+        arm_problems.extend(_reference_population_problems(full))
+        arm_problems.extend(_reference_artifact_problems(arm, base))
+        problems.extend(f"{name}: {problem}" for problem in arm_problems)
+        if isinstance(full, dict):
+            summary["arms"][name] = {key: full.get(key) for key in
+                                     ("n", "p50Ms", "p95Ms", "samplesMs")}
+    summary["valid"] = not problems
+    return summary
+
+
+def run_write_budget_leg(args, candidate_sha: str) -> dict:
+    checkout = pathlib.Path(args.checkout or REPO).expanduser().resolve()
+    budget = _candidate_module(checkout, "_lib_write_budget")
+    limits = budget.validate_limits(budget.LIMITS)
+    arms = [a for a in args.write_budget_arms.split(",") if a]
+    unknown = sorted(set(arms) - set(WRITE_BUDGET_ARMS))
+    if unknown:
+        raise ValueError(f"unknown write-budget arms: {unknown}")
+    leg = {"schemaVersion": 1, "kind": "writeBudgetLeg",
+           "candidateSha": candidate_sha, "i4": WRITE_BUDGET_I4_NOTE,
+           "policyVersion": limits.policy_version,
+           "limits": {"bytesPerMinute": limits.bytes_per_minute,
+                      "bytesPerPublication": limits.bytes_per_publication},
+           "fullBuildFactor": WRITE_BUDGET_FULL_BUILD_FACTOR,
+           "requestedArms": arms, "baselineReference": None, "arms": {}}
+    if any(name in WRITE_BUDGET_GATED_ARMS for name in arms):
+        # Qualify the reference BEFORE any arm spends the fixture's writes:
+        # a leg that cannot be judged is INVALID without running (dc15 F1).
+        leg["qualification"] = _write_budget_qualification(args)
+        leg["baselineReference"] = load_write_budget_reference(
+            getattr(args, "baseline_reference", None), leg["qualification"])
+    reference = leg["baselineReference"]
+    if reference is None or reference["valid"]:
+        for name in arms:
+            leg["arms"][name] = _run_write_budget_arm(args, name, checkout)
+    leg["fullBuildGate"] = full_build_gate(leg)
+    leg["invalidReasons"] = write_budget_invalid_reasons(leg)
+    leg["invalid"] = sorted({reason.split(":", 1)[0]
+                             for reason in leg["invalidReasons"]})
+    leg["problems"] = evaluate_write_budget_leg(leg)
+    return leg
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True,
@@ -4650,12 +6246,77 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--diagnostic-output", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--summary-only", action="store_true")
+    parser.add_argument(
+        "--write-budget-leg", action="store_true",
+        help="#901 §6.4: run the full-size write-budget leg on --fixture-copy")
+    parser.add_argument(
+        "--write-budget-arms", default=",".join(WRITE_BUDGET_ARMS),
+        help="comma-separated subset of idle,append,backlog (all by default)")
+    parser.add_argument(
+        "--baseline-reference", type=pathlib.Path,
+        help="#901 Q18: the qualified 56e66f07a reference the leg's append "
+             "and backlog full builds are gated against (<= 1.2 x)")
+    parser.add_argument(
+        "--capture-baseline-reference", action="store_true",
+        help="#901 Q18: with --write-budget-leg, measure the 56e66f07a "
+             "append and backlog reference once on this host and fixture "
+             "and write it to --output, a new file inside --root")
     parser.add_argument("--gate", action="store_true")
     args = parser.parse_args(argv)
     if args.small_pipeline and not args.produce_evidence:
         parser.error("--small-pipeline requires --produce-evidence")
     if args.duration_seconds < 20 or args.sample_seconds <= 0:
         parser.error("duration must be >=20 seconds and sample interval >0")
+    if args.capture_baseline_reference and not args.write_budget_leg:
+        parser.error("--capture-baseline-reference requires --write-budget-leg")
+    if args.write_budget_leg:
+        if not args.fixture_copy:
+            parser.error("--write-budget-leg requires --fixture-copy")
+        if args.capture_baseline_reference:
+            if not args.output:
+                parser.error("--capture-baseline-reference requires --output "
+                             "(the reference file, inside --root)")
+            if args.checkout or args.checkout_ref or args.baseline_reference:
+                parser.error("--capture-baseline-reference always measures "
+                             f"{WRITE_BUDGET_BASELINE_SHA}; drop --checkout, "
+                             "--checkout-ref and --baseline-reference")
+        sha = args.candidate_sha or subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
+            text=True, check=True).stdout.strip()
+        if args.capture_baseline_reference:
+            try:
+                reference, code = capture_write_budget_reference(args, sha)
+            except (OSError, RuntimeError, ValueError, sqlite3.Error,
+                    subprocess.SubprocessError) as exc:
+                print(json.dumps({"schemaVersion": 1,
+                                  "kind": WRITE_BUDGET_REFERENCE_KIND,
+                                  "status": "failed", "error": str(exc)},
+                                 sort_keys=True))
+                return 2
+            print(json.dumps({
+                "schemaVersion": 1, "kind": WRITE_BUDGET_REFERENCE_KIND,
+                "status": reference.get("status") or (
+                    "complete" if reference.get("valid") else "invalid"),
+                "output": str(args.output), "problems": reference["problems"],
+                "arms": {name: {key: (arm.get("fullBuild") or {}).get(key)
+                                for key in ("n", "p50Ms", "p95Ms")}
+                         for name, arm in (reference.get("arms") or {}).items()},
+            }, indent=2, sort_keys=True))
+            return code
+        try:
+            leg = run_write_budget_leg(args, sha)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            print(json.dumps({"schemaVersion": 1, "kind": "writeBudgetLeg",
+                              "status": "failed", "error": str(exc)},
+                             sort_keys=True))
+            return 2
+        rendered = json.dumps(leg, indent=2, sort_keys=True, default=str) + "\n"
+        if args.output:
+            args.output.write_text(rendered)
+        print(rendered, end="")
+        if leg["invalid"]:
+            return 2
+        return 1 if args.gate and leg["problems"] else 0
     if args.execute_regime:
         try:
             metrics = _execute_regime(args, args.execute_regime)

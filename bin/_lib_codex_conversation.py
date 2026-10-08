@@ -2167,6 +2167,38 @@ def _is_late_turn_anchor(
     )
 
 
+def in_physical_order(rows: Iterable[Any], *, timestamp, position) -> list:
+    """Rows read in ``(timestamp_utc, id)`` index order, returned in physical
+    order: ``(timestamp_utc, source_path, line_offset)``.
+
+    #901 Amendment 19 T1 (spec I1). ``idx_codex_conv_msgs_conversation`` is
+    ``(conversation_key, timestamp_utc, id)``, so a read ordered by the
+    physical position past the timestamp left SQLite a "LAST 2 TERMS" sorter
+    over every run of rows tied on one timestamp, and one conversation's tie
+    run (a whole conversation, when its rows share or lack a timestamp) is not
+    a bound. The caller now reads in index order and this orders each run in
+    Python: the same rows the caller already holds, no temp structure.
+
+    Exact: equal timestamps (NULL included) are contiguous in index order and
+    compare equal here as they do in an ORDER BY, and ``UNIQUE(source_path,
+    line_offset)`` makes ``position`` a total order inside a run.
+    """
+    ordered: list = []
+    run: list = []
+    run_timestamp = None
+    for row in rows:
+        stamp = timestamp(row)
+        if run and stamp != run_timestamp:
+            run.sort(key=position)
+            ordered.extend(run)
+            run = []
+        run_timestamp = stamp
+        run.append(row)
+    run.sort(key=position)
+    ordered.extend(run)
+    return ordered
+
+
 def codex_event_is_late_turn_anchor(event: Any) -> bool:
     """Public predicate shared by delta persistence and turn inference."""
     try:

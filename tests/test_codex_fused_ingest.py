@@ -26,7 +26,8 @@ if str(REPO_ROOT / "tests") not in sys.path:
 import _lib_source_identity as identity  # noqa: E402
 import _lib_jsonl as lj  # noqa: E402
 import _cctally_db as db  # noqa: E402
-from conftest import load_script, redirect_paths  # noqa: E402
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)  # noqa: E402
 
 
 BUILDER = BIN_DIR / "build-codex-parity-fixtures.py"
@@ -460,7 +461,8 @@ def _object_records(name: str) -> list[dict]:
 def _stage_c_sync_setup(tmp_path, monkeypatch, scenario: str = "modern-full"):
     """Create one real provider-root rollout and return its live cache seam."""
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    # Root requalification tests retained rows, not transcript expiration.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout-s1.jsonl"
     rollout.parent.mkdir(parents=True)

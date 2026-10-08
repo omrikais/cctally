@@ -15,7 +15,8 @@ import sqlite3
 
 import pytest
 
-from conftest import load_script, redirect_paths  # type: ignore
+from conftest import (load_script, redirect_paths,
+                      redirect_paths_without_conversation_retention)  # type: ignore
 
 
 FLAG = "conversation_background_mcp_reingest_pending"
@@ -151,7 +152,8 @@ def _bg_lines():
 @pytest.fixture
 def replay_env(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths(ns, monkeypatch, tmp_path)
+    # Background notification replay is independent of transcript expiration.
+    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
     import _cctally_cache as cc
 
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"

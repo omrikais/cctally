@@ -504,6 +504,105 @@ def subscription_window_ending_at(
     return window
 
 
+#: The pre-#901 grouped anchor read, kept as the fallback for a stats index
+#: without the epoch-1017 anchor indexes (it selects the same rows, but sorts
+#: one group per subscription week ever recorded through a temp b-tree).
+_SUBSCRIPTION_ANCHOR_GROUPED_SQL = (
+    "SELECT "
+    "    MIN(week_start_at) AS week_start_at, "
+    "    MIN(week_end_at)   AS week_end_at, "
+    "    week_start_date, "
+    "    MIN(week_end_date) AS week_end_date "
+    "FROM weekly_usage_snapshots "
+    "WHERE week_start_at IS NOT NULL "
+    "  AND week_end_at   IS NOT NULL "
+    "  AND week_start_date IS NOT NULL "
+    "  {account} "
+    "GROUP BY week_start_date "
+    "ORDER BY MIN(week_start_at) ASC"
+)
+
+
+def _subscription_anchor_eligibility(prefix: str) -> str:
+    return (
+        f"{prefix}week_start_at IS NOT NULL "
+        f"AND {prefix}week_end_at IS NOT NULL "
+        f"AND {prefix}week_start_date IS NOT NULL"
+    )
+
+
+def _subscription_anchor_sql(scoped: bool) -> str:
+    """The ordered representative-row anchor read (#901 Amendment 1 item 9).
+
+    The outer scan walks every qualifying row in ``(week_start_at,
+    week_start_date)`` order through ``idx_usage_subscription_anchor_order``
+    and keeps one row per date: the date's first qualifying row by
+    ``(week_start_at, id)``, found with one seek of
+    ``idx_usage_subscription_anchor_pick``. That row's ``week_start_at`` is the
+    date's lexical ``MIN(week_start_at)``, so rows leave in the old ``ORDER BY
+    MIN(week_start_at)`` order, with equal starts on two dates in date order.
+    ``MIN(week_end_at)`` and ``MIN(week_end_date)`` are INDEPENDENT correlated
+    aggregates over the date's complete qualifying population, because the
+    three minima can come from three different rows. The eligibility and the
+    optional account predicate repeat in the outer scan and in every lookup.
+    """
+    def account(alias: str) -> str:
+        return f" AND {alias}.account_key = ?" if scoped else ""
+
+    def lookup(alias: str) -> str:
+        return (
+            f"FROM weekly_usage_snapshots AS {alias} "
+            "INDEXED BY idx_usage_subscription_anchor_pick "
+            f"WHERE {alias}.week_start_date = o.week_start_date "
+            f"AND {_subscription_anchor_eligibility(alias + '.')}"
+            f"{account(alias)}"
+        )
+
+    return (
+        "SELECT o.week_start_at AS week_start_at, "
+        f"(SELECT MIN(e.week_end_at) {lookup('e')}) AS week_end_at, "
+        "o.week_start_date AS week_start_date, "
+        f"(SELECT MIN(d.week_end_date) {lookup('d')}) AS week_end_date "
+        "FROM weekly_usage_snapshots AS o "
+        "INDEXED BY idx_usage_subscription_anchor_order "
+        f"WHERE {_subscription_anchor_eligibility('o.')}{account('o')} "
+        f"AND o.id = (SELECT p.id {lookup('p')} "
+        "ORDER BY p.week_start_at ASC, p.id ASC LIMIT 1) "
+        "ORDER BY o.week_start_at ASC, o.week_start_date ASC"
+    )
+
+
+def _subscription_anchor_rows(
+    conn: sqlite3.Connection, account_key: "str | None",
+) -> list:
+    """One ``(start_at, end_at, start_date, end_date)`` row per subscription
+    week, ascending by the week's minimum start (#901 Amendment 1 item 9).
+
+    The pre-#901 statement grouped every qualifying snapshot by date and
+    sorted the groups by ``MIN(week_start_at)`` through temp b-trees, with no
+    bound on retained weeks; ``_subscription_anchor_sql`` returns the same
+    rows by streaming two epoch-1017 indexes (``c901-design-2``). A store
+    without both indexes keeps the grouped statement, which is correct.
+    """
+    present = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
+            "('idx_usage_subscription_anchor_order', "
+            "'idx_usage_subscription_anchor_pick')")
+    }
+    params: tuple = () if account_key is None else (account_key,)
+    if len(present) == 2:
+        # The account placeholder appears four times: the two aggregates, the
+        # outer scan and the representative pick, in that textual order.
+        return conn.execute(
+            _subscription_anchor_sql(account_key is not None), params * 4,
+        ).fetchall()
+    account = "" if account_key is None else " AND account_key = ?"
+    return conn.execute(
+        _SUBSCRIPTION_ANCHOR_GROUPED_SQL.format(account=account), params,
+    ).fetchall()
+
+
 def _compute_subscription_weeks(
     conn: sqlite3.Connection,
     range_start: dt.datetime,
@@ -545,23 +644,7 @@ def _compute_subscription_weeks(
     """
     # Case A: snapshots exist. Account scoping (#341): a real key filters the
     # reset anchors to that account; None is the merged (all-accounts) read.
-    acct_pred = "" if account_key is None else " AND account_key = ?"
-    acct_params: tuple = () if account_key is None else (account_key,)
-    snap_rows = conn.execute(
-        "SELECT "
-        "    MIN(week_start_at) AS week_start_at, "
-        "    MIN(week_end_at)   AS week_end_at, "
-        "    week_start_date, "
-        "    MIN(week_end_date) AS week_end_date "
-        "FROM weekly_usage_snapshots "
-        "WHERE week_start_at IS NOT NULL "
-        "  AND week_end_at   IS NOT NULL "
-        "  AND week_start_date IS NOT NULL "
-        f"  {acct_pred} "
-        "GROUP BY week_start_date "
-        "ORDER BY MIN(week_start_at) ASC",
-        acct_params,
-    ).fetchall()
+    snap_rows = _subscription_anchor_rows(conn, account_key)
 
     weeks: list[SubWeek] = []
 

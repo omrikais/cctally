@@ -66,7 +66,7 @@ Block: 2026-04-30 19:30 UTC (active, 4h 06m elapsed) · 5h%: 66.7% · 7d% 62.5�
 - **#** — 1-indexed row number.
 - **Threshold** — `percent_threshold` formatted `1%`, `2%`, ….
 - **Cumulative Cost** — `block_cost_usd`.
-- **Marginal Cost** — `marginal_cost_usd`: the cumulative cost at this crossing minus the cumulative cost at the previous crossing in the same credit segment. It is `n/a` for the first crossing in each credit segment, and for a threshold crossed on the same tick as a lower one. After `cctally db rederive` it can be negative, when a crossing that replay corrected or added is priced at today's rate card next to frozen crossings that keep their recorded cost.
+- **Marginal Cost** — `marginal_cost_usd`: the cumulative cost at this crossing minus the cumulative cost at the previous crossing in the same credit segment. It is `n/a` for the first crossing in each credit segment, and for a threshold crossed on the same tick as a lower one. After `cctally db rederive` it can be negative, when a crossing that replay corrected or added is priced at today's rate card next to frozen crossings that keep their recorded cost. A negative amount prints with its sign before the dollar sign, for example `-$71.207516`.
 - **7d at crossing** — the **effective** weekly percentage at the crossing, `effectiveSevenDayPctAtCrossing`, formatted as an integer percent; `—` when it is null. It is not `sevenDayPctAtCrossing`. That field is the raw reading the crossing tick reported, and on a tick whose weekly axis was clamped or whose weekly value a credit has since retired, the raw reading is a number no reader ever saw. The column never falls back to it: when the effective value is unavailable the marker says so.
 
 ## Empty case
