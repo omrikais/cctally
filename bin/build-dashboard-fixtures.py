@@ -2587,12 +2587,15 @@ def _pin_reconcile_nondeterminism(app_dir: Path) -> None:
                 )
             except sqlite3.OperationalError:
                 continue
-        try:
-            # The segment it names is deleted below with the rest of the
-            # journal, so an empty cursor is the honest state, not a loss.
-            conn.execute("DELETE FROM journal_cursor")
-        except sqlite3.OperationalError:
-            pass
+        # The segment each names is deleted below with the rest of the
+        # journal, so an empty cursor and admission summary are the honest
+        # state, not a loss. #825/#832: the summary records the same
+        # wall-clock-named segment as its scanned high-water.
+        for table in ("journal_cursor", "journal_admission_summary"):
+            try:
+                conn.execute(f"DELETE FROM {table}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
         conn.execute("VACUUM")
     finally:

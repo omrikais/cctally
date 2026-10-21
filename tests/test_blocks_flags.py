@@ -87,6 +87,7 @@ def test_blocks_session_length_validation(tmp_path, val, rc):
                        capture_output=True, text=True,
                        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
                             "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+                            "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
                             "TZ": "Etc/UTC"})
     assert r.returncode == rc, r.stderr
 
@@ -95,7 +96,8 @@ def test_blocks_session_length_validation(tmp_path, val, rc):
 
 def test_active_no_block_message_on_stdout(tmp_path):
     env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin",
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "TZ": "Etc/UTC"}
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1", "TZ": "Etc/UTC"}
     r = subprocess.run([sys.executable, str(BIN), "blocks", "-a"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0
@@ -148,7 +150,8 @@ def test_recent_filter_drops_old_keeps_recent_and_active(tmp_path):
     home = build_out / "recent-filter"
     env_vars = _read_input_env(home)
     env = {"HOME": str(home), "PATH": "/usr/bin:/bin",
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "TZ": "Etc/UTC",
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1", "TZ": "Etc/UTC",
            "NO_COLOR": "1", "CCTALLY_AS_OF": env_vars["AS_OF"]}
     r = subprocess.run([sys.executable, str(BIN), "blocks", "-r"],
                        capture_output=True, text=True, env=env)

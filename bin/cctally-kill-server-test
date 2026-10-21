@@ -26,6 +26,10 @@
 # aggregates it like every other harness.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Shared harness preamble (dev-instance isolation). This harness never invokes
 # the cctally binary — it drives the helper against python stubs — but every
@@ -42,7 +46,7 @@ fail_count=0
 pass () { echo "PASS $1"; pass_count=$((pass_count + 1)); }
 fail () { echo "FAIL $1"; fail_count=$((fail_count + 1)); }
 
-SCRATCH=$(mktemp -d -t cctally-kill-server-test.XXXXXX)
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/cctally-kill-server-test.XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # A stub that installs SIG_IGN for SIGTERM (cannot be killed by SIGTERM),

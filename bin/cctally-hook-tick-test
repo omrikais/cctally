@@ -15,6 +15,10 @@
 # so we use a Python one-liner via `os.utime` to backdate the throttle
 # file. Works identically on macOS and Linux.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -44,7 +48,7 @@ run_scenario () {
     # shellcheck disable=SC1091
     . "$dir/input.env"
 
-    local fake; fake=$(mktemp -d)
+    local fake; fake=$(mktemp -d "${TMPDIR:-/tmp}/cctally-hook-tick-test.XXXXXX") || exit 1
     mkdir -p "$fake/.claude" "$fake/.local/share/cctally"
 
     if [ -n "$THROTTLE_AGE_S" ]; then
@@ -149,7 +153,7 @@ run_codex_foreground_fixture () {
     [ -f "$dir/golden-stdout.txt" ] || { echo "SKIP $name: no stdout golden"; return 0; }
     [ -f "$dir/golden-marker-count.txt" ] || { echo "SKIP $name: no marker golden"; return 0; }
 
-    local fake; fake=$(mktemp -d)
+    local fake; fake=$(mktemp -d "${TMPDIR:-/tmp}/cctally-hook-tick-test.XXXXXX") || exit 1
     mkdir -p "$fake/.codex" "$fake/.local/share/cctally"
     local raw rc out
     raw=$(HOME="$fake" CODEX_HOME="$fake/.codex" TZ=Etc/UTC \
@@ -189,7 +193,7 @@ run_codex_foreground_fixture
 # ---------------------------------------------------------------------
 run_foreground_payload () {
     local name="$1" payload="$2" expected_event="$3" expected_session="$4"
-    local fake; fake=$(mktemp -d)
+    local fake; fake=$(mktemp -d "${TMPDIR:-/tmp}/cctally-hook-tick-test.XXXXXX") || exit 1
     mkdir -p "$fake/.local/share/cctally"
     local rc=0
     printf '%s' "$payload" \
@@ -241,7 +245,7 @@ fi
 # We confirm the log line lands with the expected event/session, then
 # trust the existing fixture suite for the rest.
 # ---------------------------------------------------------------------
-shell_test_fake=$(mktemp -d)
+shell_test_fake=$(mktemp -d "${TMPDIR:-/tmp}/cctally-hook-tick-test.XXXXXX") || exit 1
 mkdir -p "$shell_test_fake/.claude" "$shell_test_fake/.local/share/cctally"
 printf '{"hook_event_name":"PostToolBatch","session_id":"shellasynctest"}' \
     | HOME="$shell_test_fake" TZ=Etc/UTC /bin/sh -c "$HARNESS_BIN hook-tick --no-oauth"

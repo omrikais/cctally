@@ -10,6 +10,10 @@
 # cctally-test-all parses it. Non-vacuity for the pure fingerprint legs
 # (scenario 6) is covered by tests/test_fixture_cache.py.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Dev-instance isolation preamble (exports CCTALLY_DISABLE_DEV_AUTODETECT=1);
 # coverage enforced by tests/test_harness_dev_autodetect_coverage.py.
@@ -18,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
-SCRATCH="$(mktemp -d -t cctally-fixture-cache-XXXXXX)"; trap 'rm -rf "$SCRATCH"' EXIT
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-fixture-cache-XXXXXX")" || exit 1; trap 'rm -rf "$SCRATCH"' EXIT
 # This harness TESTS the cache mechanism, so it must be immune to an ambient
 # opt-out/audit leaking in from the caller (e.g. `CCTALLY_FIXTURE_CACHE=0
 # bin/cctally-test-all` exports the bypass suite-wide, which would turn every

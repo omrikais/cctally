@@ -169,7 +169,8 @@ def home_negative(tmp_path, monkeypatch):
 def _env(home: Path) -> dict:
     return {
         "HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
-        "CCTALLY_DISABLE_DEV_AUTODETECT": "1", "NO_COLOR": "1",
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1", "NO_COLOR": "1",
         "PYTHONIOENCODING": "utf-8",
     }
 

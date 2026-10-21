@@ -229,29 +229,37 @@ def _provider_quota_observations() -> tuple[QuotaObservation, ...]:
     )
 
 
+_SHARE_FAMILY_ARGVS = [
+    ["project"],
+    ["diff", "--a", "2026-07-14..2026-07-14", "--b", "2026-07-15..2026-07-15"],
+    ["range-cost", "--start", "2026-07-14T00:00:00Z"],
+    ["cache-report"],
+    ["report"],
+    ["codex-daily"],
+    ["codex-monthly"],
+    ["codex-weekly"],
+    ["codex-session"],
+]
+
+# One case per destination-shape rule `_share_validate_args` enforces. The
+# validator runs once in `main` for every family, so every rule runs on one
+# representative family and every family runs one rule (it was the full
+# 9 x 5 product until the test regime reset).
+_INVALID_SHARE_RULES = [
+    ["--output", "out.md"],                          # --output requires --format
+    ["--copy"],                                      # --copy requires --format
+    ["--format", "html", "--copy"],                  # --copy only with md
+    ["--format", "md", "--open"],                    # --open only with html/svg
+    ["--format", "svg", "--open", "--output", "-"],  # --open needs a file
+]
+
+
 @pytest.mark.parametrize(
-    "argv",
-    [
-        ["project"],
-        ["diff", "--a", "2026-07-14..2026-07-14", "--b", "2026-07-15..2026-07-15"],
-        ["range-cost", "--start", "2026-07-14T00:00:00Z"],
-        ["cache-report"],
-        ["report"],
-        ["codex-daily"],
-        ["codex-monthly"],
-        ["codex-weekly"],
-        ["codex-session"],
-    ],
-)
-@pytest.mark.parametrize(
-    "invalid_share_args",
-    [
-        ["--output", "out.md"],
-        ["--copy"],
-        ["--format", "html", "--copy"],
-        ["--format", "md", "--open"],
-        ["--format", "svg", "--open", "--output", "-"],
-    ],
+    "argv,invalid_share_args",
+    [(_SHARE_FAMILY_ARGVS[0], rule) for rule in _INVALID_SHARE_RULES]
+    + [(argv, ["--copy"]) for argv in _SHARE_FAMILY_ARGVS[1:]],
+    ids=[f"rule{i}" for i in range(len(_INVALID_SHARE_RULES))]
+    + [argv[0] for argv in _SHARE_FAMILY_ARGVS[1:]],
 )
 def test_invalid_share_flags_exit_before_every_provider_or_destination_io(
     monkeypatch, capsys, argv, invalid_share_args,
@@ -276,7 +284,11 @@ def test_invalid_share_flags_exit_before_every_provider_or_destination_io(
 
     assert raised.value.code == 2
     assert touched == []
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    # The share validator's own refusal, not argparse's: a family that lost
+    # `_add_share_args` would also exit 2, but with a `usage:` error.
+    assert captured.err.startswith("cctally: ") and "usage:" not in captured.err, captured.err
 
 
 @pytest.mark.parametrize(

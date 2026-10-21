@@ -402,7 +402,11 @@ def build(
     _load_cctally()
     import _cctally_core
     import _cctally_journal as jr
-    import _lib_journal as J
+    import _lib_journal
+
+    # A pre-#825/#832 journal: previous-release record shapes, no
+    # writer-generation stamp, so the pinned pre-change dumps still hold.
+    J = _lib_journal.legacy_writer_view()
 
     journal_dir = _cctally_core.JOURNAL_DIR
     journal_dir.mkdir(parents=True, exist_ok=True)

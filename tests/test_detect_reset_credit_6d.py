@@ -250,11 +250,13 @@ def test_detect_5h_suppression_empty_on_replay(ns):
         # test pre-inserts an event row. The stale-replica DELETE does, because
         # it runs only on the credit path and unconditionally once there — the
         # same pivot `test_detect_5h_legacy_no_ctx_still_fires_and_deletes`
-        # already asserts.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM weekly_usage_snapshots "
-            "WHERE journal_id = 'sa:seed5h'"
-        ).fetchone()[0] == 0, (
+        # already asserts. (#825/#832 fix round K15: the seeded row is an
+        # UNHELD stale replica, so the cleanup retires its five-hour effect
+        # in place rather than deleting it.)
+        assert tuple(conn.execute(
+            "SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key "
+            "FROM weekly_usage_snapshots WHERE journal_id = 'sa:seed5h'"
+        ).fetchone() or ()) == (None, None, None), (
             "the credit did not fire at all, so the empty suppression map "
             "proves nothing about the crash-replay path")
     finally:
@@ -276,11 +278,14 @@ def test_detect_5h_legacy_no_ctx_still_fires_and_deletes(ns):
             "SELECT COUNT(*) FROM five_hour_reset_events "
             "WHERE five_hour_window_key = ?", (_5H_KEY,),
         ).fetchone()[0] == 1
-        # The pre-credit stale-replica snapshot was deleted by pivot-2.
-        assert conn.execute(
-            "SELECT COUNT(*) FROM weekly_usage_snapshots "
-            "WHERE journal_id = 'sa:seed5h'"
-        ).fetchone()[0] == 0
+        # The pre-credit stale-replica snapshot was cleaned by pivot-2: an
+        # unheld row keeps its weekly evidence and loses its five-hour effect
+        # (#825/#832 fix round K15, every fold policy).
+        assert [tuple(r) for r in conn.execute(
+            "SELECT weekly_percent, five_hour_percent, five_hour_resets_at, "
+            "       five_hour_window_key "
+            "FROM weekly_usage_snapshots WHERE journal_id = 'sa:seed5h'"
+        )] == [(50.0, None, None, None)]
     finally:
         conn.close()
 

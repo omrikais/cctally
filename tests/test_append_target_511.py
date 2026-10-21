@@ -32,6 +32,15 @@ import _lib_journal as jl  # noqa: E402
 from conftest import load_script, redirect_paths  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 JANUARY = dt.datetime(2026, 1, 31, 23, 59, 59, tzinfo=dt.timezone.utc)
 FEBRUARY = dt.datetime(2026, 2, 1, 0, 0, 1, tzinfo=dt.timezone.utc)
 MARCH = dt.datetime(2026, 3, 1, 0, 0, 1, tzinfo=dt.timezone.utc)

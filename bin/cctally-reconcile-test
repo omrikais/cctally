@@ -28,6 +28,10 @@
 # `bin/cctally-preflight`'s check 2 now fails on both signals.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -42,7 +46,7 @@ BIN="$REPO_ROOT/bin/cctally"
 # the tree on every run. FIXTURES points at the scratch dir so each
 # reconcile_invariant call resolves $FIXTURES/<cmd>/<scenario> to the
 # freshly-built scratch copy (input.env is written by each builder).
-SCRATCH_DIR=$(mktemp -d -t cctally-reconcile-fixtures-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 FIXTURES="$SCRATCH_DIR"
 
@@ -859,7 +863,7 @@ reconcile_invariant "diff_projects_sum_eq_overall" \
 fhb_perblock_vs_range_cost () {
     local name="fhb-perblock-vs-range-cost"
     local home
-    home=$(mktemp -d -t cctally-reconcile-fhb-XXXXXX)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-fhb-XXXXXX") || exit 1
 
     # Bootstrap stats.db schema (weekly opens stats.db & runs migrations;
     # cache-sync only touches cache.db).
@@ -990,7 +994,7 @@ tz_wire_invariant () {
     local name="tz_wire_invariant_weekly_json"
     local src_home="$FIXTURES/weekly/multi-week-anchored"
     local home
-    home=$(mktemp -d -t cctally-reconcile-tz-XXXXXX)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-tz-XXXXXX") || exit 1
     cp -R "$src_home/.local" "$home/"
 
     local AS_OF=""
@@ -1192,7 +1196,7 @@ percent_breakdown_tz_localized_window_reversible
 tz_naive_args_localized () {
     local name="tz_naive_args_localized"
     local home
-    home=$(mktemp -d -t cctally-reconcile-tz4-XXXXXX)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-tz4-XXXXXX") || exit 1
 
     # Seed cctally config (display.tz=local so only --tz drives parsing)
     # and a single synthetic Claude JSONL with entries straddling the
@@ -1386,7 +1390,7 @@ tz_json_byte_stable_across_tz () {
     . "$src_home/input.env"
 
     local scratch
-    scratch=$(mktemp -d -t cctally-reconcile-tz5-XXXXXX)
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-tz5-XXXXXX") || exit 1
     local h_local="$scratch/cfg-local"
     local h_utc="$scratch/cfg-utc"
     local h_iana="$scratch/cfg-iana"
@@ -1472,7 +1476,7 @@ tz_json_byte_stable_across_tz
 sch1_milestone_alerted_at_columns () {
     local name="sch1_milestone_alerted_at_columns"
     local home
-    home=$(mktemp -d -t cctally-reconcile-sch1-XXXXXX)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-sch1-XXXXXX") || exit 1
 
     # Trigger open_db() against the fresh HOME so stats.db materializes
     # with all schema migrations applied. `weekly --json` is a cheap
@@ -1548,7 +1552,7 @@ sch1_milestone_alerted_at_columns
 a1_a2_alerts_envelope () {
     local name="a1_a2_alerts_envelope"
     local home
-    home=$(mktemp -d -t cctally-reconcile-a1a2-XXXXXX)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-a1a2-XXXXXX") || exit 1
 
     # Bootstrap stats.db (open_db() applies all inline ALTERs incl.
     # alerted_at columns from T1) by running any subcommand that
@@ -1805,7 +1809,7 @@ a1_a2_alerts_envelope
 
 credit_invariants () {
     local name="credit_invariants"
-    local home; home="$(mktemp -d -t cctally-reconcile-credit.XXXXXX)"
+    local home; home="$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-credit.XXXXXX")" || exit 1
     local result rc_py
     result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PYCRED' 2>&1
 import importlib.util, os, pathlib, sys
@@ -1972,7 +1976,7 @@ credit_invariants
 
 five_hour_credit_invariants () {
     local name="five_hour_credit_invariants"
-    local home; home="$(mktemp -d -t cctally-reconcile-5hcredit.XXXXXX)"
+    local home; home="$(mktemp -d "${TMPDIR:-/tmp}/cctally-reconcile-5hcredit.XXXXXX")" || exit 1
     local result rc_py
     result=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$home" TZ=Etc/UTC python3 - <<'PY5HC' 2>&1
 import importlib.util, os, pathlib, sys

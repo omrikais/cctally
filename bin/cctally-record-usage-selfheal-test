@@ -25,6 +25,10 @@
 #   - the dedup tick itself exited 0 (no error path taken)
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -46,7 +50,7 @@ assert_eq () {
     fi
 }
 
-SCRATCH="$(mktemp -d -t cctally-selfheal.XXXXXX)"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-selfheal.XXXXXX")" || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
 out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC \
@@ -273,7 +277,7 @@ run_credit_scenario () {
     local label="$1"
     local pycode="$2"
     local scratch
-    scratch="$(mktemp -d -t cctally-selfheal-credit.XXXXXX)"
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctally-selfheal-credit.XXXXXX")" || exit 1
     local out2
     out2=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$scratch" TZ=Etc/UTC python3 -c "$pycode")
     local ec2=$?
@@ -466,6 +470,14 @@ run_credit_scenario "credit-then-rising" "$scenario_py"
 # the statusline is immune — it renders the live rate_limits, not the DB).
 # POST-FIX the rollover heal materializes window B's block on the dedup
 # tick, WITHOUT inserting an extra snapshot row (the heal is block-only).
+#
+# #825/#832 spec 4.7 revision 6 (fix round K14b): a reading captured under
+# fold policy 1 (every reading `cmd_record_usage` captures now) treats an
+# equal five-hour value in ANOTHER canonical window as new evidence, so tick
+# 2 writes window B's first snapshot and its block derives from that row. The
+# block-only heal still serves the historical policy, i.e. a replay or
+# rederive of an unversioned observation; this scenario now pins that window
+# B gets exactly one snapshot and exactly one canonical block.
 IFS= read -r -d '' scenario_py <<'PY' || true
 import importlib.util, os, pathlib, sys, argparse, datetime as dt
 from importlib.machinery import SourceFileLoader
@@ -506,17 +518,84 @@ try:
     n_snap = conn.execute(
         "SELECT COUNT(*) FROM weekly_usage_snapshots"
     ).fetchone()[0]
+    n_snap_b = conn.execute(
+        "SELECT COUNT(*) FROM weekly_usage_snapshots "
+        "WHERE five_hour_window_key = ?",
+        (int(key_b),),
+    ).fetchone()[0]
 finally:
     conn.close()
 
 assert rc1 == 0 and rc2 == 0, f"rc1={rc1} rc2={rc2}"
-# The heal is block-only: the flat tick is STILL deduped (one snapshot),
-# but window B's canonical anchor now exists.
-assert n_snap == 1, f"unexpected extra snapshot row(s): {n_snap}"
+# Fold policy 1: the equal value in window B is that window's first
+# reading, so it writes exactly one row there, and window B's canonical
+# anchor exists.
+assert n_snap == 2, f"unexpected snapshot row count: {n_snap}"
+assert n_snap_b == 1, f"window B snapshot rows = {n_snap_b} (expected 1)"
 assert n_b == 1, f"window B five_hour_blocks rows = {n_b} (expected 1)"
 print("OK")
 PY
 run_credit_scenario "window-rollover-flat-percent-heals-block" "$scenario_py"
+
+# The same rollover, recorded as an earlier release recorded it: the raw
+# observations carry no fold-policy revision, so the historical policy keeps
+# its decision (the flat tick in window B is deduplicated) and the block-only
+# rollover heal is what materializes window B's canonical anchor.
+IFS= read -r -d '' scenario_py <<'PY' || true
+import importlib.util, os, pathlib, sys, argparse, datetime as dt
+from importlib.machinery import SourceFileLoader
+repo_root = pathlib.Path(os.environ["REPO_ROOT_RESOLVED"])
+loader = SourceFileLoader("cctally_mod", str(repo_root / "bin" / "cctally"))
+spec = importlib.util.spec_from_loader("cctally_mod", loader)
+mod = importlib.util.module_from_spec(spec); sys.modules["cctally_mod"] = mod
+loader.exec_module(mod)
+mod.APP_DIR.mkdir(parents=True, exist_ok=True)
+import _lib_journal
+_real_make_obs = _lib_journal.make_obs
+def _unversioned_make_obs(**kwargs):
+    payload = dict(kwargs.get("payload") or {})
+    payload.pop("fold_policy", None)
+    return _real_make_obs(**{**kwargs, "payload": payload})
+_lib_journal.make_obs = _unversioned_make_obs
+
+now = dt.datetime.now(dt.timezone.utc)
+week_end = int((now + dt.timedelta(days=3)).replace(
+    minute=0, second=0, microsecond=0).timestamp())
+e_a = int((now + dt.timedelta(hours=1)).replace(second=0, microsecond=0).timestamp())
+e_b = e_a + 5 * 3600
+key_a = mod._canonical_5h_window_key(e_a)
+key_b = mod._canonical_5h_window_key(e_b)
+assert key_a != key_b, f"windows collapsed to one key: {key_a}"
+
+def rec(five_reset):
+    ns = argparse.Namespace(
+        percent=50.0, resets_at=week_end,
+        five_hour_percent=0.0, five_hour_resets_at=five_reset,
+        week_start_name=None,
+    )
+    return mod.cmd_record_usage(ns)
+
+rc1 = rec(e_a)
+rc2 = rec(e_b)
+
+conn = mod.open_db()
+try:
+    n_b = conn.execute(
+        "SELECT COUNT(*) FROM five_hour_blocks WHERE five_hour_window_key = ?",
+        (int(key_b),),
+    ).fetchone()[0]
+    n_snap = conn.execute(
+        "SELECT COUNT(*) FROM weekly_usage_snapshots"
+    ).fetchone()[0]
+finally:
+    conn.close()
+
+assert rc1 == 0 and rc2 == 0, f"rc1={rc1} rc2={rc2}"
+assert n_snap == 1, f"unexpected extra snapshot row(s): {n_snap}"
+assert n_b == 1, f"window B five_hour_blocks rows = {n_b} (expected 1)"
+print("OK")
+PY
+run_credit_scenario "window-rollover-flat-percent-heals-block-historical-policy" "$scenario_py"
 
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" -eq 0 ]

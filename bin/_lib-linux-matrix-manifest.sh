@@ -19,7 +19,7 @@ apt_epoch="${2:?apt freshness epoch required}"
 image_inputs="${3:?image input digest required}"
 base_image="${CCTALLY_BASE_IMAGE:-}"
 
-work=$(mktemp -d)
+work=$(mktemp -d "${TMPDIR:-/tmp}/cctally-linux-matrix-manifest.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 
 venv_python="${checkout}/.venv/bin/python"
@@ -55,8 +55,9 @@ grep -h -E '^(Origin|Label|Suite|Version|Codename|Date|Valid-Until):' \
 # The installed npm dependency graph is read from the installed tree rather than
 # from the manifests, because `npm ci` removes package.json and the lockfile from
 # the image and the installed tree is what the lane actually resolves against.
-"$venv_python" - "$web/node_modules" <<'PY' | LC_ALL=C sort > "$work/npm-graph.tsv" || true
-import json
+# Passed with -c rather than as a here-document, so no shell writes the body
+# to a temporary file outside TMPDIR (#940 C11). It reads no stdin.
+npm_graph_program='import json
 import os
 import sys
 
@@ -80,7 +81,9 @@ if os.path.isdir(root):
                 data.get("version", ""),
             )
         )
-PY
+'
+"$venv_python" -c "$npm_graph_program" "$web/node_modules" </dev/null \
+  | LC_ALL=C sort > "$work/npm-graph.tsv" || true
 
 "$sqlite_shell" :memory: 'PRAGMA compile_options;' | LC_ALL=C sort \
   > "$work/sqlite-compile-options.txt" || true

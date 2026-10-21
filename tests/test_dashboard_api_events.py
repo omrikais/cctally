@@ -135,10 +135,16 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
         monkeypatch, tmp_path):
     """The periodic dashboard rebuild carries reducer-selected usage.
 
-    Two statusline candidates are phase-locked at the spool boundary before
-    either can reduce.  The normal periodic rebuild closure then owns the
-    snapshot-ref update and hub publication; neither the reducer nor that
+    Two statusline candidates are phase-locked after their durable capture,
+    before either can reduce.  The normal periodic rebuild closure then owns
+    the snapshot-ref update and hub publication; neither the reducer nor that
     passive rebuild may contact an OAuth path.
+
+    #825/#832 spec 4.3 revision 3 (fix round T): the render captures its
+    arrival into the account's intake and installs its spool slot under the
+    intake leaf lock, so the phase lock sits after `_capture_arrival`
+    returns. A lock taken inside `_write_candidate` would hold the leaf lock
+    and stall the other render's capture.
     """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
@@ -158,17 +164,18 @@ def test_passive_sse_reflects_statusline_reducer_without_oauth(
     arrived = 0
     abort_phase = False
     statusline = ns["_cctally_statusline"]
-    write_candidate = statusline._write_candidate
+    capture_arrival = statusline._capture_arrival
 
     def phase_locked(candidate):
         nonlocal arrived
-        write_candidate(candidate)
+        captured = capture_arrival(candidate)
         with phase:
             arrived += 1
             phase.notify_all()
             phase.wait_for(lambda: arrived == len(parsed) or abort_phase)
+        return captured
 
-    monkeypatch.setattr(statusline, "_write_candidate", phase_locked)
+    monkeypatch.setattr(statusline, "_capture_arrival", phase_locked)
     workers = [threading.Thread(
         target=statusline._statusline_persist, args=(candidate,), kwargs={"sync_for_test": True},
     ) for candidate in parsed]

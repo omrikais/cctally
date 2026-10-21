@@ -31,7 +31,7 @@ import time
 
 import pytest
 
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 from test_901_sync_transactions import (
     FakeClock,
     _claude_line,
@@ -174,7 +174,7 @@ class Product:
     def __init__(self, tmp_path: pathlib.Path, monkeypatch) -> None:
         self.ns = load_script()
         self.home = tmp_path / "home"
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             self.ns, monkeypatch, self.home)
         self.share = self.home / ".local" / "share" / "cctally"
         codex = tmp_path / "codex"
@@ -807,7 +807,7 @@ runpy.run_path(os.path.join(bin_dir, "cctally"), run_name="__main__")
 
 def _hook_home(tmp_path: pathlib.Path, monkeypatch):
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-synthetic-h1-hook"
     projects.mkdir(parents=True)
     (projects / "session-h1.jsonl").write_text(

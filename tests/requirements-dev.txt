@@ -38,7 +38,7 @@
 # checks this file and the three workflow lanes, and bin/cctally-test-remote-test
 # (private) checks the wrapper.
 #
-# Four entries below are not imported by the product and are here because a gate
+# Five entries below are not imported by the product and are here because a gate
 # detects or executes them at runtime:
 #   pytest-xdist   -- bin/cctally-test-all gates `-n "$PYTEST"` on `import xdist`
 #                     and silently falls back to SERIAL pytest without it.
@@ -58,6 +58,14 @@
 #                     0.11.0.1 while the gate requires the executable to report
 #                     0.11.0.
 #
+#   backports.zstd -- the PyPI backport of Python 3.14's `compression.zstd`
+#                     (#968 U1). The runtime CLI never requires it: cctally
+#                     resolves the decoder at call time and fails closed
+#                     without one. Every authoritative gate installs it so the
+#                     compressed-rollout suite exercises real decoding through
+#                     the production resolver and never skips. It declares no
+#                     dependencies on 3.11-3.13, so it closes on itself.
+#
 # The remaining entries are the transitive closure of the ones above: Pygments +
 # markdown-it-py + mdurl are rich's, execnet is pytest-xdist's, and iniconfig +
 # packaging + pluggy are pytest's. PyYAML and shellcheck-py declare no
@@ -69,6 +77,7 @@ pytest-timeout==2.4.0
 PyYAML==6.0.3
 rich==15.0.0
 shellcheck-py==0.11.0.1
+backports.zstd==1.0.0
 Pygments==2.20.0
 execnet==2.1.2
 iniconfig==2.3.0

@@ -29,6 +29,7 @@ cctally exit codes fall into three groups.
 | `db backup` | `2` invalid/existing destination · `3` backup or integrity failure |
 | `db prune` | `0` successful preview, no-op, or complete apply · `2` argument/configuration validation, including a malformed `storage.artifact_retention` block in **both** modes and the #146 prod-guard refusal · `3` partial apply, deletion or lock failure, or protected evidence leaving a bound unsatisfied (a blocked *preview* exits `0` with `status: "blocked"`) |
 | `db checkpoint` | `3` the target DB stayed busy / the WAL was not fully truncated through the timeout (`0` = drained, already-small, or DB absent) |
+| `cache-sync` | `1` the cache lock is held by another process (`--prune-orphans`) · `3` the conversation rollup re-derive was refused (`--prune-orphans`), or a Codex rebuild (`--rebuild`, or a pending Codex replay the sync would run) was refused because compressed rollouts could not be decoded — existing Codex data is kept |
 | `tui` | `1` fatal (missing `rich`, narrow terminal, renderer crash) · `2` argument error |
 | `statusline` | `1` unparseable/non-object stdin JSON · `2` argparse / `--config` error |
 | share surface | `2` flag-combo error · `3` output-filename collision exhaustion, or a privacy refusal (the render detected a forbidden identifier class and, per the #503 S1 decision, fails rather than redacting — nothing is written) |
@@ -46,6 +47,8 @@ A project display field that reached the renderer without going through preparat
 ```
 cctally: refused to write a share artifact — project display fields escaped preparation: acme-secret, other-repo
 ```
+
+**Codex reads exit `3` when compressed history cannot be decoded.** Codex compresses older rollouts to `rollout-….jsonl.zst`, which cctally reads with Python 3.14's `compression.zstd` or the `backports.zstd` package. When a Codex report has to read rollouts directly because the cache cannot be used, and compressed rollouts cannot be decoded, it prints `Codex totals are unavailable because compressed history could not be decoded.` and exits `3` instead of printing totals that silently leave that history out. This applies to `codex-daily`, `codex-monthly`, `codex-weekly`, `codex-session`, their `cctally codex …` forms, and the `--source codex` and `--source all` forms of `diff`, `range-cost`, `cache-report` and `report` when they use the accounting fallback, plus `budget` when a Codex budget is configured. The qualified project reader (`project`, or `range-cost` with a project filter) requires cached project metadata and reports that metadata unavailable instead of falling back to direct rollouts.
 
 **Stats-index open failures are exit `3` for every stats-reading command.** Since the DB journal redesign (§7.1) `stats.db` is a disposable journal index; a `StatsEpochMismatchError` (a version-mismatched stats.db with no journal to rebuild from) or a `StatsDbCorruptError` (corruption the auto-heal could not resolve) is caught before the generic `DatabaseError` handler and returns `3` with one-line guidance, on whichever command opened the DB. The normal mismatch/corruption case never reaches here — it self-heals by rebuild on open.
 

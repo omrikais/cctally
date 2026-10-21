@@ -831,6 +831,11 @@ def _pin_env(data_dir: pathlib.Path, claude_dir: pathlib.Path):
     os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
     os.environ["CLAUDE_CONFIG_DIR"] = str(claude_dir)
     os.environ.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")
+    # #965: ASSIGN the test retention switch before cctally loads, because this
+    # builder also runs alone. The corpus's persisted `retention_days: 0`
+    # (build_fixture) is unchanged: it is the corpus's runtime policy for later
+    # consumers (spec 4.4), not a generation-time convenience.
+    os.environ["CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"] = "1"
     # #819: the corpus's own clock, for every journal record the build appends.
     #
     # `_maybe_append_codex_account_observe` stamps its `account_observe` record
@@ -880,6 +885,8 @@ PINNED_ENV_KEYS = (
     # `build_fixture_isolated` freezes the journal's stamps and the measurement
     # that follows it runs on the caller's own clock, exactly as before.
     "CCTALLY_AS_OF",
+    # #965: restored exactly, absence as absence.
+    "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF",
 )
 
 
@@ -990,9 +997,11 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: rebuilds that were not strictly required; under-inclusion silently reuses a
 #: corpus another tree's ingest wrote, which is the defect being repaired.
 #:
-#: COST, stated rather than assumed: 141 files, and the 9.9 MB and 47 ms to
+#: COST, stated rather than assumed: 155 files, and the 9.9 MB and 47 ms to
 #: digest were measured at 139, before #834 S2 added the 140th and #901 W9's
-#: checkpoint policy the 141st. The cost is
+#: checkpoint policy the 141st; later work, ending with #825/#832's three
+#: outcome-quarantine modules and its derivation-completion step, brought it
+#: to 155. The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
 #: whose marker was written by the previous tree -- for `large` that is the
@@ -1003,6 +1012,7 @@ PRODUCER_SOURCES = (
     "bin/_cctally_cache.py",
     "bin/_cctally_cache_report.py",
     "bin/_cctally_codex.py",
+    "bin/_cctally_completion.py",
     "bin/_cctally_config.py",
     "bin/_cctally_core.py",
     "bin/_cctally_dashboard.py",
@@ -1027,6 +1037,7 @@ PRODUCER_SOURCES = (
     "bin/_cctally_percent_breakdown.py",
     "bin/_cctally_pricing_check.py",
     "bin/_cctally_project.py",
+    "bin/_cctally_quarantine.py",
     "bin/_cctally_quota.py",
     "bin/_cctally_quota_calibration.py",
     "bin/_cctally_quota_model.py",
@@ -1046,6 +1057,8 @@ PRODUCER_SOURCES = (
     "bin/_cctally_tui.py",
     "bin/_cctally_update.py",
     "bin/_cctally_weekrefs.py",
+    "bin/_lib_account_binding.py",
+    "bin/_lib_account_protocol.py",
     "bin/_lib_accounts.py",
     "bin/_lib_aggregators.py",
     "bin/_lib_alert_axes.py",
@@ -1062,6 +1075,9 @@ PRODUCER_SOURCES = (
     "bin/_lib_cache_writer_lock.py",
     "bin/_lib_changelog.py",
     "bin/_lib_codex_account_adoption.py",
+    "bin/_lib_codex_drain_admission.py",
+    "bin/_lib_codex_publication_barrier.py",
+    "bin/_lib_codex_rollout_container.py",
     "bin/_lib_codex_conversation.py",
     "bin/_lib_codex_conversation_export.py",
     "bin/_lib_codex_conversation_query.py",
@@ -1090,6 +1106,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_dashboard_json.py",
     "bin/_lib_dashboard_settings_contract.py",
     "bin/_lib_dashboard_sources.py",
+    "bin/_lib_detector_access_registry.py",
     "bin/_lib_diagnosis.py",
     "bin/_lib_diff_kernel.py",
     "bin/_lib_display_tz.py",
@@ -1102,9 +1119,12 @@ PRODUCER_SOURCES = (
     "bin/_lib_journal_router.py",
     "bin/_lib_json_envelope.py",
     "bin/_lib_jsonl.py",
+    "bin/_lib_legacy_spool.py",
+    "bin/_lib_legacy_writer_evidence.py",
     "bin/_lib_log.py",
     "bin/_lib_meter_rate_change.py",
     "bin/_lib_milestone_history.py",
+    "bin/_lib_outcome_quarantine.py",
     "bin/_lib_perf.py",
     "bin/_lib_pricing.py",
     "bin/_lib_pricing_check.py",

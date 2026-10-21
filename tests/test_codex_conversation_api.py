@@ -43,7 +43,7 @@ from http.client import HTTPConnection
 
 import pytest
 
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, start, stop
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -121,7 +121,7 @@ def _boot(ns, tmp_path, monkeypatch, *, codex_scenarios=("modern-full",),
     """Seed a Codex provider + Claude sessions, start a dashboard. Returns
     ``(srv, provider_root, codex_keys, rollouts)`` where ``codex_keys`` maps a
     scenario name → its opaque ``v1.`` conversation key."""
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     sys.path.insert(0, str(pathlib.Path(ns["__file__"]).resolve().parent))
     provider_root = tmp_path / "provider"
     rollouts = {}

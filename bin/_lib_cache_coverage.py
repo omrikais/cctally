@@ -69,7 +69,19 @@ PROGRESS_KEY = "codex_journal_coverage_progress"
 #: `REASON_MALFORMED` and falls back to a full replay — the same outcome a bump
 #: would produce. A bump would additionally invalidate certificates written by
 #: an in-development binary that already carries the field, for no gain.
-COVERAGE_VERSION = 1
+#:
+#: Version 2 (#946; #825/#832 spec 4.7 revision 2, Codex design-fix-round-3
+#: Q5): every earlier writer took `appliedThrough` from an ingest cursor that
+#: could advance past a torn suffix. `_repair_torn_tail` then wrote a record
+#: across that coordinate, the next ingest started inside it and skipped it,
+#: and a contiguous advance certified it covered — a version-1 certificate can
+#: therefore claim coverage of an unapplied record at an endpoint that follows
+#: a newline, which no endpoint check can see. `prior_is_extendable` and
+#: `certificate_is_valid` both reject version 1, so the first current binary
+#: forces the full journal recovery and never extends or restamps one. A
+#: previous release reading a version-2 certificate rejects it the same way
+#: and replays (C2).
+COVERAGE_VERSION = 2
 
 #: Bumped whenever the journal-record-to-cache-row materialization changes —
 #: `_apply_quota_records`, `_apply_file_account_records`, or the §3.5 precedence

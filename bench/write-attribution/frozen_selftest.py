@@ -74,7 +74,8 @@ Sequence:
     tree's own resolution of both cwds through the namespace equals its
     native control; both families are VALID.
  8. Bypasses: the library unloaded (/bin/sh strips it) and a raw
-    syscall(SYS_open) from a C helper are killed by the sandbox.
+    syscall(SYS_open) from a C helper are explicitly denied (EPERM/EACCES)
+    or killed by the sandbox.
  9. Invalidity: a missing mapping, a write intent, a changed frozen prefix
     (seal), a changed inode (qualification), a denied required read, a
     sandbox kill its parent swallows (Q17), an open of a probe entry
@@ -83,7 +84,7 @@ Sequence:
     (`traversal`, Amendment 14), a deliberate traversal of the
     memory link (a listing of the link or of its target, and an open under
     it, refused as a `traversal`; a raw open through the live link and of a
-    link's live target killed by the sandbox, the backstop), a lost
+    link's live target denied by the sandbox, the backstop), a lost
     receipt, absent enforcement and a timeout each make the family verdict
     (or the freeze/qualification) INVALID.
 --red runs steps 2-5 and the same assertions with the CURRENT runners'
@@ -94,12 +95,15 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import shutil
+import shlex
 import signal
 import sqlite3
 import stat as stat_mod
@@ -147,11 +151,18 @@ extern int openat_nc(int, const char *, int, ...) __asm("_openat$NOCANCEL");
 extern char *rp_plain(const char *, char *) __asm("_realpath");
 extern char *rp_ext(const char *, char *) __asm("_realpath$DARWIN_EXTSN");
 extern DIR *__opendir2(const char *, int);
-/* usage: bypass raw PATH | rp PATH | abi FILE DIR NAME LINK */
+/* usage: bypass raw PATH | raw-chmod PATH | rp PATH | abi FILE DIR NAME LINK */
 int main(int argc, char **argv) {
   if (argc == 3 && !strcmp(argv[1], "raw")) {
     long fd = syscall(SYS_open, argv[2], O_RDONLY);
     printf("{\"rawOpen\": %ld, \"errno\": %d}\n", fd, fd < 0 ? errno : 0);
+    return 0;
+  }
+  if (argc == 3 && !strcmp(argv[1], "raw-chmod")) {
+    /* Owner-allowed even on a 0444 file in a 0555 freeze. A real mode
+       change must reach the sandbox's file-write* SIGKILL backstop. */
+    long result = syscall(SYS_chmod, argv[2], 0644);
+    printf("{\"rawChmod\": %ld, \"errno\": %d}\n", result, result < 0 ? errno : 0);
     return 0;
   }
   if (argc == 3 && !strcmp(argv[1], "rp")) {
@@ -185,6 +196,47 @@ int main(int argc, char **argv) {
   return 0;
 }
 """
+
+
+# The SIP shell removes the interposer. Report the operation itself, rather
+# than treating any Python failure (or a traceback suffix) as a sandbox denial.
+UNLOADED_STAT = """import json, os, sys
+try:
+    os.stat(sys.argv[1])
+except OSError as exc:
+    print(json.dumps({"stat": -1, "errno": exc.errno}))
+else:
+    print(json.dumps({"stat": 0, "errno": 0}))
+"""
+
+
+def bypass_denied(result: subprocess.CompletedProcess, field: str) -> bool:
+    """Only an explicit permission denial or a silent SIGKILL proves denial.
+
+    Helpers intentionally exit zero after reporting their syscall outcome;
+    neither their exit status alone nor arbitrary stderr is evidence.
+    """
+    if result.stderr.strip():
+        return False
+    if result.returncode == -signal.SIGKILL:
+        return not result.stdout.strip()
+    if result.returncode != 0:
+        return False
+
+    def unique_fields(pairs):
+        obj = dict(pairs)
+        if len(obj) != len(pairs):
+            raise ValueError("duplicate denial fields")
+        return obj
+
+    try:
+        outcome = json.loads(result.stdout, object_pairs_hook=unique_fields)
+    except (ValueError, TypeError):
+        return False
+    return (isinstance(outcome, dict) and set(outcome) == {field, "errno"}
+            and type(outcome[field]) is int and outcome[field] == -1
+            and type(outcome["errno"]) is int
+            and outcome["errno"] in (errno.EPERM, errno.EACCES))
 
 
 class Bounded(Exception):
@@ -510,6 +562,34 @@ def clone(src: pathlib.Path, dst: pathlib.Path) -> None:
     run(["cp", "-cR", str(src), str(dst)], timeout=60, check=True)
 
 
+def _normalize_container_status(value: str) -> str:
+    """Ignore only valid observation clocks, retaining shape and all semantics.
+
+    Missing keys and null values remain distinct. Malformed JSON or malformed
+    non-null observation clocks cannot certify equality, even on both sides.
+    """
+    try:
+        status = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("malformed codex_container_status JSON") from exc
+    if not isinstance(status, dict):
+        raise ValueError("malformed codex_container_status object")
+    for field in ("observedAt", "decoderObservedAt"):
+        if field not in status or status[field] is None:
+            continue
+        stamp = status[field]
+        try:
+            if not isinstance(stamp, str):
+                raise ValueError("not a timestamp string")
+            parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("observation timestamp has no timezone")
+        except ValueError as exc:
+            raise ValueError(f"malformed codex_container_status {field}") from exc
+        status[field] = "<observation-clock>"
+    return json.dumps(status, sort_keys=True)
+
+
 def table_rows(data: pathlib.Path) -> dict:
     out = {}
     for name in STORES:
@@ -535,6 +615,12 @@ def table_rows(data: pathlib.Path) -> dict:
                     ki = keep.index("key")
                     rows = [r for r in rows if not any(
                         m in str(r[ki]) for m in WALL_CLOCK_KEY_MARKERS)]
+                    if table == "cache_meta":
+                        vi = keep.index("value")
+                        rows = [tuple(_normalize_container_status(value)
+                                      if i == vi and r[ki] == "codex_container_status"
+                                      else value for i, value in enumerate(r))
+                                for r in rows]
                 out[f"{name}:{table}"] = sorted(repr(r) for r in rows)
         finally:
             conn.close()
@@ -1086,10 +1172,13 @@ class SelfTest:
         rows = table_rows(data)
         diff = sorted(k for k in set(rows) | set(self.control_rows)
                       if rows.get(k) != self.control_rows.get(k))
-        self.check("frozen.rowsEqualControl", not diff,
-                   {k: {"frozen": (rows.get(k) or [])[:3],
-                        "control": (self.control_rows.get(k) or [])[:3]}
-                    for k in diff[:3]})
+        differences = {k: {"frozen": rows.get(k),
+                           "control": self.control_rows.get(k)} for k in diff}
+        # Preserve all comparison inputs and every differing row. --keep also
+        # retains the source databases, including the raw observation clocks.
+        self.facts["rowComparison"] = {"frozen": rows, "control": self.control_rows,
+                                       "differences": differences}
+        self.check("frozen.rowsEqualControl", not diff, differences)
         blob = json.dumps(rows)
         self.check("frozen.noLiveSentinel", "LIVE-SENTINEL" not in blob,
                    "the run ingested the live tree's post-capture change")
@@ -1242,12 +1331,12 @@ class SelfTest:
                        f"source's {e['ino']}: the walkers' replacement check "
                        "would treat it as a new file")
             raw = run([self.bypass, "raw", str(self.tree.rollout_a)], timeout=30)
-            self.check("bypass.rawSyscallDenied", raw.returncode == -9,
+            self.check("bypass.rawSyscallDenied", bypass_denied(raw, "rawOpen"),
                        f"a direct open of the live path returned {raw.stdout.strip()} "
                        "(nothing denies it)")
             raw = run([self.bypass, "raw", str(self.tree.memory / self.tree.memory_file.name)],
                       timeout=30)
-            self.check("bypass.rawThroughDirLinkKilled", raw.returncode == -9,
+            self.check("bypass.rawThroughDirLinkKilled", bypass_denied(raw, "rawOpen"),
                        f"a direct open through the memory link returned "
                        f"{raw.stdout.strip()} (nothing denies its live target)")
             return
@@ -1327,15 +1416,15 @@ class SelfTest:
             fam = self.family(receipts)
             self.check(f"project.{name}.familyValid", fam["valid"], fam["problems"])
         # 8. bypasses: the library unloaded (SIP shell strips it), a raw syscall
-        killed = self.launch(["/bin/sh", "-c", f'exec {PY} -c "import os; '
-                              f"os.stat('{self.tree.rollout_a}'); print('read')\""],
-                             env, self.base / "bypass-receipts")
+        killed = self.launch(["/bin/sh", "-c", "exec " + shlex.join(
+            [PY, "-c", UNLOADED_STAT, str(self.tree.rollout_a)])],
+            env, self.base / "bypass-receipts")
         self.check("bypass.unloadedLibraryKilled",
-                   killed.returncode == -9 and "read" not in killed.stdout,
+                   bypass_denied(killed, "stat"),
                    (killed.returncode, killed.stdout, killed.stderr[-300:]))
         raw = self.launch([self.bypass, "raw", str(self.tree.rollout_a)], env,
                           self.base / "bypass-receipts")
-        self.check("bypass.rawSyscallDenied", raw.returncode == -9,
+        self.check("bypass.rawSyscallDenied", bypass_denied(raw, "rawOpen"),
                    (raw.returncode, raw.stdout))
 
     # -- 9. invalidity ----------------------------------------------------------
@@ -1369,15 +1458,15 @@ class SelfTest:
         self.check("invalid.deniedRequiredRead", not fam["valid"] and any(
             "unmapped" in p for p in fam["problems"]),
                    (out.returncode, fam["problems"]))
-        # a swallowed sandbox kill (Q17): a covered child bypasses the library
-        # with a raw open of a live path, the sandbox kills it (SIGKILL, no
-        # log), and its parent ignores the failure and exits 0
+        # A swallowed sandbox kill (Q17): raw chmod of the fake freeze
+        # reaches its unchanged write backstop (no errno metadata rule there).
+        # Its parent ignores the child's SIGKILL and exits 0.
         rec = self.base / "inv-swallowedKill"
         swallow = ("import subprocess,sys\n"
-                   "r = subprocess.run([sys.argv[1], 'raw', sys.argv[2]],"
+                   "r = subprocess.run(sys.argv[1:],"
                    " capture_output=True, timeout=30)\n"
                    "print(r.returncode)\n")
-        out = self.launch([PY, "-c", swallow, self.bypass, str(t.rollout_a)], env,
+        out = self.launch([PY, "-c", swallow] + self.sandbox_kill_argv(), env,
                           rec, timeout=60)
         fam = self.family(rec)
         self.check("invalid.swallowedSandboxKill", out.returncode == 0
@@ -1389,7 +1478,7 @@ class SelfTest:
         # refused with EACCES and recorded as a `traversal` (O1: no kernel
         # call reaches the live target), as is opening a file under it; and a
         # raw open through the live link or of the live target (no library)
-        # is still killed by the sandbox, the backstop. Each is INVALID.
+        # is explicitly denied or killed by the sandbox, the backstop.
         lister = ("import os,sys\n"
                   "try: print(os.listdir(sys.argv[1]))\n"
                   "except OSError as e: print(e.errno)\n")
@@ -1443,11 +1532,11 @@ class SelfTest:
                    (out.returncode, out.stdout, fam["problems"]))
         raw = self.launch([self.bypass, "raw", str(t.memory / t.memory_file.name)], env,
                           self.base / "inv-dirLinkRaw")
-        self.check("bypass.rawThroughDirLinkKilled", raw.returncode == -9,
+        self.check("bypass.rawThroughDirLinkKilled", bypass_denied(raw, "rawOpen"),
                    (raw.returncode, raw.stdout))
         raw = self.launch([self.bypass, "raw", str(t.targets[0])], env,
                           self.base / "inv-linkTargetRaw")
-        self.check("bypass.rawLinkTargetKilled", raw.returncode == -9,
+        self.check("bypass.rawLinkTargetKilled", bypass_denied(raw, "rawOpen"),
                    (raw.returncode, raw.stdout))
         # a lost receipt
         lost = self.base / "inv-lost"
@@ -1511,6 +1600,12 @@ class SelfTest:
             self.check("invalid.timeout", True, str(exc))
 
 
+    def sandbox_kill_argv(self) -> list[str]:
+        """The owner could chmod this 0444 fake file absent the sandbox.
+        Using the freeze avoids live-root metadata's permitted errno denial;
+        only its unchanged file-write* SIGKILL rule decides this stimulus."""
+        return [self.bypass, "raw-chmod", str(self.freeze / "rootmap.tsv")]
+
     # -- 10. top-level family processes (Amendment 13 O3) --------------------
     def toplevel_ends(self) -> None:
         """A top-level family process's parent is the runner's shell, which
@@ -1528,7 +1623,7 @@ class SelfTest:
         script.write_text("\n".join([
             "set -u", f"P={HERE}", '. "$P/_inputs.sh"', f"ROOTMAP={self.rootmap}",
             f"WA_RECEIPTS={killed}",
-            f"( wa_exec {self.bypass} raw {self.tree.rollout_a} ) > /dev/null 2>&1 &",
+            f"( wa_exec {shlex.join(self.sandbox_kill_argv())} ) > /dev/null 2>&1 &",
             'wa_wait killed $!; echo "killed=$?"',
             f"WA_RECEIPTS={torn}",
             f"( wa_exec {PY} -c 'import pathlib, sys, time; "
@@ -1558,6 +1653,102 @@ class SelfTest:
                    and (fam.get("topLevel") or {}).get("records") == 2,
                    (fam["problems"], fam.get("topLevel")))
 
+    def compressed_rollouts(self) -> None:
+        """#968: mandatory real namespace coverage of fresh containers and
+        decoded symlink aliases. Separate synthetic stores/corpora keep this
+        check independent of the main self-test's native-ingest fixture."""
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import frozen_roots
+        # These are candidate-harness regressions even when TREE is the
+        # pre-change timing control. Existing plain-path checks still use TREE.
+        candidate_bin = HERE.parents[1] / "bin"
+        sys.path.insert(0, str(candidate_bin))
+        import _lib_codex_rollout_container as rc
+        backend = rc.resolve_zstd_backend()
+        if not isinstance(backend, rc.ZstdBackend):
+            raise RuntimeError("compressed namespace self-test needs a zstd decoder")
+        body = b'{"real":1}\n'
+        child = r'''
+import ctypes, json, pathlib, sys
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+import _lib_codex_rollout_container as rc
+home = pathlib.Path(sys.argv[2])
+logical = pathlib.Path(sys.argv[3])
+try:
+    active = bool(ctypes.CDLL(None).rootmap_active())
+except AttributeError:
+    active = False
+if sys.argv[4] == "read":
+    selected = rc.select_container(logical)
+    assert selected is not None
+    with rc.open_decoded(selected) as stream:
+        data = stream.read().decode()
+    result = {"kind": selected.kind, "data": data}
+else:
+    import _cctally_cache as cache
+    root = cache.CodexProviderRoot(home, home / "sessions", "synthetic-root")
+    cache._codex_provider_roots = lambda: [root]
+    result = {"canonical": sorted(str(f.physical_path)
+                                  for f in cache._discover_codex_files_with_roots())}
+result["active"] = active
+print(json.dumps(result))
+'''
+        for name, twins, operation in (("fresh", False, "read"),
+                                       ("aliases", True, "discover")):
+            base = self.base / ("compressed-" + name)
+            home = base / "home"
+            codex = home / ".codex"
+            sessions = codex / "sessions"
+            sessions.mkdir(parents=True)
+            logical = sessions / "z-real.jsonl"
+            container = logical.with_name(logical.name + ".zst")
+            container.write_bytes(backend.module.compress(body))
+            if twins:
+                (sessions / "a-alias.jsonl.zst").symlink_to(container.name)
+            store = base / "store"
+            (store / "data").mkdir(parents=True)
+            freeze = base / "freeze"
+            env = dict(os.environ, HOME=str(home), CODEX_HOME=str(codex),
+                       CCTALLY_DATA_DIR=str(store / "data"),
+                       PYTHONDONTWRITEBYTECODE="1")
+            argv = [PY, "-c", child, str(candidate_bin), str(codex),
+                    str(logical), operation]
+            native = run(argv, env=env, timeout=60)
+            control = json.loads(native.stdout) if native.returncode == 0 else {}
+            self.check(f"compressed.{name}.native", native.returncode == 0,
+                       (native.stdout, native.stderr))
+            if twins:
+                self.check("compressed.aliases.nativePopulation",
+                           control.get("canonical") == [str(logical)], control)
+            frozen_roots.capture(store, freeze, home=str(home),
+                                 codex_home=str(codex), claude_config_dir="",
+                                 decoded_twins=twins)
+            receipts = base / "receipts"
+            out = self.launch(argv, env, receipts, freeze=freeze, timeout=60)
+            result = json.loads(out.stdout) if out.returncode == 0 else {}
+            self.check(f"compressed.{name}.active", result.get("active") is True,
+                       (out.returncode, out.stdout, out.stderr))
+            if twins:
+                self.check("compressed.aliases.canonicalPopulation",
+                           result.get("canonical") == control.get("canonical")
+                           == [str(logical)], (control, result))
+            else:
+                self.check("compressed.fresh.decodedRead",
+                           result.get("kind") == rc.ZSTD
+                           and result.get("data") == body.decode(), result)
+            family = self.family(receipts, freeze)
+            self.check(f"compressed.{name}.family", family["valid"],
+                       family["problems"])
+            self.facts["compressed." + name] = {
+                "native": control, "frozen": result,
+                "returncode": out.returncode, "stderr": out.stderr,
+                "family": family,
+                "rawReceipts": {p.name: p.read_text() for p in
+                                sorted(receipts.glob("*.jsonl"))}}
+
+
     def run(self) -> int:
         red = self.args.red
         try:
@@ -1570,6 +1761,7 @@ class SelfTest:
             self.frozen_run(red)
             self.coverage(red)
             if not red:
+                self.compressed_rollouts()
                 self.invalidity()
                 self.toplevel_ends()
         except (Bounded, RuntimeError, OSError, ValueError, KeyError,

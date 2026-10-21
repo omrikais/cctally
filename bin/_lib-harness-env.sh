@@ -32,6 +32,15 @@ export CCTALLY_DISABLE_UPDATE_CHECK=1
 # `cctally db prune`, the worker entry point and the admission predicate all
 # stay directly testable — and they are, in tests/test_retention_worker.py.
 export CCTALLY_DISABLE_RETENTION_SWEEP=1
+# #965: conversation transcript retention is measured against the wall clock,
+# and fixtures carry fixed dates, so a harness rebuilding a conversation store
+# from them would start deleting its own corpus once the fixtures turn 90 days
+# old. Checkout code with no explicit `conversation.retention_days` resolves
+# the operational window to 0 while this is exactly 1; installed code ignores
+# it. Enforced by tests/test_harness_dev_autodetect_coverage.py; see
+# docs/fixtures-gotchas.md, "Conversation retention is off in test
+# environments (#965)".
+export CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF=1
 
 # Issue #108: cctally now honors $CODEX_HOME. Neutralize a dev's exported
 # value so it can't leak into codex-* goldens (the codex harnesses pin HOME

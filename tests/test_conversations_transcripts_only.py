@@ -40,6 +40,14 @@ _UNCOVERED_ACCOUNTING_FAMILIES = (
     "codex_session_files",
     "quota_window_change_log",
     "codex_quota_partition_latest",
+    # #968: maintenance debt and barrier state live in cache.db only.
+    "codex_prune_debt",
+    "codex_barrier_membership",
+    "codex_barrier_targets",
+    "codex_barrier_population",
+    "codex_barrier_certificates",
+    "codex_barrier_repairs",
+    "codex_barrier_entry_threads",
 )
 
 

@@ -809,8 +809,9 @@ def test_a_repeated_refusal_does_not_grow_the_per_tick_gap_read(
     read_sizes: list = []
     real_gap = jr._selector_gap_entries
 
-    def counting_gap(durable, cursor):
-        entries = real_gap(durable, cursor)
+    def counting_gap(durable, cursor, boundary=None):
+        # #825/#832: the gap re-fold also receives the admission boundary.
+        entries = real_gap(durable, cursor, boundary)
         read_sizes.append(len(entries))
         return entries
 

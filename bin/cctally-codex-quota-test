@@ -6,11 +6,15 @@
 # HOME so command projection/sync work cannot modify committed inputs.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FIXTURES="$REPO_ROOT/tests/fixtures/codex-quota"
 BIN="$REPO_ROOT/bin/cctally"
-SCRATCH=$(mktemp -d -t cctally-codex-quota-fixtures-XXXXXX)
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/cctally-codex-quota-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
 . "$REPO_ROOT/bin/_lib-harness-env.sh"

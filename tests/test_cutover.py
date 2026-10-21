@@ -369,7 +369,8 @@ def test_epoch_constants(ns):
     # table's four rate-change disclosure columns at 1012, and #750 S3 added
     # reset-event origin identity plus the transactional debounce state at 1013.
     # #769 S11 added the weekly held-provenance column at 1015.
-    assert core.STATS_INDEX_EPOCH == 1017
+    # #825/#832 moved it to 1018 (the account-bound admission predicate).
+    assert core.STATS_INDEX_EPOCH == 1018
     assert core.LEGACY_STATS_HEAD == 13
 
 

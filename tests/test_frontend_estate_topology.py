@@ -27,7 +27,10 @@ AGGREGATOR = "bin/cctally-test-all"
 # Zero is correct and deliberate in four of these; a flat "exactly one"
 # assertion would redden a correct workflow.
 EXPECTED = {
-    "private-push-nonstamp": 1,
+    # Test regime reset, session 1 (spec 4.11): a push to main runs no
+    # full-suite job and no e2e-reader, so a code push runs no estate. The
+    # scheduled `private-background` row still runs it.
+    "private-push-nonstamp": 0,
     "private-push-stamp": 0,
     # #630 S4. A push whose tree an authoritative receipt already covers runs
     # no estate at all, exactly as a release stamp does. Without this row the
@@ -699,12 +702,14 @@ def test_a_failed_classifier_still_admits_the_gated_lane():
     load-bearing. This context declares a FAILED classifier, which is exactly
     the case D1 says must still run the heavy lane.
     """
-    event = _push(PRIVATE)
+    # A trusted same-repository PR: a push no longer admits the gated lane.
+    event = _pull_request(PRIVATE, PRIVATE)
     # The KEY is replaced, not the dict: replacing it would drop `receipt-gate`
     # and the count would then be undecidable rather than failing on the
     # property under test.
     event["needs"]["release-stamp-gate"] = "failure"
     event["context"]["needs.release-stamp-gate.result"] = "failure"
+    event["context"]["needs.release-stamp-gate.outputs.skipHeavy"] = "true"
     assert _estate_executions(event) == 1
 
 
@@ -712,7 +717,10 @@ def test_a_failed_receipt_gate_also_still_admits_the_gated_lane():
     """#630 S4's conjunct carries the same fail-safe polarity as D1's, and
     every context in the table above declares that gate SUCCEEDED too, so
     nothing there exercises this branch either."""
-    event = _push(PRIVATE, discharged="true")
+    # A trusted same-repository PR: a push no longer admits the gated lane.
+    event = _pull_request(PRIVATE, PRIVATE)
+    event["context"]["needs.receipt-gate.outputs.admitted"] = "true"
+    event["context"]["needs.receipt-gate.outputs.discharged"] = "true"
     event["needs"]["receipt-gate"] = "failure"
     event["context"]["needs.receipt-gate.result"] = "failure"
     assert _estate_executions(event) == 1
@@ -720,7 +728,9 @@ def test_a_failed_receipt_gate_also_still_admits_the_gated_lane():
     # A byte-valid receipt cannot skip the estate when the independent
     # commit-graph admission fails. This is a successful gate job with two
     # different outputs, not the failed-job case above.
-    event = _push(PRIVATE, admitted="false", discharged="true")
+    event = _pull_request(PRIVATE, PRIVATE)
+    event["context"]["needs.receipt-gate.outputs.admitted"] = "false"
+    event["context"]["needs.receipt-gate.outputs.discharged"] = "true"
     assert _estate_executions(event) == 1
 
 
@@ -907,5 +917,9 @@ def test_the_evaluator_reproduces_the_real_gate_condition():
     accident on the rows that happen to share a value."""
     condition = " ".join(
         yaml.safe_load(CI_YML.read_text())["jobs"]["test-macos"]["if"].split())
-    assert _evaluate(condition, _push(PRIVATE)["context"]) is True
-    assert _evaluate(condition, _push(PRIVATE, skip_heavy="true")["context"]) is False
+    trusted = _pull_request(PRIVATE, PRIVATE)["context"]
+    assert _evaluate(condition, trusted) is True
+    stamped = dict(trusted, **{"needs.release-stamp-gate.outputs.skipHeavy": "true"})
+    assert _evaluate(condition, stamped) is False
+    # A push to main no longer runs the full suite (test regime reset).
+    assert _evaluate(condition, _push(PRIVATE)["context"]) is False

@@ -6,6 +6,10 @@
 # scenarios drive `cctally record-usage` directly with controlled args.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -74,7 +78,7 @@ BIN="$REPO_ROOT/bin/cctally"
 pass_count=0
 fail_count=0
 
-SCRATCH_DIR=$(mktemp -d -t cctally-five-hour-blocks-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-five-hour-blocks-XXXXXX") || exit 1
 
 cleanup_on_exit () {
     local rc=$?

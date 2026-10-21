@@ -74,7 +74,7 @@ def test_doctor_json_mode_valid_schema(tmp_path):
     # in the same change).
     assert {c["id"] for c in payload["categories"]} == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry", "performance",
+        "accounting", "pricing", "quota", "safety", "telemetry", "performance",
     }
     data = next(
         category for category in payload["categories"]
@@ -574,11 +574,17 @@ def test_gather_statusline_pipeline_is_read_only_and_marks_invalid_authority(
     import _cctally_core
     redirect_paths(ns, monkeypatch, tmp_path)
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    candidate_dir = _cctally_core.STATUSLINE_CANDIDATE_DIR
-    candidate_dir.mkdir(mode=0o700)
+    # #825/#832 section 7: the current spool and fences live under the
+    # account-bound root, partitioned by account and (fences) by window.
+    account_dir = (_cctally_core.STATUSLINE_ACCOUNT_BOUND_DIR / "accounts"
+                   / "unattributed")
+    candidate_dir = account_dir / "candidates"
+    candidate_dir.mkdir(parents=True, mode=0o700)
     malformed = candidate_dir / ("a" * 64 + ".json")
     malformed.write_text('{"schemaVersion":')
-    _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH.write_text("not-json")
+    (account_dir / "tombstones").mkdir()
+    live_week = int(__import__("time").time()) + 3 * 86400
+    (account_dir / "tombstones" / f"sevenDay-{live_week}.json").write_text("not-json")
 
     state = ns["doctor_gather_state"]()
 

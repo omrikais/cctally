@@ -24,6 +24,9 @@ CONTROL_SCHEMA_VERSION = 2
 #: Control documents this binary can read.  Version 1 predates the pending
 #: drop's deadline and retained evidence; see `_pending_drop`.
 CONTROL_SCHEMA_VERSIONS_READ = (1, 2)
+#: #825/#832: the account-bound protocol generation. Every current document,
+#: retry namespace and plan names it; the legacy spool never carries it.
+PROTOCOL_GENERATION = "account-bound-v1"
 #: D5: a non-extendable wall clock measured from the first pending drop.
 PENDING_DROP_DEADLINE_SECONDS = 180
 CANDIDATE_DOCUMENT_MAX_BYTES = 4 * 1024
@@ -53,6 +56,9 @@ class Candidate:
     received_at: int = 0
     five_hour: AxisValue | None = None
     seven_day: AxisValue | None = None
+    #: The immutable `AccountBinding` captured with this candidate (#825/#832
+    #: spec 4.2). The reducer partitions by its account; it is never inferred.
+    binding: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,7 +68,11 @@ class AxisProjection:
     canonical_key: int
     captured_at: int
     source: str
-    reset_generation: int
+    #: The reset generation the projected value belongs to. Weekly: the
+    #: reset-aware floor epoch (an int). Five-hour (#832): the LOGICAL
+    #: generation string of the exact account's active reset event, or "" for
+    #: no event — never a SQLite rowid, so a rebuild cannot change it.
+    reset_generation: int | str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,11 +83,79 @@ class FileFingerprint:
     mtime_ns: int
 
 
+#: The classification evidence of one projected axis (#825/#832 spec 4.3
+#: revision 5, Codex design-fix-round-5 Q1). ``present``: the axis holds a
+#: baseline. ``expired_predecessor``: every admitted five-hour predecessor
+#: left the projection only through expiry at the evaluation's instant (on
+#: the weekly axis: every retained weekly row lies in a week that ends at or
+#: before ``predecessor_key``, fix round K14c). ``proven_empty``: the covered
+#: snapshot proves the account has no admitted baseline on the axis.
+#: ``floor_retired`` (revision 6, Codex design-fix-round-6 Q2): the axis's
+#: group has an effective, admitted floor of the account and no accepted
+#: observation of the axis survives at or after it. ``unknown``: anything
+#: else — never inferred from an absent value.
+EVIDENCE_PRESENT = "present"
+EVIDENCE_EXPIRED_PREDECESSOR = "expired_predecessor"
+EVIDENCE_PROVEN_EMPTY = "proven_empty"
+EVIDENCE_FLOOR_RETIRED = "floor_retired"
+EVIDENCE_UNKNOWN = "unknown"
+
+
+@dataclasses.dataclass(frozen=True)
+class AxisEvidence:
+    """How an axis of a projection was classified, computed inside the same
+    validated, prefix-covered snapshot as the projection itself. An
+    expired predecessor keeps the greatest expired window's account-canonical
+    key and raw reset: the evidence a later reading's window is compared
+    with, never a value to display or to fill an axis with."""
+
+    kind: str
+    predecessor_key: int | None = None
+    predecessor_raw: int | None = None
+    #: Fix round K12 (K11R-10): for an unknown axis that wall time alone can
+    #: classify — a row beyond the future band — the earliest instant at
+    #: which such a row becomes admissible; else None.
+    admissible_at: int | None = None
+    #: ``floor_retired`` only (spec 4.3 revision 6): the account, the axis,
+    #: the retired group's account-canonical key, the floor instant, the
+    #: floor's logical identity and the group's anchor raw reset. Never a
+    #: retired percentage.
+    account_key: str | None = None
+    axis: str | None = None
+    group_key: int | None = None
+    floor_epoch: int | None = None
+    floor_identity: str | None = None
+    anchor_raw: int | None = None
+
+
+EVIDENCE_UNKNOWN_AXIS = AxisEvidence(EVIDENCE_UNKNOWN)
+
+#: How `classify_absent_axis` classifies a reading on an axis that holds no
+#: projected baseline. ``publish``: a first reading or a new window, under
+#: either drop gate. ``stale``: an older window, or a reading proven captured
+#: before the floor of a retired group — the older-window disposition, which
+#: publishes nothing on the axis and opens no consensus. ``floor``: a reading
+#: in a floor-retired group, which publishes only from contributors captured
+#: at or after the floor. ``unknown``: unclassifiable; the caller defers the
+#: whole evaluation.
+CLASS_PUBLISH = "publish"
+CLASS_STALE = "stale"
+CLASS_FLOOR = "floor"
+CLASS_UNKNOWN = "unknown"
+
+
 @dataclasses.dataclass(frozen=True)
 class DbProjection:
     five_hour: AxisProjection | None
     seven_day: AxisProjection | None
     db_files: Mapping[str, FileFingerprint | None] | None = None
+    #: The exact account this projection was read for (#825/#832 spec 4.5).
+    account_key: str | None = None
+    #: Per-axis `AxisEvidence` (spec 4.3 revision 5), keyed by axis name. Only
+    #: the covered projection read carries it; a projection without it — a
+    #: persisted control document, a deferred read — classifies an absent
+    #: axis as unknown.
+    evidence: Mapping[str, AxisEvidence] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +170,12 @@ class RetrySignature:
     candidate_percent: float
     db_key: int | None
     db_percent: float | None
-    db_reset_generation: int | None
+    db_reset_generation: int | str | None
+    #: The retry namespace (#825/#832 spec 4.3): protocol generation, account
+    #: and axis. Window, value and logical generation are the fields above.
+    protocol_generation: str | None = None
+    account_key: str | None = None
+    axis: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +257,12 @@ class ReductionDecision:
     action: str
     control: ControlState
     plan: PublicationPlan | None = None
+    #: Fix round K13 (review cycle 7 finding P1-2, spec 4.3 *Classification
+    #: evidence*): the axes on which a reading met no projected baseline and
+    #: no classification evidence. Neither drop gate publishes such an axis;
+    #: the caller defers the whole evaluation instead of reading the NOOP
+    #: on it as an unchanged reading.
+    unknown_axes: frozenset = frozenset()
 
 
 def _is_int(value: object) -> bool:
@@ -318,16 +407,30 @@ def _axis_projection(value: object) -> AxisProjection | None:
     for key in ("rawResetsAt", "canonicalKey", "capturedAt"):
         if not _is_int(doc[key]):
             raise StateValidationError(f"{key} must be an integer")
-    if not _is_nonnegative_int(doc["resetGeneration"]):
-        raise StateValidationError("resetGeneration must be nonnegative")
+    generation = _reset_generation(doc["resetGeneration"], "resetGeneration")
     return AxisProjection(
         percent=_percent(doc["percent"]),
         raw_resets_at=doc["rawResetsAt"],
         canonical_key=doc["canonicalKey"],
         captured_at=doc["capturedAt"],
         source=_require_ascii_source(doc["source"]),
-        reset_generation=doc["resetGeneration"],
+        reset_generation=generation,
     )
+
+
+#: A logical five-hour generation is `<effective>|<detected>|<journal id>`.
+_RESET_GENERATION_MAX_CHARS = 512
+
+
+def _reset_generation(value: object, label: str) -> int | str:
+    """A weekly floor epoch (nonnegative int) or a five-hour logical
+    generation (bounded ASCII string; "" means no event)."""
+    if _is_nonnegative_int(value):
+        return value
+    if (isinstance(value, str) and len(value) <= _RESET_GENERATION_MAX_CHARS
+            and value.isascii()):
+        return value
+    raise StateValidationError(f"{label} must be a nonnegative int or a logical generation")
 
 
 def _fingerprint(value: object) -> FileFingerprint | None:
@@ -360,21 +463,30 @@ def _retry_signature(value: object) -> RetrySignature | None:
     if value is None:
         return None
     doc = _require_object(value, "retrySignature")
-    _require_exact_keys(
-        doc,
-        {"candidateKey", "candidatePercent", "dbKey", "dbPercent", "dbResetGeneration"},
-    )
+    base = {"candidateKey", "candidatePercent", "dbKey", "dbPercent", "dbResetGeneration"}
+    scoped = base | {"protocolGeneration", "accountKey", "axis"}
+    if set(doc) not in (base, scoped):
+        raise StateValidationError("unexpected retrySignature keys")
     if not _is_int(doc["candidateKey"]):
         raise StateValidationError("candidateKey must be an integer")
     db_generation = doc["dbResetGeneration"]
-    if db_generation is not None and not _is_nonnegative_int(db_generation):
-        raise StateValidationError("dbResetGeneration must be nonnegative or null")
+    if db_generation is not None:
+        db_generation = _reset_generation(db_generation, "dbResetGeneration")
+    scope = (None, None, None)
+    if set(doc) == scoped:
+        scope = (doc["protocolGeneration"], doc["accountKey"], doc["axis"])
+        if (not isinstance(scope[0], str) or not isinstance(scope[1], str)
+                or not scope[1] or scope[2] not in AXES):
+            raise StateValidationError("invalid retry namespace")
     return RetrySignature(
         candidate_key=doc["candidateKey"],
         candidate_percent=_percent(doc["candidatePercent"]),
         db_key=_nullable_int(doc["dbKey"], "dbKey"),
         db_percent=_nullable_percent(doc["dbPercent"], "dbPercent"),
         db_reset_generation=db_generation,
+        protocol_generation=scope[0],
+        account_key=scope[1],
+        axis=scope[2],
     )
 
 
@@ -611,6 +723,9 @@ class _AxisDecision:
     action: str
     candidate: AxisValue | None
     pending: PendingDrop | None
+    #: A reading on an axis with no baseline and no classification evidence
+    #: (fix round K13): never published, whatever the drop gate.
+    unknown: bool = False
 
 
 def _candidate_axis(candidate: Candidate, axis: str) -> AxisValue | None:
@@ -619,6 +734,62 @@ def _candidate_axis(candidate: Candidate, axis: str) -> AxisValue | None:
 
 def _projection_axis(projection: DbProjection, axis: str) -> AxisProjection | None:
     return projection.five_hour if axis == "fiveHour" else projection.seven_day
+
+
+def axis_evidence(projection: DbProjection, axis: str) -> AxisEvidence:
+    """The classification evidence of ``axis``: ``present`` whenever the
+    axis holds a baseline, else what the covered read recorded, else
+    unknown (an absent value alone proves nothing)."""
+    if _projection_axis(projection, axis) is not None:
+        return AxisEvidence(EVIDENCE_PRESENT)
+    recorded = (projection.evidence or {}).get(axis)
+    return recorded if isinstance(recorded, AxisEvidence) else EVIDENCE_UNKNOWN_AXIS
+
+
+def classify_absent_axis(evidence: AxisEvidence | None, key: int, *,
+                         axis: str) -> str:
+    """How a reading in window ``key`` on ``axis``, which holds no projected
+    baseline, is classified (spec 4.3 revisions 5 and 6): one of the
+    ``CLASS_*`` answers.
+
+    - Proven empty, or a predecessor whose window ``key`` strictly follows:
+      a first reading or a new window, so it publishes under a closed drop
+      gate too.
+    - An expired five-hour predecessor whose key ``key`` does not strictly
+      exceed (revision 6, *Stale expired window*, Codex design-fix-round-6
+      Q3): stale. On the weekly axis the predecessor's key is only a bound,
+      so such a reading stays unknown.
+    - A floor-retired group (revision 6, *Floor retired*, Q2): a strictly
+      newer group takes the new-window rule, an older group is stale, and a
+      reading in the group itself depends on its contributors' capture
+      instants (``CLASS_FLOOR``).
+    - Anything else is unknown classification."""
+    if evidence is None:
+        return CLASS_UNKNOWN
+    if evidence.kind == EVIDENCE_PROVEN_EMPTY:
+        return CLASS_PUBLISH
+    if (evidence.kind == EVIDENCE_EXPIRED_PREDECESSOR
+            and evidence.predecessor_key is not None):
+        if int(key) > int(evidence.predecessor_key):
+            return CLASS_PUBLISH
+        return CLASS_STALE if axis == "fiveHour" else CLASS_UNKNOWN
+    if (evidence.kind == EVIDENCE_FLOOR_RETIRED
+            and evidence.group_key is not None
+            and evidence.floor_epoch is not None):
+        if int(key) > int(evidence.group_key):
+            return CLASS_PUBLISH
+        if int(key) < int(evidence.group_key):
+            return CLASS_STALE
+        return CLASS_FLOOR
+    return CLASS_UNKNOWN
+
+
+def classifies_first_reading(evidence: AxisEvidence | None, key: int) -> bool:
+    """Whether a reading in window ``key`` on an axis with no projected
+    baseline is a first reading or a new window whatever its contributors
+    (`classify_absent_axis` answers ``publish``). Such a reading is never a
+    drop, so it publishes under a closed drop gate too."""
+    return classify_absent_axis(evidence, key, axis="sevenDay") == CLASS_PUBLISH
 
 
 def _axis_value_key(value: AxisValue) -> int:
@@ -793,13 +964,22 @@ def _axis_control_changed(before: PendingDrop | None, after: PendingDrop | None)
     return before != after
 
 
-def _build_retry_signature(reduced: AxisValue, db_axis: AxisProjection | None) -> RetrySignature:
+def _build_retry_signature(
+    reduced: AxisValue, db_axis: AxisProjection | None, *, scope=None,
+) -> RetrySignature:
+    """``scope`` is ``(protocol_generation, account_key, axis)`` for a bound
+    partition (#825/#832 spec 4.3), so two accounts never share a spent
+    attempt even with identical values."""
+    protocol, account, axis = scope if scope is not None else (None, None, None)
     return RetrySignature(
         candidate_key=_axis_value_key(reduced),
         candidate_percent=reduced.percent,
         db_key=None if db_axis is None else db_axis.canonical_key,
         db_percent=None if db_axis is None else db_axis.percent,
         db_reset_generation=None if db_axis is None else db_axis.reset_generation,
+        protocol_generation=protocol,
+        account_key=account,
+        axis=axis,
     )
 
 
@@ -807,6 +987,8 @@ def _pending_kernel_attempt(
     pending: PendingDrop,
     reduced: AxisValue,
     db_axis: AxisProjection | None,
+    *,
+    scope=None,
 ) -> PendingDrop | None:
     """Return the persisted state for one bounded kernel attempt.
 
@@ -815,7 +997,7 @@ def _pending_kernel_attempt(
     plan.  A successful post-record re-reduction clears it from DB truth; an
     unchanged projection retains this bounded retry state for the next tick.
     """
-    signature = _build_retry_signature(reduced, db_axis)
+    signature = _build_retry_signature(reduced, db_axis, scope=scope)
     if pending.kernel_stage == "suppressed":
         if pending.retry_signature == signature:
             return None
@@ -888,7 +1070,8 @@ def _supporters_retracted(
 
 
 def _hold_pending(
-    pending: PendingDrop | None, db_axis: AxisProjection | None, now_epoch: int
+    pending: PendingDrop | None, db_axis: AxisProjection | None, now_epoch: int,
+    *, scope=None, drop_allowed: bool = True,
 ) -> _AxisDecision:
     """Decide a pending drop with no eligible candidate on its axis.
 
@@ -910,10 +1093,13 @@ def _hold_pending(
     if db_axis.percent <= pending.retained.percent:
         # The database already holds the drop, so the record has done its work.
         return _AxisDecision("WRITE_CONTROL", None, None)
-    if now_epoch < pending.deadline_at:
+    if now_epoch < pending.deadline_at or not drop_allowed:
+        # #825/#832 spec 5.6 item 7: while the account lacks either recovery
+        # certificate a drop below the database baseline is not published at
+        # its deadline either. It stays pending, with no attempt spent.
         return _AxisDecision("NOOP", None, pending)
     publish = _retained_axis_value(pending.retained, db_axis)
-    attempted = _pending_kernel_attempt(pending, publish, db_axis)
+    attempted = _pending_kernel_attempt(pending, publish, db_axis, scope=scope)
     if attempted is not None:
         return _AxisDecision("PUBLISH_DB", publish, attempted)
     # The bounded attempts are spent and no contributor remains that could
@@ -928,22 +1114,71 @@ def _reduce_axis(
     pending: PendingDrop | None,
     tombstone: Tombstone | None,
     now_epoch: int,
+    *,
+    scope=None,
+    drop_allowed: bool = True,
+    evidence: AxisEvidence | None = None,
 ) -> _AxisDecision:
     reduced_data = _reduced_candidate(
         candidates, axis=axis, tombstone=tombstone, db_axis=db_axis
     )
     if reduced_data is None:
-        return _hold_pending(pending, db_axis, now_epoch)
+        return _hold_pending(pending, db_axis, now_epoch, scope=scope,
+                             drop_allowed=drop_allowed)
     reduced, in_window = reduced_data
     key = _axis_value_key(reduced)
 
     if db_axis is None:
+        verdict = classify_absent_axis(evidence, key, axis=axis)
+        if verdict == CLASS_FLOOR:
+            # Spec 4.3 revision 6 (*Floor retired*, Codex design-fix-round-6
+            # Q2): the group's admitted floor retired every accepted reading.
+            # Only contributors captured at or after the floor are the
+            # ordinary first post-floor reading; one captured before it is
+            # stale and is never relabelled as post-floor. The reading opens
+            # no consensus and spends no attempt, under either gate.
+            post = tuple((candidate, value) for candidate, value in in_window
+                         if candidate.received_at >= int(evidence.floor_epoch))
+            if not post:
+                verdict = CLASS_STALE
+            else:
+                maximum = max(value.percent for _, value in post)
+                reduced = AxisValue(
+                    maximum,
+                    min(value.raw_resets_at for _, value in post
+                        if value.percent == maximum),
+                    canonical_key=key)
+                verdict = CLASS_PUBLISH
+        if verdict == CLASS_UNKNOWN:
+            # #825/#832 review finding P1-2 (Codex fix-round-4 Q2): a missing
+            # projection alone proves no empty account — it cannot tell a
+            # first reading from a drop below a baseline it does not show.
+            # Only classification evidence does (spec 4.3 revision 5,
+            # design-fix-round-5 Q1): a proven-empty baseline, or an expired
+            # five-hour predecessor whose window this reading's strictly
+            # follows. Without it the reading is unknown: never published,
+            # and a pending drop's evidence is kept. Fix round K13 (review
+            # cycle 7 P1-2): whatever the drop gate — an open gate is no
+            # classification evidence either.
+            return _AxisDecision("NOOP", None, pending, unknown=True)
+        if verdict == CLASS_STALE:
+            # Spec 4.3 revision 6 (*Stale expired window*, *Floor retired*):
+            # the existing older-window disposition — nothing published on
+            # this axis, no consensus opened, the pending drop kept.
+            return _hold_pending(pending, None, now_epoch, scope=scope,
+                                 drop_allowed=drop_allowed)
+        if (evidence.kind == EVIDENCE_FLOOR_RETIRED and pending is not None
+                and pending.canonical_key > int(evidence.group_key)):
+            # Pending state retires only where the floor proves it obsolete:
+            # a pending drop of a newer window is not the retired group's.
+            return _AxisDecision("PUBLISH_DB", reduced, pending)
         return _AxisDecision("PUBLISH_DB", reduced, None)
     if key > db_axis.canonical_key:
         return _AxisDecision("PUBLISH_DB", reduced, None)
     if key < db_axis.canonical_key:
         # A stale older window says nothing about the pending newer one.
-        return _hold_pending(pending, db_axis, now_epoch)
+        return _hold_pending(pending, db_axis, now_epoch, scope=scope,
+                             drop_allowed=drop_allowed)
     # `reduced` is the MAXIMUM across active contributors, so it can equal or
     # exceed the database value while a lower contributor is reporting a real
     # drop.  The maximum decides what is displayed; it may not erase the
@@ -1017,8 +1252,13 @@ def _reduce_axis(
         and bool(updated.contributors)
         and all(item.satisfied for item in updated.contributors.values())
     )
-    if unanimous:
-        attempted = _pending_kernel_attempt(updated, reduced, db_axis)
+    if not drop_allowed:
+        # #825/#832 spec 5.6 item 7: withheld — neither consensus nor the
+        # deadline publishes a drop below the baseline, and no bounded attempt
+        # is spent; the record stays pending with its evidence.
+        pass
+    elif unanimous:
+        attempted = _pending_kernel_attempt(updated, reduced, db_axis, scope=scope)
         if attempted is not None:
             return _AxisDecision("PUBLISH_DB", reduced, attempted)
     elif now_epoch >= updated.deadline_at:
@@ -1027,7 +1267,7 @@ def _reduce_axis(
         # all-contributor maximum, never the old high, and never a fresh
         # generation over the same drop.
         publish = _retained_axis_value(updated.retained, db_axis)
-        attempted = _pending_kernel_attempt(updated, publish, db_axis)
+        attempted = _pending_kernel_attempt(updated, publish, db_axis, scope=scope)
         if attempted is not None:
             return _AxisDecision("PUBLISH_DB", publish, attempted)
         # The bounded attempts are spent against an unchanged signature, so this
@@ -1056,11 +1296,29 @@ def reduce_candidates(
     control: ControlState,
     tombstones: Mapping[str, Tombstone | None],
     now_epoch: int,
+    account_key: str | None = None,
+    drop_consensus_allowed: bool = True,
 ) -> ReductionDecision:
     """Reduce active candidates independently for 5h and 7d axes.
 
     The output describes only a pure state transition.  The caller owns
     filesystem persistence, DB reconciliation, and invoking the record kernel.
+
+    ``account_key`` names the bound partition (#825/#832 spec 4.3): every
+    retry signature minted here then carries the namespace
+    ``(PROTOCOL_GENERATION, account_key, axis)``. The caller passes only that
+    partition's candidates, control and tombstones.
+
+    ``drop_consensus_allowed`` is the outcome-quarantine control gate
+    (#825/#832 spec 5.6 item 7). False while the account lacks either recovery
+    certificate: a pending drop below the database baseline is then published
+    neither by consensus nor at its deadline, and stays pending; rises and new
+    windows publish as always. An axis with no projected baseline publishes
+    under either gate only when ``db`` carries classification evidence for
+    it (`classify_absent_axis`: a first reading, a new window or the first
+    reading after a retiring floor); a stale reading takes the older-window
+    disposition, and an unclassifiable one is named in ``unknown_axes`` (fix
+    rounds K13 and K14c).
     """
     active = tuple(
         candidate
@@ -1074,6 +1332,9 @@ def reduce_candidates(
         control.pending_drops.get("fiveHour"),
         tombstones.get("fiveHour"),
         now_epoch,
+        scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "fiveHour"),
+        drop_allowed=drop_consensus_allowed,
+        evidence=axis_evidence(db, "fiveHour"),
     )
     seven = _reduce_axis(
         "sevenDay",
@@ -1082,17 +1343,25 @@ def reduce_candidates(
         control.pending_drops.get("sevenDay"),
         tombstones.get("sevenDay"),
         now_epoch,
+        scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "sevenDay"),
+        drop_allowed=drop_consensus_allowed,
+        evidence=axis_evidence(db, "sevenDay"),
     )
     next_control = ControlState(
         db_projection=db,
         pending_drops={"fiveHour": five.pending, "sevenDay": seven.pending},
     )
+    unknown = frozenset(
+        axis for axis, decided in (("fiveHour", five), ("sevenDay", seven))
+        if decided.unknown)
     if five.action == "PUBLISH_DB" or seven.action == "PUBLISH_DB":
         return ReductionDecision(
             "PUBLISH_DB",
             next_control,
             PublicationPlan(seven_day=seven.candidate, five_hour=five.candidate),
+            unknown_axes=unknown,
         )
     if five.action == "WRITE_CONTROL" or seven.action == "WRITE_CONTROL":
-        return ReductionDecision("WRITE_CONTROL", next_control)
-    return ReductionDecision("NOOP", next_control)
+        return ReductionDecision("WRITE_CONTROL", next_control,
+                                 unknown_axes=unknown)
+    return ReductionDecision("NOOP", next_control, unknown_axes=unknown)

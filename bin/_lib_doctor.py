@@ -232,6 +232,10 @@ class DoctorState:
     # evidence. None is the normal state; each record contains counts/reasons
     # but never configured paths or provider identifiers.
     codex_prune_refusals: Optional[list[dict]] = None
+    codex_compressed_census: Optional[dict] = None
+    codex_decoder_capability: Optional[str] = None
+    codex_container_status: Optional[dict] = None
+    codex_maintenance_debt: Optional[dict] = None
     # #705: the conversations store's refused-pricing-write record, read
     # verbatim from cache_meta. None means no refusal is recorded. A record
     # that exists but cannot be parsed arrives as {"__malformed__": True}
@@ -343,6 +347,18 @@ class DoctorState:
     # retained corpus from unreadable metadata.
     codex_project_metadata_health: Optional[dict] = None
     codex_project_metadata_error: Optional[str] = None
+    # #825/#832 (spec section 8, F9): the account-bound legacy-writer evidence.
+    # `{"available": bool, "cutoverId", "excludedCount", "coordinateDigest",
+    # "evidence": <sidecar document or None>}` from the validated admission
+    # summary (a deep run substitutes its own whole-journal recomputation).
+    # None / available=False is reported as unavailable, never as zero.
+    legacy_writer: Optional[dict] = None
+    # #825/#832 (spec section 8, F16): the outcome quarantine, read from the
+    # validated index. `{"available": bool, "triggered": bool, "accounts":
+    # [{"account", "accountLabel", "accountingPaused", "controlPaused",
+    # "accountingSince", "controlSince"}]}`. None / available=False is
+    # reported as unavailable, never as OK.
+    outcome_quarantine: Optional[dict] = None
     # Beta-channel (spec 2026-07-21 §3): the configured RELEASE channel
     # (stable|beta) that `cctally update` tracks — DISTINCT from the preview
     # `channel` (prod|preview) above. Populated by doctor_gather_state from a
@@ -391,6 +407,11 @@ class DoctorState:
     journal_cursor_lag_bytes: Optional[int] = None
     journal_hw_segment: Optional[str] = None
     journal_cursor_segment: Optional[str] = None
+    #   * journal_cursor_invalid (#946) — the applied cursor names no safe
+    #     endpoint: past its segment's size, or inside a line. The lag beside
+    #     it is then not a measure of anything consumed, so it is never
+    #     reported as caught up.
+    journal_cursor_invalid: bool = False
     journal_heal_incidents: Optional[list] = None
     journal_heal_detections: Optional[list] = None
     #   * retained_artifacts (#496 S6 §7.3) — the read-only retention scan
@@ -423,6 +444,15 @@ class DoctorState:
     journal_protocol_violations: Optional[list] = None
     journal_protocol_acknowledged: Optional[list] = None
     journal_protocol_error: Optional[str] = None
+    #   * journal_listing_error (#825/#832 fix round K11, K9K10-R6) — why the
+    #     segment listing failed. An unlistable journal is never an empty one.
+    #   * journal_scan_error (K9K10-R6/R11) — why the deep scan could not
+    #     complete: an unreadable segment, a raising admission-boundary lookup
+    #     or an unreadable excluded population. The scan's checks are then
+    #     unavailable — never zero excluded records, never an unfiltered
+    #     conflict scan.
+    journal_listing_error: Optional[str] = None
+    journal_scan_error: Optional[str] = None
     # Multi-account attribution (#341). A dict (None when unavailable) with:
     #   * claude_identity_status — "identified" | "stably_absent" | "torn"
     #   * claude_email — the active Claude email (or None)
@@ -1019,7 +1049,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1017
+            epoch = 1018
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1351,6 +1381,95 @@ def _check_data_codex_replay(s: DoctorState) -> CheckResult:
         summary="pending (clears on the next unbudgeted Codex sync)"
                 if s.codex_replay_pending else "none pending",
         remediation=None, details=details,
+    )
+
+
+def _check_data_codex_compressed_rollouts(s: DoctorState) -> CheckResult:
+    """#968 5.6 with operator clarifications D2, D3 and D6.
+
+    `warn` when any of three conditions holds: compressed rollouts exist and
+    no decoder is available; a verification ended `unverified` (D3, at once,
+    never debt); verification, reading or deletion work has been pending for
+    more than 24 hours (D2, D6). The summary states each true condition's
+    sentence once, joined by a single space, in that order. Otherwise pending
+    work is `ok` "continuing", and the all-clear sentence is used only when
+    no compressed rollout is unread, pending or unverified. Never FAIL: a
+    missing optional decoder is an environment limitation.
+    """
+    if s.codex_compressed_census is None:
+        return CheckResult(
+            id="data.codex_compressed_rollouts", title="Compressed Codex rollouts",
+            severity="warn", summary="unavailable (compressed Codex rollout census)",
+            remediation=None, details={"available": False})
+    census = s.codex_compressed_census
+    compressed = int(census.get("compressedOnly", 0) or 0)
+    never = int(census.get("neverIngested", 0) or 0)
+    incomplete = int(census.get("retainedIncomplete", 0) or 0)
+    unverified = int(census.get("unverified", 0) or 0)
+    debt = s.codex_maintenance_debt or {}
+    maintenance_partial = (s.codex_maintenance_debt is None
+                           or debt.get("coverage") == "partial")
+    verifications = int(debt.get("verifications", 0) or 0)
+    deletions = int(debt.get("deletions", 0) or 0)
+    no_decoder = s.codex_decoder_capability == "unavailable"
+    # D6: with a decoder, an unread or partly read compressed rollout is
+    # pending reading work; without one it is the no-decoder condition.
+    reads = 0 if no_decoder else never + incomplete
+    details = {
+        "compressedOnly": compressed,
+        "retainedComplete": int(census.get("retainedComplete", 0) or 0),
+        "retainedIncomplete": incomplete,
+        "neverIngested": never,
+        "unverified": unverified,
+        "verificationDebt": verifications,
+        "readDebt": reads,
+        "pruneDebt": deletions,
+    }
+    if maintenance_partial:
+        details["maintenanceCoverage"] = "partial"
+        if s.codex_maintenance_debt is None:
+            details["verificationDebt"] = None
+            details["pruneDebt"] = None
+    status = s.codex_container_status or {}
+    if status.get("census") == "partial":
+        details["census"] = "partial"
+        details["observedAt"] = status.get("observedAt")
+    if compressed:
+        details["decoderAvailable"] = not no_decoder
+    pending = bool(verifications or reads or deletions)
+    sentences = []
+    if compressed and no_decoder:
+        sentences.append(
+            f"{compressed} compressed Codex rollouts can't be read on this "
+            f"Python ({never} never ingested). Cached history was kept. "
+            "Install `backports.zstd` or use Python 3.14+.")
+    if unverified:
+        sentences.append(
+            f"{unverified} compressed Codex rollouts kept their cached history "
+            "but couldn't be verified against it.")
+    if pending and debt.get("olderThan24h"):
+        sentences.append(
+            "Codex history maintenance has been pending for more than 24 hours "
+            f"({verifications} verifications, {reads} reads, {deletions} "
+            "deletions).")
+    if sentences:
+        severity, summary = "warn", " ".join(sentences)
+    elif pending:
+        severity = "ok"
+        summary = "Codex history maintenance is continuing in the background."
+    elif maintenance_partial:
+        severity = "warn"
+        summary = "unavailable (compressed Codex rollout census)"
+    else:
+        severity = "ok"
+        summary = "All compressed Codex rollouts are readable and verified."
+    return CheckResult(
+        id="data.codex_compressed_rollouts",
+        title="Compressed Codex rollouts",
+        severity=severity,
+        summary=summary,
+        remediation=None,
+        details=details,
     )
 
 
@@ -3273,6 +3392,28 @@ _JOURNAL_CURSOR_LAG_WARN_BYTES = 4 * 1024 * 1024
 _JOURNAL_HEAL_RECENT_SECONDS = 7 * 24 * 3600
 
 
+def _journal_unreadable_remediation(s: DoctorState) -> str:
+    """K9K10-R6: the remediation for a journal doctor could not read. Fix
+    round K12 (K11R-12): it names the resolved data directory (a dev
+    checkout or `CCTALLY_DATA_DIR` is not the default path)."""
+    journal = f"{str(s.app_dir or '').rstrip('/')}/journal/"
+    return (f"Check the permissions of {journal} and the disk, then run "
+            "`cctally doctor --deep` again")
+
+
+def _journal_scan_unavailable(check_id: str, title: str, s: DoctorState,
+                              details: dict) -> CheckResult:
+    """A deep-scan check the scan could not complete (K9K10-R6): WARN,
+    unavailable, with the cause."""
+    return CheckResult(
+        id=check_id, title=title, severity="warn",
+        summary=f"unavailable ({s.journal_scan_error})",
+        remediation=_journal_unreadable_remediation(s),
+        details={**details, "scanned": True, "available": False,
+                 "error": s.journal_scan_error},
+    )
+
+
 def _check_journal_presence(s: DoctorState) -> CheckResult:
     """The journal directory exists and is appendable. A pre-cutover (legacy)
     install has NO journal yet — that is INFO (OK), never a FAIL."""
@@ -3284,6 +3425,15 @@ def _check_journal_presence(s: DoctorState) -> CheckResult:
         )
     details = {"present": True, "appendable": s.journal_appendable,
                "segments": s.journal_segment_count}
+    if s.journal_listing_error:
+        return CheckResult(
+            id="journal.presence", title="Journal", severity="warn",
+            summary=(f"segment listing unavailable "
+                     f"({s.journal_listing_error})"),
+            remediation=_journal_unreadable_remediation(s),
+            details={**details, "segments": None,
+                     "listingError": s.journal_listing_error},
+        )
     if s.journal_appendable is False:
         return CheckResult(
             id="journal.presence", title="Journal", severity="warn",
@@ -3307,6 +3457,9 @@ def _check_journal_integrity(s: DoctorState) -> CheckResult:
             id="journal.integrity", title="Journal integrity", severity="ok",
             summary="no journal", remediation=None, details={"present": False},
         )
+    if s.journal_scan_error:
+        return _journal_scan_unavailable(
+            "journal.integrity", "Journal integrity", s, {})
     if s.journal_malformed_count is None:
         return CheckResult(
             id="journal.integrity", title="Journal integrity", severity="ok",
@@ -3348,6 +3501,16 @@ def _check_journal_index_freshness(s: DoctorState) -> CheckResult:
     details = {"lag_bytes": lag, "hw_segment": s.journal_hw_segment,
                "cursor_segment": s.journal_cursor_segment,
                "warn_bytes": _JOURNAL_CURSOR_LAG_WARN_BYTES}
+    if s.journal_cursor_invalid:
+        # #946: lag is computed from the safe applied cursor, and this one is
+        # not safe, so no amount of lag here means "caught up".
+        details["cursor_invalid"] = True
+        return CheckResult(
+            id="journal.index_freshness", title="Journal index", severity="warn",
+            summary="index cursor is not at a journal line boundary",
+            remediation="Run `cctally db rebuild --db stats`",
+            details=details,
+        )
     if lag == 0:
         return CheckResult(
             id="journal.index_freshness", title="Journal index", severity="ok",
@@ -3582,6 +3745,9 @@ def _check_journal_conflicts(s: DoctorState) -> CheckResult:
             remediation=None,
             details={"scanned": True, "available": False, "conflicts": None},
         )
+    if s.journal_scan_error:
+        return _journal_scan_unavailable(
+            "journal.conflicts", "Journal conflicts", s, {"conflicts": None})
     if s.journal_conflicts is None:
         return CheckResult(
             id="journal.conflicts", title="Journal conflicts", severity="ok",
@@ -3617,6 +3783,283 @@ def _check_journal_conflicts(s: DoctorState) -> CheckResult:
         summary=(f"{len(conflicts)} quarantined same-revision group(s) "
                  "behind a provisional winner"),
         remediation=remediation, details=details,
+    )
+
+
+def _check_journal_legacy_writer(s: DoctorState) -> CheckResult:
+    """#825/#832 (spec section 8, F9, operator Q4): records an older cctally
+    process wrote after the account-bound cutover are excluded from current
+    accounting. WARN while the latest excluded population was first observed
+    under seven days ago; OK with a historical note after seven quiet days.
+    Never asserts that an old writer is alive, and never reports a missing
+    summary as zero. An incomplete legacy spool inventory is also a WARN,
+    independently of the excluded-record count (spec revision 5, section
+    8; `_with_legacy_spool_inventory`)."""
+    result = _legacy_writer_count_result(s)
+    inventory = (s.legacy_writer or {}).get("legacySpoolInventory")
+    if not inventory or inventory.get("available", False):
+        return result
+    return _with_legacy_spool_inventory(result, inventory)
+
+
+def _with_legacy_spool_inventory(result: CheckResult,
+                                 inventory: dict) -> CheckResult:
+    """Spec revision 5 (section 8): an incomplete legacy spool inventory is a
+    WARN independently of the excluded-record count. It names the path, the
+    failed operation and the error, never claims an old writer exists, and
+    says detection is paused only when the validated index holds the
+    durable `inventory-incomplete` marker. An inventory that failed for any
+    other reason (fix round K12, K11R-13) names no file: it is reported
+    unavailable with its cause."""
+    if inventory.get("unavailableCause") and not inventory.get("path"):
+        return _with_unavailable_spool_inventory(
+            result, inventory, inventory["unavailableCause"])
+    text = LEGACY_SPOOL_INVENTORY_TEXT.format(
+        path=inventory.get("path"), operation=inventory.get("operation"),
+        error=inventory.get("error"))
+    if inventory.get("paused"):
+        text += " " + LEGACY_SPOOL_INVENTORY_PAUSED_TEXT
+    note = "legacy status-line inventory unavailable"
+    if result.severity == "warn":
+        summary = f"{result.summary}; {note}"
+        remediation = (f"{result.remediation} {text}" if result.remediation
+                       else text)
+    else:
+        summary = (f"{note} ({inventory.get('operation')} "
+                   f"{inventory.get('path')}: {inventory.get('error')})")
+        remediation = text
+    return CheckResult(
+        id=result.id, title=result.title, severity="warn", summary=summary,
+        remediation=remediation,
+        details={**(result.details or {}),
+                 "legacySpoolInventory": dict(inventory)},
+    )
+
+
+def _with_unavailable_spool_inventory(result: CheckResult, inventory: dict,
+                                      cause: str) -> CheckResult:
+    """`_with_legacy_spool_inventory` for an inventory that names no file:
+    a WARN, "legacy status-line inventory unavailable ({cause})", which keeps
+    the excluded-record half's own summary and remediation."""
+    note = f"legacy status-line inventory unavailable ({cause})"
+    if result.severity == "warn":
+        summary, remediation = f"{result.summary}; {note}", result.remediation
+    else:
+        summary, remediation = note, None
+    return CheckResult(
+        id=result.id, title=result.title, severity="warn", summary=summary,
+        remediation=remediation,
+        details={**(result.details or {}),
+                 "legacySpoolInventory": dict(inventory)},
+    )
+
+
+def _legacy_writer_count_result(s: DoctorState) -> CheckResult:
+    """The excluded-record half of `journal.legacy_writer`."""
+    import _lib_legacy_writer_evidence as _lw
+
+    data = s.legacy_writer
+    if data and data.get("unavailableCause"):
+        # K9K10-R6/R11: the deep recomputation could not complete. The count
+        # is unavailable — never zero, never the stale summary.
+        return CheckResult(
+            id="journal.legacy_writer", title="Legacy writer",
+            severity="warn",
+            summary=f"unavailable ({data['unavailableCause']})",
+            remediation=_journal_unreadable_remediation(s),
+            details={"available": False,
+                     "unavailableCause": data["unavailableCause"]},
+        )
+    if not data or not data.get("available"):
+        # No current summary (for example an older process republished its
+        # own epoch). The durable sidecar alone still proves an excluded
+        # population and when it was first observed, so it decides the leg;
+        # without one the leg is unavailable, never zero.
+        sidecar = _lw.from_document((data or {}).get("evidence"))
+        if sidecar is None or sidecar.excluded_count <= 0:
+            return CheckResult(
+                id="journal.legacy_writer", title="Legacy writer",
+                severity="ok",
+                summary="unavailable (no current admission summary)",
+                remediation=None,
+                details={"available": False},
+            )
+        verdict = _lw.classify(sidecar, excluded_count=sidecar.excluded_count,
+                               now=s.now_utc)
+        return _legacy_writer_verdict_result(
+            verdict, count=sidecar.excluded_count,
+            details={"available": False, "source": "evidence-sidecar",
+                     "cutoverId": sidecar.cutover_id,
+                     "excludedCount": sidecar.excluded_count,
+                     "state": verdict.state,
+                     "lastSeenAt": verdict.last_seen_at})
+    cutover_id = data.get("cutoverId")
+    count = int(data.get("excludedCount") or 0)
+    if cutover_id is None:
+        return CheckResult(
+            id="journal.legacy_writer", title="Legacy writer", severity="ok",
+            summary="no account-bound cutover yet", remediation=None,
+            details={"available": True, "cutoverId": None,
+                     "excludedCount": count, "state": "none",
+                     "lastSeenAt": None},
+        )
+    # A missing or stale sidecar reads as "first observed now", which can only
+    # lengthen a warning (spec section 8).
+    evidence = _lw.observe(
+        _lw.from_document(data.get("evidence")), cutover_id=cutover_id,
+        excluded_count=count, coordinate_digest=data.get("coordinateDigest"),
+        now=s.now_utc)
+    verdict = _lw.classify(evidence, excluded_count=count, now=s.now_utc)
+    details = {"available": True, "cutoverId": cutover_id,
+               "excludedCount": count, "state": verdict.state,
+               "lastSeenAt": verdict.last_seen_at}
+    if verdict.state == "none":
+        return CheckResult(
+            id="journal.legacy_writer", title="Legacy writer", severity="ok",
+            summary="no legacy writes since the account-bound cutover",
+            remediation=None, details=details,
+        )
+    return _legacy_writer_verdict_result(verdict, count=count, details=details)
+
+
+def _legacy_writer_verdict_result(verdict, *, count: int,
+                                  details: dict) -> CheckResult:
+    """The WARN (recent) or historical OK (quiet) result in the approved
+    spec-section-8 content: the count, the last-seen time and the remedy."""
+    import _lib_legacy_writer_evidence as _lw
+
+    if verdict.state == "recent":
+        return CheckResult(
+            id="journal.legacy_writer", title="Legacy writer", severity="warn",
+            summary=(f"{count} record(s) an older cctally process wrote after "
+                     "the upgrade were excluded from accounting (last seen "
+                     f"{verdict.last_seen_at})"),
+            remediation=_lw.REMEDY, details=details,
+        )
+    return CheckResult(
+        id="journal.legacy_writer", title="Legacy writer", severity="ok",
+        summary=(f"no legacy writes in the last {_lw.QUIET_DAYS} days "
+                 f"({count} excluded in total, last seen "
+                 f"{verdict.last_seen_at})"),
+        remediation=None, details=details,
+    )
+
+
+#: Spec revision 5 (section 8), operator-owned wording, verbatim: an
+#: incomplete legacy spool inventory, and the sentence added when the
+#: validated index holds its durable `inventory-incomplete` marker.
+LEGACY_SPOOL_INVENTORY_TEXT = (
+    "cctally cannot read {path} ({operation}: {error}), one of the "
+    "status-line files an older cctally release used. Until it can, cctally "
+    "cannot tell whether an older process changed it. Check the file's "
+    "permissions and the disk.")
+LEGACY_SPOOL_INVENTORY_PAUSED_TEXT = (
+    "Automatic credit and reset detection is paused because of this, and "
+    "making the file readable again does not end the pause (see "
+    "`accounting.outcome_quarantine`); usage recording continues.")
+
+
+#: Operator-approved wording (#825/#832 spec section 8), verbatim.
+OUTCOME_QUARANTINE_ACCOUNTING_TEXT = (
+    "Automatic credit and reset detection is paused for {account} since "
+    "{time} because an older cctally process wrote data after the upgrade. It "
+    "resumes only after cctally verifies a clean reading for this account, "
+    "typically the first one after an idle period spanning a weekly reset; "
+    "there is no guaranteed time. If your usage was reset in place meanwhile, "
+    "record it with `cctally record-credit`.")
+OUTCOME_QUARANTINE_CONTROL_TEXT = (
+    "Status-line drop detection also waits for a successful usage refresh for "
+    "this account.")
+#: Spec revision 3 (section 8; operator decision dec-2b5bcf910816), verbatim:
+#: an account paused by an unresolved spool marker. It replaces the "resumes
+#: only after..." sentence and already names drop detection, so no control
+#: sentence is appended.
+OUTCOME_QUARANTINE_SPOOL_MARKER_TEXT = (
+    "Automatic credit, reset and status-line drop detection is paused for "
+    "{account} since {time} because an older cctally process wrote "
+    "status-line data after the upgrade. This version of cctally cannot yet "
+    "confirm a safe point to resume, so the pause does not end on its own; "
+    "usage recording continues. If your usage was reset in place meanwhile, "
+    "record it with `cctally record-credit`.")
+#: Spec revision 5 (section 8), operator-owned wording, verbatim: an account
+#: paused by a marker an incomplete legacy spool inventory left.
+OUTCOME_QUARANTINE_INVENTORY_MARKER_TEXT = (
+    "Automatic credit, reset and status-line drop detection is paused for "
+    "{account} since {time} because cctally could not read the status-line "
+    "files an older cctally release used, so it cannot rule out that an "
+    "older process changed them. This version of cctally cannot yet confirm "
+    "a safe point to resume, so the pause does not end on its own; usage "
+    "recording continues. If your usage was reset in place meanwhile, record "
+    "it with `cctally record-credit`.")
+#: Operator decision dec-5d2a9c2b004a (escalation esc-8a386c207966): the
+#: standalone sentence for an account missing only its control certificate.
+#: The approved control sentence above opens with "also", so it reads only as
+#: an addendum to the accounting one.
+OUTCOME_QUARANTINE_CONTROL_ONLY_TEXT = (
+    "Status-line drop detection is paused for {account} since {time}. It "
+    "resumes after a successful usage refresh for this account.")
+
+
+def _outcome_quarantine_message(row: dict) -> str:
+    """One account's paused outcome classes, in the approved wording. A
+    missing control certificate appends its sentence to the accounting one;
+    alone, it gets its own operator-approved standalone sentence."""
+    label = row.get("accountLabel") or row.get("account")
+    if row.get("unresolvedSpoolMarker"):
+        text = (OUTCOME_QUARANTINE_INVENTORY_MARKER_TEXT
+                if row.get("spoolMarkerCause") == "inventory-incomplete"
+                else OUTCOME_QUARANTINE_SPOOL_MARKER_TEXT)
+        return text.format(
+            account=label, time=row.get("accountingSince") or "an unknown time")
+    if row.get("accountingPaused"):
+        text = OUTCOME_QUARANTINE_ACCOUNTING_TEXT.format(
+            account=label, time=row.get("accountingSince") or "an unknown time")
+        if row.get("controlPaused"):
+            text += " " + OUTCOME_QUARANTINE_CONTROL_TEXT
+        return text
+    return OUTCOME_QUARANTINE_CONTROL_ONLY_TEXT.format(
+        account=label, time=row.get("controlSince") or "an unknown time")
+
+
+def _check_accounting_outcome_quarantine(s: DoctorState) -> CheckResult:
+    """#825/#832 (spec section 8, F16, operator Q9): after a post-cutover
+    legacy write or legacy spool change, automatic outcomes are withheld per
+    account until certified recovery. OK when no account is quarantined; WARN
+    naming per account what is paused and since when; unavailable — WARN,
+    never OK — on an unavailable or unvalidated index. Separate from
+    `journal.legacy_writer`: seven quiet days do not mean outcomes resumed.
+    Never claims when recovery will happen. While a spool marker is
+    unresolved (spec revision 3) every row uses the marker wording and the
+    details carry the markers."""
+    data = s.outcome_quarantine
+    title = "Outcome quarantine"
+    if not data or not data.get("available"):
+        return CheckResult(
+            id="accounting.outcome_quarantine", title=title, severity="warn",
+            summary="unavailable (no validated stats index)",
+            remediation=("Run any cctally command to bring the stats index "
+                         "up to date, then run `cctally doctor` again."),
+            details={"available": False, "accounts": []},
+        )
+    rows = []
+    for row in data.get("accounts") or []:
+        rows.append({**row, "message": _outcome_quarantine_message(row)})
+    details = {"available": True, "triggered": bool(data.get("triggered")),
+               "accounts": rows}
+    if data.get("unresolvedSpoolMarkers"):
+        details["unresolvedSpoolMarkers"] = list(data["unresolvedSpoolMarkers"])
+    if not rows:
+        return CheckResult(
+            id="accounting.outcome_quarantine", title=title, severity="ok",
+            summary=("no account is quarantined" if data.get("triggered")
+                     else "no legacy write or spool change since the upgrade"),
+            remediation=None, details=details,
+        )
+    return CheckResult(
+        id="accounting.outcome_quarantine", title=title, severity="warn",
+        summary=(f"automatic outcomes paused for {len(rows)} account(s)"),
+        remediation=" ".join(row["message"] for row in rows),
+        details=details,
     )
 
 
@@ -4121,6 +4564,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("journal.writer_guard", "_check_journal_writer_guard"),
         ("journal.conflicts", "_check_journal_conflicts"),
         ("journal.protocol", "_check_journal_protocol"),
+        ("journal.legacy_writer", "_check_journal_legacy_writer"),
         ("journal.quota_projection", "_check_journal_quota_projection"),
     )),
     ("data", "Data", (
@@ -4134,6 +4578,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         # after the pair rather than between them.
         ("data.codex_project_metadata", "_check_data_codex_project_metadata"),
         ("data.codex_prune_safety", "_check_data_codex_prune_safety"),
+        ("data.codex_compressed_rollouts", "_check_data_codex_compressed_rollouts"),
         ("data.codex_replay", "_check_data_codex_replay"),
         ("data.codex_ingest_backlog", "_check_data_codex_ingest_backlog"),
         ("data.codex_quota", "_check_data_codex_quota"),
@@ -4154,6 +4599,12 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("accounts.codex_reset_anchors", "_check_accounts_codex_reset_anchors"),
         ("accounts.codex_window_attribution",
          "_check_accounts_codex_window_attribution"),
+    )),
+    # #825/#832 spec section 8: reported separately from the seven-day
+    # `journal.legacy_writer` recency, because quiet time never decides
+    # recovery.
+    ("accounting", "Accounting", (
+        ("accounting.outcome_quarantine", "_check_accounting_outcome_quarantine"),
     )),
     ("pricing", "Pricing", (
         ("pricing.coverage", "_check_pricing_coverage"),

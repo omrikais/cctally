@@ -36,6 +36,10 @@
 # headers, not by separate fixture trees), so no xargs fan-out here.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -44,7 +48,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
-FIXTURE_STAGE=$(mktemp -d -t cctally-conversation-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-conversation-fixstage.XXXXXX") || exit 1
 FIX_DIR="$FIXTURE_STAGE/conversation"
 FIXTURES_ROOT="$FIX_DIR"
 # Goldens address the COMMITTED root, never the staging copy above: this
@@ -65,7 +69,7 @@ GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/conversation"
 # Per-run scratch root. The scenario's HOME is a clone of the in-tree fixture's
 # .local tree, so the dashboard server's startup writes (e.g. SQLite WAL) never
 # dirty the committed fixture.
-SCRATCH_ROOT=$(mktemp -d -t cctally-conversation-test.XXXXXX)
+SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-conversation-test.XXXXXX") || exit 1
 GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 
 pass_count=0

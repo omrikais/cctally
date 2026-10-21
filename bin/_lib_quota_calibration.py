@@ -62,6 +62,10 @@ class ApplyRejection(str, enum.Enum):
 
     UNSUPPORTED_COMPOSITION = "unsupported-composition"
     EMPTY_POPULATION = "no-local-history"
+    #: The requested interval, or an entry of the population, lies outside
+    #: the regime's own coefficient era (#978 spec 4.6). Units from another
+    #: era are never divided by this regime's units-per-point.
+    UNVALIDATED_COEFFICIENT_ERA = "unvalidated-coefficient-era"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,6 +92,9 @@ class ValidatedRegime:
     class_shares: dict
     family_radius: "float | None"
     class_radius: "float | None"
+    #: The id of the coefficient era the regime was fitted in, always a
+    #: member of `qm.COEFFICIENT_ERAS` (#978).
+    coefficient_era: str
     qualifications: tuple = ()
 
 
@@ -196,6 +203,13 @@ def validate_regime(raw, *, account_key, expected_fingerprint,
     if isinstance(revision, bool) or not isinstance(revision, int) \
             or revision != expected_revision:
         return RegimeRejection.REVISION
+    # #978 spec 4.5: under the current constants a regime names the
+    # coefficient era it was fitted in. Missing or unknown is malformed, never
+    # a guess at an era; a regime from an older build has already been
+    # reported above as a fingerprint mismatch.
+    era = qm.era_by_id(raw.get("coefficientEra"))
+    if era is None:
+        return RegimeRejection.MALFORMED
 
     point = raw.get("unitsPerPoint")
     if not _finite(point) or point <= 0.0:
@@ -256,31 +270,42 @@ def validate_regime(raw, *, account_key, expected_fingerprint,
         class_shares=class_shares,
         family_radius=family_radius,
         class_radius=class_radius,
+        coefficient_era=era.id,
         qualifications=marks,
     )
 
 
-def population_units(entries) -> float:
+def population_units(entries, *, era) -> float:
     """Summed weighted quota units over the general-meter entries.
 
     The same filter `_cctally_quota_model.analyse_account` applies to the
     current week: an entry whose family does not drain the general weekly
     meter contributes nothing, and one whose cache-write split is unknown is
-    skipped rather than priced at zero.
+    skipped rather than priced at zero. Every entry is weighted with `era`,
+    the regime's own coefficient era (#978).
+
+    An entry `era` does not cover raises `CoefficientEraMismatch`, as the
+    kernel's population functions do (#978 spec 4.2, invariant 5): skipping
+    it would divide part of the population by the regime's budget and report
+    the result as the whole.
     """
     total = 0.0
     for entry in entries:
         if qm.family_participation(qm.normalize_family(entry.model)) \
                 != "general":
             continue
-        units = qm.weighted_units(entry)
-        if units is None:
+        weighed = qm.weigh_entry(entry, era)
+        if weighed.cause == qm.ERA_UNAVAILABLE:
+            raise qm.CoefficientEraMismatch(
+                f"entry.at {entry.at.isoformat()} lies outside coefficient "
+                f"era {era.id!r}")
+        if weighed.units is None:
             continue
-        total += units
+        total += weighed.units
     return total
 
 
-def apply_regime(regime: ValidatedRegime, entries
+def apply_regime(regime: ValidatedRegime, entries, *, interval
                  ) -> "AppliedQuota | ApplyRejection":
     """Modelled consumption for `entries` under `regime`.
 
@@ -288,8 +313,28 @@ def apply_regime(regime: ValidatedRegime, entries
     status, because that status describes S1's fit population and this one is
     the consumer's. The arithmetic afterwards reproduces the kernel's, so a
     consumer never re-derives the inversion by hand.
+
+    `interval` is the half-open `[start, end)` the caller models, which a
+    consumer extrapolating over a whole week must pass as that week (#978
+    spec 4.6). Two independent checks run before any aggregation: the
+    interval must lie inside the regime's coefficient era, and so must every
+    entry. The interval check is not implied by the entry check — a week
+    starting before the era whose retained entries all fall after its start
+    is in-era entry by entry, yet modelling the whole week is forbidden.
     """
-    aggregated = qm.aggregate_composition(entries)
+    era = qm.era_by_id(regime.coefficient_era)
+    if era is None:
+        return ApplyRejection.UNVALIDATED_COEFFICIENT_ERA
+    start, end = interval
+    qm.require_aware(start, "interval.start")
+    qm.require_aware(end, "interval.end")
+    era_start, era_end = qm.era_bounds(era)
+    if start < era_start or (era_end is not None and end > era_end):
+        return ApplyRejection.UNVALIDATED_COEFFICIENT_ERA
+    entries = list(entries)
+    if any(not qm.era_contains(era, entry.at) for entry in entries):
+        return ApplyRejection.UNVALIDATED_COEFFICIENT_ERA
+    aggregated = qm.aggregate_composition(entries, era=era)
     if aggregated is None:
         return ApplyRejection.EMPTY_POPULATION
     family_shares, class_shares = aggregated
@@ -298,7 +343,7 @@ def apply_regime(regime: ValidatedRegime, entries
                            regime.class_shares, regime.class_radius):
         return ApplyRejection.UNSUPPORTED_COMPOSITION
 
-    units = population_units(entries)
+    units = population_units(entries, era=era)
     if not _finite(units) or units < 0.0:
         return ApplyRejection.EMPTY_POPULATION
 

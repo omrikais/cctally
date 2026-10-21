@@ -19,6 +19,10 @@
 # `pathlib.Path.home()` at module import time.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -42,7 +46,7 @@ assert_eq () {
 
 # Fresh HOME so APP_DIR (= $HOME/.local/share/cctally) is empty and
 # stats.db is created from scratch by open_db().
-SCRATCH="$(mktemp -d -t cctally-pms-idempotency.XXXXXX)"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-pms-idempotency.XXXXXX")" || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
 out=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH" TZ=Etc/UTC python3 - <<'PY'
@@ -173,7 +177,7 @@ assert_eq "row count after duplicate" "1" "$count"
 # would have silently dedup'd the post-credit insert to rowcount 0;
 # the new shape returns rowcount 1.
 
-SCRATCH2="$(mktemp -d -t cctally-pms-segment.XXXXXX)"
+SCRATCH2="$(mktemp -d "${TMPDIR:-/tmp}/cctally-pms-segment.XXXXXX")" || exit 1
 out2=$(REPO_ROOT_RESOLVED="$REPO_ROOT" HOME="$SCRATCH2" TZ=Etc/UTC python3 - <<'PY'
 import importlib.util, os, pathlib, sys, traceback
 from importlib.machinery import SourceFileLoader

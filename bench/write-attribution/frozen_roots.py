@@ -9,6 +9,7 @@ usage:
                           [--home H] [--codex-home ROOTS]
                           [--claude-config-dir DIRS] [--extra PATH ...]
                           [--probe PATH ...] [--retry-deadline-s 120]
+                          [--decoded-twins] [--omit PATH ...]
   frozen_roots.py verify  --freeze FREEZE [--full] [--out JSON]
   frozen_roots.py qualify --store SRC_ROOT --freeze FREEZE [--out JSON]
   frozen_roots.py family  --receipts DIR --freeze FREEZE [--expect-pid PID ...]
@@ -33,7 +34,11 @@ capture  One freeze per measurement session, bound to EVERY store copy it
          scratch copy only, see `capture_sqlite_pair`); each Claude data directory's `projects/**/*.jsonl`
          (`$CLAUDE_CONFIG_DIR`, else H/.config/claude and H/.claude); H/.claude.json;
          every `--extra` file (the namespace self-test's observed reads); and
-         every path any bound copy retains under a root. Absent inputs are
+         every path any bound copy retains under a root. Retained quota-journal
+         source paths from every bound copy additionally receive metadata-only
+         component/alias probe closure, bound to exact segment hashes; they
+         do not authorize content reads or enlarge the transcript corpus.
+         Unrepresentable closure refuses capture. Absent inputs are
          RECORDED absences, never silent. Append-only JSONL is copied as a
          prefix ending at a complete record boundary at or beyond every cursor
          and scan target (`last_byte_offset`, `size_bytes`) ANY bound copy
@@ -86,6 +91,13 @@ capture  One freeze per measurement session, bound to EVERY store copy it
          every live root and metadata file denied, the freeze write-denied, a
          violating process killed) and seal.json, then makes the freeze
          read-only. Exit 0 CAPTURED, 2 REFUSED.
+         #968: a Codex home's compressed rollouts (sessions/**/*.jsonl.zst)
+         are captured whole as class container, with their decoded length and
+         complete-line end validated through the tested tree's container leaf;
+         --decoded-twins instead presents each compressed-only rollout as its
+         decoded .jsonl twin (the pre-change timing control, spec 9.2 step 3),
+         and --omit PATH presents a logical rollout as absent in both forms
+         (an experiment's legitimately deleted rollout).
 verify   Recomputes the seal: the control files' hashes and the metadata digest
          of every frozen path (kind, size, mode, mtime, inode) - and, with
          --full, every file's content hash. Runners call it before and after
@@ -93,7 +105,8 @@ verify   Recomputes the seal: the control files' hashes and the metadata digest
 qualify  Qualifies ONE bound copy against the shared freeze; run it once per
          copy. Refuses a copy the freeze is not bound to (its root is not in
          the manifest's `stores`) or whose databases changed since the
-         capture, and the (store copy, freeze) pair when a retained cursor or
+         capture, missing/changed journal inputs or probe coverage, and the
+         (store copy, freeze) pair when a retained cursor or
          scan target is beyond its frozen file, a retained file was replaced
          (stored inode != captured inode), a committed prefix digest
          (conversation_source_files) differs from the frozen file's first
@@ -193,6 +206,61 @@ SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 #: the copied pair; removed before the seal (never part of the freeze).
 DERIVE_DIR = ".sqlite-derive"
 CHUNK = 1 << 20
+
+
+#: #968: a Codex rollout compressed in place. `X.jsonl.zst` is the same
+#: logical rollout as `X.jsonl` (spec 5.1/5.2), so the walk captures it whole
+#: as class `container`: a compressed stream is never appended to.
+CONTAINER_SUFFIX = ".jsonl.zst"
+
+
+def _container_leaf():
+    """The tested tree's container leaf (`../../bin`, which `_prep.sh`
+    requires beside the harness): the product's own decoder chain (U1)."""
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[2] / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    import _lib_codex_rollout_container as rc
+    return rc
+
+
+def _frozen_container(rc, path):
+    """A SelectedContainer for a container file read from anywhere, a frozen
+    copy included. Frozen file roots have opaque names; only real container
+    suffixes are normalized here. The manifest keeps the source identity."""
+    p = pathlib.Path(path)
+    fingerprint = rc.fingerprint_of(p, rc.ZSTD)
+    if fingerprint is None:
+        raise Refused(f"{path}: the container cannot be stat'ed")
+    return rc.SelectedContainer(rc.logical_path(p), rc.ZSTD, p, fingerprint)
+
+
+def _validate_container(path) -> dict:
+    """The decoded length and complete-line end of one frozen container, or
+    the typed reason it cannot be decoded (U6 keeps such rows; recorded)."""
+    rc = _container_leaf()
+    try:
+        result = rc.validate_full_stream(_frozen_container(rc, path))
+    except OSError as exc:
+        return {"ok": False, "length": None, "completeLineEnd": None,
+                "error": getattr(exc, "category", None) or type(exc).__name__}
+    return {"ok": bool(result.ok), "length": result.decoded_length,
+            "completeLineEnd": result.complete_line_end, "error": result.error}
+
+
+def _lines(path, container: bool):
+    """The lines of a frozen transcript, or of a frozen container decoded."""
+    if not container:
+        with open(path, "rb") as fh:
+            yield from fh
+        return
+    rc = _container_leaf()
+    with rc.open_decoded(_frozen_container(rc, path)) as fh:
+        while True:
+            line = fh.readline()
+            if not line:
+                return
+            yield line
 
 
 class Refused(Exception):
@@ -385,6 +453,190 @@ def retained_rows(store) -> "list[dict]":
         finally:
             conn.close()
     return rows
+
+
+def retained_journal_sources(store) -> dict:
+    """Read only this bound copy's retained journal, never a source it names.
+
+    Matches list_segments, decode_line, _is_codex_quota_obs and the oracle's
+    truthy root/path + non-None offset eligibility. Unlike a cursor inventory,
+    this includes disappeared rollouts. All segment bytes (including a torn
+    tail, which replay does not decode) are hashed for qualification. No byte
+    prefilter: escaped JSON spellings must have the decoder's semantics too.
+    """
+    bin_dir = str(pathlib.Path(__file__).resolve().parents[2] / "bin")
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    import _lib_journal as journal
+
+    directory = pathlib.Path(store) / "data" / "journal"
+
+    def segments():
+        try:
+            listing = os.scandir(directory)
+        except FileNotFoundError:
+            return []
+        with listing:
+            return sorted((e.name for e in listing if e.name.endswith(".jsonl")
+                           and e.name.startswith((journal.BOOTSTRAP_PREFIX,
+                                                  journal.SEGMENT_PREFIX))
+                           and e.is_file()), key=journal.segment_sort_key)
+
+    try:
+        names = segments()
+        inventory, paths = [], set()
+        records = malformed = eligible = 0
+        for name in names:
+            path = directory / name
+            before = path.stat()
+            digest = hashlib.sha256()
+            size = complete = 0
+            with path.open("rb") as fh:
+                for raw in fh:
+                    size += len(raw)
+                    digest.update(raw)
+                    if not raw.endswith(b"\n"):
+                        continue
+                    complete = size
+                    records += 1
+                    rec = journal.decode_line(raw)
+                    if rec is None:
+                        malformed += 1
+                        continue
+                    if rec.get("t") != "obs" or rec.get("provider") != "codex":
+                        continue
+                    payload = rec.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        raise Refused(f"journal {path}: invalid quota payload shape")
+                    if payload.get("kind") != "quota_window_snapshot":
+                        continue
+                    source = payload.get("source_path")
+                    if not payload.get("source_root_key") or not source \
+                            or payload.get("line_offset") is None:
+                        continue
+                    # Path(non-string) fails before any filesystem probe in
+                    # the replay oracle. A relative name needs an execution
+                    # cwd we cannot certify at this capture boundary.
+                    if not isinstance(source, str):
+                        continue
+                    if not os.path.isabs(source):
+                        raise Refused(f"journal {path}: relative source path {source!r}")
+                    _check_path(source)
+                    eligible += 1
+                    paths.add(source)
+            after = path.stat()
+            signature = lambda st: (st.st_dev, st.st_ino, st.st_size,
+                                    st.st_mtime_ns, st.st_ctime_ns)
+            if size != before.st_size or signature(before) != signature(after):
+                raise Refused(f"journal {path}: changed during source coverage scan")
+            inventory.append({"name": name, "size": size,
+                              "completeLineEnd": complete,
+                              "sha256": digest.hexdigest()})
+        if segments() != names:
+            raise Refused(f"journal {directory}: segment inventory changed during scan")
+    except OSError as exc:
+        raise Refused(f"journal {directory}: cannot read retained coverage ({exc})") from exc
+    return {"root": os.path.realpath(store), "segments": inventory,
+            "records": records, "malformed": malformed, "eligible": eligible,
+            "paths": sorted(paths)}
+
+
+def journal_probe_components(path, roots, entries, absences, denied, *, probe=None,
+                             resolved=None):
+    """Canonicalization closure in the PRESENTED namespace, metadata only.
+
+    Use existing probe entries/absences and symlink targets, including suffixes
+    below directory aliases. Ancestors of canonical roots/denied targets are
+    already guaranteed by capture's admission checks. Anything else outside
+    the existing namespace, or a link loop, refuses; it never grants a new
+    content root or substitutes an inferred ENOENT for an unknown state.
+    With no probe callback this checks the sealed metadata without live I/O.
+    """
+    pending = list(pathlib.PurePath(path).parts[1:])
+    cur, links, covered = os.sep, 0, set()
+    floors = [r.logical for r in roots] + list(denied)
+
+    def finish():
+        if resolved is not None:
+            resolved.append(os.path.normpath(os.path.join(cur, *pending)))
+        return sorted(covered)
+
+    while pending:
+        part = pending.pop(0)
+        if part == "..":
+            cur = os.path.dirname(cur)
+            continue
+        cur = os.path.join(cur, part)
+        root = _root_of(roots, cur)
+        targets = [t for t in denied if _under(cur, t)]
+        floor = (root.logical if root is not None else
+                 max(targets, key=len) if targets else None)
+        if floor is None:
+            if any(_under(f, cur) for f in floors):
+                continue                    # canonical ancestor, not a content grant
+            raise Refused(f"journal source {path}: component outside captured "
+                          f"probe namespace: {cur}")
+        # An explicit absent ancestor covers descendants in rootmap too.
+        ancestor = cur
+        while _under(ancestor, floor):
+            if ancestor in absences:
+                covered.add(ancestor)
+                return finish()
+            if ancestor == floor:
+                break
+            ancestor = os.path.dirname(ancestor)
+        entry = entries.get(cur)
+        if entry is None and cur in denied:
+            if not denied[cur].get("metadata"):
+                raise Refused(f"journal source {path}: missing target metadata: {cur}")
+            covered.add(cur)
+            continue
+        if entry is None and probe is not None:
+            probe(cur)
+            entry = entries.get(cur)
+        if entry is None:
+            if cur in absences:
+                covered.add(cur)
+                return finish()
+            raise Refused(f"journal source {path}: missing component metadata: {cur}")
+        covered.add(cur)
+        if entry.get("kind") == "symlink" or entry.get("type") == "symlink":
+            links += 1
+            if links > 40:
+                raise Refused(f"journal source {path}: alias closure exceeds 40 links")
+            raw = entry.get("target")
+            if not isinstance(raw, str) or not raw:
+                raise Refused(f"journal source {path}: missing alias target: {cur}")
+            target = raw if os.path.isabs(raw) else os.path.join(os.path.dirname(cur), raw)
+            pending = list(pathlib.PurePath(target).parts[1:]) + pending
+            cur = os.sep
+    return finish()
+
+
+def journal_selection_components(path, roots, entries, absences, denied, *, probe=None):
+    """Metadata for rollout selection through literal and canonical aliases.
+
+    Each spelling has its own attested state. A missing plain leaf cannot
+    certify its compressed sibling; a file alias may also resolve to a
+    different logical rollout whose sibling selection will probe.
+    """
+    import _lib_codex_rollout_container as rc
+
+    pending, visited, covered = [path], set(), set()
+    while pending:
+        source = pending.pop()
+        spellings = ([str(rc.logical_path(source)), str(rc.zstd_twin(source))]
+                     if rc.is_container_name(source) else [source])
+        for spelling in spellings:
+            if spelling in visited:
+                continue
+            visited.add(spelling)
+            canonical = []
+            covered.update(journal_probe_components(
+                spelling, roots, entries, absences, denied, probe=probe,
+                resolved=canonical))
+            pending.extend(p for p in canonical if p not in visited)
+    return sorted(covered)
 
 
 # ── copying ───────────────────────────────────────────────────────────────
@@ -804,24 +1056,28 @@ def _record_cwds(obj) -> list:
     return out
 
 
-def scan_cwds(paths, roots, targets=()) -> "tuple[set, dict]":
+def scan_cwds(paths, roots, targets=(), containers=()) -> "tuple[set, dict]":
     """Every working directory recorded in the given FROZEN transcript copies
-    (each copy is exactly its captured prefix), streamed line by line. A line
-    is parsed only when it names a `"cwd"` key and the spelling of a
-    directory root or of a non-traversed directory link's denied target
-    (Amendment 14 P1), since only a cwd under a root, or at or below such a
-    target, needs a probe; returns (cwds, scan statistics)."""
+    (each copy is exactly its captured prefix) and, since #968, in each frozen
+    compressed container decoded through the tested tree's leaf, streamed line
+    by line. A line is parsed only when it names a `"cwd"` key and the
+    spelling of a directory root or of a non-traversed directory link's
+    denied target (Amendment 14 P1), since only a cwd under a root, or at or
+    below such a target, needs a probe. A container that cannot be decoded is
+    counted (`undecodableContainers`) and the lines read before the failure
+    are kept; returns (cwds, scan statistics)."""
     needles = set()
     spellings = [r.logical for r in roots if not r.is_file and r.present]
     for logical in spellings + list(targets):
         needles.add(logical.encode("utf-8", "surrogateescape"))
         needles.add(json.dumps(logical)[1:-1].encode("utf-8", "surrogateescape"))
-    cwds, files, size, lines, parsed = set(), 0, 0, 0, 0
+    cwds, files, size, lines, parsed, undecodable = set(), 0, 0, 0, 0, 0
     started = time.monotonic()
-    for path in paths:
+    sources = [(p, False) for p in paths] + [(p, True) for p in containers]
+    for path, container in sources:
         files += 1
-        with open(path, "rb") as fh:
-            for line in fh:
+        try:
+            for line in _lines(path, container):
                 lines += 1
                 size += len(line)
                 if b'"cwd"' not in line or not any(n in line for n in needles):
@@ -832,17 +1088,27 @@ def scan_cwds(paths, roots, targets=()) -> "tuple[set, dict]":
                     continue
                 parsed += 1
                 cwds.update(_record_cwds(obj))
-    return cwds, {"files": files, "bytes": size, "lines": lines, "parsedLines": parsed,
+        except OSError:
+            if not container:
+                raise
+            undecodable += 1
+    return cwds, {"files": files, "containers": len(list(containers)),
+                  "bytes": size, "lines": lines, "parsedLines": parsed,
+                  "undecodableContainers": undecodable,
                   "seconds": round(time.monotonic() - started, 3)}
 
 
 def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             extras=(), retry_deadline_s: float = 120.0, clock=time.monotonic,
-            on_copy=None, on_pair=None, now=time.time, probes=()) -> dict:
+            on_copy=None, on_pair=None, now=time.time, probes=(),
+            decoded_twins: bool = False, omit=()) -> dict:
     """Capture the frozen input set of one measurement session, bound to every
     store copy in `stores` (one path or a list); returns the manifest. Raises
     Refused. `on_copy` and `on_pair` are the test seams of
-    `copy_prefix`/`copy_whole` and `capture_sqlite_pair`."""
+    `copy_prefix`/`copy_whole` and `capture_sqlite_pair`.
+    decoded_twins (#968) presents each compressed-only Codex rollout as its
+    decoded twin; omit names logical rollouts presented as absent in both forms.
+    """
     started_wall = now()
     store_ids = bind_stores(stores, started_wall)
     freeze = pathlib.Path(out)
@@ -868,6 +1134,26 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
         path = row["path"]
         required[path] = max([required.get(path, 0)]
                              + list(row["offsets"].values()))
+    journals = [retained_journal_sources(s["root"]) for s in store_ids]
+    journal_sources = sorted({p for j in journals for p in j["paths"]})
+    omitted = {_norm(p) for p in omit}
+    # #968 decoded twins: every bound Codex cursor's retained device/inode
+    # evidence must agree. One presented identity cannot qualify conflicting
+    # copies, aliases or accounting/conversation rows by choosing the first.
+    stored_identity: "dict[str, tuple[int, int]]" = {}
+
+    def retain_identity(path: str, identity: tuple[int, int]) -> None:
+        previous = stored_identity.get(path)
+        if decoded_twins and previous is not None and previous != identity:
+            raise Refused(f"{path}: conflicting retained identities "
+                          f"{previous} and {identity}")
+        stored_identity.setdefault(path, identity)
+
+    for row in retained:
+        ident = row["identity"]
+        if row["table"] in ("codex_session_files", "codex_conversation_source_files") \
+                and "device_id" in ident and "inode" in ident:
+            retain_identity(row["path"], (int(ident["device_id"]), int(ident["inode"])))
     deadline = clock() + retry_deadline_s
     entries: "dict[str, dict]" = {}
     absences: "dict[str, str]" = {}
@@ -1055,6 +1341,129 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                                      "links": [], "metadata": _meta(target_st)}
                           )["links"].append(path)
 
+    def add_twin(root: Root, logical: str, container: str) -> None:
+        """#968 decoded twin (spec 9.2 step 3.1): the compressed rollout's
+        decoded bytes at its logical path, cut at the last complete record.
+        Identity: the device and inode a bound copy retains for the logical
+        path, else the container's own; timestamps and mode are the
+        container's. The container must stay unchanged across the decode,
+        else it is retried until the deadline and then refused."""
+        if logical in entries:
+            held = entries[logical]
+            if held.get("class") == "decoded-twin":
+                # Directory traversal can visit the canonical target before
+                # a retained alias. Reconcile its later evidence before the
+                # manifest and namespace metadata are sealed.
+                need = required.get(logical, 0)
+                if held["admittedLength"] < need:
+                    raise Refused(f"{logical}: the decoded twin ends at "
+                                  f"{held['admittedLength']}, before the retained "
+                                  f"cursor/scan target {need}")
+                stored = stored_identity.get(logical)
+                if stored is not None:
+                    held.update(dev=stored[0], ino=stored[1], identitySource="store")
+            return
+        _check_path(logical)
+        add_parents(root, logical)
+        target = _frozen(freeze, root, logical)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns,
+                         s.st_ctime_ns)
+        source = os.lstat(container)
+        if stat_mod.S_ISLNK(source.st_mode):
+            # The generated plain alias must still resolve to the original
+            # canonical LOGICAL identity. Flattening it into another regular
+            # file duplicates the pre-change discovery population (AC5/I7).
+            raw = os.readlink(container)
+            try:
+                resolved = os.path.realpath(container, strict=True)
+            except OSError as exc:
+                raise Refused(f"decoded twin alias {container}: {exc}") from exc
+            canonical = resolved[:-len(".zst")]
+            owner = _root_of(roots, canonical)
+            if (not resolved.endswith(CONTAINER_SUFFIX) or owner is None
+                    or owner.kind != "codex-home" or owner.walk is None
+                    or not _under(resolved, owner.walk)
+                    or canonical in omitted or os.path.lexists(canonical)):
+                raise Refused(f"decoded twin alias {container}: its canonical "
+                              "target cannot be presented faithfully (outside "
+                              "a Codex walk, omitted, or beside a plain file)")
+            required[canonical] = max(required.get(canonical, 0),
+                                      required.get(logical, 0))
+            if logical in stored_identity:
+                retain_identity(canonical, stored_identity[logical])
+            add_twin(owner, canonical, resolved)
+            if (key(os.lstat(container)) != key(source)
+                    or os.readlink(container) != raw
+                    or os.path.realpath(container, strict=True) != resolved):
+                raise Refused(f"decoded twin alias {container}: changed during capture")
+            frozen_target = _frozen(freeze, owner, canonical)
+            os.symlink(os.path.relpath(frozen_target, target.parent), target)
+            entries[logical] = {
+                "logical": logical, "kind": "symlink", "class": "decoded-twin-alias",
+                "root": root.index, "target": canonical, "resolved": canonical,
+                "targetScope": "in-root", "targetRoot": owner.index,
+                "physical": str(target.relative_to(freeze)), **_identity(source),
+                "sourceSize": source.st_size, "admittedLength": source.st_size,
+                "container": {"logical": container, "canonicalLogical": canonical}}
+            return
+        rc = _container_leaf()
+        attempt = 0
+        while True:
+            if attempt and clock() > deadline:
+                raise Refused(f"{container}: changed during its decode; the "
+                              "retry deadline expired")
+            attempt += 1
+            st0 = os.stat(container)
+            if not stat_mod.S_ISREG(st0.st_mode):
+                raise Refused(f"not a regular file: {container}")
+            digest = hashlib.sha256()
+            boundary = 0
+            pending = bytearray()
+            tmp = str(target) + ".part"
+            try:
+                with rc.open_decoded(_frozen_container(rc, container)) as fin, \
+                        open(tmp, "wb") as fout:
+                    while True:
+                        chunk = fin.read(CHUNK)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                        cut = chunk.rfind(b"\n")
+                        if cut < 0:
+                            pending += chunk
+                            continue
+                        digest.update(pending)
+                        digest.update(chunk[:cut + 1])
+                        boundary += len(pending) + cut + 1
+                        pending = bytearray(chunk[cut + 1:])
+                    fout.truncate(boundary)
+            except OSError as exc:
+                raise Refused(f"{container}: cannot be decoded "
+                              f"({getattr(exc, 'category', None) or exc})") from exc
+            if key(os.stat(container)) != key(st0):
+                os.unlink(tmp)
+                continue
+            os.replace(tmp, target)
+            break
+        need = required.get(logical, 0)
+        if boundary < need:
+            raise Refused(f"{logical}: the decoded twin ends at {boundary}, before "
+                          f"the retained cursor/scan target {need}")
+        ident = _identity(st0)
+        stored = stored_identity.get(logical)
+        if stored is not None:
+            ident.update(dev=stored[0], ino=stored[1])
+        entries[logical] = {
+            "logical": logical, "kind": "file", "class": "decoded-twin",
+            "root": root.index, "physical": str(target.relative_to(freeze)),
+            **ident, "sourceSize": st0.st_size, "admittedLength": boundary,
+            "sha256": digest.hexdigest(), "attempts": attempt,
+            "identitySource": "store" if stored is not None else "container",
+            "container": {"logical": container, "canonicalLogical": logical,
+                          "dev": st0.st_dev, "ino": st0.st_ino,
+                          "size": st0.st_size}}
+
     boundary_counts = {}
     for root in list(roots):
         if not root.present:
@@ -1065,6 +1474,7 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             continue
         add_dir(root, root.logical)
         files = dirs = 0
+        containers: "list[str]" = []
         if root.walk is not None:
             add_parents(root, os.path.join(root.walk, "x"))
             for dirpath, dirnames, filenames in os.walk(root.walk):
@@ -1078,12 +1488,36 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                     dirs += 1
                 for name in sorted(filenames):
                     full = os.path.join(dirpath, name)
+                    logical = (full[:-len(".zst")] if name.endswith(CONTAINER_SUFFIX)
+                               else full)
+                    if logical in omitted:
+                        # Container selection probes both spellings even when
+                        # the captured source had only a plain rollout.
+                        absences[logical] = absences[logical + ".zst"] = "omitted"
+                        continue
                     if name.endswith(".jsonl"):
                         add_file(root, full, "transcript")
                         files += 1
+                    elif name.endswith(CONTAINER_SUFFIX) and root.kind == "codex-home":
+                        containers.append(full)
                     else:
                         exclusions.append({"logical": full,
                                            "reason": "not a walked *.jsonl"})
+            for full in containers:
+                logical = full[:-len(".zst")]
+                if not decoded_twins:
+                    add_file(root, full, "container")
+                    held = entries[full]
+                    if held["kind"] == "symlink":
+                        held = entries[held["resolved"]]
+                    held["decoded"] = _validate_container(freeze / held["physical"])
+                    if not os.path.lexists(logical):
+                        absences[logical] = "compressed-only"
+                elif os.path.lexists(logical):
+                    absences[full] = "container-beside-plain"
+                else:
+                    add_twin(root, logical, full)
+                    absences[full] = "container-presented-as-twin"
             if root.walk != root.logical:
                 consumed = {m + side for m in root.metadata
                             if os.path.basename(m) in SQLITE_METADATA
@@ -1102,7 +1536,8 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                 add_file(root, meta, "metadata")
             else:
                 absences[meta] = "metadata-absent"
-        boundary_counts[root.logical] = {"files": files, "dirs": dirs}
+        boundary_counts[root.logical] = {"files": files, "dirs": dirs,
+                                         "containers": len(containers)}
     for extra in extras:
         path = _norm(extra)
         root = _root_of(roots, path)
@@ -1121,8 +1556,12 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             continue
         if path in entries:
             continue
-        if os.path.lexists(path):
+        if path in omitted:
+            absences[path] = absences[path + ".zst"] = "omitted"
+        elif os.path.lexists(path):
             add_file(root, path, "transcript")
+        elif path + ".zst" in entries:
+            absences[path] = "compressed-only"
         else:
             absences[path] = "retained-missing"
     # Amendment 13 O2: probe-only entries. The product's git-root walk-up
@@ -1233,8 +1672,11 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
         return kind
 
     transcripts = sorted(str(freeze / e["physical"]) for e in entries.values()
-                         if e["kind"] == "file" and e["class"] == "transcript")
-    cwds, scan = scan_cwds(transcripts, roots, outside_targets)
+                         if e["kind"] == "file"
+                         and e["class"] in ("transcript", "decoded-twin"))
+    frozen_containers = sorted(str(freeze / e["physical"]) for e in entries.values()
+                               if e["kind"] == "file" and e["class"] == "container")
+    cwds, scan = scan_cwds(transcripts, roots, outside_targets, frozen_containers)
     probed = target_cwds = 0
     for cwd in sorted(cwds):
         if cwd.startswith("~"):
@@ -1255,6 +1697,47 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             raise Refused(f"a probe path outside every directory root and every "
                           f"denied directory-link target cannot be presented: {raw}")
         explicit.append(path)
+    # External file aliases retain exact content roots. Selection may also
+    # stat their opposite container spelling: give ONLY that literal path an
+    # existing file-root mapping with a P/A record, never copied content or a
+    # parent directory mapping. Without a mapping rootmap would pass through
+    # an out-of-root stat even if an isolated P/A record were emitted.
+    if journal_sources:
+        rc = _container_leaf()
+        for linked in tuple(link_roots.values()):
+            if not rc.is_container_name(linked.logical):
+                continue
+            plain = str(rc.logical_path(linked.logical))
+            sibling = (str(rc.zstd_twin(plain)) if linked.logical == plain else plain)
+            if _root_of(roots, sibling) is not None:
+                continue
+            root = Root("file", sibling, None, index=len(roots), origin="selection-probe")
+            roots.append(root)
+            probe_path(sibling, {"root": root.index}, sibling, "quota-journal")
+            root.present = sibling not in absences
+
+    # Journal-only references are canonicalization probes, not cursor rows:
+    # never put them in `required`, which would copy bytes and change the corpus.
+    def journal_probe(path):
+        if probe_walk(path, git=False, origin="quota-journal") is None:
+            raise Refused(f"journal source cannot be probed in this namespace: {path}")
+        held = entries.get(path)
+        if held is not None and held.get("kind") == "probe":
+            # Probe metadata must describe one stable object, including a
+            # link's spelling. Never turn a failed metadata read into absence.
+            current = _meta(os.lstat(path))
+            if any(current[k] != held[k] for k in current) or (
+                    held.get("type") == "symlink"
+                    and os.readlink(path) != held.get("target")):
+                raise Refused(f"journal probe changed during capture: {path}")
+
+    journal_coverage = {p: journal_selection_components(
+        p, roots, entries, absences, denied, probe=journal_probe)
+                        for p in journal_sources}
+    # Recheck exact retained input after metadata capture. This scans bound
+    # copies only; it does not reread any live journal or referenced content.
+    if [retained_journal_sources(s["root"]) for s in store_ids] != journals:
+        raise Refused("journal coverage changed during capture")
     for target, root in link_roots.items():
         root.links.sort()
         entries[target]["linkedFrom"] = list(root.links)
@@ -1274,6 +1757,9 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                           for k in sorted(denied)],
         "exclusions": exclusions,
         "retainedOutsideRoots": outside,
+        "decodedTwins": bool(decoded_twins), "omitted": sorted(omitted),
+        "journalCoverage": {"version": 1, "stores": journals,
+                            "sources": journal_coverage},
         # cwds: those under a directory root (probed); targetCwds: those at
         # or below a denied directory-link target outside every root (probed
         # inside it, Amendment 14 P1); cwdsParsed: every distinct cwd of a
@@ -1348,18 +1834,29 @@ def sandbox_profile(freeze: pathlib.Path, manifest: dict) -> str:
     """Deny every access to each live logical root (a directory root as a
     subpath, a file root - including an out-of-root link target - as a
     literal), to the live target of each non-traversed directory link (a
-    subpath, Amendment 10), and every write to the freeze; a violating
-    process is killed, so a call the namespace misses, or a traversal of a
-    directory link, fails instead of reading live data (spec §6.3 "Frozen
-    namespace")."""
+    subpath, Amendment 10), and every write to the freeze. Content and write
+    rules retain SIGKILL. Metadata reads and existence checks (including
+    chdir) return an error, which can also refuse a path operation before its
+    content/write check. libproc checks these operations while
+    inspecting another process's cwd or descriptors, and killing its caller
+    would prevent lsof from finding that process's unrelated scratch handles
+    (spec §6.3 "Frozen namespace")."""
     lines = ["(version 1)", "(allow default)"]
     for root in manifest["roots"]:
         filt = ("literal" if root["kind"] == "file" else "subpath")
         lines.append(f"(deny file-read* file-write* ({filt} "
                      f"{_sb_string(root['logical'])}) (with send-signal SIGKILL))")
+        lines.append(f"(deny file-read-metadata ({filt} "
+                     f"{_sb_string(root['logical'])}) (with no-report))")
+        lines.append(f"(deny file-test-existence ({filt} "
+                     f"{_sb_string(root['logical'])}) (with no-report))")
     for d in manifest.get("deniedTargets") or []:
         lines.append(f"(deny file-read* file-write* (subpath "
                      f"{_sb_string(d['logical'])}) (with send-signal SIGKILL))")
+        lines.append(f"(deny file-read-metadata (subpath "
+                     f"{_sb_string(d['logical'])}) (with no-report))")
+        lines.append(f"(deny file-test-existence (subpath "
+                     f"{_sb_string(d['logical'])}) (with no-report))")
     lines.append(f"(deny file-write* (subpath {_sb_string(os.path.realpath(freeze))})"
                  " (with send-signal SIGKILL))")
     return "\n".join(lines) + "\n"
@@ -1561,7 +2058,44 @@ def qualify(store, freeze) -> dict:
         problems.append(prep_error)
     seal_check = verify(freeze)
     problems.extend(f"seal: {p}" for p in seal_check["problems"])
+    # A sealed cursor-only freeze cannot certify quota replay. Compare this
+    # copy's exact journal inputs and prove every declared union source's
+    # canonicalization closure against sealed entries/explicit absences.
+    coverage = manifest.get("journalCoverage") or {}
+    try:
+        journals = coverage.get("stores") or []
+        if coverage.get("version") != 1 or [j.get("root") for j in journals] != [
+                s.get("root") for s in bound]:
+            raise Refused("journal coverage is missing or not bound to every store")
+        current = retained_journal_sources(store)
+        if current not in journals:
+            raise Refused("journal retained input changed since capture")
+        sources = coverage.get("sources") or {}
+        required_sources = {p for j in journals for p in j["paths"]}
+        if set(sources) != required_sources:
+            raise Refused("journal source coverage is incomplete")
+        targets = {d["logical"]: d for d in manifest.get("deniedTargets") or []}
+        for path in sorted(required_sources):
+            if journal_selection_components(path, roots, entries, absences, targets) != sources[path]:
+                raise Refused(f"journal source {path}: component coverage changed")
+    except (Refused, OSError, KeyError, TypeError, ValueError) as exc:
+        problems.append(f"journal coverage: {exc}")
+    # Canonical provenance is part of a decoded control's admission, including
+    # aliases the store never ingested. Older flattened twins have no such
+    # proof and must be recaptured rather than accepted on inode alone.
+    for entry in entries.values():
+        kind = entry.get("class")
+        if kind not in ("decoded-twin", "decoded-twin-alias"):
+            continue
+        canonical = (entry.get("container") or {}).get("canonicalLogical")
+        presented = (entry.get("resolved") if kind == "decoded-twin-alias"
+                     else entry["logical"])
+        if (not canonical or canonical != presented
+                or (kind == "decoded-twin-alias" and entry["kind"] != "symlink")):
+            problems.append(f"{entry['logical']}: decoded twin canonical identity "
+                            "is unproven or flattened; recapture the freeze")
     checked = residual_used = prefixes = empty_absent = 0
+    covered = shorter = undecodable = twins = omitted_rows = 0
     for row in retained_rows(store):
         path = row["path"]
         root = _root_of(roots, path)
@@ -1576,6 +2110,22 @@ def qualify(store, freeze) -> dict:
             entry = None                      # metadata only: no frozen bytes
         if entry is None:
             reason = absences.get(path)
+            if reason == "omitted":
+                omitted_rows += 1
+                continue
+            if reason == "compressed-only":
+                held = entries.get(path + ".zst")
+                if held is not None and held["kind"] == "symlink":
+                    held = entries.get(held["resolved"])
+                decoded = (held or {}).get("decoded") or {}
+                if not decoded.get("ok"):
+                    undecodable += 1          # U6: the product keeps these rows
+                elif any(v > (decoded.get("length") or 0)
+                         for v in row["offsets"].values()):
+                    shorter += 1              # the product resets it (5.5)
+                else:
+                    covered += 1
+                continue
             if reason is not None and path in residual:
                 residual_used += 1
                 continue
@@ -1591,6 +2141,8 @@ def qualify(store, freeze) -> dict:
                             + (f"absent from the freeze ({reason})" if reason
                                else "not in the freeze"))
             continue
+        if entry.get("class") == "decoded-twin":
+            twins += 1
         for col, value in row["offsets"].items():
             if value > entry["admittedLength"]:
                 problems.append(f"{where}: retained {col} {value} is beyond the "
@@ -1613,7 +2165,11 @@ def qualify(store, freeze) -> dict:
             "freeze": seal_identity(freeze), "retainedChecked": checked,
             "committedPrefixesVerified": prefixes,
             "residualAdmitted": residual_used,
-            "retainedEmptyAbsent": empty_absent, "qualifiedAt": _utc()}
+            "retainedEmptyAbsent": empty_absent, "qualifiedAt": _utc(),
+            "retainedContainerCovered": covered,
+            "retainedContainerShorter": shorter,
+            "retainedContainerUndecodable": undecodable,
+            "retainedTwinCovered": twins, "retainedOmitted": omitted_rows}
 
 
 # ── the run family's namespace receipts ───────────────────────────────────
@@ -2258,6 +2814,12 @@ def main(argv=None) -> int:
                    help="a path under a directory root the family only checks "
                    "(lstat/stat/access): recorded as metadata, never copied")
     c.add_argument("--retry-deadline-s", type=float, default=120.0)
+    c.add_argument("--decoded-twins", action="store_true",
+                   help="#968 timing control: present each compressed-only Codex "
+                        "rollout as its decoded .jsonl twin")
+    c.add_argument("--omit", action="append", default=[],
+                   help="#968: a logical rollout presented as absent in both "
+                        "forms (recorded `omitted`)")
     v = sub.add_parser("verify")
     v.add_argument("--freeze", required=True)
     v.add_argument("--full", action="store_true")
@@ -2305,6 +2867,7 @@ def main(argv=None) -> int:
                                codex_home=args.codex_home,
                                claude_config_dir=args.claude_config_dir,
                                extras=args.extra, probes=args.probe,
+                               decoded_twins=args.decoded_twins, omit=args.omit,
                                retry_deadline_s=args.retry_deadline_s)
         except Refused as exc:
             print(f"REFUSED: {exc}")

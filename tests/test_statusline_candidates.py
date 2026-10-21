@@ -1,6 +1,7 @@
 """Pure schema and candidate-reduction contracts for issue #318."""
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -407,7 +408,12 @@ def test_joining_lower_contributor_requires_its_own_later_receipt():
 
 
 def test_tombstone_blocks_only_the_observed_axis_through_future_skew_cutoff():
-    db = lib.DbProjection(five_hour=None, seven_day=None)
+    # Fix round K13 (review cycle 7 P1-2): an absent axis publishes only on
+    # classification evidence, whatever the drop gate, so the empty account
+    # this case means is a PROVEN empty one.
+    empty = lib.AxisEvidence(lib.EVIDENCE_PROVEN_EMPTY)
+    db = lib.DbProjection(five_hour=None, seven_day=None,
+                          evidence={"fiveHour": empty, "sevenDay": empty})
     control = lib.ControlState(db_projection=db, pending_drops={"fiveHour": None, "sevenDay": None})
     got = _reduce(
         [
@@ -967,3 +973,59 @@ def test_an_empty_retained_record_is_discarded_by_both_readers():
     assert rearmed is not None, "the hollow record cancelled a live drop"
     assert rearmed.first_seen_at == NOW + 181
     assert rearmed.retained is not None and rearmed.retained.observations
+
+
+def test_an_absent_projection_never_authorizes_a_withheld_publication():
+    """#825/#832 review finding P1-2 (Codex fix-round-4 Q2). While drop
+    consensus is closed, a missing projection proves nothing: it may be an
+    expired-window filter, not an empty account. An absent baseline alone
+    must neither publish nor erase a pending drop's evidence — only the open
+    gate (a permitted drop) may treat it as a first reading."""
+    armed = _reduce([_weekly_candidate("a", 20, NOW), _weekly_candidate("b", 20, NOW)])
+    pending = armed.control.pending_drops["sevenDay"]
+    assert pending is not None
+    absent = lib.DbProjection(five_hour=None, seven_day=None)
+    control = lib.ControlState(db_projection=absent,
+                               pending_drops={"fiveHour": None, "sevenDay": pending})
+    later = NOW + 10
+
+    def reduce(candidates, allowed):
+        return lib.reduce_candidates(
+            candidates, db=absent, control=control,
+            tombstones={"fiveHour": None, "sevenDay": None}, now_epoch=later,
+            drop_consensus_allowed=allowed)
+
+    reporting = [_weekly_candidate("a", 20, later), _weekly_candidate("b", 20, later)]
+    closed = reduce(reporting, False)
+    assert closed.action != "PUBLISH_DB", "an absent baseline published a withheld drop"
+    assert closed.control.pending_drops["sevenDay"] == pending, (
+        "an absent baseline erased the pending drop's evidence")
+    # Fix round K13 (review cycle 7 P1-2): the open gate is no
+    # classification evidence either. It neither publishes the absent axis
+    # nor erases the pending evidence; both gates name the axis unknown, so
+    # the caller defers the whole evaluation.
+    opened = reduce(reporting, True)
+    assert opened.action != "PUBLISH_DB", (
+        "an open gate classified an absent baseline as a first reading")
+    assert opened.control.pending_drops["sevenDay"] == pending
+    assert opened.unknown_axes == closed.unknown_axes == frozenset({"sevenDay"})
+    # Non-vacuity: proven-empty evidence does classify the same reading as a
+    # first reading, under either gate.
+    proven = dataclasses.replace(absent, evidence={
+        "sevenDay": lib.AxisEvidence(lib.EVIDENCE_PROVEN_EMPTY)})
+    for allowed in (True, False):
+        classified = lib.reduce_candidates(
+            reporting, db=proven, control=lib.ControlState(
+                db_projection=proven,
+                pending_drops={"fiveHour": None, "sevenDay": None}),
+            tombstones={"fiveHour": None, "sevenDay": None}, now_epoch=later,
+            drop_consensus_allowed=allowed)
+        assert classified.action == "PUBLISH_DB" and not classified.unknown_axes
+
+    first = lib.reduce_candidates(
+        [_weekly_candidate("a", 20, later)], db=absent,
+        control=lib.ControlState(db_projection=absent,
+                                 pending_drops={"fiveHour": None, "sevenDay": None}),
+        tombstones={"fiveHour": None, "sevenDay": None}, now_epoch=later,
+        drop_consensus_allowed=False)
+    assert first.action != "PUBLISH_DB", "an absent baseline authorized a publication"

@@ -28,7 +28,9 @@ import pytest
 from conftest import load_script
 
 UTC = dt.timezone.utc
-WEEK_START = dt.datetime(2026, 6, 1, tzinfo=UTC)
+#: A Monday inside the `opus-5` coefficient era (#978): entries outside every
+#: validated era carry no weight, and a regime applies only inside its own era.
+WEEK_START = dt.datetime(2026, 8, 3, tzinfo=UTC)
 WEEK_END = WEEK_START + dt.timedelta(days=7)
 
 
@@ -56,6 +58,7 @@ def _regime(*, effective_from=None, effective_until=None,
         class_shares={"fresh": 0.5, "output": 0.5},
         family_radius=family_radius,
         class_radius=class_radius,
+        coefficient_era="opus-5",
     )
 
 
@@ -200,7 +203,37 @@ def test_b3_the_attribution_causes_are_a_closed_set():
     module = _mod()
     assert set(module.ATTRIBUTION_CAUSES) == {
         "account-not-resolved", "calibration-absent", "regime-boundary",
-        "unsupported-composition", "no-local-history"}
+        "unsupported-composition", "no-local-history",
+        "unvalidated-coefficient-era"}
+
+
+def test_every_attribution_cause_has_footer_copy():
+    """A cause with no copy renders as its own code in the terminal footer,
+    which is readable but is not the sentence the footer owes a reader."""
+    module = _mod()
+    for cause in module.ATTRIBUTION_CAUSES:
+        assert module._cause_copy(cause) != cause, cause
+
+
+def test_a_week_outside_the_regimes_coefficient_era_falls_back_whole():
+    """#978 spec 4.6. An `opus-5` regime asked to model a week that crosses
+    2026-09-22 is rejected by `apply_regime` as `unvalidated-coefficient-era`,
+    a cause the project attribution must carry as a member of its own closed
+    set, with its own footer copy, rather than as a raw code."""
+    module = _mod()
+    week_start = dt.datetime(2026, 9, 17, tzinfo=UTC)
+    week_end = week_start + dt.timedelta(days=7)
+    records = _records(module, [
+        _Entry(at=week_start + dt.timedelta(days=1)),
+        _Entry(at=week_start + dt.timedelta(days=3))])
+    out = module.resolve_week_attribution(
+        _regime(), records, week_start=week_start, week_end=week_end)
+    assert out.basis == "cost-share"
+    assert out.cause == "unvalidated-coefficient-era"
+    assert out.cause in module.ATTRIBUTION_CAUSES
+    assert module._cause_copy(out.cause) == (
+        "the week is not inside the coefficient era the calibration's token "
+        "weights are validated for")
 
 
 # --------------------------------------------------------------------------
@@ -484,9 +517,9 @@ def test_an_empty_bound_set_covers_no_whole_week():
 # --------------------------------------------------------------------------
 # End to end: a partial range withholds the residual (spec §5.2)
 # --------------------------------------------------------------------------
-E2E_WEEK_START = dt.datetime(2026, 6, 1, tzinfo=UTC)
+E2E_WEEK_START = dt.datetime(2026, 8, 3, tzinfo=UTC)
 E2E_WEEK_END = E2E_WEEK_START + dt.timedelta(days=7)
-E2E_AS_OF = "2026-06-09T12:00:00Z"
+E2E_AS_OF = "2026-08-11T12:00:00Z"
 
 
 def _seed_e2e_store(app):
@@ -500,7 +533,7 @@ def _seed_e2e_store(app):
             " captured_at_utc, week_start_date, week_end_date, week_start_at,"
             " week_end_at, weekly_percent, source, payload_json)"
             " VALUES (?,?,?,?,?,?,?,?)",
-            ("2026-06-07T00:00:00Z", "2026-06-01", "2026-06-08",
+            ("2026-08-09T00:00:00Z", "2026-08-03", "2026-08-10",
              E2E_WEEK_START.isoformat().replace("+00:00", "Z"),
              E2E_WEEK_END.isoformat().replace("+00:00", "Z"),
              40.0, "fixture", "{}"))
@@ -518,7 +551,7 @@ def _seed_e2e_store(app):
                 "INSERT INTO session_files(path, size_bytes, mtime_ns,"
                 " last_byte_offset, last_ingested_at, session_id,"
                 " project_path) VALUES (?,?,?,?,?,?,?)",
-                (path, 0, 0, 0, "2026-06-09T00:00:00Z", f"s{index}",
+                (path, 0, 0, 0, "2026-08-11T00:00:00Z", f"s{index}",
                  "/fake/repos/alpha"))
             cache.execute(
                 "INSERT INTO session_entries(source_path, line_offset,"
@@ -535,8 +568,9 @@ def _seed_e2e_store(app):
     finally:
         cache.close()
 
-    family_shares, class_shares = qm.aggregate_composition(entries)
-    units = sum(qm.weighted_units(e) for e in entries)
+    era = qm.era_by_id("opus-5")
+    family_shares, class_shares = qm.aggregate_composition(entries, era=era)
+    units = sum(qm.weighted_units(e, era) for e in entries)
     payload = {
         "schemaVersion": 1,
         "accounts": {"*": {"regimes": [{
@@ -545,6 +579,7 @@ def _seed_e2e_store(app):
             "effectiveUntil": None,
             "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": "opus-5",
             "unitsPerPoint": units / 30.0,
             "interval": {"lo": units / 30.0 * 0.95,
                          "hi": units / 30.0 * 1.05},
@@ -589,7 +624,7 @@ def test_a_whole_week_range_states_the_residual(e2e_app, capsys):
     """The non-vacuity twin. Without it the partial-range test below would
     pass over a build whose residual was withheld for some other reason."""
     payload = _run_project(
-        e2e_app, capsys, "--since", "2026-06-01", "--until", "2026-06-07")
+        e2e_app, capsys, "--since", "2026-08-03", "--until", "2026-08-09")
     totals = payload["attribution"]["totals"]
     assert payload["attribution"]["basis"] == "modelled", payload[
         "attribution"]
@@ -615,20 +650,137 @@ def test_a_modelled_week_without_a_snapshot_names_the_absent_observed_side(
     finally:
         conn.close()
     payload = _run_project(
-        e2e_app, capsys, "--since", "2026-06-01", "--until", "2026-06-07")
+        e2e_app, capsys, "--since", "2026-08-03", "--until", "2026-08-09")
     totals = payload["attribution"]["totals"]
     assert totals["observedMinusModelledPoints"] is None, totals
     assert totals["residualCause"] == "observed-absent", totals
 
 
 def test_a_partial_range_withholds_the_residual(e2e_app, capsys):
-    """`--since 2026-06-03 --until 2026-06-05` used to publish a whole-week
+    """`--since 2026-08-05 --until 2026-08-07` used to publish a whole-week
     residual beside a three-day range, because `whole_weeks` asked whether
     every week had a SNAPSHOT rather than whether the range covered the week
     whole. The meter reading is the week's; the modelled population is three
     days of it."""
     payload = _run_project(
-        e2e_app, capsys, "--since", "2026-06-03", "--until", "2026-06-05")
+        e2e_app, capsys, "--since", "2026-08-05", "--until", "2026-08-07")
     totals = payload["attribution"]["totals"]
     assert totals["residualCause"] == "population-misaligned", totals
     assert totals["observedMinusModelledPoints"] is None, totals
+
+
+# --------------------------------------------------------------------------
+# End to end: a week outside the regime's coefficient era (#978 spec 4.6)
+# --------------------------------------------------------------------------
+ERA_WEEK_START = dt.datetime(2026, 9, 17, tzinfo=UTC)
+ERA_WEEK_END = ERA_WEEK_START + dt.timedelta(days=7)
+ERA_AS_OF = "2026-09-25T12:00:00Z"
+
+
+def _seed_era_crossing_store(app):
+    """One subscription week, 2026-09-17..09-24, that crosses 2026-09-22,
+    under a stored `opus-5` regime that is open and carries the current
+    fingerprint. The week starts after the regime's `effectiveFrom` and the
+    regime has no `effectiveUntil`, so the only refusal left is the coefficient
+    era: `apply_regime` rejects the week's interval as ending after `opus-5`.
+    """
+    import _lib_quota_model as qm
+
+    conn = app.open_db()
+    try:
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots("
+            " captured_at_utc, week_start_date, week_end_date, week_start_at,"
+            " week_end_at, weekly_percent, source, payload_json)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            ("2026-09-23T00:00:00Z", "2026-09-17", "2026-09-24",
+             ERA_WEEK_START.isoformat().replace("+00:00", "Z"),
+             ERA_WEEK_END.isoformat().replace("+00:00", "Z"),
+             30.0, "fixture", "{}"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    cache = app.open_cache_db()
+    try:
+        for index, (day, model) in enumerate(
+                ((1, "claude-opus-5"), (3, "claude-opus-5"),
+                 (6, "claude-opus-5-5"))):
+            at = ERA_WEEK_START + dt.timedelta(days=day, hours=6)
+            path = f"/fake/repos/alpha/era{index}.jsonl"
+            cache.execute(
+                "INSERT INTO session_files(path, size_bytes, mtime_ns,"
+                " last_byte_offset, last_ingested_at, session_id,"
+                " project_path) VALUES (?,?,?,?,?,?,?)",
+                (path, 0, 0, 0, "2026-09-25T00:00:00Z", f"era{index}",
+                 "/fake/repos/alpha"))
+            cache.execute(
+                "INSERT INTO session_entries(source_path, line_offset,"
+                " timestamp_utc, model, msg_id, req_id, input_tokens,"
+                " output_tokens, cache_create_tokens, cache_create_1h_tokens,"
+                " cache_read_tokens, cost_usd_raw)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (path, 0, at.isoformat(), model, f"em{index}",
+                 f"er{index}", 200_000, 40_000, 0, 0, 0, None))
+        cache.commit()
+    finally:
+        cache.close()
+
+    payload = {
+        "schemaVersion": 1,
+        "accounts": {"*": {"regimes": [{
+            "effectiveFrom": "2026-08-01T00:00:00+00:00",
+            "effectiveUntil": None,
+            "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+            "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": "opus-5",
+            "unitsPerPoint": 2_000_000.0,
+            "interval": {"lo": 1_900_000.0, "hi": 2_100_000.0},
+            "support": {"days": 26, "segments": 4},
+            "status": "ok",
+            "asOf": "2026-09-01T00:00:00+00:00",
+            "qualifications": [],
+            "familyShares": {"claude-opus-5": 1.0},
+            "classShares": {"fresh": 0.5, "output": 0.5},
+            "familyRadius": 1.0,
+            "classRadius": 1.0,
+        }]}},
+    }
+    import _cctally_core
+    path = _cctally_core.APP_DIR / "quota-calibrations.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+@pytest.fixture
+def era_app(monkeypatch, tmp_path):
+    from conftest import redirect_paths
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    monkeypatch.setenv("CCTALLY_DISABLE_UPDATE_CHECK", "1")
+    monkeypatch.setenv("CCTALLY_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("CCTALLY_AS_OF", ERA_AS_OF)
+    app = sys.modules["cctally"]
+    _seed_era_crossing_store(app)
+    return app
+
+
+def test_a_week_outside_the_regimes_era_names_its_cause_end_to_end(
+        era_app, capsys):
+    """The JSON names the closed-set cause, and the terminal footer renders
+    its sentence rather than the raw code."""
+    payload = _run_project(
+        era_app, capsys, "--since", "2026-09-17", "--until", "2026-09-23")
+    attribution = payload["attribution"]
+    assert attribution["basis"] == "cost-share", attribution
+    assert attribution["cause"] == "unvalidated-coefficient-era", attribution
+
+    rc = era_app.main(["project", "--since", "2026-09-17",
+                       "--until", "2026-09-23"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert ("Modelled quota: withheld — the week is not inside the "
+            "coefficient era the calibration's token weights are validated "
+            "for. Used % is a cost share.") in out, out
+    assert "withheld — unvalidated-coefficient-era" not in out, out

@@ -39,6 +39,10 @@ CODEX_ROOT_B="$RUNTIME/scratch/codex-b"
 export CODEX_HOME="$CODEX_ROOT_MAIN,$CODEX_ROOT_A,$CODEX_ROOT_B"
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
 export CCTALLY_DISABLE_TELEMETRY=1
+# #965: keep the fixed-date reader corpus durable without a persisted setting
+# (docs/fixtures-gotchas.md, "Conversation retention is off in test
+# environments (#965)"). CCTALLY_AS_OF below is unrelated and stays.
+export CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF=1
 # Keep Task A/B's native quota fixtures active and deterministic. The source
 # builders honor this established clock seam; browser-side age rendering may
 # advance, but provider capability and cycle selection stay frozen.
@@ -147,10 +151,7 @@ mkdir -p "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference"
 cp "$REPO_ROOT/tests/fixtures/codex-parity/v1/claude-seed/334-claude-thinking-reference.jsonl" \
    "$CLAUDE_CONFIG_DIR/projects/-synthetic-session-d-reference/"
 
-# 4) Keep fixed-timestamp conversation fixtures durable. Rebuilds deliberately
-#    run the configured retention pass, so the production default would make
-#    this non-retention suite expire as wall time advances.
-"$REPO_ROOT/bin/cctally" config set conversation.retention_days 0 >/dev/null
+# 4) Conversation retention: the switch exported in step 2 keeps the fixed-date corpus durable (docs/fixtures-gotchas.md, "Conversation retention is off in test environments (#965)").
 
 # 5) Disable the dashboard's update-check thread. It consults CONFIG, not the
 #    environment (docs/updates-gotchas.md: `_should_show_update_banner` reads

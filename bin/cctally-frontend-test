@@ -63,6 +63,10 @@
 # bin/cctally-test-all fans the harnesses out through.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The harness helper path is rooted through REPO_ROOT at runtime.
@@ -73,7 +77,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
 WEB_DIR="$REPO_ROOT/dashboard/web"
-GOLDEN_DIFF_TMPDIR="$(mktemp -d -t cctally-frontend-test-XXXXXX)"
+GOLDEN_DIFF_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/cctally-frontend-test-XXXXXX")" || exit 1
 export GOLDEN_DIFF_TMPDIR
 trap 'rm -rf "$GOLDEN_DIFF_TMPDIR"' EXIT
 

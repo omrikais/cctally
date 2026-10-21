@@ -246,6 +246,12 @@ def _adjacent_pairs(regimes) -> dict:
     `now` with `status: "stale"` and appends a fresh regime starting at the
     analysis start, so the two are neither adjacent nor a rate transition. The
     status check is the second, independent guard.
+
+    #978 spec 4.5: a pair also requires one `fingerprint` and one
+    `coefficientEra`. Units-per-point from two eras measure two different
+    weightings, so their difference is a coefficient change and never a
+    metering-rate change. The comparison uses `.get()`, so a legacy pair in
+    which neither regime names an era keeps its treatment.
     """
     closed: dict = {}
     for regime in regimes:
@@ -265,6 +271,10 @@ def _adjacent_pairs(regimes) -> dict:
             continue
         predecessor = closed.get(start)
         if predecessor is None or predecessor is regime:
+            continue
+        if predecessor.get("fingerprint") != regime.get("fingerprint") \
+                or predecessor.get("coefficientEra") \
+                != regime.get("coefficientEra"):
             continue
         pairs[start] = (predecessor, regime)
     return pairs

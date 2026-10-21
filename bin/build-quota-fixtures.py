@@ -338,6 +338,168 @@ def scenario_malformed_retained_instant(home: Path) -> None:
     store.close()
 
 
+# --------------------------------------------------------------------------
+# #978 — the Opus 5.5 coefficient era. Both scenarios carry their OWN clock,
+# committed in their `input.env`, because the ten scenarios above stay pinned
+# to the Opus 5 era at `AS_OF`.
+# --------------------------------------------------------------------------
+#: The `opus-5-5` token-class weights, as a literal copy. Deliberately NOT
+#: imported from the kernel: the scenario must be able to catch a kernel that
+#: weighs any aggregation path with the wrong era, which a fixture computing
+#: its units with the kernel's own table could never do.
+NEW_ERA_WEIGHTS = {"fresh": 1.0, "output": 0.64, "cache_1h": 1.0,
+                   "cache_read": 0.0148}
+#: The `opus-5` weights, likewise a literal copy, for scenario 12's pre-era
+#: days.
+OPUS5_WEIGHTS = {"fresh": 1.0, "output": 4.73, "cache_1h": 1.03,
+                 "cache_read": 0.0031}
+
+#: Scenario 11's known budget, in `opus-5-5` units per general-weekly point.
+#: Each day's meter moves an integer number of points and its tokens weigh
+#: `points * KNOWN_BUDGET * RATIO_JITTER` under NEW_ERA_WEIGHTS, so the
+#: readings are the cumulative units divided by KNOWN_BUDGET up to that
+#: jitter. EXPECTED: the golden's `calibration.fitted.value` equals
+#: KNOWN_BUDGET within 1% under the ceiling rule (the jitter's mean is 1.0).
+#: A kernel that weighs these days with the Opus 5 set, or applies a family
+#: multiplier, lands far outside that tolerance.
+KNOWN_BUDGET = 1_000_000.0
+
+#: Three 5.5-family entry shapes with differently composed class mixes, the
+#: hand-worked entries of the kernel's RED test 2b. Fields: model, fresh,
+#: output, cache_create (total writes), cache_1h, cache_read.
+NEW_ERA_SHAPES = (
+    ("claude-opus-5-5", 1000, 200, 0, 0, 50_000),        # 1868 units
+    ("claude-sonnet-5-5", 4000, 1000, 2000, 500, 0),     # 6640 units
+    ("claude-haiku-5-5", 0, 3000, 0, 0, 100_000),        # 3400 units
+)
+#: How many of each shape a day carries, cycled, so no two consecutive days
+#: share a family or class composition.
+NEW_ERA_MIXES = ((1, 1, 1), (2, 0, 1), (0, 1, 2), (1, 2, 0), (3, 1, 0),
+                 (0, 2, 1), (1, 0, 3))
+
+
+def _shape_units(shape, weights) -> float:
+    _model, fresh, output, cache_create, cache_1h, cache_read = shape
+    # A five-minute write weighs as fresh input; the one-hour write has its
+    # own coefficient. This is the kernel's decomposition, restated.
+    return (weights["fresh"] * (fresh + (cache_create - cache_1h))
+            + weights["output"] * output
+            + weights["cache_1h"] * cache_1h
+            + weights["cache_read"] * cache_read)
+
+
+def _seed_new_era_day(store, date, target, mix, *, hour=12):
+    """Entries whose NEW_ERA_WEIGHTS units total exactly `target`.
+
+    The mix is scaled by a whole multiplier, so every token count stays an
+    integer, and the remainder is topped up as fresh input on the Opus 5.5
+    entry, whose weight is exactly 1.0.
+    """
+    base = sum(count * _shape_units(shape, NEW_ERA_WEIGHTS)
+               for count, shape in zip(mix, NEW_ERA_SHAPES))
+    scale = int(target // base)
+    remainder = round(target - scale * base)
+    for offset, (count, shape) in enumerate(zip(mix, NEW_ERA_SHAPES)):
+        model, fresh, output, cache_create, cache_1h, cache_read = shape
+        n = count * scale
+        top_up = remainder if offset == 0 else 0
+        if n == 0 and top_up == 0:
+            continue
+        store.entry(dt.datetime.combine(date, dt.time(hour, offset * 10),
+                                        tzinfo=UTC),
+                    model=model, fresh=fresh * n + top_up, output=output * n,
+                    cache_create=cache_create * n, cache_1h=cache_1h * n,
+                    cache_read=cache_read * n, path=f"/p/{model}.jsonl")
+
+
+def scenario_opus55_steady_mixed_families(home: Path) -> None:
+    """A steady Opus 5.5 era history over the three 5.5 families.
+
+    Non-zero output, cache reads and both write durations, in a composition
+    that changes every day, so the new coefficients and the new token-class
+    floor are visible in the golden and a wrong weight cannot cancel through
+    the fitted scale. Clock 2026-10-20T06:00Z; 21 complete days from
+    2026-09-29. Expected: `ok`, `no-rate-change`, exit 0.
+    """
+    store = Store(home)
+    first = dt.date(2026, 9, 29)
+    days = 21
+    anchor = _week_anchor(first)
+    running: dict = {}
+    for index in range(days):
+        date = first + dt.timedelta(days=index)
+        week = anchor + dt.timedelta(
+            days=7 * ((date - anchor.date()).days // 7))
+        step = STEPS[index % len(STEPS)]
+        opening = running.get(week, 2)
+        running[week] = opening + step
+        for hour, pct in ((9, opening), (21, opening + step)):
+            store.snapshot(dt.datetime.combine(date, dt.time(hour),
+                                               tzinfo=UTC), week, pct)
+        _seed_new_era_day(
+            store, date,
+            step * KNOWN_BUDGET * RATIO_JITTER[index % len(RATIO_JITTER)],
+            NEW_ERA_MIXES[index % len(NEW_ERA_MIXES)])
+    store.entry(dt.datetime.combine(first + dt.timedelta(days=days),
+                                    dt.time(0, 30), tzinfo=UTC),
+                model="claude-opus-5-5", fresh=1000, path="/p/tail.jsonl")
+    store.close()
+
+
+#: Scenario 12's one unchanged `claude-sonnet-5` mix, with non-fresh classes.
+BOUNDARY_MIX = {"fresh": 1000, "output": 500, "cache_read": 20_000}
+
+
+def scenario_era_boundary_no_change(home: Path) -> None:
+    """A history spanning 2026-09-22 with no metering-rate change.
+
+    Clock 2026-09-28T06:00Z; complete days 2026-08-25..09-27. The token mix
+    never changes, and each day's meter moves by its units under ITS OWN
+    era's weights at one constant budget, so the provider's rate is
+    constant. Measured in Opus-5-weighted units per point, the post-boundary
+    days sit about 2.1x higher: a step a cross-era fit would read as a rate
+    change. The current subscription week is anchored 2026-09-21T12:00Z and
+    so crosses the boundary; six complete post-boundary days (09-22..27)
+    support the in-era fit.
+
+    Expected: `analysisStart` 2026-09-22; a verdict other than
+    `rate-change-detected`; the current week's consumption, headroom and
+    projection withheld as `unvalidated-coefficient-era` while its observed
+    reading is published.
+    """
+    store = Store(home)
+    first = dt.date(2026, 8, 25)
+    last = dt.date(2026, 9, 27)
+    boundary = dt.date(2026, 9, 22)
+    anchor = dt.datetime(2026, 9, 21, 12, tzinfo=UTC)
+    running: dict = {}
+    days = (last - first).days + 1
+    for index in range(days):
+        date = first + dt.timedelta(days=index)
+        week = anchor + dt.timedelta(
+            days=7 * ((date - anchor.date()).days // 7))
+        step = STEPS[index % len(STEPS)]
+        opening = running.get(week, 2)
+        running[week] = opening + step
+        # Readings after the 12:00 anchor, so no day is split across weeks.
+        for hour, pct in ((13, opening), (23, opening + step)):
+            store.snapshot(dt.datetime.combine(date, dt.time(hour),
+                                               tzinfo=UTC), week, pct)
+        weights = NEW_ERA_WEIGHTS if date >= boundary else OPUS5_WEIGHTS
+        per_mix = sum(weights[c] * n for c, n in BOUNDARY_MIX.items())
+        factor = (step * BUDGET * RATIO_JITTER[index % len(RATIO_JITTER)]
+                  / per_mix)
+        store.entry(dt.datetime.combine(date, dt.time(18), tzinfo=UTC),
+                    model="claude-sonnet-5",
+                    fresh=round(BOUNDARY_MIX["fresh"] * factor),
+                    output=round(BOUNDARY_MIX["output"] * factor),
+                    cache_read=round(BOUNDARY_MIX["cache_read"] * factor),
+                    path="/p/boundary.jsonl")
+    store.entry(dt.datetime(2026, 9, 28, 0, 30, tzinfo=UTC),
+                model="claude-sonnet-5", fresh=1000, path="/p/tail.jsonl")
+    store.close()
+
+
 SCENARIOS = {
     "01-steady-no-change": scenario_steady,
     "02-rate-change-confirmed": scenario_rate_change,
@@ -349,6 +511,8 @@ SCENARIOS = {
     "08-two-accounts": scenario_two_accounts,
     "09-offset-credit-and-fast": scenario_offset_credit_and_fast,
     "10-malformed-retained-instant": scenario_malformed_retained_instant,
+    "11-opus55-steady-mixed-families": scenario_opus55_steady_mixed_families,
+    "12-era-boundary-no-change": scenario_era_boundary_no_change,
 }
 
 

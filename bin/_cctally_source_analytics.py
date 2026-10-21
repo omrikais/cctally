@@ -11,7 +11,7 @@ import sqlite3
 import sys
 from copy import copy
 from collections import defaultdict
-from typing import Iterable
+from typing import Callable, Iterable
 
 from _cctally_core import (
     _command_as_of,
@@ -19,7 +19,7 @@ from _cctally_core import (
     get_week_start_name,
     parse_iso_datetime,
 )
-from _cctally_cache import _codex_provider_roots
+from _cctally_cache import CodexHistoryUnavailable, _codex_provider_roots
 import _lib_accounts
 from _lib_codex_metadata import (
     DecodedCodexProjectMetadata,
@@ -1247,6 +1247,7 @@ def load_qualified_codex_entries(
     cache_conn: sqlite3.Connection | None = None,
     source_identities: Iterable[tuple[str, str]] | None = None,
     inventory: "CodexThreadMetadataInventory | None" = None,
+    _on_sync: "Callable[[object], object] | None" = None,
 ) -> tuple[QualifiedCodexEntry, ...]:
     """Load exactly one bounded, root-qualified Codex accounting read.
 
@@ -1293,6 +1294,8 @@ def load_qualified_codex_entries(
             )
             if stats.lock_contended:
                 raise QualifiedMetadataUnavailable("Codex qualified project metadata is unavailable")
+            if _on_sync is not None:
+                _on_sync(stats)
         conn.row_factory = sqlite3.Row
         rows = _load_qualified_codex_rows(conn, start, end, identities)
         # §4.3: one inventory read per build. The caller supplies the build's
@@ -1948,6 +1951,8 @@ def _source_entries(
     if qualified:
         values = load_qualified_codex_entries(
             start, query_end, speed=speed, sync=sync, group=group,
+            _on_sync=_cctally()._load_sibling(
+                "_cctally_cache")._warn_compressed_unreadable_once,
         )
         return assign_collision_safe_project_labels(values)
     return load_codex_accounting_entries(
@@ -3273,6 +3278,8 @@ def cmd_source_diff(args: object) -> int:
         except ValueError as exc:
             print(f"diff: {exc}", file=sys.stderr)
             return 2
+        except CodexHistoryUnavailable:
+            raise
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -3306,12 +3313,16 @@ def cmd_source_diff(args: object) -> int:
     except QualifiedMetadataUnavailable:
         try:
             entries = _source_entries(entry_args, start, end, qualified=False)
+        except CodexHistoryUnavailable:
+            raise
         except RuntimeError:
             return _emit_source_result(
                 args, SourceResult("codex", "unavailable", None, (QUALIFIED_METADATA_WARNING,)),
                 diff=True, claude=claude,
             )
         metadata_available = False
+    except CodexHistoryUnavailable:
+        raise
     except RuntimeError:
         return _emit_source_result(
             args, SourceResult("codex", "unavailable", None, (QUALIFIED_METADATA_WARNING,)),
@@ -3361,6 +3372,8 @@ def cmd_source_range_cost(args: object) -> int:
             args, start, end, qualified=bool(getattr(args, "project", None)),
             inclusive_end=True,
         )
+    except CodexHistoryUnavailable:
+        raise
     except (QualifiedMetadataUnavailable, RuntimeError):
         return _emit_source_result(
             args, SourceResult("codex", "unavailable", None, (QUALIFIED_METADATA_WARNING,)),
@@ -3417,6 +3430,8 @@ def cmd_source_cache_report(args: object) -> int:
             )
         try:
             entries = _source_entries(entry_args, start, end, qualified=False)
+        except CodexHistoryUnavailable:
+            raise
         except RuntimeError:
             return _emit_source_result(
                 args, SourceResult("codex", "unavailable", None, (QUALIFIED_METADATA_WARNING,)),
@@ -3477,6 +3492,10 @@ def cmd_source_report(args: object) -> int:
             c.reconcile_codex_quota_projection(now=as_of)
             force_direct_accounting = bool(getattr(sync_stats, "lock_contended", False))
             already_synced = not force_direct_accounting
+            if already_synced:
+                cache_mod._warn_compressed_unreadable_once(sync_stats)
+        except CodexHistoryUnavailable:
+            raise
         except (OSError, sqlite3.Error, RuntimeError):
             return _emit_source_result(
                 args, build_codex_report_result((), (), as_of=as_of, quota_available=False),
@@ -3503,6 +3522,8 @@ def cmd_source_report(args: object) -> int:
                 args, start, end, qualified=False, sync=not already_synced,
                 force_direct=force_direct_accounting,
             )
+        except CodexHistoryUnavailable:
+            raise
         except RuntimeError:
             return _emit_source_result(
                 args, build_codex_report_result((), (), as_of=as_of, quota_available=False),

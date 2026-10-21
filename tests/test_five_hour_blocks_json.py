@@ -56,7 +56,8 @@ def _run(home, *args):
     # the subprocess resolves the PROD data-dir layout (…/cctally) and reads
     # the stats.db this fixture seeded, not an empty …/cctally-dev DB.
     env = {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     out = subprocess.run(
         [sys.executable, str(BIN), "five-hour-blocks", *args, "--json"],
         check=True, capture_output=True, env=env, text=True,

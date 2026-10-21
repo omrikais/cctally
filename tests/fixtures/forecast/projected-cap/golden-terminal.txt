@@ -1,6 +1,6 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
 │ Subscription Forecast                                                        │
-│ Week Apr 13 UTC → Apr 20 UTC  (resets Mon 2PM UTC, 3.0d remaining)           │
+│ Week Oct 12 UTC → Oct 19 UTC  (resets Mon 2PM UTC, 3.0d remaining)           │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Used     70.0%   $28.50                                                      │
 │ Forecast 122%–180% ⚠ may cap                                                 │

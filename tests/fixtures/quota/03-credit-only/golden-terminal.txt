@@ -2,7 +2,7 @@ cctally quota — weekly quota consumption and metering rate
 
 DATA
   entries through            2026-08-28T00:30:00Z
-  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 onward)
+  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 to 2026-09-22)
   eligible days              29   (1 withheld)
 
 CALIBRATION   effective blended weighted units per weekly point

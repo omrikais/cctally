@@ -132,3 +132,15 @@ def test_d1_the_sentence_never_states_a_number_or_a_command(code):
     text = _copy(ns).long_form(code)
     assert "cctally " not in text, text
     assert "%" not in text, text
+
+
+def test_the_era_sentence_does_not_claim_the_window_predates_the_weights():
+    """#978. `unvalidated-coefficient-era` withholds a week that straddles an
+    era boundary, and a stored `opus-5` regime applied to a later week, as
+    well as history before every validated era. "Predates" is false for the
+    first two, so the sentence states only what all three share."""
+    ns = load_script()
+    text = _copy(ns).long_form("unvalidated-coefficient-era")
+    assert text == ("this window is not inside a single coefficient era the "
+                    "token weights are validated for")
+    assert "predate" not in text

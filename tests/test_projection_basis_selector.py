@@ -19,7 +19,9 @@ import _lib_quota_model as qm
 from conftest import load_isolated_cctally_module
 
 UTC = dt.timezone.utc
-WEEK_START = dt.datetime(2026, 5, 18, tzinfo=UTC)
+#: A Monday inside the `opus-5` coefficient era (#978): a stored regime now
+#: applies only to a week wholly inside its own era.
+WEEK_START = dt.datetime(2026, 8, 3, tzinfo=UTC)
 WEEK_HOURS = 168
 
 
@@ -163,6 +165,7 @@ def _write_calibration(mod, *, units_per_point=2_000_000.0):
             "effectiveUntil": None,
             "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": "opus-5",
             "unitsPerPoint": units_per_point,
             "interval": {"lo": units_per_point * 0.9,
                          "hi": units_per_point * 1.1},

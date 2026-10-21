@@ -37,6 +37,10 @@
 # output stays coherent under parallelism.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -60,15 +64,24 @@ default_jobs() {
 }
 JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
 
-SCRATCH_ROOT=$(mktemp -d -t cctally-update-test.XXXXXX)
-# rm -rf can't traverse 0555 dirs (NPM_BIN_CHMOD scenario). chmod the
-# tree writable first; ignore failures (some symlink targets may resist).
-cleanup_scratch () {
-    [ -d "$SCRATCH_ROOT" ] || return 0
-    chmod -R u+w "$SCRATCH_ROOT" 2>/dev/null || true
-    rm -rf "$SCRATCH_ROOT" 2>/dev/null || true
+SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-update-test.XXXXXX") || exit 1
+# Removed through the shared release kernel (#963): it makes directories such
+# as the NPM_BIN_CHMOD scenario's 0555 bin writable without following a link
+# or changing a file's mode (scenarios hard-link the real bin/cctally into the
+# scratch), and refuses what it cannot remove safely. A cleanup failure fails
+# an otherwise passing run; a signal keeps its own status.
+_finish_scratch () {
+    local status=$1
+    if [ -e "$SCRATCH_ROOT" ] \
+       && ! python3 -B "$REPO_ROOT/bin/_lib_test_temp.py" remove "$SCRATCH_ROOT"; then
+        echo "cctally-update-test: could not remove scratch $SCRATCH_ROOT" >&2
+        [ "$status" -eq 0 ] && status=1
+    fi
+    exit "$status"
 }
-trap cleanup_scratch EXIT INT TERM
+trap '_finish_scratch $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Discover every scenario directory under FIX_DIR (any subdir with an
 # args.txt). Sorted lexicographically for deterministic output ordering.

@@ -1,0 +1,13 @@
+diff --git a/tests/_sqlite_write_accounting.py b/tests/_sqlite_write_accounting.py
+index cfa8eba..97f69c0 100644
+--- a/tests/_sqlite_write_accounting.py
++++ b/tests/_sqlite_write_accounting.py
+@@ -377,6 +377,8 @@ def _validate_layout(lib, inner_addr):
+ 
+ def _register():
+     global _STATE
++    raise AccountingUnavailable("A5s non-vacuity: the runtime cannot be "
++                                "wrapped")
+     lib = _library()
+     inner = lib.sqlite3_vfs_find(None)
+     if not inner:

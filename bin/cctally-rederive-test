@@ -2,11 +2,15 @@
 # Production-shaped CLI acceptance harness for #372 Task C.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SCRATCH="$(mktemp -d -t cctally-rederive-XXXXXX)"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rederive-XXXXXX")" || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 export REPO_ROOT
 
@@ -400,6 +404,36 @@ done
 ) &
 apply_pid_2=$!
 
+# The pause hook writes the marker and only THEN stops itself, so a continue
+# sent between the two is lost and the job would stay stopped forever (a full
+# run once waited 3 h 14 min on it). Until the paused job exits, continue the
+# recorded process whenever it shows stopped; give up after a bound, record
+# it, and kill the job so the harness always terminates.
+release_paused_until_exit() {
+    local job="$1" n=0 pid
+    while kill -0 "$job" 2>/dev/null && [ "$n" -lt 2400 ]; do
+        pid="$(sed -n '1p' "$rebuild_pause_marker" 2>/dev/null)"
+        case "$pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                case "$(ps -o stat= -p "$pid" 2>/dev/null)" in
+                    *T*) kill -CONT "$pid" 2>/dev/null ;;
+                esac
+                ;;
+        esac
+        n=$((n + 1))
+        sleep 0.05
+    done
+    if kill -0 "$job" 2>/dev/null; then
+        fail 4 job-vanished
+        pid="$(sed -n '1p' "$rebuild_pause_marker" 2>/dev/null)"
+        case "$pid" in
+            ''|*[!0-9]*) ;;
+            *) kill -KILL "$pid" 2>/dev/null ;;
+        esac
+    fi
+}
+
 if [ "$rebuild_paused" -eq 1 ]; then
     wait "$apply_pid_2"
     paused_pid="$(sed -n '1p' "$rebuild_pause_marker")"
@@ -412,11 +446,13 @@ if [ "$rebuild_paused" -eq 1 ]; then
                 fail 4 job-vanished
             ;;
     esac
+    release_paused_until_exit "$apply_pid_1"
     wait "$apply_pid_1"
 else
     fail 4 outcome-record-missing
-    wait "$apply_pid_1"
     wait "$apply_pid_2"
+    release_paused_until_exit "$apply_pid_1"
+    wait "$apply_pid_1"
 fi
 apply_json_1="$(cat "$SCRATCH/apply-1.json")"
 apply_json_2="$(cat "$SCRATCH/apply-2.json")"

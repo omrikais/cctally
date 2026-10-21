@@ -38,6 +38,8 @@ from pathlib import Path
 
 import pytest
 
+import _temp_hygiene as _hyg
+
 REPO = Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
 RUNNER = BIN / "cctally-test-all"
@@ -182,12 +184,16 @@ def _artifact(repo):
 
 def _drive(repo, args=(), env=None):
     outcome = repo / "outcome.json"
-    environment = {
+    # #963 J4: the child's suite generation lies inside this test's allocation
+    # and is removed below once the results are read.
+    # The child-local outcome destination is an explicit override, applied
+    # after the builder's owner-only scrub (spec 4.3).
+    environment = _hyg.child_aggregator_env({
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", str(repo)),
-        "CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome),
         "CCTALLY_TEST_JOBS": "1",
-    }
+    }, repo.parent)
+    environment["CCTALLY_TEST_ALL_OUTCOME_FILE"] = str(outcome)
     environment.update(env or {})
     proc = subprocess.run(
         [str(repo / "bin" / "cctally-test-all"), *args],
@@ -203,6 +209,7 @@ def _drive(repo, args=(), env=None):
         timeout=90,
     )
     proc.outcome_path = outcome  # type: ignore[attr-defined]
+    _hyg.reclaim_child_generations(repo.parent)
     return proc
 
 

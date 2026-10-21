@@ -2,7 +2,7 @@ cctally quota — weekly quota consumption and metering rate
 
 DATA
   entries through            -
-  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 onward)
+  analysis start             2026-07-25T00:00:00Z   (supported composition: 2026-07-25 to 2026-09-22)
   eligible days              0   (0 withheld)
   ! store                    malformed-retained-instant
 

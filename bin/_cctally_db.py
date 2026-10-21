@@ -801,7 +801,7 @@ def _would_block_prod_migration(conn: sqlite3.Connection) -> bool:
     test-suite's CCTALLY_DISABLE_DEV_AUTODETECT. Escape: CCTALLY_ALLOW_PROD_MIGRATION."""
     if _cctally_core._truthy_env("CCTALLY_ALLOW_PROD_MIGRATION"):
         return False
-    if not (_cctally_core._repo_root() / ".git").exists():
+    if not _cctally_core._has_git_checkout_marker():
         return False
     db_dir = _conn_db_dir(conn)
     if db_dir is None:
@@ -857,7 +857,7 @@ def _would_block_prod_stats(path: pathlib.Path) -> bool:
     ``CCTALLY_ALLOW_PROD_MIGRATION``."""
     if _cctally_core._truthy_env("CCTALLY_ALLOW_PROD_MIGRATION"):
         return False
-    if not (_cctally_core._repo_root() / ".git").exists():
+    if not _cctally_core._has_git_checkout_marker():
         return False
     try:
         return (
@@ -1700,6 +1700,10 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
     )
     forensics = None
     incident = None
+    import _cctally_completion
+    # Fix round K11 (K9K10-R7): a rebuild that published but could not record
+    # its residual obligation; reported once every lock is released.
+    obligation_failure = None
     try:
         fcntl.flock(maint_fd, fcntl.LOCK_EX)
         # #386: record the hold so a nested live `open_db()` does not request
@@ -1751,9 +1755,12 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
                             forensics_path=(
                                 str(forensics) if forensics is not None else None
                             ),
-                        )
+                        ),
+                        complete_derivation=True,
                     )
                     incident = result.quarantine_dir
+        except _cctally_completion.ResidualObligationNotDurable as exc:
+            obligation_failure = exc
         except Exception as exc:
             eprint(f"cctally: stats.db rebuild failed: {exc}")
             return 3
@@ -1766,6 +1773,20 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
             fcntl.flock(maint_fd, fcntl.LOCK_UN)
         finally:
             os.close(maint_fd)
+
+    if obligation_failure is not None:
+        # The rebuilt index IS published (spec 4.7), so its completion wake
+        # is posted as for any publication; only then is the obligation
+        # failure reported. The inputs past the rebuilt prefix stay in the
+        # journal for the next ingest.
+        _cctally_completion.post_publication_wake()
+        eprint(
+            "cctally: stats.db was rebuilt, but the record that the inputs "
+            "written during the rebuild still need deriving could not be "
+            f"saved ({obligation_failure}). Those inputs stay in the journal "
+            "and the next ingest derives them; check that the data directory "
+            "is writable.")
+        return 3
 
     total_rows = sum(result.rows_by_table.values())
     if as_json:
@@ -1870,6 +1891,11 @@ def cmd_db_rebuild(args: argparse.Namespace) -> int:
             print(f"  previous stats.db quarantined -> {incident}")
         if forensics is not None:
             print(f"  forensics -> {forensics}")
+    # #825/#832 spec 4.3 revision 2: a completed rebuild is a live index
+    # publication; its completion wake (posted with every lock released)
+    # dispatches the detached continuation, so this command never waits on
+    # it. A file-only no-op when nothing is pending.
+    _cctally_completion.post_publication_wake()
     return 0
 
 
@@ -2354,6 +2380,24 @@ def _run_pending_migrations(
     if all((m.name in applied or m.name in skipped) for m in registry):
         conn.execute(f"PRAGMA user_version = {len(registry)}")
         conn.commit()
+
+
+def _accounts_cutover_value_or_defer(what: str):
+    """`find_accounts_cutover_op` for an account backfill migration.
+
+    #825/#832 fix round K11 (K9K10-R9): a journal the lookup cannot list,
+    size or read — including the account-bound boundary lookup it applies,
+    `AccountBoundCutoverUnavailable` — proves neither the op nor its
+    absence. That is transient, so the migration defers
+    (`MigrationGateNotMet`: no error log, no banner, retried on the next
+    open) instead of failing hard and stopping the registry."""
+    import _cctally_journal
+    try:
+        return _cctally_journal.find_accounts_cutover_op()
+    except OSError as exc:
+        raise MigrationGateNotMet(
+            f"the journal could not be read to find the accounts cutover op "
+            f"({exc}); deferring the {what}") from exc
 
 
 # === Region 3: 001 handler (was bin/cctally:11232-11344) ===
@@ -4743,6 +4787,125 @@ def _apply_codex_window_attribution_read_index(conn: sqlite3.Connection) -> None
 # === Region 7b2: Eager cache-migration trigger (V4 — same-invocation 008 apply) ===
 
 
+# #968 spec 5.3: container evidence beside each Codex cursor row. Every
+# persisted key stays the LOGICAL ``.jsonl`` path; these columns record which
+# physical container's content the cursor accepted. Defaults describe what an
+# existing row already is: a plain file whose content was accepted. No evidence
+# column is backfilled by statting a file now, for the reason migration 046
+# gives for device_id/inode.
+_CODEX_CONTAINER_CURSOR_COLUMNS: "tuple[tuple[str, str], ...]" = (
+    ("container_kind", "TEXT NOT NULL DEFAULT 'plain'"),
+    ("container_path", "TEXT"),
+    ("container_size_bytes", "INTEGER"),
+    ("decoded_size_bytes", "INTEGER"),
+    ("content_anchor_version", "INTEGER"),
+    ("content_anchor", "BLOB"),
+    ("content_anchor_offset", "INTEGER"),
+    ("container_state", "TEXT NOT NULL DEFAULT 'accepted'"),
+    ("container_state_reason", "TEXT"),
+    ("pending_container_fingerprint", "TEXT"),
+)
+_CODEX_CONTAINER_CACHE_ONLY_COLUMNS: "tuple[tuple[str, str], ...]" = (
+    ("container_resume_strikes", "INTEGER NOT NULL DEFAULT 0"),
+)
+_CODEX_968_CACHE_TABLES = (
+    "codex_prune_debt", "codex_barrier_membership", "codex_barrier_targets",
+    "codex_barrier_population", "codex_barrier_certificates",
+    "codex_barrier_repairs", "codex_barrier_entry_threads",
+)
+_CODEX_968_CONVERSATIONS_TABLES = (
+    "codex_conversation_prune_debt", "codex_conversation_publications",
+    "codex_conversation_published_threads",
+)
+#: The column list of `codex_conversation_threads`, shared by the two
+#: byte-preserving thread snapshots the publication barrier keeps: a thread
+#: row is copied with INSERT ... SELECT, never through JSON, so an undecodable
+#: cwd/git_json (#845) survives exactly as stored.
+_CODEX_THREAD_SNAPSHOT_COLUMNS_DDL = (
+    " conversation_key TEXT NOT NULL PRIMARY KEY,"
+    " source_root_key TEXT NOT NULL,"
+    " native_thread_id TEXT NOT NULL,"
+    " root_thread_id TEXT NOT NULL,"
+    " parent_thread_id TEXT,"
+    " source_path TEXT NOT NULL,"
+    " cwd TEXT,"
+    " git_json TEXT,"
+    " source_kind TEXT,"
+    " thread_source_json TEXT,"
+    " model_provider TEXT,"
+    " context_window INTEGER,"
+    " first_seen_utc TEXT,"
+    " last_seen_utc TEXT)"
+)
+_CODEX_968_CACHE_DDL = (
+    "CREATE TABLE IF NOT EXISTS codex_prune_debt ("
+    " source_path TEXT NOT NULL,"
+    " source_root_key TEXT NOT NULL DEFAULT '',"
+    " recorded_at_utc TEXT NOT NULL,"
+    " PRIMARY KEY (source_path, source_root_key)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_membership ("
+    " file_identity TEXT NOT NULL,"
+    " generation_token TEXT NOT NULL,"
+    " conversation_key TEXT NOT NULL,"
+    " source_path TEXT NOT NULL,"
+    " metadata_json TEXT,"
+    " metadata_offset INTEGER,"
+    " PRIMARY KEY (file_identity, generation_token, conversation_key))"
+    " WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS idx_codex_barrier_membership_conversation"
+    " ON codex_barrier_membership(conversation_key)",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_targets ("
+    " file_identity TEXT PRIMARY KEY,"
+    " source_path TEXT NOT NULL,"
+    " source_root_key TEXT,"
+    " generation_token TEXT NOT NULL,"
+    " scan_target INTEGER NOT NULL,"
+    " complete_line_end INTEGER,"
+    " state TEXT NOT NULL CHECK (state IN ('required','ready','suspended')),"
+    " reason TEXT,"
+    " accepted_generation_token TEXT,"
+    " accepted_complete_line_end INTEGER)",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_population ("
+    " conversation_key TEXT PRIMARY KEY,"
+    " required_revision INTEGER NOT NULL DEFAULT 1,"
+    " entered_at_utc TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_entry_threads ("
+    + _CODEX_THREAD_SNAPSHOT_COLUMNS_DDL,
+    "CREATE INDEX IF NOT EXISTS idx_codex_barrier_entry_threads_parent"
+    " ON codex_barrier_entry_threads"
+    "(source_root_key, native_thread_id, conversation_key)",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_certificates ("
+    " conversation_key TEXT NOT NULL,"
+    " revision INTEGER NOT NULL,"
+    " certificate_json TEXT NOT NULL,"
+    " sealed_at_utc TEXT NOT NULL,"
+    " PRIMARY KEY (conversation_key, revision)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS codex_barrier_repairs ("
+    " conversation_key TEXT PRIMARY KEY,"
+    " revision INTEGER NOT NULL,"
+    " reason TEXT NOT NULL)",
+)
+_CODEX_968_CONVERSATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS codex_conversation_prune_debt ("
+    " source_path TEXT NOT NULL,"
+    " source_root_key TEXT NOT NULL DEFAULT '',"
+    " recorded_at_utc TEXT NOT NULL,"
+    " PRIMARY KEY (source_path, source_root_key)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS codex_conversation_publications ("
+    " conversation_key TEXT PRIMARY KEY,"
+    " required_revision INTEGER NOT NULL DEFAULT 0,"
+    " ready_certificate_revision INTEGER,"
+    " published_revision INTEGER NOT NULL DEFAULT 0,"
+    " legacy_uncertified INTEGER NOT NULL DEFAULT 0,"
+    " updated_at_utc TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS codex_conversation_published_threads ("
+    + _CODEX_THREAD_SNAPSHOT_COLUMNS_DDL,
+    "CREATE INDEX IF NOT EXISTS idx_codex_published_threads_parent"
+    " ON codex_conversation_published_threads"
+    "(source_root_key, native_thread_id, conversation_key)",
+)
+
+
 class SchemaDeliveryObject(NamedTuple):
     """One re-derivable schema object declared by a version-gated apply.
 
@@ -4928,6 +5091,21 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "column", "codex_session_files.inode",
         "_apply_codex_session_file_identity",
         "046_codex_source_file_identity"),
+    *(SchemaDeliveryObject(
+        "column", f"codex_session_files.{column}",
+        "_apply_codex_container_cache_schema", "049_codex_rollout_containers")
+      for column, _decl in (_CODEX_CONTAINER_CURSOR_COLUMNS
+                            + _CODEX_CONTAINER_CACHE_ONLY_COLUMNS)),
+    *(SchemaDeliveryObject(
+        "table", table, "_apply_codex_container_cache_schema",
+        "049_codex_rollout_containers")
+      for table in _CODEX_968_CACHE_TABLES),
+    SchemaDeliveryObject(
+        "index", "idx_codex_barrier_membership_conversation",
+        "_apply_codex_container_cache_schema", "049_codex_rollout_containers"),
+    SchemaDeliveryObject(
+        "index", "idx_codex_barrier_entry_threads_parent",
+        "_apply_codex_container_cache_schema", "049_codex_rollout_containers"),
     SchemaDeliveryObject(
         "index", "idx_codex_accounting_change_mutation",
         "_apply_codex_accounting_change_ledger",
@@ -5032,6 +5210,79 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "_apply_codex_window_attribution_read_index",
         "047_spill_free_read_paths"),
 )
+
+
+def _apply_codex_container_cache_schema(conn: sqlite3.Connection) -> None:
+    """#968 spec 5.3: container columns and the cache-side maintenance state.
+
+    Shared by ``_apply_cache_schema`` and migration 049 so both shapes
+    converge. Columns go through ``add_column_if_missing``; the cursor table is
+    checked first because that helper raises on a missing table, and a table
+    created later is created by the schema apply that calls this helper anyway.
+    """
+    # Literal column names keep the schema-delivery AST guard complete.
+    if _table_exists(conn, "codex_session_files"):
+        add_column_if_missing(
+            conn, "codex_session_files", "container_kind",
+            "TEXT NOT NULL DEFAULT 'plain'")
+        add_column_if_missing(
+            conn, "codex_session_files", "container_path", "TEXT")
+        add_column_if_missing(
+            conn, "codex_session_files", "container_size_bytes", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_session_files", "decoded_size_bytes", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_session_files", "content_anchor_version", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_session_files", "content_anchor", "BLOB")
+        add_column_if_missing(
+            conn, "codex_session_files", "content_anchor_offset", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_session_files", "container_state",
+            "TEXT NOT NULL DEFAULT 'accepted'")
+        add_column_if_missing(
+            conn, "codex_session_files", "container_state_reason", "TEXT")
+        add_column_if_missing(
+            conn, "codex_session_files", "pending_container_fingerprint", "TEXT")
+        add_column_if_missing(
+            conn, "codex_session_files", "container_resume_strikes",
+            "INTEGER NOT NULL DEFAULT 0")
+    for statement in _CODEX_968_CACHE_DDL:
+        conn.execute(statement)
+
+
+def _apply_codex_conversation_container_schema(conn: sqlite3.Connection) -> None:
+    """#968 spec 5.3: the conversations twin of the container evidence.
+
+    Shared by ``_apply_conversations_schema`` (fast path and full path) and
+    conversations migration 012.
+    """
+    # Keep these in the same order as _CODEX_CONTAINER_CURSOR_COLUMNS.
+    if _table_exists(conn, "codex_conversation_source_files"):
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "container_kind",
+            "TEXT NOT NULL DEFAULT 'plain'")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "container_path", "TEXT")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "container_size_bytes", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "decoded_size_bytes", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "content_anchor_version", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "content_anchor", "BLOB")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "content_anchor_offset", "INTEGER")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "container_state",
+            "TEXT NOT NULL DEFAULT 'accepted'")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "container_state_reason", "TEXT")
+        add_column_if_missing(
+            conn, "codex_conversation_source_files", "pending_container_fingerprint", "TEXT")
+    for statement in _CODEX_968_CONVERSATIONS_DDL:
+        conn.execute(statement)
 
 
 def _apply_codex_session_file_identity(conn: sqlite3.Connection) -> None:
@@ -5605,6 +5856,7 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
         conn, "codex_session_files", "ingest_complete",
         "INTEGER NOT NULL DEFAULT 1")
     _apply_codex_session_file_identity(conn)
+    _apply_codex_container_cache_schema(conn)
     add_column_if_missing(conn, "quota_window_snapshots", "account_key", "TEXT")
     # #195: the cache-write TTL split. NULLable with NO DEFAULT — NULL is the
     # "split unknown" sentinel a pre-#195 row produces for free, and a real
@@ -5898,6 +6150,7 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         _apply_conversation_generation_schema(conn)
         _apply_codex_conversation_source_identity(conn)
         _apply_conversation_latest_meta_indexes(conn)
+        _apply_codex_conversation_container_schema(conn)
         return
 
     _apply_cache_schema(conn)
@@ -5914,6 +6167,14 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- it), so this only clears the now-orphan ledger and keeps
         -- conversations.db transcripts-only.
         DROP TABLE IF EXISTS quota_window_change_log;
+        -- #968: only the conversation twins belong in this store.
+        DROP TABLE IF EXISTS codex_prune_debt;
+        DROP TABLE IF EXISTS codex_barrier_membership;
+        DROP TABLE IF EXISTS codex_barrier_targets;
+        DROP TABLE IF EXISTS codex_barrier_population;
+        DROP TABLE IF EXISTS codex_barrier_certificates;
+        DROP TABLE IF EXISTS codex_barrier_repairs;
+        DROP TABLE IF EXISTS codex_barrier_entry_threads;
         DROP TABLE IF EXISTS codex_accounting_change_log;
         DROP TABLE IF EXISTS codex_conversation_threads;
         DROP TABLE IF EXISTS codex_source_roots;
@@ -5987,6 +6248,7 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
     _apply_conversation_generation_schema(conn)
     _apply_codex_conversation_source_identity(conn)
     _apply_conversation_latest_meta_indexes(conn)
+    _apply_codex_conversation_container_schema(conn)
 
 
 def _ensure_codex_session_meta_provenance_index(
@@ -6364,6 +6626,19 @@ CONVERSATIONS_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "index", "idx_conv_session_latest_git_branch",
         "_apply_conversation_latest_meta_indexes",
         "011_conversation_latest_meta_indexes"),
+    *(SchemaDeliveryObject(
+        "column", f"codex_conversation_source_files.{column}",
+        "_apply_codex_conversation_container_schema",
+        "012_codex_conversation_containers")
+      for column, _decl in _CODEX_CONTAINER_CURSOR_COLUMNS),
+    *(SchemaDeliveryObject(
+        "table", table, "_apply_codex_conversation_container_schema",
+        "012_codex_conversation_containers")
+      for table in _CODEX_968_CONVERSATIONS_TABLES),
+    SchemaDeliveryObject(
+        "index", "idx_codex_published_threads_parent",
+        "_apply_codex_conversation_container_schema",
+        "012_codex_conversation_containers"),
     SchemaDeliveryObject(
         "table", "claude_conversation_account_stamp_gaps",
         "_apply_conversation_generation_schema",
@@ -6573,7 +6848,8 @@ def _conv_005_conversation_account_dimension(conn: sqlite3.Connection) -> None:
         held += _acquire_conversations_db_codex_provider_flock(
             conn, migration="conversations 005 account dimension"
         )
-        claude_key = _cctally_journal.find_accounts_cutover_op()
+        claude_key = _accounts_cutover_value_or_defer(
+            "Claude conversation backfill")
         if claude_key is None:
             pending = conn.execute(
                 "SELECT 1 FROM conversation_messages "
@@ -7028,6 +7304,20 @@ def _conv_011_conversation_latest_meta_indexes(
         conn.commit()
     finally:
         _release_cache_db_writer_flocks(held)
+
+
+@conversations_migration("012_codex_conversation_containers")
+def _conv_012_codex_conversation_containers(conn: sqlite3.Connection) -> None:
+    """#968 spec 5.3: the conversations twin of cache migration 049.
+
+    Delivers the transcript cursor's container columns, the conversation-side
+    prune debt and the last-good publication records to an already-current
+    store. Same version-gate reason and the same no-backfill rule as 049; no
+    provider flock for the same reason as 010. Re-running is a no-op. NO
+    self-stamp — the dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_codex_conversation_container_schema(conn)
+    conn.commit()
 
 
 # #177 S6: the consolidated multi-column external-content FTS5 table that
@@ -9012,7 +9302,7 @@ def _029_backfill_claude_account(conn: sqlite3.Connection) -> None:
     import _cctally_journal as _jr
     import _lib_accounts as _acc
 
-    op_value = _jr.find_accounts_cutover_op()
+    op_value = _accounts_cutover_value_or_defer("Claude account backfill")
     if op_value is None:
         # Cutover hasn't appended its op yet. Defer only if there is legacy Claude
         # history to attribute; a fresh install (no such rows) proceeds as a no-op.
@@ -9915,6 +10205,25 @@ def _048_codex_quota_physical_group_order(conn: sqlite3.Connection) -> None:
     dispatcher central-stamps on a clean return (#140).
     """
     _apply_codex_quota_group_index(conn)
+    conn.commit()
+
+
+@cache_migration("049_codex_rollout_containers")
+def _049_codex_rollout_containers(conn: sqlite3.Connection) -> None:
+    """#968 spec 5.3: deliver container evidence and maintenance state.
+
+    The schema apply that declares these objects is version-gated, so only a
+    registered migration reaches an already-current store (the reason 046
+    gives). Existing cursor rows read as plain and accepted, which is exactly
+    what they are; no container evidence is backfilled from a stat taken now.
+    The seven tables start empty: prune debt, verification state and the
+    publication barrier are written only by the runtime paths that own them.
+
+    Takes no provider flock: ADD COLUMN with a constant default and CREATE of
+    an empty table rewrite no rows. Re-running is a no-op. NO self-stamp — the
+    dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_codex_container_cache_schema(conn)
     conn.commit()
 
 
@@ -11888,6 +12197,8 @@ def _db_family_open_pids(path: pathlib.Path) -> "set[int] | None":
                 check=False,
             )
         except OSError:
+            return None
+        if result.returncode not in (0, 1):
             return None
         return {
             int(line[1:])

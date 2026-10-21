@@ -18,6 +18,10 @@
 # and `bin/cctally-alerts-dispatch-test` (Task 3 unit harness).
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -30,7 +34,8 @@ FIXTURES_DIR="$REPO_ROOT/tests/fixtures/alerts"
 # inspect post-run state (parallel to the sibling harness convention
 # documented in CLAUDE.md "Harness scratch-dir pattern"). When the
 # override is supplied, the scratch dir is NOT cleaned up on exit.
-SCRATCH_BASE="${HARNESS_FAKE_HOME_BASE:-$(mktemp -d -t cctally-alerts-fixtures.XXXXXX)}"
+SCRATCH_BASE="${HARNESS_FAKE_HOME_BASE:-$(mktemp -d "${TMPDIR:-/tmp}/cctally-alerts-fixtures.XXXXXX")}"
+[ -n "$SCRATCH_BASE" ] || exit 1
 if [ -z "${HARNESS_FAKE_HOME_BASE:-}" ]; then
     trap 'rm -rf "$SCRATCH_BASE"' EXIT
 fi

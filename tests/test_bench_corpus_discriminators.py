@@ -968,10 +968,16 @@ def test_the_session_fingerprint_backstop_fails_a_run_it_should_fail(tmp_path):
     (tmp_path / "test_backstop_child.py").write_text(
         textwrap.dedent(_BACKSTOP_CHILD_TEST), encoding="utf-8")
 
+    # Its own `--basetemp`. Without one the child takes the next numbered
+    # directory under the run's shared `pytest-of-<user>` and, at exit, deletes
+    # every unlocked older one: in the benchmark leg that is the whole main
+    # phase's basetemp, which on the runner's external drive took longer than
+    # this timeout to remove (#940 fix round).
     result = subprocess.run(
         [sys.executable, "-m", "pytest",
          str(tmp_path / "test_backstop_child.py"),
-         "-q", "-p", "no:randomly", "-p", "no:cacheprovider"],
+         "-q", "-p", "no:randomly", "-p", "no:cacheprovider",
+         "--basetemp", str(tmp_path / "child-basetemp")],
         cwd=str(tmp_path), capture_output=True, text=True, timeout=90,
     )
     combined = result.stdout + result.stderr

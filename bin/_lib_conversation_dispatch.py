@@ -779,6 +779,9 @@ def neutral_events_preflight(conn: sqlite3.Connection, ref: str) -> dict:
             return {"status": "normalization_pending",
                     "conversation_key": cref.conversation_key}
         if not q.codex_conversation_exists(conn, cref.conversation_key):
+            if q.codex_publication_pending(conn, cref.conversation_key):
+                return {"status": "normalization_pending",
+                        "conversation_key": cref.conversation_key}
             return {"status": "not_found",
                     "conversation_key": cref.conversation_key}
         return {"status": "ok", "conversation_key": cref.conversation_key,

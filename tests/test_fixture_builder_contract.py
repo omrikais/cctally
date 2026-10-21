@@ -1747,7 +1747,8 @@ def test_the_fixture_ddl_declares_exactly_the_stamped_tables(tmp_path):
         sys.path.pop(0)
     db = tmp_path / "stats.db"
     create_stats_db(db)
-    with sqlite3.connect(db) as conn:
+    # A `with sqlite3.connect(...)` block commits but never closes (#940 D0c).
+    with contextlib.closing(sqlite3.connect(db)) as conn:
         tables = [
             row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -1795,7 +1796,8 @@ def test_the_retained_block_read_path_finds_its_column_and_indexes(tmp_path):
         sys.path.pop(0)
     db = tmp_path / "stats.db"
     create_stats_db(db)
-    with sqlite3.connect(db) as conn:
+    # A `with sqlite3.connect(...)` block commits but never closes (#940 D0c).
+    with contextlib.closing(sqlite3.connect(db)) as conn:
         conn.row_factory = sqlite3.Row
         # Every expression `_retained_block_facts_many`'s parent query selects,
         # and its whole predicate. An earlier form selected two of the eight
@@ -1825,3 +1827,40 @@ def test_the_retained_block_read_path_finds_its_column_and_indexes(tmp_path):
         "five_hour_blocks is missing the journal-identity indexes production "
         f"creates at open; present: {sorted(indexes)}"
     )
+
+
+# A fixed `/tmp/...` path in a fixture script is a writer the confined runner
+# kills (#940 D4, spec 6.5), and a fixed name is shared by every run on the
+# host, so a case can read a stale copy another run left behind. A case's
+# scratch belongs in its own work directory. macOS reaches the same system
+# directories as /private/tmp, /var/tmp and /private/var/tmp (#940 D-2 F15).
+_FIXED_TMP_PATH = re.compile(r"(?<![\w$.{-])(?:/private)?(?:/var)?/tmp/")
+
+
+def test_no_fixture_script_names_a_fixed_tmp_path():
+    offenders = []
+    for script in sorted(FIXTURES.rglob("*.sh")):
+        for number, line in enumerate(
+                script.read_text(encoding="utf-8", errors="replace").splitlines(),
+                start=1):
+            if line.lstrip().startswith("#"):
+                continue
+            if _FIXED_TMP_PATH.search(line):
+                offenders.append(f"{script.relative_to(REPO)}:{number}: {line.strip()}")
+    assert not offenders, "\n".join(offenders)
+
+
+@pytest.mark.parametrize("line,refused", [
+    pytest.param('out=/tmp/cctally-case.log', True, id="tmp"),
+    pytest.param('out=/private/tmp/cctally-case.log', True, id="private-tmp"),
+    pytest.param('out=/var/tmp/cctally-case.log', True, id="var-tmp"),
+    pytest.param('out=/private/var/tmp/cctally-case.log', True, id="private-var-tmp"),
+    pytest.param('out="$work/tmp/cctally-case.log"', False, id="case-scratch"),
+    pytest.param('out="${TMPDIR:-/tmp}/cctally-case.XXXXXX"', False, id="tmpdir-default"),
+])
+def test_the_fixed_tmp_guard_sees_every_system_tmp_spelling(line, refused):
+    # #940 D-2 F15: macOS reaches the same system temporary directories as
+    # /private/tmp, /var/tmp and /private/var/tmp, each a fixed shared path the
+    # confined runner kills a writer for; the guard must see all of them, and
+    # still not a case's own `tmp` directory or the C11 `${TMPDIR:-/tmp}` form.
+    assert bool(_FIXED_TMP_PATH.search(line)) is refused, line

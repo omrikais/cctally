@@ -306,6 +306,9 @@ _FROZEN_ROUTES = {
     ("_cctally_doctor.py", "custom"): 1,
     ("_cctally_doctor.py", "default"): 2,
     ("_cctally_journal.py", "custom"): 1,
+    # #825/#832 fix round K13: the wait-token read opens stats.db with a
+    # zero busy timeout and forwards every opener keyword (`**kwargs`).
+    ("_cctally_statusline.py", "custom"): 1,
 }
 
 

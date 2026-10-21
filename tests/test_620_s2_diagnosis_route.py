@@ -291,14 +291,25 @@ def test_diagnosis_deadline_retires_stuck_producer_and_recovers():
     sources = sys.modules["cctally"]._load_sibling(
         "_cctally_diagnosis_sources"
     )
+    deadline_seconds = 0.25
     admission = dash._DiagnosisAdmission(max_callers=3, max_per_key=2,
-                                         max_keys=2, deadline_seconds=0.25)
+                                         max_keys=2,
+                                         deadline_seconds=deadline_seconds)
+    # #962: the callers stop waiting at the flight deadline, but the producer
+    # keeps the single process-wide slot until its process build has been
+    # retired (killed and reaped). On a loaded or sandboxed runner that
+    # retirement outlasts a whole recovery deadline, so model a slow reap
+    # deterministically instead of depending on how fast the host is.
+    slow_retirement_seconds = 4 * deadline_seconds
 
     def _bounded_stuck(remaining):
-        return sources._run_process_with_deadline(
-            _nonterminating_diagnosis_worker, (),
-            timeout_seconds=remaining,
-        )
+        try:
+            return sources._run_process_with_deadline(
+                _nonterminating_diagnosis_worker, (),
+                timeout_seconds=remaining,
+            )
+        finally:
+            time.sleep(slow_retirement_seconds)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(
@@ -316,6 +327,13 @@ def test_diagnosis_deadline_retires_stuck_producer_and_recovers():
         with pytest.raises(dash._DiagnosisTimedOut):
             follower.result(timeout=PRESENCE_BACKSTOP_SECONDS)
 
+    # The callers gave up at the deadline; the retired producer still owns the
+    # slot until its reap finishes. A queued flight must not start late, so the
+    # recovery is only meaningful once that slot is free again (#962).
+    assert admission._admission.acquire(timeout=PRESENCE_BACKSTOP_SECONDS), (
+        "the retired producer never released the diagnosis slot"
+    )
+    admission._admission.release()
     assert admission.run(
         ("b", True, False), lambda: "recovered",
         bounded_build=lambda _remaining: "recovered",

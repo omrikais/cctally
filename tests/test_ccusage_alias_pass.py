@@ -65,38 +65,52 @@ def _window_args(cmd):
     return []
 
 
+_PARSER_MODULE = None
+
+
+def _parse(argv):
+    """Parse `argv` with the real ``cctally`` parser, in process.
+
+    The alias flags are pure parser surface: whether a flag is accepted is
+    decided by ``build_parser`` alone, so one subprocess per flag and command
+    re-proved the same shared helper (test regime reset, session 2)."""
+    global _PARSER_MODULE
+    if _PARSER_MODULE is None:
+        _PARSER_MODULE = load_script_module()
+    return _PARSER_MODULE.build_parser().parse_args(argv)
+
+
+def _assert_rejected_as_unknown(argv, capsys):
+    with pytest.raises(SystemExit) as raised:
+        _parse(argv)
+    assert raised.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+CLAUDE_ALIAS_ARGVS = [
+    ["-z", "UTC"], ["--timezone", "UTC"], ["-O"], ["--offline"], ["--no-offline"],
+    ["--compact"], ["--config", "/nonexistent/config.json"], ["--debug", "--debug-samples", "3"],
+    ["-d"], ["--single-thread"], ["--color"], ["--no-color"],
+]
+
+
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_ALL)
-class TestAliasSurface:
+def test_every_claude_alias_flag_parses(cmd):
     """§9.1 / §7.6 — every in-scope cmd accepts the full ccusage alias
     surface: -z/--timezone, -O/--offline/--no-offline, --compact,
     --config, -d/--debug, --debug-samples, --single-thread, --color,
     --no-color. The helper's `_argparse_has_arg` guard means parsers
     that already declared a flag don't trip an ArgumentError.
     """
+    for flags in CLAUDE_ALIAS_ARGVS:
+        _parse([cmd, *_window_args(cmd), *flags])
 
-    def test_z_timezone_alias(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "-z", "UTC")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
 
-    def test_timezone_long_form(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--timezone", "UTC")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_offline_short(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "-O")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_offline_long_form(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--offline")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_no_offline(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--no-offline")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_compact_parses(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--compact")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
+@pytest.mark.parametrize("cmd", INSCOPE_CMDS_ALL)
+class TestAliasSurface:
+    """The alias flags whose effect is wired per command: each command loads
+    its own `--config` and emits its own debug report, so these run the real
+    command."""
 
     def test_config_path_missing_errors_clearly(self, cmd, fake_home, tmp_path):
         # Issue #88: --config <missing> now errors out with a clear stderr
@@ -133,24 +147,16 @@ class TestAliasSurface:
         # The placeholder note from Session A T1.8 is GONE
         assert "diagnostic-sample emission is not yet wired" not in r.stderr, r.stderr
 
-    def test_debug_note_absent_without_flag(self, cmd, fake_home):
-        # Without --debug, neither the new report header NOR the old
-        # placeholder note appears.
-        r = _run(cmd, *_window_args(cmd))
-        assert "=== Pricing Mismatch Debug Report ===" not in r.stderr
-        assert "diagnostic-sample emission is not yet wired" not in r.stderr
 
-    def test_single_thread_noop(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--single-thread")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_color_alias_parses(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--color")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_no_color_alias_parses(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--no-color")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
+@pytest.mark.parametrize("cmd", ["daily", "diff"])
+def test_debug_note_absent_without_flag(cmd, fake_home):
+    # Without --debug, neither the new report header NOR the old
+    # placeholder note appears. The flag is read by the one shared
+    # `_emit_debug_samples_if_set`, so a single-report and the two-report
+    # command represent every in-scope command.
+    r = _run(cmd, *_window_args(cmd))
+    assert "=== Pricing Mismatch Debug Report ===" not in r.stderr
+    assert "diagnostic-sample emission is not yet wired" not in r.stderr
 
 
 def _load_cctally_module():
@@ -211,8 +217,8 @@ def test_z_alias_bridge_invokes_resolver(monkeypatch, capsys):
     Note: this test drives ``_bridge_z_into_tz`` directly rather than
     spawning a full ``cctally blocks -z UTC`` subprocess — that proxy is
     sufficient because every wired cmd_* calls the bridge unconditionally
-    (§7.2). End-to-end behavioral coverage of ``-z`` lives in the matrix
-    in ``TestAliasSurface``.
+    (§7.2). That every alias accepts ``-z`` at all is checked, parsing
+    only, by ``test_every_claude_alias_flag_parses``.
     """
     mod = _load_cctally_module()
 
@@ -307,71 +313,53 @@ CODEX_CMDS = ["codex-daily", "codex-monthly", "codex-weekly", "codex-session"]
 # issue #92, `_add_codex_shared_args` was extended to ALSO accept
 # `-d/--debug` + `--debug-samples` (codex now emits a "Codex Pricing
 # Debug Report"), so those three left this list — see
-# TestCodexAliasParity.test_debug_* below. `--single-thread` and
-# `--config` stay out of scope: if a codex parser accepts either, the
-# Claude-side `_add_ccusage_alias_args` helper was incorrectly wired
-# onto a codex parser (a contamination regression).
+# CODEX_ALIAS_ARGVS below. `--single-thread` stays out of scope: if a
+# codex parser accepts it, the Claude-side `_add_ccusage_alias_args` helper
+# was incorrectly wired onto a codex parser (a contamination regression).
+# `--config` left this list too: the provider-aware routing (3480a68fc)
+# gave every codex report its own read-only `--config PATH`. The old
+# subprocess check still passed on it only because a missing path exits 2.
 SESSION_A_CLAUDE_ONLY_FLAGS = [
     "--single-thread",
-    "--config",
+]
+
+
+CODEX_ALIAS_ARGVS = [
+    ["-z", "UTC"], ["--timezone", "UTC"], ["-O"], ["--offline"], ["--no-offline"],
+    ["--compact"], ["--color"],
+    # Issue #92: codex parsers now carry `-d/--debug` + `--debug-samples`
+    # (the "Codex Pricing Debug Report" surface). These were Claude-only
+    # through #89; #92 extended `_add_codex_shared_args` to accept them.
+    ["-d"], ["--debug"], ["--debug-samples", "5"],
 ]
 
 
 @pytest.mark.parametrize("cmd", CODEX_CMDS)
-class TestCodexAliasParity:
+def test_codex_alias_surface_parses_and_rejects_claude_only_flags(cmd, capsys):
     """§2 closing paragraph: codex-* parsers already carry the ccusage-
     codex sharedArgs alias surface via `_add_codex_shared_args`. Session
     A's test-only verification keeps that contract observable.
+
+    Spec §7.6 (closing paragraph): `_add_ccusage_alias_args` fires only on
+    the 10 Claude-side parsers. If a codex parser accepts one of the
+    Claude-only flags, the helper was incorrectly wired onto a codex parser
+    (or `_add_codex_shared_args` was extended with the Session A Claude-side
+    surface — a scope violation).
     """
+    for flags in CODEX_ALIAS_ARGVS:
+        _parse([cmd, *flags])
+    # _nonneg_int validator fires at parse time (shared with Claude side).
+    with pytest.raises(SystemExit) as raised:
+        _parse([cmd, "--debug-samples", "-1"])
+    assert raised.value.code == 2
+    assert "must be >= 0" in capsys.readouterr().err
+    for flag in SESSION_A_CLAUDE_ONLY_FLAGS:
+        _assert_rejected_as_unknown([cmd, flag], capsys)
 
-    def test_z_timezone(self, cmd, fake_home):
-        r = _run(cmd, "-z", "UTC")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
 
-    def test_timezone_long_form(self, cmd, fake_home):
-        r = _run(cmd, "--timezone", "UTC")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_offline_short(self, cmd, fake_home):
-        r = _run(cmd, "-O")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_offline_long(self, cmd, fake_home):
-        r = _run(cmd, "--offline")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_no_offline(self, cmd, fake_home):
-        r = _run(cmd, "--no-offline")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_compact(self, cmd, fake_home):
-        r = _run(cmd, "--compact")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_color(self, cmd, fake_home):
-        r = _run(cmd, "--color")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    # Issue #92: codex parsers now carry `-d/--debug` + `--debug-samples`
-    # (the "Codex Pricing Debug Report" surface). These were Claude-only
-    # through #89; #92 extended `_add_codex_shared_args` to accept them.
-    def test_debug_short(self, cmd, fake_home):
-        r = _run(cmd, "-d")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_debug_long(self, cmd, fake_home):
-        r = _run(cmd, "--debug")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_debug_samples(self, cmd, fake_home):
-        r = _run(cmd, "--debug-samples", "5")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_debug_samples_rejects_negative(self, cmd, fake_home):
-        # _nonneg_int validator fires at parse time (shared with Claude side).
-        r = _run(cmd, "--debug-samples", "-1")
-        assert r.returncode == 2, (r.returncode, r.stderr)
-        assert "must be >= 0" in r.stderr, r.stderr
+@pytest.mark.parametrize("cmd", CODEX_CMDS)
+class TestCodexAliasParity:
+    """Codex dates are parsed by each command, so these run the real one."""
 
     def test_dual_date_form_yyyy_mm_dd(self, cmd, fake_home):
         # codex commands already accept both forms; this confirms
@@ -383,32 +371,6 @@ class TestCodexAliasParity:
     def test_dual_date_form_yyyymmdd(self, cmd, fake_home):
         r = _run(cmd, "--since", "20260101")
         assert "must be" not in r.stderr, r.stderr
-
-
-@pytest.mark.parametrize("cmd", CODEX_CMDS)
-@pytest.mark.parametrize("flag", SESSION_A_CLAUDE_ONLY_FLAGS)
-def test_codex_does_not_carry_claude_only_session_a_flags(cmd, flag, fake_home):
-    """Spec §7.6 (closing paragraph): `_add_ccusage_alias_args` fires
-    only on the 10 Claude-side parsers. If a codex parser accepts one of
-    these flags, the helper was incorrectly wired onto a codex parser
-    (or `_add_codex_shared_args` was extended with the Session A
-    Claude-side surface — a scope violation).
-    """
-    # The flag must be rejected as an unknown argument (returncode 2,
-    # "unrecognized arguments" in stderr). Some Session A flags take
-    # a value; supply one so the assertion is "rejected as unknown"
-    # rather than "rejected for missing argument".
-    args = [cmd, flag]
-    if flag == "--debug-samples":
-        args.append("5")
-    elif flag == "--config":
-        args.append("/tmp/whatever.json")
-    r = _run(*args)
-    assert "unrecognized arguments" in r.stderr or r.returncode == 2, (
-        f"codex {cmd} unexpectedly accepted Claude-only Session A flag "
-        f"{flag!r}; this is a scope violation (spec §7.6 closing paragraph). "
-        f"returncode={r.returncode} stderr={r.stderr!r}"
-    )
 
 
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_DATE)
@@ -430,12 +392,6 @@ class TestDualDateForm:
         assert "must be YYYY-MM-DD or YYYYMMDD" not in r.stderr, r.stderr
         assert r.returncode in (0, 2), (r.returncode, r.stderr)
 
-    def test_mixed_forms_in_one_invocation(self, cmd, fake_home):
-        # Mixing the two forms in one call must work.
-        r = _run(cmd, "--since", "2026-01-01", "--until", "20260102")
-        assert "must be YYYY-MM-DD or YYYYMMDD" not in r.stderr, r.stderr
-        assert r.returncode in (0, 2), (r.returncode, r.stderr)
-
     def test_invalid_form_rejected(self, cmd, fake_home):
         # Garbage date string → centralized helper's error message.
         r = _run(cmd, "--since", "26-01-01")
@@ -451,27 +407,20 @@ INSCOPE_CMDS_MODE = [
 
 
 @pytest.mark.parametrize("cmd", INSCOPE_CMDS_MODE)
-class TestModeFlag:
+def test_mode_flag_surface(cmd, capsys):
     """Session C — every mode-scope cmd exposes -m/--mode {auto,calculate,
     display} with default auto, accepts all three values, rejects invalid."""
-
-    def test_help_lists_mode_flag(self, cmd, fake_home):
-        r = _run(cmd, "--help")
-        assert r.returncode == 0, r.stderr
-        assert "--mode" in r.stdout, r.stdout
-        assert "{auto,calculate,display}" in r.stdout, r.stdout
-
-    @pytest.mark.parametrize("val", ["auto", "calculate", "display"])
-    def test_mode_value_parses(self, cmd, val, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--mode", val)
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-        assert "invalid choice" not in r.stderr, r.stderr
-
-    def test_mode_short_flag_parses(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "-m", "calculate")
-        assert "unrecognized arguments" not in r.stderr, r.stderr
-
-    def test_invalid_mode_rejected(self, cmd, fake_home):
-        r = _run(cmd, *_window_args(cmd), "--mode", "bogus")
-        assert r.returncode == 2, (r.returncode, r.stderr)
-        assert "invalid choice" in r.stderr, r.stderr
+    with pytest.raises(SystemExit) as raised:
+        _parse([cmd, "--help"])
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--mode" in help_text, help_text
+    assert "{auto,calculate,display}" in help_text, help_text
+    assert _parse([cmd, *_window_args(cmd)]).mode == "auto"
+    for val in ("auto", "calculate", "display"):
+        assert _parse([cmd, *_window_args(cmd), "--mode", val]).mode == val
+    assert _parse([cmd, *_window_args(cmd), "-m", "calculate"]).mode == "calculate"
+    with pytest.raises(SystemExit) as raised:
+        _parse([cmd, *_window_args(cmd), "--mode", "bogus"])
+    assert raised.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

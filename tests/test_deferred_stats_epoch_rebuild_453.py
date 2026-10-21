@@ -493,6 +493,100 @@ def test_worker_real_rebuild_converges_then_next_open_is_steady(
         conn.close()
 
 
+def _applied_cursor(core, journal):
+    conn = core.open_db()
+    try:
+        return journal._read_cursor(conn)
+    finally:
+        conn.close()
+
+
+def _usage_obs(wire, percent: float, at: str) -> dict:
+    resets_at = int(dt.datetime(2026, 8, 6, tzinfo=dt.timezone.utc).timestamp())
+    return wire.make_obs(
+        at=at, src="statusline", provider="claude",
+        payload={"weekly_percent": percent, "resets_at": resets_at,
+                 "source": "statusline", "captured_at": at},
+    )
+
+
+def test_worker_derives_the_observation_whose_ingest_deferred(runtime):
+    """#825/#832 (spec C3/F1): a recorder appends its observation and only then
+    opens the index; finding another epoch, that open defers and ingests
+    nothing. A rebuild is apply-only, so the worker's rebuild runs the
+    derivation-completion step, which journals the decision the deferred
+    ingest never made instead of consuming the observation unmaterialized
+    (Codex fix-round-1 Q1)."""
+    _ns, core, _db, store = runtime
+    import _cctally_journal as journal
+    import _lib_journal as wire
+
+    journal.append_record(_usage_obs(wire, 12.0, "2026-08-02T12:00:00Z"))
+    journal.run_stats_ingest(mode="authoritative")
+    # Ingest appends its own evts past the prefix it pinned, so the applied
+    # cursor sits behind the journal high-water even when nothing is pending.
+    applied = _applied_cursor(core, journal)
+    journal.append_record(_usage_obs(wire, 14.0, "2026-08-02T12:05:00Z"))
+    appended = journal.journal_high_water()
+    _stamp(core.DB_PATH, core.STATS_INDEX_EPOCH - 1)
+    (core.APP_DIR / "stats-epoch-rebuild.pending").touch()
+
+    assert store.cmd_stats_epoch_rebuild_internal(SimpleNamespace()) == 0
+    assert store.stats_epoch_rebuild_pending() is False
+
+    conn = core.open_db()
+    try:
+        percents = sorted(r[0] for r in conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots"))
+        cursor = journal._read_cursor(conn)
+    finally:
+        conn.close()
+    assert percents == [12.0, 14.0]
+    # The suffix ingest consumed everything that was appended before it ran.
+    assert journal._coordinate_covers(cursor, appended)
+
+
+def test_derivation_frontier_is_trusted_only_from_a_sound_current_index(
+    runtime,
+):
+    """Any doubt about the replaced index's derivation frontier answers None,
+    so completion replays from the cutover rather than from somewhere
+    unproven; the applied cursor is never consulted (Codex fix-round-1 Q1)."""
+    _ns, core, _db, _store = runtime
+    import _cctally_journal as journal
+    import _lib_journal as wire
+
+    journal.append_record(_usage_obs(wire, 12.0, "2026-08-02T12:00:00Z"))
+    journal.run_stats_ingest(mode="authoritative")
+    segment, offset = _applied_cursor(core, journal)
+    assert journal.read_trusted_derivation_frontier(core.DB_PATH) == (
+        segment, offset)
+
+    def with_frontier(sql, params=()):
+        conn = sqlite3.connect(core.DB_PATH)
+        try:
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+        return journal.read_trusted_derivation_frontier(core.DB_PATH)
+
+    set_frontier = ("UPDATE journal_derivation_frontier SET segment = ?, "
+                    "offset = ? WHERE id = 1")
+    assert with_frontier(set_frontier, (segment, offset - 1)) is None
+    assert with_frontier(set_frontier, (segment, offset + 1)) is None
+    assert with_frontier(
+        set_frontier, ("observations-2099-01.jsonl", offset)) is None
+    assert with_frontier(set_frontier, (segment, 0)) == (segment, 0)
+    # A previous-release epoch never certifies derivation, whatever it holds.
+    _stamp(core.DB_PATH, journal.DERIVATION_FRONTIER_EPOCH - 1)
+    assert journal.read_trusted_derivation_frontier(core.DB_PATH) is None
+    _stamp(core.DB_PATH, core.STATS_INDEX_EPOCH)
+    assert with_frontier("DELETE FROM journal_derivation_frontier") is None
+    assert journal.read_trusted_derivation_frontier(
+        core.APP_DIR / "absent.db") is None
+
+
 def _subprocess_env(core) -> dict[str, str]:
     env = os.environ.copy()
     env.update({

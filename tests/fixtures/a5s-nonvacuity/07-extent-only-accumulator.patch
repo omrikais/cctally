@@ -1,0 +1,17 @@
+diff --git a/tests/_sqlite_write_accounting.py b/tests/_sqlite_write_accounting.py
+index cfa8eba..debb8be 100644
+--- a/tests/_sqlite_write_accounting.py
++++ b/tests/_sqlite_write_accounting.py
+@@ -216,6 +216,12 @@ class _State:
+         return cls, temp
+ 
+     def _count(self, pfile, record, n, offset):
++        # A5s non-vacuity: an extent-only accumulator. Each file adds only
++        # how far its highest written end grew, not every write it passed.
++        extents = self.__dict__.setdefault("_extents", {})
++        end = offset + n
++        n = max(0, end - extents.get(pfile, 0))
++        extents[pfile] = max(end, extents.get(pfile, 0))
+         cls, temp, _inner = record
+         counts = self.counts
+         counts["WRITES"] += 1

@@ -405,9 +405,12 @@ def test_a_later_legacy_claude_observation_moves_last_seen(tmp_path, monkeypatch
     top-level `account`, so the cutover account's last-seen advances."""
     _ns, jr, jl = _load(tmp_path, monkeypatch)
     core = importlib.import_module("_cctally_core")
+    # Legacy means a pre-stamp writer: a current-generation Claude line names
+    # its account explicitly (#825/#832 fix round C, CD2-004).
     _last_seen_journal(jr, jl, core, tail=[
         jl.make_obs(at="2099-01-01T00:00:00Z", src="record-usage",
-                    provider="claude", payload={"weekly_percent": 9.0}),
+                    provider="claude", payload={"weekly_percent": 9.0},
+                    writer_generation=None),
     ])
     assert _rebuild_last_seen(jr, tmp_path)["acct-a"] == "2099-01-01T00:00:00Z"
 

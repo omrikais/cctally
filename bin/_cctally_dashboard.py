@@ -2586,9 +2586,9 @@ def _dashboard_maybe_prune_retention() -> None:
     crash the sync thread)."""
     try:
         c = sys.modules["cctally"]
-        from _cctally_config import resolve_retention_days
+        from _cctally_config import resolve_prune_retention_days
         import _lib_conversation_retention as retention
-        retention_days = resolve_retention_days(c.load_config())
+        retention_days = resolve_prune_retention_days(c.load_config())
         if retention_days <= 0:
             return
         conn = c.open_conversations_db(attach_cache=False)

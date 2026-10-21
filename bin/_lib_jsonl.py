@@ -359,7 +359,7 @@ def _iter_jsonl_entries_with_offsets(fh, path_str: str):
 
 
 _CODEX_FILENAME_UUID_RE = re.compile(
-    r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-fA-F-]{36})\.jsonl$"
+    r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-fA-F-]{36})\.jsonl(?:\.zst)?$"
 )
 
 
@@ -883,7 +883,7 @@ def _reject_nonfinite_json_constant(value: str) -> None:
 
 
 def _codex_generation_transition_between(
-    path_str: str, after_offset: int, before_offset: int,
+    path_str: str, after_offset: int, before_offset: int, *, open_stream=None,
 ) -> bool:
     """Return whether a producer lifecycle boundary exists in this byte gap.
 
@@ -892,12 +892,13 @@ def _codex_generation_transition_between(
     and is never consumed. This reconstructs the one bit of parser state a
     metadata-only or budgeted pass can leave between the last accounting row
     and the next token event without adding another cache schema column.
-    Malformed or unreadable evidence fails closed.
+    Malformed or unreadable evidence fails closed. A container walk supplies
+    ``open_stream`` so all gap offsets address decoded bytes.
     """
     if after_offset < 0 or before_offset <= after_offset:
         return False
     try:
-        with open(path_str, "rb") as fh:
+        with (open_stream() if open_stream is not None else open(path_str, "rb")) as fh:
             fh.seek(after_offset)
             fh.readline()  # skip the retained accounting record itself
             while fh.tell() < before_offset:

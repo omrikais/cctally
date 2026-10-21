@@ -26,6 +26,8 @@ import sqlite3
 import threading
 from collections import OrderedDict
 
+from _lib_codex_publication_barrier import LAST_GOOD_THREADS_VIEW
+
 
 #: The physical name of the raw threads table. ``resolve_codex_threads_table``
 #: returns it qualified by whichever schema actually holds it.
@@ -185,6 +187,8 @@ def _schema_holds_threads_table(conn: sqlite3.Connection, schema: str) -> bool:
 def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
     """The RAW threads table reference for this connection.
 
+    A conversations connection carrying the #968 last-good view resolves to it.
+
     A bare cache connection (``open_cache_db()``) holds the table in its own
     ``main`` schema; a conversations connection
     (``open_conversations_db``/``open_conversations_db_readonly``) reaches it
@@ -222,8 +226,21 @@ def resolve_codex_threads_table(conn: sqlite3.Connection) -> str:
             _threads_table_resolution_cache.move_to_end(conn)
             return cached
 
+    # One metadata SELECT preserves last-good priority without adding a
+    # fifth query to the bounded accounting/metadata-health read contracts.
+    schema = conn.execute(
+        "SELECT CASE "
+        "WHEN EXISTS (SELECT 1 FROM sqlite_temp_master "
+        "WHERE type='view' AND name=?) THEN 'temp' "
+        "WHEN EXISTS (SELECT 1 FROM main.sqlite_master "
+        "WHERE type='table' AND name=?) THEN 'main' END",
+        (LAST_GOOD_THREADS_VIEW, CODEX_THREADS_TABLE),
+    ).fetchone()[0]
     resolved = None
-    if _schema_holds_threads_table(conn, "main"):
+    if schema == "temp":
+        # #968 spec 5.11: unpublished metadata never overrides last-good.
+        resolved = f"temp.{LAST_GOOD_THREADS_VIEW}"
+    elif schema == "main":
         resolved = f"main.{CODEX_THREADS_TABLE}"
     else:
         attached = tuple(conn.execute("PRAGMA database_list"))

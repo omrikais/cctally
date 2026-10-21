@@ -135,7 +135,7 @@ def test_other_accounts_credit_floor_does_not_clamp_active(app):
                      captured_epoch=now - 20, account_key=_key("uuid-A"))
     # A credit floor stamped to a DIFFERENT account (B) at now-10.
     _seed_credit_floor(app, reset, at_epoch=now - 10, account_key=_key("uuid-B"))
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key=_key("uuid-A"))
     # Scoped to A (which has no floor): the pre-floor 50% peak survives.
     assert projection.seven_day is not None
     assert projection.seven_day.percent == 50
@@ -150,7 +150,7 @@ def test_active_accounts_own_credit_floor_still_clamps(app):
     # The floor is stamped to the ACTIVE account -> it clamps: the only snapshot
     # is pre-floor, so no eligible row remains and the 7d projection is dropped.
     _seed_credit_floor(app, reset, at_epoch=now - 10, account_key=_key("uuid-A"))
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key=_key("uuid-A"))
     assert projection.seven_day is None
 
 
@@ -170,7 +170,7 @@ def test_candidate_selection_scopes_to_active_account_A(app):
                      captured_epoch=now - 20, account_key=_key("uuid-A"))
     _insert_snapshot(app, weekly_percent=90, weekly_resets_epoch=reset,
                      captured_epoch=now - 10, account_key=_key("uuid-B"))
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key=_key("uuid-A"))
     assert projection.seven_day is not None
     # Merged (unscoped) would pick B's later 90%; scoped picks A's 50%.
     assert projection.seven_day.percent == 50
@@ -185,6 +185,6 @@ def test_candidate_selection_scopes_to_active_account_B(app):
                      captured_epoch=now - 20, account_key=_key("uuid-B"))
     _insert_snapshot(app, weekly_percent=90, weekly_resets_epoch=reset,
                      captured_epoch=now - 10, account_key=_key("uuid-A"))
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key=_key("uuid-B"))
     assert projection.seven_day is not None
     assert projection.seven_day.percent == 50

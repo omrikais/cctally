@@ -446,12 +446,21 @@ def _build(scratch: pathlib.Path) -> tuple[dict[str, dict], dict[str, dict]]:
     claude_config = scratch / "claude"
     (claude_config / "projects").mkdir(parents=True, exist_ok=True)
 
-    os.environ["CCTALLY_DATA_DIR"] = str(scratch / "data")
+    data_dir = scratch / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    os.environ["CCTALLY_DATA_DIR"] = str(data_dir)
     os.environ["CLAUDE_CONFIG_DIR"] = str(claude_config)
     os.environ["CODEX_HOME"] = str(codex_home)
     os.environ["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
     os.environ["CCTALLY_DISABLE_UPDATE_CHECK"] = "1"
     os.environ["CCTALLY_DISABLE_TELEMETRY"] = "1"
+    # #965: transcript retention is off for this builder through the test
+    # switch, assigned here because the builder also runs alone (the remote
+    # wrapper forwards no caller environment). No retention setting is
+    # persisted. docs/fixtures-gotchas.md, "Conversation retention is off in
+    # test environments (#965)".
+    os.environ["CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"] = "1"
     os.environ["TZ"] = "Etc/UTC"
 
     if str(BIN_DIR) not in sys.path:

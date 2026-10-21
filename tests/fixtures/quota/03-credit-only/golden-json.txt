@@ -187,26 +187,49 @@
     "calibrationFileQuarantinedTo": null
   },
   "method": {
-    "algorithmRevision": 3,
-    "constantsFingerprint": "0cd932a7f8caa5d9bec7010ed5d800935e5c78332ae060c1142650943512a24a",
-    "verifiedAt": "2026-08-29",
+    "algorithmRevision": 4,
+    "constantsFingerprint": "5835b430978b2fc556c577d44c9e62d5d7807e62533b32819ed63d37e3af671a",
+    "verifiedAt": "2026-10-20",
     "supportedCompositionFrom": "2026-07-25",
     "coefficientSupport": {
       "supportedCompositionFrom": "2026-07-25",
+      "supportedCompositionUntil": "2026-09-22",
+      "coefficientEra": "opus-5",
       "fastModeParticipation": "usage-credits-only-excluded"
     },
     "coefficientEras": [
       {
+        "id": null,
         "from": null,
         "until": "2026-07-25",
         "state": "unvalidated",
         "provenance": "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 units per point against 2.4M for Opus 5, a budget difference the shared token-class coefficients do not absorb. The shipped estimator gives 1,265,184 to 1,479,027 over the same weeks, and spec section 6 declines to adjudicate between the two."
       },
       {
+        "id": "opus-5",
         "from": "2026-07-25",
+        "until": "2026-09-22",
+        "state": "validated",
+        "provenance": "The Opus 5 calibration, docs/quota-model.md \"The finding\"",
+        "tokenClassWeights": {
+          "fresh": 1.0,
+          "output": 4.73,
+          "cache_1h": 1.03,
+          "cache_read": 0.0031
+        }
+      },
+      {
+        "id": "opus-5-5",
+        "from": "2026-09-22",
         "until": null,
         "state": "validated",
-        "provenance": "docs/quota-model.md: 2026-07-25 is the Opus 5 changeover, the epoch the token-class weights were fitted on."
+        "provenance": "The 2026-10-18 Opus 5.5 refit; output weakly identified (95% CI 0.23\u20131.13), cache read sharp (0.0128\u20130.0168)",
+        "tokenClassWeights": {
+          "fresh": 1.0,
+          "output": 0.64,
+          "cache_1h": 1.0,
+          "cache_read": 0.0148
+        }
       }
     ],
     "detector": {

@@ -210,11 +210,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": false,
-                            "registry_size": 48,
+                            "registry_size": 49,
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1017,
+                            "epoch": 1018,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -279,7 +279,8 @@
                                     "045_conversation_render_revision_columns",
                                     "046_codex_source_file_identity",
                                     "047_spill_free_read_paths",
-                                    "048_codex_quota_physical_group_order"
+                                    "048_codex_quota_physical_group_order",
+                                    "049_codex_rollout_containers"
                                 ],
                                 "skipped": []
                             },
@@ -307,7 +308,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/61 applied",
+                    "summary": "0/62 applied",
                     "title": "Migrations"
                 },
                 {
@@ -556,13 +557,17 @@
                             [
                                 "cache.db",
                                 "048_codex_quota_physical_group_order"
+                            ],
+                            [
+                                "cache.db",
+                                "049_codex_rollout_containers"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "61 pending",
+                    "summary": "62 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -733,6 +738,15 @@
                 },
                 {
                     "details": {
+                        "available": false
+                    },
+                    "id": "journal.legacy_writer",
+                    "severity": "ok",
+                    "summary": "unavailable (no current admission summary)",
+                    "title": "Legacy writer"
+                },
+                {
+                    "details": {
                         "incomplete": null
                     },
                     "id": "journal.quota_projection",
@@ -816,6 +830,22 @@
                     "severity": "ok",
                     "summary": "no refused prune",
                     "title": "Codex orphan pruning"
+                },
+                {
+                    "details": {
+                        "compressedOnly": 0,
+                        "neverIngested": 0,
+                        "pruneDebt": 0,
+                        "readDebt": 0,
+                        "retainedComplete": 0,
+                        "retainedIncomplete": 0,
+                        "unverified": 0,
+                        "verificationDebt": 0
+                    },
+                    "id": "data.codex_compressed_rollouts",
+                    "severity": "ok",
+                    "summary": "All compressed Codex rollouts are readable and verified.",
+                    "title": "Compressed Codex rollouts"
                 },
                 {
                     "details": {
@@ -995,6 +1025,24 @@
             "checks": [
                 {
                     "details": {
+                        "accounts": [],
+                        "available": false
+                    },
+                    "id": "accounting.outcome_quarantine",
+                    "remediation": "Run any cctally command to bring the stats index up to date, then run `cctally doctor` again.",
+                    "severity": "warn",
+                    "summary": "unavailable (no validated stats index)",
+                    "title": "Outcome quarantine"
+                }
+            ],
+            "id": "accounting",
+            "severity": "warn",
+            "title": "Accounting"
+        },
+        {
+            "checks": [
+                {
+                    "details": {
                         "fallback": [],
                         "unpriced": []
                     },
@@ -1160,8 +1208,8 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 61,
-            "warn": 6
+            "ok": 63,
+            "warn": 7
         },
         "severity": "warn"
     },

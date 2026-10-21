@@ -21,6 +21,15 @@ import pytest
 from conftest import load_script, redirect_paths
 
 
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin" / "cctally"
 AT = "2026-07-27T06:00:00Z"
@@ -1034,12 +1043,7 @@ def test_malformed_protocol_resolution_remains_fail_closed():
     )
     audit["payload"]["violations"][0]["unexpected"] = True
     audit["id"] = journal.content_id(
-        {
-            "t": audit["t"],
-            "at": audit["at"],
-            "src": audit["src"],
-            "payload": audit["payload"],
-        }
+        {key: value for key, value in audit.items() if key not in ("v", "id")}
     )
 
     with pytest.raises(
@@ -1064,12 +1068,7 @@ def test_malformed_resolution_cli_json_is_fail_closed_and_read_only(tmp_path):
     )
     audit["payload"]["unexpected"] = True
     audit["id"] = journal.content_id(
-        {
-            "t": audit["t"],
-            "at": audit["at"],
-            "src": audit["src"],
-            "payload": audit["payload"],
-        }
+        {key: value for key, value in audit.items() if key not in ("v", "id")}
     )
     segment = journal_dir / "observations-2026-07.jsonl"
     segment.write_bytes(
@@ -1969,7 +1968,10 @@ def test_the_whole_recovery_command_takes_no_extra_prefix_traversal(
     rebuilt = []
 
     def _stub_rebuild(*, context, high_water, update_quota_cache,
-                      before_swap=None):
+                      before_swap=None, complete_derivation=False):
+        # #825/#832 fix round A: every production rebuild completes
+        # derivation first.
+        assert complete_derivation is True
         rebuilt.append(high_water)
         return _StubRebuildResult()
 

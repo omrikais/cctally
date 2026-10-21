@@ -529,6 +529,43 @@ def resolve_retention_days(config: dict) -> int:
     return default
 
 
+#: The test-only switch (#965). Honored only at exactly "1", only when no
+#: retention setting exists, and only for code running from a git checkout.
+CONVERSATION_RETENTION_TEST_SWITCH = "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"
+
+
+def _conversation_retention_setting_absent(config) -> bool:
+    """True when no ``conversation.retention_days`` setting exists (#965 5.2).
+
+    Absent: no ``conversation`` key, or a ``conversation`` dictionary without
+    ``retention_days``. A present key of any value (``null`` and malformed
+    values included), a non-dictionary ``conversation`` and a non-dictionary
+    config are not absent: they keep ``resolve_retention_days``'s meaning."""
+    if not isinstance(config, dict):
+        return False
+    if "conversation" not in config:
+        return True
+    block = config["conversation"]
+    return isinstance(block, dict) and "retention_days" not in block
+
+
+def resolve_prune_retention_days(config: dict) -> int:
+    """Operational transcript-retention window of the three prune paths (#965).
+
+    ``resolve_retention_days`` stays the reporting resolver (``config get``,
+    the settings manifest, docs). This one differs in exactly one case: with
+    no retention setting, the test switch at exactly ``"1"`` and a ``.git``
+    entry at the running code's root, it returns ``0`` (keep forever). The
+    switch and the marker are read on every call; nothing is cached, written
+    or logged. docs/fixtures-gotchas.md, "Conversation retention is off in
+    test environments (#965)"."""
+    if (_conversation_retention_setting_absent(config)
+            and os.environ.get(CONVERSATION_RETENTION_TEST_SWITCH) == "1"
+            and _cctally_core._has_git_checkout_marker()):
+        return 0
+    return resolve_retention_days(config)
+
+
 def _config_codex_leaf_value(config: dict, key: str) -> object:
     """Read one nested Codex budget leaf with its public default.
 

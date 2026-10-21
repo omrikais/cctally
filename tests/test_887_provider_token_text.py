@@ -121,12 +121,10 @@ FLAGGED = [
     ("K: bare o1.", '"o1.' + "A" * 43 + '"'),
     ("K: bare v1.", '"v1.' + "A" * 24 + '"'),
     ("K: upper-case prefix", "CBK1_" + "ab" * 20),
-    ("K: glued o1., no token", "id_o1.80001" + "Q" * 38),
     ("K: glued o1., token", "id_o1.70001" + "Q" * 38),
     ("K: glued v1.", "x_v1." + "A" * 24),
     ("K: glued cbk2_", "id_cbk2_" + "A" * 30),
     ("K: ofc1.", "ofc1." + "A" * 43),
-    ("K: glued ofc1., no token", "id_ofc1.80001"),
     ("K: glued ofc1., token", "id_ofc1.70001"),
     ("K: one-character body", "cbk1_a"),
     ("K: documented false-positive shape", "foo1.bar"),
@@ -137,11 +135,12 @@ FLAGGED = [
     ("G3: mixed-case base64url", "aB3" + "x" * 13),
 ]
 
+# Each shape carries a token: the guard runs before the token check, so a
+# body it misses fails with the leak message instead, and a token-free twin
+# of the same shape would only repeat the first half of that proof.
 SHORT_BODIES = [
-    "cbk1_a80001b", "cbk1_a70001b", "cbk1_80001", "cbk1_70001",
-    "id_cbk1_a80001", "id_cbk1_a70001", "cbk2_a80001b", "cbk2_a70001b",
-    "id_o1.80001", "id_o1.70001", "v9.a80001", "v9.a70001",
-    "CBK1_a70001b", "ID_O1.70001",
+    "cbk1_a70001b", "cbk1_70001", "id_cbk1_a70001", "cbk2_a70001b",
+    "id_o1.70001", "v9.a70001", "CBK1_a70001b", "ID_O1.70001",
 ]
 
 NOT_FLAGGED = [

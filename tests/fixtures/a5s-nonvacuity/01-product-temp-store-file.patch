@@ -1,0 +1,36 @@
+diff --git a/bin/_lib_conversation_retention.py b/bin/_lib_conversation_retention.py
+index a5308ba..2d11311 100644
+--- a/bin/_lib_conversation_retention.py
++++ b/bin/_lib_conversation_retention.py
+@@ -794,7 +794,6 @@ def open_deletion_connection(db_path) -> sqlite3.Connection:
+     try:
+         _apply_connection_settings(conn)
+         conn.execute(f"PRAGMA cache_size = -{DELETION_CACHE_SIZE_KIB}")
+-        conn.execute("PRAGMA temp_store = MEMORY")
+     except BaseException:
+         conn.close()
+         raise
+@@ -1195,7 +1194,7 @@ def delete_group(conn: sqlite3.Connection, group: ExpiredGroup, *,
+     mode = "fallback" if fallback else "spill_free"
+     # temp_store may only change outside a transaction; the provider flocks
+     # the visit holds keep `rows` exact until the DELETE.
+-    conn.execute(f"PRAGMA temp_store = {'FILE' if fallback else 'MEMORY'}")
++    conn.execute("PRAGMA temp_store = FILE")  # A5s non-vacuity: MEMORY removed
+     interval = _lib_write_io.begin_interval("maintenance")
+     t0 = clock()
+     op_started = _operation_start(started_at, t0, visit_clock0)
+diff --git a/tests/test_retention_spill_free.py b/tests/test_retention_spill_free.py
+index 3d26518..49317d3 100644
+--- a/tests/test_retention_spill_free.py
++++ b/tests/test_retention_spill_free.py
+@@ -289,8 +289,8 @@ def test_spill_free_deletion_writes_each_dirty_page_once(
+         assert product_frames <= 1.05 * unbounded_frames, (
+             "the product deletion re-spilled dirty pages to the WAL",
+             product_frames, unbounded_frames)
+-        assert (seen[0]["temp_store"], seen[0]["cache_size"]) == (
+-            2, -262144), "temp_store=MEMORY under the 256 MiB cache cap"
++        # A5s non-vacuity: the pragma check would catch the mutation first;
++        # neutralised so the temp-byte assertion below is reached.
+         assert all(s["attributed"] for s in seen), (_BYPASS, seen)
+         # #940 revision 7j: temp-file bytes are counted directly, per file
+         # class, so no frame or baseline is subtracted.

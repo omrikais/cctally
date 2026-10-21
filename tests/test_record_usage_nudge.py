@@ -147,7 +147,7 @@ def test_statusline_path_nudges_by_default(mods, monkeypatch):
     monkeypatch.setattr(
         journal, "run_stats_ingest",
         lambda **_: _result(journal, ran=True, error=None, events_emitted=1))
-    result = ns["_authoritative_record_usage"](_args(source="api"), {"sevenDay"})
+    result = ns["_authoritative_record_usage"](_args(source="api"), {"sevenDay"}, binding=ns["_capture_binding"]())
     assert result.status == "ok", result.reason
     assert nudges == [1]
 
@@ -164,7 +164,8 @@ def test_refresh_origin_record_suppresses_the_inner_nudge(mods, monkeypatch):
         journal, "run_stats_ingest",
         lambda **_: _result(journal, ran=True, error=None, events_emitted=1))
     result = ns["_authoritative_record_usage"](
-        _args(source="api"), {"sevenDay"}, nudge_dashboard=False)
+        _args(source="api"), {"sevenDay"}, nudge_dashboard=False,
+        binding=ns["_capture_binding"]())
     assert result.status == "ok", result.reason
     assert nudges == []
 
@@ -205,7 +206,7 @@ def test_the_nudge_fires_after_the_selected_state_lock_is_released(
         journal, "run_stats_ingest",
         lambda **_: _result(journal, ran=True, error=None, events_emitted=1))
 
-    result = ns["_authoritative_record_usage"](_args(source="api"), {"sevenDay"})
+    result = ns["_authoritative_record_usage"](_args(source="api"), {"sevenDay"}, binding=ns["_capture_binding"]())
 
     assert result.status == "ok", result.reason
     assert events == ["lock", "unlock", "nudge"]
@@ -219,7 +220,7 @@ def test_the_hook_tick_nudge_fires_after_its_own_lock_is_released(
     monkeypatch.setitem(ns, "load_config", lambda: {})
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
     monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
-    monkeypatch.setitem(ns, "_statusline_observe_age_seconds", lambda: 10_000.0)
+    monkeypatch.setitem(ns, "_statusline_observe_age_seconds", lambda **_: 10_000.0)
     monkeypatch.setitem(ns, "_selected_state_lock",
                         lambda: _RecordingLock(events))
     monkeypatch.setitem(ns, "_nudge_dashboard_repaint",
@@ -257,7 +258,7 @@ def test_hook_tick_oauth_fetch_does_not_hold_the_selected_state_lock(
     monkeypatch.setitem(ns, "load_config", lambda: {})
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda *a, **kw: "tok")
     monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
-    monkeypatch.setitem(ns, "_statusline_observe_age_seconds", lambda: 10_000.0)
+    monkeypatch.setitem(ns, "_statusline_observe_age_seconds", lambda **_: 10_000.0)
     monkeypatch.setitem(ns, "_selected_state_lock", SelectedLock)
 
     def fetch(**_kwargs):
@@ -290,6 +291,7 @@ def test_lock_held_authoritative_record_requires_a_deferred_nudge_sink(
 
     result = ns["_authoritative_record_usage"](
         _args(source="api"), {"sevenDay"}, lock_held=True,
+        binding=ns["_capture_binding"](),
     )
 
     assert result.status == "record_failed"

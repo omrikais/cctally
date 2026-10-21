@@ -76,6 +76,8 @@ def _init_paths_from_env() -> None:
     global STATUSLINE_CANDIDATE_DIR, STATUSLINE_SELECTED_PATH
     global STATUSLINE_TRANSPORT_MARKER_PATH
     global STATUSLINE_AUTHORITATIVE_7D_PATH, STATUSLINE_AUTHORITATIVE_5H_PATH
+    global STATUSLINE_ACCOUNT_BOUND_DIR, LEGACY_SPOOL_BASELINE_PATH
+    global ACCOUNT_BOUND_CUTOVER_CACHE_PATH, LEGACY_WRITER_EVIDENCE_PATH
     global OAUTH_BACKOFF_MARKER_PATH, OAUTH_BACKOFF_COUNT_PATH
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
@@ -184,6 +186,19 @@ def _init_paths_from_env() -> None:
     STATUSLINE_TRANSPORT_MARKER_PATH = APP_DIR / "statusline-transport.last"
     STATUSLINE_AUTHORITATIVE_7D_PATH = APP_DIR / "statusline-authoritative-7d.json"
     STATUSLINE_AUTHORITATIVE_5H_PATH = APP_DIR / "statusline-authoritative-5h.json"
+    # #825/#832 account-bound protocol (spec section 7). Every current
+    # coordination file lives under its own sibling root; the legacy paths
+    # above are never read as authority after the cutover, only compared with
+    # the journal-anchored legacy spool baseline. The coordinate cache only
+    # accelerates locating the cutover op and never confers authority; the
+    # legacy-writer evidence sidecar is diagnostic only (spec section 8).
+    STATUSLINE_ACCOUNT_BOUND_DIR = APP_DIR / "statusline-account-bound-v1"
+    LEGACY_SPOOL_BASELINE_PATH = (
+        STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-spool-baseline.json")
+    ACCOUNT_BOUND_CUTOVER_CACHE_PATH = (
+        STATUSLINE_ACCOUNT_BOUND_DIR / "cutover-coordinate.json")
+    LEGACY_WRITER_EVIDENCE_PATH = (
+        STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-writer-evidence.json")
     OAUTH_BACKOFF_MARKER_PATH = APP_DIR / "oauth-backoff.until"
     # Consecutive-429 counter (text int) driving the headerless exponential
     # backoff (base * 2**count). Separate from the deadline marker so the
@@ -261,6 +276,18 @@ def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
 
 
+def _has_git_checkout_marker() -> bool:
+    """True iff the running code has a ``.git`` entry at its root (#965 5.1).
+
+    A main checkout has a ``.git`` directory and a linked worktree a ``.git``
+    file; both count. Eligibility follows the code's resolved location
+    (``_repo_root()``), never the current directory, and is evaluated on every
+    call. No suppressor (``CCTALLY_DISABLE_DEV_AUTODETECT``,
+    ``CCTALLY_ALLOW_PROD_MIGRATION``) affects it. npm and Homebrew installs
+    ship without ``.git``, so they never read True."""
+    return (_repo_root() / ".git").exists()
+
+
 def _is_dev_checkout() -> bool:
     """True iff running from a git checkout (a ``.git`` entry at the repo
     root — a directory for a main checkout, a file for a worktree) AND the
@@ -272,7 +299,7 @@ def _is_dev_checkout() -> bool:
     install copies ship without ``.git`` so they never read True."""
     if _truthy_env("CCTALLY_DISABLE_DEV_AUTODETECT"):
         return False
-    return (_repo_root() / ".git").exists()
+    return _has_git_checkout_marker()
 
 
 def is_preview_channel() -> bool:
@@ -487,8 +514,18 @@ _init_paths_from_env()
 # reason this is a bump and not a migration is unchanged: the registry is
 # frozen at 13, and an epoch-current open returns before any schema work, so a
 # schema helper alone would never run on an upgraded install.
-STATS_INDEX_EPOCH = 1017
+# 1017 -> 1018 (#825/#832 spec section 6): the same journal now has a different
+# authoritative interpretation — the account-bound admission predicate excludes
+# unstamped post-cutover records before any derivation — so an index
+# materialized under the old interpretation is not current even though its
+# schema is usable. The epoch also carries the disposable
+# `journal_admission_summary` table, whose presence is the protocol marker
+# `_cctally_store.validated_read_snapshot` checks inside each decision
+# scope's own snapshot. An epoch transition, not a numbered migration: the
+# registry stays frozen at 13.
+STATS_INDEX_EPOCH = 1018
 LEGACY_STATS_HEAD = 13
+
 
 #: #496 S1 F1. A NEW branch, for a state that cannot occur before the
 #: publication transaction exists: a replacement index was published and then
@@ -3310,6 +3347,106 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "cutover_seen INTEGER NOT NULL DEFAULT 0, "
             "cutover_account_key TEXT)"
         )
+        # #825/#832 epoch 1018 (spec section 8): the bounded, disposable
+        # summary of the complete journal records the admission predicate
+        # EXCLUDED (post-cutover records without the current writer
+        # generation). Ingest extends it inside its cycle transaction and a
+        # rebuild reproduces it from the pinned prefix; `complete_through` is
+        # NULL when the row was started mid-journal (it then describes only
+        # what it saw). Coordinates are JSON `{"segment", "offset"}` text, and
+        # `coordinate_digest` is the order-independent population digest of
+        # every excluded coordinate (`_lib_account_protocol`).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_admission_summary ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "cutover_id TEXT, "
+            "scanned_high_water TEXT, "
+            "excluded_total INTEGER NOT NULL DEFAULT 0, "
+            "family_counts_json TEXT NOT NULL DEFAULT '{}', "
+            "first_excluded_coordinate TEXT, "
+            "latest_excluded_coordinate TEXT, "
+            "coordinate_digest TEXT, "
+            "complete_through TEXT, "
+            # The boundary payload this summary classified against, so the
+            # live ingest path resolves admission without scanning the journal.
+            "boundary_json TEXT)"
+        )
+        # #825/#832 fix round A (Codex fix-round-1 Q1): the derivation
+        # frontier. Every admitted derivable input at or before this journal
+        # coordinate has had its decisions journaled by a current binary. Live
+        # ingest advances it with the cursor only while the two are equal; a
+        # rebuild carries it from a trusted predecessor index or sets it after
+        # the shared completion step proved the window. Absent means unknown,
+        # which the completion step reads as "replay from the cutover".
+        # Fix round C (P1-1): the frontier counts CONSUMED INPUTS, and the
+        # decisions a cycle derives from them land beyond it, so the row also
+        # names the output end — the coordinate through which every decision
+        # derived from an input at or before the frontier is journaled, with
+        # nothing between the two derived from a later input. NULL means
+        # nothing is owed beyond the frontier.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_derivation_frontier ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "segment TEXT NOT NULL, "
+            "offset INTEGER NOT NULL, "
+            "output_segment TEXT, "
+            "output_offset INTEGER)"
+        )
+        # An index an earlier build of this epoch created lacks the two
+        # columns; additive, so it keeps its frontier row.
+        add_column_if_missing(
+            conn, "journal_derivation_frontier", "output_segment", "TEXT")
+        add_column_if_missing(
+            conn, "journal_derivation_frontier", "output_offset", "INTEGER")
+        # Revision 2 (#946, Codex design-fix-round-3 Q5): the proof
+        # generation. A row written under the old traversal rule (NULL here)
+        # may name a valid endpoint past an input nothing derived, so only
+        # `_cctally_journal.DERIVATION_PROOF_GENERATION` is trusted.
+        add_column_if_missing(
+            conn, "journal_derivation_frontier", "proof_generation", "INTEGER")
+        # #825/#832 fix round A (Codex fix-round-1 Q2): the physical revision
+        # inventory of every EXCLUDED event or correction action the index has
+        # consumed, by logical id. Admission hides these from effective
+        # selection, so without it a current writer would classify the id NEW
+        # and append a revision-0 twin the previous release reads as a
+        # same-revision conflict.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_excluded_event_revisions ("
+            "event_id TEXT PRIMARY KEY, "
+            "max_rev INTEGER NOT NULL)"
+        )
+        # #825/#832 epoch 1018 (spec 5.6 item 9): the outcome quarantine. A
+        # deterministic function of journal order that ingest extends inside
+        # its cycle transaction and a rebuild reproduces from the pinned
+        # prefix: one row per uncertainty trigger (an excluded record or a
+        # current `legacy_spool_activity` op, at its physical coordinate), the
+        # whole-prefix envelope per scope ("excluded" applies to every
+        # account), and each account's accounting and control certificates
+        # with the trigger sequence they were granted against. A certificate
+        # granted against an older sequence is void; a missing or
+        # unverifiable row reads as quarantined.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_triggers ("
+            "seq INTEGER PRIMARY KEY, "
+            "segment TEXT, "
+            "byte_offset INTEGER, "
+            "kind TEXT NOT NULL, "
+            "reason TEXT NOT NULL, "
+            "at TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_envelope ("
+            "scope TEXT PRIMARY KEY, "
+            "envelope_json TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_certificates ("
+            "account_key TEXT PRIMARY KEY, "
+            "accounting_certificate_json TEXT, "
+            "accounting_trigger_seq INTEGER, "
+            "control_certificate_json TEXT, "
+            "control_trigger_seq INTEGER)"
+        )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_selector_batches ("
             "batch_id TEXT PRIMARY KEY, "
@@ -3368,6 +3505,45 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "record_path TEXT NOT NULL, "
             "started_at_utc TEXT NOT NULL, "
             "stamped_at_utc TEXT NOT NULL)"
+        )
+        # #825/#832 Task 4.0 (epoch 1018): a milestone whose snapshot a
+        # credit's stale-replica removal deleted. The removal's band starts at
+        # floor10 of the arming tick, so it also reaches the GENUINE pre-credit
+        # peak tick when that tick shares the arming tick's ten-minute slot —
+        # and that tick is the one that crossed the last weekly and five-hour
+        # milestones. A rebuild folds the suppression (order 30) before the
+        # milestones (order 60), so their journaled `usage_snapshot_ref` named
+        # a row that no longer existed and the NOT NULL row was silently
+        # dropped; the next tick then re-recorded the highest weekly milestone
+        # and its conflict convergence raised on every cycle.
+        #
+        # The tombstone records every journaled snapshot the index deleted —
+        # the live stale-replica removals and the suppression appliers alike,
+        # because a trigger sees every DELETE — so the fold's ONE resolver
+        # (`_cctally_journal._resolve_fold_ref`) can tell "a suppression
+        # removed it" from a genuinely unresolvable reference. The trigger's
+        # second half points every milestone that referenced the deleted row at
+        # the 0 "no snapshot row" sentinel, which is what the rebuild resolves
+        # such a reference to, so the live index and a rebuild agree. Both
+        # milestone readers already treat 0 as "no row": the five-hour
+        # milestone read LEFT JOINs (and so publishes the effective weekly
+        # value as unavailable, as it already did for the dangling rowid), and
+        # the observation-gap classifier never continues a run through 0.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage_snapshot_suppressions ("
+            "journal_id TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_usage_snapshot_suppression "
+            "AFTER DELETE ON weekly_usage_snapshots "
+            "BEGIN "
+            "INSERT OR IGNORE INTO usage_snapshot_suppressions (journal_id) "
+            "SELECT OLD.journal_id WHERE OLD.journal_id IS NOT NULL; "
+            "UPDATE percent_milestones SET usage_snapshot_id = 0 "
+            "WHERE usage_snapshot_id = OLD.id; "
+            "UPDATE five_hour_milestones SET usage_snapshot_id = 0 "
+            "WHERE usage_snapshot_id = OLD.id; "
+            "END"
         )
 
         # §6.2 backfill gate (Task 8): stamp the one-shot marker AFTER the three

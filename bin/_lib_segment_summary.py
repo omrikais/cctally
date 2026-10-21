@@ -84,7 +84,7 @@ SIDECAR_NAME = ".segment-summaries"
 #: Bumped by hand when a summary's FIELD SET or the meaning of one of its
 #: numbers changes. It is only one of the three inputs to `summary_version`; the
 #: other two are derived, for the reason that function's docstring gives.
-SUMMARY_SHAPE_VERSION = 3
+SUMMARY_SHAPE_VERSION = 4
 
 #: The refusal reasons `summary_is_elidable` returns. They are stable, because
 #: the rebuild record reports them (spec section 6.3, "recorded, not silent").
@@ -121,6 +121,14 @@ class SegmentSummary:
     malformed: int = 0
     #: True when the segment holds ZERO records of a retained type.
     quota_only: bool = True
+    #: #825/#832 fix round A (Codex fix-round-1 Q4): True only when EVERY
+    #: decoded record in the summarized extent is a positively identified
+    #: Codex quota observation — no Claude, administrative, protocol or
+    #: unknown record. The one proof that lets a segment past the account-bound
+    #: cutover's frozen extents be elided: a summary describes its lines
+    #: WITHOUT admission, and `quota_only` alone still admits a stamped Claude
+    #: observation that feeds the quarantine and the derivation completion.
+    codex_quota_only: bool = False
     #: Elements the segment contributed to the rebuild's `decoded` list —
     #: retained records plus placeholders, and never a malformed line. `None`
     #: means the summary predates the field and cannot be elided against.
@@ -227,7 +235,8 @@ def summary_is_elidable(
 _FIELDS = (
     "segment_name", "st_dev", "st_ino", "summarized_size",
     "complete_line_covered_offset", "lines", "bytes", "decodes", "malformed",
-    "quota_only", "decoded_entry_count", "complete_prefix_sha256",
+    "quota_only", "codex_quota_only", "decoded_entry_count",
+    "complete_prefix_sha256",
     "last_seen_stamped",
     "last_seen_legacy_claude_at", "last_seen_legacy_codex_at",
 )
@@ -285,6 +294,7 @@ def to_wire(summary) -> dict:
         "decodes": int(summary.decodes),
         "malformed": int(summary.malformed),
         "quota_only": bool(summary.quota_only),
+        "codex_quota_only": bool(summary.codex_quota_only),
         "decoded_entry_count": (
             None if summary.decoded_entry_count is None
             else int(summary.decoded_entry_count)),
@@ -326,6 +336,7 @@ def from_wire(item) -> SegmentSummary:
         decodes=int(item["decodes"]),
         malformed=int(item["malformed"]),
         quota_only=bool(item["quota_only"]),
+        codex_quota_only=bool(item["codex_quota_only"]),
         decoded_entry_count=None if count is None else int(count),
         complete_prefix_sha256=(
             None if item["complete_prefix_sha256"] is None
@@ -425,6 +436,28 @@ def read_sidecar(path):
         }
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def admission_permits_elision(boundary, name, pinned_raw_extent,
+                              summary) -> bool:
+    """Whether the account-bound admission fence lets segment ``name`` be
+    elided at all (#825/#832 fix round A, Codex fix-round-1 Q4). The rebuild
+    and the prefix validation share it; every other elision condition is
+    still `summary_is_elidable`'s.
+
+    A summary describes its lines without admission. A wholly historical
+    extent (inside the cutover's frozen extent for that segment) needs no
+    admission. Past it, only a summary proving every decoded record a Codex
+    quota observation — always admitted, never a quarantine or completion
+    input — may stand in for reading the segment; anything unproven (no
+    summary, an older shape, a mixed segment) is scanned.
+    """
+    if boundary is None:
+        return True
+    extent = boundary.frozen_extents.get(name)
+    if extent is not None and int(pinned_raw_extent) <= int(extent):
+        return True
+    return summary is not None and bool(summary.codex_quota_only)
 
 
 def with_identity(summary, *, st_dev, st_ino) -> SegmentSummary:

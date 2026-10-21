@@ -60,8 +60,8 @@ def test_no_suppression_expires_before_the_pricing_snapshot_date():
 # platform.claude.com/docs/en/about-claude/pricing at PRICING_SNAPSHOT_DATE.
 # The two WRITE multipliers are uniform and derived (5-minute write 1.25x base
 # input, 1-hour write 2x). Cache READS are model-specific and are therefore
-# stored per model: the two 5.1 point releases read at 0.025x base input rather
-# than the 0.1x every other current model uses, and pinning that fourth column
+# stored per model: the two 5.1 point releases read at 0.025x base input and
+# Opus/Sonnet 5.5 read at 0.05x; other current models use 0.1x. Pinning that column
 # is the only thing that stops a later edit normalizing it back. Mythos Preview
 # retains its historical
 # Project Glasswing rate even though Mythos 5 succeeded it. Haiku 5.5 is the
@@ -80,7 +80,7 @@ _CURRENT_GENERATION_RATES = {
     "claude-opus-5":    (5e-06,  2.5e-05, 6.25e-06, 5e-07),
     "claude-opus-5-5":  (4e-06,  2e-05,   5e-06,    2e-07),
     "claude-sonnet-5":  (2e-06,  1e-05,   2.5e-06,  2e-07),
-    "claude-sonnet-5-5": (2e-06, 1e-05,   2.5e-06,  2e-07),
+    "claude-sonnet-5-5": (2e-06, 1e-05,   2.5e-06,  1e-07),
 }
 
 _HISTORICAL_GENERATION_RATES = {
@@ -126,7 +126,7 @@ def test_historical_models_retain_vendor_rates(model, rates):
 @pytest.mark.parametrize("model,expected", [
     ("claude-opus-5-5", 37.20),
     ("claude-sonnet-5", 18.70),
-    ("claude-sonnet-5-5", 18.70),
+    ("claude-sonnet-5-5", 18.60),
     ("claude-mythos-5", 93.50),
     ("claude-mythos-preview", 233.75),
 ])

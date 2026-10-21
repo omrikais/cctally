@@ -12,6 +12,10 @@
 #   * mode-display    — -m display (drops cost-less entries to $0 → distinct golden)
 # The since-window scenario adds --since/--until via input.env FLAGS.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -19,7 +23,7 @@ HARNESS_SUBCOMMAND="daily"
 HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/daily"
 HARNESS_BIN="$REPO_ROOT/bin/cctally"
 
-SCRATCH_DIR=$(mktemp -d -t cctally-daily-fixtures-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-daily-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
 

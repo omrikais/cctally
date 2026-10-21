@@ -26,6 +26,10 @@
 #   because the postinstall invokes the script via the interpreter, not a PATH
 #   lookup (spec §7.4).
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -35,7 +39,7 @@ FIXTURES_DIR="$REPO_ROOT/tests/fixtures/npm-postinstall"
 NODE_BIN=$(command -v node 2>/dev/null || true)
 [ -z "$NODE_BIN" ] && { echo "FAIL: node not found on PATH" >&2; exit 1; }
 
-SCRATCH_DIR=$(mktemp -d -t cctally-npm-postinstall-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-npm-postinstall-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 pass_count=0; fail_count=0
 
@@ -87,6 +91,7 @@ EOF
     [ "$QUIET" = "1" ] && quiet_val=1 || quiet_val=0
 
     stdout_file="$work/_stdout.txt"; stderr_file="$work/_stderr.txt"
+    # retention-control: production-behavior -- npm runs the copied package's postinstall script in this cleared environment by design; it reaches only CCTALLY_PYTHON (a stub here, installed code in production, spec I8), so the switch is deliberately absent.
     env -i HOME="$HOME" PATH="/usr/bin:/bin" \
         npm_config_global="$global_val" \
         CCTALLY_NPM_POSTINSTALL_QUIET="$quiet_val" \

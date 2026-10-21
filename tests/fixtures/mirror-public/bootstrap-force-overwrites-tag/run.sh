@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -uo pipefail
 PUB_OLD_TAG_SHA=$(git -C ../public rev-parse v1.0.0)
 python3 bin/cctally-mirror-public \

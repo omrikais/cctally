@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -uo pipefail
 python3 bin/cctally-mirror-public \
   --bootstrap \

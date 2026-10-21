@@ -30,8 +30,10 @@ import pytest
 from conftest import load_script, redirect_paths
 
 UTC = dt.timezone.utc
-NOW = dt.datetime(2026, 7, 6, tzinfo=UTC)
-CURRENT_WEEK_START = dt.datetime(2026, 6, 29, tzinfo=UTC)
+#: Every candidate week below lies wholly inside the `opus-5` coefficient era
+#: (#978), because a stored regime applies only inside its own era.
+NOW = dt.datetime(2026, 9, 14, tzinfo=UTC)
+CURRENT_WEEK_START = dt.datetime(2026, 9, 7, tzinfo=UTC)
 #: Five prior weeks, most recent first — the loop's own order.
 CANDIDATES = [CURRENT_WEEK_START - dt.timedelta(days=7 * n)
               for n in range(1, 6)]
@@ -71,7 +73,7 @@ def _seed_week(conn, cache, start, *, model):
             "INSERT INTO session_files(path, size_bytes, mtime_ns,"
             " last_byte_offset, last_ingested_at, session_id, project_path)"
             " VALUES (?,?,?,?,?,?,?)",
-            (path, 0, 0, 0, "2026-07-06T00:00:00Z", f"s-{tag}",
+            (path, 0, 0, 0, "2026-09-14T00:00:00Z", f"s-{tag}",
              "/fake/repos/alpha"))
         cache.execute(
             "INSERT INTO session_entries(source_path, line_offset,"
@@ -91,8 +93,9 @@ def _write_calibration(entries_model=SUPPORTED_MODEL):
     probe = [qm.EntryRecord(at=NOW, model=entries_model, fresh=200_000,
                             output=40_000, cache_create_total=0, cache_1h=0,
                             cache_read=0)]
-    family_shares, class_shares = qm.aggregate_composition(probe)
-    units = qm.weighted_units(probe[0]) * 3.0
+    era = qm.era_by_id("opus-5")
+    family_shares, class_shares = qm.aggregate_composition(probe, era=era)
+    units = qm.weighted_units(probe[0], era) * 3.0
     per_point = units / 40.0
     payload = {
         "schemaVersion": 1,
@@ -102,6 +105,7 @@ def _write_calibration(entries_model=SUPPORTED_MODEL):
             "effectiveUntil": None,
             "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": "opus-5",
             "unitsPerPoint": per_point,
             "interval": {"lo": per_point * 0.95, "hi": per_point * 1.05},
             "support": {"days": 26, "segments": 4},

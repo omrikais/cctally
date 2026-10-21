@@ -951,6 +951,8 @@ def test_a_crash_at_each_commit_point(tmp_path, monkeypatch, op, point):
 # ── explicit `cache-sync --prune-conversations` (primary's resolution 1) ──
 
 def _cache_sync_prune(ns, capsys):
+    # #965: deletion is this test's subject, so it opts into retention explicitly.
+    ns["save_config"]({"conversation": {"retention_days": 90}})
     import argparse
 
     args = argparse.Namespace(source="all", rebuild=False, prune_orphans=False,

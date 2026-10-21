@@ -165,8 +165,11 @@ def test_registry_survives_rebuild(ns):
 
 def test_classify_legacy_usage_obs_is_claude(ns):
     jr, J, acc = _siblings()
+    # Legacy means a line no account-bound writer stamped (#825/#832 fix
+    # round C): a current-generation line names its account explicitly.
     obs = J.make_obs(at="2026-01-01T00:00:00Z", src="statusline",
-                     provider="claude", payload={"kind": "weekly_usage_snapshot"})
+                     provider="claude", payload={"kind": "weekly_usage_snapshot"},
+                     writer_generation=None)
     assert jr.classify_legacy_provider(obs) == "claude"
     assert jr.legacy_account_key(obs, "claude-legacy-key") == "claude-legacy-key"
 
@@ -174,7 +177,8 @@ def test_classify_legacy_usage_obs_is_claude(ns):
 def test_classify_legacy_quota_obs_is_codex_unattributed(ns):
     jr, J, acc = _siblings()
     obs = J.make_obs(at="2026-01-01T00:00:00Z", src="codex-hook",
-                     provider="codex", payload={"kind": "quota_window_snapshot"})
+                     provider="codex", payload={"kind": "quota_window_snapshot"},
+                     writer_generation=None)
     assert jr.classify_legacy_provider(obs) == "codex"
     assert jr.legacy_account_key(obs, "claude-legacy-key") == acc.UNATTRIBUTED
 

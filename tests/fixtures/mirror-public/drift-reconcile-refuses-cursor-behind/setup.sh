@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 work="$(pwd)"
 REPO_ROOT="$1"
@@ -43,6 +43,11 @@ cp "$REPO_ROOT/.public-tag-patterns" .
 git add -A
 git commit --no-verify -q -m "chore: infra bootstrap"
 git -c tag.gpgsign=false tag mirror-cursor HEAD
+# A local bare private origin: the mirror tool publishes mirror-cursor there
+# itself (bootstrap included), leased on origin's value, and a push it cannot
+# complete is an error, never a warning.
+git init -q --bare "$work/private-origin.git"
+git remote add origin "$work/private-origin.git"
 
 # cwd remains $work/private/ for scenario-specific bash that follows.
 mkdir -p docs

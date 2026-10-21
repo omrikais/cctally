@@ -53,6 +53,10 @@
 #      pre-change endpoint answered.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -117,7 +121,7 @@ assert_contains () {
 # global mutations don't propagate up. Caller invokes as plain
 # `start_server` and reads HOME_DIR / base from the parent shell.
 start_server () {
-    HOME_DIR=$(mktemp -d)
+    HOME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-settings-api-test.XXXXXX") || exit 1
     SCRATCH_HOMES+=("$HOME_DIR")
     local log="$HOME_DIR/dash.log"
     HOME="$HOME_DIR" TZ=Etc/UTC \
@@ -294,7 +298,7 @@ stop_server
 # actual POST broadcast and tolerates an arbitrary number of interloper
 # frames before it.
 start_server || exit 1
-sse_log=$(mktemp)
+sse_log=$(mktemp "${TMPDIR:-/tmp}/cctally-settings-api-test.XXXXXX") || exit 1
 ( curl -sN --max-time 5 "$base/api/events" > "$sse_log" ) &
 sse_pid=$!
 BG_PIDS+=("$sse_pid")

@@ -27,6 +27,7 @@ import json
 import math
 import re
 import statistics
+import typing
 
 from _lib_pricing import _strip_anthropic_model_prefix
 
@@ -36,14 +37,9 @@ from _lib_pricing import _strip_anthropic_model_prefix
 # fitted under a different fingerprint is `stale`.
 # ---------------------------------------------------------------------------
 
-#: Weights in "fresh input token" equivalents. Calibrated on Opus-5-dominated
-#: traffic; the five-minute cache-write quantity is weighted as fresh input.
-TOKEN_CLASS_WEIGHTS: dict[str, float] = {
-    "fresh": 1.0,
-    "output": 4.73,
-    "cache_1h": 1.03,
-    "cache_read": 0.0031,
-}
+#: The four weighted token classes, in the order every era states its
+#: weights. The five-minute cache-write quantity is weighted as fresh input.
+TOKEN_CLASSES: tuple[str, ...] = ("fresh", "output", "cache_1h", "cache_read")
 
 #: Recognized model spellings (case-folded, provider prefix stripped, anchored
 #: terminal -YYYYMMDD removed) resolved to their canonical family. An
@@ -87,6 +83,12 @@ FAMILY_ALIASES: dict[str, str] = {
     "claude-mythos-5": "claude-mythos-5",
     "claude-mythos-5-1": "claude-mythos-5-1",
     "claude-mythos-preview": "claude-mythos-5",
+    # The 5.5 generation (#978). Each is its OWN canonical family, on the
+    # #704 precedent: pooling one into the family it follows would assert
+    # equal per-unit consumption, which nothing here establishes.
+    "claude-opus-5-5": "claude-opus-5-5",
+    "claude-sonnet-5-5": "claude-sonnet-5-5",
+    "claude-haiku-5-5": "claude-haiku-5-5",
 }
 
 #: Whether a canonical family drains the general weekly quota, drains a
@@ -114,6 +116,9 @@ FAMILY_PARTICIPATION: dict[str, str] = {
     "claude-fable-5-1": "general",
     "claude-mythos-5": "general",
     "claude-mythos-5-1": "general",
+    "claude-opus-5-5": "general",
+    "claude-sonnet-5-5": "general",
+    "claude-haiku-5-5": "general",
 }
 
 #: Where each classification came from, so a later reader can re-test it
@@ -121,6 +126,12 @@ FAMILY_PARTICIPATION: dict[str, str] = {
 #: operator-supplied and are NOT derivable from this repository. No family is
 #: ever classified "unknown" on the strength of unfamiliarity with it: an
 #: unrecognized family is escalated to the operator instead.
+_PROVENANCE_55: str = (
+    "operator-supplied in #978 (2026-10-18), confirmed by the 2026-10-20 "
+    "handoff: participates in the general weekly meter; modelled with the "
+    "selected coefficient era's shared token-class coefficients"
+)
+
 FAMILY_PROVENANCE: dict[str, str] = {
     "claude-fable-5": (
         "operator-supplied 2026-08-28: drains a dedicated pool AND the "
@@ -143,6 +154,10 @@ FAMILY_PROVENANCE: dict[str, str] = {
         "general weekly meter on the same terms as claude-mythos-5; only "
         "the general draining is modelled"
     ),
+    # Participation is the operator's statement, never the API price card.
+    "claude-opus-5-5": _PROVENANCE_55,
+    "claude-sonnet-5-5": _PROVENANCE_55,
+    "claude-haiku-5-5": _PROVENANCE_55,
 }
 
 #: Eligibility fence parameters (section 5).
@@ -193,14 +208,70 @@ MIX_SUPPORT: dict[str, object] = {
     "token_class_max_relative_effect": 0.05,
 }
 
-#: Producer policy that changes which retained requests the fitted model
-#: represents. It is fingerprinted with the arithmetic because moving the era
-#: floor or admitting another billing class changes the fitted answer just as
-#: surely as editing a coefficient does.
-COEFFICIENT_SUPPORT: dict[str, str] = {
-    "supportedCompositionFrom": "2026-07-25",
-    "fastModeParticipation": "usage-credits-only-excluded",
-}
+#: The fast-mode policy every validated era applies: fast-mode requests are
+#: billed to usage credits only and never reach the weekly meter.
+FAST_MODE_PARTICIPATION: str = "usage-credits-only-excluded"
+
+
+@dataclasses.dataclass(frozen=True)
+class CoefficientEra:
+    """One validated coefficient era: a half-open UTC date interval, the four
+    token-class weights fitted for it, its support policy and provenance.
+
+    `start` is inclusive and `end` exclusive, both at UTC midnight; an open
+    era has `end=None`. `weights` is a tuple of `(class, weight)` pairs in
+    `TOKEN_CLASSES` order, so the record stays immutable and hashable.
+    """
+
+    id: str
+    start: "dt.date"
+    end: "dt.date | None"
+    weights: tuple
+    fast_mode_participation: str
+    provenance: str
+
+    def weight_map(self) -> dict[str, float]:
+        """The weights as a fresh `{class: weight}` dict the caller may own."""
+        return {name: float(weight) for name, weight in self.weights}
+
+
+#: The ordered, immutable table of validated coefficient eras (spec 4.2).
+#: Exactly one era covers any instant from 2026-07-25 on; earlier history is
+#: covered by none and stays unvalidated. There is deliberately no mutable
+#: "current weights" global: every weighting path asks this table.
+COEFFICIENT_ERAS: tuple = (
+    CoefficientEra(
+        id="opus-5",
+        start=dt.date(2026, 7, 25),
+        end=dt.date(2026, 9, 22),
+        weights=(("fresh", 1.0), ("output", 4.73), ("cache_1h", 1.03),
+                 ("cache_read", 0.0031)),
+        fast_mode_participation=FAST_MODE_PARTICIPATION,
+        provenance='The Opus 5 calibration, docs/quota-model.md "The finding"',
+    ),
+    CoefficientEra(
+        id="opus-5-5",
+        start=dt.date(2026, 9, 22),
+        end=None,
+        weights=(("fresh", 1.0), ("output", 0.64), ("cache_1h", 1.0),
+                 ("cache_read", 0.0148)),
+        fast_mode_participation=FAST_MODE_PARTICIPATION,
+        provenance=("The 2026-10-18 Opus 5.5 refit; output weakly identified "
+                    "(95% CI 0.23\u20131.13), cache read sharp "
+                    "(0.0128\u20130.0168)"),
+    ),
+)
+
+
+def _era_payload(era: CoefficientEra) -> dict:
+    return {
+        "id": era.id,
+        "from": era.start.isoformat(),
+        "until": None if era.end is None else era.end.isoformat(),
+        "tokenClassWeights": era.weight_map(),
+        "fastModeParticipation": era.fast_mode_participation,
+        "provenance": era.provenance,
+    }
 
 #: The reading-to-interval rule of section 4. Bumped when that rule changes.
 DISPLAY_RULE_REVISION: int = 1
@@ -229,8 +300,8 @@ DEDICATED_POOL_SCOPE_NOTE: str = (
     "only general-quota draining is modelled"
 )
 
-QUOTA_MODEL_ALGORITHM_REVISION: int = 3
-QUOTA_MODEL_VERIFIED_AT: str = "2026-08-29"
+QUOTA_MODEL_ALGORITHM_REVISION: int = 4
+QUOTA_MODEL_VERIFIED_AT: str = "2026-10-20"
 
 
 def constants_payload() -> dict:
@@ -244,7 +315,6 @@ def constants_payload() -> dict:
         "algorithmRevision": QUOTA_MODEL_ALGORITHM_REVISION,
         "verifiedAt": QUOTA_MODEL_VERIFIED_AT,
         "displayRuleRevision": DISPLAY_RULE_REVISION,
-        "tokenClassWeights": dict(TOKEN_CLASS_WEIGHTS),
         "familyAliases": dict(FAMILY_ALIASES),
         "familyParticipation": dict(FAMILY_PARTICIPATION),
         "familyProvenance": dict(FAMILY_PROVENANCE),
@@ -252,7 +322,7 @@ def constants_payload() -> dict:
         "detector": dict(DETECTOR),
         "trust": dict(TRUST),
         "mixSupport": dict(MIX_SUPPORT),
-        "coefficientSupport": dict(COEFFICIENT_SUPPORT),
+        "coefficientEras": [_era_payload(era) for era in COEFFICIENT_ERAS],
     }
 
 
@@ -268,7 +338,7 @@ def constants_fingerprint() -> str:
 #: constant above without re-pinning this line is caught rather than silently
 #: invalidating every persisted calibration.
 QUOTA_MODEL_CONSTANTS_FINGERPRINT: str = (
-    "0cd932a7f8caa5d9bec7010ed5d800935e5c78332ae060c1142650943512a24a"
+    "5835b430978b2fc556c577d44c9e62d5d7807e62533b32819ed63d37e3af671a"
 )
 
 
@@ -735,12 +805,136 @@ def token_class_units(e: EntryRecord) -> dict[str, float] | None:
     }
 
 
-def weighted_units(e: EntryRecord) -> float | None:
-    """Weighted quota units for one entry, or None when the split is unknown."""
+# ---------------------------------------------------------------------------
+# Coefficient eras (#978, spec section 4.2).
+#
+# One covering era per instant, selected by the instant alone and never by
+# the model name. The raw decomposition above is era-independent; everything
+# that turns raw class quantities into units goes through `class_units`.
+# ---------------------------------------------------------------------------
+#: `weigh_entry`'s cause when no validated era covers the entry, or the
+#: explicitly requested era does not. A member of `EVIDENCE_CODES`.
+ERA_UNAVAILABLE: str = "unvalidated-coefficient-era"
+
+#: `weigh_entry`'s cause when `token_class_units` cannot split the entry.
+SPLIT_UNKNOWN: str = "token-split-unknown"
+
+
+class CoefficientEraMismatch(ValueError):
+    """A population-level operation was handed an instant outside its era.
+
+    Units from two eras are never added together or divided by one budget
+    (spec section 4.2, invariant 5), so the refusal is loud rather than a
+    silent reweighting.
+    """
+
+
+def _utc_midnight(date) -> "dt.datetime":
+    return dt.datetime.combine(date, dt.time(0, 0), tzinfo=dt.timezone.utc)
+
+
+def era_bounds(era: CoefficientEra) -> tuple:
+    """`(start, end)` as aware UTC-midnight instants; `end` None when open."""
+    return (_utc_midnight(era.start),
+            None if era.end is None else _utc_midnight(era.end))
+
+
+def era_contains(era: CoefficientEra, at: "dt.datetime") -> bool:
+    """`start <= at < end`, the half-open interval, for an aware instant."""
+    require_aware(at, "at")
+    start, end = era_bounds(era)
+    return at >= start and (end is None or at < end)
+
+
+def era_for_instant(at: "dt.datetime") -> "CoefficientEra | None":
+    """The one validated era covering `at`, or None before 2026-07-25.
+
+    Raises on a naive datetime: a host-local reading would move the boundary
+    by the process's UTC offset.
+    """
+    require_aware(at, "at")
+    for era in COEFFICIENT_ERAS:
+        if era_contains(era, at):
+            return era
+    return None
+
+
+def era_by_id(era_id: object) -> "CoefficientEra | None":
+    """The era whose identifier is exactly `era_id`, or None.
+
+    Anything that is not a known identifier string — None, a number, an
+    unknown name — is None, which a stored-regime reader treats as
+    malformed.
+    """
+    if not isinstance(era_id, str):
+        return None
+    for era in COEFFICIENT_ERAS:
+        if era.id == era_id:
+            return era
+    return None
+
+
+def class_units(classes, era: CoefficientEra) -> float:
+    """Raw class quantities weighted by `era`'s coefficients.
+
+    The ONLY place in this module a quantity is multiplied by a weight, so
+    every aggregation path weights with the era it was given and none can keep
+    a multiplication of its own.
+    """
+    weights = era.weight_map()
+    return sum(float(classes.get(name, 0.0)) * weights[name]
+               for name in TOKEN_CLASSES)
+
+
+class EntryWeighting(typing.NamedTuple):
+    """One entry's weighted units, or None with the typed reason why."""
+
+    units: "float | None"
+    cause: "str | None"
+
+
+def weigh_entry(e: EntryRecord,
+                era: "CoefficientEra | None" = None) -> EntryWeighting:
+    """Weighted units for one entry under its covering era.
+
+    With `era=None` the era is the one covering the entry's instant. An
+    instant no validated era covers, or an explicit `era` that does not
+    contain it, is `ERA_UNAVAILABLE` — checked FIRST, so an uncovered entry is
+    never reported as a split problem. An unknown split is `SPLIT_UNKNOWN`.
+    """
+    covering = era_for_instant(e.at) if era is None else (
+        era if era_contains(era, e.at) else None)
+    if covering is None:
+        return EntryWeighting(None, ERA_UNAVAILABLE)
     classes = token_class_units(e)
     if classes is None:
-        return None
-    return sum(qty * TOKEN_CLASS_WEIGHTS[name] for name, qty in classes.items())
+        return EntryWeighting(None, SPLIT_UNKNOWN)
+    return EntryWeighting(class_units(classes, covering), None)
+
+
+def weighted_units(e: EntryRecord,
+                   era: "CoefficientEra | None" = None) -> float | None:
+    """Weighted quota units for one entry, or None when it cannot be weighted.
+
+    None covers both an unknown split and an instant outside every validated
+    era (or outside `era`); `weigh_entry` says which.
+    """
+    return weigh_entry(e, era).units
+
+
+def _require_era(era) -> CoefficientEra:
+    if not isinstance(era, CoefficientEra):
+        raise TypeError(f"era must be a CoefficientEra, got {era!r}")
+    return era
+
+
+def _require_in_era(era: CoefficientEra, instants, label: str) -> None:
+    """Raise `CoefficientEraMismatch` on the first instant outside `era`."""
+    for at in instants:
+        if not era_contains(era, at):
+            raise CoefficientEraMismatch(
+                f"{label} {at.isoformat()} lies outside coefficient era "
+                f"{era.id!r}")
 
 
 def integer_percent(value: float) -> int:
@@ -1055,8 +1249,8 @@ def _day_slices(segments, now):
             )
 
 
-def build_daily_series(segments, entries, *, now,
-                       newest_entry_at) -> list[DailyObservation]:
+def build_daily_series(segments, entries, *, now, newest_entry_at,
+                       era: CoefficientEra) -> list[DailyObservation]:
     """One observation per complete UTC date, in date order.
 
     Within one day and one segment the observation runs from the first to the
@@ -1082,12 +1276,21 @@ def build_daily_series(segments, entries, *, now,
     unfinished, so reporting it as `no-local-history` asserts something false
     and, because it always falls on or after any split date, withheld every
     verdict at exit 3. `in_progress_dates` reports it as a diagnostic instead.
+
+    `era` is the ONE coefficient era the whole series is weighted with
+    (#978). Every entry and every segment reading must lie inside it, and a
+    population that does not raises `CoefficientEraMismatch` rather than
+    summing units from two eras.
     """
     require_aware(now, "now")
     if newest_entry_at is not None:
         require_aware(newest_entry_at, "newest_entry_at")
     for entry in entries:
         require_aware(entry.at, "entry.at")
+    _require_era(era)
+    _require_in_era(era, (e.at for e in entries), "entry.at")
+    _require_in_era(era, (r.at for seg in segments for r in seg.rows),
+                    "snapshot.at")
     ordered = sorted(entries, key=lambda e: e.at)
     instants = [e.at for e in ordered]
 
@@ -1122,7 +1325,7 @@ def build_daily_series(segments, entries, *, now,
         # token count per class, which is what the composition support vector
         # is (section 34) — a coefficient-weighted share cannot carry the
         # materiality floor derived from those same coefficients.
-        raw = {name: 0.0 for name in TOKEN_CLASS_WEIGHTS}
+        raw = {name: 0.0 for name in TOKEN_CLASSES}
         units = 0.0
         families: dict = {}
         split_unknown = False
@@ -1136,10 +1339,9 @@ def build_daily_series(segments, entries, *, now,
             if quantities is None:
                 split_unknown = True
                 continue
-            entry_units = 0.0
             for name, qty in quantities.items():
                 raw[name] += qty
-                entry_units += qty * TOKEN_CLASS_WEIGHTS[name]
+            entry_units = class_units(quantities, era)
             units += entry_units
             families[family] = families.get(family, 0.0) + entry_units
         raw_total = sum(raw.values())
@@ -1186,7 +1388,8 @@ def in_progress_dates(segments, *, now) -> tuple:
                          if sl.kind == "in-progress"}))
 
 
-def unattributed_units(segments, entries, *, now) -> dict:
+def unattributed_units(segments, entries, *, now,
+                       era: CoefficientEra) -> dict:
     """Weighted units and entry count on NO observation's token interval.
 
     Section 14 requires this diagnostic rather than a silent discard. An
@@ -1203,7 +1406,17 @@ def unattributed_units(segments, entries, *, now) -> dict:
     the general-quota entries whose token split is known, because that is the
     quantity the fit would have used; a dedicated-pool entry is reported as
     present and contributes nothing, exactly as it would inside an interval.
+
+    `era` is the one coefficient era the series is weighted with, and the
+    same out-of-era refusal applies as in `build_daily_series`.
     """
+    _require_era(era)
+    entries = list(entries)
+    for entry in entries:
+        require_aware(entry.at, "entry.at")
+    _require_in_era(era, (e.at for e in entries), "entry.at")
+    _require_in_era(era, (r.at for seg in segments for r in seg.rows),
+                    "snapshot.at")
     windows = sorted((s.first_at, s.last_at)
                      for s in _day_slices(segments, now)
                      if s.kind == "attributed")
@@ -1218,7 +1431,7 @@ def unattributed_units(segments, entries, *, now) -> dict:
         count += 1
         if family_participation(normalize_family(entry.model)) != "general":
             continue
-        units = weighted_units(entry)
+        units = weighted_units(entry, era)
         if units is not None:
             total += units
     return {"units": total, "entries": count}
@@ -1317,7 +1530,7 @@ def support_radius(vectors, centre) -> float | None:
     return median(distances) + MIX_SUPPORT["fence_mads"] * spread
 
 
-def token_class_floor(centre) -> float | None:
+def token_class_floor(centre, *, era: CoefficientEra) -> float | None:
     """Materiality floor for the token-class radius, at `centre`.
 
     Derived, not asserted. For raw share distributions
@@ -1325,19 +1538,22 @@ def token_class_floor(centre) -> float | None:
     movement of the weighted-unit total at
     `MIX_SUPPORT["token_class_max_relative_effect"]` bounds the admissible
     total-variation distance at `effect * mu / spread`, where `mu` is the
-    centre's own weighted value and `spread` is the coefficient range. At the
-    shipped coefficients the spread is 4.73 - 0.0031 = 4.7269, so a fresh-only
-    centre admits about 0.01058 — half the 10% detection-width gate and a
-    third of the 15% prediction-width gate.
+    centre's own weighted value and `spread` is the coefficient range of the
+    selected `era` (#978). Under `opus-5` the spread is 4.73 - 0.0031 =
+    4.7269, so a fresh-only centre admits about 0.01058 — half the 10%
+    detection-width gate and a third of the 15% prediction-width gate. Under
+    `opus-5-5` it is 1.0 - 0.0148 = 0.9852, and a fresh-only centre admits
+    about 0.0507511.
 
     None when the centre is undefined, which is a mix finding in its own right
     and never reaches here.
     """
+    _require_era(era)
     if centre is None:
         return None
-    mu = sum(float(centre.get(name, 0.0)) * weight
-             for name, weight in TOKEN_CLASS_WEIGHTS.items())
-    spread = max(TOKEN_CLASS_WEIGHTS.values()) - min(TOKEN_CLASS_WEIGHTS.values())
+    weights = era.weight_map()
+    mu = class_units(centre, era)
+    spread = max(weights.values()) - min(weights.values())
     if spread <= 0.0 or not math.isfinite(mu) or mu <= 0.0:
         return None
     return float(MIX_SUPPORT["token_class_max_relative_effect"]) * mu / spread
@@ -1364,7 +1580,7 @@ def effective_radius(empirical, floor) -> float | None:
     return max(empirical, floor)
 
 
-def aggregate_composition(entries) -> tuple | None:
+def aggregate_composition(entries, *, era: CoefficientEra) -> tuple | None:
     """One `(family_shares, class_shares)` pair over a set of entries.
 
     The forecast population is a set of entries rather than a set of days
@@ -1374,8 +1590,16 @@ def aggregate_composition(entries) -> tuple | None:
 
     None when no general-quota entry with a known token split contributes,
     because an empty population supports no comparison.
+
+    `era` is the one coefficient era the population is weighted with; an
+    entry outside it raises `CoefficientEraMismatch` (#978).
     """
-    raw = {name: 0.0 for name in TOKEN_CLASS_WEIGHTS}
+    _require_era(era)
+    entries = list(entries)
+    for entry in entries:
+        require_aware(entry.at, "entry.at")
+    _require_in_era(era, (e.at for e in entries), "entry.at")
+    raw = {name: 0.0 for name in TOKEN_CLASSES}
     families: dict = {}
     for entry in entries:
         family = normalize_family(entry.model)
@@ -1384,10 +1608,9 @@ def aggregate_composition(entries) -> tuple | None:
         quantities = token_class_units(entry)
         if quantities is None:
             continue
-        units = 0.0
         for name, qty in quantities.items():
             raw[name] += qty
-            units += qty * TOKEN_CLASS_WEIGHTS[name]
+        units = class_units(quantities, era)
         families[family] = families.get(family, 0.0) + units
     raw_total = sum(raw.values())
     unit_total = sum(families.values())
@@ -2160,6 +2383,7 @@ def _composition_provenance(*, confirmed, reference_days, decisive_days,
 
 
 def analyse(series, *, now, newest_at, forecast_population,
+            era: CoefficientEra, current_week_withheld: "str | None" = None,
             fingerprint_matches=True, observed_percent=None,
             current_week_units=None, current_week_start=None,
             current_week_end=None, override_split=None, extra_statuses=(),
@@ -2199,7 +2423,16 @@ def analyse(series, *, now, newest_at, forecast_population,
     non-finite or negative value withholds the evidence that depends on it
     with a typed code, because a NaN propagates through the headroom
     arithmetic into a published interval instead of raising.
+
+    `era` is the ONE coefficient era the analysis is fitted in (#978): the
+    support floor uses its weights and the forecast probe aggregates under
+    it, and a forecast entry outside it raises `CoefficientEraMismatch`.
+    `current_week_withheld`, when set, is an `EVIDENCE_CODES` member that
+    withholds the current week's consumption, headroom and projection while
+    leaving `fitted` untouched — the glue's rule for a subscription week that
+    spans the era boundary, whose units must never be summed across eras.
     """
+    _require_era(era)
     require_aware(now, "now")
     for label, value in (("newest_at", newest_at),
                          ("current_week_start", current_week_start),
@@ -2209,6 +2442,8 @@ def analyse(series, *, now, newest_at, forecast_population,
     forecast_entries = list(forecast_population)
     for entry in forecast_entries:
         require_aware(entry.at, "forecast_entry.at")
+    _require_in_era(era, (e.at for e in forecast_entries),
+                    "forecast_entry.at")
 
     rejected: list[str] = []
     if current_week_units is not None and not _usable_quantity(
@@ -2278,7 +2513,7 @@ def analyse(series, *, now, newest_at, forecast_population,
     family_radius = effective_radius(
         family_radius, float(MIX_SUPPORT["family_tv_floor"]))
     class_radius = effective_radius(
-        class_radius, token_class_floor(class_centre))
+        class_radius, token_class_floor(class_centre, era=era))
 
     # Section 35: after a confirmed change only the entries at or after the
     # successor boundary belong to the current regime, and they are measured
@@ -2289,7 +2524,7 @@ def analyse(series, *, now, newest_at, forecast_population,
             if e.at.astimezone(dt.timezone.utc).date() >= detector.split_date]
     else:
         probed_entries = forecast_entries
-    forecast_shares = (aggregate_composition(probed_entries)
+    forecast_shares = (aggregate_composition(probed_entries, era=era)
                        if probed_entries else None)
 
     contributed = list(extra_statuses)
@@ -2431,6 +2666,13 @@ def analyse(series, *, now, newest_at, forecast_population,
                                   week_start=current_week_start,
                                   week_end=current_week_end,
                                   qualifications=published_qualifications)
+    if current_week_withheld is not None:
+        consumption = evidence_withheld(current_week_withheld, population,
+                                        published_qualifications)
+        headroom = evidence_withheld(current_week_withheld, population,
+                                     published_qualifications)
+        projection = evidence_withheld(current_week_withheld, population,
+                                       published_qualifications)
 
     merged = dict(diagnostics or {})
     merged.update({

@@ -12,7 +12,14 @@ cctally quota --reset-calibration
 
 ## What the fitted value is, and what it is not
 
-The command fits one number: the **effective blended weighted units per general-weekly point**. Weighted units are token counts scaled by four fixed coefficients — fresh input at 1.0, output at 4.73, one-hour cache writes at 1.03 and cache reads at 0.0031 — and the fitted value is the total weighted units your history spent divided by the total meter movement it produced.
+The command fits one number: the **effective blended weighted units per general-weekly point**. Weighted units are token counts scaled by four fixed token-class coefficients, and the fitted value is the total weighted units your history spent divided by the total meter movement it produced. The coefficients belong to a **coefficient era**, a date range they were calibrated for:
+
+| Era | Dates (UTC) | Fresh input | Output | One-hour cache writes | Cache reads |
+| --- | --- | --- | --- | --- | --- |
+| `opus-5` | 2026-07-25 to 2026-09-22 | 1.0 | 4.73 | 1.03 | 0.0031 |
+| `opus-5-5` | from 2026-09-22 | 1.0 | 0.64 | 1.0 | 0.0148 |
+
+The `opus-5-5` output coefficient is weakly identified: its 95% interval runs from 0.23 to 1.13, because output is a small share of the units the refit saw. Its cache-read coefficient is sharp (0.0128 to 0.0168). Five-minute cache writes are weighted as fresh input in both eras.
 
 Four disclosures follow from how that value was obtained, and none of them is a caveat you can safely skip.
 
@@ -20,9 +27,11 @@ Four disclosures follow from how that value was obtained, and none of them is a 
 
 **It is the provider's budget minus an unmeasured, workload-dependent amount.** Your quota is charged for work this machine cannot see — usage from claude.ai, the desktop app, another machine, and the summarisation call a compaction makes, which carries no `usage` block and never reaches local session data. Every one of those raises the meter without raising the local token total, so the fitted units-per-point comes out lower than the provider's own figure by however much of that you do.
 
-**No per-family multiplier ships.** Every family known to drain the general weekly meter contributes through the same four token-class coefficients. The research prototype carried a `MODEL_WEIGHT_DEFAULT` of 0.70 for anything it did not recognise; nothing like it ships, and an unrecognised family withholds the day instead.
+**No per-family multiplier ships.** Every family known to drain the general weekly meter contributes through the same four token-class coefficients of the era in force. The Opus 5.5, Sonnet 5.5 and Haiku 5.5 families are recognised and drain the general weekly meter, which the operator confirmed rather than an API price card. The research prototype carried a `MODEL_WEIGHT_DEFAULT` of 0.70 for anything it did not recognise; nothing like it ships, and an unrecognised family withholds the day instead.
 
-**The coefficients were calibrated on Opus-5-dominated traffic.** The analysis start is therefore floored at 2026-07-25, the Opus 5 changeover, whatever `--since` you pass. Earlier history is a different metering era whose composition these coefficients have no validation for, and it is excluded rather than fitted. If your entire retained history predates that date the command reports `unvalidated-coefficient-era` and withholds.
+**One era per analysis, selected by the clock.** The command analyses only the era that contains the current time, so today that is `opus-5-5` and the analysis starts at 2026-09-22 whatever `--since` you pass. `--since` and `--watch-from` narrow the window and never cross into an earlier era: days from two eras weigh the same tokens differently, so they are never summed or fitted together, and the change of coefficients on 2026-09-22 is never reported as a metering-rate change. A `--watch-from` earlier than the era's start evaluates the first in-era day with an empty baseline, which cannot confirm a change. History before 2026-07-25 is covered by no validated era and stays unvalidated. If your entire retained history predates the selected era the command reports `unvalidated-coefficient-era` and withholds at exit `3`; with only a few days in the era it reports `insufficient-history` or `unstable-fit` at exit `4`.
+
+**A subscription week that spans an era boundary is not modelled.** Its units would come from two eras, and the in-era part is not the whole week, so the week's modelled consumption, observed-minus-modelled, headroom and projection are withheld with the code `unvalidated-coefficient-era`. The observed reading and the fitted calibration are still published when they are independently valid. The terminal report's `(supported composition: …)` line names the selected era's dates, for example `2026-09-22 onward`.
 
 **Fast mode is paid outside the subscription quota.** Anthropic's [Fast mode documentation](https://code.claude.com/docs/en/fast-mode) says subscription fast-mode requests draw directly from usage credits even while plan quota remains, so rows recorded with `speed = fast` are excluded from the weekly-plan fit and counted in `health.fastModeEntriesExcluded`. Standard and unmarked rows keep their existing treatment.
 
@@ -30,7 +39,7 @@ Four disclosures follow from how that value was obtained, and none of them is a 
 
 | Flag | Effect |
 | --- | --- |
-| `--since DATE` | Ignore data before this ISO date or timestamp. It narrows the window and never widens it past the supported-composition floor. |
+| `--since DATE` | Ignore data before this ISO date or timestamp. It narrows the window and never widens it past the start of the selected coefficient era. |
 | `--watch-from DATE` | Evaluate this split date instead of scanning for one. It bypasses the scan and the multiplicity correction, never the health or fit gates. A run passing it persists nothing. |
 | `--account REF` | Scope to one account. The reference resolves case-insensitively as a label, an email or a unique key prefix. |
 | `--json` | Emit the machine-readable payload described below (`schemaVersion: 1`). |
@@ -71,6 +80,8 @@ The terminal report prints both, labelled. The JSON publishes `composition.famil
 **Every day containing a model this build does not recognise is withheld as `unsupported-model-mix` at exit `3`, and it stays withheld until the family catalogue is updated.** A family's participation in the general weekly quota is not derivable from token counts, so an unrecognised name is treated as unknown rather than assumed. That is deliberate — assuming a new family drains the general meter at the shared exchange rate is exactly the kind of silent, wrong answer this command exists to avoid — but the consequence is worth stating plainly: on the day Anthropic ships a new family, this command stops answering for anyone using it, and stays stopped until a release adds the family to the catalogue.
 
 Updating the catalogue changes the constants payload, so `QUOTA_MODEL_CONSTANTS_FINGERPRINT` must be re-pinned in the same change. **Re-pinning it marks every persisted calibration stale**, on every machine, because each stored regime records the fingerprint it was fitted under and a mismatch means the stored value was fitted under constants that no longer apply. The command does not act on a stale regime; it fits a fresh one, appends it, and leaves the old value untouched, because that value was true under its own constants. A user therefore sees one run reporting `stale` only if their fresh evidence is too thin to fit — otherwise the calibration self-heals on the first run under the new build.
+
+The same rule holds for a change of coefficient era. Each stored regime also records the era it was fitted in, and a regime from another era is reported `stale` and replaced on the next successful automatic fit, exactly as a fingerprint change is. A stored rate from one era is never applied to a week or to entries outside that era: `forecast`, `project` and projected alerts fall back to their uncalibrated basis for such a week instead. A run whose clock is set inside an earlier era than the stored regime's persists nothing, so a historical run never overwrites the present calibration. Two adjacent regimes from different eras are never compared as a metering-rate transition.
 
 ## When the metering rate changes
 
@@ -153,6 +164,10 @@ Above one real account the per-account payloads appear under `accounts`, and the
 
 Every calibration value takes the same evidence shape: `state` is `available` or `withheld`; an available value carries `value`, `interval`, `support` and `population`; a withheld one carries a typed `code` and no value at all. There is no confidence field on any of them, because the design never defined what a confidence would mean here.
 
+The coefficient-era fields are additive. `method.supportedCompositionFrom` is the selected era's start. `method.coefficientSupport` carries `supportedCompositionFrom`, `supportedCompositionUntil` (the era's exclusive end, or `null` for the open era), `coefficientEra` (the selected era's id) and `fastModeParticipation`. `method.coefficientEras` lists the whole catalogue in order: the unvalidated record before 2026-07-25 (`id: null`, no weights), then `opus-5` and `opus-5-5`, each with `id`, `from`, `until`, `state`, `provenance` and `tokenClassWeights`.
+
+These fields can be `null` when the clock selects no era. That happens only for a clock before 2026-07-25, which no real run has and which is reachable only through the test harnesses' fixed clock. Such a run reads nothing, so `scope.analysisStart`, `method.supportedCompositionFrom`, and `supportedCompositionFrom`, `supportedCompositionUntil` and `coefficientEra` inside `method.coefficientSupport` are all `null`. The run reports status `unvalidated-coefficient-era` with `health.storeCause` `history-predates-supported-composition` and exits `3`. `method.coefficientEras` still lists the whole catalogue. Under any real clock `scope.analysisStart` and `method.supportedCompositionFrom` are strings, and only `supportedCompositionUntil` is `null`, for the open era.
+
 Every JSON timestamp is RFC 3339 UTC with a trailing `Z`, including timestamps read back from an older calibration file that used an explicit `+00:00` offset.
 
 `verdict` is the closed set `rate-change-detected | no-rate-change | withheld`. `status` is the closed set `ok`, `insufficient-history`, `fragmented-history`, `unstable-fit`, `local-history-incomplete`, `unsupported-model-mix`, `unvalidated-coefficient-era`, `token-split-unknown`, `stale`, `future`, `unavailable`.
@@ -165,7 +180,7 @@ Every JSON timestamp is RFC 3339 UTC with a trailing `Z`, including timestamps r
 
 A bounded exact scan is still valid evidence, so truncation is **not** a status and does not mark the calibration unhealthy. It is disclosed instead: when `historyTruncated` is true the terminal report states that only the most recent 64 of N eligible days were scanned and where the scan started.
 
-The two date bounds compose in a fixed order. The 2026-07-25 coefficient-era floor first removes unsupported history; the detector then takes at most the most recent 64 eligible days from what remains. The eligibility fence, including the baseline side of a confirmed split, is computed from that same bounded population, so pre-horizon volume cannot change which scanned days qualify.
+The two date bounds compose in a fixed order. The start of the selected coefficient era (2026-09-22 for `opus-5-5`) first removes history from other eras; the detector then takes at most the most recent 64 eligible days from what remains. The eligibility fence, including the baseline side of a confirmed split, is computed from that same bounded population, so pre-horizon volume cannot change which scanned days qualify.
 
 ## What is out of scope
 

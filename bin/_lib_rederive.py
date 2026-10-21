@@ -144,6 +144,24 @@ _OP_CLASSIFICATIONS = {
         "retained", "operator Codex window attribution is outside claude-usage"),
     "codex_window_attribution_retract": KindClassification(
         "retained", "operator Codex window retraction is outside claude-usage"),
+    # #825/#832 spec 5.1. The versioned reviewed decision is replayed into
+    # scratch exactly like its previous-release twin.
+    "claude_weekly_observation_decision_v2": KindClassification(
+        "retained_input",
+        "reviewed weekly-axis decisions are replayed into scratch"),
+    # The account-bound protocol ops are fence metadata: they decide what is
+    # admitted and anchor the legacy spool baseline, and nothing in the
+    # claude-usage family derives them.
+    "account_bound_cutover": KindClassification(
+        "retained", "the account-bound journal fence is replayed, never "
+        "re-derived"),
+    "legacy_spool_activity": KindClassification(
+        "retained", "legacy spool evidence is replayed, never re-derived"),
+    # The versioned journal-repair acknowledgement is an audit record over the
+    # raw prefix, outside claude-usage (its previous-release twin is consumed
+    # by the selector directly and never registered).
+    "journal_protocol_resolution_v2": KindClassification(
+        "retained", "journal-repair acknowledgements are audit records"),
 }
 
 
@@ -1310,6 +1328,45 @@ def _reconcile_snapshot_identities(
         )
 
 
+def _suppression_deletes_snapshot(record: Mapping, *, weekly: bool,
+                                  five_hour: bool) -> bool:
+    """Whether the stale-replica suppressions naming one snapshot delete it
+    (#825/#832 spec 4.7 revisions 6 and 7), as the journal appliers
+    materialize them. A five-hour credit retires an unheld row's five-hour
+    reading in place and deletes a held row; a weekly suppression makes a row
+    that carries its own five-hour reading weekly-held and deletes a row that
+    keeps no evidence on either axis. Both retirements together delete the
+    row, in either order."""
+    payload = record.get("payload") or {}
+    held = payload.get("weekly_observation_held") == 1
+    carries_five_hour = (
+        payload.get("five_hour_percent") is not None
+        and payload.get("five_hour_resets_at") is not None
+        and payload.get("source") != "record-credit"
+    )
+    if weekly and five_hour:
+        return True
+    if five_hour:
+        return held
+    if weekly:
+        return not carries_five_hour
+    return False
+
+
+def _without_snapshot_suppression(payload: Mapping) -> Mapping:
+    """``payload`` without its `weekly_usage_snapshots` stale-replica
+    suppression list. Since spec 4.7 revision 7 (fix round K16b) a
+    suppression that names a reviewed-held snapshot can leave it
+    materialized (a weekly credit keeps a row carrying its own five-hour
+    reading weekly-held), and that list is then a retirement effect on the
+    snapshot, not a reference that depends on it."""
+    if ("suppression" not in payload
+            or payload.get("suppression_table", "weekly_usage_snapshots")
+            != "weekly_usage_snapshots"):
+        return payload
+    return {key: value for key, value in payload.items() if key != "suppression"}
+
+
 def _preserve_reviewed_hold_dependencies(
     current: Mapping[str, Mapping], desired: dict[str, Mapping],
     reviewed_weekly_hold_ids=(), historical_close_markers=None,
@@ -1334,9 +1391,11 @@ def _preserve_reviewed_hold_dependencies(
     }
     if not snapshot_ids:
         return
-    suppressed_snapshot_ids = set()
+    weekly_named: set = set()
+    five_hour_named: set = set()
     for record in (*current.values(), *desired.values()):
-        suppression = (record.get("payload") or {}).get("suppression")
+        payload = record.get("payload") or {}
+        suppression = payload.get("suppression")
         if suppression is None:
             continue
         if not isinstance(suppression, list) or any(
@@ -1346,7 +1405,26 @@ def _preserve_reviewed_hold_dependencies(
                 "reviewed weekly hold suppression has an unfamiliar shape: "
                 + str(record.get("id"))
             )
-        suppressed_snapshot_ids.update(snapshot_ids & set(suppression))
+        named = snapshot_ids & set(suppression)
+        if (payload.get("suppression_table", "weekly_usage_snapshots")
+                != "weekly_usage_snapshots"):
+            continue
+        if payload.get("kind") == "five_hour_credit":
+            five_hour_named.update(named)
+        else:
+            weekly_named.update(named)
+    # #825/#832 spec 4.7 revision 7 (*Versioning and replay*, fix round
+    # K16b): suppression-list membership no longer implies whole-snapshot
+    # deletion. Each axis's stale-replica suppression retires its own axis
+    # (`_cctally_journal._apply_reset_with_suppression`), so a snapshot is
+    # deleted only where the materialization deletes it.
+    suppressed_snapshot_ids = {
+        snapshot_id for snapshot_id in weekly_named | five_hour_named
+        if _suppression_deletes_snapshot(
+            (desired.get(snapshot_id) or current.get(snapshot_id) or {}),
+            weekly=snapshot_id in weekly_named,
+            five_hour=snapshot_id in five_hour_named)
+    }
     if suppressed_snapshot_ids:
         for event_id, record in (*current.items(), *desired.items()):
             payload = record.get("payload") or {}
@@ -1368,7 +1446,8 @@ def _preserve_reviewed_hold_dependencies(
         payload = record.get("payload") or {}
         usage_ref = payload.get("usage_snapshot_ref")
         if usage_ref not in snapshot_ids:
-            if _contains_any_value(payload, snapshot_ids):
+            if _contains_any_value(_without_snapshot_suppression(payload),
+                                   snapshot_ids):
                 raise RederiveConflict(
                     "reviewed weekly hold dependency has an unfamiliar shape: "
                     + event_id
@@ -1413,7 +1492,8 @@ def _preserve_reviewed_hold_dependencies(
         payload = record.get("payload") or {}
         usage_ref = payload.get("usage_snapshot_ref")
         if usage_ref not in snapshot_ids:
-            if _contains_any_value(payload, snapshot_ids):
+            if _contains_any_value(_without_snapshot_suppression(payload),
+                                   snapshot_ids):
                 raise RederiveConflict(
                     "reviewed weekly hold dependency has an unfamiliar shape: "
                     + event_id
@@ -1625,6 +1705,7 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
                             reviewed_weekly_hold_ids=(),
                             uncertain_cost_fact_ids=(),
                             historical_close_markers=None,
+                            physical_revisions=None,
                             enforce_guard=True) -> RederivePlan:
     """Diff current effective events against one scratch-derived desired set.
 
@@ -1660,6 +1741,11 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
     the same way closes are decided before milestones."""
     conflicted_event_ids = frozenset(conflicted_event_ids or ())
     historical_close_markers = dict(historical_close_markers or {})
+    # #825/#832 fix round A (Codex fix-round-1 Q2): the highest revision of
+    # every physical record admission hides (an excluded legacy event or
+    # correction action). A new revision is allocated above it, so the
+    # previous release never reads a same-revision conflict.
+    physical_revisions = dict(physical_revisions or {})
     desired = _desired_by_id(desired_events)
     current = {
         event_id: selected.record
@@ -1824,6 +1910,9 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
             disposition = "add"
             at = str(desired_record["at"])
             payload = dict(desired_record.get("payload") or {})
+        floor = physical_revisions.get(event_id)
+        if floor is not None and revision <= floor:
+            revision = floor + 1
         counts[disposition] += 1
         kind_record = (
             current_record if disposition == "tombstone"

@@ -28,6 +28,10 @@
 # Pattern: dynamic-import of bin/cctally (matches the selfheal harness).
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 # The golden helper path is computed from BASH_SOURCE at runtime.
@@ -43,7 +47,7 @@ AS_OF="2026-06-19T14:37:00Z"
 # harness later `rm -rf`s leaves _lib-golden-diff.sh temp files racing the
 # teardown (cosmetic `rm: Directory not empty`). Keeping it separate sidesteps
 # that — set once, torn down at the very end.
-GDT="$(mktemp -d -t cctally-rc-gdt.XXXXXX)"
+GDT="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-gdt.XXXXXX")" || exit 1
 export GOLDEN_DIFF_TMPDIR="$GDT"
 trap 'rm -rf "$GDT"' EXIT
 
@@ -204,7 +208,7 @@ PY
 # in the `report` CLI (`report` joins usage snapshots directly; `weekly`
 # recomputes cost from session_entries and renders nothing in an empty
 # scratch, so `report` is the faithful surface for the snapshot repair).
-S1="$(mktemp -d -t cctally-rc-s1.XXXXXX)"
+S1="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s1.XXXXXX")" || exit 1
 seed_week "$S1" >/dev/null
 rc_cli "$S1" --to 31 --yes >/dev/null 2>&1
 s1_ec=$?
@@ -219,7 +223,7 @@ fi
 rm -rf "$S1"
 
 # ── S2: --dry-run writes nothing; preview text matches golden ──────────
-S2="$(mktemp -d -t cctally-rc-s2.XXXXXX)"
+S2="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s2.XXXXXX")" || exit 1
 seed_week "$S2" >/dev/null
 before=$(snap_count "$S2")
 preview=$(rc_cli "$S2" --to 31 --dry-run 2>&1)
@@ -237,7 +241,7 @@ fi
 rm -rf "$S2"
 
 # ── S5: --json --yes envelope matches golden ───────────────────────────
-S5="$(mktemp -d -t cctally-rc-s5.XXXXXX)"
+S5="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s5.XXXXXX")" || exit 1
 seed_week "$S5" >/dev/null
 json_out=$(rc_cli "$S5" --to 31 --json --yes 2>/dev/null)
 s5_ec=$?
@@ -252,7 +256,7 @@ fi
 rm -rf "$S5"
 
 # ── S6: non-TTY without --yes/--dry-run is refused ─────────────────────
-S6="$(mktemp -d -t cctally-rc-s6.XXXXXX)"
+S6="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s6.XXXXXX")" || exit 1
 seed_week "$S6" >/dev/null
 s6_out=$(rc_cli "$S6" --to 31 </dev/null 2>&1)
 s6_ec=$?

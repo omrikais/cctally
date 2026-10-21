@@ -9,13 +9,16 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       61 pending
+  ⚠ Pending migrations       62 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✗ Retained evidence        retention policy in config.json is malformed — automatic reclaim is off
       → Fix or remove the storage.artifact_retention block: storage.artifact_retention.max_age_days must be >= 1, got 0
 Journal
 Data
 Accounts
+Accounting
+  ⚠ Outcome quarantine       unavailable (no validated stats index)
+      → Run any cctally command to bring the stats index up to date, then run `cctally doctor` again.
 Pricing
 Quota
 Safety
@@ -24,4 +27,4 @@ Safety
 Telemetry
 Performance
 
-Summary: 61 OK · 5 WARN · 1 FAIL
+Summary: 63 OK · 6 WARN · 1 FAIL

@@ -582,6 +582,10 @@ degrade to a dash. Run `cctally doctor` for the store-specific diagnosis; when
 Doctor confirms corruption, the supported recovery is
 `cctally cache-sync --rebuild`.
 
+Compressed Codex rollouts open and expand like plain ones. Expanding an item whose full content is read back from a compressed rollout needs Python 3.14+ or the `backports.zstd` package; without one, that request returns the ordinary query-error response, and the conversation is never reported as gone. While a compressed rollout is still being verified, the viewer, the list and account-filtered views keep showing the conversation's last complete version. A conversation recovered from compressed history that has never been shown before answers with the existing pending state until its history is verified, then appears normally.
+
+Right after an upgrade to a version that reads compressed rollouts, cctally proves once, in the background, which conversations each already-cached rollout feeds, and verifies any rollout that was compressed before that pass reached it. Until the readable membership census and pending verifications finish, no conversation that has used compressed or transitioning history moves forward, all of them at once: each keeps its last complete version, and a never-shown conversation recovered from compressed history stays pending. The initial membership pass happens once; later container changes still require verification before a new publication. `cctally cache-sync --source codex` runs that work in the foreground. A permanently unreadable contributor becomes an exclusion: a rollout that can't be read (no decoder, a damaged or unverifiable file) never holds a conversation back: the conversation keeps the history and project it already had and keeps showing new activity from its other rollouts.
+
 **Loopback-default gate.** By default the conversation routes are served **only
 over loopback** — even when the dashboard itself is LAN-bound (`--host 0.0.0.0`
 / `dashboard.bind lan`). A request whose `Host` header is not a loopback
@@ -763,6 +767,8 @@ When you have a conversation open and fully paged to its end, the reader follows
 The watch loop runs a targeted single-file cache ingest scoped to only the open session's file(s) — it never triggers a full project-tree walk — so following a live conversation stays cheap. It is fail-closed behind the same [transcript privacy gate](#conversation-viewer-endpoints-plan-2) as the other conversation routes: loopback by default, LAN only under `dashboard.expose_transcripts`, and an IP-literal `Host` only (a spoofed/rebinding `Host` is `403`).
 
 `--no-sync` makes the stream **passive**: the dashboard was started to freeze data at the startup snapshot, so the live-tail endpoint sends keep-alives only and performs no ingest and no `tail` emit, leaving the frozen snapshot untouched.
+
+A Codex conversation keeps live-tailing when Codex compresses one of its rollouts to `.jsonl.zst`: the change is noticed once and the view does not refresh repeatedly, and an unchanged compressed rollout stays quiet. While a conversation fed by a compressed rollout is still being verified, a new message in it appears once that verification finishes; until then the view keeps its last complete version and does not refresh repeatedly. The same holds for an account-filtered reader.
 
 To opt out of the live-tail entirely, set `dashboard.live_tail` to `false` (via `cctally config set dashboard.live_tail false` or the dashboard Settings overlay). The reader then falls back to the periodic snapshot tick for new turns. The default is `true` (absence is ON); see [`config.md`](config.md#allowed-keys).
 

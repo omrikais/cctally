@@ -73,7 +73,8 @@ def _run_json(home, *args):
     # the subprocess resolves the PROD data-dir layout (…/cctally) and reads
     # the stats.db this fixture seeded, not an empty …/cctally-dev DB.
     env = {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     out = subprocess.run(
         [sys.executable, str(BIN), "five-hour-breakdown", *args, "--json"],
         check=True, capture_output=True, env=env, text=True,
@@ -86,7 +87,8 @@ def _run_text(home, *args):
     # Suppressor: see _run_json — fresh env dict needs it explicitly so the
     # subprocess resolves the prod data-dir layout, not …/cctally-dev.
     env = {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     out = subprocess.run(
         [sys.executable, str(BIN), "five-hour-breakdown", *args],
         capture_output=True, env=env, text=True,
@@ -390,6 +392,7 @@ def home_held_row_after_credit(tmp_path, monkeypatch):
 def _c835_env(home):
     return {"HOME": str(home), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
             "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+            "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
             "CCTALLY_AS_OF": _C835_AS_OF}
 
 
@@ -842,7 +845,9 @@ def test_835_r1_a_null_weekly_value_still_terminates_the_walk(walk, tmp_path):
             "CREATE TABLE weekly_usage_snapshots ("
             " id INTEGER PRIMARY KEY, captured_at_utc TEXT,"
             " week_start_date TEXT, week_start_at TEXT, week_end_at TEXT,"
-            " weekly_percent REAL, five_hour_window_key INTEGER,"
+            " weekly_percent REAL, five_hour_percent REAL,"
+            " five_hour_resets_at TEXT, five_hour_window_key INTEGER,"
+            " weekly_observation_held INTEGER NOT NULL DEFAULT 0,"
             " account_key TEXT)")
         legacy.execute(
             "CREATE TABLE weekly_credit_floors ("
@@ -858,11 +863,12 @@ def test_835_r1_a_null_weekly_value_still_terminates_the_walk(walk, tmp_path):
         legacy.executemany(
             "INSERT INTO weekly_usage_snapshots (captured_at_utc,"
             " week_start_date, week_start_at, week_end_at, weekly_percent,"
-            " five_hour_window_key, account_key) VALUES (?,?,?,?,?,?,?)",
+            " five_hour_percent, five_hour_window_key, account_key)"
+            " VALUES (?,?,?,?,?,?,?,?)",
             [("2026-04-30T10:00:00Z", _R1_WEEK, _R1_WS_AT, _R1_WE_AT, 40.0,
-              _R1_WINDOW_KEY, "unattributed"),
+              10.0, _R1_WINDOW_KEY, "unattributed"),
              ("2026-04-30T11:00:00Z", _R1_WEEK, _R1_WS_AT, _R1_WE_AT, None,
-              _R1_WINDOW_KEY, "unattributed")])
+              10.0, _R1_WINDOW_KEY, "unattributed")])
         legacy.commit()
         bands = ns["_credit_retirement_bands"](
             legacy, week_start_date=_R1_WEEK, week_start_at=_R1_WS_AT,
@@ -1520,10 +1526,14 @@ def test_835_r8_an_absent_capture_stamp_falls_back_to_the_block_shape(
 #: Every table this render path queries, and the statement count each one must see
 #: PER ACCOUNT PER RENDER on this fixture. Measured, not predicted.
 #:
-#: The three against `weekly_usage_snapshots` are `_latest_seven_day_and_window`'s
-#: own walk, `_account_axis_weeks`' `SELECT DISTINCT` week load and
-#: `_account_axis_capture_weeks`' narrowed capture-record load — the last of which
-#: R9 added.
+#: The four against `weekly_usage_snapshots` are `_latest_seven_day_and_window`'s
+#: own walk, its window-key selection, `_account_axis_weeks`' `SELECT DISTINCT`
+#: week load and `_account_axis_capture_weeks`' narrowed capture-record load. R9
+#: added the capture-record load. #825/#832 K16c added the window-key selection:
+#: the window key now comes from the newest row that CARRIES a five-hour reading
+#: (`latest_five_hour_reading`, spec 4.7 revision 7) rather than from the walk's
+#: first row, which a retired replica or a weekly-only reading leaves without a
+#: key. It is one `LIMIT 1` statement per render, independent of the block count.
 #:
 #: The two against each credit table are the TWO band-resolving call sites, not two
 #: candidate weeks: `_latest_seven_day_and_window` resolves this week's bands to
@@ -1536,7 +1546,7 @@ def test_835_r8_an_absent_capture_stamp_falls_back_to_the_block_shape(
 _T2_COUNTED_TABLES = (
     "weekly_usage_snapshots", "weekly_credit_floors", "week_reset_events")
 _T2_EXPECTED_STATEMENTS = {
-    "weekly_usage_snapshots": 3,
+    "weekly_usage_snapshots": 4,
     "weekly_credit_floors": 2,
     "week_reset_events": 2,
 }
@@ -1767,6 +1777,10 @@ _R8_DERIVED_COLUMN_SITES = {
     # not because the name always comes from elsewhere: `_load_breakdown`'s table is
     # a two-literal ternary three lines above the query, which any reader can follow
     # and this walk still cannot.
+    # #968: fixed _VERIFY_TABLES cursor pair and fixed TEMP last-good thread
+    # view; neither can contain either five_hour_blocks weekly axis.
+    ("_cctally_cache.py", "_load_cursor_snapshot"): "dynamic-table-not-blocks",
+    ("_cctally_cache.py", "_install_codex_last_good_views"): "dynamic-table-not-blocks",
     ("_cctally_core.py", "_get_latest_row_for_week"): "dynamic-table-not-blocks",
     ("_cctally_five_hour.py", "_load_breakdown"): "dynamic-table-not-blocks",
     ("_cctally_quota.py",

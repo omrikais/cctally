@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
   "week": {
-    "start_at": "2026-04-13T14:00:00Z",
-    "end_at": "2026-04-20T14:00:00Z",
+    "start_at": "2026-10-12T14:00:00Z",
+    "end_at": "2026-10-19T14:00:00Z",
     "elapsed_hours": 96.0,
     "elapsed_fraction": 0.5714,
     "remaining_hours": 72.0,
@@ -18,7 +18,7 @@
     "five_hour_percent": null,
     "spent_usd": 28.5,
     "snapshot_count": 10,
-    "latest_snapshot_at": "2026-04-17T14:00:00Z"
+    "latest_snapshot_at": "2026-10-16T14:00:00Z"
   },
   "rates": {
     "week_average_pct_per_hour": 0.723958,
@@ -35,7 +35,7 @@
     "projection_code": null,
     "calibration_code": "unavailable",
     "projected_cap": true,
-    "cap_at": "2026-04-18T09:53:28Z",
+    "cap_at": "2026-10-17T09:53:28Z",
     "already_capped": false,
     "confidence": "high",
     "low_confidence_reasons": []
@@ -55,7 +55,7 @@
     }
   ],
   "meta": {
-    "generated_at": "2026-04-17T14:00:00Z",
+    "generated_at": "2026-10-16T14:00:00Z",
     "tool_version": "forecast-v1"
   }
 }

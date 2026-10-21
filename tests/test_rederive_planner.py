@@ -1411,6 +1411,9 @@ def test_legacy_cutover_account_normalizes_unstamped_claude_history(
     cutover["id"] = runtime.CUTOVER_OP_ID
     legacy_obs = _raw_obs(journal)
     legacy_obs.pop("account")
+    # A pre-#341 line is a pre-stamp writer's: a current-generation line
+    # names its account explicitly (#825/#832 fix round C, CD2-004).
+    legacy_obs = journal.unstamped_record(legacy_obs)
 
     plan = mod.plan_claude_usage_rederive(
         [cutover, legacy_obs],
@@ -2699,13 +2702,24 @@ def test_held_replay_does_not_replace_the_later_genuine_journal_decision(
         for action in held_suppression.actions
     } == {old["id"]: "tombstone", new["id"]: "add"}
 
+    # #825/#832 spec 4.7 revision 7 (fix round K16b): a weekly suppression
+    # deletes only a snapshot that keeps no evidence on either axis; one that
+    # carries its own five-hour reading is kept weekly-held, so its
+    # milestones keep their reference. The guard is therefore exercised over
+    # a weekly-only snapshot, which the suppression does delete.
+    weekly_only = journal.make_evt(
+        kind="snapshot_accept", id=old["id"], at=old_at,
+        payload={key: value for key, value in old["payload"].items()
+                 if key not in ("kind", "five_hour_percent",
+                                "five_hour_resets_at", "five_hour_window_key")},
+    )
     with pytest.raises(
         rederive.RederiveConflict,
         match="suppression would leave a dependent milestone",
     ):
         rederive.build_claude_usage_plan(
             selection=journal.resolve_effective_events([
-                old, old_milestone, dangling,
+                weekly_only, old_milestone, dangling,
             ]),
             desired_events=[new, old_milestone, dangling],
             journal_high_water=kwargs["journal_high_water"],

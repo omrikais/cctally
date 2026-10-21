@@ -251,9 +251,9 @@ def test_selector_quarantines_divergent_same_revision_candidates():
     assert conflict.event_id == "evt:x"
     assert conflict.rev == 0
     assert conflict.content_hashes == tuple(
-        sorted({J._sha256_canonical(first), J._sha256_canonical(second)})
+        sorted({J.event_content_hash(first), J.event_content_hash(second)})
     )
-    assert conflict.selected_hash == J._sha256_canonical(first)
+    assert conflict.selected_hash == J.event_content_hash(first)
     assert conflict.to_dict() == {
         "eventId": "evt:x",
         "revision": 0,
@@ -272,9 +272,9 @@ def test_selector_provisional_winner_is_lowest_sequence_across_many_variants():
 
     conflict = selected.conflicts[0]
     assert selected.active == [variants[0]]
-    assert conflict.selected_hash == J._sha256_canonical(variants[0])
+    assert conflict.selected_hash == J.event_content_hash(variants[0])
     assert conflict.content_hashes == tuple(
-        sorted(J._sha256_canonical(v) for v in variants)
+        sorted(J.event_content_hash(v) for v in variants)
     )
 
 
@@ -1342,7 +1342,7 @@ def test_live_divergent_same_revision_duplicate_is_quarantined_and_advances(ns):
         assert conn.execute(
             "SELECT content_hash FROM journal_effective_events "
             "WHERE event_id = 'sa:dupe-live'"
-        ).fetchone()[0] == J._sha256_canonical(first)
+        ).fetchone()[0] == J.event_content_hash(first)
     finally:
         conn.close()
 
@@ -1481,8 +1481,13 @@ def test_epoch_resolver_serializes_maintenance_then_ingest(
     )
     # #388: the resolver no longer drains or quarantines before the replacement
     # exists. The common rebuild cutover owns those operations after validation.
+    # #825/#832 (spec C3/F1; Codex fix-round-1 Q1): the transition's rebuild
+    # runs the derivation-completion step itself, inside both locks; it is
+    # never pinned at the replaced index's applied cursor.
     monkeypatch.setattr(
-        jr, "run_epoch_transition", lambda: calls.append("rebuild")
+        jr,
+        "run_epoch_transition",
+        lambda: calls.append("rebuild"),
     )
     monkeypatch.setattr(
         jr,

@@ -1061,7 +1061,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1017
+    assert _cctally_core.STATS_INDEX_EPOCH == 1018
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -1081,7 +1081,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1017
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1018
     finally:
         conn.close()
 
@@ -2139,10 +2139,16 @@ def test_a_failed_publication_in_the_worker_reports_publication_guidance(ns):
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
 
     real_validate = jr._validate_rebuilt_stats_index
+    live = pathlib.Path(_cctally_core.DB_PATH).resolve()
 
     def fail_on_the_destination(conn, high_water):
+        # The LIVE destination only. Since #825/#832 fix round A (Codex
+        # fix-round-1 Q1) the heal runs derivation completion first, which
+        # builds its predecessor scratch through a `target_path` rebuild that
+        # publishes and validates a non-`.rebuilding-` file of its own; that
+        # file is not the publication this test is about.
         real_validate(conn, high_water)
-        if ".rebuilding-" not in _main_file_of(conn).name:
+        if _main_file_of(conn).resolve() == live:
             raise jr.JournalError("injected post-publication validation failure")
 
     jr._validate_rebuilt_stats_index = fail_on_the_destination

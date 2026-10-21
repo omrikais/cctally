@@ -27,6 +27,8 @@ import pytest
 
 import _sql_plan_guard as guard
 from conftest import load_script, redirect_paths
+from test_codex_publication_barrier import env as quota_heal_env  # noqa: F401
+from test_codex_prune_drain import _no_detached_drains  # noqa: F401
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = REPO / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
@@ -593,3 +595,57 @@ def test_no_pending_rule_remains():
     add here; a bounded one goes in ``ALLOWLIST`` with its bound.
     """
     assert guard.PENDING == ()
+
+
+@pytest.mark.parametrize("temp_store", sorted(TEMP_STORE_CODE))
+def test_historical_quota_natural_key_lookup_uses_its_complete_unique_index(
+        quota_heal_env, monkeypatch, temp_store):
+    """#968 AC7: capture the actual walk's lookup after journal restoration.
+
+    A lookup missing its path predicate, a sorter, an automatic index, or a
+    table scan must fail here. The production heal fixture supplies multiple files,
+    two quota slots and multiple observations; no substitute SQL is explained.
+    """
+    from test_codex_publication_barrier import _seed_production_heal, _sync
+
+    ns, provider, day, _spawned = quota_heal_env
+    control, _ = _seed_production_heal(ns, provider, day, monkeypatch)
+    cache = importlib.import_module("_cctally_cache")
+    assert cache.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "settled"
+    store = importlib.import_module("_cctally_store")
+    monkeypatch.setattr(store, "WRITER_TEMP_STORE", temp_store)
+    with guard.capture_sql_plans(temp_store=temp_store) as recorder:
+        recorder.phase = "historical-quota-heal"
+        stats = _sync(ns, quota_reconcile="defer")
+    assert stats.files_processed >= 3
+    reads = [s for s in recorder.statements
+             if s.call_sites and s.call_sites[0] == "_cctally_cache._sync_codex_cache_locked"
+             and s.sql.startswith("SELECT line_offset, logical_limit_key ")
+             and "FROM quota_window_snapshots " in s.sql]
+    assert len(reads) == 3  # one covering range seek per historical identity
+    assert len(control["quota"]) == 4
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM quota_window_snapshots").fetchone()[0] == 4
+        indexes = [row for row in conn.execute("PRAGMA index_list(quota_window_snapshots)")
+                   if row[2]]
+        natural_indexes = {row[1] for row in indexes if [col[2] for col in conn.execute(
+            f"PRAGMA index_info({row[1]})")] == [
+                "source", "source_path", "line_offset", "logical_limit_key"]}
+    finally:
+        conn.close()
+    assert natural_indexes
+    for statement in reads:
+        assert statement.sql == (
+            "SELECT line_offset, logical_limit_key FROM quota_window_snapshots "
+            "WHERE source='codex' AND source_path=?")
+        assert statement.temp_store == TEMP_STORE_CODE[temp_store]
+        assert len(statement.plan) == 1
+        assert statement.plan[0].startswith("SEARCH quota_window_snapshots USING COVERING INDEX ")
+        assert any(index in statement.plan[0] for index in natural_indexes)
+        assert "(source=? AND source_path=?)" in statement.plan[0]
+    assert guard.classify(reads, allowlist=(), pending=()) == ([], [])
+    print(json.dumps({"tempStore": temp_store, "population": len(control["quota"]),
+                      "actualLookups": len(reads), "sql": reads[0].sql,
+                      "plans": sorted({detail for s in reads for detail in s.plan})}))

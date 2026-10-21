@@ -32,7 +32,11 @@ import hashlib
 import pathlib
 import sqlite3
 
-import _lib_journal as jl
+import _lib_journal
+
+# A pre-cutover journal: every record has the previous release's exact shape
+# (no writer-generation stamp), so the pinned pre-change baselines still hold.
+jl = _lib_journal.legacy_writer_view()
 
 
 AT = "2026-07-27T06:00:00Z"

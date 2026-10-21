@@ -16,6 +16,10 @@
 # `FAIL <name>` lines + a final `passed: N   failed: M` summary the aggregator
 # parses.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Shared dev-autodetect suppressor preamble (exports
 # CCTALLY_DISABLE_DEV_AUTODETECT=1); coverage enforced by
@@ -55,7 +59,7 @@ REAL_CLAUDE="$HOME/.claude/projects"
 cache_existed=$(exists "$REAL_CACHE")
 claude_existed=$(exists "$REAL_CLAUDE")
 
-SCRATCH=$(mktemp -d -t cctally-bench-selftest-XXXXXX)
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/cctally-bench-selftest-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 
 # Pin BOTH env axes (Codex-P1 isolation) + TZ + dev-autodetect off, and pass an

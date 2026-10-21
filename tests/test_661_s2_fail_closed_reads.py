@@ -319,6 +319,7 @@ def _make_regime(qcg, *, effective_from=dt.datetime(2026, 1, 1, tzinfo=UTC)):
         class_shares={"output": 1.0},
         family_radius=0.2,
         class_radius=0.2,
+        coefficient_era="opus-5",
     )
 
 
@@ -338,7 +339,7 @@ def _pin_regime(ns, monkeypatch, counter, *, unsupported=()):
     refused = set(unsupported)
     monkeypatch.setattr(
         qcg, "apply_regime",
-        lambda _regime, entries: (
+        lambda _regime, entries, **_kw: (
             qcg.ApplyRejection.UNSUPPORTED_COMPOSITION
             if entries and entries[0] in refused
             else qcg.AppliedQuota(10.0, 9.0, 11.0, 1.0)))

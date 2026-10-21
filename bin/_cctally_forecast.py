@@ -97,6 +97,7 @@ from _lib_forecast import (
 # exercises). doctor's _iso_z deliberately keeps its own divergent copy.
 _ensure_sibling_loaded("_lib_json_envelope")
 from _lib_json_envelope import _iso_z
+from _lib_five_hour import latest_five_hour_reading
 
 # #620 S1 D11: the one affordance shape every warning state renders.
 _ensure_sibling_loaded("_lib_alert_scope")
@@ -175,7 +176,8 @@ def _week_rows_by_capture(cursor, *, by_id: bool) -> list:
 def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime,
                                   *, account_key: "str | None" = None,
                                   include_held: bool = False,
-                                  include_account: bool = False):
+                                  include_account: bool = False,
+                                  include_scope: bool = False):
     """Return (week_start_at, week_end_at, list[(captured_at, percent, five_hr)])
     for the subscription week containing `now_utc`, or None if no snapshot
     exists for the current week.
@@ -225,6 +227,14 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     ``include_account`` appends the physical account key after the held flag
     for the multi-account Current Week card only. The default wire-independent
     sample shape and merged forecast/cost reads remain unchanged.
+
+    ``include_scope`` (#825/#832 spec 4.7 revision 7) appends a fourth element,
+    ``(week_start_date, week_start_at_texts)``: the week scope the samples were
+    read under, in the form ``latest_five_hour_reading`` takes
+    (``week_start_at_texts`` is ``None`` on the date-only fallback). A caller
+    reading the five-hour axis selects its reading under exactly this scope
+    rather than from the newest sample, which a retired replica or a
+    weekly-only reading leaves without a five-hour value.
     """
     # #341: optional account scoping — same predicate on every leg so the whole
     # window resolution stays consistent (a real key or the `unattributed`
@@ -296,6 +306,8 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
         samples = _shape_week_samples(rows, include_held=include_held,
                                       include_account=include_account)
         samples = [s for s in samples if s[0] <= now_utc]
+        if include_scope:
+            return week_start_at, week_end_at, samples, (drow[0], None)
         return week_start_at, week_end_at, samples
     row = chosen
     week_start_at = parse_iso_datetime(row[0], "week_start_at")
@@ -327,6 +339,9 @@ def _fetch_current_week_snapshots(conn: sqlite3.Connection, now_utc: dt.datetime
     samples = _shape_week_samples(rows, include_held=include_held,
                                   include_account=include_account)
     samples = [s for s in samples if s[0] <= now_utc]
+    if include_scope:
+        return (week_start_at, week_end_at, samples,
+                (chosen_date, tuple(matching_texts)))
     return week_start_at, week_end_at, samples
 
 
@@ -372,6 +387,42 @@ def _apply_midweek_reset_override(
     except (sqlite3.DatabaseError, ValueError):
         pass
     return week_start_at, samples
+
+
+def _current_week_five_hour_percent(conn, now_utc, week_scope, *,
+                                    account_key, week_start_at,
+                                    week_start_before_override):
+    """The percentage of ``_current_week_five_hour_reading``, or ``None``."""
+    reading = _current_week_five_hour_reading(
+        conn, now_utc, week_scope, account_key=account_key,
+        week_start_at=week_start_at,
+        week_start_before_override=week_start_before_override)
+    return None if reading is None else reading.percent
+
+
+def _current_week_five_hour_reading(conn, now_utc, week_scope, *,
+                                    account_key, week_start_at,
+                                    week_start_before_override):
+    """The current week's five-hour reading: the newest five-hour READING
+    under the current-week read's own scope (#825/#832 spec 4.7 revision 7).
+    Its percent and reset come from one row, so a caller that shows both
+    shows one reading.
+
+    ``week_scope`` is ``_fetch_current_week_snapshots(include_scope=True)``'s
+    fourth element. When ``_apply_midweek_reset_override`` moved the week's
+    start, its new start bounds the captures exactly as it bounded the samples.
+    ``account_key`` ``None`` keeps the merged read's account-blind contract.
+    """
+    week_start_date, week_start_at_texts = week_scope
+    floor = (week_start_at if week_start_at != week_start_before_override
+             else None)
+    reading = latest_five_hour_reading(
+        conn, account_key=account_key,
+        as_of_utc=_iso_z(now_utc),
+        captured_at_or_after_utc=None if floor is None else _iso_z(floor),
+        week_start_date=week_start_date,
+        week_start_at_in=week_start_at_texts)
+    return reading
 
 
 def _resolve_current_budget_window(conn, now_utc, *, account_key=None):
@@ -807,8 +858,13 @@ def _dpp_candidate_comparability(regime, week_start_at, week_end_at, *,
 
     - `"comparable"` — in regime, and its own population passes the support
       test.
-    - `"incomparable"` — in regime, population read, support test failed.
-      This is drift, and only this.
+    - `"incomparable"` — in regime, population read, and `apply_regime`
+      rejected it. That is drift (the support test failed), or a week outside
+      the regime's coefficient era (`unvalidated-coefficient-era`, #978 spec
+      4.6), whose units were weighted with another era's coefficients and so
+      cannot be compared with this regime's rate either, or a week with no
+      local population to weigh (`no-local-history`). All three mean the
+      same thing to the selector: the candidate is not comparable.
     - `"excluded"` — on the far side of a rate boundary.
     - `"unreadable"` — the population could not be read at all. Folding this
       into `"excluded"` made a locked `cache.db` look like twelve weeks that
@@ -837,7 +893,8 @@ def _dpp_candidate_comparability(regime, week_start_at, week_end_at, *,
             cache_conn_factory=cache_conn_factory)
     except Exception:                                  # noqa: BLE001
         return "unreadable"
-    applied = qcg.apply_regime(regime, entries)
+    applied = qcg.apply_regime(regime, entries,
+                               interval=(week_start_at, week_end_at))
     if isinstance(applied, qcg.ApplyRejection):
         return "incomparable"
     return "comparable"
@@ -1289,7 +1346,12 @@ def _calibrated_week_detail(
             week_start_at, horizon, account_key=account_key)
     except sqlite3.Error:
         return CalibratedWeek(code="unavailable")
-    applied = qcg.apply_regime(read.regime, entries)
+    # The interval is the whole week the projection extrapolates over, not
+    # the entries' span: a week straddling the regime's coefficient era is
+    # refused as `unvalidated-coefficient-era` even when every retained entry
+    # so far is in-era (#978 spec 4.6).
+    applied = qcg.apply_regime(read.regime, entries,
+                               interval=(week_start_at, week_end_at))
     if isinstance(applied, qcg.ApplyRejection):
         return CalibratedWeek(code=applied.value)
 
@@ -1392,12 +1454,14 @@ def _load_forecast_inputs(
     c = _cctally()
     # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
     fetched = _fetch_current_week_snapshots(
-        conn, now_utc, account_key=account_key, include_held=True)
+        conn, now_utc, account_key=account_key, include_held=True,
+        include_scope=True)
     if fetched is None:
         return None
-    week_start_at, week_end_at, observations = fetched
+    week_start_at, week_end_at, observations, week_scope = fetched
     if not observations:
         return None
+    week_start_before_override = week_start_at
 
     # Mid-week reset override: shift week_start_at to the effective
     # reset moment and drop pre-reset samples so elapsed/remaining math
@@ -1421,8 +1485,16 @@ def _load_forecast_inputs(
     p_now = latest[1]
     # The five-hour axis, which is why the read is held-inclusive: a held row
     # exists precisely because its five-hour reading GREW, so the newest
-    # observation of either kind is the current five-hour percentage.
-    five_hr = observations[-1][2]
+    # READING of either kind is the current five-hour percentage. It is
+    # selected through the one shared selection (#825/#832 spec 4.7 revision
+    # 7) under this read's own scope: the account, the week, `now_utc`, and
+    # the mid-week reset's lower bound when the override applied. The newest
+    # observation is not the answer, because a retired replica or a
+    # weekly-only reading carries no five-hour value.
+    five_hr = _current_week_five_hour_percent(
+        conn, now_utc, week_scope, account_key=account_key,
+        week_start_at=week_start_at,
+        week_start_before_override=week_start_before_override)
 
     elapsed_hours = (now_utc - week_start_at).total_seconds() / 3600.0
     total_hours = (week_end_at - week_start_at).total_seconds() / 3600.0

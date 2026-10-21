@@ -190,9 +190,13 @@ def _midweek_approaching(stats_conn, cache_conn):
 
 # --- Scenario: projected-cap --------------------------------------------
 # Day 5, 70% used, heavy recent burn -> high >= 100, cap_at populated.
+# Dated exactly 26 weeks after the other scenarios (same weekday and hour), so
+# its current week lies inside a validated quota coefficient era (#978): the
+# reconcile PROJECTED1-b invariant seeds a calibration over this week, and a
+# regime may only be applied inside its own era.
 def _projected_cap(stats_conn, cache_conn):
-    week_start = dt.datetime(2026, 4, 13, 14, 0, 0, tzinfo=dt.timezone.utc)
-    week_end   = dt.datetime(2026, 4, 20, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_start = dt.datetime(2026, 10, 12, 14, 0, 0, tzinfo=dt.timezone.utc)
+    week_end   = dt.datetime(2026, 10, 19, 14, 0, 0, tzinfo=dt.timezone.utc)
     samples = [(h, (h / 80.0) * 30.0) for h in (6, 18, 30, 42, 54, 66, 78)]
     samples += [(84, 45.0), (90, 60.0), (96, 70.0)]
     _insert_snapshots(stats_conn, week_start, week_end, samples)
@@ -369,7 +373,7 @@ SCENARIOS = {
         _midweek_approaching,
     ),
     "projected-cap": (
-        dt.datetime(2026, 4, 17, 14, 0, 0, tzinfo=dt.timezone.utc),
+        dt.datetime(2026, 10, 16, 14, 0, 0, tzinfo=dt.timezone.utc),
         _projected_cap,
     ),
     "already-capped": (

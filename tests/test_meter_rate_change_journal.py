@@ -793,7 +793,7 @@ def test_c2_the_dropped_conflict_line_reports_an_insert_that_materialized_nothin
             "UPDATE journal_effective_events SET event_json = ?, "
             "content_hash = ? WHERE event_id = ?",
             (_lib_journal.encode_line(record).decode("utf-8").rstrip("\n"),
-             _lib_journal._sha256_canonical(record), event_id))
+             _lib_journal.event_content_hash(record), event_id))
         capsys.readouterr()
         jr.record_meter_rate_change(
             ctx, t, notify=False, created_at="2026-09-05T09:15:00+00:00")
@@ -1131,7 +1131,7 @@ def test_c2_the_descriptor_is_returned_rather_than_acted_on_under_the_lock(
 
     mode = glue.PersistMode(
         kind="automatic", account_key=None, now=NOW, fingerprint="FP",
-        regime_start=NOW)
+        regime_start=NOW, coefficient_era="opus-5")
     quarantined, fresh, candidates = glue.persist_and_detect(object(), mode)
 
     assert quarantined is None
@@ -1235,7 +1235,7 @@ def test_c2_an_unreadable_calibration_yields_an_iterable_second_element(
             glue.empty_calibration_state(), unreadable=True))
     mode = glue.PersistMode(
         kind="automatic", account_key=None, now=NOW, fingerprint="FP",
-        regime_start=NOW)
+        regime_start=NOW, coefficient_era="opus-5")
     quarantined, fresh, candidates = glue.persist_and_detect(object(), mode)
     assert quarantined is None
     # The literal consumer, spelled the way `cmd_quota` spells it — for BOTH
@@ -1265,7 +1265,7 @@ def test_c2_an_unreadable_calibration_writes_nothing(ns, monkeypatch):
     monkeypatch.setattr(glue, "reduce_state", _must_not_run)
     mode = glue.PersistMode(
         kind="automatic", account_key=None, now=NOW, fingerprint="FP",
-        regime_start=NOW)
+        regime_start=NOW, coefficient_era="opus-5")
     glue.persist_and_detect(object(), mode)
     assert saved == []
 

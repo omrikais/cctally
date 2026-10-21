@@ -12,6 +12,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 _BIN = Path(__file__).resolve().parent.parent / "bin"
 if str(_BIN) not in sys.path:
     sys.path.insert(0, str(_BIN))
@@ -47,6 +49,20 @@ def _seed_msg(conn, session_id, ts, *, source_path="seed.jsonl",
         (session_id, f"u-{_OFFSET[0]}", source_path, _OFFSET[0], ts, entry_type, text),
     )
     return _OFFSET[0]
+
+
+def _claude_line(uuid: str, ts: str, session_id: str = "aged") -> str:
+    import json
+    return json.dumps({
+        "type": "user", "uuid": uuid, "sessionId": session_id,
+        "timestamp": ts, "message": {"role": "user", "content": "hello world"},
+    }) + "\n"
+
+
+def _opt_into_retention(ns, days: int = 90) -> None:
+    """#965: operational prunes resolve 0 under the test default, so a test
+    whose subject is deletion configures its window explicitly (spec 4.5)."""
+    ns["save_config"]({"conversation": {"retention_days": days}})
 
 
 def _fts_count(conn):
@@ -482,32 +498,42 @@ def test_prune_pass_does_not_starve_shared_maintenance_readers(
 
 def test_rebuild_replay_triggers_force_prune_but_noop_sync_does_not(tmp_path, monkeypatch):
     """F9 wiring: a from-zero replay (rebuild) invokes the UNTHROTTLED prune
-    (force=True); a plain no-op sync does not prune at all."""
+    (force=True) with the configured window and really deletes; a plain no-op
+    sync does not prune at all."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    _opt_into_retention(ns)
     cache_mod = importlib.import_module("_cctally_cache")
     retention = importlib.import_module("_lib_conversation_retention")
-    (tmp_path / ".claude" / "projects" / "-Users-u-proj").mkdir(parents=True, exist_ok=True)
+    project = tmp_path / ".claude" / "projects" / "-Users-u-proj"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "aged.jsonl").write_text(
+        _claude_line("m-old-1", OLD) + _claude_line("m-old-2", OLDER))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex"))
 
     calls = []
+    real = retention._maybe_prune_conversation_retention
 
-    def spy(conn, *, now_utc, retention_days, force=False):
-        calls.append(force)
-        return None
+    def spy(conn, *, now_utc, retention_days, force=False, **kwargs):
+        calls.append((force, retention_days))
+        return real(conn, now_utc=now_utc, retention_days=retention_days,
+                    force=force, **kwargs)
 
     monkeypatch.setattr(retention, "_maybe_prune_conversation_retention", spy)
 
-    conn = ns["open_conversations_db"](attach_cache=False)
+    conn = ns["open_conversations_db"]()
     try:
         cache_mod.sync_claude_conversations(conn, rebuild=True)
-        assert calls == [True], "Claude rebuild must force-prune"
+        assert calls == [(True, 90)], "Claude rebuild must force-prune with the configured window"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages WHERE session_id='aged'"
+        ).fetchone()[0] == 0, "the forced prune must actually delete the aged transcript"
         calls.clear()
         cache_mod.sync_claude_conversations(conn)
         assert calls == [], "a Claude no-op sync must not prune"
         calls.clear()
         cache_mod.sync_codex_conversations(conn, rebuild=True)
-        assert calls == [True], "Codex rebuild must force-prune"
+        assert calls == [(True, 90)], "Codex rebuild must force-prune"
         calls.clear()
         cache_mod.sync_codex_conversations(conn)
         assert calls == [], "a Codex no-op sync must not prune"
@@ -528,6 +554,7 @@ def test_truncation_replay_force_prunes_aged_transcripts_unthrottled(tmp_path, m
     import json
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
+    _opt_into_retention(ns)
     cache_mod = importlib.import_module("_cctally_cache")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex"))
 
@@ -777,6 +804,7 @@ def test_codex_forced_replay_prune_removes_rederived_derived_rows(tmp_path, monk
     stamp (a throttled prune would skip)."""
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
+    _opt_into_retention(ns)
     cache_mod = importlib.import_module("_cctally_cache")
     provider_root = tmp_path / "provider"
     rollout = provider_root / "sessions" / "2024" / "01" / "10" / "rollout-aged.jsonl"
@@ -1164,3 +1192,107 @@ def test_the_reclaim_warn_distinguishes_a_paced_wait_from_a_refusal():
             "reason": "no_checkpoint_on_close_unavailable",
             "at": "2026-10-03T12:00:00Z"}}))
     assert failing.details["reclaim_wait"] == "failing"
+
+
+# ── #965 T3: in-process prune paths keep expired fixtures under the test default ──
+
+_WINDOWS = pytest.mark.parametrize("window", [None, 30], ids=["test-default", "explicit-window"])
+
+
+def _t3_env(tmp_path, monkeypatch, window):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    if window is not None:
+        _opt_into_retention(ns, window)
+    provider = tmp_path / "provider"
+    rollout = provider / "sessions" / "2024" / "01" / "10" / "rollout-aged.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text((_CORPUS / "modern-full.jsonl").read_text()
+                       .replace("2026-07-14", "2024-01-10"))
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    project = tmp_path / ".claude" / "projects" / "-Users-u-retention-965"
+    project.mkdir(parents=True, exist_ok=True)
+    jsonl = project / "aged.jsonl"
+    jsonl.write_text(_claude_line("t3-old-1", OLD) + _claude_line("t3-old-2", OLDER))
+    return ns, importlib.import_module("_cctally_cache"), jsonl
+
+
+def _messages(conn, provider):
+    sql = ("SELECT COUNT(*) FROM conversation_messages WHERE session_id='aged'"
+           if provider == "claude" else "SELECT COUNT(*) FROM codex_conversation_messages")
+    return conn.execute(sql).fetchone()[0]
+
+
+def _expect(conn, window, provider):
+    count = _messages(conn, provider)
+    if window is None:
+        assert count > 0, (f"{provider}: the test default deleted an expired fixture "
+                           f"(message count {count})")
+    else:
+        assert count == 0, f"{provider}: an explicit {window}-day window deleted nothing"
+
+
+@_WINDOWS
+def test_965_rebuild_replays_keep_expired_fixtures(tmp_path, monkeypatch, window):
+    ns, cache_mod, _ = _t3_env(tmp_path, monkeypatch, window)
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_claude_conversations(conn, rebuild=True)
+        _expect(conn, window, "claude")
+        cache_mod.sync_codex_conversations(conn, rebuild=True)
+        _expect(conn, window, "codex")
+    finally:
+        conn.close()
+
+
+@_WINDOWS
+def test_965_a_truncation_replay_keeps_expired_fixtures(tmp_path, monkeypatch, window):
+    ns, cache_mod, jsonl = _t3_env(tmp_path, monkeypatch, window)
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_claude_conversations(conn)
+        assert _messages(conn, "claude") == 2, "an ordinary sync never prunes"
+        jsonl.write_text(_claude_line("t3-old-1", OLD))
+        stats = cache_mod.sync_claude_conversations(conn)
+        assert stats.files_reset_truncated >= 1, "the rewrite must trip the truncation replay"
+        _expect(conn, window, "claude")
+    finally:
+        conn.close()
+
+
+@_WINDOWS
+def test_965_the_codex_replay_marker_keeps_expired_fixtures(tmp_path, monkeypatch, window):
+    ns, cache_mod, _ = _t3_env(tmp_path, monkeypatch, window)
+    key = cache_mod.CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_codex_conversations(conn)
+        assert _messages(conn, "codex") > 0, "an ordinary sync never prunes"
+        conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)", (key, "1"))
+        conn.commit()
+        stats = cache_mod.sync_codex_conversations(conn)
+        assert stats.deferred_reason is None, stats.deferred_reason
+        assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (key,)).fetchone() is None, (
+            "the byte-zero replay did not run")
+        _expect(conn, window, "codex")
+    finally:
+        conn.close()
+
+
+@_WINDOWS
+def test_965_the_dashboard_prune_keeps_expired_fixtures(tmp_path, monkeypatch, window):
+    ns, cache_mod, _ = _t3_env(tmp_path, monkeypatch, window)
+    conn = ns["open_conversations_db"]()
+    try:
+        cache_mod.sync_claude_conversations(conn)
+        cache_mod.sync_codex_conversations(conn)
+        assert _messages(conn, "claude") > 0 and _messages(conn, "codex") > 0
+    finally:
+        conn.close()
+    importlib.import_module("_cctally_dashboard")._dashboard_maybe_prune_retention()
+    conn = ns["open_conversations_db"]()
+    try:
+        _expect(conn, window, "claude")
+        _expect(conn, window, "codex")
+    finally:
+        conn.close()

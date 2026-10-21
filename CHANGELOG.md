@@ -5,6 +5,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.115.0] - 2026-10-21
+
+### Added
+- `cctally doctor` has two new checks: `Legacy writer` warns while an older cctally process left running across the upgrade is still writing or its status-line files cannot be read, and `Outcome quarantine` names each paused account and why.
+- `cctally quota` recognises Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5 and weights usage from 2026-09-22 with Opus 5.5 coefficients, fitting it when the model-mix checks pass; a week spanning that date is not modelled.
+
+### Changed
+- The status line now records every reading under the Claude account active when it was captured, so switching accounts can no longer file one account's usage under another.
+- Upgrading marks a one-time cutover: anything an older cctally process writes afterwards, including after a downgrade and re-upgrade, is kept out of your usage history. Restart such processes, usually a `cctally dashboard`.
+- After an older process writes post-upgrade, credit and reset detection pauses until each account reads clean, or indefinitely if status-line files changed or are unreadable; usage still records, and `cctally record-credit` records resets.
+- `cctally record-usage` exits 2 and records nothing when the active Claude account cannot be read consistently, instead of recording under a guessed account.
+- Existing `cctally quota` calibrations become incompatible immediately; each account's is replaced on its next successful automatic fit, and a diagnostic run or too little Opus 5.5 history leaves the old one stored and ignored.
+
+### Fixed
+- Codex reports now read compressed rollouts (`.jsonl.zst`) without losing cached history, slow history cleanup no longer runs inside the Codex hook, and `cctally doctor` has a new `Compressed Codex rollouts` check.
+- `daily`, `session` and other Claude cost reports price Sonnet 5.5 cache reads at $0.10 per million tokens instead of $0.20. Recorded snapshots, closed blocks and milestones keep their original amounts.
+- The status line's 5-hour figure no longer changes, or retries a pending drop, when another account's 5-hour reset is recorded.
+- `cctally db rebuild --db stats` no longer drops percent milestones after a 5-hour or manual credit, which also stalled recording afterwards; this upgrade's one-time rebuild restores them.
+- A usage reading recorded right after an upgrade while an older cctally process (such as a dashboard) was still running, or during `cctally db rebuild --db stats` or a stats index repair, no longer goes missing or waits for a later reading.
+- `cctally db rebuild --db stats` keeps the current 5-hour block's first-seen time and pricing details as recorded. It no longer moves that time after a 5-hour credit or when two readings were recorded out of order.
+- The status line, dashboard, TUI, `forecast`, `five-hour-blocks` and `five-hour-breakdown` show the latest 5-hour reading when the newest reading has none, instead of a blank or 0 % 5-hour figure or a closed current block.
+- A 5-hour credit no longer discards a weekly reading recorded alongside the stale 5-hour figure, so the weekly figure no longer falls back to an older value.
+- A weekly credit detected mid-week no longer discards the 5-hour reading recorded with the stale weekly figure, so the status line, 5-hour blocks and 5-hour milestones keep it, and upgrading restores readings already lost.
+
 ## [1.114.0] - 2026-10-08
 
 ### Added
@@ -16,6 +40,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `cctally doctor` no longer warns about modest free space in `conversations.db`; it warns only while a large backlog (over 2 GiB and 20% of the file) is being reclaimed at a paced rate, and says why when reclaim is refused.
 
 ### Fixed
+- Statusline and usage recording avoid redundant sorting of retained snapshots and expired blocks, with the same quota readings and publication order.
 - The `dashboard` block cost chart shows every trajectory sample when it exceeds a retained total.
 - The `dashboard` Sessions filter and sort icons keep their intended size on phones.
 - The `dashboard` keeps same-name project suffixes and panel counts readable, contains account status chips on phones, and keeps the swipe cue clear of spend details. Returning to All accounts starts at the first card.

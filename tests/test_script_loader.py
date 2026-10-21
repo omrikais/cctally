@@ -963,8 +963,8 @@ def _code_path_expression(node, bindings):
             if source is not None:
                 filename = node.args[1] if len(node.args) > 1 else None
                 if (
-                    isinstance(source, ast.Name)
-                    and source.id not in bindings
+                    isinstance(node.args[0], ast.Name)
+                    and node.args[0].id not in bindings
                     and _is_synthetic_code_label(filename)
                 ):
                     # The source expression is a name this scope cannot
@@ -987,11 +987,11 @@ def _code_path_expression(node, bindings):
             and node.func.attr in _CONTENT_READER_METHODS
         ):
             return node.func.value
-        return None
+        return ast.Call(func=ast.Name(id="__code_source__", ctx=ast.Load()), args=[node], keywords=[])
     if isinstance(node, ast.Name):
         # A local alias or a parameter. The evidence lattice resolves the first
         # and the outward recursion may resolve the second.
-        return node
+        return ast.Call(func=ast.Name(id="__code_source__", ctx=ast.Load()), args=[node], keywords=[])
     return None
 
 
@@ -1039,6 +1039,88 @@ def _writes_into_namespace(node, name):
     )
 
 
+def _source_origin(node, bindings, depth=0):
+    """Follow text reads and structurally verified replacement transforms."""
+    if depth >= _ALIAS_DEPTH:
+        return None
+    if _is_literal_text(node, bindings):
+        return _OTHER_BINDING
+    if isinstance(node, ast.Name) and node.id in bindings:
+        return _source_origin(bindings[node.id], bindings, depth + 1)
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _CONTENT_READER_METHODS:
+            return node.func.value
+        if (ast.unparse(node.func) in bindings.get("__source_transforms__", ()) and node.args
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id not in bindings
+                and node.func.value.id not in bindings.get("__shadowed_names__", ())):
+            return _source_origin(node.args[0], bindings, depth + 1)
+    return node
+
+
+def _verified_source_transforms(tree):
+    """A replacement chain derives source from its first argument.
+
+    This is a proof about the imported implementation, not a name exemption.
+    Unknown functions, changed return values and unknown inputs stay unknown.
+    """
+    result = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            path = SCRIPT_PATH.parent.parent / "tests" / (alias.name + ".py")
+            if not path.is_file():
+                continue
+            imported = ast.parse(path.read_text())
+            functions = {f.name: f for f in imported.body if isinstance(f, ast.FunctionDef)}
+            replace = functions.get("_replace_once")
+            if replace is None:
+                continue
+            returns = [n for n in ast.walk(replace) if isinstance(n, ast.Return)]
+            if len(returns) != 1 or ast.unparse(returns[0].value) != "source.replace(anchor, replacement, 1)":
+                continue
+            if any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+                   and n.id != "count" for n in ast.walk(replace)):
+                continue
+            if any(isinstance(n, ast.Call) and ast.unparse(n.func) not in
+                   ("source.count", "ValueError", "source.replace") for n in ast.walk(replace)):
+                continue
+            for name, function in functions.items():
+                body = function.body
+                if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                    body = body[1:]
+                if not body or not isinstance(body[-1], ast.Return) or ast.unparse(body[-1].value) != "source":
+                    continue
+                if not function.args.args or function.args.args[0].arg != "source":
+                    continue
+                valid = True
+                transforms = 0
+                literals = {}
+                for statement in body[:-1]:
+                    if not isinstance(statement, ast.Assign) or len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                        valid = False
+                        break
+                    if statement.targets[0].id == "source":
+                        value = statement.value
+                        if not (isinstance(value, ast.Call) and _callee_name(value) == "_replace_once"
+                                and len(value.args) == 3 and not value.keywords
+                                and ast.unparse(value.args[0]) == "source"
+                                and all(_is_literal_text(arg, literals) for arg in value.args[1:])):
+                            valid = False
+                            break
+                        transforms += 1
+                    elif not _is_literal_text(statement.value, literals):
+                        valid = False
+                        break
+                    else:
+                        literals[statement.targets[0].id] = statement.value
+                if valid and transforms:
+                    result.add(f"{alias.asname or alias.name}.{name}")
+    return result
+
+
 def _determine(identity_node, path_node, bindings):
     """Does this call build a module from ``bin/cctally``?
 
@@ -1052,6 +1134,8 @@ def _determine(identity_node, path_node, bindings):
     """
     if _identity_literal(identity_node, bindings) == _SCRIPT_COMPONENT:
         return "yes"
+    if (isinstance(path_node, ast.Call) and _callee_name(path_node) == "__code_source__"):
+        path_node = _source_origin(path_node.args[0], bindings)
     evidence = _path_evidence(path_node, bindings)
     if evidence == CCTALLY_EVIDENCE:
         return "yes"
@@ -1175,6 +1259,7 @@ def _loader_sites_in_source(source, label):
     """
     tree = ast.parse(source)
     module_bindings = _scope_bindings(tree)
+    module_bindings["__source_transforms__"] = _verified_source_transforms(tree)
 
     enclosing = {}
     for node in ast.walk(tree):
@@ -1216,6 +1301,7 @@ def _loader_sites_in_source(source, label):
             merged = dict(module_bindings)
             merged.update(_parametrize_bindings(function, module_bindings))
             merged.update(locals_of(function))
+            merged["__shadowed_names__"] = set(_parameter_names(function))
             merged_cache[key] = merged
         return merged_cache[key]
 
@@ -2598,6 +2684,12 @@ _PRIVATE_CHILD_SITE_OWNERS = {
     "test_rewrite_release_notes.py": "tests/test_rewrite_release_notes.py",
     "test_schema_delivery_parity.py": "tests/test_schema_delivery_parity.py",
     "test_session_memory.py": "tests/test_session_memory.py",
+    "test_merge.py": "tests/test_merge.py",
+    "test_mixed_schedule_oracle_m20.py": "tests/test_mixed_schedule_oracle_m20.py",
+    "test_derivation_completion_frozen.py":
+        "tests/test_derivation_completion_frozen.py",
+    "test_outcome_quarantine_spool_marker_frozen.py":
+        "tests/test_outcome_quarantine_spool_marker_frozen.py",
 }
 
 _GENERATED_CHILD_SITES = {
@@ -2608,6 +2700,12 @@ _GENERATED_CHILD_SITES = {
     # exit-zero tests. The child still runs cctally's real main().
     "test_cmd_doctor.py": 1,
     "test_codex_fused_ingest.py": 1,
+    # #968: HOOK_PROBE_SOURCE loads the selected measured tree in a fresh
+    # child before timing; the current-tree loader would select another tree.
+    "test_codex_rollout_u4_regressions.py": 1,
+    # #968: compressed-selftest loads the selected harness frozen_selftest.py
+    # through a child-supplied path, not necessarily the current cctally tree.
+    "test_write_attribution_tools.py": 1,
     "test_correction_rebuild_orchestration_394.py": 1,
     "test_debug_sample_emission.py": 1,
     "test_doctor_gather.py": 4,
@@ -2652,6 +2750,14 @@ _GENERATED_CHILD_SITES = {
     # file and cannot produce the site.
     "test_session_memory.py": _estate.private_expectation(
         1, _PRIVATE_CHILD_SITE_OWNERS["test_session_memory.py"]),
+    # Test regime reset S2: the `_CONCURRENT`, `_HOLDER` and `_PARENT` child
+    # programs load bin/_lib_merge.py, not bin/cctally, from a path on argv,
+    # in separate interpreters that contend for or hold the merge lock.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_merge.py": _estate.private_expectation(
+        3, _PRIVATE_CHILD_SITE_OWNERS["test_merge.py"]),
     # The embedded validator shim loads whatever `EV_SHIM_REAL_KERNEL`
     # names, so the path is a subscript the detector cannot evaluate.
     "test_test_all_observability.py": 1,
@@ -2668,6 +2774,42 @@ _GENERATED_CHILD_SITES = {
     # observable; a pytest helper cannot reach a process that detached from
     # its parent.
     "test_901_wal_keeper.py": 1,
+    # #825/#832 Task 4.2 (case M20): `_OLD_REDUCER` loads the FROZEN previous
+    # release's `bin/cctally` — an extracted `git archive 4c36730a4 bin`, never
+    # this tree — under module identity `cctally`, then runs that release's own
+    # `_statusline_persist` to completion as the old detached reducer. The
+    # child runs the old release's code, so it cannot import this tree's
+    # primitive from `tests/`.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_mixed_schedule_oracle_m20.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS["test_mixed_schedule_oracle_m20.py"]),
+    # #825/#832 fix round E: `_OLD_RECORD_WITHOUT_INGEST` loads the FROZEN
+    # previous release's `bin/cctally` (an extracted `git archive 4c36730a4
+    # bin`, never this tree) under module identity `cctally` and runs that
+    # release's own `record-usage` with its ingest stubbed out — the legacy
+    # recorder that appends before the cutover and stops before its ingest.
+    # The child runs the old release's code, so it cannot import this tree's
+    # primitive from `tests/`.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_derivation_completion_frozen.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS["test_derivation_completion_frozen.py"]),
+    # #825/#832 fix round Q (decisive test 16): `_OLD_RENDER` loads the FROZEN
+    # previous release's `bin/cctally` (an extracted `git archive 4c36730a4
+    # bin`, never this tree) under module identity `cctally` and runs that
+    # release's own `_write_candidate`: the legacy render whose spool write
+    # is all it does, producing the `legacy_spool_activity` trigger. The
+    # child runs the old release's code, so it cannot import this tree's
+    # primitive from `tests/`.
+    #
+    # Mirror-private, so the public clone collects this module without the
+    # file and cannot produce the site.
+    "test_outcome_quarantine_spool_marker_frozen.py": _estate.private_expectation(
+        1, _PRIVATE_CHILD_SITE_OWNERS[
+            "test_outcome_quarantine_spool_marker_frozen.py"]),
 }
 
 
@@ -2694,13 +2836,13 @@ def _generated_child_diff(found, known, *, profile):
 
 
 def test_generated_child_sites_are_named_rather_than_silently_left():
-    """Eighteen modules on the private profile, and fifteen on the public
+    """Twenty-two modules on the private profile, and fifteen on the public
     one, embed a loader in source for a separate interpreter.
 
     A child program started by `subprocess` has no `tests/` on its path and no
     parent pytest helper to import, so it cannot call the primitive. They are
     listed here so that leaving them is a recorded decision rather than an
-    oversight, and so that a nineteenth appearing is a failing test rather than
+    oversight, and so that a twenty-third appearing is a failing test rather than
     a silent regression.
 
     Membership means the module embeds a loader the detector cannot prove is
@@ -2823,3 +2965,49 @@ def test_the_named_alternate_identities_have_real_callers():
             "name from test_every_migrated_identity_still_loads rather than "
             "leaving a parametrization that names nothing"
         )
+
+
+@pytest.fixture
+def synthetic_source_transformer(tmp_path, monkeypatch):
+    """Give public controls a real transformer source with no private dependency."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "_synthetic_transformer.py").write_text(
+        "def _replace_once(source, anchor, replacement):\n"
+        "    count = source.count(anchor)\n"
+        "    if count != 1:\n"
+        "        raise ValueError('expected one anchor')\n"
+        "    return source.replace(anchor, replacement, 1)\n"
+        "\n"
+        "def instrument_runner(source):\n"
+        "    source = _replace_once(source, 'original', 'replacement')\n"
+        "    return source\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "SCRIPT_PATH", tmp_path / "bin" / "cctally")
+
+
+@pytest.mark.parametrize("leaf,want", [("_mutation_runner.py", False), ("cctally", True), (None, True)])
+@pytest.mark.parametrize("generated", [False, True])
+def test_transformed_runner_source_has_determinate_file_provenance(
+        leaf, want, generated, synthetic_source_transformer):
+    origin = f"Path('tests') / {leaf!r}" if leaf else "unknown_path"
+    argument = "diagnostic.instrument_runner(SOURCE)" if generated else "SOURCE"
+    source = ("import types\nimport _synthetic_transformer as diagnostic\nfrom pathlib import Path\n"
+              f"SOURCE = ({origin}).read_text()\n"
+              "def load(source):\n"
+              "    module = types.ModuleType('diagnostic_contract_runner')\n"
+              "    exec(compile(source, module.__file__, 'exec'), module.__dict__)\n"
+              f"load({argument})\n")
+    assert bool(_sites(source)) is want
+
+
+@pytest.mark.parametrize("expression", ["diagnostic.unknown(SOURCE)", "unknown.instrument_runner(SOURCE)",
+                                      "absent.instrument_runner(SOURCE)"])
+def test_unknown_source_transformers_remain_reported(expression, synthetic_source_transformer):
+    source = ("import _synthetic_transformer as diagnostic\n"
+              "import _absent_transformer as absent\n"
+              "from pathlib import Path\n"
+              "SOURCE = Path('tests/_mutation_runner.py').read_text()\n"
+              f"exec(compile({expression}, '<generated>', 'exec'), {{}})\n")
+    assert _sites(source)

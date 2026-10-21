@@ -19,6 +19,10 @@
 # scenario measures at a pinned instant.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -29,7 +33,7 @@ HARNESS_BIN="$REPO_ROOT/bin/cctally"
 # Per-run scratch dir for the regenerated fixture DBs and the oracle manifests.
 # Keeps the in-tree fixture tree free of binary .db files, which are not
 # byte-stable across hosts and sqlite versions.
-SCRATCH_DIR=$(mktemp -d -t cctally-explain-fixtures-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-explain-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
 

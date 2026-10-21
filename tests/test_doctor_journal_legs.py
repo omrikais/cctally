@@ -653,7 +653,8 @@ def test_a_repeated_heal_id_is_one_detection():
     assert r.severity == "warn"
 
 
-def test_the_journal_leg_roster_is_still_exactly_eight():
+def test_the_journal_leg_roster_is_exactly_nine():
+    """#825/#832 spec 8 added `journal.legacy_writer` after `journal.protocol`."""
     import _lib_doctor
     journal_category = next(
         cat for cat in _lib_doctor._CATEGORY_DEFINITIONS if cat[0] == "journal")
@@ -661,7 +662,8 @@ def test_the_journal_leg_roster_is_still_exactly_eight():
     assert ids == [
         "journal.presence", "journal.integrity", "journal.index_freshness",
         "journal.auto_heal", "journal.writer_guard", "journal.conflicts",
-        "journal.protocol", "journal.quota_projection",
+        "journal.protocol", "journal.legacy_writer",
+        "journal.quota_projection",
     ]
 
 

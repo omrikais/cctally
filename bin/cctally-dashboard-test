@@ -44,15 +44,87 @@
 # its own scratch tree.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
+
+# `credited-week` / `credited-week-same-day` (#750 S4 §6.2 / #734): the
+# builder shipped no production-shaped in-place credit, so the assembled
+# wire and render contract of a credited week had no byte-compared
+# coverage. `reset-week` stays the BOUNDARY-SHIFT control beside them.
+fixture_scenarios=(ok warn over reset-week credited-week credited-week-same-day no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-combined-account-unresolved all-budget-account-focus codex-account-fallback non-monday-anchor block-week-straddle alerts-weekly alerts-five-hour alerts-project-budget)
+
+# Test regime reset, session 2 (spec 4.3). A normal run excludes the cases
+# tests/quarantine.json lists for this harness (`harness:dashboard::<case>`),
+# names them on an `excluded:` line and counts them as neither passes nor
+# failures. `--cases a,b` runs exactly those scenarios, quarantined or not,
+# without the banner and golden-shape checks (the CI quarantine leg); an
+# unknown name is a usage error. `--list-cases` prints the scenario inventory
+# the quarantine list is validated against.
+usage () {
+    echo "usage: cctally-dashboard-test [--list-cases | --cases NAME[,NAME...]]" >&2
+    exit 2
+}
+selected_cases=""
+cases_given=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --list-cases) printf '%s\n' "${fixture_scenarios[@]}"; exit 0 ;;
+        --cases) [ "$#" -ge 2 ] || usage; selected_cases=$2; cases_given=1; shift 2 ;;
+        --cases=*) selected_cases=${1#--cases=}; cases_given=1; shift ;;
+        *) echo "cctally-dashboard-test: unknown argument: $1" >&2; usage ;;
+    esac
+done
+excluded_cases=()
+if [ "$cases_given" = 1 ]; then
+    [ -n "$selected_cases" ] || { echo "cctally-dashboard-test: --cases needs at least one name" >&2; usage; }
+    IFS=, read -r -a wanted <<<"$selected_cases"
+    [ "${#wanted[@]}" -gt 0 ] || { echo "cctally-dashboard-test: --cases needs at least one name" >&2; usage; }
+    for w in "${wanted[@]}"; do
+        known=0
+        for s in "${fixture_scenarios[@]}"; do [ "$s" = "$w" ] && known=1; done
+        if [ "$known" = 0 ]; then
+            echo "cctally-dashboard-test: unknown case: '$w' (known: ${fixture_scenarios[*]})" >&2
+            exit 2
+        fi
+    done
+    kept=()
+    for s in "${fixture_scenarios[@]}"; do
+        for w in "${wanted[@]}"; do
+            if [ "$s" = "$w" ]; then kept+=("$s"); break; fi
+        done
+    done
+    fixture_scenarios=(${kept[@]+"${kept[@]}"})
+else
+    # A list that cannot be read fails the run; it never silently runs
+    # (or silently skips) the cases it was meant to name.
+    if ! quarantined=$(python3 "$REPO_ROOT/bin/_lib_quarantine.py" --repo "$REPO_ROOT" \
+                       harness-cases dashboard); then
+        echo "FAIL quarantine: tests/quarantine.json could not be applied"
+        echo
+        echo "passed: 0   failed: 1"
+        exit 1
+    fi
+    kept=()
+    for s in "${fixture_scenarios[@]}"; do
+        if printf '%s\n' "$quarantined" | grep -qxF -- "$s"; then
+            excluded_cases+=("$s")
+        else
+            kept+=("$s")
+        fi
+    done
+    fixture_scenarios=(${kept[@]+"${kept[@]}"})
+fi
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
-FIXTURE_STAGE=$(mktemp -d -t cctally-dashboard-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-dashboard-fixstage.XXXXXX") || exit 1
 FIX_DIR="$FIXTURE_STAGE/dashboard"
 FIXTURES_ROOT="$FIX_DIR"
 # Goldens address the COMMITTED root, never the staging copy above: this
@@ -89,7 +161,7 @@ JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
 # this, the dashboard server writes back to the in-tree stats.db during
 # normal startup paths (e.g. AUTOINCREMENT bumps on INSERT-OR-IGNORE
 # duplicates in `week_reset_events`), dirtying the worktree.
-SCRATCH_ROOT=$(mktemp -d -t cctally-dashboard-test.XXXXXX)
+SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-dashboard-test.XXXXXX") || exit 1
 
 pass_count=0
 fail_count=0
@@ -1296,11 +1368,6 @@ run_scenario () {
 # output goes to its own _output.log; the loop after `xargs` flushes
 # them in fixed scenario order so the harness output reads identically
 # to the old sequential version.
-# `credited-week` / `credited-week-same-day` (#750 S4 §6.2 / #734): the
-# builder shipped no production-shaped in-place credit, so the assembled
-# wire and render contract of a credited week had no byte-compared
-# coverage. `reset-week` stays the BOUNDARY-SHIFT control beside them.
-fixture_scenarios=(ok warn over reset-week credited-week credited-week-same-day no-data utc-tz tz-override projected-alerts command-secret codex-cache-active codex-cache-idle all-combined all-combined-decorated all-combined-account-unresolved all-budget-account-focus codex-account-fallback non-monday-anchor block-week-straddle alerts-weekly alerts-five-hour alerts-project-budget)
 export -f _run_scenario_inner run_scenario normalize_json normalize_session_json normalize_block_json
 export -f kill_server_bounded
 # Golden-diff helpers must reach the xargs `bash -c` subshells too.
@@ -1308,11 +1375,13 @@ export -f _golden_diff_files _golden_diff_str _golden_diff_two_str
 export -f _golden_require _golden_require_str
 export FIX_DIR GOLDEN_ROOT BIN SCRATCH_ROOT
 
-printf '%s\n' "${fixture_scenarios[@]}" \
-    | xargs -n1 -P "$JOBS" -I{} \
-        bash -c 'set -uo pipefail; run_scenario "$@"' _ {}
+if [ "${#fixture_scenarios[@]}" -gt 0 ]; then
+    printf '%s\n' "${fixture_scenarios[@]}" \
+        | xargs -n1 -P "$JOBS" -I{} \
+            bash -c 'set -uo pipefail; run_scenario "$@"' _ {}
+fi
 
-for name in "${fixture_scenarios[@]}"; do
+for name in ${fixture_scenarios[@]+"${fixture_scenarios[@]}"}; do
     if [ -f "$SCRATCH_ROOT/$name/_output.log" ]; then
         cat "$SCRATCH_ROOT/$name/_output.log"
     fi
@@ -1326,6 +1395,14 @@ for name in "${fixture_scenarios[@]}"; do
         fail_count=$((fail_count + 1))
     fi
 done
+
+# --cases runs the named scenarios only; the checks below are not cases.
+if [ "$cases_given" = 1 ]; then
+    echo
+    echo "passed: $pass_count   failed: $fail_count"
+    [ "$fail_count" = "0" ]
+    exit
+fi
 
 # Local assert helpers used only by the banner scenarios below — kept
 # here (rather than at file top) so the existing scenario flow that
@@ -1539,5 +1616,8 @@ for golden in "$GOLDEN_ROOT"/*/golden-data.json; do
 done
 
 echo
+if [ "${#excluded_cases[@]}" -gt 0 ]; then
+    echo "excluded: ${excluded_cases[*]}"
+fi
 echo "passed: $pass_count   failed: $fail_count"
 [ "$fail_count" = "0" ]

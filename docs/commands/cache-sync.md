@@ -35,7 +35,7 @@ run. Use `cache-sync` when you want to:
 | Flag | Description |
 | --- | --- |
 | `--rebuild` | Drop all cached entries and re-ingest from scratch. It first checks an existing transcript store and safely recovers confirmed corruption. Waits up to 30s for each provider lock; each transcript-provider phase has a 30-minute no-progress ceiling and exits non-zero if incomplete (see Notes). |
-| `--prune-orphans` | Remove cache rows for source files no longer on disk, without a full rebuild (Claude cache only). |
+| `--prune-orphans` | Remove cache rows for source files no longer on disk, without a full rebuild (Claude cache only; Codex orphans are pruned after every Codex sync, see [Compressed Codex rollouts](#compressed-codex-rollouts)). |
 | `--prune-conversations` | Prune conversation transcripts older than `conversation.retention_days` (default 90) right now, without a full rebuild. Reports the rows removed per provider. See `--prune-conversations` below. |
 | `--source {claude,codex,all}` | Which ingest half to sync/rebuild. Default `all`. |
 
@@ -63,7 +63,19 @@ Eligibility is decided per conversation from the authoritative message rows, nev
 
 The command reports the number of sessions/messages (Claude) and conversations/events (Codex) removed. Each conversation's deletion draws on the same 4 MiB/min transcript maintenance allowance a running dashboard's automatic pass uses, so a large backlog can take more than one run: when the allowance is spent the command still exits 0 and adds a `stopped early` line beside its counts, and the remaining expired transcripts are pruned on later runs or by a running dashboard. It skips (exit 1) if a sync or another maintenance operation is holding the conversation-store locks — retry shortly.
 
-You rarely need to run this by hand: the dashboard self-heals these orphans automatically (once at startup and periodically while running), so `--prune-orphans` is mainly for headless or one-off cleanup.
+You rarely need to run this by hand: the dashboard self-heals these orphans automatically (once at startup and periodically while running), so `--prune-orphans` is mainly for headless or one-off cleanup. Codex orphans need no flag: a Codex sync records them as pending maintenance, and `cache-sync` (or, after a hook-driven sync, a background worker) removes them one rollout at a time, after re-checking that the rollout is really gone.
+
+## Compressed Codex rollouts
+
+Codex compresses older rollouts to `rollout-….jsonl.zst`. `cache-sync` reads them as the same rollout they were before compression, so totals, offsets, conversation history and account attribution stay exactly as they were. Reading them needs Python 3.14 or newer (its `compression.zstd`) or the `backports.zstd` package in the Python environment that runs cctally (`pip install backports.zstd`).
+
+Without a decoder nothing already cached is lost: rollouts cctally read before they were compressed keep their history, and rollouts it has never read are counted by `cctally doctor` (`data.codex_compressed_rollouts`). An explicit command prints this once (the Codex hook never does):
+
+    Some compressed Codex rollouts could not be read. Cached history was kept. Use Python 3.14+ or install `backports.zstd` in the Python environment running cctally (`pip install backports.zstd`).
+
+`--rebuild` for Codex history (`--source codex` or `--source all`) refuses before it clears anything when a compressed rollout it would have to re-read cannot be decoded or fails its integrity check. It prints `Codex rebuild refused: compressed rollouts could not be decoded. Existing Codex data was kept.` and exits `3`; the same refusal protects a pending Codex replay that an ordinary sync would otherwise run.
+
+Slow Codex history maintenance runs off the Codex hook: removing the rows of rollouts that no longer exist on disk, and verifying a rollout that changed from plain to compressed before its cached rows are trusted. `cache-sync` performs that maintenance itself after syncing. When a background worker is already doing it, `cache-sync` prints `Codex history maintenance is continuing in the background.` and exits normally.
 
 ## Examples
 

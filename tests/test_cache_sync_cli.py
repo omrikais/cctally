@@ -1,11 +1,18 @@
 """cmd_cache_sync: --rebuild aggregates a non-zero exit on lock contention
 (was silently exit 0); --prune-orphans runs the helper and reports."""
 from __future__ import annotations
-import argparse, fcntl, json, multiprocessing, os, pathlib, shutil, sqlite3, time
+import argparse, fcntl, json, multiprocessing, os, pathlib, shutil, sqlite3, subprocess, sys, time
 import pytest
 from conftest import load_script, redirect_paths
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
+
+import _lib_test_isolation as _iso
+from _retention_fixtures import (
+    LAUNCH_TIMEOUT_S, SWITCH, assert_holds_expired, copy_layout, counts, fork,
+    seed, stage, write_retention)
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture
@@ -186,11 +193,9 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     """
     ns, tmp_path, monkeypatch = env
     cache_mod = ns["_cctally_cache"]
-    # The fixture entry has a fixed 2026-07-01 timestamp, and the default
-    # 90-day transcript retention would prune it once the wall clock passes
-    # that window, leaving the retry with no conversation messages. Retention
-    # is not what this test exercises, so turn it off.
-    ns["save_config"]({"conversation": {"retention_days": 0}})
+    # Fixed-date fixture: durable under the test default
+    # (docs/fixtures-gotchas.md, "Conversation retention is off in test
+    # environments (#965)").
     _write_claude_entry(tmp_path)
     monkeypatch.setattr(
         cache_mod,
@@ -623,6 +628,8 @@ def test_prune_conversations_cli(env, capsys):
     # far-future timestamps keep the assertion time-independent (the command
     # uses real `now`).
     ns, tmp_path, monkeypatch = env
+    # #965: deletion is this test's subject, so it opts into retention explicitly.
+    ns["save_config"]({"conversation": {"retention_days": 90}})
     conn = ns["open_conversations_db"](attach_cache=False)
     for off, (sid, ts) in enumerate(
         [("old", "2020-01-01T00:00:00.000Z"),
@@ -882,3 +889,135 @@ def test_prune_orphans_reports_contention_before_a_refusal(env, capsys):
     finally:
         fcntl.flock(holder, fcntl.LOCK_UN)
         holder.close()
+
+
+# ── #965: one seeded store per module, forked per row (runtime cost) ─────────
+
+def _checkout_cache_sync(staged, *args):
+    # timing-budget: #965 hang bound for one cctally launch, LAUNCH_TIMEOUT_S (45 s) from tests/_retention_fixtures.py; a node makes at most two in sequence, under the 120 s cap
+    proc = subprocess.run(
+        [sys.executable, str(_REPO / "bin" / "cctally"), "cache-sync", *args],
+        env=staged.env, capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc
+
+
+@pytest.fixture(scope="module")
+def retention_template(tmp_path_factory):
+    """A store seeded ONCE per module and xdist worker through the checkout CLI
+    with retention explicitly off. Every T2 and T4 row forks it and reads the
+    same source tree through the same explicit CODEX_HOME, so the seed proves
+    that each row's launch reads a Codex root holding expired transcripts."""
+    staged = stage(tmp_path_factory.mktemp("retention-965-template"))
+    assert staged.env.get(SWITCH) == "1", "the copied environment lost the switch"
+    seed(staged.data, lambda *args: _checkout_cache_sync(staged, *args))
+    return staged
+
+
+def _forked(template, tmp_path, explicit):
+    """The row's own store: a fork proven to hold expired transcripts, then the
+    row's retention setting (None removes the template's explicit 0)."""
+    staged = fork(template, tmp_path)
+    assert_holds_expired(staged.data, when="after forking the template")
+    write_retention(staged.data, explicit)
+    return staged
+
+
+# ── #965 T2: eligibility follows the executed code (real subprocess pruning) ──
+
+# id, layout, switch (None = unset), explicit window, declared control, survives.
+# Spec T2's "an explicit positive window still prunes in an eligible checkout" is
+# T4's test_965_rebuild_under_the_test_default[explicit-window], which runs the
+# real checkout, so no copied-checkout row repeats it.
+_LAYOUT_ROWS = [
+    ("packaged-switch", "packaged", "1", None, True, False),
+    ("npm-switch", "npm", "1", None, True, False),
+    ("brew-switch", "brew", "1", None, True, False),
+    ("checkout-switch", "checkout", "1", None, False, True),
+    ("worktree-switch", "worktree", "1", None, False, True),
+    ("checkout-unset", "checkout", None, None, True, False),
+    ("worktree-unset", "worktree", None, None, True, False),
+    ("packaged-explicit-zero", "packaged", "1", 0, True, True),
+]
+
+
+@pytest.fixture(scope="module")
+def retention_layouts(tmp_path_factory):
+    root = tmp_path_factory.mktemp("retention-965-layouts")
+    return {kind: copy_layout(kind, root / kind)
+            for kind in ("packaged", "npm", "brew", "checkout", "worktree")}
+
+
+def _layout_cache_sync(launcher, staged, *args, switch, declared):
+    env = dict(staged.env)
+    if switch is None:
+        env.pop(SWITCH, None)
+    else:
+        env[SWITCH] = switch
+    argv = [sys.executable, str(launcher), "cache-sync", *args]
+
+    def run():
+        # Always from a checkout working directory: eligibility follows the code.
+        # timing-budget: #965 hang bound for one cctally launch, LAUNCH_TIMEOUT_S (45 s) from tests/_retention_fixtures.py; a node makes at most two in sequence, under the 120 s cap
+        return subprocess.run(argv, env=env, cwd=_REPO, capture_output=True,
+                              text=True, timeout=LAUNCH_TIMEOUT_S)
+
+    if declared:
+        with _iso.retention_launch_control(
+                "production-behavior",
+                reason="#965 T2: production semantics are this row's subject"):
+            proc = run()
+    else:
+        proc = run()
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc
+
+
+@pytest.mark.parametrize(
+    "layout,switch,explicit,declared,survives",
+    [row[1:] for row in _LAYOUT_ROWS], ids=[row[0] for row in _LAYOUT_ROWS])
+def test_965_eligibility_follows_the_executed_code(
+        retention_template, retention_layouts, tmp_path,
+        layout, switch, explicit, declared, survives):
+    staged = _forked(retention_template, tmp_path, explicit)
+    _layout_cache_sync(retention_layouts[layout], staged, "--source", "all",
+                       "--rebuild", switch=switch, declared=declared)
+    got = counts(staged.data)
+    assert got["recent_claude"] > 0, f"the rebuild lost the recent survivor: {got}"
+    if survives:
+        assert got["expired_claude"] > 0 and got["expired_codex"] > 0, (
+            f"{layout}: the expired transcripts were deleted: {got}")
+    else:
+        assert got["expired_claude"] == 0 and got["expired_codex"] == 0, (
+            f"{layout}: expired transcripts survived production retention: {got}")
+
+
+# ── #965 T4: the real CLI under the test default, with deletion controls ──
+
+@pytest.mark.parametrize("window", [None, 30], ids=["test-default", "explicit-window"])
+def test_965_rebuild_under_the_test_default(retention_template, tmp_path, window):
+    staged = _forked(retention_template, tmp_path, window)
+    assert staged.env.get(SWITCH) == "1", "the copied environment lost the switch"
+    _checkout_cache_sync(staged, "--source", "all", "--rebuild")
+    got = counts(staged.data)
+    assert got["recent_claude"] > 0, got
+    if window is None:
+        assert got["expired_claude"] > 0 and got["expired_codex"] > 0, (
+            f"the test default deleted expired transcripts on --rebuild: {got}")
+    else:
+        assert got["expired_claude"] == 0 and got["expired_codex"] == 0, got
+
+
+@pytest.mark.parametrize("window", [None, 30], ids=["test-default", "explicit-window"])
+def test_965_explicit_prune_under_the_test_default(retention_template, tmp_path, window):
+    # The template ingested with retention explicitly off, so the prune below is
+    # the only deleter.
+    staged = _forked(retention_template, tmp_path, window)
+    _checkout_cache_sync(staged, "--prune-conversations")
+    got = counts(staged.data)
+    assert got["recent_claude"] > 0, got
+    if window is None:
+        assert got["expired_claude"] > 0 and got["expired_codex"] > 0, (
+            f"the test default deleted expired transcripts on --prune-conversations: {got}")
+    else:
+        assert got["expired_claude"] == 0 and got["expired_codex"] == 0, got

@@ -64,6 +64,7 @@ worker is a fresh process, so the compile is paid once per worker.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 import types
@@ -153,4 +154,30 @@ def load_script_module(name: str = "cctally", register: bool = True) -> types.Mo
                 sys.modules[name] = previous
             else:
                 sys.modules.pop(name, None)
+    _install_inline_statusline_continuation()
     return mod
+
+
+def _install_inline_statusline_continuation() -> None:
+    """#825/#832 spec 4.3 revision 2: an in-process test never detaches a
+    `cctally _statusline-continue` process. The statusline continuation's ONE
+    spawn seam runs a reserved worker synchronously in the calling thread
+    (the in-process twin of the detached worker) and never runs a dependency
+    waiter, so no thread is left blocked on a lock its own test holds. A test
+    that exercises waiters installs `tests/_statusline_continuation.Dispatch`
+    instead."""
+    statusline = sys.modules.get("_cctally_statusline")
+    if statusline is None or not hasattr(statusline, "_run_spawned_continuation"):
+        return
+
+    def spawn(kind, fd, argument=None):
+        if kind != "worker":
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return True
+        statusline._run_spawned_continuation(kind, fd, argument)
+        return True
+
+    statusline._spawn_continuation = spawn

@@ -105,7 +105,8 @@ def test_a_mutation_during_the_read_is_retried_once_and_then_succeeds(
 
     monkeypatch.setattr(glue, "_read_stats_component", wrapper)
     result = glue.load_population(None, since=None,
-                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert calls["n"] == 2, "a divergence must cost exactly one re-read"
     assert result.status is None
     assert len(result.snapshots) == 1
@@ -135,7 +136,8 @@ def test_a_second_divergence_withholds_with_unavailable(
 
     monkeypatch.setattr(glue, "_read_stats_component", wrapper)
     result = glue.load_population(None, since=None,
-                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert seen["n"] == 2, "exactly one bounded retry, then refuse"
     assert result.status is glue.CalibrationStatus.UNAVAILABLE
     assert result.cause == "generation-incoherent"
@@ -168,7 +170,8 @@ def test_the_retained_span_is_inside_the_coherence_bracket(
 
     monkeypatch.setattr(glue, "_retained_snapshot_span", wrapper)
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert calls["n"] == 2, "the span read must participate in the retry"
     assert result.status is None
     assert len(result.snapshots) == 1
@@ -181,7 +184,8 @@ def test_an_unopenable_store_is_unavailable_not_an_exception(
 
     monkeypatch.setattr(_cctally_core, "open_db", boom)
     result = glue.load_population(None, since=None,
-                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert result.status is glue.CalibrationStatus.UNAVAILABLE
     assert result.cause == "store-unavailable"
 
@@ -201,7 +205,8 @@ def test_snapshot_rowid_is_the_store_rowid(store, glue):
         "SELECT id FROM weekly_usage_snapshots ORDER BY id")]
     conn.close()
     result = glue.load_population(None, since=None,
-                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+                                  now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert sorted(s.rowid for s in result.snapshots) == ids
     assert ids[0] != ids[1]
 
@@ -221,7 +226,8 @@ def test_synthetic_sources_are_excluded_and_unknown_sources_are_retained(
     conn.commit()
     conn.close()
     result = glue.load_population(None, since=None,
-                                  now=dt.datetime(2026, 8, 9, tzinfo=UTC))
+                                  now=dt.datetime(2026, 8, 9, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 9, tzinfo=UTC)))
     kept = sorted(s.source for s in result.snapshots)
     assert kept == ["some-future-writer", "statusline"]
     assert result.diagnostics["unrecognisedSnapshotSources"] == {
@@ -256,7 +262,8 @@ def test_credit_boundaries_are_filtered_as_instants_not_text(store, glue):
     conn.close()
 
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
     assert [credit.at for credit in result.credits] == [
         dt.datetime(2026, 7, 25, tzinfo=UTC)]
 
@@ -270,7 +277,28 @@ def test_fast_mode_usage_credit_entries_do_not_enter_plan_quota(store, glue):
     cache.close()
 
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC))
+        None, since=None, now=dt.datetime(2026, 8, 5, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 8, 5, tzinfo=UTC)))
+    assert [entry.fresh for entry in result.entries] == [10]
+    assert result.diagnostics["fastModeEntriesExcluded"] == 1
+
+
+def test_a_closed_era_counts_only_its_own_fast_mode_entries(store, glue):
+    """#978: the excluded count describes the analysed window. A fast-mode
+    row after a closed era's end is outside it, so it is not counted."""
+    cache = _cache(store)
+    _entry(cache, at="2026-08-01T10:00:00+00:00", fresh=10, offset=1)
+    _entry(cache, at="2026-08-01T11:00:00+00:00", fresh=20, speed="fast",
+           offset=2)
+    _entry(cache, at="2026-10-01T10:00:00+00:00", fresh=30, speed="fast",
+           offset=3)
+    cache.commit()
+    cache.close()
+
+    now = dt.datetime(2026, 9, 1, tzinfo=UTC)
+    era = glue.select_era(now)
+    assert glue.qm.era_bounds(era)[1] == dt.datetime(2026, 9, 22, tzinfo=UTC)
+    result = glue.load_population(None, since=None, now=now, era=era)
     assert [entry.fresh for entry in result.entries] == [10]
     assert result.diagnostics["fastModeEntriesExcluded"] == 1
 
@@ -290,8 +318,11 @@ def test_the_era_floor_bounds_the_analysis_start(store, glue):
               week_start=f"{after}T08:00:00+00:00", percent=5)
     conn.commit()
     conn.close()
+    # #978: the floor is the start of the era the clock selects, so the
+    # clock sits inside the `opus-5` era whose start is this floor.
+    now = dt.datetime(2026, 9, 1, tzinfo=UTC)
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 12, 1, tzinfo=UTC))
+        None, since=None, now=now, era=glue.select_era(now))
     assert len(result.snapshots) == 1
     assert result.snapshots[0].at.date() > floor
     assert result.analysis_start.date() == floor
@@ -300,9 +331,10 @@ def test_the_era_floor_bounds_the_analysis_start(store, glue):
 def test_a_since_earlier_than_the_era_floor_does_not_widen_the_window(
         store, glue):
     floor = glue.SUPPORTED_COMPOSITION_FROM
+    now = dt.datetime(2026, 9, 1, tzinfo=UTC)
     result = glue.load_population(
-        None, since=dt.datetime(2020, 1, 1, tzinfo=UTC),
-        now=dt.datetime(2026, 12, 1, tzinfo=UTC))
+        None, since=dt.datetime(2020, 1, 1, tzinfo=UTC), now=now,
+        era=glue.select_era(now))
     assert result.analysis_start.date() == floor
 
 
@@ -316,7 +348,8 @@ def test_history_entirely_before_the_era_floor_is_an_unvalidated_era(
     conn.commit()
     conn.close()
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 12, 1, tzinfo=UTC))
+        None, since=None, now=dt.datetime(2026, 12, 1, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 12, 1, tzinfo=UTC)))
     assert result.status is glue.CalibrationStatus.UNVALIDATED_COEFFICIENT_ERA
     assert result.snapshots == ()
 
@@ -325,7 +358,8 @@ def test_an_empty_store_is_not_an_unvalidated_era(store, glue):
     """The cause means "your history predates the coefficients", which is a
     claim about retained rows. With no rows at all there is nothing to say."""
     result = glue.load_population(
-        None, since=None, now=dt.datetime(2026, 12, 1, tzinfo=UTC))
+        None, since=None, now=dt.datetime(2026, 12, 1, tzinfo=UTC),
+        era=glue.select_era(dt.datetime(2026, 12, 1, tzinfo=UTC)))
     assert result.status is None
 
 
@@ -364,8 +398,10 @@ def test_two_accounts_read_independently_with_no_cross_account_rows(
     day = _seed_two_accounts(store)
     now = dt.datetime.combine(day + dt.timedelta(days=2), dt.time(0),
                               tzinfo=UTC)
-    a = glue.load_population("acct-a", since=None, now=now)
-    b = glue.load_population("acct-b", since=None, now=now)
+    a = glue.load_population("acct-a", since=None, now=now,
+        era=glue.select_era(now))
+    b = glue.load_population("acct-b", since=None, now=now,
+        era=glue.select_era(now))
     assert [s.percent for s in a.snapshots] == [5.0]
     assert [s.percent for s in b.snapshots] == [6.0]
     assert [e.fresh for e in a.entries] == [1000]
@@ -447,7 +483,8 @@ def test_the_ingest_tail_is_store_wide_not_account_scoped(store, glue):
     cache.close()
     now = dt.datetime.combine(day + dt.timedelta(days=3), dt.time(0),
                               tzinfo=UTC)
-    a = glue.load_population("acct-a", since=None, now=now)
+    a = glue.load_population("acct-a", since=None, now=now,
+        era=glue.select_era(now))
     assert a.entries and all(e.at.date() == day for e in a.entries)
     assert a.newest_entry_at.date() == day + dt.timedelta(days=1)
 
@@ -470,7 +507,8 @@ def test_the_unattributed_bucket_matches_a_null_account_key(store, glue):
     conn.close()
     now = dt.datetime.combine(day + dt.timedelta(days=2), dt.time(0),
                               tzinfo=UTC)
-    result = glue.load_population("unattributed", since=None, now=now)
+    result = glue.load_population("unattributed", since=None, now=now,
+        era=glue.select_era(now))
     assert [e.fresh for e in result.entries] == [77]
     assert [s.percent for s in result.snapshots] == [9.0]
 
@@ -595,6 +633,8 @@ def test_the_success_path_publishes_the_current_week_consumption(
     assert payload["health"]["entriesThrough"].endswith("Z")
     assert payload["method"]["coefficientSupport"] == {
         "supportedCompositionFrom": "2026-07-25",
+        "supportedCompositionUntil": "2026-09-22",
+        "coefficientEra": "opus-5",
         "fastModeParticipation": "usage-credits-only-excluded",
     }
 
@@ -2234,3 +2274,381 @@ def test_reset_calibration_sweeps_nothing_and_leaves_the_identity_owed(
         "unattributed"], (
         "the positive control did not fire, so the identity was never owed "
         "and the reset assertion above proved nothing")
+
+
+# --------------------------------------------------------------------------
+# #978 — the clock selects one coefficient era and the analysis is confined
+# to it (spec section 4.3).
+# --------------------------------------------------------------------------
+#: One unchanged `claude-sonnet-5` token mix. Each day's tokens are scaled so
+#: that its units UNDER ITS OWN ERA'S WEIGHTS equal the meter movement times
+#: one budget, so the provider's metering rate never changes. Weighting the
+#: Opus 5 days with the Opus 5.5 set, or the reverse, would move the implied
+#: units-per-point by about 2.1x at 2026-09-22.
+_MIX = {"fresh": 1000, "output": 500, "cache_read": 20000}
+#: A deterministic +/-5% day-to-day variation in the units-to-meter ratio.
+_MIX_JITTER = [1.0, 1.05, 0.95, 1.03, 0.97, 1.04, 0.96]
+
+
+def _z(at: dt.datetime) -> str:
+    return at.isoformat().replace("+00:00", "Z")
+
+
+def _seed_mix_series(store, glue, *, first, days, budget, watch_budget=None,
+                     watch_days=0, model="claude-sonnet-5"):
+    """A meter series over `days` UTC days from `first`, weighted per era.
+
+    Weekly anchors fall on Mondays at 08:00 UTC, as `_seed_series`'s do, so
+    the week holding 2026-09-22 is anchored 2026-09-21T08:00Z and spans the
+    era boundary.
+    """
+    qm = glue.qm
+    anchor = dt.datetime(2026, 7, 27, 8, tzinfo=UTC)
+    stats = _stats(store)
+    cache = _cache(store)
+    steps = [5, 3, 7, 4, 8, 6, 5]
+    running: dict = {}
+    for index in range(days):
+        date = first + dt.timedelta(days=index)
+        noon = dt.datetime.combine(date, dt.time(12), tzinfo=UTC)
+        weights = qm.era_for_instant(noon).weight_map()
+        week = anchor + dt.timedelta(
+            days=7 * ((date - anchor.date()).days // 7))
+        scale = budget
+        if watch_days and index >= days - watch_days:
+            scale = watch_budget
+        step = steps[index % len(steps)]
+        opening = running.get(week, 2)
+        running[week] = opening + step
+        target = step * scale * _MIX_JITTER[index % len(_MIX_JITTER)]
+        factor = target / sum(weights[c] * n for c, n in _MIX.items())
+        for hour, pct in ((9, opening), (21, opening + step)):
+            at = dt.datetime.combine(date, dt.time(hour), tzinfo=UTC)
+            _snapshot(stats, at=at.isoformat(), week_start=week.isoformat(),
+                      percent=pct)
+        _entry(cache, at=noon.isoformat(), model=model,
+               fresh=round(_MIX["fresh"] * factor),
+               output=round(_MIX["output"] * factor),
+               cache_read=round(_MIX["cache_read"] * factor),
+               offset=index, path="/p/mix.jsonl")
+    _entry(cache, at=dt.datetime.combine(
+        first + dt.timedelta(days=days), dt.time(0, 30),
+        tzinfo=UTC).isoformat(), model=model, fresh=1000, offset=days,
+        path="/p/mix-tail.jsonl")
+    stats.commit()
+    cache.commit()
+    stats.close()
+    cache.close()
+
+
+def _json_run(store, glue, monkeypatch, capsys, clock, *argv):
+    monkeypatch.setenv("CCTALLY_AS_OF", clock)
+    code = _run(store, glue, "--json", *argv)
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_since_before_era_does_not_widen_window(store, glue, monkeypatch,
+                                                capsys):
+    _code, payload = _json_run(store, glue, monkeypatch, capsys,
+                               "2026-10-15T12:00:00Z", "--since",
+                               "2026-08-01")
+    assert payload["scope"]["analysisStart"] == "2026-09-22T00:00:00Z"
+
+
+def test_old_only_history_is_unvalidated_exit_3(store, glue, monkeypatch,
+                                                capsys):
+    _seed_series(store, days=20, budget=2_000_000.0)  # 2026-07-28..08-16
+    code, payload = _json_run(store, glue, monkeypatch, capsys,
+                              "2026-10-15T06:00:00Z")
+    assert code == 3
+    assert payload["status"] == "unvalidated-coefficient-era"
+    assert payload["verdict"] == "withheld"
+    assert payload["health"]["storeCause"] == \
+        "history-predates-supported-composition"
+
+
+@pytest.mark.parametrize("days, clock, status", [
+    (24, "2026-09-25T06:00:00Z", "insufficient-history"),
+    (22, "2026-09-23T06:00:00Z", "unstable-fit"),
+])
+def test_thin_new_era_history_statuses(store, glue, monkeypatch, capsys,
+                                       days, clock, status):
+    """Three, then one, new-era day behind 21 complete Opus 5 era days. The
+    old days are healthy evidence for their own era and must not count."""
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 1), days=days,
+                     budget=2_000_000.0)
+    code, payload = _json_run(store, glue, monkeypatch, capsys, clock)
+    assert payload["status"] == status
+    assert payload["verdict"] == "withheld"
+    assert code == 4
+    assert payload["health"]["eligibleDays"] == days - 21
+
+
+def test_boundary_spanning_history_does_not_detect_a_change(
+        store, glue, monkeypatch, capsys):
+    """RED test 3: the coefficient switch is not a metering-rate change."""
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 2), days=40,
+                     budget=2_000_000.0)
+    code, payload = _json_run(store, glue, monkeypatch, capsys,
+                              "2026-10-12T06:00:00Z")
+    assert payload["verdict"] != "rate-change-detected"
+    assert code != 1
+    assert payload["scope"]["analysisStart"] == "2026-09-22T00:00:00Z"
+    detector = payload["method"]["detector"]
+    assert detector["scanStartDate"] >= "2026-09-22"
+    assert detector["inputEligibleDays"] <= 20
+    assert payload["health"]["eligibleDays"] <= 20
+
+
+def test_within_era_rate_change_still_detects(store, glue, monkeypatch,
+                                              capsys):
+    """The paired control: the same construction wholly inside `opus-5-5`
+    with a 30% budget step is detected, persisted and delivered, so the
+    boundary test is not passing because detection, persistence or delivery
+    is broken (#978 spec section 5, RED test 3)."""
+    import _cctally_journal as jr
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    _enable_rate_change_alerts()
+    glue.seed_delivery_state()
+    # The seven watch days are the whole week anchored 2026-10-19T08:00Z,
+    # so the successor regime is one unfragmented segment.
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 22), days=34,
+                     budget=2_000_000.0, watch_budget=1_400_000.0,
+                     watch_days=7)
+    code, payload = _json_run(store, glue, monkeypatch, capsys,
+                              "2026-10-26T06:00:00Z")
+    assert payload["verdict"] == "rate-change-detected", json.dumps(
+        [payload["status"], payload["method"]["detector"]])
+    assert code == 1
+
+    # Persisted: the predecessor is closed at the successor's start and both
+    # regimes carry the current fingerprint and the `opus-5-5` era, which is
+    # what transition qualification requires.
+    state = json.loads(
+        (_cctally_core.APP_DIR / "quota-calibrations.json").read_text())
+    regimes = glue.stored_regimes(state, None)
+    assert len(regimes) == 2, regimes
+    predecessor, successor = regimes
+    assert predecessor["effectiveUntil"] == successor["effectiveFrom"]
+    assert successor["effectiveUntil"] is None
+    for regime in regimes:
+        assert regime["coefficientEra"] == "opus-5-5", regime
+        assert regime["fingerprint"] == \
+            glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT, regime
+
+    # Deliverable: the transition is recorded durably and dispatched once.
+    assert len(_mrc_rows(store)) == 1, _mrc_rows(store)
+    assert len(_fired(dispatched)) == 1, dispatched
+
+
+def test_straddling_week_withholds_modelled_figures(store, glue, monkeypatch,
+                                                    capsys):
+    """The week anchored 2026-09-21T08:00Z spans the boundary. Six complete
+    in-era days (09-22..09-27) make an in-era fit computable, so the fitted
+    calibration is independently valid while the week's modelled figures are
+    withheld."""
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 15), days=13,
+                     budget=2_000_000.0)
+    _code, payload = _json_run(store, glue, monkeypatch, capsys,
+                               "2026-09-28T06:00:00Z")
+    week = payload["currentWeek"]
+    assert week["start"] == "2026-09-21T08:00:00Z"
+    for field in ("consumption", "headroom", "projection"):
+        assert week[field]["state"] == "withheld", field
+        assert week[field]["code"] == "unvalidated-coefficient-era", field
+    assert week["observedMinusModelled"] is None
+    assert week["observedPercent"] is not None
+    assert payload["calibration"]["fitted"]["state"] == "available"
+
+
+def test_straddling_week_control_inside_the_era(store, glue, monkeypatch,
+                                                capsys):
+    """Non-vacuity: one week later the current week lies wholly inside the
+    era and the same figures are published."""
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 15), days=20,
+                     budget=2_000_000.0)
+    _code, payload = _json_run(store, glue, monkeypatch, capsys,
+                               "2026-10-05T06:00:00Z")
+    week = payload["currentWeek"]
+    assert week["start"] == "2026-09-28T08:00:00Z"
+    for field in ("consumption", "headroom", "projection"):
+        assert week[field]["state"] == "available", field
+    # The week opened at 2% and every day's units are its meter step times
+    # the fitted budget (within the seed's 5% jitter), so the modelled
+    # consumption tracks the meter. Mutation `current-week-wrong-era`: the
+    # week's entries weighted with another era's coefficients do not.
+    assert week["consumption"]["value"] == pytest.approx(
+        week["observedPercent"] - 2, rel=0.10)
+
+
+def test_clock_before_any_validated_era_is_unvalidated(store, glue,
+                                                       monkeypatch, capsys):
+    _seed_series(store, days=10, budget=2_000_000.0,
+                 first=dt.date(2026, 6, 10))
+    code, payload = _json_run(store, glue, monkeypatch, capsys,
+                              "2026-07-01T00:00:00Z")
+    assert code == 3
+    assert payload["status"] == "unvalidated-coefficient-era"
+    assert payload["method"]["coefficientSupport"]["coefficientEra"] is None
+    # The nullability `docs/commands/quota.md` documents for a clock before
+    # every validated era.
+    assert payload["scope"]["analysisStart"] is None
+    assert payload["method"]["supportedCompositionFrom"] is None
+    assert payload["method"]["coefficientSupport"][
+        "supportedCompositionFrom"] is None
+    assert payload["method"]["coefficientSupport"][
+        "supportedCompositionUntil"] is None
+    assert payload["health"]["storeCause"] == \
+        "history-predates-supported-composition"
+    assert [e["id"] for e in payload["method"]["coefficientEras"]] == [
+        None, "opus-5", "opus-5-5"]
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-01T00:00:00Z")
+    assert _run(store, glue) == 3
+    assert "cctally quota" in capsys.readouterr().out
+
+
+def test_watch_from_before_era_forces_split_at_first_in_era_day(
+        store, glue, monkeypatch, capsys):
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 2), days=40,
+                     budget=2_000_000.0)
+    _code, payload = _json_run(store, glue, monkeypatch, capsys,
+                               "2026-10-12T06:00:00Z", "--watch-from",
+                               "2026-09-10")
+    # The override lands on the first in-era eligible day, which is
+    # `detect_change`'s `forced[:1]`: one admissible split whose baseline is
+    # empty. An empty baseline can never qualify, so the detector publishes
+    # no winning split and nothing is confirmed, exactly as a `--watch-from`
+    # before the first analysed day behaves today. The preceding era's days
+    # never reach the baseline: the scan starts at 2026-09-22.
+    detector = payload["method"]["detector"]
+    assert detector["scanStartDate"] == "2026-09-22"
+    assert detector["holmFamilySize"] == 1
+    assert detector["splitDate"] is None
+    assert detector["baselineDays"] == 0
+    assert detector["qualified"] is False
+    assert payload["verdict"] != "rate-change-detected"
+    assert payload["scope"]["invocation"] == "diagnostic"
+
+
+def test_method_metadata_names_the_selected_era(store, glue, monkeypatch,
+                                                capsys):
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 22), days=10,
+                     budget=2_000_000.0)
+    _code, payload = _json_run(store, glue, monkeypatch, capsys,
+                               "2026-10-02T06:00:00Z")
+    method = payload["method"]
+    assert method["supportedCompositionFrom"] == "2026-09-22"
+    assert method["coefficientSupport"] == {
+        "supportedCompositionFrom": "2026-09-22",
+        "supportedCompositionUntil": None,
+        "coefficientEra": "opus-5-5",
+        "fastModeParticipation": "usage-credits-only-excluded",
+    }
+    eras = method["coefficientEras"]
+    assert [e["id"] for e in eras] == [None, "opus-5", "opus-5-5"]
+    assert eras[0]["state"] == "unvalidated"
+    assert "tokenClassWeights" not in eras[0]
+    assert eras[0]["until"] == "2026-07-25"
+    assert [(e["from"], e["until"], e["state"]) for e in eras[1:]] == [
+        ("2026-07-25", "2026-09-22", "validated"),
+        ("2026-09-22", None, "validated")]
+    assert eras[2]["tokenClassWeights"] == {
+        "fresh": 1.0, "output": 0.64, "cache_1h": 1.0, "cache_read": 0.0148}
+
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-10-02T06:00:00Z")
+    _run(store, glue)
+    assert "(supported composition: 2026-09-22 onward)" in \
+        capsys.readouterr().out
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-08-20T06:00:00Z")
+    _run(store, glue)
+    text = capsys.readouterr().out
+    assert "(supported composition: 2026-07-25 to 2026-09-22)" in text
+
+
+# --------------------------------------------------------------------------
+# #978 spec 4.2 invariant 5: the current-week sum refuses an out-of-era entry
+# rather than skipping it.
+# --------------------------------------------------------------------------
+def _week_entry(glue, at, **over):
+    base = dict(at=at, model="claude-opus-5-5", fresh=1000, output=100,
+                cache_create_total=0, cache_1h=0, cache_read=2000)
+    base.update(over)
+    return glue.qm.EntryRecord(**base)
+
+
+def test_current_week_units_refuses_an_out_of_era_entry(glue):
+    era = glue.qm.era_by_id("opus-5-5")
+    inside = _week_entry(glue, dt.datetime(2026, 10, 1, 12, tzinfo=UTC))
+    outside = _week_entry(glue, dt.datetime(2026, 9, 21, 12, tzinfo=UTC))
+    with pytest.raises(glue.qm.CoefficientEraMismatch):
+        glue.current_week_units([inside, outside], era)
+
+
+def test_current_week_units_still_skips_an_unknown_token_split(glue):
+    qm = glue.qm
+    era = qm.era_by_id("opus-5-5")
+    inside = _week_entry(glue, dt.datetime(2026, 10, 1, 12, tzinfo=UTC))
+    split = _week_entry(glue, dt.datetime(2026, 10, 1, 13, tzinfo=UTC),
+                        cache_create_total=500, cache_1h=None)
+    assert qm.weigh_entry(split, era).cause == qm.SPLIT_UNKNOWN
+    # 1000 fresh + 0.64 * 100 output + 0.0148 * 2000 cache reads.
+    assert glue.current_week_units([inside, split], era) == pytest.approx(
+        1000.0 + 64.0 + 29.6, abs=1e-9)
+
+
+# --------------------------------------------------------------------------
+# #978: the analysis start bounds the population as an INSTANT, not as text.
+# --------------------------------------------------------------------------
+#: Text that sorts at or after `2026-09-22T00:00:00+00:00` while naming an
+#: instant before it, and text that sorts before it while naming an instant
+#: after it.
+_PRE_ERA_LATE_TEXT_ENTRY = "2026-09-22T03:00:00+05:00"     # 09-21T22:00Z
+_PRE_ERA_LATE_TEXT_SNAPSHOT = "2026-09-22T04:00:00+05:00"  # 09-21T23:00Z
+_IN_ERA_EARLY_TEXT_ENTRY = "2026-09-21T22:30:00-05:00"     # 09-22T03:30Z
+
+
+def _seed_offset_rows(store):
+    stats = _stats(store)
+    _snapshot(stats, at=_PRE_ERA_LATE_TEXT_SNAPSHOT,
+              week_start="2026-09-21T08:00:00+00:00", percent=1)
+    stats.commit()
+    stats.close()
+    cache = _cache(store)
+    _entry(cache, at=_PRE_ERA_LATE_TEXT_ENTRY, model="claude-sonnet-5",
+           fresh=1000, offset=0, path="/p/offset-pre.jsonl")
+    _entry(cache, at=_IN_ERA_EARLY_TEXT_ENTRY, model="claude-sonnet-5",
+           fresh=1000, offset=0, path="/p/offset-in.jsonl")
+    cache.commit()
+    cache.close()
+
+
+def test_the_era_start_filters_rows_as_instants_not_text(store, glue):
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 22), days=20,
+                     budget=2_000_000.0)
+    _seed_offset_rows(store)
+    now = dt.datetime(2026, 10, 15, 6, tzinfo=UTC)
+    result = glue.load_population(None, since=None, now=now,
+                                  era=glue.select_era(now))
+    start = dt.datetime(2026, 9, 22, tzinfo=UTC)
+    assert result.status is None, result.cause
+    assert all(e.at >= start for e in result.entries), [
+        e.at for e in result.entries if e.at < start]
+    assert all(s.at >= start for s in result.snapshots), [
+        s.at for s in result.snapshots if s.at < start]
+    # The widened prefilter must not drop an in-range row whose text sorts
+    # before the era start.
+    assert dt.datetime(2026, 9, 22, 3, 30, tzinfo=UTC) in {
+        e.at for e in result.entries}
+
+
+def test_an_offset_pre_era_row_does_not_crash_the_command(
+        store, glue, monkeypatch, capsys):
+    _seed_mix_series(store, glue, first=dt.date(2026, 9, 22), days=20,
+                     budget=2_000_000.0)
+    _seed_offset_rows(store)
+    code, payload = _json_run(store, glue, monkeypatch, capsys,
+                              "2026-10-15T06:00:00Z")
+    assert payload["scope"]["analysisStart"] == "2026-09-22T00:00:00Z"
+    assert payload["status"] != "unavailable", payload["health"]
+    assert code in (0, 1, 3, 4), code

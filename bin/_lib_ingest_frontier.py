@@ -31,13 +31,14 @@ from __future__ import annotations
 import json
 import fcntl
 import os
+import _lib_codex_rollout_container as _rc
 import secrets
 import sqlite3
 import threading
 import pathlib
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 from _lib_retained_size import retained_size_bytes
 
@@ -73,6 +74,160 @@ _COMPLETE_KEYS = {
     "claude": "claude_ingest_walk_complete",
     "codex": CODEX_FULL_WALK_COMPLETE_KEY,
 }
+#: Review N3. The durable debt-only tokens: cache.db for the accounting
+#: frontier, conversations.db for the conversation frontier. A full walk
+#: clean except for pending prune debt writes a fresh one; any other
+#: unbudgeted or certifying full walk deletes it.
+CODEX_FULL_WALK_DEBT_ONLY_KEY = "dashboard_codex_full_walk_debt_only"
+CODEX_CONVERSATION_WALK_DEBT_ONLY_KEY = "dashboard_codex_conversation_walk_debt_only"
+#: How long a frontier holds a debt-only store before walking it again: the
+#: certificate's own staleness bound, so a store whose certificate is
+#: withheld (spec 5.7) is never staler than a certified one.
+FRONTIER_DEBT_HOLD_SECONDS = FRONTIER_CERTIFICATE_MAX_AGE_SECONDS
+_DEBT_HOLD = {
+    "accounting": (CODEX_FULL_WALK_DEBT_ONLY_KEY, "codex_prune_debt"),
+    "conversation": (CODEX_CONVERSATION_WALK_DEBT_ONLY_KEY,
+                     "codex_conversation_prune_debt"),
+}
+
+
+class _DebtCleared:
+    """``stats`` as if no prune debt were pending (review N3)."""
+
+    def __init__(self, stats):
+        self._stats = stats
+
+    def __getattr__(self, name):
+        if name == "prune_debt_pending":
+            return 0
+        if name == "full_walk_complete":
+            return bool(getattr(self._stats, "full_walk_debt_only", False)
+                        or getattr(self._stats, "full_walk_complete", False))
+        return getattr(self._stats, name)
+
+
+def debt_only_refusal(predicate, mode: str, stats, **kwargs) -> bool:
+    """True when pending prune debt is the ONLY reason ``predicate`` refuses
+    this result: the walk observed everything else clean (review N3). The
+    frontier's own predicate decides, so the walks and the planner can never
+    disagree about what "clean" means."""
+    if stats is None or not getattr(stats, "prune_debt_pending", 0):
+        return False
+    return (not predicate(mode, stats, **kwargs)
+            and bool(predicate(mode, _DebtCleared(stats), **kwargs)))
+
+
+def _debt_only_token(owner, conn) -> "str | None":
+    key, _table = _DEBT_HOLD[owner.CONSUMER]
+    try:
+        row = conn.execute(
+            "SELECT value FROM main.cache_meta WHERE key=?", (key,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None else str(row[0])
+
+
+def _prune_debt_present(owner, conn) -> "bool | None":
+    _key, table = _DEBT_HOLD[owner.CONSUMER]
+    try:
+        return conn.execute(
+            f"SELECT 1 FROM main.{table} LIMIT 1").fetchone() is not None
+    except sqlite3.Error:
+        return None
+
+
+def _marker_extent(owner) -> "tuple[int, int, int] | None":
+    """The activity marker's (device, inode, size), or None when absent."""
+    try:
+        st = os.stat(activity_marker_path(owner.app_dir))
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size)
+
+
+def _codex_activity_since(owner, extent) -> bool:
+    """Whether a Codex ticket reached the activity marker after ``extent``.
+
+    Review r3 F2: the Claude hook and the Codex hook append to one shared
+    marker (`record_activity`), so a moved extent alone would end the
+    conversation hold on any Claude Code activity. A ``codex`` record
+    appended after ``extent`` ends it, and so does a replaced marker (a
+    rotation or a recreated pathname, whose old tail this reader can no
+    longer see) or a removed one (`invalidate_activity_marker` runs after a
+    writer could not append its ticket). A marker that was absent at the plan
+    is read from its start. A slice that cannot be read or decoded ends the
+    hold too: failing open costs one walk, failing closed could hide a Codex
+    ticket for the rest of the hold. The slice holds at most one hold period
+    of tickets, because the hold ends FRONTIER_DEBT_HOLD_SECONDS after the
+    plan that recorded ``extent``.
+    """
+    if _marker_extent(owner) == extent:
+        return False
+    try:
+        with activity_marker_path(owner.app_dir).open("rb") as fh:
+            st = os.fstat(fh.fileno())
+            if extent is None:
+                start = 0
+            elif ((st.st_dev, st.st_ino) != extent[:2]
+                  or st.st_size < extent[2]):
+                return True                      # replaced
+            else:
+                start = extent[2]
+            fh.seek(start)
+            raw = fh.read()
+    except OSError:
+        return True                              # removed or unreadable
+    complete = raw[:raw.rfind(b"\n") + 1]        # a writer may be mid-append
+    try:
+        records = _decode_marker_records(complete)
+    except ValueError:
+        return True
+    return any(record[0] == "codex" for record in records)
+
+
+def _debt_hold_plan(owner, provider: str, conn) -> "FrontierPlan | None":
+    """Hold instead of re-walking a debt-only Codex store (spec 5.7; N3).
+
+    The certificate stays withheld while prune debt is pending, so without
+    this every tick re-planned a full walk until the drain finished: a ~7 s
+    median walk on the production estate, the unconditional per-tick walk
+    FRONTIER_CERTIFICATE_MAX_AGE_SECONDS' note measured at ~44 % of a core.
+    The hold answers ``caught_up`` (reason ``debt_hold``) while this owner's
+    last full plan is younger than FRONTIER_DEBT_HOLD_SECONDS, a full walk
+    has written a debt-only token since that plan, and debt is still
+    pending. It drops any certificate this
+    owner holds (none may stand while debt is pending), and an empty debt
+    table ends it at once, so the walk that certifies the store follows the
+    drain immediately. The conversation frontier's hold also ends when a
+    Codex ticket reached the activity marker since that plan, or the marker
+    was replaced or removed (`_codex_activity_since`; a Claude ticket does
+    not end it, review r3 F2): no hook writes conversations.db, so Codex
+    hook activity is transcript content only a walk can publish. The
+    accounting frontier's hold does not read tickets at all; the bounded
+    delay that costs is a stated residual (review r3 F3).
+    """
+    if provider != "codex":
+        return None
+    last = getattr(owner, "_debt_walks", {}).get(provider)
+    if last is None or _now() - last[1] >= FRONTIER_DEBT_HOLD_SECONDS:
+        return None
+    state = owner._states.get(provider)
+    if state is not None and state.seeded_at >= last[1]:
+        # The last full walk certified, and a certifying walk deletes the
+        # token: the steady state answers here, with no database read.
+        return None
+    token = _debt_only_token(owner, conn)
+    if token is None or token == last[0]:
+        return None
+    if _prune_debt_present(owner, conn) is not True:
+        return None
+    if (owner.CONSUMER == "conversation"
+            and _codex_activity_since(owner, last[2])):
+        return None
+    owner._generations.drop(provider, owner.CONSUMER)
+    owner._states.pop(provider, None)
+    return FrontierPlan(provider, "caught_up", reason="debt_hold")
+
 _PENDING_META_KEYS = (
     "conversation_backfill_pending",
     "conversation_sessions_backfill_pending",
@@ -263,11 +418,127 @@ def classify_ledger_continuity(
 
 
 class ObservedFile(NamedTuple):
-    """One restat of a tracked rollout: what is at that pathname right now."""
+    """One restat of a tracked rollout: what is at that pathname right now.
+
+    #968 spec 5.9: ``size`` is in DECODED space. A compressed container's byte
+    length is never compared with a decoded cursor: an accepted compressed
+    container reports the cursor's validated decoded size, and any other
+    compressed observation is pending container work (``container_pending``),
+    ``container_known`` when a verification already holds that exact
+    container.
+    """
 
     size: int
     device: int
     inode: int
+    container_pending: bool = False
+    container_known: bool = False
+    kind: str = "plain"
+    mtime_ns: "int | None" = None
+
+
+class ContainerEvidence(NamedTuple):
+    """The container a cursor row last accepted, and what it holds pending."""
+
+    kind: str
+    container_size: "int | None"
+    decoded_size: "int | None"
+    mtime_ns: "int | None"
+    device: "int | None"
+    inode: "int | None"
+    state: str
+    pending_fingerprint: "str | None"
+
+    def _same_container(self, kind: str, st) -> bool:
+        if kind != self.kind or source_identity_replaced(
+                self.device, self.inode, st.st_dev, st.st_ino):
+            return False
+        if kind == _rc.PLAIN:
+            return True
+        # Review P3-2: a compressed container also needs the exact device,
+        # matching the walk's container-unchanged check and the generation
+        # token (Task 1, Task 3).
+        return (self.device is not None and int(self.device) == st.st_dev
+                and self.container_size == st.st_size
+                and self.mtime_ns == st.st_mtime_ns
+                and self.decoded_size is not None)
+
+    def accepts(self, kind: str, st) -> bool:
+        return self.state == "accepted" and self._same_container(kind, st)
+
+    def holds(self, kind: str, st) -> bool:
+        if self.state not in ("pending", "unverified"):
+            return False
+        if not self.pending_fingerprint:     # a hold on the accepted container
+            return self._same_container(kind, st)
+        fp = _rc.ContainerFingerprint.from_json(self.pending_fingerprint)
+        return (fp is not None and fp.kind == kind and fp.size == st.st_size
+                and fp.mtime_ns == st.st_mtime_ns
+                and fp.device == st.st_dev and fp.inode == st.st_ino)
+
+
+_CONTAINER_EVIDENCE_COLUMNS = (
+    "path, container_kind, container_size_bytes, decoded_size_bytes, "
+    "mtime_ns, device_id, inode, container_state, pending_container_fingerprint")
+
+
+def _container_evidence_for(conn, table: str, paths) -> "dict[str, ContainerEvidence]":
+    """Container evidence for the named cursor rows, one chunked indexed read.
+
+    No paths, no statement: an idle tick reads nothing. A store without the
+    #968 columns (an unmigrated opener, a hand-built fixture) has no
+    container evidence, which is exactly the plain-only world.
+    """
+    if table not in _CODEX_CURSOR_TABLES:
+        raise ValueError("unknown codex cursor table")
+    wanted = sorted({str(p) for p in paths if p})
+    out: "dict[str, ContainerEvidence]" = {}
+    try:
+        for start in range(0, len(wanted), _CURSOR_QUERY_CHUNK):
+            chunk = wanted[start:start + _CURSOR_QUERY_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                    f"SELECT {_CONTAINER_EVIDENCE_COLUMNS} FROM {table} "
+                    f"WHERE path IN ({placeholders})", chunk):
+                out[str(row[0])] = ContainerEvidence(
+                    row[1] or _rc.PLAIN, row[2], row[3], row[4], row[5],
+                    row[6], row[7] or "accepted", row[8])
+    except sqlite3.OperationalError:
+        return {}
+    return out
+
+
+def _observe_logical(path: str, evidence: "ContainerEvidence | None"):
+    """Restat one LOGICAL rollout through its selected container (5.2, 5.9).
+
+    Plain wins and keeps today's single ``pathlib`` stat, so a plain estate
+    is observed exactly as before; the ``.zst`` twin is statted only when the
+    plain file is absent.
+    """
+    kind = _rc.PLAIN
+    try:
+        st = pathlib.Path(path).stat()
+    except OSError:
+        try:
+            st = pathlib.Path(_rc.zstd_twin(path)).stat()
+        except OSError:
+            return None
+        kind = _rc.ZSTD
+    if evidence is not None and evidence.accepts(kind, st):
+        size = (st.st_size if kind == _rc.PLAIN
+                else int(evidence.decoded_size))
+        return ObservedFile(size, st.st_dev, st.st_ino, kind=kind,
+                            mtime_ns=st.st_mtime_ns)
+    if kind == _rc.PLAIN and (evidence is None or (
+            evidence.state == "accepted" and evidence.kind == _rc.PLAIN)):
+        # Today's plain evidence: append, shrink and replacement are decided
+        # by the existing classifier from size and identity.
+        return ObservedFile(st.st_size, st.st_dev, st.st_ino, kind=kind,
+                            mtime_ns=st.st_mtime_ns)
+    return ObservedFile(
+        0, st.st_dev, st.st_ino, container_pending=True,
+        container_known=evidence is not None and evidence.holds(kind, st),
+        kind=kind, mtime_ns=st.st_mtime_ns)
 
 
 def source_identity_replaced(
@@ -325,7 +596,7 @@ def classify_recent_active_path(
     """Classify one recently-active rollout against its committed cursor.
 
     Pure. Returns one of ``unchanged``, ``append``, ``resume``, ``replaced``,
-    ``cursor_gap`` or ``vanished``.
+    ``cursor_gap``, ``vanished`` or ``container_pending``.
 
     IDENTITY OUTRANKS SIZE. A larger file at a different inode is a
     replacement, not an append: its first byte is not the continuation of the
@@ -339,6 +610,9 @@ def classify_recent_active_path(
     """
     if observed is None:
         return "vanished"
+    if getattr(observed, "container_pending", False):
+        # Pending container work is decided by verification, never identity.
+        return "container_pending"
     if source_identity_replaced(
         committed_device, committed_inode, observed.device, observed.inode,
     ):
@@ -506,13 +780,10 @@ def _bump_counter(name: str, amount: int = 1) -> None:
         _FRONTIER_COUNTERS[name] = _FRONTIER_COUNTERS.get(name, 0) + amount
 
 
-def _observe_file(path: str, table: str) -> "ObservedFile | None":
+def _observe_file(path: str, table: str,
+                  evidence: "ContainerEvidence | None" = None) -> "ObservedFile | None":
     _bump_counter(f"retained_file_visits.{table}")
-    try:
-        st = pathlib.Path(path).stat()
-    except OSError:
-        return None
-    return ObservedFile(st.st_size, st.st_dev, st.st_ino)
+    return _observe_logical(path, evidence)
 
 
 #: The two Codex cursor tables the restat may read, and whether each carries
@@ -572,19 +843,25 @@ def plan_recent_active_restat(
         # `sqlite3.DatabaseError` and an escape here would end the tick.
         return frozenset(), "codex_cursor_unavailable"
     targets: set[str] = set()
+    evidence = _container_evidence_for(conn, table, candidates)
     for path, (size, offset, complete, device, inode) in sorted(
         candidates.items()
     ):
+        observed = _observe_file(path, table, evidence.get(path))
         verdict = classify_recent_active_path(
             committed_size=size,
             committed_offset=offset,
             committed_complete=complete,
             committed_device=device,
             committed_inode=inode,
-            observed=_observe_file(path, table),
+            observed=observed,
         )
         if verdict in {"append", "resume"}:
             targets.add(path)
+        elif verdict == "container_pending":
+            # New transitions request verification once; known holds converge.
+            if not observed.container_known:
+                targets.add(path)
         elif verdict == "replaced":
             return frozenset(), "source_replaced"
         elif verdict == "cursor_gap":
@@ -692,13 +969,23 @@ def _configuration_generation_reason(
 
 
 def _ticket_target_paths(provider: str, records, roots):
-    """The ticketed paths this plan may target, or a refusal reason."""
+    """The ticketed paths this plan may target, or a refusal reason.
+
+    #968 spec 5.9: a Codex ticket may name either spelling; it is
+    normalized to ONE logical target, and containment is enforced on the
+    selected physical container.
+    """
     provider_paths = tuple(
         path for kind, path, _e, _s, _c in records if kind == provider)
     if any(not path for path in provider_paths):
         return None, "ambiguous_activity"
+    if provider == "codex":
+        provider_paths = tuple(
+            os.fspath(_rc.logical_path(path)) for path in provider_paths)
     paths = frozenset(provider_paths)
-    if any(not _target_in_roots(path, roots) for path in paths):
+    if any(not _target_in_roots(path, roots,
+                                allow_compressed=provider == "codex")
+           for path in paths):
         return None, "target_outside_scope"
     return paths, None
 
@@ -771,6 +1058,12 @@ def _counted_plan(owner, body, provider, conn, **kwargs):
     _bump_counter(f"plans.{consumer}.{provider}.{plan.mode}")
     if plan.mode == "full":
         _bump_counter(f"full_walks.{consumer}.{provider}")
+        debt_walks = getattr(owner, "_debt_walks", None)
+        if provider == "codex" and debt_walks is not None:
+            # Review N3: the debt-only token this full plan saw, when, and
+            # the activity marker's extent at that moment.
+            debt_walks[provider] = (
+                _debt_only_token(owner, conn), _now(), _marker_extent(owner))
     if plan.paths:
         _bump_counter(
             f"targeted_paths.{consumer}.{provider}", len(plan.paths))
@@ -1699,19 +1992,41 @@ def _target_has_cursor_gap(conn, provider: str, source_path: str) -> bool:
     ).fetchone()
     if row is None:
         return False  # a genuinely new file is a valid targeted append
+    floor = max(int(row[0] or 0), int(row[1] or 0))
+    if provider == "codex":
+        observed = _observe_logical(
+            source_path,
+            _container_evidence_for(conn, table, [source_path]).get(source_path))
+        if observed is None:
+            return True
+        if observed.container_pending:
+            return False   # pending container work, not a missing-file gap
+        return observed.size < floor
     try:
         actual_size = pathlib.Path(source_path).stat().st_size
     except OSError:
         return True
-    return actual_size < max(int(row[0] or 0), int(row[1] or 0))
+    return actual_size < floor
 
 
-def _target_in_roots(source_path: str, roots) -> bool:
+def _target_in_roots(source_path: str, roots, *,
+                     allow_compressed: bool = False) -> bool:
     path = pathlib.Path(source_path)
-    if not path.is_absolute() or path.suffix != ".jsonl":
+    if not path.is_absolute():
         return False
+    if allow_compressed:
+        if not _rc.is_container_name(path.name):
+            return False
+        selected = _rc.select_container(path)
+        if selected is None:
+            return False
+        physical = selected.path
+    else:
+        if path.suffix != ".jsonl":
+            return False
+        physical = path
     try:
-        resolved = path.resolve(strict=True)
+        resolved = physical.resolve(strict=True)
     except OSError:
         return False
     if not resolved.is_file():
@@ -1752,8 +2067,11 @@ def provider_sync_certifiable(mode: str, stats: object) -> bool:
         return False
     common_clean = not any((
         getattr(stats, "lock_contended", False),
+        getattr(stats, "barrier_retry", False),
         getattr(stats, "files_failed", 0),
         getattr(stats, "files_deferred_torn", 0),
+        getattr(stats, "container_pending", 0),
+        getattr(stats, "files_deferred_reset", 0),
         getattr(stats, "deferred_reason", None),
         getattr(stats, "prune_refused", False),
         getattr(stats, "budget_exhausted", False),
@@ -1777,6 +2095,7 @@ class DashboardIngestFrontier:
     def __init__(self, app_dir: pathlib.Path):
         self.app_dir = pathlib.Path(app_dir)
         self._states: dict[str, _ProviderState] = {}
+        self._debt_walks: dict = {}
         self.last_seed_failure: dict[str, str] = {}
         self._fallback_count = 0
         self._generations = frontier_generations(self.app_dir)
@@ -1923,6 +2242,9 @@ class DashboardIngestFrontier:
         self, provider: str, conn, *, roots, guard_paths=(),
         configuration_generation=_DERIVE_CONFIGURATION_GENERATION,
     ) -> FrontierPlan:
+        hold = _debt_hold_plan(self, provider, conn)
+        if hold is not None:
+            return hold
         state = self._states.get(provider)
         if state is None:
             return FrontierPlan(provider, "full", reason="unseeded")
@@ -2079,12 +2401,29 @@ def _conversation_target_risk(conn, provider: str, source_path: str) -> str | No
     ).fetchone()
     if row is None:
         return None
+    stored_size = int(row[0] or 0)
+    floor = max(stored_size, int(row[2] or 0))
+    if provider == "codex":
+        # #968 spec 5.9: the same container-aware contract as the accounting
+        # planner, so the two planners converge.
+        observed = _observe_logical(
+            source_path,
+            _container_evidence_for(conn, table, [source_path]).get(source_path))
+        if observed is None:
+            return "cursor_gap"
+        if observed.container_pending:
+            return None
+        if observed.size < floor:
+            return "cursor_gap"
+        if (observed.kind == _rc.PLAIN and observed.size == stored_size
+                and observed.mtime_ns != int(row[1] or 0)):
+            return "source_replaced"
+        return None
     try:
         stat = pathlib.Path(source_path).stat()
     except OSError:
         return "cursor_gap"
-    stored_size = int(row[0] or 0)
-    if stat.st_size < max(stored_size, int(row[2] or 0)):
+    if stat.st_size < floor:
         return "cursor_gap"
     if stat.st_size == stored_size and stat.st_mtime_ns != int(row[1] or 0):
         return "source_replaced"
@@ -2101,8 +2440,11 @@ def conversation_sync_certifiable(
         return False
     if any((
         getattr(stats, "lock_contended", False),
+        getattr(stats, "barrier_retry", False),
         getattr(stats, "files_failed", 0),
         getattr(stats, "files_deferred_torn", 0),
+        getattr(stats, "container_pending", 0),
+        getattr(stats, "container_reads_held", 0),
         getattr(stats, "deferred_reason", None),
         getattr(stats, "prune_refused", False),
         getattr(stats, "budget_exhausted", False),
@@ -2110,9 +2452,12 @@ def conversation_sync_certifiable(
     )):
         return False
     total = int(getattr(stats, "files_total", 0) or 0)
+    held = sum((getattr(stats, "container_skipped", None) or {}).values())
     completed = (
         int(getattr(stats, "files_processed", 0) or 0)
         + int(getattr(stats, "files_skipped_unchanged", 0) or 0)
+        + int(held)
+        + int(getattr(stats, "barrier_files_deferred", 0) or 0)
     )
     if mode == "targeted":
         # A source deleted after planning is filtered before the sync sees it;
@@ -2121,8 +2466,37 @@ def conversation_sync_certifiable(
     if mode == "full":
         # There is no durable conversation-walk sentinel.  The per-call census
         # is therefore the proof that the exhaustive discovery actually drained.
-        return completed == total
+        return completed == total and not getattr(stats, "prune_debt_pending", 0)
     return False
+
+
+def _codex_publication_backlog(conn) -> "tuple[bool, frozenset[str]]":
+    """Certificates newer than their publication (#968 spec 5.11).
+
+    A seal token the conversations store has not acknowledged means a
+    publication pass is due; its contributor paths are the files that pass
+    must read. Any read failure answers "nothing due": the conversation pass
+    itself fails closed.
+    """
+    import _lib_codex_publication_barrier as barrier
+    try:
+        sealed = conn.execute("SELECT value FROM cache_db.cache_meta WHERE key=?",
+                              (barrier.SEAL_SEQ_KEY,)).fetchone()
+        if sealed is None:
+            return False, frozenset()
+        seen = conn.execute("SELECT value FROM main.cache_meta WHERE key=?",
+                            (barrier.PUBLISHED_SEQ_KEY,)).fetchone()
+        if seen is not None and seen[0] == sealed[0]:
+            return False, frozenset()
+        paths: set = set()
+        for _key, _revision, text in conn.execute(
+                barrier.BACKLOG_CERTIFICATES_SQL):
+            cert = barrier.parse_certificate(text)
+            if cert is not None:
+                paths.update(c["path"] for c in cert["contributors"])
+        return True, frozenset(paths)
+    except sqlite3.Error:
+        return False, frozenset()
 
 
 class ConversationSyncFrontier:
@@ -2139,6 +2513,7 @@ class ConversationSyncFrontier:
     def __init__(self, app_dir: pathlib.Path):
         self.app_dir = pathlib.Path(app_dir)
         self._states: dict[str, _ProviderState] = {}
+        self._debt_walks: dict = {}
         self.last_seed_failure: dict[str, str] = {}
         self._fallback_count = 0
         self._generations = frontier_generations(self.app_dir)
@@ -2257,6 +2632,17 @@ class ConversationSyncFrontier:
         self, provider: str, conn, *, roots, guard_paths=(),
         configuration_generation=_DERIVE_CONFIGURATION_GENERATION,
     ):
+        hold = _debt_hold_plan(self, provider, conn)
+        if hold is not None:
+            if provider == "codex":
+                due, backlog = _codex_publication_backlog(conn)
+                if due:
+                    # The hold withholds a certificate, not a publication the
+                    # cache has sealed; with no certificate held,
+                    # commit_provider ignores the targeted result.
+                    return replace(hold, mode="targeted", paths=backlog,
+                                   reason="publication_backlog")
+            return hold
         state = self._states.get(provider)
         if state is None:
             return FrontierPlan(provider, "full", reason="unseeded")
@@ -2313,11 +2699,19 @@ class ConversationSyncFrontier:
             return FrontierPlan(provider, "full", reason="source_replaced")
         if "cursor_gap" in target_risks:
             return FrontierPlan(provider, "full", reason="cursor_gap")
-        return _restat_and_return(
+        plan = _restat_and_return(
             provider, conn, cursor_table=_conversation_source_table(provider),
             paths=paths, marker_end=marker_end, ledger_epoch=ledger_epoch,
             ledger_sequence=ledger_sequence,
         )
+        if provider == "codex" and plan.mode in ("caught_up", "targeted"):
+            due, backlog = _codex_publication_backlog(conn)
+            if due:
+                plan = replace(
+                    plan, mode="targeted", paths=plan.paths | backlog,
+                    reason=("publication_backlog" if plan.mode == "caught_up"
+                            else plan.reason))
+        return plan
 
     def commit_provider(
         self, plan: FrontierPlan, conn, *, roots, guard_paths=(), trusted=True,

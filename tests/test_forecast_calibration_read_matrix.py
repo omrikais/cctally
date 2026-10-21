@@ -32,8 +32,10 @@ import _cctally_core
 from conftest import load_script, redirect_paths
 
 UTC = dt.timezone.utc
-NOW = dt.datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
-WEEK_START = dt.datetime(2026, 6, 29, tzinfo=UTC)
+#: A week wholly inside the `opus-5` coefficient era (#978), because a stored
+#: regime applies only inside its own era.
+NOW = dt.datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+WEEK_START = dt.datetime(2026, 8, 3, tzinfo=UTC)
 WEEK_END = WEEK_START + dt.timedelta(days=7)
 
 SUPPORTED_MODEL = "claude-opus-4-5"
@@ -67,13 +69,15 @@ def _regime(**over):
     """One prediction-ready stored regime, centred on `SUPPORTED_MODEL`."""
     import _lib_quota_model as qm
     probe = _records(SUPPORTED_MODEL)
-    family_shares, class_shares = qm.aggregate_composition(probe)
-    per_point = qm.weighted_units(probe[0]) * 3.0 / 40.0
+    era = qm.era_by_id("opus-5")
+    family_shares, class_shares = qm.aggregate_composition(probe, era=era)
+    per_point = qm.weighted_units(probe[0], era) * 3.0 / 40.0
     record = {
         "effectiveFrom": (WEEK_START - dt.timedelta(days=30)).isoformat(),
         "effectiveUntil": None,
         "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
         "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+        "coefficientEra": "opus-5",
         "unitsPerPoint": per_point,
         "interval": {"lo": per_point * 0.95, "hi": per_point * 1.05},
         "support": {"days": 26, "segments": 4},
@@ -151,7 +155,7 @@ def test_a_quarantined_file_states_unavailable(ns):
     the primary is not, and this reader never scans for the sidecar."""
     primary = _write_regime()
     primary.rename(primary.with_name(
-        f"{primary.name}.quarantined-20260706T120000Z"))
+        f"{primary.name}.quarantined-20260810T120000Z"))
     assert not primary.exists()
     assert _detail(ns, population=SUPPORTED_MODEL).code == "unavailable"
 

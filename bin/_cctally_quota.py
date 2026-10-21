@@ -313,6 +313,10 @@ PROJECTION_GATE_CALLERS: "dict[str, tuple[str, ...]]" = {
 #: and requires a statement verb earlier in that text than the match. Nothing
 #: about which reads are covered changed; what changed is that the count now
 #: means what its name says.
+# #968 adds eight cache cursor/thread reads, one doctor prune-debt read,
+# and two frontier cursor/debt reads. Fixed cursor pairs, thread tuples/TEMP
+# views and debt enums cannot reach either quota projection table. This
+# census is consumed only by test_selector_state_496_s5b.py; see its audit.
 PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_account.py": 1,
     # Three, all in `_import_legacy_conversation_rows`: `FROM main.{table}`,
@@ -340,7 +344,7 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # has work without performing it (#780). `{table}` iterates the same
     # hardcoded `_LEGACY_BRIDGE_TABLES` tuple as the three reads above, so
     # neither reaches a projection family and neither needs an entry below.
-    "_cctally_cache.py": 9,
+    "_cctally_cache.py": 17,
     # One, not two, since #750 S4: `_get_latest_row_for_week` composed
     # its `WHERE` clauses instead of branching on `as_of_utc`, so its
     # two near-identical `FROM {table_name}` reads became one. The
@@ -352,7 +356,7 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # Six, not seven: `cctally: rebuilt stats.db from {} journal segment(s)` is
     # an operator line, not a statement, and no longer counts.
     "_cctally_db.py": 6,
-    "_cctally_doctor.py": 1,
+    "_cctally_doctor.py": 2,
     "_cctally_five_hour.py": 1,
     # Sixteen, not eighteen: the two `event {} rev {} conflicts with effective
     # rev {} from {}` refusals are prose and no longer count.
@@ -365,7 +369,14 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # `budget_milestones`, `projected_milestones` or
     # `project_budget_milestones`. None is a projection table, so it needs no
     # entry below.
-    "_cctally_journal.py": 17,
+    #
+    # Nineteen since #825/#832 fix round E: `_rematerialize_scratch_row`'s
+    # row lookup by journal id and `_delete_scratch_row`'s removal by row id
+    # touch only a derivation-completion SCRATCH projection, and the table
+    # they interpolate is always an `_EVT_SPECS` table (the snapshot, reset,
+    # block and milestone families). None is a projection table, so neither
+    # needs an entry below.
+    "_cctally_journal.py": 19,
     "_cctally_pricing_check.py": 1,
     # One, in `_read_stats_component`: a single `SELECT {column} FROM
     # {table}` shared by `week_reset_events` and `weekly_credit_floors`,
@@ -373,6 +384,17 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
     "_cctally_quota_model.py": 1,
     "_cctally_quota.py": 1,
+    # Two, both #825/#832 revision 5 per-account row counts:
+    # `_account_rows`' `SELECT COUNT(*) FROM {table}` behind the projection's
+    # classification evidence, and `_tokens_from`'s `SELECT COUNT(*),
+    # MAX(rowid) FROM {table}` behind a waiting head's dependency tokens
+    # (`_wait_tokens` before fix round K13, which shares it with the
+    # activating event's non-waiting read).
+    # `{table}` is always one of the hardcoded `weekly_usage_snapshots`,
+    # `week_reset_events`, `weekly_credit_floors`, `five_hour_reset_events`
+    # or `five_hour_blocks`; neither site reaches a quota projection table, so
+    # no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
+    "_cctally_statusline.py": 2,
     # One, in `_codex_rollup_revision`: the table is selected from a hardcoded
     # pair of Codex conversation rollups. Neither is a quota projection table,
     # so no `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
@@ -400,7 +422,7 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # total over those two names and raises on anything else. Every choice here
     # is hardcoded; none is a quota projection table, so no
     # `PROJECTION_DYNAMIC_READ_ACTIONS` classification applies.
-    "_lib_ingest_frontier.py": 6,
+    "_lib_ingest_frontier.py": 8,
     "_lib_snapshot_cache.py": 1,
     "_lib_subscription_weeks.py": 1,
 }

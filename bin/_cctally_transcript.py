@@ -49,13 +49,14 @@ def cmd_transcript(args) -> int:
 # ---- export ----------------------------------------------------------------
 
 _SPEED_ONLY_CODEX_MSG = "transcript: --speed applies only to Codex conversations"
-# Deliberately generic about WHAT is pending. Three distinct conditions reach
-# this branch — a cache predating migration 025, a store with the contract
-# rebuild marker armed, and a store with a byte-zero Codex replay marker armed —
-# and naming the migration told users to wait for work applied long ago.
+# Deliberately generic about WHAT is pending. Four distinct conditions reach
+# this branch: a cache predating migration 025, a store with the contract
+# rebuild marker armed, a store with a byte-zero Codex replay marker armed,
+# and (#968) a population conversation the publication barrier has not yet
+# published. The last is finished by a background worker, not by the next
+# cache open, so the note names no mechanism (operator decision D5).
 _PENDING_EXPORT_MSG = (
-    "transcript: Codex conversation is not yet normalized "
-    "(the pending work runs on the next cache open) — retry shortly")
+    "transcript: Codex conversation is not yet normalized — retry shortly")
 
 
 def _emit_export(md: str, output) -> None:
@@ -265,7 +266,7 @@ def _cmd_transcript_search_claude(args) -> int:
 
 # ---- search (Codex) --------------------------------------------------------
 
-# Same generic wording as `_PENDING_EXPORT_MSG`, for the same reason.
+# The store-wide conditions run on the next cache open; D5 changes only export.
 _CODEX_SEARCH_PENDING_MSG = (
     "transcript: Codex conversations are not yet normalized "
     "(the pending work runs on the next cache open); no results yet")

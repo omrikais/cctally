@@ -26,8 +26,7 @@ if str(REPO_ROOT / "tests") not in sys.path:
 import _lib_source_identity as identity  # noqa: E402
 import _lib_jsonl as lj  # noqa: E402
 import _cctally_db as db  # noqa: E402
-from conftest import (load_script, redirect_paths,
-                      redirect_paths_without_conversation_retention)  # noqa: E402
+from conftest import (load_script, redirect_paths)  # noqa: E402
 
 
 BUILDER = BIN_DIR / "build-codex-parity-fixtures.py"
@@ -36,6 +35,44 @@ ROOT_B = "/synthetic/root-b/project-blue"
 SHARED_ID = "11111111-1111-4111-8111-111111111111"
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1"
 FUSED_ITER = lj._iter_codex_fused_records_with_offsets
+
+
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
 
 
 def test_dynamic_cctally_load_resolves_fused_identity_leaf():
@@ -198,7 +235,7 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             # account_key (#341): trailing observe-and-stamp column.
             ("account_key", "TEXT", 0),
         ]
-        assert _columns(conn, "codex_session_files")[-10:] == [
+        assert _columns(conn, "codex_session_files")[-21:] == [
             ("source_root_key", "TEXT", 0),
             ("last_native_thread_id", "TEXT", 0),
             ("last_root_thread_id", "TEXT", 0),
@@ -219,6 +256,18 @@ def test_schema_codex_fused_tables_and_nullable_linkage_are_exact():
             # nullable because an existing row has no identity to claim.
             ("device_id", "INTEGER", 0),
             ("inode", "INTEGER", 0),
+            # #968: physical-container evidence follows the decoded cursor.
+            ("container_kind", "TEXT", 1),
+            ("container_path", "TEXT", 0),
+            ("container_size_bytes", "INTEGER", 0),
+            ("decoded_size_bytes", "INTEGER", 0),
+            ("content_anchor_version", "INTEGER", 0),
+            ("content_anchor", "BLOB", 0),
+            ("content_anchor_offset", "INTEGER", 0),
+            ("container_state", "TEXT", 1),
+            ("container_state_reason", "TEXT", 0),
+            ("pending_container_fingerprint", "TEXT", 0),
+            ("container_resume_strikes", "INTEGER", 1),
         ]
 
         quota_sql = _schema_sql(conn, "quota_window_snapshots")
@@ -461,8 +510,9 @@ def _object_records(name: str) -> list[dict]:
 def _stage_c_sync_setup(tmp_path, monkeypatch, scenario: str = "modern-full"):
     """Create one real provider-root rollout and return its live cache seam."""
     ns = load_script()
-    # Root requalification tests retained rows, not transcript expiration.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout-s1.jsonl"
     rollout.parent.mkdir(parents=True)
@@ -694,6 +744,12 @@ def test_sync_codex_cache_requalifies_when_overlapping_root_order_changes(
             "SELECT source_root_key FROM codex_session_files WHERE path = ?",
             (str(rollout.resolve()),),
         ).fetchone() == (new_key,)
+        # Requalification is immediate; the root-only orphan cleanup belongs
+        # to the detached drain under #968, after both ingest passes complete.
+        assert conn.execute(
+            "SELECT value FROM cache_meta WHERE key='codex_prune_root_cleanup_pending'"
+        ).fetchone() == ("1",)
+        ns["_cctally_cache"].run_codex_prune_drain(wait_for_requests=False)
         assert conn.execute(
             "SELECT source_root_key FROM codex_source_roots"
         ).fetchall() == [(new_key,)]
@@ -1034,7 +1090,10 @@ def test_sync_codex_cache_replaces_same_path_incomplete_old_root_children(
 
         assert replacement.files_processed == 1
         assert replacement.files_skipped_unchanged == 1
-        assert replacement.files_pruned == 1
+        assert replacement.files_pruned == 0
+        prune_result = sys.modules["_cctally_cache"].run_codex_prune_drain(
+            wait_for_requests=False)
+        assert prune_result.identities_deleted == 1
         for table, path_column in tables:
             assert conn.execute(
                 f"SELECT DISTINCT source_root_key FROM {table} "

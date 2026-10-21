@@ -49,7 +49,7 @@ Renders one whole conversation to Markdown. The output is byte-for-byte the same
 
 **Emission is byte-exact.** The export is written as raw UTF-8 with no added trailing newline (the render already ends in exactly one). This is what lets `transcript export` byte-match the dashboard endpoint — a qualified default export byte-matches `GET /api/conversation/<v1key>/export?anonymize=1`, and `--raw` byte-matches the un-parameterized download — and lets you diff two exports meaningfully.
 
-**Pending Codex normalization.** A Codex conversation whose normalized corpus is not yet authoritative — a cache predating migration `025_codex_conversation_normalization`, or a store with a byte-zero replay still pending — cannot be exported yet: the command prints a `transcript: …` note to stderr (citing that the pending work runs on the next cache open) and exits `1` — never a 0-exit empty export. Open the dashboard once, or run `cctally cache-sync --source codex`, to stamp it.
+**Pending Codex normalization.** A Codex conversation whose normalized corpus is not yet authoritative cannot be exported yet. Four conditions cause this: a cache predating migration `025_codex_conversation_normalization`, a store with a contract rebuild still pending, a store with a byte-zero replay still pending, or a population conversation fed by compressed or transitioning Codex history that the publication barrier has not yet published. The command prints `transcript: Codex conversation is not yet normalized — retry shortly` to stderr and exits `1` — never a 0-exit empty export. Open the dashboard once, or run `cctally cache-sync --source codex`: the first three clear on that cache open, and `cache-sync` also runs the membership, verification and publication work that holds back the fourth, which otherwise proceeds in the background. A previously published conversation continues exporting its last complete version while a newer revision waits.
 
 ## `transcript search`
 
@@ -96,7 +96,7 @@ Its `--json` is a source-qualified, stamped-first camelCase envelope (distinct f
 }
 ```
 
-A Codex store whose normalized corpus is not yet authoritative — predating migration `025`, or with a byte-zero replay still pending — returns an empty result set with a one-line stderr note and exit `0` — "nothing yet" is a truthful navigation answer, not an error.
+A Codex store whose normalized corpus is not yet authoritative — predating migration `025`, with a contract rebuild still pending, or with a byte-zero replay still pending — returns an empty result set with a one-line stderr note and exit `0` — "nothing yet" is a truthful navigation answer, not an error. A conversation whose compressed history is still being verified does not make the store pending: search answers from the conversation's last published version, and lists a conversation that has never been shown once its verification finishes.
 
 ### Claude search `--json` schema
 

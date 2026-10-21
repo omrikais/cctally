@@ -271,6 +271,7 @@ def test_bound_extract_lines_charges_its_own_truncation_notice():
     # measured output over a ceiling the function exists to enforce.
     out, stats = K.bound_extract_lines(["y" * 50] * 100, max_total_bytes=500)
     emitted = sum(len(line.encode("utf-8")) + 1 for line in out)
+    # timing-budget: `emitted` is a byte count against `max_total_bytes`, not a duration; the guard reads the name as one
     assert emitted <= 500, (emitted, out)
     assert stats["truncated"] is True
     assert out[-1].startswith("[TRUNCATED:")
@@ -2589,8 +2590,13 @@ def test_the_public_kernel_imports_only_the_standard_library():
     # is a truncated gzip member, and the decompressor raises `zlib.error` for
     # one whose bytes no longer decode. Both are built-in C modules of the
     # standard library, and `gzip` imports `zlib` itself, so neither adds a
-    # dependency the published tree does not already carry.
-    assert modules <= {"__future__", "gzip", "json", "os", "re", "zlib"}, modules
+    # dependency the published tree does not already carry. #940 (contract C8)
+    # adds three for the evidence-store functions: `hashlib` (each indexed
+    # run's expected digest, R7-F7), `fcntl` (the evidence index's update
+    # lock) and `datetime` (the seeded-loss retention horizon). All three are
+    # standard-library modules on both Darwin and the Ubuntu lane.
+    assert modules <= {"__future__", "datetime", "fcntl", "gzip", "hashlib", "json", "os",
+                       "re", "zlib"}, modules
 
 
 # ------------------------------------------------ per-test durations merge (#630 S1)
@@ -3502,18 +3508,19 @@ def test_the_validator_admits_the_placeholder_the_transformer_writes(line):
 # `build_known_tokens` over this repository, which is what makes the leak rows
 # further down reachable on a real run rather than only under a fixture context.
 _PLACEHOLDER_LITERAL_RE = re.compile(r"<[a-z][a-z0-9-]*>")
-# `bin/cctally-test-all` is a Bash script that embeds its evidence driver as a
-# single-quoted `EVPY` heredoc, so the production root names are read out of that
-# heredoc's Python rather than out of the shell.
-_EVPY_HEREDOC_RE = re.compile(r"<<'EVPY'\n(?P<body>.*?)\nEVPY\n", re.S)
+# `bin/cctally-test-all` is a Bash script that embeds its evidence driver as one
+# single-quoted string its `_ev_bridge` function prints (#940 C11 removed the
+# `EVPY` here-document), so the production root names are read out of that
+# program's Python rather than out of the shell.
+_EV_BRIDGE_START = "_ev_bridge() {\n    printf '%s\\n' '"
 
 
 def _production_root_names():
     """The `roots` keys `bin/cctally-test-all` injects, read from its source."""
     text = (REPO / "bin" / "cctally-test-all").read_text(encoding="utf-8")
-    heredoc = _EVPY_HEREDOC_RE.search(text)
-    assert heredoc, "bin/cctally-test-all no longer embeds an EVPY heredoc"
-    for node in ast.walk(ast.parse(heredoc.group("body"))):
+    assert _EV_BRIDGE_START in text, "bin/cctally-test-all no longer defines _ev_bridge"
+    bridge = text.split(_EV_BRIDGE_START, 1)[1].split("'\n}\n", 1)[0].replace("'\\''", "'")
+    for node in ast.walk(ast.parse(bridge)):
         if isinstance(node, ast.FunctionDef) and node.name == "_roots":
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Dict):
@@ -3566,7 +3573,7 @@ def test_the_leg_admits_every_placeholder_name_the_kernel_can_write():
     `ast`, which is what supplies `<path>` — written inline in
     `_substitute_paths` and in no table; and the `roots` keys
     `bin/cctally-test-all` injects into the production `ScrubContext`, walked out
-    of its `EVPY` heredoc, which is what supplies `<private-tmp>`,
+    of its `_ev_bridge` program, which is what supplies `<private-tmp>`,
     `<runner-temp>` and `<tmpdir>`. The kernel cannot report the root names
     itself, because the caller supplies them.
 
@@ -4973,3 +4980,653 @@ def test_the_unvalidatable_replacement_path_returns_no_lines_either(monkeypatch)
     assert record["refused"] is True, record
     assert record["refusal"] == "unvalidatable-replacement", record
     assert out == [], out
+
+
+# ------------------------------------------- the evidence index's writer lock
+#
+# #940 (contract C8): the kernel names no lock layout. Every writer of the
+# internal evidence index takes the lock its CALLER supplies and holds it over
+# the whole read-modify-write, so two writers never interleave a read and a
+# replace; the lock itself (its file, its flavour) belongs to the caller.
+
+
+class _RecordingLock(object):
+    def __init__(self):
+        self.held = False
+        self.entered = 0
+
+    def __enter__(self):
+        assert not self.held, "the kernel re-entered a lock it already held"
+        self.held = True
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc):
+        self.held = False
+        return False
+
+
+def test_every_evidence_index_writer_holds_the_lock_its_caller_supplies(tmp_path, monkeypatch):
+    index = str(tmp_path / "evidence-index.json")
+    lock = _RecordingLock()
+    writes = []
+    real = K._write_json_atomic
+
+    def recording_write(path, doc, mode=0o644):
+        writes.append((path, lock.held))
+        return real(path, doc, mode)
+
+    monkeypatch.setattr(K, "_write_json_atomic", recording_write)
+    K.update_evidence_index(index, store_id="s", run_id="r1", started_at="a", ended_at="b",
+                            length=1, digest="sha256:00", lock=lock)
+    K.record_store_loss(index, store_id="s", start="a", end="b", reason="lost", lock=lock)
+    K.forget_indexed_runs(index, store_id="s", run_ids={"r1"}, lock=lock)
+    assert lock.entered == 3
+    assert writes == [(index, True)] * 3, writes
+    assert not lock.held
+
+
+def test_an_evidence_index_writer_refuses_to_run_without_a_lock(tmp_path):
+    # #940 D0b: `lock` is required, so a caller that forgets it fails loudly
+    # instead of racing another writer unlocked. An explicit None is the same
+    # omission spelled out, and is refused the same way; neither touches the
+    # index.
+    index = tmp_path / "evidence-index.json"
+    calls = (
+        lambda **kw: K.update_evidence_index(str(index), store_id="s", run_id="r1",
+                                             started_at="a", ended_at="b", length=1,
+                                             digest="sha256:00", **kw),
+        lambda **kw: K.record_store_loss(str(index), store_id="s", start="a", end="b",
+                                         reason="lost", **kw),
+        lambda **kw: K.forget_indexed_runs(str(index), store_id="s", run_ids={"r1"}, **kw),
+    )
+    for call in calls:
+        for kwargs in ({}, {"lock": None}):
+            with pytest.raises(TypeError, match="lock"):
+                call(**kwargs)
+    assert not index.exists()
+
+
+def test_forget_indexed_runs_drops_only_the_named_runs_of_one_store(tmp_path):
+    index = str(tmp_path / "evidence-index.json")
+    for store, run in (("a", "r1"), ("a", "r2"), ("b", "r1")):
+        K.update_evidence_index(index, store_id=store, run_id=run, started_at="x",
+                                ended_at="y", length=1, digest="sha256:00",
+                                lock=contextlib.nullcontext())
+    K.forget_indexed_runs(index, store_id="a", run_ids={"r1", "missing"},
+                          lock=contextlib.nullcontext())
+    stores = K.read_evidence_index(index)["stores"]
+    assert [r["runId"] for r in stores["a"]["runs"]] == ["r2"]
+    assert [r["runId"] for r in stores["b"]["runs"]] == ["r1"]
+    # An unknown store, and an empty set, leave the index untouched.
+    before = pathlib.Path(index).read_bytes()
+    K.forget_indexed_runs(index, store_id="z", run_ids={"r2"}, lock=contextlib.nullcontext())
+    K.forget_indexed_runs(index, store_id="a", run_ids=set(), lock=contextlib.nullcontext())
+    assert pathlib.Path(index).read_bytes() == before
+
+
+def test_the_kernel_carries_no_index_lock_of_its_own():
+    assert not hasattr(K, "_IndexLock")
+    source = (REPO / "bin" / "_lib_test_evidence.py").read_text(encoding="utf-8")
+    assert "fcntl" not in source
+
+
+# ----------------------------------- the aggregator's retention pass and the index
+#
+# A run retention evicted on purpose is planned, never lost. When the pass that
+# evicted it could not also drop it from the evidence index (the index's lock or
+# write failed), a later pass must not read the evicted run's absence as loss:
+# that would hold `coverage: degraded` for the whole retention horizon over
+# evidence nobody lost.
+
+_AGGREGATOR = REPO / "bin" / "cctally-test-all"
+_STORE = "11111111-2222-3333-4444-555555555555+66666666-7777-8888-9999-BBBBBBBBBBBB:2"
+
+
+def _aggregator_bridge():
+    source = _AGGREGATOR.read_text(encoding="utf-8")
+    start = "_ev_bridge() {\n    printf '%s\\n' '"
+    assert start in source, "bin/cctally-test-all no longer defines _ev_bridge"
+    return source.split(start, 1)[1].split("'\n}\n", 1)[0].replace("'\\''", "'")
+
+
+def _bridge(args, env_extra):
+    import os
+    import subprocess
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC", PYTHONDONTWRITEBYTECODE="1")
+    for name in ("CCTALLY_RUNNER_STORE_ID", "CCTALLY_RUNNER_EVIDENCE_INDEX"):
+        env.pop(name, None)
+    env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, "-", str(REPO / "bin" / "_lib_test_evidence.py"), os.devnull] + args,
+        input=_aggregator_bridge(), env=env, capture_output=True, text=True, check=False)
+
+
+def _aggregator_run(root, run_id, started):
+    run = pathlib.Path(root) / "cctally-dev" / run_id
+    (run / "logs").mkdir(parents=True)
+    (run / "logs" / "big.log").write_text("x" * 1000, encoding="utf-8")
+    (run / "manifest.json").write_text(json.dumps({
+        "schemaVersion": 1, "runId": run_id, "remoteDir": "cctally-dev",
+        "state": "completed", "outcome": "pass", "failureClass": "none", "exitCode": 0,
+        "pid": None, "pidStart": "", "startedEpoch": started,
+        "finishedEpoch": started + 60}), encoding="utf-8")
+    return run
+
+
+def test_an_eviction_whose_index_forget_failed_is_never_read_as_loss(tmp_path):
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    aged = _aggregator_run(root, "aged", now - 30 * 86400)
+    result = _bridge(["index", str(root), str(aged), "aged"], env)
+    assert result.returncode == 0, result.stderr
+    assert [r["runId"] for r in K.read_evidence_index(str(index))["stores"][_STORE]["runs"]] \
+        == ["aged"]
+    _aggregator_run(root, "current", now - 60)
+    # Pass 1 evicts the aged run, but nothing can take the index's lock: the
+    # forget fails after the eviction succeeded.
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    assert not aged.exists(), "the aged run was evicted"
+    assert "could not be updated" in result.stderr, result.stderr
+    blocker.rmdir()
+    # Pass 2, with the index healthy again: the evicted run is forgotten, not lost.
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert record["seededLoss"] == [], record
+    stores = K.read_evidence_index(str(index))["stores"]
+    assert stores[_STORE]["loss"] == [], stores
+    assert stores[_STORE]["runs"] == [], stores
+    assert "evidence loss" not in result.stderr, result.stderr
+    assert not record.get("indexForgetPending"), record
+
+
+def test_a_pending_forget_does_not_hide_a_real_loss(tmp_path):
+    # Non-vacuity: a run that is deleted while still indexed, and that no
+    # retention pass evicted, is still discovered as lost next to a pending
+    # forget.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    aged = _aggregator_run(root, "aged", now - 30 * 86400)
+    victim = _aggregator_run(root, "victim", now - 7200)
+    for run, run_id in ((aged, "aged"), (victim, "victim")):
+        assert _bridge(["index", str(root), str(run), run_id], env).returncode == 0
+    _aggregator_run(root, "current", now - 60)
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    assert _bridge(["retention", str(root), "current"], env).returncode == 0
+    blocker.rmdir()
+    import shutil
+    shutil.rmtree(str(victim))
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    reasons = [e["reason"] for e in record["seededLoss"]]
+    assert any("victim" in r for r in reasons), record
+    assert not any("aged" in r for r in reasons), record
+
+
+def _index_with_a_lost_run(base, names=("lost",)):
+    """An index that lists each run of `names` (by default one, `lost`), whose
+    evidence is gone (deleted, not evicted), beside the current run: the next
+    retention pass finds one loss per name."""
+    root = base / "ev"
+    index = base / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    for offset, name in enumerate(names):
+        lost = _aggregator_run(root, name, now - 7200 - offset * 600)
+        assert _bridge(["index", str(root), str(lost), name], env).returncode == 0
+        shutil.rmtree(str(lost))
+    _aggregator_run(root, "current", now - 60)
+    return root, index, env
+
+
+def _bridge_popen(args, env_extra):
+    import os
+    import subprocess
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC", PYTHONDONTWRITEBYTECODE="1")
+    for name in ("CCTALLY_RUNNER_STORE_ID", "CCTALLY_RUNNER_EVIDENCE_INDEX"):
+        env.pop(name, None)
+    env.update(env_extra)
+    proc = subprocess.Popen(
+        [sys.executable, "-", str(REPO / "bin" / "_lib_test_evidence.py"), os.devnull] + args,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        text=True)
+    proc.stdin.write(_aggregator_bridge())
+    proc.stdin.close()
+    return proc
+
+
+def _finish(proc, timeout=60):
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        proc.stdout.close()
+        proc.stderr.close()
+    return proc.returncode, err
+
+
+def test_a_detected_loss_is_recorded_under_the_index_lock(tmp_path):
+    # #940 D0b: `_detect_index_loss` writes the loss through `record_store_loss`
+    # under `<index>.lock`, the lock enrollment also takes. Observed, not read
+    # from the source: a control pass with the lock free shows how long the
+    # pass takes; a second pass, on an identical fixture, is then held on the
+    # lock for several times that long and must still be waiting with the
+    # index unchanged, and must record the loss once the lock is released.
+    import fcntl
+    import os
+    root, index, env = _index_with_a_lost_run(tmp_path / "control")
+    started = time.monotonic()
+    rc, err = _finish(_bridge_popen(["retention", str(root), "current"], env))
+    control = time.monotonic() - started
+    assert rc == 0, err
+    assert K.read_evidence_index(str(index))["stores"][_STORE]["loss"], "control found no loss"
+
+    root, index, env = _index_with_a_lost_run(tmp_path / "held")
+    before = pathlib.Path(index).read_bytes()
+    fd = os.open(str(index) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        proc = _bridge_popen(["retention", str(root), "current"], env)
+        try:
+            deadline = time.monotonic() + 3 * control + 1.0
+            while time.monotonic() < deadline:
+                assert proc.poll() is None, "the retention pass finished under the held lock"
+                time.sleep(0.05)
+            assert pathlib.Path(index).read_bytes() == before, \
+                "the loss was written while another writer held the index lock"
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    rc, err = _finish(proc)
+    assert rc == 0, err
+    loss = K.read_evidence_index(str(index))["stores"][_STORE]["loss"]
+    assert any("run lost" in e["reason"] for e in loss), loss
+
+
+def test_a_loss_found_while_the_index_is_unwritable_still_degrades_coverage(tmp_path):
+    # #940 D0b: the loss joins the record's seeded loss BEFORE the index write,
+    # so an index that cannot be written does not drop a loss this pass found.
+    # Two losses (D-1 F4): the first failed write must not drop the second.
+    root, index, env = _index_with_a_lost_run(tmp_path, names=("lost-a", "lost-b"))
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    try:
+        result = _bridge(["retention", str(root), "current"], env)
+    finally:
+        blocker.rmdir()
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    reasons = [e["reason"] for e in record["seededLoss"]]
+    assert any(r.endswith("of run lost-a") for r in reasons), record
+    assert any(r.endswith("of run lost-b") for r in reasons), record
+    assert record["coverage"] == "degraded", record
+
+
+def _pending_record(root, pending):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".retention.json").write_text(json.dumps({
+        "schemaVersion": 1, "store": _STORE, "passes": 1, "seededLoss": [], "gaps": [],
+        "indexForgetPending": pending}), encoding="utf-8")
+
+
+def test_a_pass_without_the_index_carries_the_pending_forgets_forward(tmp_path):
+    # #940 D0b: a pass that cannot reach the index (here, no index is named)
+    # must keep the earlier pass's pending forgets, or the next indexed pass
+    # reads those planned evictions as loss. #940 D0c: the run is evicted by the
+    # byte cap, so it finished inside the retention window: a pass without the
+    # index age-bounds its pending forgets by their finish, and this one is
+    # not past it.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12", "EV_MAX_BYTES": "2000"}
+    now = int(time.time())
+    aged = _aggregator_run(root, "aged", now - 7200)
+    assert _bridge(["index", str(root), str(aged), "aged"], env).returncode == 0
+    _aggregator_run(root, "current", now - 60)
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    assert _bridge(["retention", str(root), "current"], env).returncode == 0
+    blocker.rmdir()
+    assert not aged.exists()
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == ["aged"], record
+
+    unindexed = dict(env)
+    del unindexed["CCTALLY_RUNNER_EVIDENCE_INDEX"]
+    assert _bridge(["retention", str(root), "current"], unindexed).returncode == 0
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == ["aged"], record
+
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert record["seededLoss"] == [], record
+    assert "evidence loss" not in result.stderr, result.stderr
+    assert not record.get("indexForgetPending"), record
+
+
+def _stamped(epoch, tail):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(epoch)) + "-" + tail
+
+
+def _pending_record_ended(root, pending, ended):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".retention.json").write_text(json.dumps({
+        "schemaVersion": 1, "store": _STORE, "passes": 1, "seededLoss": [], "gaps": [],
+        "indexForgetPending": pending, "indexForgetPendingEnded": ended}), encoding="utf-8")
+
+
+def test_pending_forgets_age_out_at_the_retention_window(tmp_path):
+    # #940 D-1 F5, D0c: on a host that never names an index nothing ever
+    # forgets a pending run, so the list is age-bound there, by the quantity
+    # retention evicts by: the run's finish (`indexForgetPendingEnded`). A run
+    # that started before the window but finished inside it is kept, and so is
+    # one whose finish was never recorded, whatever its id stamp says.
+    root = tmp_path / "ev"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    finished_long_ago = _stamped(now - 14 * 86400, "11-1")
+    long_run = _stamped(now - 13 * 86400, "22-2")
+    unrecorded = _stamped(now - 13 * 86400, "33-3")
+    _aggregator_run(root, "current", now - 60)
+    _pending_record_ended(root, [finished_long_ago, long_run, unrecorded, "unstamped"], {
+        finished_long_ago: now - 14 * 86400 + 60, long_run: now - 2 * 86400})
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == sorted([long_run, unrecorded, "unstamped"]), \
+        record
+    assert record.get("indexForgetPendingEnded") == {long_run: now - 2 * 86400}, record
+
+
+def test_a_pass_without_an_index_adds_none_of_its_evictions_to_the_pending_forgets(tmp_path):
+    # #940 D0c: the CI lane names no index and its run ids carry no stamp, so
+    # an eviction added there would stay pending forever. With no index there
+    # is nothing to forget from: the evicted run is not added.
+    root = tmp_path / "ev"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    aged = _aggregator_run(root, "macos-123-1", now - 30 * 86400)
+    _aggregator_run(root, "current", now - 60)
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    assert not aged.exists(), "the aged run was evicted"
+    record = json.loads((root / ".retention.json").read_text())
+    assert "indexForgetPending" not in record, record
+    assert "indexForgetPendingEnded" not in record, record
+
+
+def test_an_aged_pending_forget_is_carried_until_its_forget_succeeds(tmp_path):
+    # #940 D0c: with an index named, a pending run older than the window is not
+    # dropped for age while its forget keeps failing: the index still lists it,
+    # so it is carried (with the finish the index records) until a forget
+    # succeeds, and is then forgotten, never lost.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    ancient = _stamped(now - 13 * 86400, "11-1")
+    run = _aggregator_run(root, ancient, now - 13 * 86400)
+    assert _bridge(["index", str(root), str(run), ancient], env).returncode == 0
+    shutil.rmtree(str(run))
+    _aggregator_run(root, "current", now - 60)
+    _pending_record(root, [ancient])
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    try:
+        result = _bridge(["retention", str(root), "current"], env)
+    finally:
+        blocker.rmdir()
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == [ancient], record
+    assert record.get("indexForgetPendingEnded") == {ancient: now - 13 * 86400 + 60}, record
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert not record.get("indexForgetPending"), record
+    assert record["seededLoss"] == [], record
+    assert K.read_evidence_index(str(index))["stores"][_STORE]["runs"] == []
+
+
+def test_a_missing_run_whose_finish_is_inside_the_window_is_lost_whatever_its_id_stamp(
+        tmp_path):
+    # #940 D0c: retention evicts by a run's finish, so loss detection ages by
+    # the finish the index records, not by the start stamp of the run id. A
+    # run that started before the window and finished inside it, and whose
+    # evidence is gone, is a loss.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    long_run = _stamped(now - 13 * 86400, "22-2")
+    run = _aggregator_run(root, long_run, now - 13 * 86400)
+    manifest = json.loads((run / "manifest.json").read_text())
+    manifest["finishedEpoch"] = now - 2 * 86400
+    (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    assert _bridge(["index", str(root), str(run), long_run], env).returncode == 0
+    shutil.rmtree(str(run))
+    _aggregator_run(root, "current", now - 60)
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    reasons = [e["reason"] for e in record["seededLoss"]]
+    assert any(r.endswith("of run " + long_run) for r in reasons), record
+
+
+def test_an_indexed_run_older_than_the_retention_window_is_never_read_as_loss(tmp_path):
+    # #940 D-1 F5: the other half of the age bound. A pending forget dropped
+    # for age may still be listed by an index whose forgets failed, and its
+    # evidence is gone by design: retention evicts every run older than the
+    # window. It must not then be read as loss. A recent missing run still is.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    ancient = _stamped(now - 13 * 86400, "11-1")
+    recent = _stamped(now - 7200, "22-2")
+    for name, started in ((ancient, now - 13 * 86400), (recent, now - 7200)):
+        run = _aggregator_run(root, name, started)
+        assert _bridge(["index", str(root), str(run), name], env).returncode == 0
+        shutil.rmtree(str(run))
+    _aggregator_run(root, "current", now - 60)
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    reasons = [e["reason"] for e in record["seededLoss"]]
+    assert any(r.endswith("of run " + recent) for r in reasons), record
+    assert not any(ancient in r for r in reasons), record
+    assert ancient not in result.stderr, result.stderr
+    # #940 D0c: and it is forgotten from the index, not skipped and kept there
+    # for ever (where it would also move a drive replacement's seeded loss
+    # interval to its start).
+    listed = [r["runId"] for r in K.read_evidence_index(str(index))["stores"][_STORE]["runs"]]
+    assert ancient not in listed, listed
+
+
+def test_an_unreadable_end_falls_back_to_the_start_when_aging_an_indexed_run(tmp_path):
+    # #940 D-2 F14: `_indexed_finish` reads `endedAt`, else `startedAt`. An
+    # `endedAt` that does not parse must fall through to `startedAt`, not end
+    # the search with no finish: a run whose start is past the window, and
+    # whose evidence retention evicted, would otherwise never age out and be
+    # read as loss.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    ancient = _stamped(now - 13 * 86400, "11-1")
+    run = _aggregator_run(root, ancient, now - 13 * 86400)
+    assert _bridge(["index", str(root), str(run), ancient], env).returncode == 0
+    shutil.rmtree(str(run))
+    document = json.loads(index.read_text(encoding="utf-8"))
+    [row] = document["stores"][_STORE]["runs"]
+    assert row["startedAt"] and row["endedAt"], row
+    row["endedAt"] = "not-a-timestamp"
+    index.write_text(json.dumps(document), encoding="utf-8")
+    _aggregator_run(root, "current", now - 60)
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert not any(ancient in e["reason"] for e in record["seededLoss"]), record
+    assert ancient not in result.stderr, result.stderr
+    listed = [r["runId"] for r in K.read_evidence_index(str(index))["stores"][_STORE]["runs"]]
+    assert ancient not in listed, listed
+
+
+@pytest.mark.parametrize("failure", [
+    pytest.param("unreadable", id="unreadable"),
+    pytest.param("locked", id="locked"),
+])
+def test_pending_forgets_stay_bounded_while_a_named_index_keeps_failing(tmp_path, failure):
+    # #940 D-2 F19: with an index named, a pending forget is carried while its
+    # forget keeps failing (D0c), but not for ever: an index that stays
+    # unreadable, or whose forget keeps failing, must not grow the pending list
+    # on every pass. An entry is carried for one retention window past the
+    # horizon (loss detection forgets an aged run it finds listed once the index
+    # recovers) and then dropped; no entry whose run finished inside the horizon
+    # is dropped, nor one carried for less than that window.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    import shutil
+    stale = _stamped(now - 30 * 86400, "11-1")
+    aged = _stamped(now - 13 * 86400, "22-2")
+    recent = _stamped(now - 2 * 86400, "33-3")
+    started = {stale: now - 30 * 86400, aged: now - 13 * 86400, recent: now - 2 * 86400}
+    for name in (stale, aged, recent):
+        run = _aggregator_run(root, name, started[name])
+        assert _bridge(["index", str(root), str(run), name], env).returncode == 0
+        shutil.rmtree(str(run))
+    _aggregator_run(root, "current", now - 60)
+    _pending_record_ended(root, [stale, aged, recent],
+                          dict((name, started[name] + 60) for name in started))
+    blocker = pathlib.Path(str(index) + ".lock")
+    healthy = index.read_text(encoding="utf-8")
+    if failure == "unreadable":
+        index.write_text("{not json", encoding="utf-8")
+    else:
+        if blocker.exists():
+            blocker.unlink()
+        blocker.mkdir()
+    try:
+        for _ in range(2):
+            result = _bridge(["retention", str(root), "current"], env)
+            assert result.returncode == 0, result.stderr
+    finally:
+        if failure == "locked":
+            blocker.rmdir()
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == sorted([aged, recent]), record
+    assert record.get("indexForgetPendingEnded") == {
+        aged: started[aged] + 60, recent: started[recent] + 60}, record
+    # Fix round 2 (V9): dropping the stale entry neither invents a loss nor
+    # degrades coverage; it only stops carrying a forget that cannot succeed.
+    assert record.get("seededLoss") == [], record
+    assert record.get("gaps") == [] and record.get("coverage") == "complete", record
+    # The index recovers: the next pass forgets the carried runs, forgets the
+    # dropped stale one as aged rather than reading it as loss, and carries
+    # nothing further.
+    if failure == "unreadable":
+        index.write_text(healthy, encoding="utf-8")
+    result = _bridge(["retention", str(root), "current"], env)
+    assert result.returncode == 0, result.stderr
+    assert "evidence loss" not in result.stderr, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert "indexForgetPending" not in record, record
+    assert "indexForgetPendingEnded" not in record, record
+    assert record.get("seededLoss") == [], record
+    assert record.get("coverage") == "complete", record
+    listed = [r["runId"] for r in K.read_evidence_index(str(index))["stores"][_STORE]["runs"]]
+    assert not set(listed) & {stale, aged, recent}, listed
+
+
+@pytest.mark.parametrize("pending", ["ab", ["a", 5, "../escape", None]])
+def test_pending_forgets_accept_only_a_list_of_run_ids(tmp_path, pending):
+    # #940 D0b: `indexForgetPending` is a list of run-id strings. A string is
+    # not a list of its characters, and an entry that is not a safe run id is
+    # dropped. The index lists `a` (present, not lost) and the lock is blocked,
+    # so whatever the pass accepted stays pending in the record.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    kept = _aggregator_run(root, "a", now - 7200)
+    assert _bridge(["index", str(root), str(kept), "a"], env).returncode == 0
+    _aggregator_run(root, "current", now - 60)
+    _pending_record(root, pending)
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    try:
+        result = _bridge(["retention", str(root), "current"], env)
+    finally:
+        blocker.rmdir()
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    expected = [] if isinstance(pending, str) else ["a"]
+    assert (record.get("indexForgetPending") or []) == expected, record
+
+
+def test_pending_forgets_are_reconciled_against_the_index(tmp_path):
+    # #940 D0b: while forgets keep failing, the pending list keeps only the runs
+    # the index still lists, so it cannot grow without bound.
+    root = tmp_path / "ev"
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    now = int(time.time())
+    listed = _aggregator_run(root, "listed", now - 7200)
+    assert _bridge(["index", str(root), str(listed), "listed"], env).returncode == 0
+    _aggregator_run(root, "current", now - 60)
+    _pending_record(root, ["gone-1", "gone-2", "listed"])
+    blocker = pathlib.Path(str(index) + ".lock")
+    if blocker.exists():
+        blocker.unlink()
+    blocker.mkdir()
+    try:
+        result = _bridge(["retention", str(root), "current"], env)
+    finally:
+        blocker.rmdir()
+    assert result.returncode == 0, result.stderr
+    record = json.loads((root / ".retention.json").read_text())
+    assert record.get("indexForgetPending") == ["listed"], record

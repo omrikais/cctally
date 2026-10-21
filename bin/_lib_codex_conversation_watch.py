@@ -43,15 +43,16 @@ All six §5.4 bullets are contract:
    its first ingest attempt (so a discovered file is never lost even if its
    first ingest is dirty/lock-contended and leaves no cursor row). A path is
    retried while unclassified: with no committed cursor it is surfaced every
-   time it is visited; with a committed cursor it is surfaced only when its size
-   exceeds that cursor (an incomplete-``session_meta`` tail completing without
-   any directory-mtime change). A path leaves the set when the driver ``reap``s
+   time it is visited; with a committed cursor it is surfaced only when its
+   signature advances beyond that cursor (an incomplete-``session_meta`` tail
+   completing without any directory-mtime change). A path leaves the set when the driver ``reap``s
    it (it gained a thread row — child or non-child), when it vanishes, or on a
    bounded per-candidate expiry (handed to the next full sync).
 """
 from __future__ import annotations
 
 import os
+import _lib_codex_rollout_container as _rc
 
 
 # ── production-default injected callables ─────────────────────────────────────
@@ -101,6 +102,48 @@ def default_file_size(filepath):
     return st.st_size
 
 
+def default_file_sig(filepath):
+    """The selected container's live-tail signature (#968 spec 5.9).
+
+    Plain keeps today's size (as ``("plain", size)``); a compressed-only
+    rollout reports its container fingerprint instead of vanishing.
+    """
+    return _rc.observe_watch_sig(filepath)
+
+
+def _as_sig(value):
+    if value is None or isinstance(value, tuple):
+        return value
+    return (_rc.PLAIN, int(value))
+
+
+def codex_sig_advanced(observed, committed) -> bool:
+    """Whether an observed signature is ahead of the committed one.
+
+    Plain grows (append-only, size decides); any other change of a compressed
+    container, or of the container kind, is a change. A bare int on either
+    side is a legacy plain size.
+    """
+    obs, com = _as_sig(observed), _as_sig(committed)
+    if obs is None:
+        return False
+    if com is None:
+        return True
+    if obs[0] == com[0] == _rc.PLAIN:
+        return obs[1] > com[1]
+    return obs != com
+
+
+def committed_watch_sig(kind, size_bytes, container_size_bytes, mtime_ns,
+                        device, inode):
+    """The signature a cursor row's ACCEPTED container would observe: the
+    leaf's ``ContainerFingerprint.watch_sig`` shape, device included."""
+    if kind in (None, _rc.PLAIN):
+        return (_rc.PLAIN, int(size_bytes or 0))
+    return (_rc.ZSTD, int(container_size_bytes or 0), int(mtime_ns or 0),
+            int(device or 0), int(inode or 0))
+
+
 _SENTINEL = object()
 
 
@@ -118,7 +161,7 @@ class CodexChildFrontier:
         pending_expiry_cycles: int = 50,
         scandir_fn=default_scandir,
         dir_mtime_fn=default_dir_mtime,
-        file_size_fn=default_file_size,
+        file_size_fn=default_file_sig,
         clock_fn=None,
     ):
         self._walk_root = str(walk_root)
@@ -175,7 +218,7 @@ class CodexChildFrontier:
 
         ``known_paths`` — every path already tracked in ``codex_session_files``,
         so a newly enumerated file already known to some table is not
-        re-registered. ``committed_sizes`` — ``{path: size_bytes}`` committed
+        re-registered. ``committed_sizes`` — ``{path: signature}`` committed
         cursors, for the pending-growth check.
 
         Returns the set of candidate paths to targeted-ingest this cycle (new
@@ -251,8 +294,8 @@ class CodexChildFrontier:
         mtime as the dir's baseline (so a create landing during the enumeration
         is re-examined next rotation), skips symlinked descendants (the
         ``follow_symlinks=False`` boundary), adds real subdirectories to the
-        frontier, and registers brand-new ``*.jsonl`` files in ``pending`` BEFORE
-        their first ingest — surfacing each for that first ingest attempt in the
+        frontier, and registers brand-new logical rollout files in ``pending``
+        BEFORE their first ingest — surfacing each for that first ingest attempt in the
         SAME cycle it is discovered (the pending sweep then owns the retries).
         Returns True iff it consumed a filesystem op."""
         if not self._enum_queue:
@@ -267,10 +310,12 @@ class CodexChildFrontier:
                 if path not in self._dir_set:
                     self._dir_set.add(path)
                     self._dirs.append(path)           # new subdir joins frontier
-            elif path.endswith(".jsonl"):
-                if path not in self._known and path not in self._pending:
-                    self._pending[path] = 0           # register BEFORE first ingest
-                    ingest.add(path)                  # first ingest attempt now
+            elif _rc.is_container_name(name):
+                # Both spellings enumerate one logical identity.
+                logical = os.fspath(_rc.logical_path(path))
+                if logical not in self._known and logical not in self._pending:
+                    self._pending[logical] = 0        # register BEFORE first ingest
+                    ingest.add(logical)               # first ingest attempt now
         return True
 
     def _op_pending(self, ingest: set) -> bool:
@@ -286,12 +331,12 @@ class CodexChildFrontier:
             p = keys[idx]
             if p not in self._pending:                # reaped/dropped mid-cycle
                 continue
-            size = self._file_size(p)                 # 1 fs op
-            if size is None:
+            sig = self._file_size(p)                  # 1 signature probe
+            if sig is None:
                 self._pending.pop(p, None)            # vanished → drop
             else:
                 committed = self._committed.get(p)
-                if committed is None or size > committed:
+                if codex_sig_advanced(sig, committed):
                     ingest.add(p)
             return True
         return False

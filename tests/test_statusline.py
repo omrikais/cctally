@@ -652,6 +652,10 @@ def _statusline_subprocess(args, stdin_json, env_overrides=None):
     }
     if env_overrides:
         env.update(env_overrides)
+    # #965: this fresh environment launches checkout cctally, so it carries
+    # the test retention switch (docs/fixtures-gotchas.md, "Conversation
+    # retention is off in test environments (#965)").
+    env["CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"] = "1"
     # Disable dev autodetect so the dev checkout's data dir routing
     # doesn't interfere with test-controlled CCTALLY_DATA_DIR.
     env.setdefault("CCTALLY_DISABLE_DEV_AUTODETECT", "1")

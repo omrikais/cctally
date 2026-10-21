@@ -107,8 +107,65 @@ def staged_names(text: str, roots: tuple[str, ...] = _STAGING_ROOTS) -> set[str]
 _REDIRECT = re.compile(r'>\s*"([^"]*(?:golden|expected)[^"]*)"', re.IGNORECASE)
 
 
-def goldens_addressed_at_staging(text: str) -> list[str]:
-    """Golden paths this harness builds out of a staging root."""
+# Fixture writes into one case's own scratch tree `$d` whose path contains
+# "golden" only because the tool under test keys on that exact path, so the
+# fixture cannot be renamed. Keyed by (harness, redirect target); each value is
+# (the tool whose source names the path, the rationale). An entry holds only
+# while every mention of the target's file name among the harness's reported
+# golden writes is that exact write, once per line (`_only_scratch_fixture_writes`);
+# any other mention defeats it and the recorded write is reported again.
+_SCRATCH_FIXTURE_WRITES = {
+    ("cctally-preflight-test", "$d/bin/_lib-golden-diff.sh"): (
+        "bin/cctally-preflight",
+        "heredoc-floor-declared-file plants a here-document in its own scratch "
+        "tree at the floor-bash target _FLOOR_BASH_CALLERS names, so the "
+        "pre-flight's C11 floor check fires on it. Nothing reads or writes a "
+        "golden; the scratch tree is the case's fixture.",
+    ),
+    ("cctally-preflight-test", "$d/tests/test_share_golden_discipline.py"): (
+        "bin/cctally-preflight",
+        "floor-caller-stale-file-target plants the floor-bash caller "
+        "_FLOOR_BASH_CALLERS names in its own scratch tree without the target, "
+        "so the pre-flight reports the missing target. Nothing reads or writes "
+        "a golden; the scratch tree is the case's fixture.",
+    ),
+}
+
+
+def _only_scratch_fixture_writes(text: str, target: str) -> bool:
+    """True when every reported golden write that mentions `target`'s file name
+    is the redirect `> "<target>"`, and no line carries two of them."""
+    name = target.rsplit("/", 1)[-1]
+    exact = f'> "{target}"'
+    mentions = [o for o in goldens_addressed_at_staging(text) if name in o]
+    if not mentions or any(o != exact for o in mentions):
+        return False
+    for raw in text.splitlines():
+        if raw.strip().startswith("#"):
+            continue
+        if sum(name in t for t in _REDIRECT.findall(raw)) > 1:
+            return False
+    return True
+
+
+def goldens_addressed_at_staging(text: str, harness: str | None = None) -> list[str]:
+    """Golden paths this harness builds out of a staging root.
+
+    `harness`, the harness's file name, applies its recorded scratch-fixture
+    writes; without it nothing is exempt.
+    """
+    offenders = _staged_golden_writes(text)
+    if harness is None:
+        return offenders
+    exempt = {
+        f'> "{target}"'
+        for (owner, target) in _SCRATCH_FIXTURE_WRITES
+        if owner == harness and _only_scratch_fixture_writes(text, target)
+    }
+    return [o for o in offenders if o not in exempt]
+
+
+def _staged_golden_writes(text: str) -> list[str]:
     staged = staged_names(text)
     offenders = []
     for name, assigned in assignments(text).items():
@@ -133,7 +190,7 @@ def goldens_addressed_at_staging(text: str) -> list[str]:
 
 _DEFECTIVE = """\
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixstage.XXXXXX")
 FIXTURES="$FIXTURE_STAGE/doctor"
 trap 'rm -rf "$FIXTURE_STAGE"' EXIT
 run_mode () {
@@ -147,7 +204,7 @@ run_mode () {
 
 _FIXED = """\
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixstage.XXXXXX")
 FIXTURES="$FIXTURE_STAGE/doctor"
 GOLDEN_ROOT="$REPO_ROOT/tests/fixtures/doctor"
 trap 'rm -rf "$FIXTURE_STAGE"' EXIT
@@ -190,7 +247,8 @@ def _harnesses() -> list[pathlib.Path]:
 def test_no_harness_addresses_a_golden_through_its_staging_root():
     reported = {}
     for harness in _harnesses():
-        offenders = goldens_addressed_at_staging(harness.read_text(encoding="utf-8"))
+        offenders = goldens_addressed_at_staging(
+            harness.read_text(encoding="utf-8"), harness=harness.name)
         if offenders:
             reported[harness.name] = offenders
     assert not reported, (
@@ -200,6 +258,332 @@ def test_no_harness_addresses_a_golden_through_its_staging_root():
         "root instead, as bin/cctally-share-v2-test does with GOLDEN_ROOT."
         % reported
     )
+
+
+# --------------------------------------------- the recorded scratch-fixture writes
+
+
+# A synthetic harness in the shape the recorded entries exempt: a case
+# allocates its own scratch tree `d` under SCRATCH_DIR and writes one fixture
+# into it whose path happens to contain "golden".
+_SCRATCH_CASE = """\
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-preflight-XXXXXX")
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+new_tree () {
+    local d="$SCRATCH_DIR/$1"
+    printf '%s' "$d"
+}
+d=$(new_tree heredoc-floor-declared-file)
+printf '%s\\n' body > "$d/bin/_lib-golden-diff.sh"
+expect_c11 heredoc-floor-declared-file "$d" bin/_lib-golden-diff.sh:1
+"""
+
+_SCRATCH_TARGET = "$d/bin/_lib-golden-diff.sh"
+_SCRATCH_KEY = ("cctally-preflight-test", _SCRATCH_TARGET)
+
+
+def test_a_recorded_scratch_fixture_write_is_exempt_only_for_its_harness():
+    assert goldens_addressed_at_staging(_SCRATCH_CASE) == [f'> "{_SCRATCH_TARGET}"']
+    assert goldens_addressed_at_staging(
+        _SCRATCH_CASE, harness="cctally-preflight-test") == []
+    # Keyed by file: the same write in any other harness is still reported.
+    assert goldens_addressed_at_staging(
+        _SCRATCH_CASE, harness="cctally-doctor-test") == [f'> "{_SCRATCH_TARGET}"']
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param('golden="$d/bin/_lib-golden-diff.sh"\n',
+                 id="golden-variable-bound-to-the-path"),
+    pytest.param('printf x > "$SCRATCH_DIR/bin/_lib-golden-diff.sh"\n',
+                 id="written-under-the-staging-root"),
+    pytest.param('printf x > "$d/tests/fixtures/x/bin/_lib-golden-diff.sh"\n',
+                 id="written-at-another-path-in-the-case-tree"),
+    pytest.param('printf x > "$d/bin/_lib-golden-diff.sh"; '
+                 'printf y > "$d/bin/_lib-golden-diff.sh"\n',
+                 id="two-writes-on-one-line"),
+])
+def test_a_recorded_scratch_fixture_write_is_defeated_by_any_other_mention(extra):
+    """The entry holds only while every mention of the name is the scratch-tree
+    write; one other mention defeats it, and then the recorded write is reported
+    too."""
+    offenders = goldens_addressed_at_staging(
+        _SCRATCH_CASE + extra, harness="cctally-preflight-test")
+    assert f'> "{_SCRATCH_TARGET}"' in offenders, offenders
+    assert len(offenders) >= 2, offenders
+
+
+def test_every_recorded_scratch_fixture_write_is_live():
+    """Each entry names a harness that still makes exactly that write, a tool
+    that still keys on the path (which is why the fixture cannot be renamed),
+    and a rationale."""
+    assert _SCRATCH_FIXTURE_WRITES, (
+        "the scratch-fixture table is empty; delete it rather than keep it")
+    assert _SCRATCH_KEY in _SCRATCH_FIXTURE_WRITES
+    for (harness, target), (tool, rationale) in _SCRATCH_FIXTURE_WRITES.items():
+        assert rationale.strip(), (harness, target)
+        assert target.startswith("$d/"), (harness, target)
+        text = (REPO / "bin" / harness).read_text(encoding="utf-8")
+        assert f'> "{target}"' in goldens_addressed_at_staging(text), (
+            f"{harness} no longer writes {target}; remove the entry")
+        assert _only_scratch_fixture_writes(text, target), (harness, target)
+        relpath = target[len("$d/"):]
+        assert relpath in (REPO / tool).read_text(encoding="utf-8"), (
+            f"{tool} no longer names {relpath}, so the fixture can be renamed "
+            f"and the entry removed")
+
+
+# #940 F2 fix round 2 (G4): the case-tree binding check over-approximates.
+# A bare-word `d`: not part of a longer word, not a parameter expansion (`$d`,
+# `${d…}`), an option (`-d`), a printf conversion (`%d`), or part of a path or
+# extension (`/d`, `.d`, `d/`, `d.`).
+_BARE_D = re.compile(r"(?<![A-Za-z0-9_$%/.\-])(?<!\$\{)d(?![A-Za-z0-9_/.])")
+# `${d:=…}`, `${d=…}`, `${d:?…}` and `${d?…}` assign (or abort on) `d`.
+_ASSIGNING_D = re.compile(r"\$\{d:?[=?]")
+# What may follow an accepted binding's value: the end of the word.
+_WORD_END = r"(?=$|[\s;&|)])"
+# The three accepted bindings, matched at the bare `d`.
+_NEW_TREE_D = re.compile(r"d=\$\(new_tree\s[^()]*\)" + _WORD_END)
+_LOCAL_PREFIX = re.compile(r"(?:^|[\s;&|({!])local\s+$")
+_LOCAL_POSITIONAL_D = re.compile(r"d=\$1" + _WORD_END)
+_SCRATCH_DIR_D = re.compile(r'd="\$SCRATCH_DIR/[^"`]*"' + _WORD_END)
+# A here-document operator (not a `<<<` here-string) and its delimiter word:
+# `'TAG'`, `"TAG"`, `\TAG` (quoted, so the body is literal) or `TAG`.
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|\\(\w+)|(\w+))")
+
+
+def _case_tree_scan_lines(text: str):
+    """The text the binding check reads: ``(number, line)`` for every line,
+    with full-line comments, trailing comments and quoted here-document
+    bodies removed.
+
+    Quote state is carried across lines (in single quotes only ``'`` ends
+    the string; in double quotes ``\\`` escapes and ``"`` ends it), so a
+    ``#`` or ``<<'TAG'`` inside a string is neither a comment nor a
+    here-document. Each misreading this lexer can make errs toward reading
+    more: a trailing comment whose text holds a quote, a backtick or a
+    ``)`` is kept, since it may be a string the lexer mis-tracked; a quoted
+    here-document whose delimiter line never comes is not skipped; and an
+    unquoted body is read in full, comments included, because it expands
+    ``${d:=…}``."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    out = []
+    state = None          # None (code), "'" or '"'
+    pending = []          # [(tag, quoted, strip_tabs)] in operator order
+    k = 0
+    while k < len(lines):
+        line = lines[k]
+        number = k + 1
+        k += 1
+        if pending:
+            tag, quoted, strip_tabs = pending[0]
+            closing = line.lstrip("\t") if strip_tabs else line
+            if closing == tag:
+                pending.pop(0)
+                continue
+            if not quoted:
+                out.append((number, line))
+            continue
+        if state is None and line.lstrip().startswith("#"):
+            continue
+        kept = line
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if state == "'":
+                if ch == "'":
+                    state = None
+            elif state == '"':
+                if ch == "\\":
+                    j += 1
+                elif ch == '"':
+                    state = None
+            elif ch == "\\":
+                j += 1
+            elif ch in "'\"":
+                state = ch
+            elif ch == "#" and (j == 0 or line[j - 1] in " \t"):
+                comment = line[j:]
+                if not any(c in comment for c in "'\"`)"):
+                    kept = line[:j]
+                break
+            elif ch == "<":
+                m = _HEREDOC.match(line, j)
+                if m:
+                    quoted_tag = m.group(2) if m.group(2) is not None else (
+                        m.group(3) if m.group(3) is not None else m.group(4))
+                    if quoted_tag is not None:
+                        rest = lines[k:]
+                        strip = bool(m.group(1))
+                        if any((r.lstrip("\t") if strip else r) == quoted_tag for r in rest):
+                            pending.append((quoted_tag, True, strip))
+                        # An unclosed quoted body is read: nothing is skipped.
+                    else:
+                        pending.append((m.group(5), False, bool(m.group(1))))
+                    j = m.end()
+                    continue
+            j += 1
+        out.append((number, kept))
+    return out
+
+
+def _bare_d_is_accepted(line: str, at: int) -> bool:
+    """Whether the bare `d` at ``at`` is the binding of exactly one accepted
+    form: ``d=$(new_tree …)``, ``local d=$1`` or ``[local] d="$SCRATCH_DIR/…"``."""
+    forms = 0
+    if _NEW_TREE_D.match(line, at):
+        forms += 1
+    if _LOCAL_PREFIX.search(line[:at]) and _LOCAL_POSITIONAL_D.match(line, at):
+        forms += 1
+    if _SCRATCH_DIR_D.match(line, at):
+        forms += 1
+    return forms == 1
+
+
+def _case_tree_binding_offenders(text: str) -> list[str]:
+    """#940 F2-f, made total in fix round 2 (G4): every binding of a case's
+    tree variable `d` must be a scratch tree the case allocated. The check
+    does not list binding forms. It over-approximates, failing closed: a
+    binding it missed is the harmful direction, and a false alarm is cheap.
+
+    1. It skips full-line comments, trailing comments (a ``#`` after
+       whitespace, outside quotes) and quoted here-document bodies
+       (``<<'TAG'``, ``<<"TAG"``, ``<<\\TAG``, with or without ``-``), up to
+       the closing line (see ``_case_tree_scan_lines``). An unquoted body is
+       read, because it expands ``${d:=…}``.
+    2. On every remaining line it finds each bare-word `d` (``_BARE_D``) and
+       each assigning expansion ``${d:=…}``, ``${d=…}``, ``${d:?…}`` or
+       ``${d?…}``. An assigning expansion is an offender whatever the line.
+    3. A line is accepted only when each bare `d` in it is the binding of
+       exactly one accepted form: ``d=$(new_tree …)``, ``local d=$1`` or
+       ``d="$SCRATCH_DIR/…"`` (with or without ``local``).
+    4. Every other line with a bare `d` is an offender. That includes a `d`
+       in a quoted string, a false alarm on purpose: a fixture that needs
+       `d` as a word uses another name."""
+    offenders = []
+    source = text.split("\n")
+    for number, line in _case_tree_scan_lines(text):
+        offending = _ASSIGNING_D.search(line) is not None or any(
+            not _bare_d_is_accepted(line, m.start()) for m in _BARE_D.finditer(line))
+        if offending:
+            offenders.append("%d: %s" % (number, source[number - 1].strip()))
+    return offenders
+
+
+def test_every_case_tree_binding_is_a_scratch_tree():
+    """#940 F2-f: the scratch-fixture exemptions above hold only while `$d` is
+    a case's own scratch tree; a binding of `d` to anything else would make
+    a recorded write land outside it."""
+    text = (REPO / "bin" / "cctally-preflight-test").read_text(encoding="utf-8")
+    assert _case_tree_binding_offenders(text) == []
+    assert text.count("d=$(new_tree ") > 100  # the scan reads the real bindings
+    # The rule bites: other bindings are reported.
+    assert _case_tree_binding_offenders('d="$REPO_ROOT/x"\nlocal d=/tmp/y\n') == [
+        '1: d="$REPO_ROOT/x"', "2: local d=/tmp/y"]
+    assert _case_tree_binding_offenders("local d=$1 mode=$2\n") == []
+    # #940 F2 fix round 2 (G4): a bare `d` in quoted fixture text is reported
+    # on purpose (the rule over-approximates); such a fixture uses another name.
+    assert _case_tree_binding_offenders('printf x "      - run: d=$(pwd)"\n') == [
+        '1: printf x "      - run: d=$(pwd)"']
+
+
+@pytest.mark.parametrize("line", [
+    pytest.param("for d in /tmp/a /tmp/b; do", id="for-loop"),
+    pytest.param("    for d in \"$SCRATCH_DIR\"/*; do", id="for-loop-indented"),
+    pytest.param("true; for d in x; do :; done", id="for-loop-mid-line"),
+    pytest.param("read d < /tmp/f", id="read"),
+    pytest.param("read -r d", id="read-r"),
+    pytest.param("IFS= read -r name d", id="read-second-name"),
+    pytest.param("while read -r d; do", id="while-read"),
+    pytest.param("x=1; d=/tmp/y", id="semicolon"),
+    pytest.param("[ -n x ] && d=$(pwd)", id="and"),
+    pytest.param("[ -n x ] || d=\"$REPO_ROOT/x\"", id="or"),
+])
+def test_each_other_binding_form_of_the_case_tree_is_an_offender(line):
+    """#940 F2 fix round (F2X-5): a `for d in`, a `read … d` and a mid-line
+    `; d=`, `&& d=` or `|| d=` also bind `d`; each one that is not one of the
+    three accepted forms is reported."""
+    assert _case_tree_binding_offenders(line + "\n") == ["1: %s" % line.strip()]
+
+
+@pytest.mark.parametrize("line", [
+    pytest.param("x=1; d=$(new_tree y)", id="semicolon-new-tree"),
+    pytest.param("[ -n x ] && d=\"$SCRATCH_DIR/z\"", id="and-scratch"),
+    pytest.param("read -r dd", id="read-another-name"),
+    pytest.param("for dir in a b; do", id="for-another-name"),
+    pytest.param("# for d in a b; read d; x; d=/tmp", id="comment"),
+])
+def test_the_other_binding_forms_accept_the_scratch_forms(line):
+    assert _case_tree_binding_offenders(line + "\n") == []
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param("if read -r d; then", id="if-read"),
+    pytest.param("elif read d; then", id="elif-read"),
+    pytest.param("command read d", id="command-read"),
+    pytest.param("x; local d=/tmp", id="mid-line-local"),
+    pytest.param("then d=/tmp/a", id="then-assign"),
+    pytest.param("printf -v d %s /tmp", id="printf-v"),
+    pytest.param("mapfile d < f", id="mapfile"),
+    pytest.param("readarray -t d < f", id="readarray"),
+    pytest.param("select d in a b; do", id="select"),
+    pytest.param("(( d++ ))", id="arithmetic"),
+    pytest.param(": ${d:=/tmp/a}", id="assign-default-colon"),
+    pytest.param(": ${d=/tmp/a}", id="assign-default"),
+    pytest.param(': "${d:?unset}"', id="error-if-unset-colon"),
+    pytest.param(": ${d?unset}", id="error-if-unset"),
+    pytest.param("d+=/x", id="append"),
+    pytest.param("export d=/tmp/a", id="export"),
+    pytest.param("declare d=/tmp/a", id="declare"),
+    pytest.param("x=1 d=/tmp/a", id="second-prefix-assignment"),
+    pytest.param("d=$(new_tree x); : ${d:=/tmp}", id="assigning-expansion-beside-a-binding"),
+    pytest.param("local d=$1x", id="local-positional-with-suffix"),
+    pytest.param("d=$(new_tree x)/sub", id="new-tree-with-suffix"),
+    pytest.param("foo  # it's (read d)", id="trailing-comment-with-a-quote"),
+    pytest.param('x="$(cat "a # b")"; read d', id="hash-inside-a-nested-quote"),
+])
+def test_every_binding_form_of_the_case_tree_is_an_offender(text):
+    """#940 F2 fix round 2 (G4): the rule over-approximates rather than
+    listing binding forms, so each of these is reported."""
+    assert _case_tree_binding_offenders(text + "\n") == ["1: %s" % text.strip()]
+
+
+def test_an_unquoted_here_document_body_is_read():
+    """#940 F2 fix round 2 (G4): an unquoted here-document expands its body,
+    so ``${d:=…}`` there assigns ``d``; only a quoted body is skipped."""
+    text = "cat <<EOF\n${d:=/tmp/a}\nEOF\n"
+    assert _case_tree_binding_offenders(text) == ["2: ${d:=/tmp/a}"]
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param("d=$(new_tree x)\n", id="new-tree"),
+    pytest.param("    local d=$1\n", id="local-positional"),
+    pytest.param('    local d="$SCRATCH_DIR/$1-tool"\n', id="local-scratch"),
+    pytest.param('printf "%s\\n" "$d" "${d}" "${d%/}"\n', id="parameter-expansions"),
+    pytest.param('cp a "$d/bin/x"\n', id="path-use"),
+    pytest.param("[ -d x ] && ls -d y\n", id="option"),
+    pytest.param("printf '%d\\n' 3\n", id="printf-conversion"),
+    pytest.param("ls a/d d/b x.d d.x\n", id="path-and-extension"),
+    pytest.param("foo  # see read d\n", id="trailing-comment"),
+    pytest.param("  # for d in a b; read d\n", id="full-line-comment"),
+    pytest.param("cat <<'EOF'\nfor d in a b:\nEOF\n", id="single-quoted-here-document"),
+    pytest.param('cat <<"EOF" >x\nread d\nEOF\n', id="double-quoted-here-document"),
+    pytest.param("cat <<\\EOF\nd=/tmp\nEOF\n", id="escaped-here-document"),
+    pytest.param("cat <<-'EOF'\n\tfor d in a b:\n\tEOF\n", id="tab-stripped-here-document"),
+])
+def test_the_scratch_forms_and_non_bindings_stay_clean(text):
+    """#940 F2 fix round 2 (G4): the three accepted bindings, expansions,
+    options, conversions, paths, comments and quoted here-document bodies
+    are not offenders."""
+    assert _case_tree_binding_offenders(text) == []
+
+
+def test_a_quoted_here_document_skip_ends_at_its_delimiter():
+    """#940 F2 fix round 2 (G4): the skip covers the body only; the line
+    after the closing delimiter is read again."""
+    text = "cat <<'EOF'\nfor d in a b:\nEOF\nread d\n"
+    assert _case_tree_binding_offenders(text) == ["4: read d"]
 
 
 def test_at_least_one_harness_is_scanned():

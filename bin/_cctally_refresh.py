@@ -609,19 +609,25 @@ def _refresh_usage_inproc(timeout_seconds: float = 5.0) -> _RefreshUsageResult:
             reason="test stub",
         )
 
-    token = c._resolve_oauth_token()
-    if not token:
-        return _RefreshUsageResult(status="no_oauth_token", reason="no token")
-
     # Force-refresh deliberately bypasses the pre-fetch backoff gate, but its
     # resulting 429/success transition must be ordered with the automatic
     # refresh writer.  Hold the canonical selected-state lock from the fetch
     # through authoritative publication and the matching backoff update.
     try:
         with c._selected_state_lock():
+            # #825/#832 spec 4.6: the selected credential and its binding are
+            # captured TOGETHER, before the fetch.
+            binding, token = _capture_selected_credential(c)
+            if binding is None:
+                return _RefreshUsageResult(
+                    status="record_failed",
+                    reason="the active Claude identity is unreadable or changing")
+            if not token:
+                return _RefreshUsageResult(status="no_oauth_token", reason="no token")
             return _refresh_usage_inproc_locked(
                 c,
                 token=token,
+                binding=binding,
                 timeout_seconds=timeout_seconds,
             )
     except OSError as exc:
@@ -632,12 +638,20 @@ def _refresh_usage_inproc_locked(
     c,
     *,
     token: str,
+    binding,
     timeout_seconds: float,
 ) -> _RefreshUsageResult:
-    """Force-refresh with the canonical selected-state lock already held."""
+    """Force-refresh with the canonical selected-state lock already held.
+
+    ``binding`` was captured together with ``token`` before the fetch. The
+    response is revalidated against it before ANY mutation (spec 4.6)."""
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
+        if not _revalidate_selected_credential(c, binding):
+            return _RefreshUsageResult(
+                status="record_failed",
+                reason="the selected identity changed during the fetch")
         # Force-refresh bypasses the backfill/backoff GATE (user asked for
         # it), but a resulting 429 MUST advance the shared backoff deadline
         # so automatic polling still honors it (spec §4).
@@ -698,6 +712,14 @@ def _refresh_usage_inproc_locked(
                 f"ignoring unparseable five_hour fields: {exc}"
             )
 
+    # #825/#832 spec 4.6: publication proceeds only when the second stable
+    # binding equals the captured one AND the selected credential is still
+    # the one the response was fetched with. A->B, a torn read or a changed
+    # credential discards the response before any mutation.
+    if not _revalidate_selected_credential(c, binding):
+        return _RefreshUsageResult(
+            status="record_failed",
+            reason="the selected identity or credential changed during the fetch")
     record_args = argparse.Namespace(
         percent=seven_pct,
         resets_at=str(seven_resets_epoch),
@@ -716,6 +738,7 @@ def _refresh_usage_inproc_locked(
             *({"fiveHour"} if five_pct is not None else set()),
         },
         lock_held=True,
+        binding=binding,
         # #583 S2 §5.3: the dashboard calls this INSIDE its own `sync_lock`
         # while servicing a `refresh=1`, so an inner nudge would enqueue a
         # second rebuild for work already underway. `cmd_refresh_usage`
@@ -918,11 +941,46 @@ def cmd_refresh_usage(args: argparse.Namespace) -> int:
 # Hook-tick OAuth refresh path
 # =========================================================================
 
-def _hook_tick_oauth_skip_status(c, *, throttle_seconds: float) -> str | None:
-    """Return the automatic-refresh suppression reason under selected lock."""
+def _capture_selected_credential(c):
+    """``(binding, token)`` captured together under the selected-state lock
+    (#825/#832 spec 4.6), or ``(None, None)`` when the identity is torn or
+    changes across the credential read. The identity is read on both sides of
+    the credential read so a credential is never paired with an identity it
+    was not selected under; the binding then carries the credential's salted
+    digest (never the credential). ``(binding, None)``: stable, no token."""
+    import _cctally_statusline as _sl
+
+    first = _sl._capture_binding()
+    if first is None:
+        return None, None
+    token = c._resolve_oauth_token()
+    second = _sl._capture_binding()
+    if second is None or second != first:
+        return None, None
+    if not token:
+        return first, None
+    bound = _sl._capture_binding(credential=token)
+    if bound is None or bound.without_credential() != first:
+        return None, None
+    return bound, token
+
+
+def _revalidate_selected_credential(c, binding) -> bool:
+    """The second stable read after the fetch: the identity AND the selected
+    credential must still be exactly the captured ones. A->B->A is accepted
+    only when the credential is unchanged (the response was fetched with A's
+    captured credential)."""
+    current, token = _capture_selected_credential(c)
+    return current is not None and bool(token) and current == binding
+
+
+def _hook_tick_oauth_skip_status(c, *, throttle_seconds: float, binding) -> str | None:
+    """Return the automatic-refresh suppression reason under selected lock.
+    Repair need and selected freshness are the captured account's own."""
     now_epoch = int(time.time())
-    needs_repair = c._authoritative_repair_required(now_epoch=now_epoch)
-    obs_age = c._statusline_observe_age_seconds()
+    needs_repair = c._authoritative_repair_required(
+        now_epoch=now_epoch, binding=binding)
+    obs_age = c._statusline_observe_age_seconds(binding=binding)
     if (not needs_repair
             and obs_age < float(_cctally_core.OAUTH_BACKFILL_STALE_SECONDS)):
         return f"skipped(statusline-fresh:{int(obs_age)}s)"
@@ -995,9 +1053,6 @@ def _hook_tick_oauth_refresh(
     `five_hour`) on success, or None on any non-ok branch.
     """
     c = _cctally()
-    token = c._resolve_oauth_token()
-    if not token:
-        return "skipped-no-token", None
     if throttle_seconds is None:
         try:
             throttle_seconds = float(_get_oauth_usage_config(c.load_config())["throttle_seconds"])
@@ -1010,8 +1065,15 @@ def _hook_tick_oauth_refresh(
     # during network I/O.
     try:
         with c._selected_state_lock():
+            # #825/#832 spec 4.6: capture the selected credential and its
+            # binding together before the fetch.
+            binding, token = _capture_selected_credential(c)
+            if binding is None:
+                return "err(identity-unstable)", None
+            if not token:
+                return "skipped-no-token", None
             skipped = _hook_tick_oauth_skip_status(
-                c, throttle_seconds=throttle_seconds,
+                c, throttle_seconds=throttle_seconds, binding=binding,
             )
     except OSError:
         return "err(record-usage=exc)", None
@@ -1023,6 +1085,8 @@ def _hook_tick_oauth_refresh(
     except RefreshUsageRateLimitError as exc:
         try:
             with c._selected_state_lock():
+                if not _revalidate_selected_credential(c, binding):
+                    return "err(identity-changed)", None
                 c._oauth_backoff_register_429(
                     retry_after_deadline=getattr(
                         exc, "retry_after_deadline", None,
@@ -1048,9 +1112,15 @@ def _hook_tick_oauth_refresh(
     deferred = []
     try:
         with c._selected_state_lock():
+            # Revalidate under the reacquired lock BEFORE any mutation: the
+            # response is published only for the identity AND credential it
+            # was fetched with (spec 4.6).
+            if not _revalidate_selected_credential(c, binding):
+                return "err(identity-changed)", None
             skipped = _hook_tick_oauth_skip_status(
                 c,
                 throttle_seconds=throttle_seconds,
+                binding=binding,
             )
             if skipped is not None:
                 return skipped, None
@@ -1058,6 +1128,7 @@ def _hook_tick_oauth_refresh(
                 record_args,
                 axes,
                 lock_held=True,
+                binding=binding,
                 nudge_sink=lambda: deferred.append(1),
             )
             if authoritative.status != "ok":

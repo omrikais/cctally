@@ -553,6 +553,8 @@ _FIVE_HOUR_JITTER_FLOOR_SECONDS = _lib_five_hour._FIVE_HOUR_JITTER_FLOOR_SECONDS
 _floor_to_ten_minutes = _lib_five_hour._floor_to_ten_minutes
 _round_to_ten_minutes = _lib_five_hour._round_to_ten_minutes
 _canonical_5h_window_key = _lib_five_hour._canonical_5h_window_key
+FiveHourReading = _lib_five_hour.FiveHourReading
+latest_five_hour_reading = _lib_five_hour.latest_five_hour_reading
 
 _lib_subscription_weeks = _load_sibling("_lib_subscription_weeks")
 SubWeek = _lib_subscription_weeks.SubWeek
@@ -1170,6 +1172,7 @@ _collect_codex_entries_direct = _cctally_cache._collect_codex_entries_direct
 get_codex_entries = _cctally_cache.get_codex_entries
 _sum_codex_cost_for_range = _cctally_cache._sum_codex_cost_for_range
 get_entries = _cctally_cache.get_entries
+CodexHistoryUnavailable = _cctally_cache.CodexHistoryUnavailable
 AccountAttributionUnavailable = _cctally_cache.AccountAttributionUnavailable
 open_cache_db = _cctally_cache.open_cache_db
 open_conversations_db = _cctally_cache.open_conversations_db
@@ -1190,6 +1193,7 @@ sync_codex_conversations = _cctally_cache.sync_codex_conversations
 _reset_orphan_warning_throttle = _cctally_cache._reset_orphan_warning_throttle
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
 cmd_codex_replay_drain_internal = _cctally_cache.cmd_codex_replay_drain_internal
+cmd_codex_prune_drain_internal = _cctally_cache.cmd_codex_prune_drain_internal
 
 
 # Record-usage / hook-tick hot-path subsystem — the runtime path that
@@ -1220,6 +1224,7 @@ maybe_record_codex_budget_milestone = _cctally_record.maybe_record_codex_budget_
 maybe_record_projected_alert = _cctally_record.maybe_record_projected_alert
 _weekly_pct_week_avg_projection = _cctally_record._weekly_pct_week_avg_projection
 _compute_block_totals = _cctally_record._compute_block_totals
+_block_pricing_provenance_json = _cctally_record._block_pricing_provenance_json
 # #620 S2 E2: the pure fold lifted out of _compute_block_totals, plus the
 # canonical priced record and bucket shapes it folds over.
 PricedEntry = _cctally_record.PricedEntry
@@ -1228,6 +1233,7 @@ BlockTotals = _cctally_record.BlockTotals
 fold_block_totals = _cctally_record.fold_block_totals
 maybe_update_five_hour_block = _cctally_record.maybe_update_five_hour_block
 cmd_record_usage = _cctally_record.cmd_record_usage
+record_usage_bound = _cctally_record.record_usage_bound
 CreditPlan = _cctally_record.CreditPlan
 _parse_credit_at = _cctally_record._parse_credit_at
 _build_credit_plan = _cctally_record._build_credit_plan
@@ -1235,6 +1241,9 @@ _resolve_reset_aware_hwm = _cctally_record._resolve_reset_aware_hwm
 _insert_credit_snapshot = _cctally_record._insert_credit_snapshot
 _resolve_prior_5h = _cctally_record._resolve_prior_5h
 _resolve_active_five_hour_reset_event_id = _cctally_record._resolve_active_five_hour_reset_event_id
+resolve_five_hour_reset_event = _cctally_record.resolve_five_hour_reset_event
+FiveHourResetEvent = _cctally_record.FiveHourResetEvent
+NoFiveHourResetEvent = _cctally_record.NoFiveHourResetEvent
 _apply_credit = _cctally_record._apply_credit
 _fire_in_place_credit = _cctally_record._fire_in_place_credit
 detect_reset_and_credit = _cctally_record.detect_reset_and_credit
@@ -1624,6 +1633,11 @@ CLAUDE_MODEL_CONTEXT_WINDOWS = _cctally_statusline.CLAUDE_MODEL_CONTEXT_WINDOWS
 CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY = _cctally_statusline.CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY
 _resolve_statusline_tz = _cctally_statusline._resolve_statusline_tz
 cmd_statusline = _cctally_statusline.cmd_statusline
+# #825/#832 spec 4.3 revision 2: the hidden detached continuation worker and
+# dependency waiter.
+cmd_statusline_continue_internal = (
+    _cctally_statusline.cmd_statusline_continue_internal
+)
 _resolve_context_window = _cctally_statusline._resolve_context_window
 _read_last_assistant_usage = _cctally_statusline._read_last_assistant_usage
 _build_statusline_injections = _cctally_statusline._build_statusline_injections
@@ -1655,6 +1669,8 @@ _authoritative_repair_required = _cctally_statusline._authoritative_repair_requi
 _after_authoritative_record = _cctally_statusline._after_authoritative_record
 _statusline_reduce_and_publish = _cctally_statusline._statusline_reduce_and_publish
 _build_publication_plan = _cctally_statusline._build_publication_plan
+_statusline_tombstone_states = _cctally_statusline._statusline_tombstone_states
+_capture_binding = _cctally_statusline._capture_binding
 
 
 # Eager re-export of bin/_cctally_codex.py — the four cmd_codex_* are the
@@ -1751,6 +1767,8 @@ BudgetRow = _cctally_forecast.BudgetRow
 _resolve_forecast_now = _cctally_forecast._resolve_forecast_now
 _fetch_current_week_snapshots = _cctally_forecast._fetch_current_week_snapshots
 _apply_midweek_reset_override = _cctally_forecast._apply_midweek_reset_override
+_current_week_five_hour_percent = _cctally_forecast._current_week_five_hour_percent
+_current_week_five_hour_reading = _cctally_forecast._current_week_five_hour_reading
 _resolve_current_budget_window = _cctally_forecast._resolve_current_budget_window
 _build_budget_status_inputs = _cctally_forecast._build_budget_status_inputs
 _build_vendor_budget_inputs = _cctally_forecast._build_vendor_budget_inputs
@@ -3666,6 +3684,9 @@ def main(argv: list[str] | None = None) -> int:
         # not print a partial report".
         eprint(f"cctally: {exc}")
         return 3
+    except CodexHistoryUnavailable as exc:
+        eprint(str(exc))
+        return 3
     except AccountAttributionUnavailable as exc:
         # #341: a `--account`-scoped entry read hit a query-time cache degrade
         # (open failure / concurrent ingest) that would drop the account
@@ -3813,7 +3834,8 @@ def _post_command_update_hooks(command: str | None, args) -> None:
         return
     if command in ("_update-check", "_telemetry-beat", "_codex-quota-verify",
                    "_stats-epoch-rebuild", "_stats-corruption-heal",
-                   "_codex-replay-drain", "_artifact-retention"):
+                   "_codex-replay-drain", "_codex-prune-drain", "_artifact-retention",
+                   "_statusline-continue"):
         # All six hidden workers are detached and have already done their one job
         # in their own command handler; none must re-enter this hook.
         # Without the guard the ``_update-check`` worker would fall through to

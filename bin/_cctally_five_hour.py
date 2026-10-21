@@ -45,6 +45,7 @@ import sqlite3
 import sys
 
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel (#341)
+from _lib_five_hour import latest_five_hour_reading
 from _cctally_core import _command_as_of, eprint, now_utc_iso, open_db, parse_iso_datetime
 
 
@@ -983,9 +984,10 @@ def _latest_seven_day_and_window(
     overlooked (#769 S11, #824). A `weekly_observation_held` row's five-hour
     fields are the writing tick's own, so it is the freshest statement of which
     window is current; excluding it would resolve an older window and report the
-    live block closed. Rows with no ``five_hour_window_key`` are included here
-    too, unchanged, because the latest row's key is the answer even when it is
-    NULL.
+    live block closed. It is the key of the newest row that CARRIES a five-hour
+    reading (#825/#832 spec 4.7 revision 7, ``latest_five_hour_reading``): a
+    retired replica or a weekly-only reading can be the newest row, and its NULL
+    key would report the live block closed and leave its weekly end stale.
 
     **The weekly value is CREDIT-AWARE**, which is the #835 change. It comes from
     the most recent row that is not a post-floor stale replica — the same band
@@ -1065,8 +1067,15 @@ def _latest_seven_day_and_window(
         row = cur.fetchone()
         if row is None:
             return None, None
-        # Axis 1: the five-hour window key, from the latest row, held-inclusive.
-        key = row["five_hour_window_key"]
+        # Axis 1: the five-hour window key, held-inclusive, from the newest
+        # five-hour READING of the newest row's own account (#825/#832 spec
+        # 4.7 revision 7, the one shared selection). The newest row can be a
+        # retired replica or a weekly-only reading, which names no window.
+        # Merged mode scopes the weekly walk to that account too, so an
+        # account-blind selection here would pair another account's window
+        # with this account's weekly value.
+        reading = latest_five_hour_reading(conn, account_key=row["account_key"])
+        key = None if reading is None else reading.window_key
         # Axis 2: the weekly value. The scope, the bands and the floor all come
         # from the NEWEST row and are resolved ONCE, because the walk may not
         # leave that scope — so there is nothing to memoize per candidate.
@@ -2718,6 +2727,7 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
 
 def _backfill_five_hour_blocks(
     conn: sqlite3.Connection, *, only_missing: bool = False,
+    journaled_first: "dict | None" = None,
 ) -> int:
     """One-shot historical backfill of five_hour_blocks from existing
     weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
@@ -2740,9 +2750,58 @@ def _backfill_five_hour_blocks(
     re-materializes only the open block (block-only, no milestones — the
     journaled 5h-milestone evts carry their own values and resolve block_id
     against this row), keeping the pass O(open windows) instead of O(all blocks).
+
+    #825/#832 fix round J4 (#954): the rebuild projection reproduces the open
+    block live ingest left, on its accounting columns too.
+
+    * ``journaled_first`` maps ``(account_key, five_hour_window_key)`` to the
+      window's FIRST WRITER — its first effective `snapshot_accept` decision
+      in journal order (`_cctally_journal.
+      journaled_block_first_observations`) — and supplies the block's
+      immutable start values (`first_observed_at_utc`,
+      `five_hour_resets_at`, `block_start_at`,
+      `seven_day_pct_at_block_start`) whenever it is present. Live ingest's
+      upsert never updates those columns: the writer that materializes the
+      row owns them. Two things separate that writer from the earliest
+      surviving snapshot. A five-hour credit's stale-replica removal can
+      delete its snapshot (the band starts at floor10 of the arming tick, so
+      it reaches the genuine pre-credit reading); the snapshot still observed
+      the block, because the removal retires its weekly VALUE, not the
+      observation (J4). And a reading captured earlier can be appended, and
+      so derived, later (fix round J5, 825-832-CD4-V01): its row survives
+      with the earlier capture, but it updated a block another reading had
+      already opened. Neither survivor-derived pick reproduces live. A
+      window without an entry (a payload without an explicit account) falls
+      back to the earliest surviving snapshot.
+    * The projection stamps the computation-time pricing provenance of the
+      totals it computes, through the live upsert's own helper
+      (`_block_pricing_provenance_json`), so a successor's
+      `five_hour_block_close` freezes it exactly as after live ingest. The
+      ordinary (legacy, pre-journal) backfill keeps NULL: its blocks predate
+      provenance, which `_lib_cost_provenance.historical_close_marker` reads
+      as unproven.
     """
     _c = _cctally()
     inserted = 0
+    journaled_first = (journaled_first or {}) if only_missing else {}
+
+    def _first_row(key, acct):
+        """The window's start row: its first writer (J4/J5), else the
+        earliest surviving snapshot."""
+        journaled = journaled_first.get((acct, key))
+        if journaled is not None:
+            return journaled
+        return conn.execute(
+            """
+            SELECT five_hour_resets_at, captured_at_utc, weekly_percent
+              FROM weekly_usage_snapshots
+             WHERE five_hour_window_key = ? AND account_key = ?
+               AND five_hour_percent IS NOT NULL
+             ORDER BY captured_at_utc ASC, id ASC LIMIT 1
+            """,
+            (key, acct),
+        ).fetchone()
+
     try:
         # Iterate distinct windows that have BOTH a canonical key AND a
         # 5h percent. The percent guard is critical: MAX(five_hour_percent)
@@ -2812,18 +2871,9 @@ def _backfill_five_hour_blocks(
         for key, acct in keys:
             if (acct, key) in seen_keys:
                 continue
-            # Same MIN-captured pick the insert loop makes below, so the
+            # Same start-row pick the insert loop makes below, so the
             # ownership interval and the inserted row cannot disagree.
-            anchor_row = conn.execute(
-                """
-                SELECT five_hour_resets_at
-                  FROM weekly_usage_snapshots
-                 WHERE five_hour_window_key = ? AND account_key = ?
-                   AND five_hour_percent IS NOT NULL
-                 ORDER BY captured_at_utc ASC, id ASC LIMIT 1
-                """,
-                (key, acct),
-            ).fetchone()
+            anchor_row = _first_row(key, acct)
             if anchor_row is None:
                 continue
             try:
@@ -2849,22 +2899,14 @@ def _backfill_five_hour_blocks(
         conn.execute("BEGIN IMMEDIATE")
         try:
             for key, acct in keys:
-                # MIN-captured row defines the immutable block boundary
-                # values (deterministic — picking "any in-window row"
-                # would be nondeterministic under seconds-level Anthropic
-                # ISO jitter that the canonical key collapses). Scoped to
+                # The start row (the first writer, else the MIN-captured
+                # survivor) defines the immutable block boundary values
+                # (deterministic — picking "any in-window row" would be
+                # nondeterministic under seconds-level Anthropic ISO jitter
+                # that the canonical key collapses). Scoped to
                 # (window_key, account_key) so a shared window's per-account
                 # blocks each read their own account's boundary rows (#341).
-                min_row = conn.execute(
-                    """
-                    SELECT five_hour_resets_at, captured_at_utc, weekly_percent
-                      FROM weekly_usage_snapshots
-                     WHERE five_hour_window_key = ? AND account_key = ?
-                       AND five_hour_percent IS NOT NULL
-                     ORDER BY captured_at_utc ASC, id ASC LIMIT 1
-                    """,
-                    (key, acct),
-                ).fetchone()
+                min_row = _first_row(key, acct)
                 max_row = conn.execute(
                     """
                     SELECT captured_at_utc, weekly_percent, five_hour_percent
@@ -2941,9 +2983,15 @@ def _backfill_five_hour_blocks(
                 # JSONL if cache.db is unreadable.
                 # skip_sync=True: backfill runs inside open_db(); a sync_cache
                 # cascade here would reopen cache.db recursively.
+                pricing_evidence = {} if only_missing else None
                 totals = _c._compute_block_totals(
                     block_start_dt, last_obs_dt, skip_sync=True,
                     owner_key=key, windows=ownership.get(acct, []),
+                    pricing_evidence=pricing_evidence,
+                )
+                pricing_provenance_json = (
+                    _c._block_pricing_provenance_json(pricing_evidence)
+                    if pricing_evidence is not None else None
                 )
 
                 cur = conn.execute(
@@ -2963,12 +3011,14 @@ def _backfill_five_hour_blocks(
                       total_cache_create_tokens,
                       total_cache_read_tokens,
                       total_cost_usd,
+                      pricing_provenance_json,
                       is_closed,
                       created_at_utc,
                       last_updated_at_utc,
                       account_key
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?)
                     """,
                     (
                         key,
@@ -2985,6 +3035,7 @@ def _backfill_five_hour_blocks(
                         totals["cache_create_tokens"],
                         totals["cache_read_tokens"],
                         totals["cost_usd"],
+                        pricing_provenance_json,
                         is_closed,
                         projection_created_at,
                         projection_updated_at,

@@ -70,7 +70,8 @@ _LONG_FORM: dict = {
         "the models in use sit outside the mix the calibration was fitted "
         "over",
     "unvalidated-coefficient-era":
-        "this window predates the token weights the model is validated for",
+        "this window is not inside a single coefficient era the token "
+        "weights are validated for",
     "stale":
         "the stored calibration was fitted under different constants, so it "
         "no longer describes this build",

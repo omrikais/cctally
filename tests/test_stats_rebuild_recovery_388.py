@@ -11,7 +11,18 @@ import sqlite3
 import subprocess
 import sys
 import time
+
+import pytest
 from datetime import datetime, timezone
+
+
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

@@ -126,15 +126,18 @@ which one you are reading.
 
     attributed_pct[P, W] = weighted_units[P, W] / units_per_point[W]
 
-`weighted_units` is the same per-request weighting `cctally quota` fits, run
-on each entry BEFORE it is aggregated into a project bucket — the aggregate
-drops the one-hour cache-write split the weighting needs. It needs no meter
-reading and no cost denominator at all.
+`weighted_units` is the same per-request weighting `cctally quota` fits, using
+the token-class coefficients of the regime's coefficient era (`opus-5` or
+`opus-5-5`), run on each entry BEFORE it is aggregated into a project bucket —
+the aggregate drops the one-hour cache-write split the weighting needs. It
+needs no meter reading and no cost denominator at all.
 
 A week is modelled only when every entry in it falls inside one S1 metering
-regime and the week's whole account population passes that regime's
-composition support test. A week that fails either falls back for the **whole
-week**: partial-week mixtures are not produced. Support is tested over the
+regime, the whole subscription week lies inside that regime's coefficient era,
+and the week's whole account population passes that regime's composition
+support test. A week that fails any of these falls back for the **whole
+week**: partial-week mixtures are not produced, and a week spanning an era
+boundary (2026-09-22) always takes the cost share. Support is tested over the
 account-week population, never per project.
 
 **The cost share** is the fallback, and is what every install without a fitted
@@ -176,8 +179,9 @@ The additive keys:
   a whole. The run reports the weakest basis any contributing week reached.
 - `attribution.cause` — the typed reason modelled quota was not reached:
   `account-not-resolved`, `calibration-absent`, `regime-boundary`,
-  `unsupported-composition` or `no-local-history`. `null` when the basis is
-  `modelled`.
+  `unsupported-composition`, `no-local-history` or
+  `unvalidated-coefficient-era` (the week is not inside the coefficient era
+  of the stored calibration). `null` when the basis is `modelled`.
 - `attribution.totals` — four distinct quantities, which are not the same
   number and are never conflated: `modelledWeekPoints` (every local entry in
   the window's MODELLED weeks, weighted and converted), `visibleRowPoints`

@@ -95,3 +95,5 @@ public bin/cctally-tui-test
 public bin/cctally-update
 public bin/cctally-update-test
 public bin/cctally-weekly-test
+private bin/runner-job-hook-completed.sh
+private bin/runner-job-hook-started.sh

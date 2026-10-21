@@ -1,55 +1,42 @@
 """#832 — the status line's five-hour projection resolves its reset generation
-under the WRONG account. Component characterization (#834 S1).
+for the EXACT projected account (case M13, spec 4.5).
 
-WHAT THIS ASSERTS. That the defect CURRENTLY OCCURS. It is a characterization of
-a known residual, not a statement that the behaviour is right. When #832 is
-fixed this module fails loudly, and it must then be REWRITTEN to assert that the
-account's projection resolves its OWN generation — never deleted. It follows the
-same pattern as `test_characterization_823_stale_high_re_raise_mints_a_second_credit`
-in `tests/test_in_place_5h_credit_detection.py`.
+HISTORY. Until #825/#832 this module was a characterization of the defect: the
+projection called `_resolve_active_five_hour_reset_event_id(conn, canonical)`
+with no account, the parameter defaulted to the `unattributed` sentinel, and a
+foreign `unattributed` event therefore (1) became the real account's
+`reset_generation`, entering its retry signature, and (2) supplied the
+`floor_epoch` that withheld the real account's own five-hour rows. Its
+expectations are reversed here, as the old docstring required: the module is
+rewritten, never deleted.
 
-WHAT IT DOES NOT REACH. It is a COMPONENT characterization, covering the
-projection and the retry signature built from it. It does NOT reproduce the
-mixed-fleet extra publication the #834 S1 specification describes — the sequence
-in which alternating the old `unattributed` generation with the new
-active-account generation unlocks a third publication attempt and source-local
-confirmation then mints a five-hour credit neither uniform fleet produces. That
-sequence needs two binaries against one spool and is out of reach of a unit test.
+WHAT THIS ASSERTS NOW.
 
-THE DEFECT. `_read_db_projection_once` scopes its ENTIRE projection to the active
-account — both candidate SELECTs included — and then calls
-`_resolve_active_five_hour_reset_event_id(conn, canonical)` with no
-`account_key`. That parameter DEFAULTS to the `unattributed` sentinel rather than
-being absent, so the call does not read a merged set: it explicitly queries one
-specific other account. The behaviour is therefore MIS-scoped, not unscoped.
+  * A foreign account's event changes neither the projected percentage, nor
+    the projected generation, nor the retry signature built from it, and its
+    instant never filters the projected account's rows.
+  * The generation is LOGICAL (effective instant, detection instant, stable
+    journal identity), so a real `db rebuild --db stats` that renumbers the
+    SQLite rowid leaves it unchanged.
+  * The account's OWN genuine event does change it (non-vacuity).
+  * The resolver is typed and has no default account; a database failure
+    propagates instead of reading as "no event".
 
-It has TWO consumers, and both are asserted here:
+THE CLOCK IS PINNED. The projection reads `time.time()` for the five-hour
+plausibility gate, so `time.time` is patched to a fixed instant.
 
-  1. the resolved id becomes `AxisProjection.reset_generation`, which is part of
-     the per-axis retry signature (`_build_retry_signature`), so a foreign
-     account's event changes when the reducer is granted a fresh publication
-     attempt;
-  2. the resolved event also supplies `floor_epoch`, which filters which of the
-     ACTIVE account's snapshot rows are eligible — so a foreign event can
-     withhold this account's five-hour projection entirely.
-
-#832 ships no production fix in #834 S1. Its gate is confluence safety for an
-alternating generation: decision D-B of the #769 S11 specification binds a change
-that lets one version write a decision input another version consumes for a
-reset, credit or drop-consensus outcome, and alternating the two generations is
-exactly that. See section 3 of
-`docs/superpowers/specs/2026-09-13-834-s1-evidence-account-credit.md`.
-
-THE CLOCK IS PINNED. `_read_db_projection_once` reads `time.time()` for the
-five-hour plausibility gate (`_statusline_reset_is_plausible`), which admits a
-window only within `[now - 600, now + 6h]`. The function takes no `now_epoch`
-parameter, and adding one would be production code #832 must not ship this
-session, so the clock is pinned by patching `time.time` instead. Without that
-pin every assertion here is a same-second assumption and would flake.
+The projection helper below calls `_read_db_projection_once` with the explicit
+account when the API takes one, and otherwise relies on the patched active
+account. That is only so the same assertions can be run against the pre-fix
+code to prove they are RED for the #832 reason (the saved RED log under
+`.local/reports/825-832-account-bound/red/`).
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import inspect
+import sqlite3
 import sys
 import time
 
@@ -57,7 +44,6 @@ import pytest
 
 from conftest import load_script, redirect_paths
 
-#: A fixed instant, so the five-hour plausibility gate is deterministic.
 #: 2026-06-13T00:00:00Z.
 PINNED_NOW = 1781308800
 #: Inside the gate's `now + 6h` upper bound.
@@ -74,11 +60,19 @@ def app(monkeypatch, tmp_path):
     redirect_paths(ns, monkeypatch, tmp_path)
     monkeypatch.setattr(time, "time", lambda: float(PINNED_NOW))
     import _cctally_statusline as sl
-    # The active account is the REAL one, so the whole projection — both
-    # candidate SELECTs — is scoped to it. That scoping is what makes the
-    # unscoped generation resolution a contamination rather than a no-op.
-    monkeypatch.setattr(sl, "_statusline_active_account", lambda: REAL_ACCOUNT)
+    # Pre-fix code scoped the projection to the active account; the fixed code
+    # takes the account explicitly. Patching both keeps one assertion set.
+    monkeypatch.setattr(sl, "_statusline_active_account",
+                        lambda: REAL_ACCOUNT, raising=False)
     return sys.modules["cctally"]
+
+
+def _project(account_key: str):
+    import _cctally_statusline as sl
+    if "account_key" in inspect.signature(sl._read_db_projection_once).parameters:
+        return sl._read_db_projection_once(account_key=account_key)
+    sl._statusline_active_account = lambda: account_key
+    return sl._read_db_projection_once()
 
 
 def _iso(epoch: int) -> str:
@@ -92,7 +86,6 @@ def _canonical(app) -> int:
 
 def _insert_five_hour_snapshot(app, *, captured_epoch, five_hour_percent,
                                account_key):
-    """One `weekly_usage_snapshots` row carrying a five-hour reading."""
     conn = app.open_db()
     try:
         cur = conn.execute(
@@ -113,7 +106,7 @@ def _insert_five_hour_snapshot(app, *, captured_epoch, five_hour_percent,
         conn.close()
 
 
-def _insert_five_hour_reset_event(app, *, account_key) -> int:
+def _insert_five_hour_reset_event(app, *, account_key, effective=EVENT_EPOCH):
     conn = app.open_db()
     try:
         cur = conn.execute(
@@ -121,8 +114,8 @@ def _insert_five_hour_reset_event(app, *, account_key) -> int:
             "(detected_at_utc, five_hour_window_key, prior_percent, "
             " post_percent, effective_reset_at_utc, account_key) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (_iso(EVENT_EPOCH), _canonical(app), 30.0, 10.0,
-             _iso(EVENT_EPOCH), account_key),
+            (_iso(effective), _canonical(app), 30.0, 10.0,
+             _iso(effective), account_key),
         )
         conn.commit()
         return int(cur.lastrowid)
@@ -130,104 +123,161 @@ def _insert_five_hour_reset_event(app, *, account_key) -> int:
         conn.close()
 
 
-def _delete_snapshots(app):
+def test_m13_foreign_unattributed_event_changes_neither_projection_nor_retry_generation(app):
+    """Case M13 (RED before the fix): the real account's projection and retry
+    signature are identical with and without a foreign `unattributed` event."""
+    import _lib_statusline_candidates as candidates
+
+    canonical = _canonical(app)
+    _insert_five_hour_snapshot(
+        app, captured_epoch=PINNED_NOW - 300, five_hour_percent=12.0,
+        account_key=REAL_ACCOUNT)
+    before = _project(REAL_ACCOUNT)
+    assert before.five_hour is not None
+    reduced = candidates.AxisValue(
+        percent=12.0, raw_resets_at=RESETS_EPOCH, canonical_key=canonical)
+    signature_before = candidates._build_retry_signature(reduced, before.five_hour)
+
+    _insert_five_hour_reset_event(app, account_key=UNATTRIBUTED)
+    after = _project(REAL_ACCOUNT)
+    assert after.five_hour is not None
+    assert after.five_hour.percent == pytest.approx(12.0)
+    assert after.five_hour.reset_generation == before.five_hour.reset_generation, (
+        "a foreign `unattributed` event became the real account's reset "
+        "generation (#832)")
+    assert candidates._build_retry_signature(
+        reduced, after.five_hour) == signature_before, (
+        "a foreign event changed the real account's retry signature, so it "
+        "would reopen a spent publication attempt (#832)")
+
+
+def test_m13_foreign_event_instant_never_filters_the_account_rows(app):
+    """The foreign event's effective instant is not this account's floor: a
+    row captured before it still projects."""
+    _insert_five_hour_reset_event(app, account_key=UNATTRIBUTED)
+    _insert_five_hour_snapshot(
+        app, captured_epoch=EVENT_EPOCH - 300, five_hour_percent=12.0,
+        account_key=REAL_ACCOUNT)
+    projection = _project(REAL_ACCOUNT)
+    assert projection.five_hour is not None, (
+        "a foreign event's instant withheld the account's own five-hour row")
+    assert projection.five_hour.percent == pytest.approx(12.0)
+
+
+def test_m13_own_event_changes_the_generation_and_floors_its_rows(app):
+    """Non-vacuity: the account's OWN event is a new logical generation and
+    its instant filters that account's pre-event rows."""
+    _insert_five_hour_snapshot(
+        app, captured_epoch=PINNED_NOW - 300, five_hour_percent=12.0,
+        account_key=REAL_ACCOUNT)
+    before = _project(REAL_ACCOUNT)
+    _insert_five_hour_reset_event(app, account_key=REAL_ACCOUNT)
+    after = _project(REAL_ACCOUNT)
+    assert after.five_hour is not None
+    assert after.five_hour.reset_generation != before.five_hour.reset_generation
+
     conn = app.open_db()
     try:
         conn.execute("DELETE FROM weekly_usage_snapshots")
         conn.commit()
     finally:
         conn.close()
-
-
-def _delete_reset_events(app):
-    conn = app.open_db()
-    try:
-        conn.execute("DELETE FROM five_hour_reset_events")
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def test_characterization_832_unattributed_event_contaminates_a_real_account_projection(
-        app):
-    """The real account's five-hour projection adopts an `unattributed` event's
-    id as its reset generation, and that event's effective instant as the floor
-    that decides which of the real account's own rows are eligible.
-
-    Three phases, in one test because they share one seeded window and the third
-    is what makes the second attributable:
-
-      A. a real-account row captured AFTER the foreign event — the projection
-         exists and reports the FOREIGN event's id as its generation, and the
-         retry signature built from it carries that id;
-      B. the same store with only a row captured BEFORE the foreign event — the
-         projection is withheld entirely, because the foreign event's
-         `floor_epoch` excluded this account's only row;
-      C. the same row with the foreign event removed — the projection returns,
-         with generation 0. Phase C is the non-vacuity companion: without it,
-         phase B's withholding could be any other filter."""
-    import _lib_statusline_candidates as candidates
-    import _cctally_statusline as sl
-
-    canonical = _canonical(app)
-    # The event belongs to `unattributed`. The real account has NO event.
-    foreign_event_id = _insert_five_hour_reset_event(
-        app, account_key=UNATTRIBUTED)
-    assert foreign_event_id > 0
-
-    # The CONTROL for everything below: the resolver itself is account-correct.
-    # Asked for the real account it answers 0, the no-event sentinel; asked with
-    # no account it answers the foreign id, because the parameter defaults to the
-    # `unattributed` sentinel rather than being absent. So what this module
-    # characterizes is precisely the missing argument at the call site in
-    # `_read_db_projection_once`, not a defect in the resolver.
-    conn = app.open_db()
-    try:
-        assert app._resolve_active_five_hour_reset_event_id(
-            conn, canonical, account_key=REAL_ACCOUNT) == 0
-        assert app._resolve_active_five_hour_reset_event_id(
-            conn, canonical) == foreign_event_id
-    finally:
-        conn.close()
-
-    # ── Phase A: the generation, and the retry signature built from it ──────
-    _insert_five_hour_snapshot(
-        app, captured_epoch=PINNED_NOW - 300, five_hour_percent=12.0,
-        account_key=REAL_ACCOUNT)
-    projection = sl._read_db_projection_once()
-    assert projection.five_hour is not None, (
-        "the real account's own post-floor row must project")
-    assert projection.five_hour.percent == pytest.approx(12.0)
-    assert projection.five_hour.canonical_key == canonical
-    assert projection.five_hour.reset_generation == foreign_event_id, (
-        "CHARACTERIZATION: the real account's projection adopted an "
-        "`unattributed` event's id. When #832 is fixed this becomes 0 (the "
-        "no-event sentinel for THIS account) and this assertion must be "
-        "rewritten, not deleted.")
-
-    reduced = candidates.AxisValue(
-        percent=12.0, raw_resets_at=RESETS_EPOCH, canonical_key=canonical)
-    signature = candidates._build_retry_signature(reduced, projection.five_hour)
-    assert signature.db_reset_generation == foreign_event_id, (
-        "CHARACTERIZATION: the per-axis retry signature carries the foreign "
-        "generation, so another account's event decides when this account's "
-        "reducer is granted a fresh publication attempt.")
-
-    # ── Phase B: the same event's instant filters this account's rows ───────
-    _delete_snapshots(app)
     _insert_five_hour_snapshot(
         app, captured_epoch=EVENT_EPOCH - 300, five_hour_percent=12.0,
         account_key=REAL_ACCOUNT)
-    withheld = sl._read_db_projection_once()
-    assert withheld.five_hour is None, (
-        "CHARACTERIZATION: the foreign event's `effective_reset_at_utc` became "
-        "`floor_epoch`, which excluded the real account's only row and withheld "
-        "its five-hour projection entirely.")
+    assert _project(REAL_ACCOUNT).five_hour is None
 
-    # ── Phase C: non-vacuity — remove the foreign event, the row returns ────
-    _delete_reset_events(app)
-    restored = sl._read_db_projection_once()
-    assert restored.five_hour is not None, (
-        "the pre-event row is otherwise eligible, so phase B's withholding is "
-        "attributable to the foreign event and to nothing else")
-    assert restored.five_hour.reset_generation == 0
+
+def _record(app, monkeypatch, *, five, at):
+    monkeypatch.setattr(time, "time", lambda: float(PINNED_NOW + at))
+    monkeypatch.setenv("CCTALLY_AS_OF", _iso(PINNED_NOW + at))
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    args = argparse.Namespace(
+        percent=20, resets_at=str(PINNED_NOW + 3 * 86400),
+        five_hour_percent=five, five_hour_resets_at=str(RESETS_EPOCH),
+        source="statusline")
+    assert app.cmd_record_usage(args, nudge_dashboard=False) == 0
+
+
+def test_m13_real_rebuild_renumbering_keeps_the_logical_generation(app, monkeypatch):
+    """Case M13 (RED before the fix): a real `db rebuild --db stats` renumbers
+    `five_hour_reset_events.id`; the logical generation, and therefore the
+    retry signature, is unchanged."""
+    import _lib_statusline_candidates as candidates
+
+    monkeypatch.setattr(sys.modules["_cctally_statusline"],
+                        "_statusline_active_account", lambda: UNATTRIBUTED,
+                        raising=False)
+    _record(app, monkeypatch, five=70, at=0)
+    _record(app, monkeypatch, five=20, at=2)
+    _record(app, monkeypatch, five=20, at=4)
+    conn = app.open_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_reset_events WHERE account_key = ?",
+            (UNATTRIBUTED,)).fetchone()[0] == 1, (
+            "real recording must create the account's logical reset event")
+        conn.execute("UPDATE five_hour_reset_events SET id = id + 1000")
+        conn.commit()
+    finally:
+        conn.close()
+    before = _project(UNATTRIBUTED)
+    assert before.five_hour is not None
+
+    args = app.build_parser().parse_args(["db", "rebuild", "--db", "stats", "--json"])
+    assert args.func(args) == 0
+    conn = app.open_db()
+    try:
+        assert conn.execute(
+            "SELECT id FROM five_hour_reset_events").fetchone()[0] < 1000, (
+            "the rebuild must actually renumber the row for this to be decisive")
+    finally:
+        conn.close()
+    after = _project(UNATTRIBUTED)
+    assert after.five_hour.reset_generation == before.five_hour.reset_generation, (
+        "a rowid renumbering changed the reset generation (#832)")
+    value = candidates.AxisValue(10.0, RESETS_EPOCH, after.five_hour.canonical_key)
+    assert (candidates._build_retry_signature(value, before.five_hour)
+            == candidates._build_retry_signature(value, after.five_hour))
+
+
+def test_resolver_is_typed_exact_account_and_logically_ordered(app):
+    """The resolver requires the account, returns a typed result naming it,
+    and orders by effective instant, never by rowid."""
+    canonical = _canonical(app)
+    conn = app.open_db()
+    try:
+        with pytest.raises(TypeError):
+            app.resolve_five_hour_reset_event(conn, canonical)
+        none = app.resolve_five_hour_reset_event(
+            conn, canonical, account_key=REAL_ACCOUNT)
+        assert isinstance(none, app.NoFiveHourResetEvent)
+        assert (none.account_key, none.canonical_window_key) == (REAL_ACCOUNT, canonical)
+        for physical, effective in ((100, EVENT_EPOCH), (1, EVENT_EPOCH + 60)):
+            conn.execute(
+                "INSERT INTO five_hour_reset_events (id, detected_at_utc, "
+                "five_hour_window_key, prior_percent, post_percent, "
+                "effective_reset_at_utc, account_key) VALUES (?,?,?,?,?,?,?)",
+                (physical, _iso(effective), canonical, 70, 20, _iso(effective),
+                 REAL_ACCOUNT))
+        conn.commit()
+        event = app.resolve_five_hour_reset_event(
+            conn, canonical, account_key=REAL_ACCOUNT)
+        assert isinstance(event, app.FiveHourResetEvent)
+        assert event.account_key == REAL_ACCOUNT
+        assert event.effective_reset_at_utc == _iso(EVENT_EPOCH + 60)
+        assert event.floor_epoch == EVENT_EPOCH + 60
+        assert event.logical_generation.startswith(_iso(EVENT_EPOCH + 60) + "|")
+        assert "100" not in event.logical_generation.split("|")
+    finally:
+        conn.close()
+
+
+def test_resolver_database_failure_propagates(app):
+    class Broken:
+        def execute(self, *args, **kwargs):
+            raise sqlite3.DatabaseError("read failed")
+
+    with pytest.raises(sqlite3.DatabaseError, match="read failed"):
+        app.resolve_five_hour_reset_event(
+            Broken(), _canonical(app), account_key=REAL_ACCOUNT)

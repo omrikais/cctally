@@ -35,7 +35,7 @@ import pytest
 
 import _sql_plan_guard as guard
 from conftest import (
-    load_script, redirect_paths, redirect_paths_without_conversation_retention,
+    load_script, redirect_paths,
 )
 
 BIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "bin"
@@ -429,7 +429,7 @@ def test_a_long_tied_codex_conversation_loads_without_a_temp_structure(
     turn anchor repairs its rollout's turn ids, reloads it and rebuilds its
     find projection with no temp structure."""
     ns = load_script()
-    redirect_paths_without_conversation_retention(
+    redirect_paths(
         ns, monkeypatch, tmp_path / "data")
     _pin_writer_temp_store(monkeypatch, temp_store)
     provider = tmp_path / "provider"

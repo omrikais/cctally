@@ -46,6 +46,10 @@
 # documented never to block a cut.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -54,7 +58,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CCTALLY="$REPO_ROOT/bin/cctally"
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
-FIXTURE_STAGE=$(mktemp -d -t cctally-pricing-check-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-pricing-check-fixstage.XXXXXX") || exit 1
 # Armed HERE, not with the combined trap further down: the PINNED_AS_OF guard
 # below can exit before SCRATCH_ROOT exists, and an exit between this mktemp
 # and that trap would leak this directory. The later trap supersedes this one.
@@ -80,7 +84,7 @@ REGENERATE="${CCTALLY_PRICING_CHECK_REGENERATE:-}"
 # generically by tests/test_pricing_check.py::
 # test_no_suppression_expires_before_the_pricing_snapshot_date, and the cutover
 # itself is asserted in tests/test_codex_56_pricing.py.
-PINNED_AS_OF="2026-10-07T00:00:00Z"
+PINNED_AS_OF="2026-10-14T00:00:00Z"
 
 SNAPSHOT_DATE=$(sed -n \
     's/^PRICING_SNAPSHOT_DATE[[:space:]]*=[[:space:]]*"\([0-9-]*\)".*/\1/p' \
@@ -104,7 +108,7 @@ fail_count=0
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
-SCRATCH_ROOT=$(mktemp -d -t cctally-pricing-check-XXXXXX)
+SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-pricing-check-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 
 # python3-only clean bin so the CLI runs without leaking a real cctally onto

@@ -16,6 +16,10 @@
 # fresh HOME is sufficient — no separate CCTALLY_HOME env var is needed.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -330,7 +334,7 @@ esac
 # Drives the actual CLI (subprocess) under a fresh HOME so APP_DIR resolves
 # under the scratch dir. Asserts the mode=test discriminator separates this
 # log line from real-alert dispatches.
-TMP_CLI=$(mktemp -d -t cctally-alerts-cli-XXXXXX)
+TMP_CLI=$(mktemp -d "${TMPDIR:-/tmp}/cctally-alerts-cli-XXXXXX") || exit 1
 HOME="$TMP_CLI" bin/cctally alerts test --axis weekly --threshold 90 >/dev/null 2>&1
 cli_ec=$?
 if [ $cli_ec -eq 0 ] || [ $cli_ec -eq 1 ] || [ $cli_ec -eq 3 ]; then
@@ -382,7 +386,7 @@ check_nonregistry_axis () {
     axis_flag=$1
     want_axis=$2
     shift 2
-    TMP_NR=$(mktemp -d -t cctally-alerts-nonreg-XXXXXX)
+    TMP_NR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-alerts-nonreg-XXXXXX") || exit 1
     HOME="$TMP_NR" bin/cctally alerts test --axis "$axis_flag" "$@" >/dev/null 2>&1
     nr_ec=$?
     if [ $nr_ec -eq 0 ] || [ $nr_ec -eq 1 ] || [ $nr_ec -eq 3 ]; then
@@ -416,7 +420,7 @@ check_nonregistry_axis meter-rate-change meter_rate_change
 
 # `--threshold` is a usage error on the rate-change axis: exit 2, and the
 # message must name BOTH the axis and the flag.
-TMP_REF=$(mktemp -d -t cctally-alerts-refuse-XXXXXX)
+TMP_REF=$(mktemp -d "${TMPDIR:-/tmp}/cctally-alerts-refuse-XXXXXX") || exit 1
 refuse_err=$(HOME="$TMP_REF" bin/cctally alerts test \
     --axis meter-rate-change --threshold 95 2>&1 >/dev/null)
 refuse_ec=$?

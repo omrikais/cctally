@@ -79,6 +79,7 @@ write_oauth_credentials
 # Fresh weekly snapshot 2s before CCTALLY_AS_OF
 python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \
     "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-authoritative-7d.json" <<'JSON'
-{"schemaVersion":1,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
+mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones"
+cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones/sevenDay-4102444800.json" <<'JSON'
+{"schemaVersion":1,"protocolGeneration":"account-bound-v1","accountKey":"unattributed","canonicalWindowKey":4102444800,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
 JSON

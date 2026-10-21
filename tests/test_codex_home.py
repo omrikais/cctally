@@ -365,8 +365,8 @@ def test_root_aware_discovery_keeps_configured_path_spelling_for_rows(
 # ── P1: cache scoped to current $CODEX_HOME (prior-root purge) ────────────
 def test_codex_home_switch_purges_prior_root(cc, tmp_path):
     # P1 (issue #108): reusing one cache.db across `CODEX_HOME=/A` then
-    # `CODEX_HOME=/B` must return B's totals ONLY, not A+B. iter_codex_entries
-    # has no root predicate, so sync_codex_cache must purge prior-root rows.
+    # `CODEX_HOME=/B` must return B's totals ONLY, not A+B. Reporting scopes
+    # currently configured roots while physical cleanup runs off-hook (#968).
     home = tmp_path / "home"; home.mkdir()
     data = tmp_path / "data"           # SHARED across both runs (no rmtree)
     a = tmp_path / "rootA"; b = tmp_path / "rootB"
@@ -396,9 +396,9 @@ def test_codex_home_switch_purges_prior_root(cc, tmp_path):
 
 
 def test_relative_codex_home_switch_purges_prior_root(cc, tmp_path):
-    # P2 (issue #108): the prior-root purge must also work for a RELATIVE
-    # $CODEX_HOME (e.g. `codexA`). _codex_home_roots canonicalizes to absolute
-    # so the row is stored absolute and the prune's isabs guard prunes it.
+    # P2 (issue #108): immediate report scoping must also work for a RELATIVE
+    # $CODEX_HOME (e.g. `codexA`). _codex_home_roots canonicalizes to absolute;
+    # the report excludes retired roots before the detached drain removes rows.
     # Run with cwd=tmp_path so the relative roots resolve there.
     home = tmp_path / "home"; home.mkdir()
     data = tmp_path / "data"           # SHARED across both runs (no rmtree)

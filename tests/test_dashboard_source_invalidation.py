@@ -31,6 +31,44 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
 
 
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
+
+
 def _sync_setup(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
@@ -148,12 +186,18 @@ def test_codex_physical_mutation_sequence_tracks_root_prune_and_rebuild(
         rollout_b.parent.mkdir(parents=True)
         shutil.copyfile(CORPUS / "modern-full.jsonl", rollout_b)
         monkeypatch.setenv("CODEX_HOME", str(provider_b))
-        ns["sync_codex_cache"](conn)
+        foreground = ns["sync_codex_cache"](conn)
+        assert foreground.files_pruned == 0
+        assert sys.modules["_cctally_cache"].run_codex_prune_drain(
+            wait_for_requests=False).identities_deleted == 1
         # One mutation for pruning A and one for ingesting B.
         assert _physical_seq(conn) == 3
 
         monkeypatch.setenv("CODEX_HOME", str(provider_root))
-        ns["sync_codex_cache"](conn)
+        foreground = ns["sync_codex_cache"](conn)
+        assert foreground.files_pruned == 0
+        assert sys.modules["_cctally_cache"].run_codex_prune_drain(
+            wait_for_requests=False).identities_deleted == 1
         assert _physical_seq(conn) == 5
 
         ns["sync_codex_cache"](conn, rebuild=True)

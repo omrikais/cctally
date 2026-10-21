@@ -13,7 +13,7 @@ import pytest
 
 from conftest import (  # type: ignore
     load_script,
-    redirect_paths_without_conversation_retention,
+    redirect_paths,
 )
 
 FLAG = "conversation_sessions_backfill_pending"
@@ -117,7 +117,7 @@ def env(tmp_path, monkeypatch):
     (cache_mod, conn, projects). Each test writes its own JSONL into ``projects``
     then advances both independent syncs through ``_sync``."""
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     import _cctally_cache as cache_mod   # the module object load_script just loaded
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)

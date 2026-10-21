@@ -104,11 +104,23 @@ def test_make_obs_is_fully_formed_with_content_id():
     assert rec["src"] == "statusline"
     assert rec["provider"] == "claude"
     assert rec["payload"] == {"pct": 57}
-    # id is the content digest over (t, at, src, provider, payload) — no v/id
+    # id is the content digest over (t, at, src, provider, payload, wpg) —
+    # no v/id. #825/#832: the writer-generation stamp is part of the core.
+    assert rec["wpg"] == "account-bound-v1"
     expected = J.content_id({"t": "obs", "at": "2026-07-22T20:14:07Z",
                              "src": "statusline", "provider": "claude",
-                             "payload": {"pct": 57}})
+                             "payload": {"pct": 57},
+                             "wpg": "account-bound-v1"})
     assert rec["id"] == expected
+    # The previous release's shape is byte-stable: no stamp, the old core.
+    legacy = J.make_obs(at="2026-07-22T20:14:07Z", src="statusline",
+                        provider="claude", payload={"pct": 57},
+                        writer_generation=None)
+    assert "wpg" not in legacy
+    assert legacy["id"] == J.content_id({
+        "t": "obs", "at": "2026-07-22T20:14:07Z", "src": "statusline",
+        "provider": "claude", "payload": {"pct": 57}})
+    assert J.unstamped_record(rec) == legacy
 
 
 def test_make_op_has_no_provider_and_content_id():
@@ -119,8 +131,15 @@ def test_make_op_has_no_provider_and_content_id():
     assert rec["id"].startswith("o:")
     expected = J.content_id({"t": "op", "at": "2026-07-22T20:14:07Z",
                              "src": "record-credit",
-                             "payload": {"kind": "weekly_credit_floor"}})
+                             "payload": {"kind": "weekly_credit_floor"},
+                             "wpg": "account-bound-v1"})
     assert rec["id"] == expected
+    legacy = J.make_op(at="2026-07-22T20:14:07Z", src="record-credit",
+                       payload={"kind": "weekly_credit_floor"},
+                       writer_generation=None)
+    assert legacy["id"] == J.content_id({
+        "t": "op", "at": "2026-07-22T20:14:07Z", "src": "record-credit",
+        "payload": {"kind": "weekly_credit_floor"}})
 
 
 def test_make_evt_carries_passed_id_default_rev_and_kind_in_payload():

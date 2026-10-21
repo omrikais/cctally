@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import _lib_test_generation
+import _temp_hygiene as _hyg
 from helpers.authoritative_runtime_budget import write_budget
 from tests import _estate_stub
 
@@ -38,12 +40,18 @@ def _run_lib(tmp_path, snippet, env=None):
     )
     script.chmod(0o755)
     e = dict(os.environ)
+    # #966(c), spec 4.3: the outer run's owner-only variables (its outcome
+    # record, run id and evidence store) never reach the child, which would
+    # otherwise write the PARENT run's outcome. Applied before `env`, so a test
+    # may still name a child-local outcome destination.
+    _lib_test_generation.scrub_owner_env(e)
     # POPPED, not merely defaulted. The local escape hatch exports this variable
     # into every child when `agentmem` is absent — the exact path M4 exists to
     # support — so a suite run through CCTALLY_TEST_LOCAL=1 on such a machine
     # inherited it here and turned the control case below into an environmental
     # failure. `_run_nested_pytest` pops CCTALLY_AGENTMEM_TEST_POLICY and the
-    # leaked xdist variables for the same reason.
+    # leaked xdist variables for the same reason. The owner-only scrub above
+    # now covers this name too; the explicit pop stays as the stated reason.
     e.pop("CCTALLY_TEST_EXTERNAL_INCOMPLETE", None)
     e.update(env or {})
     return subprocess.run(
@@ -307,12 +315,10 @@ def test_the_aggregator_calls_the_partition_helper():
 
 # --------------------------------- contract_check_runtime_budget's two guards
 #
-# Both are correct defensive code that the shipped wiring cannot reach.
-# Eligibility at check time implies eligibility at admission, where a missing
-# budget already refused the run, and an eligible run that passed no cases at
-# all does not reach a green class. They are driven directly so that the
-# classification and the SUBJECT each guard reports are pinned: the two share a
-# reason code and are told apart only by the subject.
+# The runtime budget is report-only (test regime reset, session 1): a budget
+# that could not be evaluated is a NOTE and an unknown `exceeded`, never a
+# reason code and never a satisfied budget. They are driven directly so that
+# the note and the recorded state are pinned.
 
 _BUDGET_ELIGIBLE = {
     "CCTALLY_AUTHORITATIVE_RUN": "1",
@@ -332,11 +338,20 @@ def _budget_check(tmp_path, snippet):
         tmp_path,
         _BUDGET_PRELUDE + snippet + "\n"
         "contract_check_runtime_budget\n"
-        'printf "%s" "$CONTRACT_REASONS"',
+        'printf "%s" "$CONTRACT_REASONS"\n'
+        'printf "\\n@class=%s\\n@exceeded=%s\\n@note=%s\\n" '
+        '"$CONTRACT_CLASS" "$CONTRACT_BUDGET_EXCEEDED" "$CONTRACT_DIAGNOSTICS"',
         env=_BUDGET_ELIGIBLE,
     )
     assert r.returncode == 0, r.stdout + r.stderr
-    rows = [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+    body, _, tail = r.stdout.partition("\n@class=")
+    rows = [ln.split("\t") for ln in body.splitlines() if ln.strip()]
+    info = {"class": tail.split("\n", 1)[0]}
+    for line in tail.split("\n"):
+        if line.startswith("@exceeded="):
+            info["exceeded"] = line[len("@exceeded="):]
+    info["note"] = tail.split("@note=", 1)[1] if "@note=" in tail else ""
+    r.info = info  # type: ignore[attr-defined]
     return r, rows
 
 
@@ -345,7 +360,10 @@ def test_an_unloaded_threshold_is_recorded_as_unavailable_not_satisfied(tmp_path
         tmp_path,
         'CONTRACT_BUDGET_MAX=""\nCONTRACT_PASSED=10\nCONTRACT_PYTEST_PASSED=10',
     )
-    assert rows == [["runtime-budget-unavailable", "budget", "threshold"]], r.stdout
+    assert rows == [], r.stdout
+    assert r.info["class"] == "none", r.info
+    assert r.info["exceeded"] == "", "an unevaluated budget is neither met nor exceeded"
+    assert "could not be evaluated" in r.info["note"], r.info
 
 
 def test_a_run_that_passed_no_cases_is_recorded_as_unavailable(tmp_path):
@@ -353,7 +371,10 @@ def test_a_run_that_passed_no_cases_is_recorded_as_unavailable(tmp_path):
         tmp_path,
         "CONTRACT_BUDGET_MAX=120\nCONTRACT_PASSED=0\nCONTRACT_PYTEST_PASSED=0",
     )
-    assert rows == [["runtime-budget-unavailable", "budget", "denominator"]], r.stdout
+    assert rows == [], r.stdout
+    assert r.info["class"] == "none", r.info
+    assert r.info["exceeded"] == "", r.info
+    assert "passed no cases" in r.info["note"], r.info
 
 
 def test_the_two_guards_are_green_when_both_inputs_are_present(tmp_path):
@@ -364,6 +385,31 @@ def test_the_two_guards_are_green_when_both_inputs_are_present(tmp_path):
         "CONTRACT_BUDGET_MAX=1000000\nCONTRACT_PASSED=10\nCONTRACT_PYTEST_PASSED=10",
     )
     assert rows == [], r.stdout
+    assert r.info["exceeded"] == "false", r.info
+
+
+def test_an_over_budget_full_run_passes_and_records_the_overrun(tmp_path):
+    """Test regime reset, session 1 (spec 4.2/4.11): the runtime budget is
+    report-only. A green full run at 132.49 s per thousand cases against the
+    committed 120 exits 0, records `runtimeBudget.exceeded == true` in the
+    outcome (additive at schemaVersion 1) and tells the operator in a note."""
+    record = tmp_path / "outcome.json"
+    r, rows = _budget_check(
+        tmp_path,
+        "CONTRACT_BUDGET_MAX=120.0\nCONTRACT_PASSED=1000\nCONTRACT_PYTEST_PASSED=99000\n"
+        "CONTRACT_WALL_SECONDS=13249\n"
+        f'trap \'CCTALLY_TEST_ALL_OUTCOME_FILE="{record}" contract_emit_outcome '
+        '"$(contract_exit_code)"\' EXIT',
+    )
+    assert rows == [], r.stdout
+    assert r.info["class"] == "none", r.info
+    assert r.info["exceeded"] == "true", r.info
+    assert "132.49 seconds per 1,000 cases exceeds the committed maximum of 120" in r.info["note"], r.info
+    out = json.loads(record.read_text())
+    assert out["schemaVersion"] == 1, out
+    assert (out["outcome"], out["failureClass"], out["exitCode"]) == ("pass", "none", 0), out
+    assert out["reasons"] == [], out
+    assert out["runtimeBudget"] == {"maxSecondsPerThousandCases": 120.0, "exceeded": True}, out
 
 
 # --------------------------------------------------------------- scratch estate
@@ -597,16 +643,21 @@ def _estate(
     return repo
 
 
-def _drive(est, env=None, args=(), timeout=180, interpreter=None):
+def _drive(est, env=None, args=(), timeout=180, interpreter=None, reclaim=True):
     outcome = est / "outcome.json"
     if outcome.exists():
         outcome.unlink()
-    e = {
+    # #963 J4: the child's TMPDIR lies inside this test's allocation, so its
+    # suite generation (retained by design when the child fails) lies inside
+    # the outer generation; it is removed below once the results are read.
+    # The child-local outcome destination is an explicit override, applied
+    # after the builder's owner-only scrub (spec 4.3).
+    e = _hyg.child_aggregator_env({
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", str(est)),
-        "CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome),
         "CCTALLY_TEST_JOBS": "1",
-    }
+    }, est.parent)
+    e["CCTALLY_TEST_ALL_OUTCOME_FILE"] = str(outcome)
     e.update(env or {})
     argv = [str(est / "bin" / "cctally-test-all"), *args]
     # `interpreter` runs the aggregator under a named bash rather than the one
@@ -622,6 +673,8 @@ def _drive(est, env=None, args=(), timeout=180, interpreter=None):
         timeout=timeout,
     )
     proc.outcome_path = outcome  # type: ignore[attr-defined]
+    if reclaim:
+        _hyg.reclaim_child_generations(est.parent)
     return proc
 
 
@@ -643,7 +696,7 @@ def _codes(proc):
 
 def test_admission_harness_on_disk_but_not_in_manifest(tmp_path):
     est = _estate(tmp_path, harnesses=["alpha", "beta"], manifest_names=["alpha"])
-    r = _drive(est)
+    r = _drive(est, reclaim=False)
     assert r.returncode == 3, r.stderr
     out = _outcome(r)
     assert out["failureClass"] == "infrastructure"
@@ -653,6 +706,12 @@ def test_admission_harness_on_disk_but_not_in_manifest(tmp_path):
     ), out["reasons"]
     # The diagnostic must state both alternatives, not merely the reason code.
     assert "beta" in r.stderr and "manifest" in r.stderr
+    # #963 R31: a refusal launches no harness and creates no log directory.
+    # Since the test regime reset (session 1) the generation claimed before
+    # admission is removed at exit too: it recorded no process group, so its
+    # reap succeeds and nothing is kept for 24 hours.
+    gens = sorted(p for p in (tmp_path / "child-tmp").iterdir() if p.name.startswith("ctg-"))
+    assert gens == [], gens
 
 
 def test_admission_harness_in_manifest_but_absent_on_disk(tmp_path):
@@ -1594,6 +1653,28 @@ VALID_CLASSES = {"none", "product", "infrastructure", "incomplete"}
 VALID_PHASES = {"admission", "harness", "pytest", "transport", "budget"}
 
 
+def test_every_contract_fail_phase_is_a_carrier_phase():
+    """Every reason bin/cctally-test-all emits through contract_fail names a
+    phase the carrier accepts (#963 PX1, the twin of G1). A phase outside
+    PHASES reaches the remote wrapper as outcome-record-malformed/reason-phase,
+    which keeps the exit band but loses the reason code."""
+    carrier = (BIN / "_lib-test-contract.sh").read_text()
+    declared = re.search(r"^PHASES = \{([^}]*)\}", carrier, re.M)
+    assert declared, "the carrier's PHASES declaration moved"
+    phases = set(re.findall(r'"([a-z]+)"', declared.group(1)))
+    assert phases == VALID_PHASES
+    calls = []
+    for number, line in enumerate((BIN / "cctally-test-all").read_text().splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for _cls, code, _subject, phase in re.findall(
+                r'contract_fail\s+(\S+)\s+(\S+)\s+("[^"]*"|\S+)\s+([^\s;]+)', line):
+            calls.append((number, code, phase))
+    assert len(calls) >= 10, calls
+    outside = [call for call in calls if call[2] not in phases]
+    assert not outside, outside
+
+
 def test_outcome_object_shape(tmp_path):
     est = _estate(tmp_path)
     r = _drive(est)
@@ -1745,17 +1826,20 @@ def _budget_load(tmp_path, payload=None, path=None):
 )
 def test_a_malformed_budget_is_refused(tmp_path, payload, cause):
     """#630 S7. A budget that cannot be evaluated must never read as a budget
-    that was satisfied, so an unreadable file refuses the run in seconds rather
-    than being skipped after twenty minutes. The strictness matches what
-    contract_manifest_load already applies to the estate manifest: unknown
-    keys, duplicate keys, missing keys, non-numeric and non-positive values."""
+    that was satisfied, so the loader refuses the file with its cause. The
+    strictness matches what contract_manifest_load already applies to the
+    estate manifest: unknown keys, duplicate keys, missing keys, non-numeric
+    and non-positive values. Since the test regime reset the refusal is a note,
+    not an admission failure: the run proceeds with the budget unevaluated."""
     got = _budget_load(tmp_path, payload)
-    assert got["rc"] == "1", got
-    assert got["class"] == "infrastructure", got
-    assert got["codes"] == ["runtime-budget-unavailable"], got
-    assert got["phases"] == ["admission"], got
+    # The run proceeds (test regime reset fix round, B3): the loader succeeds
+    # and records the cause as a note, leaving no threshold behind.
+    assert got["rc"] == "0", got
+    assert got["class"] == "none", got
+    assert got["codes"] == [], got
     assert got["max"] == "", "a refused budget must leave no threshold behind"
     assert cause in got["note"], got
+    assert "the run proceeds" in got["note"], got
 
 
 def test_a_valid_budget_yields_its_maximum(tmp_path):
@@ -1781,10 +1865,9 @@ def test_a_non_utf8_budget_names_its_cause_instead_of_tracing(tmp_path):
     path = tmp_path / "budget.json"
     path.write_bytes(b'{"schemaVersion": 1, "metric": "\xff\xfe"}\n')
     got = _budget_load(tmp_path, path=path)
-    assert got["rc"] == "1", got
-    assert got["class"] == "infrastructure", got
-    assert got["codes"] == ["runtime-budget-unavailable"], got
-    assert got["phases"] == ["admission"], got
+    assert got["rc"] == "0", got
+    assert got["class"] == "none", got
+    assert got["codes"] == [], got
     assert "UTF-8" in got["note"], got
     # The second half, in the opposite direction. The escaping handler also
     # refused, so only the two together separate "refused with a cause" from
@@ -1794,8 +1877,10 @@ def test_a_non_utf8_budget_names_its_cause_instead_of_tracing(tmp_path):
 
 def test_an_absent_budget_file_is_refused(tmp_path):
     got = _budget_load(tmp_path, path=tmp_path / "there-is-no-such-file.json")
-    assert got["rc"] == "1", got
-    assert got["codes"] == ["runtime-budget-unavailable"], got
+    assert got["rc"] == "0", got
+    assert "the run proceeds" in got["note"], got
+    assert got["codes"] == [], got
+    assert got["max"] == "", got
 
 
 def test_the_committed_budget_parses(tmp_path):
@@ -1931,21 +2016,21 @@ def test_an_eligible_run_within_the_budget_records_no_budget_reason(tmp_path):
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert _budget_reasons(r) == [], _outcome(r)
+    assert _outcome(r)["runtimeBudget"]["exceeded"] is False, _outcome(r)
 
 
-def test_an_eligible_run_over_the_budget_is_product_at_exit_one(tmp_path):
-    """#630 S7. The class is `product` rather than `infrastructure` because the
-    instrument is working correctly and reporting a true fact about the tree;
-    `infrastructure` means the instrument itself broke."""
+def test_an_eligible_run_over_the_budget_is_green_with_a_note(tmp_path):
+    """Test regime reset, session 1. The budget is report-only: an eligible
+    run over it stays green at exit 0, records the overrun in
+    `runtimeBudget`, and tells the operator in a note."""
     est = _estate(tmp_path, private=True, budget=0.001, harness_sleep={"alpha": 1})
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
     out = _outcome(r)
-    assert out["failureClass"] == "product", out
-    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
-    assert out["exitCode"] == 1, out
-    rows = _budget_reasons(r)
-    assert [x["code"] for x in rows] == ["runtime-budget-exceeded"], out
-    assert ">" in rows[0]["subject"], rows
+    assert out["failureClass"] == "none", out
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert out["exitCode"] == 0, out
+    assert _budget_reasons(r) == [], out
+    assert out["runtimeBudget"] == {"maxSecondsPerThousandCases": 0.001, "exceeded": True}, out
     # The operator is told what to do about it, not merely that it happened.
     assert "per 1,000 cases" in r.stderr, r.stderr
 
@@ -1959,8 +2044,11 @@ def test_the_breach_states_both_numbers_readably(tmp_path):
     test_the_rounded_metric_would_not_have_caught_the_boundary_breach pins."""
     est = _estate(tmp_path, private=True, budget=0.001, harness_sleep={"alpha": 1})
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
-    subject = _budget_reasons(r)[0]["subject"]
-    assert re.fullmatch(r"\d+(\.\d{1,2})? > 0\.001", subject), subject
+    found = re.search(r"runtime budget: (\S+) seconds per 1,000 cases exceeds the "
+                      r"committed maximum of (\S+) ", r.stderr)
+    assert found, r.stderr
+    assert re.fullmatch(r"\d+(\.\d{1,2})?", found.group(1)), found.group(0)
+    assert found.group(2) == "0.001", found.group(0)
     # The threshold reads as the number a maintainer typed into the committed
     # file, not as its float repr.
     assert "0.001000" not in r.stderr, r.stderr
@@ -1973,6 +2061,7 @@ def test_a_non_authoritative_run_over_the_budget_is_still_green(tmp_path):
     r = _drive(est)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _budget_reasons(r) == [], _outcome(r)
+    assert "runtimeBudget" not in _outcome(r), _outcome(r)
 
 
 def test_a_public_tree_over_the_budget_is_still_green(tmp_path):
@@ -1989,6 +2078,7 @@ def test_a_public_tree_over_the_budget_is_still_green(tmp_path):
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert _budget_reasons(r) == [], _outcome(r)
+    assert "runtimeBudget" not in _outcome(r), _outcome(r)
     assert _outcome(r)["coverage"]["mode"] == "full", _outcome(r)
 
 
@@ -2026,45 +2116,49 @@ def test_a_red_run_gains_no_budget_reason(tmp_path):
 
 def test_a_null_denominator_is_unavailable_not_a_breach(tmp_path):
     """passedCases is null when pytest's passed-item count was unreadable, which
-    is a different answer from zero. An otherwise-green eligible run that cannot
-    establish its denominator is infrastructure, never product — a budget that
-    could not be evaluated must never read as a budget that was satisfied."""
+    is a different answer from zero. The budget is then unevaluated: a note and
+    an unknown `exceeded`, never a satisfied budget and never a failure."""
     est = _estate(tmp_path, private=True)
     env = dict(_pytest_output_shim(est, r'b"no summary line here at all\n"'))
     env["CCTALLY_AUTHORITATIVE_RUN"] = "1"
     r = _drive(est, env=env)
     out = _outcome(r)
     assert out["passedCases"] is None, out
-    assert [x["code"] for x in out["reasons"]] == ["runtime-budget-unavailable"], out
-    assert out["failureClass"] == "infrastructure", out
-    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-    assert out["exitCode"] == 3, out
+    assert out["reasons"] == [], out
+    assert out["failureClass"] == "none", out
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert out["runtimeBudget"]["exceeded"] is None, out
+    assert "runtime budget:" in r.stderr, r.stderr
 
 
-def test_a_missing_budget_refuses_an_eligible_run_before_anything_runs(tmp_path):
-    """Validated at ADMISSION, so a missing budget refuses the run in seconds
-    rather than after twenty minutes of work whose verdict it cannot judge."""
+def test_a_missing_budget_is_a_note_and_the_run_proceeds(tmp_path):
+    """Test regime reset, session 1. A missing budget file no longer refuses an
+    eligible run at admission: every harness runs, the run stays green, and the
+    budget is recorded as unevaluated."""
     est = _estate(tmp_path, private=True, budget=False, sentinel=True)
     ran = tmp_path / "ran"
     ran.mkdir()
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1",
                          "SENTINEL_DIR": str(ran)})
     out = _outcome(r)
-    assert out["failureClass"] == "infrastructure", out
-    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-    assert "runtime-budget-unavailable" in {x["code"] for x in out["reasons"]}, out
-    assert _executed(ran) == set(), (
-        "the run was refused at admission, so no harness may have executed"
-    )
+    assert out["failureClass"] == "none", out
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "runtime-budget-unavailable" not in {x["code"] for x in out["reasons"]}, out
+    assert _executed(ran), "a missing budget must not stop any harness from running"
+    assert out["runtimeBudget"] == {"maxSecondsPerThousandCases": None, "exceeded": None}, out
 
 
-def test_a_malformed_budget_refuses_an_eligible_run(tmp_path):
+def test_a_malformed_budget_file_is_a_note(tmp_path):
+    """Test regime reset, session 1. A malformed budget file is reported, not
+    enforced: the run exits 0 and its outcome carries no budget reason."""
     est = _estate(tmp_path, private=True, budget='{"schemaVersion": 1}\n')
     r = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
     out = _outcome(r)
-    assert out["failureClass"] == "infrastructure", out
-    assert r.returncode == 3, (r.returncode, r.stdout, r.stderr)
-    assert "runtime-budget-unavailable" in {x["code"] for x in out["reasons"]}, out
+    assert out["failureClass"] == "none", out
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert out["reasons"] == [], out
+    assert "runtime budget: missing-key" in r.stderr, r.stderr
+    assert out["runtimeBudget"] == {"maxSecondsPerThousandCases": None, "exceeded": None}, out
 
 
 def test_an_ineligible_run_is_not_refused_for_a_budget_it_never_reads(tmp_path):
@@ -2075,14 +2169,6 @@ def test_an_ineligible_run_is_not_refused_for_a_budget_it_never_reads(tmp_path):
     r = _drive(est)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "runtime-budget-unavailable" not in _codes(r), _outcome(r)
-
-
-def test_both_budget_reasons_are_registered():
-    """A code absent from _CONTRACT_REASON_CODES is not a code: the emission
-    sites are bare string literals, so nothing in the shell catches a typo."""
-    codes = _registry()
-    assert "runtime-budget-exceeded" in codes, sorted(codes)
-    assert "runtime-budget-unavailable" in codes, sorted(codes)
 
 
 # --- the estate check, driven end to end (#648 D6, D11, D12) ----------------
@@ -2146,8 +2232,9 @@ def test_plan_mode_runs_no_estate_check(tmp_path):
     est = _estate(tmp_path)
     r = subprocess.run(
         [str(est / "bin" / "cctally-test-all")],
-        env={"PATH": os.environ["PATH"], "CCTALLY_TEST_ALL_PLAN": "1",
-             "CCTALLY_TEST_JOBS": "1"},
+        env=dict(_hyg.child_aggregator_env(
+            {"PATH": os.environ["PATH"], "CCTALLY_TEST_JOBS": "1"}, est.parent),
+            CCTALLY_TEST_ALL_PLAN="1"),
         capture_output=True, text=True, timeout=60,
     )
     assert r.returncode == 0, r.stdout + r.stderr
@@ -2551,11 +2638,10 @@ def _carry(tmp_path, record, rc):
 @pytest.mark.parametrize(
     "code,cls,exit_code,subject",
     [
-        ("runtime-budget-exceeded", "product", 1, "142.7 > 120"),
-        # BOTH codes, because §2.5 asks for a carrier-level case for each and
-        # the two travel different class and exit-code paths. The `budget` phase
-        # is what the carrier validates, and it validates it per reason row.
-        ("runtime-budget-unavailable", "infrastructure", 3, "denominator"),
+        # The one code still emitted in the `budget` phase since the runtime
+        # budget became report-only (test regime reset, session 1): the merge
+        # gate's 300-second deadline. The carrier validates the phase per row.
+        ("merge-runtime-budget-exceeded", "infrastructure", 3, "301"),
     ],
 )
 def test_the_carrier_accepts_the_budget_phase(
@@ -2563,10 +2649,8 @@ def test_the_carrier_accepts_the_budget_phase(
 ):
     """#630 S7. The carrier's phase set is CLOSED: a reason carrying an
     unlisted phase is rewritten to outcome-record-malformed, which is
-    infrastructure and exits 3. That would strip runtime-budget-exceeded of
-    the product class and the exit 1 the whole design rests on, silently — and
-    it would make runtime-budget-unavailable indistinguishable from a transport
-    fault, which is the one thing it is not."""
+    infrastructure and exits 3. The merge gate's deadline reason is carried in
+    the `budget` phase, so the carrier must keep accepting that phase."""
     doc, rc = _carry(
         tmp_path,
         _carrier_record(
@@ -2874,8 +2958,8 @@ def test_fake_ncpu_outside_plan_mode_is_a_usage_error(tmp_path):
 
 def test_fake_ncpu_inside_plan_mode_is_still_honoured(tmp_path):
     est = _estate(tmp_path)
-    e = {"PATH": os.environ["PATH"], "CCTALLY_TEST_ALL_PLAN": "1",
-         "CCTALLY_TEST_ALL_FAKE_NCPU": "16"}
+    e = dict(_hyg.child_aggregator_env({"PATH": os.environ["PATH"]}, est.parent),
+             CCTALLY_TEST_ALL_PLAN="1", CCTALLY_TEST_ALL_FAKE_NCPU="16")
     r = subprocess.run(
         [str(est / "bin" / "cctally-test-all")],
         env=e, capture_output=True, text=True, timeout=60,
@@ -2901,11 +2985,10 @@ def test_plan_mode_emits_no_outcome_even_with_a_capability_absent(tmp_path):
     shim = _shim(est, "pytest")
     r = subprocess.run(
         [str(est / "bin" / "cctally-test-all")],
-        env={
+        env=dict(_hyg.child_aggregator_env({
             "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}",
-            "CCTALLY_TEST_ALL_PLAN": "1",
             "CCTALLY_AUTHORITATIVE_RUN": "1",
-        },
+        }, est.parent), CCTALLY_TEST_ALL_PLAN="1"),
         capture_output=True,
         text=True,
         timeout=60,
@@ -3474,6 +3557,107 @@ def test_external_reason_rejects_the_empty_value(tmp_path):
     assert "empty value" in r.stderr, r.stderr
 
 
+# --- #966(c), spec 4.3: a nested contract run never writes the parent's outcome --
+
+
+def test_a_nested_contract_run_cannot_write_the_parent_outcome(tmp_path, monkeypatch):
+    """E1. The bad-external-reason reproducer, run as a test inside an
+    aggregator's pytest leg would run it: CCTALLY_TEST_ALL_OUTCOME_FILE names
+    the PARENT run's record. The child must exit 2 and leave that record's bytes
+    and metadata exactly as they were, checked before the parent could rewrite it."""
+    sentinel = tmp_path / "parent-outcome.json"
+    sentinel.write_bytes(b'{"sentinel": "the parent run\'s record"}\n')
+    os.chmod(sentinel, 0o640)
+    before = os.lstat(sentinel)
+    content = sentinel.read_bytes()
+    monkeypatch.setenv("CCTALLY_TEST_ALL_OUTCOME_FILE", str(sentinel))
+    r = _run_lib(tmp_path, "contract_admit_external_reason\n",
+                 env={"CCTALLY_TEST_EXTERNAL_INCOMPLETE": "whatever-i-felt-like"})
+    after = os.lstat(sentinel)
+    assert sentinel.read_bytes() == content, "the nested run wrote the parent run's outcome"
+    assert (after.st_ino, after.st_size, after.st_mode, after.st_mtime_ns) == (
+        before.st_ino, before.st_size, before.st_mode, before.st_mtime_ns), (
+        "the nested run touched the parent run's outcome")
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+
+
+def test_an_explicit_child_outcome_destination_still_works(tmp_path):
+    """E1's control: a test may still give its child an explicit, child-local
+    outcome destination (spec 4.3)."""
+    child = tmp_path / "child-outcome.json"
+    r = _run_lib(tmp_path, "contract_admit_external_reason\n",
+                 env={"CCTALLY_TEST_EXTERNAL_INCOMPLETE": "whatever-i-felt-like",
+                      "CCTALLY_TEST_ALL_OUTCOME_FILE": str(child)})
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert json.loads(child.read_text(encoding="utf-8"))["exitCode"] == 2
+
+
+_E1_OWNER = {
+    "CCTALLY_TEST_RUN_ID": "e1-run",
+    "CCTALLY_TEST_EVIDENCE_MAX_AGE_DAYS": "7",
+    "CCTALLY_TEST_EVIDENCE_MAX_BYTES": "1000000000",
+    "CCTALLY_REMOTE_DIR": "e1-remote",
+    "CCTALLY_TEST_ALL_E1_PROBE": "owner-only by prefix",
+    "CCTALLY_TEST_EVIDENCE_E1_PROBE": "owner-only by prefix",
+}
+_E1_PRESERVED = {
+    "CCTALLY_PROGRESS_INTERVAL": "30",
+    "_CCTALLY_RUNNER_RESERVATION_TOKEN": "e1-token",
+}
+_E1_DUMP_TEST = (
+    "import json, os\n"
+    "def test_dumps_its_environment():\n"
+    "    with open(os.environ['E1_PYTEST_DUMP'], 'w') as fh:\n"
+    "        json.dump(sorted(os.environ), fh)\n"
+)
+
+
+def _e1_owner_names(names):
+    return sorted(n for n in names if n.startswith(("CCTALLY_TEST_ALL_", "CCTALLY_TEST_EVIDENCE_"))
+                  or n in {"CCTALLY_TEST_RUN_ID", "CCTALLY_TEST_EXTERNAL_INCOMPLETE",
+                           "CCTALLY_RUNNER_EVIDENCE_INDEX", "CCTALLY_REMOTE_DIR",
+                           "_CCTALLY_HARNESS_SCRUB"})
+
+
+def test_owner_only_variables_stop_at_the_harness_and_pytest_boundaries(tmp_path):
+    """E1 at the shell-harness and pytest launch boundaries of bin/cctally-test-all.
+    The aggregator is given every owner-only family (the outcome file it needs
+    itself, the run id, the evidence family, the index and remote-dir flags, and
+    one synthetic name per prefix); neither a harness nor a pytest leg may see
+    any of them, and the deliberately inherited classes still arrive."""
+    est = _estate(tmp_path)
+    harness_dump, pytest_dump = tmp_path / "harness-env.json", tmp_path / "pytest-env.json"
+    alpha = est / "bin" / "cctally-alpha-test"
+    alpha.write_text(
+        "#!/usr/bin/env bash\n"
+        "python3 -c 'import json, os, sys; json.dump(sorted(os.environ), open(sys.argv[1], \"w\"))' "
+        "\"$E1_HARNESS_DUMP\"\n"
+        "printf '%s\\n' " + shlex.quote(DEFAULT_SUMMARY.rstrip("\n")) + "\n"
+        "exit 0\n", encoding="utf-8")
+    alpha.chmod(0o755)
+    (est / "tests" / "test_e1_dump.py").write_text(_E1_DUMP_TEST, encoding="utf-8")
+    env = dict(_E1_OWNER, **_E1_PRESERVED)
+    # The index is a path the child aggregator itself writes (non-deciding);
+    # it must lie inside this test, never in the working directory.
+    env.update({"CCTALLY_TEST_EVIDENCE_ROOT": str(tmp_path / "ev"),
+                "CCTALLY_RUNNER_EVIDENCE_INDEX": str(tmp_path / "evidence-index.json"),
+                "E1_HARNESS_DUMP": str(harness_dump), "E1_PYTEST_DUMP": str(pytest_dump)})
+    r = _drive(est, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    harness = json.loads(harness_dump.read_text(encoding="utf-8"))
+    leg = json.loads(pytest_dump.read_text(encoding="utf-8"))
+    assert _e1_owner_names(harness) == [], (
+        "owner-only variables reached the harness boundary: %s" % _e1_owner_names(harness))
+    assert _e1_owner_names(leg) == [], (
+        "owner-only variables reached the pytest boundary: %s" % _e1_owner_names(leg))
+    # #965's test retention switch is deliberately inherited (ledger P4): the
+    # aggregator exports it, and both boundaries must keep handing it on.
+    for name in ("CCTALLY_TEST_JOBS", "CCTALLY_DISABLE_DEV_AUTODETECT",
+                 "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF", *_E1_PRESERVED):
+        assert name in harness and name in leg, name
+    assert "CCTALLY_ESTATE_OBSERVED_DIR" in leg
+
+
 # --- #529 S6 M4: the degradation is announced ONCE, with a real count -------
 
 
@@ -3758,18 +3942,17 @@ def test_the_tier_is_excluded_from_the_runtime_budget(tmp_path):
     """Eligibility condition 2. The tier ran a DIFFERENT estate, so its quotient
     answers a different question from the one the committed threshold was
     derived for. Non-vacuous by construction: the same estate, the same marker
-    and the same 0.001 budget produce runtime-budget-exceeded on a full run."""
+    and the same 0.001 budget record an overrun on a full run."""
     est = _tier_estate(tmp_path, budget=0.001, harness_sleep={"alpha": 1})
     _tier_touch(est, "alpha")
     full = _drive(est, env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
-    assert [x["code"] for x in _budget_reasons(full)] == [
-        "runtime-budget-exceeded"
-    ], _outcome(full)
+    assert _outcome(full)["runtimeBudget"]["exceeded"] is True, _outcome(full)
 
     tiered = _drive(est, args=("--tier-fast", "HEAD"),
                     env={"CCTALLY_AUTHORITATIVE_RUN": "1"})
     assert tiered.returncode == 0, tiered.stdout + tiered.stderr
     assert _budget_reasons(tiered) == [], _outcome(tiered)
+    assert "runtimeBudget" not in _outcome(tiered), _outcome(tiered)
 
 
 def test_the_tier_and_a_subset_cannot_be_combined(tmp_path):

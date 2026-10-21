@@ -30,6 +30,10 @@
 # top into a scratch tree, then iterates. Output is line-buffered and
 # emitted in fixture-order so logs stay coherent under `xargs -P`.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -45,7 +49,7 @@ BIN="$REPO/bin/cctally"
 # generated seeds here so in-tree fixture dirs stay byte-stable; the
 # in-tree fixture dir still owns input.json / golden.* / flags.txt /
 # input.env, with the builder filling in seeds/.
-SCRATCH_ROOT="$(mktemp -d -t cctally-statusline-XXXXXX)"
+SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cctally-statusline-XXXXXX")" || exit 1
 # 2>/dev/null swallows "Directory not empty" races on macOS APFS when WAL/
 # shm sidecar files are flushed concurrently with rm.
 trap 'rm -rf "$SCRATCH_ROOT" 2>/dev/null' EXIT

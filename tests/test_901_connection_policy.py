@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -354,8 +355,39 @@ def test_backup_checkpoint_and_vacuum_connections_keep_the_default(
 
 # ── no temp file on a real sync pass and a real ingest (non-vacuous) ────────
 
+_STATUS_CLOCK_SOURCE = r'''
+import datetime as _clock_dt
+import types as _clock_types
+_clock_fixed = _clock_dt.datetime(2026, 7, 15, 12, tzinfo=_clock_dt.timezone.utc)
+
+def _fixed_container_status_recorder(cache):
+    """Control observation time without changing other product clock reads."""
+    original = cache._record_codex_container_status
+
+    class FixedDatetime(_clock_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _clock_fixed.astimezone(tz) if tz is not None else _clock_fixed.replace(tzinfo=None)
+
+    def record(*args, **kwargs):
+        previous = cache.dt
+        clock = _clock_types.SimpleNamespace(**vars(previous))
+        clock.datetime = FixedDatetime
+        cache.dt = clock
+        try:
+            return original(*args, **kwargs)
+        finally:
+            cache.dt = previous
+
+    return record
+'''
+_clock_namespace = {}
+exec(_STATUS_CLOCK_SOURCE, _clock_namespace)
+_fixed_container_status_recorder = _clock_namespace['_fixed_container_status_recorder']
+
+
 _CHILD = r'''
-import json, os, sqlite3, sys
+import hashlib, json, os, sqlite3, struct, sys
 
 bin_dir, workload, mode = sys.argv[1:4]
 sys.path.insert(0, bin_dir)
@@ -369,6 +401,9 @@ sys.modules["cctally"] = mod
 loader.exec_module(mod)
 import _cctally_core
 import _cctally_store
+import _cctally_cache
+''' + _STATUS_CLOCK_SOURCE + r'''
+_cctally_cache._record_codex_container_status = _fixed_container_status_recorder(_cctally_cache)
 
 if mode == "control":
     # The policy disabled: SQLite's default (file) temp store.
@@ -377,9 +412,15 @@ if mode == "control":
 watched = os.environ["SQLITE_TMPDIR"]
 untouched = int(os.environ["G8_UNTOUCHED_NS"])
 first_spill = []
+statements = []
+statement_frames = []
 
 
 def _check(sql):
+    if os.environ.get("G8_DIAGNOSTIC") and "target" in globals():
+        wal_path = target + "-wal"
+        statement_frames.append([" ".join(str(sql).split())[:160],
+            os.path.getsize(wal_path) if os.path.exists(wal_path) else 0])
     if not first_spill and os.stat(watched).st_mtime_ns != untouched:
         first_spill.append(" ".join(str(sql).split())[:120])
 
@@ -428,6 +469,8 @@ def connect(*args, **kwargs):
     kwargs.setdefault("factory", Connection)
     conn = real_connect(*args, **kwargs)
     # No checkpoint during the run, so the WAL holds every frame it wrote.
+    if os.environ.get("G8_DIAGNOSTIC"):
+        conn.set_trace_callback(statements.append)
     conn.execute("PRAGMA wal_autocheckpoint = 0")
     return conn
 
@@ -450,10 +493,25 @@ else:
     status = f"rows_changed={stats.rows_changed}"
 page = pin.execute("PRAGMA page_size").fetchone()[0]
 wal = os.path.getsize(target + "-wal")
+if os.environ.get("G8_DIAGNOSTIC"):
+    with open(target + "-wal", "rb") as handle:
+        raw = handle.read()
+    frames = []
+    for offset in range(32, len(raw), page + 24):
+        number, commit = struct.unpack(">II", raw[offset:offset + 8])
+        frames.append({"page": number, "commit": commit,
+                       "sha256": hashlib.sha256(
+                           raw[offset + 24:offset + 24 + page]).hexdigest()})
+    objects = [list(row) for row in pin.execute(
+        "SELECT name, pageno, pagetype, ncell, payload, unused FROM dbstat")]
+    print("G8_DIAGNOSTIC " + json.dumps({"workload": workload, "mode": mode,
+          "statements": statements, "statement_frames": statement_frames,
+          "frames": frames, "objects": objects}))
 print(json.dumps({"status": status, "first_spill": first_spill,
                   "frames": (wal - 32) // (page + 24)}))
 pin.close()
 '''
+
 
 
 def _words(i, count):
@@ -530,6 +588,9 @@ WORKLOADS = {
 
 def _build(ns, tmp_path, monkeypatch, workload):
     """Ingest a base, then append the delta the child will sync."""
+    cache = importlib.import_module("_cctally_cache")
+    monkeypatch.setattr(cache, "_record_codex_container_status",
+                        _fixed_container_status_recorder(cache))
     _statement, base, delta = WORKLOADS[workload]
     ns["CONFIG_PATH"].write_text('{"conversation":{"retention_days":0}}\n')
     codex = tmp_path / "codex-home"
@@ -585,6 +646,8 @@ def _run_child(tmp_path, codex, workload, mode):
         [sys.executable, "-c", _CHILD, str(BIN), workload, mode],
         env=env, capture_output=True, text=True, timeout=50)
     assert child.returncode == 0, child.stderr[-4000:]
+    if os.environ.get("G8_DIAGNOSTIC"):
+        print("\n".join(child.stdout.strip().splitlines()[:-1]))
     result = json.loads(child.stdout.strip().splitlines()[-1])
     result["temp_dir_touched"] = (
         os.stat(watched).st_mtime_ns != UNTOUCHED_NS)
@@ -612,3 +675,86 @@ def test_a_sync_pass_and_an_ingest_write_no_temp_file(
     assert product["frames"] == control["frames"] > 0, (
         "the policy must change where statement journals live and nothing "
         "else", product, control)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_the_status_clock_is_fixed_only_during_the_status_observation(fails):
+    cache = types.SimpleNamespace(dt=dt)
+    real_datetime = dt.datetime
+
+    def original():
+        assert cache.dt.datetime.now(UTC) == FIXED
+        assert dt.datetime is real_datetime
+        if fails:
+            raise RuntimeError("observation failed")
+        return "recorded"
+
+    cache._record_codex_container_status = original
+    fixed = _fixed_container_status_recorder(cache)
+    if fails:
+        with pytest.raises(RuntimeError, match="observation failed"):
+            fixed()
+    else:
+        assert fixed() == "recorded"
+    assert cache.dt is dt
+
+
+def test_clock_bootstrap_preserves_the_inherited_guard_and_fixture_access(ns, tmp_path):
+    """Clock sharing must not rederive roots from this child's fake HOME."""
+    target = tmp_path / ".local/share/cctally"
+    target.mkdir(parents=True, exist_ok=True)
+    before = (
+        "import json, os, sys\n"
+        "import _lib_test_isolation as isolation\n"
+        "envelope = {k: v for k, v in os.environ.items() if k.startswith('CCTALLY_ISOLATION_')}\n"
+        "roots = isolation.protected_roots()\n"
+    )
+    after = r'''
+assert envelope == {k: v for k, v in os.environ.items() if k.startswith('CCTALLY_ISOLATION_')}
+assert roots == isolation.protected_roots()
+assert 'conftest' not in sys.modules
+sqlite3.connect(os.path.join(os.environ['CCTALLY_DATA_DIR'], 'clock-bootstrap.db')).close()
+# A second, disposable guard instance owns only this synthetic negative fixture.
+# The active inherited guard and its environment are never rebound.
+probe_spec = ilu.spec_from_file_location('_g8_negative_guard', os.path.join(bin_dir, '_lib_test_isolation.py'))
+probe = ilu.module_from_spec(probe_spec)
+sys.modules[probe_spec.name] = probe
+probe_spec.loader.exec_module(probe)
+probe._ROOTS = (os.path.realpath(sys.argv[4]),)
+probe._LEDGER_PATH = sys.argv[5]
+probe._TOKEN = 'synthetic-clock-bootstrap'
+probe._NODE_GETTER = lambda: 'clock-bootstrap-synthetic-negative'
+sys.addaudithook(probe._audit_hook)
+victim = os.path.join(sys.argv[4], 'must-not-be-created')
+try:
+    with open(victim, 'w') as handle:
+        handle.write('forbidden')
+except probe.ProductionWriteBlocked:
+    pass
+else:
+    raise AssertionError('synthetic protected write was not rejected')
+assert not os.path.exists(victim)
+assert envelope == {k: v for k, v in os.environ.items() if k.startswith('CCTALLY_ISOLATION_')}
+assert roots == isolation.protected_roots()
+with open(sys.argv[5]) as handle:
+    ledger = [json.loads(line) for line in handle]
+assert len(ledger) == 1 and ledger[0]['path'] == os.path.realpath(victim)
+print(json.dumps({'envelope': envelope, 'roots': roots, 'fixtureAccessible': True,
+                  'syntheticRejected': True, 'ledger': ledger}))
+'''
+    synthetic = tmp_path / "clock-bootstrap-synthetic-protected"
+    synthetic.mkdir()
+    ledger = tmp_path / "clock-bootstrap-negative-ledger.jsonl"
+    prefix = _CHILD.split('if mode == "control":', 1)[0]
+    env = dict(os.environ, HOME=str(tmp_path), CCTALLY_DATA_DIR=str(target),
+               CCTALLY_DISABLE_DEV_AUTODETECT="1")
+    proc = subprocess.run([sys.executable, "-c", before + prefix + after,
+                           str(BIN), "conversation-sync", "product", str(synthetic), str(ledger)],
+                          env=env, capture_output=True, text=True, timeout=50)
+    assert proc.returncode == 0, proc.stderr
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert observed["fixtureAccessible"]
+    assert observed["roots"]
+    assert observed["syntheticRejected"]
+    assert ledger.read_text().strip()
+    print("CLOCK_BOOTSTRAP_PROOF " + json.dumps(observed, sort_keys=True))

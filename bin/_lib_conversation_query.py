@@ -3295,11 +3295,19 @@ def _scoped_codex_anon_paths(conn, account_key: str):
             raise RuntimeError("Codex raw threads table missing for scoped anonymization")
         return set(), 0, 0
     ambiguous = 0
-    thread_schema = threads.split(".", 1)[0]
+    # Threads can live in the last-good TEMP view, whose schema says nothing
+    # about the physical accounting roots. Resolve roots independently and
+    # bypass account-scope TEMP shadows; the provenance checks below still
+    # decide which of those paths this account may use. A missing/unreadable
+    # physical roots table propagates as a refusal, never a partial vocabulary.
+    roots_table = (
+        "main.codex_source_roots" if conn.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' "
+            "AND name='codex_source_roots'").fetchone() is not None
+        else "cache_db.codex_source_roots")
     root_paths: dict[str, str] = {}
     for root_key, root_path in conn.execute(
-        "SELECT source_root_key, canonical_root_path FROM "
-        + thread_schema + ".codex_source_roots"
+        "SELECT source_root_key, canonical_root_path FROM " + roots_table
     ):
         if isinstance(root_key, str) and isinstance(root_path, str):
             if root_path and os.path.isabs(root_path):

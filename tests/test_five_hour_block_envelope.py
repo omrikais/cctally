@@ -49,7 +49,12 @@ def _seed_snapshot(
     week_start_date: str = "2026-04-25",
     week_end_date: str = "2026-05-02",
     week_start_at: "str | None" = None,
+    five_hour_percent: float = 12.0,
 ):
+    # ``five_hour_percent`` (#825/#832 K16c, spec 4.7 revision 7): the current
+    # window is the newest row CARRYING a five-hour reading, so a row with a
+    # window key and no percent is not one. The recorder always writes the
+    # percent beside the key; the value itself is not what these tests assert.
     # Schema: weekly_usage_snapshots has weekly_percent (not used_pct) and
     # requires payload_json NOT NULL (see open_db at bin/cctally:7341).
     # ``week_start_at`` (TEXT, nullable) was added later via
@@ -61,13 +66,14 @@ def _seed_snapshot(
         INSERT INTO weekly_usage_snapshots (
             week_start_date, week_end_date, captured_at_utc,
             week_start_at,
-            weekly_percent, five_hour_window_key, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            weekly_percent, five_hour_percent, five_hour_window_key,
+            payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             week_start_date, week_end_date, captured,
             week_start_at,
-            used_pct, key, "{}",
+            used_pct, five_hour_percent, key, "{}",
         ),
     )
     conn.commit()

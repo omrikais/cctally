@@ -47,7 +47,7 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1017
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1018
         names = {
             row[0]
             for row in conn.execute(
@@ -1634,8 +1634,17 @@ def _projection_scan_paths():
     bin_dir = pathlib.Path(__file__).resolve().parent.parent / "bin"
     yield bin_dir / "cctally"
     for path in sorted(bin_dir.glob("*.py")):
-        if not path.name.startswith("build-"):
+        if not path.name.startswith("build-") and not _is_sql_data_only(path):
             yield path
+
+
+# #825/#832 spec 5.6 item 6: the access-contract registry holds the SQL TEXT
+# of every registered strict-path access as DATA (its fingerprints), never
+# executed. It is skipped only while it contains no `execute(` call at all;
+# the moment it gains one, it is scanned like any other source.
+def _is_sql_data_only(path) -> bool:
+    return (path.name == "_lib_detector_access_registry.py"
+            and "execute(" not in path.read_text(encoding="utf-8"))
 
 
 def _scan_projection_read_sites():

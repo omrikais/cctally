@@ -380,7 +380,7 @@ def test_statusline_projection_splits_the_two_axes(app, monkeypatch):
             five_hour_percent=FRESH_FIVE_HOUR, five_hour_resets_at=live_resets)
     sl = app._load_sibling("_cctally_statusline")
     monkeypatch.setattr(sl, "_statusline_active_account", lambda: "unattributed")
-    projection = sl._read_db_projection_once()
+    projection = sl._read_db_projection_once(account_key="unattributed")
     assert projection.seven_day is not None
     assert projection.seven_day.percent == GENUINE_WEEKLY
     assert projection.seven_day.captured_at == int(T0.timestamp())

@@ -24,9 +24,10 @@ process, and a descriptor opened before the protection was installed.
 At module scope this file imports nothing from ``pytest`` and nothing from
 ``bin/``, so a separate process can import it to exercise the lock (which is
 how ``tests/test_tick_stats_integration.py`` proves the copier actually waits).
-The single exception is deliberate and lazy: a root-scope copy re-stamps each
-copied Codex root's hook trust record, and it loads
-``bin/build-bench-fixtures.py`` by path at that moment rather than reimplement
+The two exceptions are deliberate and lazy. The copier loads
+``bin/_lib_clone_copy.py`` (stdlib only) by path to copy by APFS clone. And a
+root-scope copy re-stamps each copied Codex root's hook trust record, and it
+loads ``bin/build-bench-fixtures.py`` by path at that moment rather than reimplement
 the one writer of that record. The generator's own module-level imports are
 stdlib only, so a child process pays a parse and keeps working.
 ``tests/conftest.py`` re-exports the public names.
@@ -57,6 +58,9 @@ _FINGERPRINT_EXCLUDED_SUFFIXES = (".db-wal", ".db-shm", ".db-journal")
 
 #: Lazily loaded `bin/build-bench-fixtures.py`, cached for the process.
 _BENCH_GENERATOR = None
+
+#: Lazily loaded `bin/_lib_clone_copy.py`, cached for the process.
+_CLONE_COPY = None
 
 
 def corpus_lock_path(corpus_root, scale) -> pathlib.Path:
@@ -125,7 +129,10 @@ def copy_shared_corpus(data_dir, destination, *, scope="root") -> pathlib.Path:
     with open(lock_path, "a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
         try:
-            shutil.copytree(
+            # Clone-first (#940 D2): on APFS every file is a block-sharing
+            # clone, so a corpus copy writes no data; elsewhere a real copy.
+            # The result equals shutil.copytree's for the same arguments.
+            _load_clone_copy().copytree(
                 source, destination,
                 ignore=shutil.ignore_patterns(*CORPUS_SIDECAR_PATTERNS),
             )
@@ -155,6 +162,22 @@ def _load_bench_generator():
         loader.exec_module(module)
         _BENCH_GENERATOR = module
     return _BENCH_GENERATOR
+
+
+def _load_clone_copy():
+    """Load ``bin/_lib_clone_copy.py`` by path, without touching sys.path.
+
+    Lazy for the same reason as :func:`_load_bench_generator`: importing this
+    module pulls in nothing from ``bin/``. The clone module is stdlib only.
+    """
+    global _CLONE_COPY
+    if _CLONE_COPY is None:
+        path = pathlib.Path(__file__).resolve().parents[1] / "bin" / "_lib_clone_copy.py"
+        spec = importlib.util.spec_from_file_location("_lib_clone_copy", str(path))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CLONE_COPY = module
+    return _CLONE_COPY
 
 
 def restamp_codex_hook_trust(corpus_root) -> None:

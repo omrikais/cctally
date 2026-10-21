@@ -43,6 +43,10 @@
 # `$fake` (and its `/private/var` realpath form on macOS) to /FAKE.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Regenerate goldens: CCTALLY_SETUP_REGENERATE=1 bin/cctally-setup-test
 # (rewrites each scenario's golden-stdout.txt from the current normalized
@@ -99,7 +103,7 @@ run_scenario () {
     [ -d "$dir" ] || return 0
     [ -f "$dir/cmd.txt" ] || { echo "SKIP $name: no cmd.txt"; return 0; }
 
-    local fake; fake=$(mktemp -d)
+    local fake; fake=$(mktemp -d "${TMPDIR:-/tmp}/cctally-setup-test.XXXXXX") || exit 1
     # Temp compare files for the golden-diff helpers land in the scratch
     # HOME, cleaned with the `rm -rf "$fake"` at scenario end.
     local GOLDEN_DIFF_TMPDIR="$fake"

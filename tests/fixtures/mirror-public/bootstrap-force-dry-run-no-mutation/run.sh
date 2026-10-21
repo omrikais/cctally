@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -uo pipefail
 PUB_HEAD_BEFORE=$(git -C ../public rev-parse HEAD)
 python3 bin/cctally-mirror-public \

@@ -459,12 +459,12 @@ def test_codex_accounting_reader_closes_its_cache_connection(monkeypatch):
                timestamp_utc TEXT, session_id TEXT, model TEXT,
                input_tokens INTEGER, cached_input_tokens INTEGER,
                output_tokens INTEGER, reasoning_output_tokens INTEGER,
-               total_tokens INTEGER, source_path TEXT
+               total_tokens INTEGER, source_path TEXT, source_root_key TEXT
            )"""
     )
     conn.execute(
-        "INSERT INTO codex_session_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("2026-06-16T12:00:00+00:00", "session", "gpt-5", 100, 20, 30, 5, 130, "/fixture.jsonl"),
+        "INSERT INTO codex_session_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2026-06-16T12:00:00+00:00", "session", "gpt-5", 100, 20, 30, 5, 130, "/fixture.jsonl", None),
     )
     monkeypatch.setattr(cache, "open_cache_db", lambda: conn)
 
@@ -607,6 +607,18 @@ def test_qualified_scale_query_uses_composite_index_and_bounded_resolution(
 # Task 2: the provider-neutral result kernels intentionally start with pure
 # synthetic rows.  These tests lock the native token vocabulary and endpoint
 # semantics before any command adapter or parser routing exists.
+@pytest.fixture
+def cctally_module():
+    """Load the `cctally` module the source commands reach through `_cctally()`.
+
+    Each command test loads it itself. Relying on an earlier test having
+    registered ``sys.modules["cctally"]`` raised ``KeyError: 'cctally'`` when
+    the test ran alone: the quick gate's source-aware row, a single node, or
+    an xdist worker that drew it first.
+    """
+    return load_script()
+
+
 @pytest.fixture
 def analytics_entries():
     return (
@@ -971,7 +983,7 @@ def test_report_block_selection_keeps_newest_block_per_full_identity(two_blocks)
     ],
 )
 def test_source_command_entries_emit_direct_codex_json(
-    analytics_entries, command_name, extra, capsys,
+    cctally_module, analytics_entries, command_name, extra, capsys,
 ):
     args = SimpleNamespace(
         source_entries=analytics_entries,
@@ -1136,7 +1148,7 @@ def test_all_source_diff_omits_unavailable_codex_values_from_combined(analytics_
     ],
 )
 def test_source_command_returns_stamped_unavailable_when_accounting_fallback_fails(
-    command_name, args_data, diff, monkeypatch, capsys,
+    cctally_module, command_name, args_data, diff, monkeypatch, capsys,
 ):
     def fail_both(_args, _start, _end, *, qualified, inclusive_end=False):
         if qualified:
@@ -1217,7 +1229,8 @@ def test_project_excluding_diff_keeps_unavailable_envelope_when_accounting_fails
     ],
 )
 def test_source_command_preserves_partial_accounting_when_only_qualified_metadata_fails(
-    analytics_entries, command_name, args_data, diff, unavailable_key, monkeypatch, capsys,
+    cctally_module, analytics_entries, command_name, args_data, diff, unavailable_key, monkeypatch,
+    capsys,
 ):
     def accounting_fallback(_args, _start, _end, *, qualified, inclusive_end=False):
         if qualified:

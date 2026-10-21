@@ -21,6 +21,44 @@ if str(BIN_DIR) not in sys.path:
 ROLLOUTS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1" / "rollouts"
 
 
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
+
+
 def _seed_retained_store(tmp_path, monkeypatch):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path / "data")
@@ -193,8 +231,14 @@ def test_valid_root_prunes_one_genuinely_deleted_rollout_and_clears_refusal(
         cache_stats = ns["sync_codex_cache"](cache)
         conversation_stats = ns["sync_codex_conversations"](conversations)
 
-        assert cache_stats.files_pruned == 1
-        assert conversation_stats.files_pruned == 1
+        assert cache_stats.files_pruned == 0
+        prune_result = sys.modules["_cctally_cache"].run_codex_prune_drain(
+            wait_for_requests=False)
+        assert prune_result.identities_deleted == 1
+        assert conversation_stats.files_pruned == 0
+        conversation_drain = sys.modules["_cctally_cache"].run_codex_conversation_prune_drain(
+            wait_for_requests=False)
+        assert conversation_drain.identities_deleted == 1
         assert cache_stats.prune_refused is False
         assert conversation_stats.prune_refused is False
         assert cache.execute(
@@ -356,8 +400,14 @@ def test_valid_sibling_does_not_authorize_pruning_an_unmounted_configured_root(
         monkeypatch.setenv("CODEX_HOME", str(root_a))
         cache_pruned = ns["sync_codex_cache"](cache)
         conversations_pruned = ns["sync_codex_conversations"](conversations)
-        assert cache_pruned.files_pruned == 1
-        assert conversations_pruned.files_pruned == 1
+        assert cache_pruned.files_pruned == 0
+        prune_result = sys.modules["_cctally_cache"].run_codex_prune_drain(
+            wait_for_requests=False)
+        assert prune_result.identities_deleted == 1
+        assert conversations_pruned.files_pruned == 0
+        conversation_drain = sys.modules["_cctally_cache"].run_codex_conversation_prune_drain(
+            wait_for_requests=False)
+        assert conversation_drain.identities_deleted == 1
         assert cache_pruned.prune_refused is False
         assert conversations_pruned.prune_refused is False
         assert cache.execute(
@@ -464,9 +514,27 @@ def test_failed_recovery_walk_keeps_both_refusal_markers(tmp_path, monkeypatch):
             fh.write(b"\n")
         monkeypatch.setenv("CODEX_HOME", str(valid_root))
         real_open = builtins.open
+        cache_mod = sys.modules["_cctally_cache"]
+        real_recognizer = cache_mod._codex_file_is_recognizable
+        recognizing = False
+
+        def recognize_before_injected_failure(path):
+            # #968 recognition now shares open_decoded with the ingest path.
+            # Preserve this test's intended boundary: actual positive root
+            # evidence first, then a failure of each ordinary delta read.
+            nonlocal recognizing
+            recognizing = True
+            try:
+                return real_recognizer(path)
+            finally:
+                recognizing = False
+
+        monkeypatch.setattr(cache_mod, "_codex_file_is_recognizable",
+                            recognize_before_injected_failure)
 
         def fail_rollout_open(file, *args, **kwargs):
-            if pathlib.Path(file) == rollout and args and args[0] == "rb":
+            if (not recognizing and pathlib.Path(file) == rollout
+                    and args and args[0] == "rb"):
                 raise OSError("injected read failure")
             return real_open(file, *args, **kwargs)
 
@@ -474,6 +542,7 @@ def test_failed_recovery_walk_keeps_both_refusal_markers(tmp_path, monkeypatch):
         cache_stats = ns["sync_codex_cache"](cache)
         conversation_stats = ns["sync_codex_conversations"](conversations)
         assert cache_stats.files_processed == 0
+        assert cache_stats.files_failed == 1
         assert conversation_stats.files_failed == 1
 
         import _cctally_cache

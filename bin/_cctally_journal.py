@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
@@ -41,10 +43,13 @@ import time
 from dataclasses import dataclass, field, replace as _dc_replace
 
 import _cctally_core
+import _lib_account_protocol
 import _lib_accounts
 import _lib_cache_coverage
 import _lib_journal
 import _lib_journal_router
+import _lib_legacy_spool
+import _lib_legacy_writer_evidence
 import _lib_record
 import _lib_segment_summary
 import _lib_selector_state
@@ -455,6 +460,67 @@ def _remove_empty_future_segments(
     return _list_append_target_candidates(journal_dir, seg_name)
 
 
+#: In-process memo of the verified account-bound cutover: ``(journal dir,
+#: segment, op offset, (st_dev, st_ino))``. Steady-state appends check it with
+#: one `stat` — never a journal scan or a line read (spec 5.5, C4).
+_ACCOUNT_BOUND_CUTOVER_MEMO = None
+
+
+def account_bound_cutover_enforced() -> bool:
+    """False only under the test-harness opt-out
+    ``CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER=1``, which low-level journal
+    mechanics suites set because they pin the exact bytes, offsets and line
+    counts of their own records. The chokepoint itself is covered by
+    tests/test_statusline_cutover_f1.py.
+
+    #825/#832 fix round A (review P3-6): the opt-out is honoured only while a
+    pytest test is running (`PYTEST_CURRENT_TEST`, which pytest sets for the
+    duration of each test and its subprocesses inherit), so the variable alone
+    can never switch the fence off in production."""
+    return not (os.environ.get("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER")
+                and os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _require_account_bound_cutover(now_utc=None) -> None:
+    """Enforce, for a stamped append, that the account-bound cutover op exists
+    in this journal, establishing it first when absent (#825/#832 spec 5.5:
+    "every append entry point enforces its existence for stamped records").
+
+    Every current mutating producer reaches the journal through
+    `append_record`/`append_records`, so this ONE chokepoint covers the
+    statusline reducer, `record-usage`, `hook-tick`, `refresh-usage`,
+    `record-credit`, the dashboard and the ingest emitters alike. The op is
+    appended under `journal.lock` by `ensure_account_bound_cutover` before this
+    caller takes the same lock, so it always lands at a smaller coordinate
+    than the record. While the one-time journal cutover is still pending the
+    boundary cannot be fixed yet; the record is then appended inside what will
+    become the historical prefix, which is admitted input either way."""
+    global _ACCOUNT_BOUND_CUTOVER_MEMO
+    if not account_bound_cutover_enforced():
+        return
+    journal_dir = _cctally_core.JOURNAL_DIR
+    memo = _ACCOUNT_BOUND_CUTOVER_MEMO
+    if memo is not None and memo[0] == str(journal_dir):
+        try:
+            st = os.stat(journal_dir / memo[1])
+        except OSError:
+            st = None
+        if (st is not None and (st.st_dev, st.st_ino) == memo[3]
+                and st.st_size > memo[2]):
+            return
+    try:
+        boundary = ensure_account_bound_cutover(now_utc=now_utc)
+    except AccountBoundCutoverDeferred:
+        return
+    try:
+        st = os.stat(journal_dir / boundary.segment)
+    except OSError:
+        return
+    _ACCOUNT_BOUND_CUTOVER_MEMO = (
+        str(journal_dir), boundary.segment, int(boundary.end_offset),
+        (st.st_dev, st.st_ino))
+
+
 def _validate_append_target(journal_dir, seg_name: str) -> None:
     """Refuse an append whose target is not the canonically-last segment.
 
@@ -541,6 +607,12 @@ def append_record(
     explicit_now = now_utc is not None
     if now_utc is None:
         now_utc = _utc_now()
+    # #825/#832 spec 5.1: every record the current binary writes carries the
+    # writer-generation stamp, prepared by the ONE shared step before encoding.
+    record = _lib_journal.prepare_record(record)
+    # #825/#832 spec 5.5: a stamped record never precedes the cutover op.
+    # Taken BEFORE `journal.lock`, because establishment acquires it itself.
+    _require_account_bound_cutover(now_utc if explicit_now else None)
     data = _lib_journal.encode_line(record)
     if len(data) > _MAX_LINE_BYTES:
         raise JournalError(
@@ -560,6 +632,7 @@ def append_record(
             pass
 
     lock_fd = _acquire_leaf_lock()
+    appended = False
     try:
         if dedupe_codex_quota:
             if not _is_codex_quota_obs(record):
@@ -596,6 +669,7 @@ def append_record(
             _write_all(fd, data)
             os.fsync(fd)
             end_offset = os.fstat(fd).st_size
+            appended = True
         finally:
             os.close(fd)
         if dedupe_codex_quota:
@@ -609,6 +683,15 @@ def append_record(
         return (seg_name, end_offset)
     finally:
         _release_leaf_lock(lock_fd)
+        # #825/#832 spec 4.3 revision 2: journal growth wakes deferred
+        # statusline work only while a frontier conflict is pending, and the
+        # dispatch is deferred past any lock the caller holds.
+        if appended:
+            try:
+                import _cctally_statusline
+                _cctally_statusline.post_wake("append")
+            except Exception:
+                pass
 
 
 def append_records(
@@ -637,9 +720,13 @@ def append_records(
     explicit_now = now_utc is not None
     if now_utc is None:
         now_utc = _utc_now()
+    # #825/#832 spec 5.5: see append_record. A caller-pinned high water is
+    # checked after this, so an establishment here surfaces as that caller's
+    # own drift refusal rather than being silently absorbed.
+    _require_account_bound_cutover(now_utc if explicit_now else None)
     encoded = []
     for record in records:
-        data = _lib_journal.encode_line(record)
+        data = _lib_journal.encode_line(_lib_journal.prepare_record(record))
         if len(data) > _MAX_LINE_BYTES:
             raise JournalError(
                 f"journal line is {len(data)} bytes, exceeds the "
@@ -659,6 +746,7 @@ def append_records(
             pass
 
     lock_fd = _acquire_leaf_lock()
+    appended = False
     try:
         segments = list_segments()
         actual_high_water = None
@@ -695,6 +783,7 @@ def append_records(
             _repair_torn_tail(fd)
             for index, data in enumerate(encoded, start=1):
                 _write_all(fd, data)
+                appended = True
                 if line_hook is not None:
                     line_hook(index)
             os.fsync(fd)
@@ -708,6 +797,13 @@ def append_records(
         return (seg_name, end_offset)
     finally:
         _release_leaf_lock(lock_fd)
+        # #825/#832 spec 4.3 revision 2: see `append_record`.
+        if appended:
+            try:
+                import _cctally_statusline
+                _cctally_statusline.post_wake("append")
+            except Exception:
+                pass
 
 
 def list_segments() -> list[str]:
@@ -715,18 +811,27 @@ def list_segments() -> list[str]:
     segments first, then observation segments, each class lexicographic.
     Excludes ``.partial`` cutover files and any non-segment entries."""
     journal_dir = _cctally_core.JOURNAL_DIR
-    if not journal_dir.exists():
+    # Review cycle 7 825-832-CD3-J02: only an ABSENT journal directory or
+    # entry is absent. `Path.exists`/`Path.is_file` answer False for any stat
+    # error under Python 3.14, which silently dropped an unreadable segment
+    # from the listing and so from every scan built on it; `DirEntry.is_file`
+    # raises every error but ENOENT (and needs no stat at all for a regular
+    # file on a filesystem that reports entry types).
+    try:
+        listing = os.scandir(journal_dir)
+    except FileNotFoundError:
         return []
     names = []
-    for entry in journal_dir.iterdir():
-        name = entry.name
-        if not name.endswith(".jsonl"):
-            continue
-        if not (name.startswith(_lib_journal.BOOTSTRAP_PREFIX)
-                or name.startswith(_lib_journal.SEGMENT_PREFIX)):
-            continue
-        if entry.is_file():
-            names.append(name)
+    with listing:
+        for entry in listing:
+            name = entry.name
+            if not name.endswith(".jsonl"):
+                continue
+            if not (name.startswith(_lib_journal.BOOTSTRAP_PREFIX)
+                    or name.startswith(_lib_journal.SEGMENT_PREFIX)):
+                continue
+            if entry.is_file():
+                names.append(name)
     return sorted(names, key=_lib_journal.segment_sort_key)
 
 
@@ -784,19 +889,24 @@ def _complete_line_offset(path, size: int) -> int:
     `_COMPLETE_LINE_TAIL_WINDOW` answers 0 rather than reading the whole
     segment: 0 is a valid boundary, it is the conservative direction, and it is
     computed identically by every caller, so two callers cannot disagree.
+
+    A failed tail read RAISES (#825/#832 fix round K11, K9K10-R5/R10): 0 is a
+    valid boundary only when the segment really holds no complete line. The
+    frozen extents of the account-bound cutover, the latest-anchor scan and
+    the excluded population must never mistake an unreadable segment for an
+    empty one, so the callers that can tolerate the failure (the coverage
+    vector, the cursor and high-water normalizers) catch it explicitly and
+    keep their conservative answer.
     """
     if size <= 0:
         return 0
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(size - 1)
-            if handle.read(1) == b"\n":
-                return size
-            window = min(size, _COMPLETE_LINE_TAIL_WINDOW)
-            handle.seek(size - window)
-            tail = handle.read(window)
-    except OSError:
-        return 0
+    with open(path, "rb") as handle:
+        handle.seek(size - 1)
+        if handle.read(1) == b"\n":
+            return size
+        window = min(size, _COMPLETE_LINE_TAIL_WINDOW)
+        handle.seek(size - window)
+        tail = handle.read(window)
     index = tail.rfind(b"\n")
     if index < 0:
         return 0
@@ -1090,7 +1200,7 @@ class _SegmentSummaryCollector:
 
     __slots__ = ("summaries", "last_seen", "_name", "_lo", "_stat",
                  "_lines", "_bytes", "_decodes", "_malformed", "_retained",
-                 "_line_end", "_prefix_digest")
+                 "_line_end", "_prefix_digest", "_non_codex_quota")
 
     def __init__(self) -> None:
         self.summaries: dict = {}
@@ -1107,6 +1217,7 @@ class _SegmentSummaryCollector:
         self._decodes = 0
         self._malformed = 0
         self._retained = 0
+        self._non_codex_quota = 0
         self._line_end = 0
         # #834 S2 (#827): the running digest of the COMPLETE prefix this summary
         # will describe. Accumulated from the bytes the pass is already reading,
@@ -1143,7 +1254,7 @@ class _SegmentSummaryCollector:
         self._prefix_digest.update(raw)
         self._prefix_digest.update(b"\n")
 
-    def decoded(self, retained: bool) -> None:
+    def decoded(self, retained: bool, codex_quota: bool = False) -> None:
         """One decoded record: one traversal decode AND one `decoded` element.
 
         ONE counter, because the two are the same number by construction — the
@@ -1157,6 +1268,8 @@ class _SegmentSummaryCollector:
         self._decodes += 1
         if retained:
             self._retained += 1
+        if not codex_quota:
+            self._non_codex_quota += 1
 
     def malformed_line(self) -> None:
         self._malformed += 1
@@ -1187,6 +1300,7 @@ class _SegmentSummaryCollector:
                 decodes=self._decodes,
                 malformed=self._malformed,
                 quota_only=self._retained == 0,
+                codex_quota_only=self._non_codex_quota == 0,
                 decoded_entry_count=self._decodes,
                 complete_prefix_sha256=self._prefix_digest.hexdigest(),
                 last_seen_stamped=(
@@ -1240,8 +1354,13 @@ def coverage_pinned_vector():
             # vector nothing can match, which falls back to a full replay. That
             # is the right answer: the journal shape moved under this pass.
             size = -1
-        vector.append(
-            (name, size, 0 if size < 0 else _complete_line_offset(path, size)))
+        try:
+            complete = 0 if size < 0 else _complete_line_offset(path, size)
+        except OSError:
+            # An unreadable tail leaves a vector nothing can match: a full
+            # replay, exactly as for a vanished segment.
+            complete = 0
+        vector.append((name, size, complete))
     return tuple(vector)
 
 
@@ -1324,6 +1443,51 @@ ALERT_DISPATCHER = None
 FOLD_APPLIERS: dict = {}
 
 
+@dataclass(frozen=True)
+class LockBlock:
+    """The lock a failed acquisition lost to (#825/#832 review finding
+    CD2-007, Codex fix-round-4 Q3), reported by the failed try-lock itself.
+
+    ``lock`` names the dependency (``maintenance``, ``ingest``,
+    ``epoch-worker``, ``heal-worker``, or — for a cache-leg prefix stop,
+    cycle-4 finding CD2-007 — ``cache`` for the global cache writer flock and
+    ``cache-codex`` for the Codex provider cache flock) and ``mode`` the mode
+    that was requested (``shared`` or ``exclusive``): a waiter acquiring in that mode
+    conflicts with every holder that could have refused it. ``contended`` is
+    True when the lock was HELD (contention), False for an I/O error, which
+    no holder caused and which therefore never manufactures a release wake.
+    """
+
+    lock: str
+    mode: str
+    contended: bool
+
+
+#: The cache writer flock this context's most recent cache-leg prefix stop
+#: lost to, as a `LockBlock` (#825/#832 cycle-4 finding CD2-007), or None. A
+#: context variable rather than a widened return, because `QUOTA_APPLIER`'s
+#: `(decoded) -> stop | None` contract has test doubles; `_run_cycle` resets
+#: it before calling the leg and reads it on a stop.
+_CACHE_LEG_BLOCK = contextvars.ContextVar("journal_cache_leg_block", default=None)
+
+
+def _cache_lock_block(path, exc) -> "LockBlock":
+    """The `LockBlock` of a failed cache writer flock acquisition: which of
+    the two ordered flocks refused it (both are always requested
+    exclusively), and whether it was held or an I/O error."""
+    codex = pathlib.Path(str(path)) == pathlib.Path(
+        str(_cctally_core.CACHE_LOCK_CODEX_PATH))
+    return LockBlock("cache-codex" if codex else "cache", "exclusive",
+                     isinstance(exc, BlockingIOError))
+
+
+def _lock_block(lock: str, mode: str) -> "LockBlock":
+    """The `LockBlock` of the acquisition helper that just returned None, from
+    the cause it recorded in `_LOCK_FAILURE`. Only a recorded I/O error is not
+    contention: a helper that records nothing returned None for a busy lock."""
+    return LockBlock(lock, mode, _LOCK_FAILURE.get() != "error")
+
+
 @dataclass
 class IngestResult:
     """Outcome of one `run_stats_ingest` call."""
@@ -1349,6 +1513,22 @@ class IngestResult:
     # caller must still mark the ledger.
     meter_rate_change_result: object = None
     deferred_alerts: list = field(default_factory=list)
+    # #825/#832 Codex fix-round-4 Q3: on a `ran=False` that a lock refused,
+    # the `LockBlock` naming that lock, the requested mode and whether it was
+    # held (contention) or the try-lock failed with an I/O error. Cycle-4
+    # finding CD2-007: ALSO on a `ran=True` cycle whose cache leg
+    # prefix-stopped because a cache writer flock refused it, since the
+    # records past the stop wait for that lock's release exactly as a
+    # refused ingest does. None for every other outcome, including a
+    # `ran=False` no lock caused and a prefix stop a SQLite failure caused.
+    blocked_by: "LockBlock | None" = None
+    # #825/#832 fix round K5 (Codex cycle 6 P1-1): the journal cursor this
+    # cycle left applied — its high water, or the cache-leg prefix-stop
+    # coordinate — so a caller that owes a residual derivation can judge
+    # whether the inputs it owes are now consumed, rather than assume it from
+    # the attempt having returned. None when no cycle ran or nothing was
+    # ever consumed.
+    applied_through: "tuple | None" = None
 
 
 @dataclass(frozen=True)
@@ -1429,6 +1609,26 @@ class IngestContext:
     # violated the same-revision rule. Each entry is a `DroppedConflict`; the row
     # was converged from the already-journaled effective event instead.
     conflicts_dropped: list = field(default_factory=list)
+    # #825/#832 spec 5.6: the outcome-quarantine fold this cycle advances in
+    # journal order, and the gate it decided for the record whose hooks are
+    # running. `None` (a direct caller with no fold) leaves every automatic
+    # outcome allowed, exactly as before.
+    quarantine: object = None
+    outcome_gate: object = None
+    # #825/#832 fix round A (Codex fix-round-1 Q2): where this cycle stopped
+    # reading and the admission boundary it classified against, so the
+    # physical collision check can also see an excluded twin a previous-release
+    # process appended past this cycle's high-water. `excluded_tail` caches
+    # that scan for the cycle.
+    unread_from: object = None
+    admission_boundary: object = None
+    excluded_tail: "dict | None" = None
+    # #825/#832 fix round E (spec 4.7 revision 1): a derivation-completion
+    # scratch replay's `ScratchRetention`, which decides what the private
+    # projection holds for each derived id (the retained effective decision,
+    # never a fresh candidate in its place). None everywhere else: `db
+    # rederive` and live ingest are unchanged.
+    scratch_retention: object = None
 
     def as_of_for(self, record: dict) -> str:
         return record["at"]
@@ -1532,11 +1732,25 @@ class _HarvestSpec:
 # ingest lock (spec §5.1: opportunistic NB / authoritative bounded-blocking)
 # --------------------------------------------------------------------------
 
+#: Why this context's most recent lock acquisition helper returned None
+#: (#825/#832 Codex fix-round-4 Q3): ``contention`` when the lock was held,
+#: ``error`` for any other OS error. A context variable rather than a
+#: parameter, so every existing caller and test double of the helpers keeps
+#: its signature; `_run_stats_ingest_once` resets it before each acquisition.
+_LOCK_FAILURE = contextvars.ContextVar("journal_lock_failure", default=None)
+
+
+def _note_lock_failure(exc) -> None:
+    """Record why a try-lock failed: held, or an I/O error."""
+    _LOCK_FAILURE.set("contention" if isinstance(exc, BlockingIOError) else "error")
+
+
 def _acquire_ingest_lock(mode: str, timeout_s: float) -> int | None:
     """Acquire `journal.ingest.lock`; return the held fd or None (busy).
 
     Opportunistic → single non-blocking attempt (busy = None). Authoritative →
     poll LOCK_NB up to `timeout_s` (a bounded blocking wait; None on timeout).
+    On None, the last attempt's cause is recorded in `_LOCK_FAILURE`.
     """
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(_cctally_core.JOURNAL_INGEST_LOCK_PATH),
@@ -1545,7 +1759,8 @@ def _acquire_ingest_lock(mode: str, timeout_s: float) -> int | None:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fd
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as exc:
+            _note_lock_failure(exc)
             os.close(fd)
             return None
     deadline = time.monotonic() + timeout_s
@@ -1559,8 +1774,9 @@ def _acquire_ingest_lock(mode: str, timeout_s: float) -> int | None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return fd
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
                 if time.monotonic() >= deadline:
+                    _note_lock_failure(exc)
                     os.close(fd)
                     return None
                 time.sleep(0.02)
@@ -1589,7 +1805,8 @@ def _acquire_maintenance_shared(mode: str, timeout_s: float) -> int | None:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             _cctally_core.note_stats_maintenance_acquired()
             return fd
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as exc:
+            _note_lock_failure(exc)
             os.close(fd)
             return None
     deadline = time.monotonic() + timeout_s
@@ -1599,8 +1816,9 @@ def _acquire_maintenance_shared(mode: str, timeout_s: float) -> int | None:
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 _cctally_core.note_stats_maintenance_acquired()
                 return fd
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
                 if time.monotonic() >= deadline:
+                    _note_lock_failure(exc)
                     os.close(fd)
                     return None
                 time.sleep(0.02)
@@ -1622,7 +1840,8 @@ def _acquire_maintenance_exclusive(mode: str, timeout_s: float) -> int | None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _cctally_core.note_stats_maintenance_acquired()
             return fd
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as exc:
+            _note_lock_failure(exc)
             os.close(fd)
             return None
     deadline = time.monotonic() + timeout_s
@@ -1632,8 +1851,9 @@ def _acquire_maintenance_exclusive(mode: str, timeout_s: float) -> int | None:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 _cctally_core.note_stats_maintenance_acquired()
                 return fd
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
                 if time.monotonic() >= deadline:
+                    _note_lock_failure(exc)
                     os.close(fd)
                     return None
                 time.sleep(0.02)
@@ -1732,6 +1952,215 @@ def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
         "applied_offset = excluded.applied_offset",
         (segment, offset, segment, offset),
     )
+
+
+#: #825/#832 fix round A: the first stats index epoch that carries
+#: `journal_derivation_frontier`. A frontier read from any earlier epoch — in
+#: practice the previous release republishing its own index — is never trusted
+#: as proof that derivation completed (Codex fix-round-1 Q1).
+DERIVATION_FRONTIER_EPOCH = 1018
+
+#: #825/#832 revision 2 (#946, Codex design-fix-round-3 Q5): the generation of
+#: the derivation-completeness proof. Generation 1 (stored as NULL) advanced
+#: from a cursor that could pass a torn suffix, so a row of it can name a
+#: valid endpoint past an input nothing derived; endpoint checks cannot tell,
+#: so every older generation is untrusted and the next rebuild reconstructs
+#: from the journal's origin. Bumped whenever the rule that advances the
+#: frontier changes.
+DERIVATION_PROOF_GENERATION = 2
+
+
+@dataclass(frozen=True)
+class DerivationFrontier:
+    """The index's derivation proof (#825/#832 fix round C, P1-1).
+
+    ``frontier`` counts CONSUMED INPUTS: every admitted derivable input at or
+    before it has had its decisions journaled by a current binary.
+    ``output_end`` is where those decisions end: an ingest cycle consumes its
+    inputs through its captured high water and journals what it derives from
+    them BEYOND it, so a state rebuilt through ``frontier`` alone lacks them.
+    Every decision derived from an input at or before ``frontier`` is
+    journaled at or before ``output_end``, and no admitted decision between
+    the two was derived from a later input. ``None`` means nothing is owed
+    beyond the frontier. The two coordinates are never merged: consumed-input
+    coverage and output positions are different facts."""
+    frontier: tuple
+    output_end: "tuple | None" = None
+
+
+def _read_derivation_state(conn) -> "DerivationFrontier | None":
+    """The index's derivation proof, or None when it is unknown — including a
+    proof of any generation other than `DERIVATION_PROOF_GENERATION`, which
+    is therefore never extended or restamped (revision 2)."""
+    row = conn.execute(
+        "SELECT segment, offset, output_segment, output_offset, "
+        "proof_generation FROM journal_derivation_frontier WHERE id = 1"
+    ).fetchone()
+    if row is None or row[4] != DERIVATION_PROOF_GENERATION:
+        return None
+    output_end = (None if row[2] is None or row[3] is None
+                  else (str(row[2]), int(row[3])))
+    return DerivationFrontier((str(row[0]), int(row[1])), output_end)
+
+
+def read_derivation_proof(conn) -> "DerivationFrontier | None":
+    """The derivation proof of the index ``conn`` reads, inside the caller's
+    validated snapshot (`_read_derivation_state`)."""
+    return _read_derivation_state(conn)
+
+
+def derivation_complete_through(proof, cursor) -> bool:
+    """Whether ``proof`` certifies everything the applied ``cursor`` covers
+    (review cycle 3 P1-1, Codex fix-round-4 Q1): classification needs
+    consumed-input AND output completeness, not applied coverage alone.
+
+    Consumed inputs: the frontier IS the cursor, so every admitted derivable
+    input the index folded had its decisions journaled by a current binary.
+    A frontier behind the cursor marks inputs some rebuild consumed without
+    deriving; one ahead of it marks inputs the index has not folded. Output:
+    no owed decision lies beyond the cursor, so the index already holds every
+    output of those inputs. An absent or older-generation proof certifies
+    nothing."""
+    if proof is None or cursor is None:
+        return False
+    if tuple(proof.frontier) != tuple(cursor):
+        return False
+    return proof.output_end is None or (
+        journal_coordinate_key(proof.output_end)
+        <= journal_coordinate_key(cursor))
+
+
+def _read_derivation_frontier(conn) -> "tuple[str, int] | None":
+    """The index's derivation frontier (consumed inputs), or None."""
+    state = _read_derivation_state(conn)
+    return None if state is None else state.frontier
+
+
+def _write_derivation_frontier(conn, frontier, output_end=None) -> None:
+    """Replace the derivation frontier; ``None`` records it as unknown.
+
+    ``frontier`` is a coordinate or a `DerivationFrontier`; ``output_end``
+    (with a bare coordinate) names where the frontier's own decisions end."""
+    if isinstance(frontier, DerivationFrontier):
+        frontier, output_end = frontier.frontier, frontier.output_end
+    conn.execute("DELETE FROM journal_derivation_frontier")
+    if frontier is not None:
+        if output_end is not None and (
+                journal_coordinate_key(output_end)
+                <= journal_coordinate_key(frontier)):
+            output_end = None
+        conn.execute(
+            "INSERT INTO journal_derivation_frontier "
+            "(id, segment, offset, output_segment, output_offset, "
+            "proof_generation) VALUES (1, ?, ?, ?, ?, ?)",
+            (str(frontier[0]), int(frontier[1]),
+             None if output_end is None else str(output_end[0]),
+             None if output_end is None else int(output_end[1]),
+             DERIVATION_PROOF_GENERATION),
+        )
+
+
+def _record_excluded_revisions(conn, records) -> None:
+    """Fold the excluded events and correction actions among ``records`` into
+    the physical revision inventory (Codex fix-round-1 Q2)."""
+    for record in records:
+        if not isinstance(record, dict) or record.get("t") not in (
+                "evt", "correction"):
+            continue
+        event_id = record.get("id")
+        rev = record.get("rev", 0)
+        if not isinstance(event_id, str) or not event_id or (
+                type(rev) is not int or rev < 0):
+            continue
+        conn.execute(
+            "INSERT INTO journal_excluded_event_revisions (event_id, max_rev) "
+            "VALUES (?, ?) ON CONFLICT(event_id) DO UPDATE SET "
+            "max_rev = MAX(max_rev, excluded.max_rev)",
+            (event_id, rev),
+        )
+
+
+def journal_coordinate_key(coordinate) -> tuple:
+    """Canonical journal order of a `(segment, offset)` coordinate."""
+    return (_lib_journal.segment_sort_key(coordinate[0]), int(coordinate[1]))
+
+
+def read_trusted_derivation_frontier(path) -> "tuple[str, int] | None":
+    """The consumed-input frontier of `read_trusted_derivation_state`."""
+    state = read_trusted_derivation_state(path)
+    return None if state is None else state.frontier
+
+
+def _sound_line_boundary(coordinate) -> bool:
+    """Whether ``coordinate`` names a retained segment at a complete-line
+    boundary inside it."""
+    segment, offset = coordinate
+    if offset < 0 or segment not in list_segments():
+        return False
+    seg_path = _cctally_core.JOURNAL_DIR / segment
+    try:
+        if offset > os.path.getsize(seg_path):
+            return False
+        if offset > 0:
+            with _open_segment_for_read(seg_path) as handle:
+                handle.seek(offset - 1)
+                if handle.read(1) != b"\n":
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def read_trusted_derivation_state(path) -> "DerivationFrontier | None":
+    """The derivation proof of the index at ``path`` when it can be
+    trusted, else None (#825/#832 fix round A, Codex fix-round-1 Q1; the
+    output end is fix round C, P1-1).
+
+    Trusted means: a readable index at `DERIVATION_FRONTIER_EPOCH` or later
+    (only an account-bound binary writes one), carrying the frontier row, whose
+    coordinates (the frontier and any output end beyond it) name segments the
+    journal still has, at complete-line boundaries inside them. A
+    previous-release index, a corrupt or missing file,
+    or any doubt answers None, and the caller replays from the cutover.
+
+    The live index is read only when its WAL/SHM family is raw-classified
+    safe, exactly as `_observe_selector_desynchronization` reads it (#514):
+    even a `mode=ro` open of an unproven family can rewrite the `-shm` header
+    before the rebuild's cutover preserves the incident bytes, destroying the
+    evidence the publication protocol (#496) exists to keep. An unproven
+    family answers None, the conservative start."""
+    import _lib_stats_wal
+
+    path = pathlib.Path(path)
+    if not path.exists():
+        return None
+    wal_index = _lib_stats_wal.inspect_wal_index_family(path)
+    if wal_index.get("verdict") not in {"coherent", "wal_absent", "wal_empty"}:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        epoch = conn.execute("PRAGMA user_version").fetchone()[0]
+        if type(epoch) is not int or epoch < DERIVATION_FRONTIER_EPOCH:
+            return None
+        state = _read_derivation_state(conn)
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        conn.close()
+    if state is None or not _sound_line_boundary(state.frontier):
+        return None
+    # The output end is part of the proof: an unsound one, or one behind the
+    # frontier, makes the whole row untrusted rather than silently dropping
+    # the decisions it names.
+    if state.output_end is not None and (
+            not _sound_line_boundary(state.output_end)
+            or journal_coordinate_key(state.output_end)
+            <= journal_coordinate_key(state.frontier)):
+        return None
+    return state
 
 
 _SEGMENT_READ_CHUNK = 256 * 1024
@@ -1893,6 +2322,123 @@ def _read_range(cursor, hw) -> list[tuple[str, int, bytes]]:
     return list(iter_range(cursor, hw))
 
 
+def _cursor_line_boundary(cursor, hw):
+    """``cursor`` moved back to the last complete-line boundary at or before
+    it, within the pinned prefix (#946 endpoint check).
+
+    A cursor inside a line or past its segment's pinned size was left by a
+    binary that advanced over a torn tail; the line straddling it was never
+    consumed, so re-reading from the boundary before it is exactly the safe
+    traversal. This supplements the proof-generation invalidation and never
+    replaces it: once such a cursor has advanced again to a valid endpoint,
+    nothing here can see what it skipped."""
+    if cursor is None or hw is None:
+        return cursor
+    try:
+        segment, offset = str(cursor[0]), int(cursor[1])
+    except (TypeError, ValueError, IndexError):
+        return cursor
+    if offset <= 0:
+        return cursor
+    path = _cctally_core.JOURNAL_DIR / segment
+    try:
+        limit = (int(hw[1]) if segment == hw[0]
+                 else os.path.getsize(path))
+    except OSError:
+        return cursor
+    try:
+        boundary = _complete_line_offset(path, min(offset, limit))
+    except OSError:
+        # The conservative boundary (re-read the segment from its start),
+        # exactly what the swallowed read answered before fix round K11.
+        boundary = 0
+    return cursor if boundary == offset else (segment, boundary)
+
+
+def _safe_pinned_high_water(high_water, segments=None, sizes=None):
+    """The SAFE endpoint of the pinned prefix ``high_water`` (#946; #825/#832
+    spec 4.7 revision 2, Codex design-fix-round-3 Q5).
+
+    A traversal consumes only the COMPLETE lines of its pinned prefix. A
+    complete malformed line it skips and counts is consumed; an unterminated
+    suffix never is, because `_repair_torn_tail` truncates it before the next
+    append and writes a record at the truncation point. Advancing past those
+    bytes (the raw high water) put the next cursor inside or beyond that
+    record, so it was skipped as malformed or never read, and every proof
+    derived from the cursor — the derivation frontier, the Codex coverage
+    certificate — then certified it consumed.
+
+    So the endpoint is the offset after the last newline at or before the
+    pinned size of the high-water segment. Bytes before that newline are
+    immutable (a repair truncates only after it), so pinning this boundary
+    and then reading up to it reads exactly the lines it names.
+
+    An unconsumed suffix is never jumped to reach a later segment without a
+    safe disposition. The one disposition is a SEALED segment: once a later
+    segment holds bytes, `_validate_append_target` refuses every append to an
+    earlier one (a data-bearing later segment fails closed rather than being
+    removed), so an earlier unterminated suffix can never become a record.
+    When every later segment is EMPTY, an appender may still remove them and
+    write behind the suffix, so the endpoint stays at the last complete line
+    of the last data-bearing segment.
+
+    Idempotent: a complete-line boundary maps to itself. ``segments`` and
+    ``sizes`` (parallel) let a caller holding the leaf lock pass the listing
+    and raw sizes it already pinned."""
+    if high_water is None:
+        return None
+    segment, size = str(high_water[0]), int(high_water[1])
+    if segments is None:
+        segments = list_segments()
+    if segment not in segments:
+        return (segment, size)
+    index = segments.index(segment)
+    journal_dir = _cctally_core.JOURNAL_DIR
+    if size > 0:
+        try:
+            # A repair may have truncated the segment below a size pinned
+            # earlier; the bytes past its current end are gone, and the
+            # boundary search must not read past them.
+            size = min(size, os.path.getsize(journal_dir / segment))
+        except OSError:
+            return (segment, size)
+        try:
+            return (segment, _complete_line_offset(journal_dir / segment, size))
+        except OSError:
+            # The conservative endpoint: nothing of the segment is consumed.
+            return (segment, 0)
+    for earlier in range(index - 1, -1, -1):
+        name = segments[earlier]
+        try:
+            raw = (int(sizes[earlier]) if sizes is not None
+                   else os.path.getsize(journal_dir / name))
+        except (OSError, IndexError, TypeError, ValueError):
+            return (segment, 0)
+        if raw <= 0:
+            continue
+        try:
+            complete = _complete_line_offset(journal_dir / name, raw)
+        except OSError:
+            complete = 0
+        return (segment, 0) if complete == raw else (name, complete)
+    return (segment, 0)
+
+
+def journal_safe_high_water() -> "tuple[str, int] | None":
+    """`journal_high_water` reduced to its safe complete-line endpoint
+    (`_safe_pinned_high_water`): what the ingest cycle consumes through, and
+    what a derivation proof's output end names (spec 4.7 revision 2) —
+    never a raw size.
+
+    The reduction reads the pinned segment after the snapshot. Bytes before
+    its last newline at snapshot time never change; if a repair and an
+    append land in between, the newline found can only end a COMPLETE
+    record written since, which the traversal then reads whole. It calls
+    `journal_high_water` through the module so the one snapshot seam tests
+    use to stage an append race stays the one this cycle takes."""
+    return _safe_pinned_high_water(journal_high_water())
+
+
 def journal_prefix_hash(high_water) -> "str | None":
     """Hash exact raw segment bytes through one canonical high-water.
 
@@ -1942,13 +2488,34 @@ def _capture_protocol_prefix_evidence(
         record.get("t") == "op"
         and isinstance(record.get("payload"), dict)
         and record["payload"].get("kind")
-        == _lib_journal._PROTOCOL_RESOLUTION_KIND
+        in _lib_journal.PROTOCOL_RESOLUTION_KINDS
     ):
         digest = (
             hasher.digest_at(prior_high_water) if hasher is not None
             else journal_prefix_hash(prior_high_water)
         )
         evidence.append((prior_high_water, digest))
+
+
+def _admitted_prefix_evidence(evidence, owners, slots) -> list:
+    """The raw-prefix evidence of the resolution records admission kept
+    (#825/#832 fix round C, 825-832-CD2-005).
+
+    A reader that captures evidence during its pass and applies admission
+    after it must exclude a record and its evidence TOGETHER: the selector
+    binds evidence to resolutions one-for-one, so the evidence of an excluded
+    previous-release acknowledgement past the cutover would pair with no
+    admitted resolution and fail selection (`JournalProtocolError`) for every
+    current maintenance command. ``owners`` is parallel to ``evidence``: the
+    slot index of the record each entry was captured for. The digests
+    themselves still cover the complete physical prefix."""
+    kept = []
+    for item, index in zip(evidence, owners):
+        slot = slots[index]
+        if isinstance(slot, dict) and slot.get("t") != (
+                _lib_account_protocol.EXCLUDED_PLACEHOLDER_TYPE):
+            kept.append(item)
+    return kept
 
 
 # --------------------------------------------------------------------------
@@ -2017,6 +2584,59 @@ def _is_codex_quota_obs(rec: dict) -> bool:
         and rec.get("provider") == "codex"
         and (rec.get("payload") or {}).get("kind") == _QUOTA_OBS_KIND
     )
+
+
+#: The byte prefilter for `codex_journal_history_sources`, on the argument
+#: `_FILE_ACCOUNT_KIND_MARKER` states: the canonical encoder never escapes an
+#: ASCII kind token, so every genuine observation carries it verbatim.
+_QUOTA_OBS_KIND_MARKER = f'"{_QUOTA_OBS_KIND}"'.encode("ascii")
+
+
+def _codex_journal_history_evidence(paths, *, identities=(), capture=False):
+    """One off-hook streaming pass for Task10 provenance and retained facts.
+
+    Public callers keep the path-only Interface. The provenance drain also
+    retains matching observations as raw bytes and matching file decisions,
+    in canonical journal order, for per-identity admitted application. No
+    SQLite connection or cache lock is held during this preparation.
+    """
+    wanted, identities = {str(p) for p in paths}, set(identities)
+    hw = journal_safe_high_water()
+    found, quotas, decisions = set(), {}, {}
+    if hw is None or not wanted:
+        return frozenset(), hw, quotas, decisions
+    for _seg, _off, raw in iter_range(None, hw, list_segments()):
+        quota_line = _QUOTA_OBS_KIND_MARKER in raw
+        decision_line = capture and _FILE_ACCOUNT_KIND_MARKER in raw
+        if not (quota_line or decision_line):
+            continue
+        rec = _lib_journal.decode_line(raw)
+        if rec is None:
+            continue
+        if _is_codex_quota_obs(rec):
+            path = (rec.get("payload") or {}).get("source_path")
+            if path in wanted:
+                found.add(path)
+                if capture:
+                    quotas.setdefault(path, []).append(raw)
+                elif len(found) == len(wanted):
+                    break
+        elif decision_line and _is_codex_file_account_op(rec):
+            identity = (rec.get("payload") or {}).get("file_identity")
+            if identity in identities:
+                decisions.setdefault(identity, []).append(rec)
+    return frozenset(found), hw, quotas, decisions
+
+
+def codex_journal_history_sources(paths):
+    """Which paths retained Codex quota observations name, and the safe HW.
+
+    The two-value public Interface is unchanged. Matching by source path
+    alone over-matches conservatively: live authentication never reconstructs
+    a journal-retained historical stamp.
+    """
+    found, hw, _quotas, _decisions = _codex_journal_history_evidence(paths)
+    return found, hw
 
 
 # --------------------------------------------------------------------------
@@ -2915,7 +3535,9 @@ def rehydrate_codex_journal_families(
 
     if authoritative:
         _assert_coverage_already_invalidated(cache_conn, caller=caller)
-    hw = journal_high_water()
+    # #946: the window-attribution cursor stored below is this coordinate,
+    # so it is the safe complete-line endpoint, never the raw size.
+    hw = journal_safe_high_water()
     if hw is None:
         # No journal at all: an authoritative pass still says "the journal is
         # the truth", and the truth is that there is nothing to attribute.
@@ -3269,10 +3891,19 @@ def _cache_applier(decoded, *, cursor=None, covered_to=None,
     )
 
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # #825/#832 cycle-4 finding CD2-007: the prefix stop reports the flock
+    # it lost to (`_CACHE_LEG_BLOCK`), so a deferred statusline reading
+    # leaves an obligation for that lock's release instead of stranding:
+    # releasing a cache lock is no stats event.
+    def _refused(path, exc):
+        _CACHE_LEG_BLOCK.set(_cache_lock_block(path, exc))
+
     try:
         held = acquire_cache_writer_flocks(
             _cctally_core.CACHE_LOCK_PATH,
             _cctally_core.CACHE_LOCK_CODEX_PATH,
+            on_failure=_refused,
         )
     except OSError:
         return stop_idx
@@ -3412,6 +4043,59 @@ def _resolve_ref(conn: sqlite3.Connection, table: str, logical_id) -> int | None
     if row is None:
         return None
     return int(row[0])
+
+
+#: #825/#832 Task 4.0. The FK whose referenced row a journaled suppression may
+#: legitimately delete: a milestone's `usage_snapshot_id`. Every other logical FK
+#: names a row no applier removes, so an unresolvable one is a defect to report.
+_SUPPRESSIBLE_FOLD_REFS = frozenset({("usage_snapshot_id", "weekly_usage_snapshots")})
+
+
+class UnresolvedFoldReference(JournalError):
+    """A journaled logical FK that resolves to no row and that no journaled
+    suppression explains (#825/#832 Task 4.0). Every target column such a
+    reference fills is NOT NULL, so the row cannot be materialized; the callers
+    report it instead of letting `INSERT OR IGNORE` swallow the row."""
+
+    def __init__(self, event_id, column, ref_table, logical_id):
+        self.event_id = event_id
+        self.column = column
+        self.ref_table = ref_table
+        self.logical_id = logical_id
+        super().__init__(
+            f"{event_id}: {column} names {ref_table} {logical_id!r}, which "
+            "no row carries and no journaled suppression removed")
+
+
+def _resolve_fold_ref(conn, evt, column, ref_table, logical_id) -> int:
+    """THE logical-FK resolver for every fold and convergence (#825/#832 Task
+    4.0): `_apply_generic_evt`, `_apply_reset_with_suppression` and
+    `_evt_target_columns` all route through here, so a live convergence and a
+    rebuild cannot resolve one reference two ways.
+
+    A reference that resolves is its rowid (the falsy no-FK sentinel stays 0).
+    A milestone's snapshot reference whose row a journaled suppression deleted
+    resolves to the same 0 "no snapshot row" sentinel: the snapshot is gone in
+    every interpretation of the journal, the milestone is still a journaled
+    fact, and the `trg_usage_snapshot_suppression` trigger points the live
+    row at 0 when the live removal runs, so the live index and a rebuild hold
+    the same value. Anything else raises `UnresolvedFoldReference`."""
+    rowid = _resolve_ref(conn, ref_table, logical_id)
+    if rowid is not None:
+        return rowid
+    if (column, ref_table) in _SUPPRESSIBLE_FOLD_REFS and conn.execute(
+        "SELECT 1 FROM usage_snapshot_suppressions WHERE journal_id = ?",
+        (logical_id,),
+    ).fetchone() is not None:
+        return 0
+    raise UnresolvedFoldReference(evt.get("id"), column, ref_table, logical_id)
+
+
+def _report_unresolved_fold_reference(exc: "UnresolvedFoldReference") -> None:
+    print(
+        f"[journal] fold: {exc}; the row was not materialized",
+        file=sys.stderr,
+    )
 
 
 def _insert_or_ignore(
@@ -3581,6 +4265,144 @@ class UsageSnapshotFoldResult:
     snapshot_action: str
 
 
+# ── Fold policy and the shared axis floors (#825/#832 spec 4.7 rev 6) ───────
+#
+#: The raw Claude usage observation's payload key that records the fold
+#: policy it was captured under (Codex design-fix-round-6 Q1). A missing key
+#: selects the historical policy, so every observation an earlier release
+#: journaled keeps its decision under replay and `db rederive`.
+FOLD_POLICY_KEY = "fold_policy"
+#: The same revision on a frozen statusline publication plan. Recovery keeps
+#: a plan's revision, so a plan frozen before revision 6 publishes an
+#: observation without one.
+PLAN_FOLD_POLICY_KEY = "foldPolicy"
+#: The historical policy: the decisions every unversioned observation made.
+FOLD_POLICY_HISTORICAL = 0
+#: Spec 4.7 *First reading after a floor*: the first eligible observation
+#: after an axis's floor materializes, deduplication requires matching
+#: evidence, and the five-hour floor is the logically ordered reset event.
+FOLD_POLICY_FIRST_POST_FLOOR = 1
+#: The revision newly captured observations and newly frozen plans carry.
+CURRENT_FOLD_POLICY = FOLD_POLICY_FIRST_POST_FLOOR
+
+
+def fold_policy_of(document, key=FOLD_POLICY_KEY) -> int:
+    """The fold policy a raw observation payload (or, with
+    ``PLAN_FOLD_POLICY_KEY``, a frozen plan) records: a known revision, else
+    the historical policy. A bool is never a revision."""
+    value = document.get(key) if isinstance(document, dict) else None
+    if type(value) is int and value == FOLD_POLICY_FIRST_POST_FLOOR:
+        return value
+    return FOLD_POLICY_HISTORICAL
+
+
+@dataclass(frozen=True)
+class AxisFloor:
+    """One axis's floor for EXACTLY one account, resolved on the caller's
+    connection (#825/#832 spec 4.7 revision 6). The fold, the statusline
+    projection and the retry identity all select the floor through
+    :func:`resolve_weekly_axis_floor` / :func:`resolve_five_hour_axis_floor`
+    and filter rows through :func:`captured_at_or_after_floor`, so they agree
+    on the logical floor whatever the physical row order.
+
+    ``floor_at_utc`` / ``floor_epoch`` are None when the axis has no floor.
+    ``logical_generation`` is the five-hour event's replay-stable generation
+    (empty for the weekly axis and for no event); ``event`` is the resolved
+    ``FiveHourResetEvent`` (None otherwise)."""
+
+    account_key: str
+    floor_at_utc: "str | None"
+    floor_epoch: "int | None"
+    logical_generation: str = ""
+    event: object = field(default=None, compare=False)
+
+
+def resolve_weekly_axis_floor(conn, *, account_key, week_start_date,
+                              week_start_at, week_end_at) -> AxisFloor:
+    """The weekly floor: `_reset_aware_floor` for the exact account and the
+    given weekly bounds, with its existing scope (reset events effective
+    inside the interval, credit floors of the start date)."""
+    if not isinstance(account_key, str) or not account_key:
+        raise ValueError("the weekly axis floor requires an exact account")
+    floor = _cctally_core._reset_aware_floor(
+        conn, week_start_date, week_start_at, week_end_at,
+        account_key=account_key)
+    if not floor:
+        return AxisFloor(account_key, None, None)
+    return AxisFloor(account_key, str(floor), _floor_epoch(floor))
+
+
+def resolve_five_hour_axis_floor(conn, *, account_key,
+                                 canonical_window_key) -> AxisFloor:
+    """The five-hour floor: the exact account's and window's reset event as
+    `resolve_five_hour_reset_event` orders it LOGICALLY (effective instant,
+    detection instant, journal identity), never by row id. A database error
+    propagates."""
+    import _cctally_record
+    event = _cctally_record.resolve_five_hour_reset_event(
+        conn, int(canonical_window_key), account_key=account_key)
+    if not isinstance(event, _cctally_record.FiveHourResetEvent):
+        return AxisFloor(account_key, None, None)
+    return AxisFloor(account_key, event.effective_reset_at_utc,
+                     int(event.floor_epoch), event.logical_generation, event)
+
+
+def _floor_epoch(value) -> "int | None":
+    try:
+        return int(_cctally_core.parse_iso_datetime(
+            str(value), "axis floor").timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def captured_at_or_after_floor(captured_at, floor: AxisFloor) -> bool:
+    """Row and capture eligibility after ``floor``: a capture at or after the
+    floor instant (equality qualifies). With no floor every valid capture is
+    eligible; an unparseable capture never is."""
+    captured = _floor_epoch(captured_at)
+    if captured is None:
+        return False
+    return floor.floor_epoch is None or captured >= floor.floor_epoch
+
+
+def latest_post_floor_weekly_row(conn, floor: AxisFloor, *, week_start_date,
+                                 week_end_at):
+    """The latest accepted weekly evidence after ``floor``: a NON-held row of
+    the floor's account, ``week_start_date`` and normalized weekly window
+    (``week_end_at`` compared as an instant) with a valid capture at or after
+    the floor, as ``(weekly_percent, captured_at_utc)``; None when there is
+    none. Held rows carry a copied value and never establish weekly
+    evidence."""
+    if not week_end_at:
+        return None
+    return conn.execute(
+        "SELECT weekly_percent, captured_at_utc FROM weekly_usage_snapshots "
+        "WHERE week_start_date = ? AND account_key = ? "
+        "  AND weekly_observation_held = 0 AND weekly_percent IS NOT NULL "
+        "  AND unixepoch(week_end_at) = unixepoch(?) "
+        "  AND unixepoch(captured_at_utc) >= unixepoch(?) "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+        (week_start_date, floor.account_key, week_end_at,
+         floor.floor_at_utc or "1970-01-01T00:00:00Z"),
+    ).fetchone()
+
+
+def has_post_floor_five_hour_row(conn, floor: AxisFloor, *,
+                                 canonical_window_key) -> bool:
+    """Whether any row of the floor's account and canonical five-hour window
+    carries a valid percent and reset pair with a capture at or after the
+    floor. Weekly-held rows count: their five-hour observation is real."""
+    return conn.execute(
+        "SELECT 1 FROM weekly_usage_snapshots "
+        "WHERE five_hour_window_key = ? AND account_key = ? "
+        "  AND five_hour_percent IS NOT NULL "
+        "  AND five_hour_resets_at IS NOT NULL "
+        "  AND unixepoch(captured_at_utc) >= unixepoch(?) LIMIT 1",
+        (int(canonical_window_key), floor.account_key,
+         floor.floor_at_utc or "1970-01-01T00:00:00Z"),
+    ).fetchone() is not None
+
+
 def _usage_snapshot_fold_decision(
     conn, payload, *, force_weekly_hold=False, reviewed_weekly_basis=None,
 ) -> UsageSnapshotFoldResult:
@@ -3611,7 +4433,20 @@ def _usage_snapshot_fold_decision(
     Every value returned is derived from the same `conn` state and payload, so
     the whole result is exactly as replay-deterministic as the boolean it
     replaces.
+
+    ``payload["fold_policy"]`` (#825/#832 spec 4.7 revision 6) selects the
+    policy the observation was captured under; a missing revision is the
+    historical policy, whose decisions are unchanged. Under
+    ``FOLD_POLICY_FIRST_POST_FLOOR`` the five-hour floor is the logically
+    ordered reset event, ``payload["captured_at"]`` (the observation's
+    retained capture instant) decides whether it can be an axis's first
+    post-floor reading, an axis with no qualifying evidence since its floor
+    is new evidence, and deduplication compares only against matching
+    evidence (`_first_post_floor_unchanged`).
     """
+    first_post_floor = (
+        fold_policy_of(payload) == FOLD_POLICY_FIRST_POST_FLOOR)
+    captured_at = payload.get("captured_at")
     week_start_date = payload["week_start_date"]
     week_start_at = payload.get("week_start_at")
     week_end_at = payload.get("week_end_at")
@@ -3626,10 +4461,10 @@ def _usage_snapshot_fold_decision(
     account_key = payload.get("account_key") or _lib_accounts.UNATTRIBUTED
 
     # ── Weekly axis ────────────────────────────────────────────────────────
-    clamp_floor_iso = _cctally_core._reset_aware_floor(
-        conn, week_start_date, week_start_at, week_end_at,
-        account_key=account_key,
-    ) or "1970-01-01T00:00:00Z"
+    weekly_floor = resolve_weekly_axis_floor(
+        conn, account_key=account_key, week_start_date=week_start_date,
+        week_start_at=week_start_at, week_end_at=week_end_at)
+    clamp_floor_iso = weekly_floor.floor_at_utc or "1970-01-01T00:00:00Z"
     # `weekly_observation_held = 0` (#769 S11): a held row's weekly value is a
     # copy of an OLDER row's, so counting it here would let pre-credit evidence
     # re-enter a post-credit maximum and clamp a genuine reading. The MAX is a
@@ -3673,7 +4508,30 @@ def _usage_snapshot_fold_decision(
     # block, so a weekly-clamped tick reported its five-hour reading RAW.
     adjusted_5h = five_hour_percent
     five_hour_disposition = FIVE_HOUR_MISSING
-    if five_hour_percent is not None and five_hour_window_key is not None:
+    five_hour_floor = None
+    if (first_post_floor and five_hour_percent is not None
+            and five_hour_window_key is not None):
+        five_hour_disposition = FIVE_HOUR_AS_OBSERVED
+        # Revision 6: ONE logically resolved floor serves the in-window
+        # maximum here and the existence test below, and it is the floor the
+        # statusline projection and the retry identity select.
+        five_hour_floor = resolve_five_hour_axis_floor(
+            conn, account_key=account_key,
+            canonical_window_key=five_hour_window_key)
+        max_5h_row = conn.execute(
+            "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots "
+            "WHERE five_hour_window_key = ? AND account_key = ? "
+            "  AND unixepoch(captured_at_utc) >= unixepoch(?)",
+            (int(five_hour_window_key), account_key,
+             five_hour_floor.floor_at_utc or "1970-01-01T00:00:00Z"),
+        ).fetchone()
+        max_5h = max_5h_row[0] if max_5h_row else None
+        if _lib_record.hwm_clamp_applies(float(five_hour_percent), max_5h):
+            adjusted_5h = float(max_5h)
+            five_hour_disposition = FIVE_HOUR_CLAMPED
+        else:
+            adjusted_5h = float(five_hour_percent)
+    elif five_hour_percent is not None and five_hour_window_key is not None:
         five_hour_disposition = FIVE_HOUR_AS_OBSERVED
         max_5h_row = conn.execute(
             "SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots "
@@ -3697,8 +4555,14 @@ def _usage_snapshot_fold_decision(
     # HELD-INCLUSIVE, deliberately. This is a five-hour read as much as a
     # weekly one: a held row carries the latest five-hour value, so excluding
     # it would make the next held tick look like new five-hour evidence and
-    # write a duplicate row every tick. Its weekly value is by construction a
-    # copy of the basis's, so including it changes no weekly comparison.
+    # write a duplicate row every tick. Its weekly value is either a copy of
+    # its basis's (a hold-written row) or, for a row a weekly credit converted
+    # to held (#825/#832 spec 4.7 revision 7), the row's own retired value.
+    # That value only decides whether a reading repeating it on BOTH axes is
+    # skipped as unchanged: a reading with new five-hour evidence is still
+    # written, and a capture at or after the weekly floor under the
+    # first-post-floor policy compares against the latest non-held post-floor
+    # row instead (`_first_post_floor_unchanged`).
     last_week_start_date = (
         basis.week_start_date if force_weekly_hold and basis is not None
         else week_start_date
@@ -3716,6 +4580,18 @@ def _usage_snapshot_fold_decision(
     five_hour_unchanged = adjusted_5h is None or (
         last_5h is not None and float(last_5h) == float(adjusted_5h)
     )
+    weekly_unchanged = (
+        last is not None and float(last[0]) == weekly_percent
+    )
+    if first_post_floor:
+        weekly_unchanged, five_hour_unchanged = _first_post_floor_unchanged(
+            conn, account_key=account_key, captured_at=captured_at,
+            weekly_floor=weekly_floor, week_start_date=week_start_date,
+            week_end_at=week_end_at, weekly_percent=weekly_percent,
+            weekly_held=weekly_held, five_hour_floor=five_hour_floor,
+            five_hour_window_key=five_hour_window_key,
+            adjusted_5h=adjusted_5h, last_week_start_date=last_week_start_date,
+            historical=(weekly_unchanged, five_hour_unchanged))
 
     # ── The window-rollover heal, orthogonal to the action ─────────────────
     rollover_heal = False
@@ -3748,9 +4624,6 @@ def _usage_snapshot_fold_decision(
         else:
             action = SNAPSHOT_WRITE_HELD_5H
     else:
-        weekly_unchanged = (
-            last is not None and float(last[0]) == weekly_percent
-        )
         action = (
             SNAPSHOT_SKIP_NO_CHANGE
             if weekly_unchanged and five_hour_unchanged
@@ -3759,6 +4632,64 @@ def _usage_snapshot_fold_decision(
 
     return UsageSnapshotFoldResult(
         weekly=weekly, five_hour=five_hour, snapshot_action=action)
+
+
+def _first_post_floor_unchanged(
+    conn, *, account_key, captured_at, weekly_floor, week_start_date,
+    week_end_at, weekly_percent, weekly_held, five_hour_floor,
+    five_hour_window_key, adjusted_5h, last_week_start_date, historical,
+):
+    """Whether each axis carries NO new evidence under
+    ``FOLD_POLICY_FIRST_POST_FLOOR`` (#825/#832 spec 4.7 revision 6), as
+    ``(weekly_unchanged, five_hour_unchanged)``.
+
+    A capture before an axis's floor can never be that axis's first post-floor
+    reading, so it keeps the historical comparison (``historical``) for the
+    weekly axis and a key-matching value comparison for the five-hour axis.
+    A capture at or after the floor (equality qualifies) compares only with
+    MATCHING evidence, and an axis with none since its floor is new evidence:
+
+    - weekly: the latest NON-held row of the account's normalized weekly
+      window (the boundary the row would be stored with: the first boundary
+      the account established for the start date, else the tick's own) and
+      floor segment, equal in value. A held row's carried value is not an
+      independent observation. Unused while the weekly axis is held;
+    - five-hour: the latest (held-inclusive) row of the week must carry the
+      tick's canonical key, a valid percent and reset pair, a capture at or
+      after the logical five-hour floor and the same effective value."""
+    import _cctally_weekrefs
+
+    weekly_unchanged, _ = historical
+    if not weekly_held and captured_at_or_after_floor(captured_at, weekly_floor):
+        _, canonical_end = _cctally_weekrefs._get_canonical_boundary_for_date(
+            conn, week_start_date, account_key=account_key)
+        latest = latest_post_floor_weekly_row(
+            conn, weekly_floor, week_start_date=week_start_date,
+            week_end_at=canonical_end or week_end_at)
+        weekly_unchanged = (
+            latest is not None and float(latest[0]) == weekly_percent)
+
+    if adjusted_5h is None or five_hour_floor is None:
+        return weekly_unchanged, True
+    last = conn.execute(
+        "SELECT five_hour_percent, five_hour_window_key, five_hour_resets_at, "
+        "       captured_at_utc "
+        "FROM weekly_usage_snapshots "
+        "WHERE week_start_date = ? AND account_key = ? "
+        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+        (last_week_start_date, account_key),
+    ).fetchone()
+    same_value = (
+        last is not None and last[0] is not None and last[1] is not None
+        and int(last[1]) == int(five_hour_window_key)
+        and float(last[0]) == float(adjusted_5h)
+    )
+    if not captured_at_or_after_floor(captured_at, five_hour_floor):
+        return weekly_unchanged, same_value
+    return weekly_unchanged, (
+        same_value and last[2] is not None
+        and captured_at_or_after_floor(last[3], five_hour_floor)
+    )
 
 
 # NOTE (rev 3): the direct obs -> weekly_usage_snapshots fold is GONE. That
@@ -3980,7 +4911,12 @@ _ACCOUNTS_MACHINERY_KINDS = frozenset(
     ("account_observe", "account_label", "accounts_cutover",
      "claude_weekly_observation_decision",
      "codex_file_account",
-     "codex_window_attribution", "codex_window_attribution_retract"))
+     "codex_window_attribution", "codex_window_attribution_retract",
+     # #825/#832 spec 5.1: the protocol ops and the versioned successors of the
+     # two strict administrative kinds. None carries a target row to stamp.
+     "account_bound_cutover", "legacy_spool_activity",
+     "journal_protocol_resolution_v2",
+     "claude_weekly_observation_decision_v2"))
 
 # Legacy-classifier exhaustiveness guard (#341, review finding P2-1). EVERY evt
 # kind in `_EVT_SPECS` and every harvest kind in `_HARVEST_SPECS` must carry a
@@ -4034,6 +4970,8 @@ def classify_legacy_provider(record) -> str | None:
         return None
     t = record.get("t")
     if t == "obs":
+        if _obs_names_its_account(record):
+            return None
         prov = record.get("provider")
         return prov if prov in ("claude", "codex") else None
     if t == "op":
@@ -4045,6 +4983,40 @@ def classify_legacy_provider(record) -> str | None:
             return vendor if vendor in ("claude", "codex") else None
         return _EVT_KIND_PROVIDER.get(kind)
     return None
+
+
+def _obs_names_its_account(record) -> bool:
+    """Whether an observation states its account explicitly although it has
+    no top-level stamp (#825/#832 fix round C, 825-832-CD2-004).
+
+    A current account-bound writer omits the top-level `account` exactly when
+    its binding is `stably_absent`: the binding names `unattributed`
+    DELIBERATELY, and live ingest reads it so. That omission is not the
+    pre-#341 "never named an account" that legacy normalization maps to the
+    `accounts_cutover` account, so a current-generation Claude observation is
+    never legacy, and neither is one whose retained binding validates
+    (`_lib_account_binding.load`) and names `unattributed` — the only binding
+    a stampless observation can carry. Rebuild, live selection, completion and
+    `db rederive` all normalize through here, so they agree with live ingest.
+    A binding that names a real account, or fails validation, carries no such
+    meaning for a stampless line and is left to the legacy rule.
+
+    Claude only: a Codex observation's legacy mapping is `unattributed`
+    already, and its quota cache leg distinguishes that sentinel from a NULL
+    (no evidence) attribution, which this rule must not change."""
+    if record.get("provider") != "claude":
+        return False
+    if _lib_account_protocol.is_stamped(record):
+        return True
+    document = (record.get("payload") or {}).get("account_binding")
+    if document is None:
+        return False
+    import _lib_account_binding
+    try:
+        binding = _lib_account_binding.load(document)
+    except (TypeError, ValueError, KeyError):
+        return False
+    return binding.account_key == _lib_accounts.UNATTRIBUTED
 
 
 def legacy_account_key(record, claude_legacy_account: str) -> str | None:
@@ -4173,7 +5145,15 @@ def _apply_generic_evt(conn, evt):
             continue
         if key in spec.fk_refs:
             column, ref_table = spec.fk_refs[key]
-            cols[column] = _resolve_ref(conn, ref_table, value)
+            try:
+                cols[column] = _resolve_fold_ref(
+                    conn, evt, column, ref_table, value)
+            except UnresolvedFoldReference as exc:
+                # Reported, never swallowed by the `INSERT OR IGNORE` below:
+                # the target column is NOT NULL, so the insert would drop the
+                # row without a word (#825/#832 Task 4.0).
+                _report_unresolved_fold_reference(exc)
+                return None
         else:
             cols[key] = value
     # Re-derive any projection-FK columns from a journaled natural-key column
@@ -4230,6 +5210,13 @@ def _apply_weekly_credit_effects(conn, evt, *, projection_writes=True):
     payload = evt.get("payload") or {}
     table = payload.get("suppression_table", "weekly_usage_snapshots")
     for logical_id in (payload.get("suppression") or []):
+        if table == "weekly_usage_snapshots":
+            # #825/#832 spec 4.7 revision 7 (fix round K16b): the stale-replica
+            # effects retire WEEKLY evidence only. A `--force` clear's old
+            # synthetic rides the same list and is removed (see
+            # `_retire_weekly_effects`).
+            _retire_weekly_effects(conn, logical_id)
+            continue
         conn.execute(f"DELETE FROM {table} WHERE journal_id = ?", (logical_id,))
     for logical_id in (payload.get("floor_suppression") or []):
         conn.execute(
@@ -4587,7 +5574,25 @@ def _apply_reset_with_suppression(conn, evt):
     `journal_id` (idempotent — deleting an already-absent id is a clean no-op,
     mirroring `_apply_weekly_credit_effects`). The synthetic post-credit
     snapshots ride their own `snapshot_accept` evts; this vehicle only inserts
-    the reset row and replays its suppression."""
+    the reset row and replays its suppression.
+
+    #825/#832 spec 4.7 revision 6 (fix round K15): a `five_hour_credit`'s
+    suppression retires FIVE-HOUR effects only, for every event however old,
+    exactly as `detect_reset_and_credit`'s live cleanup does. A named row
+    that carries accepted weekly evidence (``weekly_observation_held = 0``)
+    is retired in place: its five-hour percent, reset and window key become
+    NULL together, and its weekly value, boundary, capture and held
+    provenance stay. A held row is deleted. The event's payload is unchanged
+    (one `suppression` list, as the previous release writes and folds it),
+    so a row the previous release's cleanup deleted comes back, retired, on
+    the upgrade rebuild. Both statements are idempotent.
+
+    Spec 4.7 revision 7 (fix round K16b): a `week_reset`'s suppression is the
+    symmetric case. It retires WEEKLY effects only (`_retire_weekly_effects`):
+    a named row carrying a five-hour reading is kept weekly-held, and only a
+    row that keeps evidence on neither axis is deleted. In either order the
+    two retirements leave exactly the still-valid axis, and both together
+    delete the row."""
     payload = evt.get("payload") or {}
     spec = _EVT_SPECS.get(payload.get("kind"))
     if spec is None or spec.table is None:
@@ -4598,14 +5603,64 @@ def _apply_reset_with_suppression(conn, evt):
             continue
         if key in spec.fk_refs:
             column, ref_table = spec.fk_refs[key]
-            cols[column] = _resolve_ref(conn, ref_table, value)
+            cols[column] = _resolve_fold_ref(conn, evt, column, ref_table, value)
         else:
             cols[key] = value
     _insert_or_ignore(conn, spec.table, cols)
     supp_table = payload.get("suppression_table", "weekly_usage_snapshots")
+    five_hour = (payload.get("kind") == "five_hour_credit"
+                 and supp_table == "weekly_usage_snapshots")
     for logical_id in (payload.get("suppression") or []):
+        if five_hour:
+            conn.execute(
+                "UPDATE weekly_usage_snapshots SET five_hour_percent = NULL, "
+                "five_hour_resets_at = NULL, five_hour_window_key = NULL "
+                "WHERE journal_id = ? AND weekly_observation_held = 0",
+                (logical_id,))
+            conn.execute(
+                "DELETE FROM weekly_usage_snapshots "
+                "WHERE journal_id = ? AND weekly_observation_held = 1",
+                (logical_id,))
+            continue
+        if supp_table == "weekly_usage_snapshots":
+            _retire_weekly_effects(conn, logical_id)
+            continue
         conn.execute(f"DELETE FROM {supp_table} WHERE journal_id = ?", (logical_id,))
     return None
+
+
+def _retire_weekly_effects(conn, logical_id) -> None:
+    """Replay one weekly stale-replica suppression by logical id (#825/#832
+    spec 4.7 revision 7, *Weekly suppression and five-hour evidence*; fix
+    round K16b), exactly as `_cctally_record._delete_doomed_snapshot_rows`
+    does live.
+
+    The suppression retires WEEKLY effects only. A named unheld row that
+    carries a five-hour reading of its own (a percent and reset pair, and not
+    a `record-credit` synthetic, whose five-hour columns are a copy) is kept
+    and becomes weekly-held, with its identity, capture, boundaries and
+    five-hour columns intact. A row that keeps evidence on neither axis is
+    deleted: an unheld one left without a five-hour reading (also one a
+    five-hour credit already retired in place, so the two retirements
+    commute and retiring both deletes the row), a synthetic, and a held row
+    without a five-hour reading. A row that is already weekly-held and
+    carries a five-hour reading keeps it: a weekly suppression never retires
+    five-hour evidence. Both statements are idempotent; the event payload
+    (one `suppression` list) is unchanged, so the previous release still
+    folds it (it deletes every named row, residual 12)."""
+    conn.execute(
+        "UPDATE weekly_usage_snapshots SET weekly_observation_held = 1 "
+        "WHERE journal_id = ? AND weekly_observation_held = 0 "
+        "  AND five_hour_percent IS NOT NULL "
+        "  AND five_hour_resets_at IS NOT NULL "
+        "  AND source <> 'record-credit'",
+        (logical_id,))
+    conn.execute(
+        "DELETE FROM weekly_usage_snapshots "
+        "WHERE journal_id = ? AND (weekly_observation_held = 0 "
+        "  OR five_hour_percent IS NULL OR five_hour_resets_at IS NULL "
+        "  OR source = 'record-credit')",
+        (logical_id,))
 
 
 def _apply_evt(conn, evt, *, projection_writes=True):
@@ -4773,6 +5828,130 @@ for _hs in _HARVEST_SPECS:
 # Model-A emission + harvest (spec §5.3, step 4c)
 # --------------------------------------------------------------------------
 
+#: `ScratchRetention.applied` value for an id the predecessor index already
+#: materialized (as of the rebuild that produced it, not necessarily its
+#: final effective revision).
+_PREDECESSOR_HELD = object()
+
+
+class ScratchRetention:
+    """What a derivation-completion scratch replay materializes for each event
+    id (#825/#832 fix round E; spec 4.7 "Derivation completion (revision 1)",
+    Codex fix-round-2 Q1).
+
+    The replay re-derives admitted inputs in original order to find the
+    decisions a gap owes, but every input must be derived against the state
+    uninterrupted ingest had: the retained effective decisions, never fresh
+    candidates in their place. ``effective`` maps every admitted, selected
+    event id to its effective record (None for a tombstone). An id is
+    materialized ONCE, at the first of:
+
+    * an input deriving it (`decide`, from `emit_model_a` and harvest): the
+      projection holds the retained record — or nothing, for a tombstone —
+      and the fresh candidate only for a new identity, or, with a
+      ``reference``, for an id whose candidate differs from the reference
+      replay's (the gap affects it, so its descendants must see the effect);
+    * its physical journal position (`on_journaled`): a retained fact no
+      replayed input re-derives (bootstrap facts, other families, a decision
+      the current pipeline spells differently).
+
+    A retained decision is therefore in place as soon as the input it answers
+    is replayed, even when a concurrent append put a later input physically
+    before it (raw 70, raw 60, admitted 70). ``applied`` holds what each id
+    materialized; ``seed`` marks ids the predecessor index already holds.
+
+    ``retained_only`` names the inputs (by window index; the replay sets
+    ``current_input``) a previous release decided: their history is exactly
+    the decisions that release journaled, so a fresh candidate the current
+    pipeline derives for them beyond those is never materialized."""
+
+    def __init__(self, effective, *, reference=None,
+                 retained_only=frozenset()):
+        self.effective = effective
+        self.reference = reference
+        self.retained_only = retained_only
+        self.current_input = None
+        self.applied: dict = {}
+
+    def seed(self, event_ids) -> None:
+        for event_id in event_ids:
+            self.applied.setdefault(event_id, _PREDECESSOR_HELD)
+
+    def _affected(self, evt) -> bool:
+        if self.reference is None:
+            return False
+        expected = self.reference.get(evt["id"])
+        return (expected is None
+                or expected != _lib_journal.event_content_hash(evt))
+
+    def decide(self, evt):
+        """``(chosen, fresh)``: the record the projection holds for the id of
+        the freshly derived ``evt`` (None: nothing), and whether this call
+        decided it (the caller applies only a fresh decision)."""
+        event_id = evt["id"]
+        if event_id in self.applied:
+            held = self.applied[event_id]
+            if held is _PREDECESSOR_HELD:
+                held = self.effective.get(event_id, evt)
+            return held, False
+        if (self.current_input in self.retained_only
+                and event_id not in self.effective):
+            return None, False
+        if event_id in self.effective and not self._affected(evt):
+            chosen = self.effective[event_id]
+        else:
+            chosen = evt
+        self.applied[event_id] = chosen
+        return chosen, True
+
+    def on_journaled(self, conn, record) -> None:
+        """At an admitted ``evt``/``correction`` line's physical position."""
+        event_id = record.get("id")
+        if not isinstance(event_id, str) or event_id not in self.effective:
+            return
+        target = self.effective[event_id]
+        if event_id in self.applied:
+            if (record.get("t") == "correction"
+                    and self.applied[event_id] is _PREDECESSOR_HELD):
+                # The predecessor index holds this id as of an earlier
+                # revision; the retained decision is its effective one.
+                self.applied[event_id] = target
+                _rematerialize_scratch_row(conn, event_id, target)
+            return
+        self.applied[event_id] = target
+        if target is not None and (
+                (target.get("payload") or {}).get("kind") in _EVT_SPECS):
+            _apply_evt(conn, target)
+
+
+def _rematerialize_scratch_row(conn, event_id, target) -> None:
+    """Bring a scratch projection row to ``target`` (None: remove it). An
+    effects-only family has no row to bring, and its effects already ran."""
+    kind = None if target is None else (target.get("payload") or {}).get("kind")
+    tables = ({_EVT_SPECS[kind].table} if kind in _EVT_SPECS
+              else {spec.table for spec in _EVT_SPECS.values()})
+    for table in sorted(t for t in tables if t):
+        row = conn.execute(
+            f"SELECT id FROM {table} WHERE journal_id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            continue
+        if target is None:
+            _delete_scratch_row(conn, table, row[0])
+        else:
+            _converge_row_from_effective(
+                conn, event_id, table=table, rowid=row[0], record=target)
+        return
+
+
+def _delete_scratch_row(conn, table, rowid) -> None:
+    """Remove one row of a derivation-completion SCRATCH projection that a
+    retained tombstone says does not exist (fix round E). ``table`` is a
+    journal family's own table (`_EVT_SPECS`/`_HARVEST_SPECS`); only a
+    scratch replay's private connection ever reaches this."""
+    conn.execute(f"DELETE FROM {table} WHERE id = ?", (int(rowid),))
+
+
 def emit_model_a(ctx, *, kind, evt_id, table, columns, refs=None, at=None):
     """Emit one Model-A evt (spec §5.3): append the evt line FIRST (leaf lock,
     inside the txn — legal per the lock-order law; fsync'd before the commit
@@ -4806,7 +5985,18 @@ def emit_model_a(ctx, *, kind, evt_id, table, columns, refs=None, at=None):
         # and an EMPTY sink list is falsy.
         ctx.event_sink.append(evt)
         ctx.events_emitted += 1
-        _apply_evt(ctx.conn, evt, projection_writes=ctx.projection_writes)
+        retention = ctx.scratch_retention
+        if retention is None:
+            _apply_evt(ctx.conn, evt, projection_writes=ctx.projection_writes)
+        else:
+            # Derivation completion: the projection holds the retained
+            # effective decision for an already-decided id (nothing for a
+            # tombstone), exactly once, and the fresh candidate only for a
+            # new identity or one the gap affects.
+            chosen, fresh = retention.decide(evt)
+            if fresh and chosen is not None:
+                _apply_evt(ctx.conn, chosen,
+                           projection_writes=ctx.projection_writes)
     else:
         decision = _classify_live_effective_event(ctx.conn, evt)
         if decision == CLASSIFY_CONFLICT:
@@ -4816,9 +6006,21 @@ def emit_model_a(ctx, *, kind, evt_id, table, columns, refs=None, at=None):
                 selected,
                 lambda: _converge_row_from_effective(
                     ctx.conn, evt_id, table=table))
+        elif (decision == CLASSIFY_DUPLICATE
+              and _is_metadata_only_duplicate(ctx.conn, evt)):
+            # #825/#832: a metadata-only duplicate of a retained event is
+            # never appended; the retained row already stands.
+            pass
+        elif (decision == CLASSIFY_NEW
+              and (excluded_rev := physical_excluded_revision(
+                  ctx, evt_id)) is not None):
+            # #825/#832 (Codex Q2): admission hides an excluded legacy twin.
+            effective = _emit_over_excluded_twin(ctx, evt, excluded_rev)
+            _apply_evt(
+                ctx.conn, effective, projection_writes=ctx.projection_writes)
         else:
-            # `new` AND `duplicate` both still append: crash-replay convergence
-            # and two-bootstrap idempotency are built on that.
+            # `new` AND an exact `duplicate` both still append: crash-replay
+            # convergence and two-bootstrap idempotency are built on that.
             append_record(evt)
             ctx.events_emitted += 1
             if decision == CLASSIFY_NEW:
@@ -5035,6 +6237,21 @@ def _emit_harvest_row(ctx, spec, row):
         # still resolve. Never classify, drop, or touch live metadata.
         ctx.event_sink.append(evt)
         ctx.events_emitted += 1
+        retention = ctx.scratch_retention
+        if retention is not None:
+            # Derivation completion: the derived row is replaced by what the
+            # retained decision says it is — removed under a tombstone,
+            # converged to a retained record that differs from it.
+            chosen, _fresh = retention.decide(evt)
+            if chosen is None:
+                _delete_scratch_row(conn, spec.table, row["id"])
+                return evt
+            if (chosen is not evt
+                    and _lib_journal.event_content_hash(chosen)
+                    != _lib_journal.event_content_hash(evt)):
+                _converge_row_from_effective(
+                    conn, chosen["id"], table=spec.table, rowid=row["id"],
+                    record=chosen)
         conn.execute(
             f"UPDATE {spec.table} SET journal_id = ? WHERE id = ?",
             (evt["id"], row["id"]),
@@ -5050,11 +6267,20 @@ def _emit_harvest_row(ctx, spec, row):
                 conn, evt["id"], table=spec.table, rowid=row["id"]))
         return evt
 
-    append_record(evt)
-    ctx.events_emitted += 1
-    if decision == CLASSIFY_NEW:
+    excluded_rev = (physical_excluded_revision(ctx, evt["id"])
+                    if decision == CLASSIFY_NEW else None)
+    if excluded_rev is not None:
+        # #825/#832 (Codex Q2): admission hides an excluded legacy twin, so
+        # the decision lands as a correction above it (metadata included).
+        _emit_over_excluded_twin(ctx, evt, excluded_rev)
+    elif decision == CLASSIFY_NEW:
+        append_record(evt)
+        ctx.events_emitted += 1
         _record_new_effective_event(conn, evt)
     else:
+        if not _is_metadata_only_duplicate(conn, evt):
+            append_record(evt)
+            ctx.events_emitted += 1
         # An exact crash-retry duplicate still validates excluded derived FKs
         # before it stamps the physical row.
         _validate_excluded_derived_fks(conn, spec, row)
@@ -5319,9 +6545,19 @@ def record_meter_rate_change(ctx, transition, *, notify: bool,
         kind=mrc.EVT_KIND, id=eid, at=created_at, payload=payload)
     decision = _classify_live_effective_event(ctx.conn, evt)
     if decision == CLASSIFY_NEW:
-        append_record(evt)
-        ctx.events_emitted += 1
-        _record_new_effective_event(ctx.conn, evt)
+        excluded_rev = physical_excluded_revision(ctx, eid)
+        if excluded_rev is not None:
+            # #825/#832 (Codex Q2): `meter_rate_change` is a Claude-event
+            # family whatever its provider, so a previous-release process's
+            # unstamped decision for this same transition past the cutover is
+            # excluded and hidden from the classifier. Land this one as a
+            # correction above it, never a revision-0 twin the previous
+            # release would read as a same-revision conflict.
+            evt = _emit_over_excluded_twin(ctx, evt, excluded_rev)
+        else:
+            append_record(evt)
+            ctx.events_emitted += 1
+            _record_new_effective_event(ctx.conn, evt)
         created = _insert_meter_rate_change(ctx.conn, evt)
         if created and notify:
             ctx.deferred_alerts.append(mrc.alert_payload(transition))
@@ -6139,11 +7375,110 @@ def _classify_live_effective_event(conn, evt) -> str:
     )
 
 
-def _record_new_effective_event(conn, evt) -> None:
+def _is_metadata_only_duplicate(conn, evt) -> bool:
+    """Whether a `CLASSIFY_DUPLICATE` emission differs from the retained
+    effective event only by writer metadata (#825/#832 spec 5.1).
+
+    An exact byte-identical duplicate still appends (crash-replay convergence
+    is built on that). A duplicate whose bytes differ — today only by the
+    writer-generation stamp, which `event_content_hash` strips — is never
+    appended: the retained line already carries the semantic event, and a
+    metadata-only second copy would be a distinct line the previous release
+    hashes as a same-revision conflict."""
+    retained = _metadata_event_record(conn, evt["id"])
+    if retained is None:
+        return False
+    return (_lib_journal.encode_line(retained)
+            != _lib_journal.encode_line(_lib_journal.prepare_record(evt)))
+
+
+#: #825/#832 fix round A: the correction-batch family of the shared
+#: derivation-completion step and of the live physical collision check. Both
+#: only ever journal a decision the current pipeline derived.
+DERIVATION_COMPLETION_FAMILY = "derivation-completion"
+
+
+def _unread_excluded_revisions(ctx) -> dict:
+    """Excluded events a previous-release process appended past this cycle's
+    high-water: the part of the physical inventory the index has not consumed
+    yet. Scanned once per cycle (the unread tail is normally empty)."""
+    if ctx.excluded_tail is not None:
+        return ctx.excluded_tail
+    found: dict = {}
+    boundary = ctx.admission_boundary
+    start = ctx.unread_from
+    if boundary is not None and start is not None:
+        tail_hw = journal_high_water()
+        if tail_hw is not None and (
+                journal_coordinate_key(tail_hw) > journal_coordinate_key(start)):
+            for segment, offset, raw in _read_range(start, tail_hw):
+                record = _lib_journal.decode_line(raw)
+                if (record is None
+                        or record.get("t") not in ("evt", "correction")
+                        or _is_admitted(record, segment, offset, boundary)):
+                    continue
+                rev = record.get("rev", 0)
+                event_id = record.get("id")
+                if isinstance(event_id, str) and type(rev) is int and rev >= 0:
+                    found[event_id] = max(rev, found.get(event_id, rev))
+    ctx.excluded_tail = found
+    return found
+
+
+def physical_excluded_revision(ctx, event_id) -> "int | None":
+    """The highest revision of any EXCLUDED physical event or correction
+    action under ``event_id`` — consumed (the index inventory) or still unread
+    — or None when admission hides none (Codex fix-round-1 Q2)."""
+    row = ctx.conn.execute(
+        "SELECT max_rev FROM journal_excluded_event_revisions "
+        "WHERE event_id = ?", (event_id,),
+    ).fetchone()
+    revs = [int(row[0])] if row is not None else []
+    tail = _unread_excluded_revisions(ctx).get(event_id)
+    if tail is not None:
+        revs.append(tail)
+    return max(revs) if revs else None
+
+
+def _emit_over_excluded_twin(ctx, evt, excluded_rev: int) -> dict:
+    """Journal a NEW live decision whose id an excluded legacy event already
+    holds: a completed correction batch replacing the id at a revision above
+    every retained one, never a revision-0 twin the previous release would
+    read as a same-revision conflict (Codex fix-round-1 Q2). Records the
+    effective metadata exactly as selection derives it, so the next cycle's
+    preflight passes it through, and returns the effective evt record.
+
+    Deterministic in its input — the batch's `at` is the decision's own — so
+    a crash-retry re-emits byte-identical lines, which the selector keeps once.
+    """
+    action = {"action": "replace", "id": evt["id"], "rev": excluded_rev + 1,
+              "at": evt["at"], "payload": dict(evt["payload"])}
+    digest = hashlib.sha256(json.dumps(
+        action, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")).hexdigest()
+    records = _lib_journal.make_correction_batch(
+        batch_id=f"{DERIVATION_COMPLETION_FAMILY}:{digest}",
+        family=DERIVATION_COMPLETION_FAMILY,
+        at=evt["at"],
+        actions=[action],
+    )
+    append_records(records)
+    ctx.events_emitted += 1
+    selected = _lib_journal.resolve_effective_events(records).by_id[evt["id"]]
+    _record_new_effective_event(ctx.conn, evt, selected=selected)
+    return selected.record
+
+
+def _record_new_effective_event(conn, evt, *, selected=None) -> None:
     """Write the effective-metadata row for a `CLASSIFY_NEW` emission. The
-    DELETE covers the legacy `qaa` advance (the only case where a prior row is
-    replaced rather than absent)."""
-    selected = _lib_journal.resolve_effective_events([evt]).by_id[evt["id"]]
+    DELETE covers the legacy `qaa` advance and an excluded-twin correction
+    (`_emit_over_excluded_twin` passes the correction's own ``selected``
+    winner) — the cases where a prior row is replaced rather than absent. It
+    stays the ONE metadata DELETE of the live emit paths (#386 frozen write
+    surface)."""
+    if selected is None:
+        selected = _lib_journal.resolve_effective_events([evt]).by_id[
+            evt["id"]]
     if _metadata_row(conn, selected.event_id) is not None:
         conn.execute(
             "DELETE FROM journal_effective_events WHERE event_id = ?",
@@ -6250,7 +7585,7 @@ def _effective_event_for_convergence(conn, event_id) -> dict:
     ):
         raise _lib_journal.JournalProtocolError(
             f"cannot converge {event_id}: retained record is not a matching evt")
-    if _lib_journal._sha256_canonical(record) != content_hash:
+    if _lib_journal.event_content_hash(record) != content_hash:
         raise _lib_journal.JournalProtocolError(
             f"cannot converge {event_id}: retained record hash mismatch")
     return record
@@ -6278,7 +7613,11 @@ def _evt_target_columns(conn, evt, spec) -> tuple:
             continue
         if key in spec.fk_refs:
             column, ref_table = spec.fk_refs[key]
-            cols[column] = _resolve_ref(conn, ref_table, value)
+            # The SAME resolver the fold uses (#825/#832 Task 4.0): a
+            # suppressed snapshot converges to 0 exactly as a rebuild folds it,
+            # and an unexplained miss raises `UnresolvedFoldReference` rather
+            # than handing an UPDATE a None for a NOT NULL column.
+            cols[column] = _resolve_fold_ref(conn, evt, column, ref_table, value)
         else:
             cols[key] = value
     acct = cols.get("account_key")
@@ -6304,7 +7643,105 @@ _CONVERGE_OUTCOME_WORDING: dict = {
 }
 
 
-def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> str:
+def _keep_five_hour_retirement(conn, cols: dict, rowid: int) -> None:
+    """Keep an admitted five-hour retirement through a row convergence
+    (#825/#832 spec 4.7 revision 6, fix round K15, review finding K14R-5).
+
+    A five-hour credit retires an unheld stale replica in place: its
+    five-hour percent, reset and window key are NULL while its
+    `snapshot_accept` payload still carries them. Converging the row from
+    that payload (`emit_model_a`'s live conflict path, a harvest conflict
+    or `_rematerialize_scratch_row`) would hand the replica its five-hour
+    values back, so live state would differ from a rebuild, which folds the
+    event and then the credit. The row is that retired replica when it is
+    unheld, all three five-hour columns are NULL while the payload carries a
+    five-hour reading, and the account holds an admitted five-hour credit of
+    the payload's window effective at or before its capture. ``cols`` then
+    converges every other column and keeps the three NULL."""
+    if cols.get("five_hour_percent") is None or cols.get(
+            "five_hour_window_key") is None:
+        return
+    row = conn.execute(
+        "SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key, "
+        "       weekly_observation_held "
+        "FROM weekly_usage_snapshots WHERE id = ?", (rowid,)).fetchone()
+    if (row is None or row[0] is not None or row[1] is not None
+            or row[2] is not None or row[3]):
+        return
+    credited = conn.execute(
+        "SELECT 1 FROM five_hour_reset_events "
+        "WHERE account_key = ? AND five_hour_window_key = ? "
+        "  AND unixepoch(effective_reset_at_utc) <= unixepoch(?) LIMIT 1",
+        (cols.get("account_key") or _lib_accounts.UNATTRIBUTED,
+         int(cols["five_hour_window_key"]), cols.get("captured_at_utc")),
+    ).fetchone()
+    if credited is None:
+        return
+    cols["five_hour_percent"] = None
+    cols["five_hour_resets_at"] = None
+    cols["five_hour_window_key"] = None
+
+
+def _keep_weekly_retirement(conn, cols: dict, rowid: int) -> None:
+    """Keep an admitted weekly retirement through a row convergence (#825/#832
+    spec 4.7 revision 7, fix round K16b), the weekly twin of
+    `_keep_five_hour_retirement`.
+
+    A weekly credit's stale-replica cleanup keeps a band row that carries a
+    five-hour reading and makes it weekly-held, while its `snapshot_accept`
+    payload still says unheld. Converging the row from that payload would hand
+    the retired weekly value back as accepted weekly evidence. The row is that
+    converted replica when it is weekly-held while the payload is not, carries
+    a five-hour reading, and its capture and weekly value lie in the band of
+    an admitted weekly credit of its own account and week: an in-place
+    `week_reset_events` row ending that week (inclusive band) or a
+    `weekly_credit_floors` row of its start date (strict band), the same
+    bands `_cctally_record._credit_retirement_bands` reads and
+    `_weekly_value_is_retired_replica` applies. ``cols`` then converges every
+    other column and keeps the row held."""
+    if cols.get("weekly_observation_held") not in (None, 0):
+        return
+    row = conn.execute(
+        "SELECT weekly_observation_held, five_hour_percent, "
+        "       five_hour_resets_at "
+        "FROM weekly_usage_snapshots WHERE id = ?", (rowid,)).fetchone()
+    if row is None or not row[0] or row[1] is None or row[2] is None:
+        return
+    import _cctally_record
+    account_key = cols.get("account_key") or _lib_accounts.UNATTRIBUTED
+    bands = []
+    try:
+        week_end = _cctally_core._canonicalize_optional_iso(
+            cols.get("week_end_at"), "converge.week_end_at")
+    except (TypeError, ValueError):
+        week_end = None
+    if week_end is not None:
+        for floor_at, retired in conn.execute(
+                "SELECT effective_reset_at_utc, observed_pre_credit_pct "
+                "FROM week_reset_events "
+                "WHERE account_key = ? AND new_week_end_at = ? "
+                "  AND observed_pre_credit_pct IS NOT NULL",
+                (account_key, week_end)).fetchall():
+            bands.append((str(floor_at), float(retired), True))
+    for floor_at, retired in conn.execute(
+            "SELECT effective_at_utc, observed_pre_credit_pct "
+            "FROM weekly_credit_floors "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "  AND observed_pre_credit_pct IS NOT NULL",
+            (cols.get("week_start_date"), account_key)).fetchall():
+        bands.append((str(floor_at), float(retired), False))
+    try:
+        weekly_percent = float(cols.get("weekly_percent"))
+    except (TypeError, ValueError):
+        return
+    if _cctally_record._weekly_value_is_retired_replica(
+            bands, captured_at_utc=cols.get("captured_at_utc"),
+            weekly_percent=weekly_percent):
+        cols["weekly_observation_held"] = 1
+
+
+def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None,
+                                 record=None) -> str:
     """Bring the live physical row into agreement with the already-journaled
     effective event, and stamp `journal_id` in the SAME operation (#374 §6).
 
@@ -6328,8 +7765,13 @@ def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> s
     A family WITH a table but no physical row carrying the event id is also
     `CONVERGE_DROPPED`: convergence updates what exists, it never materialises a
     row (see the `rowid is None` branch).
+
+    ``record`` (#825/#832 fix round E) converges to that evt-shaped record
+    instead of the live effective metadata's: a derivation-completion scratch
+    replay passes the retained effective decision it holds.
     """
-    record = _effective_event_for_convergence(conn, event_id)
+    record = (_effective_event_for_convergence(conn, event_id)
+              if record is None else record)
     spec = _EVT_SPECS.get((record.get("payload") or {}).get("kind"))
     if spec is None or spec.table is None:
         return CONVERGE_DROPPED
@@ -6337,7 +7779,16 @@ def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> s
     if table is not None and table != target:
         raise JournalError(
             f"convergence target mismatch for {event_id}: {table} != {target}")
-    cols, children = _evt_target_columns(conn, record, spec)
+    try:
+        cols, children = _evt_target_columns(conn, record, spec)
+    except UnresolvedFoldReference as exc:
+        # The effective event names a row the index cannot resolve and no
+        # suppression explains. Converging would write a None into a NOT NULL
+        # column and abort every later cycle on the same IntegrityError, so
+        # the row is left as it is and the miss is reported (#825/#832 Task
+        # 4.0) — the same outcome as a family with nothing to converge.
+        _report_unresolved_fold_reference(exc)
+        return CONVERGE_DROPPED
     if rowid is None:
         row = conn.execute(
             f"SELECT id FROM {target} WHERE journal_id = ?", (event_id,)
@@ -6357,6 +7808,9 @@ def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None) -> s
             file=sys.stderr,
         )
         return CONVERGE_DROPPED
+    if target == "weekly_usage_snapshots":
+        _keep_five_hour_retirement(conn, cols, int(rowid))
+        _keep_weekly_retirement(conn, cols, int(rowid))
     assignments = ", ".join(f"{name} = ?" for name in cols)
     conn.execute(
         f"UPDATE {target} SET {assignments} WHERE id = ?",
@@ -6415,17 +7869,25 @@ def _validate_excluded_derived_fks(conn, spec, row) -> None:
 def _full_effective_selection(hw, accumulators=None):
     records = []
     evidence = []
+    evidence_owners = []
     coordinates = {}
     prior_high_water = None
+    # #825/#832: admission is applied after the pass and before selection.
+    pass_boundary = _PassBoundary()
+    record_coordinates = []
     if hw is not None:
         for segment, offset, raw in _read_range(None, hw):
             record = _lib_journal.decode_line(raw)
             if record is not None:
+                pass_boundary.observe(record)
+                record_coordinates.append((segment, offset))
                 _capture_protocol_prefix_evidence(
                     record,
                     prior_high_water,
                     evidence,
                 )
+                if len(evidence) > len(evidence_owners):
+                    evidence_owners.append(len(records))
                 # Only correction records can establish a completed-to-tainted
                 # transition. Keep their exact sequence coordinates without
                 # adding one tuple for every observation in a full fallback.
@@ -6434,9 +7896,13 @@ def _full_effective_selection(hw, accumulators=None):
                         segment, offset + len(raw) + 1)
                 records.append(record)
             prior_high_water = (segment, offset + len(raw) + 1)
+    _apply_pass_admission(records, record_coordinates,
+                          pass_boundary.resolve(hw))
+    evidence = _admitted_prefix_evidence(evidence, evidence_owners, records)
     cutover_claude = resolve_cutover_claude_account()
     for record in records:
-        _normalize_legacy_account_stamp(record, cutover_claude)
+        if record is not None:
+            _normalize_legacy_account_stamp(record, cutover_claude)
     selected = _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=evidence,
@@ -6610,7 +8076,7 @@ def _selector_gap_bytes(durable, cursor) -> "int | None":
     return total
 
 
-def _selector_gap_entries(durable, cursor):
+def _selector_gap_entries(durable, cursor, boundary=None):
     """Decoded records in ``[durable, cursor)`` with each one's end offset.
 
     This is non-empty only after a tick that could not validate the durable
@@ -6634,6 +8100,9 @@ def _selector_gap_entries(durable, cursor):
             # A malformed line consumes no sequence number, exactly as the
             # cycle's own read loop and `decoded_entry_count` treat it.
             continue
+        if not _is_admitted(record, segment, offset, boundary):
+            # #825/#832: excluded, but it still consumes its sequence number.
+            record = None
         entries.append((record, segment, offset + len(raw) + 1))
     return entries
 
@@ -6660,7 +8129,8 @@ def _normalized_for_selection(records, cutover_claude):
     return copies
 
 
-def _incremental_selection(conn, records, entries, cursor, covered):
+def _incremental_selection(conn, records, entries, cursor, covered,
+                           boundary=None):
     """Continue the durable fold over one cycle's delta, or return None.
 
     ``entries`` is positionally parallel to ``records``: each element is the
@@ -6730,7 +8200,7 @@ def _incremental_selection(conn, records, entries, cursor, covered):
             # durable prefix behind forever, and an uncapped re-fold would grow
             # the per-tick read without limit. See `_GAP_REFOLD_BYTE_CAP`.
             return None
-        gap = _selector_gap_entries(durable, cursor)
+        gap = _selector_gap_entries(durable, cursor, boundary)
 
     stream = [item[0] for item in gap] + list(records)
     coordinates = {}
@@ -6759,7 +8229,7 @@ def _incremental_selection(conn, records, entries, cursor, covered):
                 record.get("t") == "op"
                 and isinstance(record.get("payload"), dict)
                 and record["payload"].get("kind")
-                == _lib_journal._PROTOCOL_RESOLUTION_KIND
+                in _lib_journal.PROTOCOL_RESOLUTION_KINDS
             )
         )
         for record in stream
@@ -6900,6 +8370,9 @@ def _correction_commit_high_water(batch_id, hw=None):
         hw = journal_high_water()
     if hw is None:
         return None
+    # #825/#832: `batch_id` comes from an admission-filtered selection, so the
+    # first matching marker is the batch's own (a later stamped marker can
+    # only duplicate it).
     for segment, offset, raw in iter_range(None, hw):
         record = _lib_journal.decode_line(raw)
         if (
@@ -6914,12 +8387,13 @@ def _correction_commit_high_water(batch_id, hw=None):
 
 def _has_correction_records(records) -> bool:
     return any(
-        record.get("t") in {"correction", "correction_batch"}
+        isinstance(record, dict) and record.get("t") in {"correction", "correction_batch"}
         or (
-            record.get("t") == "op"
+            isinstance(record, dict)
+            and record.get("t") == "op"
             and isinstance(record.get("payload"), dict)
             and record["payload"].get("kind")
-            == _lib_journal._PROTOCOL_RESOLUTION_KIND
+            in _lib_journal.PROTOCOL_RESOLUTION_KINDS
         )
         for record in records
     )
@@ -6927,7 +8401,7 @@ def _has_correction_records(records) -> bool:
 
 def _preflight_live_events(
     conn, records, hw, conflicts=None, protocol_scan=None,
-    selector=None, cursor=None, entries=None,
+    selector=None, cursor=None, entries=None, boundary=None,
 ):
     """Validate unread evt/correction records before the stats transaction.
 
@@ -6952,7 +8426,10 @@ def _preflight_live_events(
     carries each record's `(segment, end offset)`, from which the incremental
     step derives the absolute-sequence coordinate map.
     """
-    event_records = [record for record in records if record.get("t") == "evt"]
+    event_records = [
+        record for record in records
+        if isinstance(record, dict) and record.get("t") == "evt"
+    ]
     selected_new = _lib_journal.resolve_effective_events(event_records)
     if conflicts is not None:
         conflicts.extend(selected_new.conflicts)
@@ -7004,7 +8481,8 @@ def _preflight_live_events(
     has_corrections = _has_correction_records(records)
     incremental = None
     if selector is not None or has_corrections:
-        incremental = _incremental_selection(conn, records, entries, cursor, hw)
+        incremental = _incremental_selection(
+            conn, records, entries, cursor, hw, boundary=boundary)
     if selector is not None and incremental is not None:
         selector["before"] = incremental["before"]
         selector["after"] = incremental["after"]
@@ -7122,13 +8600,48 @@ def _preflight_live_events(
 # the cycle (spec §5.2, revision 3)
 # --------------------------------------------------------------------------
 
+def _defer_derivation_before_owed_outputs(decoded, stop, proof) -> int:
+    """The prefix a cache-leg prefix stop at ``stop`` may consume when the
+    index's derivation ``proof`` owes outputs past it (fix round J3, Codex
+    cycle 3 verification P1-1).
+
+    Completion that runs out of rounds publishes through its proven input
+    endpoint and keeps the proof's output end, so the decisions its last
+    round journaled for inputs at or before the cursor lie past it, possibly
+    behind a residual input another process appended meanwhile. Ordinary
+    ingest applies those owed decisions in its event preflight before the
+    pipeline derives anything, which holds only while the cycle consumes
+    through them. A prefix stop that ends the cycle before the output end
+    leaves some of them unread, so an input the cycle still consumed would be
+    derived against a state uninterrupted ingest never had (a residual 20%
+    credited against 60% instead of the owed 70%). The cycle therefore stops
+    at its first input record instead: the evts before it are applied as
+    usual, and every input waits for the cycle that reads through the output
+    end. The stop only moves earlier, so the cache leg — which committed
+    nothing — and the scalar cursor, selector and proof rules are unchanged;
+    a proof with nothing owed past the stop leaves it where it was."""
+    if proof is None or proof.output_end is None:
+        return stop
+    _rec, stop_seg, stop_off = decoded[stop]
+    if journal_coordinate_key(proof.output_end) <= journal_coordinate_key(
+            (stop_seg, stop_off)):
+        return stop
+    for index in range(stop):
+        record = decoded[index][0]
+        if isinstance(record, dict) and record.get("t") in ("obs", "op"):
+            return index
+    return stop
+
+
 def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
                codex_apply=None, post_commit=None,
                meter_rate_change=None) -> IngestResult:
+    import _cctally_store
     # Step 1: HW snapshot (leaf lock, µs). Lines appended after this — by other
     # processes OR by this cycle's own evt emission — are past HW and belong to
-    # the next cycle (§5.2.1, closes the skipped-append race).
-    hw = journal_high_water()
+    # the next cycle (§5.2.1, closes the skipped-append race). #946: the SAFE
+    # high water, the end of the last complete line under the same hold.
+    hw = journal_safe_high_water()
     # An empty journal (no segments yet) has nothing to consume. Normally that is
     # a no-op cycle — BUT a LIVE-only entry that appends no journal line of its
     # own must still run even on a still-empty journal: the Design-C budget-config
@@ -7148,6 +8661,8 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     malformed = 0
     cursor = None
     cursor_target = None
+    # The cache flock a cache-leg prefix stop lost to (cycle-4 CD2-007).
+    cache_block = None
     if hw is None:
         if (reconcile_config is None and codex_apply is None
                 and meter_rate_change is None):
@@ -7158,8 +8673,19 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
 
         # Step 2: read cursor -> HW in canonical order; decode, counting
         # malformed. Keep each record's (segment, offset) so the cache leg can
-        # truncate the cursor on a prefix-stop.
-        cursor = _read_cursor(conn)
+        # truncate the cursor on a prefix-stop. #825/#832 spec 6: the cursor is
+        # read on a snapshot proven current (epoch + protocol marker), so a
+        # supplied or retained connection cannot plan from an index a
+        # previous-release process republished.
+        with _cctally_store.current_stats_snapshot(conn):
+            stored_cursor = _read_cursor(conn)
+            # Fix round J3 (Codex cycle 3 verification P1-1): read in the
+            # same snapshot as the cursor, so the owed-output check below
+            # judges the proof this cursor was published with.
+            stored_proof = _read_derivation_state(conn)
+        # #946 endpoint check: a stored cursor off a line boundary resumes
+        # from the boundary before it (see `_cursor_line_boundary`).
+        cursor = _cursor_line_boundary(stored_cursor, hw)
         for seg, off, raw in _read_range(cursor, hw):
             rec = _lib_journal.decode_line(raw)
             if rec is None:
@@ -7174,6 +8700,14 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # decoded[:stop], sets the cursor to decoded[stop]'s offset, and retries
         # the remainder next cycle (§5.2 step 3; prefix consumption keeps the
         # scalar cursor sound).
+        #
+        # #946 (spec 4.7 revision 2): `hw` is the SAFE endpoint of the pinned
+        # prefix (`journal_safe_high_water`), so the target is the end of the
+        # last complete line this pass actually traversed, never the raw size.
+        # A torn suffix stays unconsumed until an append repairs it and a
+        # later cycle reads the record written there; the Codex coverage claim
+        # and `appliedThrough` inherit the same endpoint, so neither bridges
+        # the skipped bytes.
         cursor_target = (hw_seg, hw_size)
         if QUOTA_APPLIER is not None:
             # The cycle's own range, so the leg can advance the #496 S5b
@@ -7183,19 +8717,43 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
             # `decoded_end` is the last DECODED record's end coordinate, which
             # bounds the covered claim below the raw cursor target whenever the
             # traversal stopped short of it — a torn or malformed trailing line.
+            _CACHE_LEG_BLOCK.set(None)
             stop = QUOTA_APPLIER(
                 decoded, cursor=cursor, covered_to=cursor_target,
                 decoded_end=(
                     None if not decoded
                     else (decoded[-1][1], end_offsets[-1])))
             if stop is not None:
+                cache_block = _CACHE_LEG_BLOCK.get()
+                stop = _defer_derivation_before_owed_outputs(
+                    decoded, stop, stored_proof)
                 _rec, stop_seg, stop_off = decoded[stop]
                 cursor_target = (stop_seg, stop_off)
                 decoded = decoded[:stop]
                 end_offsets = end_offsets[:stop]
 
+    # #825/#832 admission point A (spec 5.3): BEFORE any interpretation —
+    # the pipeline, legacy account normalization, last-seen, correction
+    # selection. The Codex cache leg above consumes only Codex-only families,
+    # which the predicate always admits. An excluded record keeps its slot as a
+    # `None` placeholder, so the cursor, `end_offsets` and every selector
+    # sequence number advance across it exactly as a rebuild numbers it.
+    boundary = (_ingest_admission_boundary(conn, decoded, cursor)
+                if hw is not None else None)
+    # #825/#832 spec 5.6: the outcome-quarantine fold needs each excluded
+    # record itself (a trigger at its coordinate whose readings widen the
+    # every-account envelope), so collect them beside the notification.
+    excluded_records: dict = {}
+
+    def _on_excluded(record, coord):
+        excluded_records[(coord.segment, coord.offset)] = record
+        _notify_excluded(record, coord)
+
+    decoded, excluded = admit_records(
+        decoded, boundary, on_excluded=_on_excluded)
     records = [r for (r, _s, _o) in decoded]
-    batch = [r for r in records if r.get("t") in ("obs", "op")]
+    batch = [r for r in records
+             if r is not None and r.get("t") in ("obs", "op")]
     # #374: the preflight reader quarantines same-revision divergence instead of
     # raising; the groups it drops are counted on the cycle summary.
     preflight_conflicts: list = []
@@ -7221,6 +8779,7 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         selector=selector_state,
         cursor=cursor,
         entries=selector_entries,
+        boundary=boundary,
     )
 
     # Step 4: ONE BEGIN IMMEDIATE — replay + pipeline + derived-fact journaling +
@@ -7228,12 +8787,22 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
     # back rows + cursor together; the fsync'd evt lines replay idempotently in
     # the next cycle's step 4a.
     ctx = IngestContext(conn=conn, batch=batch,
-                        config=(_load_config_once() if batch else None))
+                        config=(_load_config_once() if batch else None),
+                        unread_from=cursor_target,
+                        admission_boundary=boundary)
     # #695: None unless step 4b''' runs, so a cycle with no `meter_rate_change`
     # descriptor reports exactly what it did before this change.
     rate_change_result = None
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # #825/#832 spec 6: validated again inside the mutation transaction's
+        # own snapshot, so nothing derived from a non-current index commits.
+        _cctally_store.require_current_stats_identity(conn)
+        # #825/#832 fix round A (Codex Q2): the excluded events this cycle
+        # consumed join the physical revision inventory BEFORE any emission
+        # below, so a decision the pipeline derives in this same cycle sees a
+        # legacy twin that precedes it.
+        _record_excluded_revisions(conn, excluded_records.values())
         # 4a. Replay journal evt lines (a prior cycle's emission that landed past
         # its own HW, or a crashed cycle's orphans). Apply-only, sorted by fold
         # order so a referenced family (snapshots, resets, blocks) resolves
@@ -7248,9 +8817,31 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # effects already applied). Hooks emit Model-A evts and push alert
         # payloads to ctx.pending_alerts.
         pipeline_changes_before = conn.total_changes
-        for rec in batch:
-            for hook in PIPELINE:
-                hook(ctx, rec)
+        # #825/#832 spec 5.6: the quarantine fold advances in journal order
+        # over EVERY decoded slot (excluded records, evts and ops included),
+        # read and written inside this transaction's validated snapshot, and a
+        # record's hooks run only after the fold has decided its gate — so no
+        # durable append precedes the withholding decision.
+        import _cctally_quarantine
+        ctx.quarantine = _cctally_quarantine.QuarantineFold.load(conn)
+        for rec, segment, offset in decoded:
+            if rec is None:
+                original = excluded_records.get((segment, offset))
+                if original is not None:
+                    ctx.quarantine.on_excluded(
+                        original, segment=segment, offset=offset)
+                continue
+            gate = ctx.quarantine.on_record(
+                rec, segment=segment, offset=offset)
+            if rec.get("t") not in ("obs", "op"):
+                continue
+            ctx.outcome_gate = gate
+            try:
+                for hook in PIPELINE:
+                    hook(ctx, rec)
+            finally:
+                ctx.outcome_gate = None
+        ctx.quarantine.persist(conn)
         # 4b'. Design C (§5.3): run the live-only budget-config reconcile INSIDE
         # the txn, after the pipeline and BEFORE harvest, so any newly-latched
         # crossing row is journaled by the budget harvest below. No op line is
@@ -7323,6 +8914,31 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         # segment past the (absent) HW — replayed idempotently next cycle. So do
         # not touch the cursor here.
         if cursor_target is not None:
+            _advance_admission_summary(
+                conn, boundary, excluded, cursor, cursor_target)
+            # #825/#832 fix round A: this cycle derived every input it
+            # consumed, so the derivation frontier follows the cursor — but
+            # only while the two were equal. A frontier behind the cursor
+            # marks inputs a rebuild consumed without deriving, which only the
+            # completion step may certify.
+            # Skipped when the cycle consumed nothing: rewriting the same row
+            # (DELETE + INSERT) dirties the page, so an idle tick would write
+            # the file and defeat the stats digest memo (#857).
+            # Fix round C (P1-1): this cycle journaled its decisions BEYOND
+            # `cursor_target`, so the row also names the output end — the
+            # journal end now, after every append of the cycle and under the
+            # ingest lock, so no admitted decision between the two can derive
+            # from a later input.
+            # Revision 2 (#946, Codex design-fix-round-3 Q5): only from a
+            # TRUSTED predecessor — a current-generation proof at the cursor
+            # this cycle actually resumed from (a cursor the endpoint check
+            # moved is no such cursor) — and the output end is the verified
+            # complete-line endpoint, never the raw size. An old-generation
+            # row reads as absent, so it is never extended or restamped.
+            if (cursor_target != cursor and cursor == stored_cursor
+                    and _read_derivation_frontier(conn) == cursor):
+                _write_derivation_frontier(
+                    conn, cursor_target, output_end=journal_safe_high_water())
             _write_cursor(conn, cursor_target[0], cursor_target[1])
         conn.commit()
     except BaseException:
@@ -7331,6 +8947,15 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
         except Exception:
             pass
         raise
+
+    # #825/#832 spec 8: this cycle excluded records, so the durable
+    # legacy-writer evidence learns the extended population (after the commit:
+    # it is a file, never part of the stats transaction).
+    if excluded:
+        try:
+            _record_legacy_writer_evidence(_read_admission_summary(conn))
+        except sqlite3.Error:
+            pass
 
     # `post_commit` (the reconcile's `_after_stats_commit` seam) fires AFTER the
     # commit and BEFORE alert dispatch — the committed state stands, and a raise
@@ -7351,7 +8976,16 @@ def _run_cycle(conn: sqlite3.Connection, *, reconcile_config=None,
                         conflicts_dropped=(len(ctx.conflicts_dropped)
                                            + len(preflight_conflicts)),
                         meter_rate_change_result=rate_change_result,
-                        deferred_alerts=list(ctx.deferred_alerts))
+                        deferred_alerts=list(ctx.deferred_alerts),
+                        blocked_by=cache_block,
+                        applied_through=(cursor_target
+                                         if cursor_target is not None
+                                         else cursor))
+
+
+#: How many times one ingest invocation re-opens an index whose epoch or
+#: identity changed under it before withholding its result (#825/#832 spec 6).
+_INDEX_IDENTITY_RETRIES = 3
 
 
 def _run_stats_ingest_once(
@@ -7447,12 +9081,27 @@ def _run_stats_ingest_once(
             if own_conn:
                 conn = _cctally_core.open_db()
         elif own_conn:
+            # #825/#832 spec 6: a still-running previous-release process also
+            # treats this epoch as mismatched and republishes its own, so the
+            # ping-pong has no global bound. Each invocation bounds its own
+            # retries and withholds its result rather than spin.
+            attempts = 0
             while True:
+                attempts += 1
+                if attempts > _INDEX_IDENTITY_RETRIES:
+                    import _cctally_store
+                    return IngestResult(
+                        ran=False, consumed=0, malformed=0,
+                        events_emitted=0, alerts=[],
+                        error=_cctally_store.StatsIndexNotCurrent(
+                            "the stats index kept changing epoch; another "
+                            "cctally process is republishing it"))
                 raw_epoch = _stats_db_user_version()
                 if (
                     raw_epoch is None
                     or raw_epoch <= _cctally_core.LEGACY_STATS_HEAD
                 ):
+                    _LOCK_FAILURE.set(None)
                     maintenance_fd = _acquire_maintenance_exclusive(
                         mode, timeout_s
                     )
@@ -7463,6 +9112,7 @@ def _run_stats_ingest_once(
                             malformed=0,
                             events_emitted=0,
                             alerts=[],
+                            blocked_by=_lock_block("maintenance", "exclusive"),
                     )
                     identity_before = _stats_db_identity()
                     conn = _cctally_core.open_db()
@@ -7470,6 +9120,7 @@ def _run_stats_ingest_once(
                 else:
                     identity_before = _stats_db_identity()
                     conn = _cctally_core.open_db()
+                    _LOCK_FAILURE.set(None)
                     maintenance_fd = _acquire_maintenance_shared(
                         mode, timeout_s
                     )
@@ -7483,6 +9134,7 @@ def _run_stats_ingest_once(
                         malformed=0,
                         events_emitted=0,
                         alerts=[],
+                        blocked_by=_lock_block("maintenance", "shared"),
                     )
                 identity_after = _stats_db_identity()
                 opened_epoch = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -7500,6 +9152,7 @@ def _run_stats_ingest_once(
                 conn.close()
                 conn = None
         else:
+            _LOCK_FAILURE.set(None)
             maintenance_fd = _acquire_maintenance_shared(mode, timeout_s)
             if maintenance_fd is None:
                 return IngestResult(
@@ -7508,20 +9161,27 @@ def _run_stats_ingest_once(
                     malformed=0,
                     events_emitted=0,
                     alerts=[],
+                    blocked_by=_lock_block("maintenance", "shared"),
                 )
 
         if not locks_held:
+            _LOCK_FAILURE.set(None)
             lock_fd = _acquire_ingest_lock(mode, timeout_s)
             if lock_fd is None:
                 if own_conn and conn is not None:
                     conn.close()
                     conn = None
+                # #825/#832 Codex fix-round-4 Q3: the failed try-lock itself
+                # names the lock that refused it, the requested mode and
+                # whether it was held, so the caller can leave an obligation
+                # for exactly that release (every `ran=False` above does too).
                 return IngestResult(
                     ran=False,
                     consumed=0,
                     malformed=0,
                     events_emitted=0,
                     alerts=[],
+                    blocked_by=_lock_block("ingest", "exclusive"),
                 )
         try:
             # #386: declare the sanctioned steady-state write regime for the
@@ -7579,6 +9239,15 @@ def _run_stats_ingest_once(
             _release_ingest_lock(lock_fd)
         if maintenance_fd is not None:
             _release_maintenance_shared(maintenance_fd)
+        # #825/#832 spec 4.3 revision 2: a cycle that held the ingest lock —
+        # committed, rolled back or failed — posts its wake once every lock
+        # it took has unwound. Under `locks_held` the outer owner posts it.
+        if lock_fd is not None:
+            try:
+                import _cctally_statusline
+                _cctally_statusline.post_wake("holder:ingest")
+            except Exception:
+                pass
 
 
 def _correction_recovery_guidance(cause) -> str:
@@ -7614,6 +9283,11 @@ def _correction_error_result(error) -> IngestResult:
     )
 
 
+def _index_not_current():
+    import _cctally_store
+    return _cctally_store.StatsIndexNotCurrent
+
+
 def _tainted_batch_converged(signal: CorrectionRebuildRequired) -> bool:
     """Convergence for a completed-to-tainted signal (#496 S5b §3.7).
 
@@ -7632,8 +9306,12 @@ def _tainted_batch_converged(signal: CorrectionRebuildRequired) -> bool:
         return False
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
     try:
-        rows = _read_selector_rows(conn)
-    except sqlite3.Error:
+        # #825/#832 spec 6: convergence is declared only from a validated
+        # current index.
+        import _cctally_store
+        with _cctally_store.current_stats_snapshot(conn):
+            rows = _read_selector_rows(conn)
+    except (sqlite3.Error, _index_not_current()):
         return False
     finally:
         conn.close()
@@ -7663,11 +9341,18 @@ def _correction_index_converged(signal: CorrectionRebuildRequired) -> bool:
         return False
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
     try:
-        row = conn.execute(
-            "SELECT rev, status, content_hash, batch_id "
-            "FROM journal_effective_events WHERE event_id = ?",
-            (signal.event_id,),
-        ).fetchone()
+        try:
+            import _cctally_store
+            with _cctally_store.current_stats_snapshot(conn):
+                row = conn.execute(
+                    "SELECT rev, status, content_hash, batch_id "
+                    "FROM journal_effective_events WHERE event_id = ?",
+                    (signal.event_id,),
+                ).fetchone()
+        except _index_not_current():
+            # #825/#832 spec 6: an unvalidated index never declares
+            # convergence.
+            return False
         if row is None:
             return False
         return (
@@ -7737,6 +9422,10 @@ def _recover_completed_correction(
                 "stats maintenance lock is busy"
             )
         )
+    import _cctally_completion
+    # Fix round K11 (K9K10-R7): the rebuild published, but its residual
+    # obligation could not be made durable; reported after the locks go.
+    obligation_failure = None
     ingest_fd = None
     try:
         ingest_fd = _acquire_ingest_lock(mode, timeout_s)
@@ -7780,7 +9469,10 @@ def _recover_completed_correction(
                         trigger="correction-recovery-in-band"
                     ),
                     high_water=signal.high_water,
+                    complete_derivation=True,
                 )
+        except _cctally_completion.ResidualObligationNotDurable as exc:
+            obligation_failure = exc
         except BaseException as exc:
             _cleanup_new_correction_scratches(scratches_before)
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
@@ -7792,6 +9484,19 @@ def _recover_completed_correction(
         if ingest_fd is not None:
             _release_ingest_lock(ingest_fd)
         _release_maintenance_shared(maintenance_fd)
+    if obligation_failure is not None:
+        # The correction rebuild IS published: post its completion wake,
+        # then report the obligation failure. Rebuilding again would not
+        # help; the inputs past the rebuilt prefix stay in the journal for
+        # the next ingest.
+        _cctally_completion.post_publication_wake()
+        raise CorrectionRecoveryError(
+            "the correction rebuild was published, but the record that the "
+            "inputs written during it still need deriving could not be saved "
+            f"({obligation_failure}); those inputs stay in the journal and "
+            "the next ingest derives them, so retry once the data directory "
+            "is writable"
+        ) from obligation_failure
 
 
 def run_stats_ingest(
@@ -8119,13 +9824,19 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "five_hour_credit_confirmation_state",
         "five_hour_milestones",
         "five_hour_reset_events",
+        "journal_admission_summary",
         "journal_cursor",
+        "journal_derivation_frontier",
         "journal_effective_events",
+        "journal_excluded_event_revisions",
         "journal_protocol_violations",
         "journal_selector_batch_records",
         "journal_selector_batches",
         "journal_selector_state",
         "meter_rate_change_events",
+        "outcome_quarantine_certificates",
+        "outcome_quarantine_envelope",
+        "outcome_quarantine_triggers",
         "percent_milestones",
         "project_budget_milestones",
         "projected_milestones",
@@ -8140,6 +9851,7 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "stats_open_fixups",
         "stats_publication_stamp",
         "stats_quota_projection_state",
+        "usage_snapshot_suppressions",
         "week_reset_events",
         "weekly_cost_snapshots",
         "weekly_credit_floors",
@@ -8147,6 +9859,11 @@ _REBUILD_REQUIRED_TABLES = frozenset(
         "weekly_usage_snapshots",
     }
 )
+#: #825/#832 Task 4.0. The one stats trigger. A scratch index without it would
+#: publish a store whose live stale-replica removals leave dangling milestone
+#: references a rebuild cannot reproduce, so its absence fails validation like a
+#: missing table does.
+_REBUILD_REQUIRED_TRIGGERS = frozenset({"trg_usage_snapshot_suppression"})
 _REBUILD_REQUIRED_INDEXES = frozenset(
     {
         "idx_budget_milestones_alert_digest",
@@ -8210,12 +9927,14 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_weekly_usage_snapshots_journal_id",
     }
 )
-# SHA-256 of the current epoch's non-internal table/index sqlite_schema rows,
+# SHA-256 of the current epoch's non-internal table/index/trigger sqlite_schema
+# rows (triggers since #825/#832 Task 4.0),
 # ordered by (type, name).  Unlike table-name checks, this catches a silently
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
+# #825/#832 revision 2 (#946): `journal_derivation_frontier.proof_generation`.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "2ef6dab067703e612360245f9fbe4522290046dc6d8d7b009798a384cb5c27b8"
+    "92692b90b8446b0d40aff266bb142b76b0319a749d9e75b2caf469d5461ec952"
 )
 
 
@@ -8224,7 +9943,7 @@ def _stats_schema_fingerprint(conn: sqlite3.Connection) -> str:
         tuple(row)
         for row in conn.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-            "WHERE type IN ('table', 'index') "
+            "WHERE type IN ('table', 'index', 'trigger') "
             "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
         )
     ]
@@ -8277,6 +9996,19 @@ def _validate_rebuilt_stats_index(
         raise JournalError(
             "rebuilt stats index index contract mismatch"
             f"; missing={missing_indexes!r}; unexpected={unexpected_indexes!r}"
+        )
+
+    triggers = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'trigger'"
+        )
+    }
+    if triggers != _REBUILD_REQUIRED_TRIGGERS:
+        raise JournalError(
+            "rebuilt stats index trigger contract mismatch"
+            f"; missing={sorted(_REBUILD_REQUIRED_TRIGGERS - triggers)!r}"
+            f"; unexpected={sorted(triggers - _REBUILD_REQUIRED_TRIGGERS)!r}"
         )
 
     schema_fingerprint = _stats_schema_fingerprint(conn)
@@ -8355,6 +10087,10 @@ def stats_index_matches_journal_prefix(
     if not pathlib.Path(path).exists():
         return False
     try:
+        # #946: a rebuild materializes the SAFE endpoint of the prefix it
+        # pins, so a raw high water a caller captured is compared as that
+        # endpoint (idempotent on a complete-line boundary).
+        high_water = _safe_pinned_high_water(high_water)
         all_segments = list_segments()
         segments = all_segments
         elision = None
@@ -8391,9 +10127,16 @@ def stats_index_matches_journal_prefix(
             cutover_captured = _CUTOVER_UNSEEN
             marker_coordinates: dict = {}
             hasher = _lib_journal_router.PrefixHashAccumulator()
+            # #825/#832: the same admission the rebuild applied.
+            admission_boundary = _whole_prefix_admission_boundary()
             if high_water is not None:
                 def _elide_segment(name, lo, hi, stat_result) -> bool:
                     nonlocal prior_high_water
+                    # The rebuild's own admission predicate (Codex Q4).
+                    if not _lib_segment_summary.admission_permits_elision(
+                            admission_boundary, name, hi,
+                            elision.summaries.get(name)):
+                        return False
                     summary = elision.decide(name, hi, stat_result)
                     if summary is None:
                         return False
@@ -8413,7 +10156,10 @@ def stats_index_matches_journal_prefix(
                     elide=_elide_segment,
                 ):
                     record = _lib_journal.decode_line(raw)
-                    if record is not None:
+                    if record is not None and not _is_admitted(
+                            record, segment, offset, admission_boundary):
+                        decoded.append(None)
+                    elif record is not None:
                         _capture_protocol_prefix_evidence(
                             record,
                             prior_high_water,
@@ -8425,7 +10171,7 @@ def stats_index_matches_journal_prefix(
                         )
                         if (isinstance(record.get("payload"), dict)
                                 and record["payload"].get("kind")
-                                == _lib_journal._PROTOCOL_RESOLUTION_KIND):
+                                in _lib_journal.PROTOCOL_RESOLUTION_KINDS):
                             elision.resolution_seen = True
                         if (cutover_captured is _CUTOVER_UNSEEN
                                 and record.get("id") == CUTOVER_OP_ID):
@@ -8447,7 +10193,8 @@ def stats_index_matches_journal_prefix(
                     )
             hasher = None
             cutover_claude = _resolve_cutover_for_rebuild(
-                cutover_captured, high_water, all_segments)
+                cutover_captured, high_water, all_segments,
+                boundary=admission_boundary)
             for record in decoded:
                 if record is not None:
                     _normalize_legacy_account_stamp(record, cutover_claude)
@@ -10772,7 +12519,8 @@ def _cutover_value_of(record) -> "str | None":
     return payload.get("claude_legacy_account")
 
 
-def _resolve_cutover_for_rebuild(captured, hw, segments, counters=None) -> str:
+def _resolve_cutover_for_rebuild(captured, hw, segments, counters=None,
+                                 boundary=None) -> str:
     """The cutover account for one rebuild, reading each byte at most once.
 
     `captured` is what the streaming pass saw inside the pinned prefix, or
@@ -10806,7 +12554,8 @@ def _resolve_cutover_for_rebuild(captured, hw, segments, counters=None) -> str:
         record = _lib_journal.decode_line(raw)
         if counters is not None and record is not None:
             counters["decodes"] += 1
-        if record is not None and record.get("id") == CUTOVER_OP_ID:
+        if (record is not None and record.get("id") == CUTOVER_OP_ID
+                and _is_admitted(record, _segment, _offset, boundary)):
             value = _cutover_value_of(record)
             return value if value is not None else _lib_accounts.UNATTRIBUTED
     return _lib_accounts.UNATTRIBUTED
@@ -10952,8 +12701,19 @@ def rebuild_stats_index(
     high_water: "tuple[str, int] | None" = None,
     update_quota_cache: bool = True,
     before_swap=None,
+    complete_derivation: bool = False,
 ) -> RebuildResult:
     """Rebuild the stats index under a SHARED `artifact-retention.lock` hold.
+
+    ``complete_derivation=True`` (#825/#832 fix round A, Codex fix-round-1
+    Q1) first runs the shared derivation-completion step
+    (`_cctally_completion`), which journals the decisions of every admitted
+    input a rebuild would otherwise consume without deriving, and then builds
+    the live index. Only a caller that holds stats maintenance EXCLUSIVE and
+    `journal.ingest.lock` may pass it (no current decision can then be
+    appended concurrently), and only for the live destination. Every
+    production rebuild of the live index passes it; a direct call that does
+    not stays apply-only and carries the replaced index's trusted frontier.
 
     #496 S6 §5.3. A rebuild holds retention SHARED while publishing the
     cold-quarantine incident manifest and the rebuild record that names it, so
@@ -10966,6 +12726,17 @@ def rebuild_stats_index(
 
     See `_rebuild_stats_index_locked` for the rebuild itself.
     """
+    if complete_derivation:
+        if target_path is not None:
+            raise ValueError(
+                "complete_derivation applies to the live destination only")
+        import _cctally_completion
+        return _cctally_completion.complete_and_rebuild(
+            context=context,
+            high_water=high_water,
+            update_quota_cache=update_quota_cache,
+            before_swap=before_swap,
+        )
     import _cctally_retention
 
     with _cctally_retention.retention_shared(label="stats rebuild"):
@@ -10978,6 +12749,74 @@ def rebuild_stats_index(
         )
 
 
+def journaled_block_first_observations(records, by_id) -> dict:
+    """Each five-hour window's FIRST WRITER, per account:
+    ``{(account_key, five_hour_window_key): {"captured_at_utc",
+    "five_hour_resets_at", "weekly_percent"}}`` from the effective
+    `snapshot_accept` decision that live ingest derived first for the window
+    (#825/#832 fix round J5, 825-832-CD4-V01; J4, #954).
+
+    Live ingest derives inputs one at a time in journal order and journals
+    each decision as it goes, and its block upsert leaves the start columns
+    to the writer that materializes the row (none is in its ``DO UPDATE``).
+    So the first writer is the window's first decision IN JOURNAL ORDER,
+    never its earliest capture: a recorder that captured first can append
+    last, and its accepted reading then updates a block another reading
+    already opened. Decisions are ordered by their id's FIRST appearance in
+    ``records`` (an ordinary evt, or the correction that introduced the id),
+    so a correction revising a decision keeps the decision's place, and each
+    takes its effective revision from ``by_id`` (`resolve_effective_events`'
+    ``by_id``) — a decision that is not active never wrote. A
+    `snapshot_accept` payload IS its row's column map, and the entry survives
+    a stale-replica removal that deleted the row.
+
+    Pure: ``records`` are the retained, account-normalized records in
+    canonical journal order (non-dicts are skipped). A payload without an
+    explicit account is skipped rather than guessed, so the backfill falls
+    back to the surviving snapshots for it."""
+    first: dict = {}
+    seen: set = set()
+    for record in records:
+        if not isinstance(record, dict) or record.get("t") not in (
+                "evt", "correction"):
+            continue
+        event_id = record.get("id")
+        if not isinstance(event_id, str) or event_id in seen:
+            continue
+        seen.add(event_id)
+        selected = by_id.get(event_id)
+        if selected is None or selected.status != "active":
+            continue
+        effective = selected.record
+        payload = (effective.get("payload")
+                   if isinstance(effective, dict) else None)
+        if not isinstance(payload, dict) or payload.get("kind") != "snapshot_accept":
+            continue
+        account_key = payload.get("account_key")
+        window_key = payload.get("five_hour_window_key")
+        captured = payload.get("captured_at_utc")
+        if (not isinstance(account_key, str) or not account_key
+                or window_key is None or payload.get("five_hour_percent") is None
+                or not isinstance(captured, str)):
+            continue
+        try:
+            identity = (account_key, int(window_key))
+        except (TypeError, ValueError):
+            continue
+        if identity not in first:
+            first[identity] = {
+                "captured_at_utc": captured,
+                "five_hour_resets_at": payload.get("five_hour_resets_at"),
+                "weekly_percent": payload.get("weekly_percent"),
+            }
+    return first
+
+
+#: `_rebuild_stats_index_locked`'s default: carry the replaced index's trusted
+#: derivation frontier, clipped to the rebuilt prefix.
+_CARRY_FRONTIER = object()
+
+
 def _rebuild_stats_index_locked(
     *,
     context: RebuildContext,
@@ -10985,6 +12824,8 @@ def _rebuild_stats_index_locked(
     high_water: "tuple[str, int] | None" = None,
     update_quota_cache: bool = True,
     before_swap=None,
+    derivation_frontier=_CARRY_FRONTIER,
+    whole_prefix: "bool | None" = None,
 ) -> RebuildResult:
     """Build a FRESH stats index from the journal alone (spec §5.4).
 
@@ -11027,11 +12868,27 @@ def _rebuild_stats_index_locked(
     )
     dest = (pathlib.Path(target_path) if target_path is not None
             else pathlib.Path(_cctally_core.DB_PATH))
+    if whole_prefix is None:
+        whole_prefix = high_water is None
+    # #825/#832 fix round A: the frontier is a journal fact (every admitted
+    # input at or before it has journaled decisions), so an apply-only rebuild
+    # may carry a trusted one — never invent one. Fix round C (P1-1): it is
+    # carried UNCHANGED, output end included, even past this rebuild's prefix.
+    # Clipping it to the prefix would claim a frontier whose decisions are
+    # interleaved, beyond it, with decisions derived from later inputs, which
+    # no output end can describe soundly; a frontier ahead of the cursor only
+    # stops live ingest from advancing it until the next completion.
+    if derivation_frontier is _CARRY_FRONTIER:
+        derivation_frontier = read_trusted_derivation_state(dest)
 
     # HW snapshot at the START — lines appended during the rebuild are past HW
     # and belong to the next ingest cycle (they replay idempotently); mirrors the
-    # live cycle's §5.2.1 HW-prefix rule.
-    hw = high_water if high_water is not None else journal_high_water()
+    # live cycle's §5.2.1 HW-prefix rule. #946 (spec 4.7 revision 2): the SAFE
+    # endpoint of that prefix, so the rebuilt cursor, the admission summary,
+    # the durable selector prefix and the Codex coverage claim all name the
+    # last complete line this pass reads, never a torn suffix past it.
+    hw = (_safe_pinned_high_water(high_water) if high_water is not None
+          else journal_safe_high_water())
     # ONE segment snapshot for the whole rebuild (#496 S4 §4). `list_segments()`
     # re-enumerates the directory at call time and orders bootstrap segments
     # first, so a bootstrap segment appearing mid-rebuild would shift the indices
@@ -11050,6 +12907,26 @@ def _rebuild_stats_index_locked(
                 f"rebuild high-water offset is invalid for {hw[0]}: {hw[1]}"
             )
         segments = segments[:segments.index(hw[0]) + 1]
+
+    # #825/#832 (spec 5.3): the account-bound boundary is a function of the
+    # journal alone, so it is resolved once and applied to every record of the
+    # pinned prefix BEFORE interpretation. The summary is rebuilt from scratch.
+    admission_boundary = _whole_prefix_admission_boundary()
+    # #825/#832 spec 5.6 item 9: the outcome quarantine is recomputed in
+    # journal order, inline in the single read pass, by the same fold live
+    # ingest runs.
+    import _cctally_quarantine
+    rebuild_quarantine = _cctally_quarantine.QuarantineFold.empty()
+    #: #825/#832 fix round A (Codex Q2): the excluded events and correction
+    #: actions of the pinned prefix, folded into the physical inventory.
+    excluded_decisions: list = []
+    rebuild_admission = AdmissionSummary(
+        cutover_id=(None if admission_boundary is None
+                    else _lib_account_protocol.CUTOVER_OP_ID),
+        scanned_high_water=hw,
+        complete_through=hw,
+        boundary=admission_boundary,
+    )
 
     # Observed BEFORE the scratch is built, because it describes the index this
     # rebuild is about to replace (#496 S5b). It is the only report a persistent
@@ -11130,6 +13007,14 @@ def _rebuild_stats_index_locked(
             """Contribute an elided segment's share instead of reading it."""
             nonlocal prior_high_water
             nonlocal malformed
+            # #825/#832 (Codex fix-round-1 Q4): a summary describes its lines
+            # WITHOUT admission, so past the frozen extents only a proven
+            # Codex-quota-only segment may be elided; anything else is read
+            # and admitted line by line.
+            if not _lib_segment_summary.admission_permits_elision(
+                    admission_boundary, name, hi,
+                    elision.summaries.get(name)):
+                return False
             summary = elision.decide(name, hi, stat_result)
             if summary is None:
                 return False
@@ -11179,6 +13064,30 @@ def _rebuild_stats_index_locked(
                     )
                     continue
                 prefix["decodes"] += 1
+                if (admission_boundary is not None
+                        and not _is_admitted(
+                            rec, segment, offset, admission_boundary)):
+                    # Excluded before interpretation: no protocol evidence, no
+                    # cutover capture, no last-seen, no retained record — one
+                    # positional placeholder, exactly like a non-retained line.
+                    # Its raw bytes still feed the prefix hash above.
+                    coord = _lib_account_protocol.Coordinate(segment, offset)
+                    rebuild_admission.extend([ExcludedRecord(
+                        coordinate=coord,
+                        family=_lib_account_protocol.record_family(rec))])
+                    _notify_excluded(rec, coord)
+                    rebuild_quarantine.on_excluded(
+                        rec, segment=segment, offset=offset)
+                    if rec.get("t") in ("evt", "correction"):
+                        excluded_decisions.append(
+                            {"t": rec.get("t"), "id": rec.get("id"),
+                             "rev": rec.get("rev", 0)})
+                    summaries.decoded(False)
+                    decoded.append(None)
+                    prior_high_water = (segment, offset + len(raw) + 1)
+                    continue
+                rebuild_quarantine.on_record(
+                    rec, segment=segment, offset=offset)
                 # `_capture_protocol_prefix_evidence` returns immediately for
                 # anything that is not an op, so this guard changes nothing it
                 # does — it moves the phase attribution's two clock reads from
@@ -11207,7 +13116,7 @@ def _rebuild_stats_index_locked(
                     evidence_seconds += time.monotonic() - evidence_started
                     if (isinstance(rec.get("payload"), dict)
                             and rec["payload"].get("kind")
-                            == _lib_journal._PROTOCOL_RESOLUTION_KIND):
+                            in _lib_journal.PROTOCOL_RESOLUTION_KINDS):
                         # Nothing further is elided in this pass. The
                         # accumulator stays non-composable for the rest of it —
                         # a gap already read is still a gap — so every later
@@ -11232,7 +13141,7 @@ def _rebuild_stats_index_locked(
                     )
                 retained = (
                     rec.get("t") in _lib_journal_router.RETAINED_RECORD_TYPES)
-                summaries.decoded(retained)
+                summaries.decoded(retained, _is_codex_quota_obs(rec))
                 if retained:
                     decoded.append(rec)
                 else:
@@ -11286,7 +13195,8 @@ def _rebuild_stats_index_locked(
         # single-account rebuild is byte-neutral.
         cutover_started = time.monotonic()
         cutover_claude = _resolve_cutover_for_rebuild(
-            cutover_captured, hw, all_segments, traversal["cutover_suffix"])
+            cutover_captured, hw, all_segments, traversal["cutover_suffix"],
+            boundary=admission_boundary)
         phase_seconds["cutover_suffix"] = round(
             time.monotonic() - cutover_started, 6)
         for rec in decoded:
@@ -11419,7 +13329,14 @@ def _rebuild_stats_index_locked(
             cctally = sys.modules.get("cctally")
             bf = getattr(cctally, "_backfill_five_hour_blocks", None)
             if bf is not None:
-                bf(conn, only_missing=True)
+                # #825/#832 fix rounds J4/J5: the open block's start columns
+                # come from the window's FIRST WRITER — its first effective
+                # `snapshot_accept` in journal order, which a credit's
+                # stale-replica removal cannot delete and an earlier capture
+                # appended later cannot displace.
+                bf(conn, only_missing=True,
+                   journaled_first=journaled_block_first_observations(
+                       decoded, effective.by_id))
         except Exception as exc:  # pragma: no cover — projection is best-effort
             print(f"[rebuild] open 5h block re-materialization failed: {exc}",
                   file=sys.stderr)
@@ -11465,6 +13382,10 @@ def _rebuild_stats_index_locked(
                 last_seen.resolve(cutover_claude, _lib_accounts.UNATTRIBUTED),
             )
             if hw is not None:
+                _write_admission_summary(conn, rebuild_admission)
+                rebuild_quarantine.persist(conn)
+                _record_excluded_revisions(conn, excluded_decisions)
+                _write_derivation_frontier(conn, derivation_frontier)
                 _write_cursor(conn, hw[0], hw[1])
             conn.commit()
         except BaseException:
@@ -11598,6 +13519,12 @@ def _rebuild_stats_index_locked(
     # on its behalf would let a preview change what the status line shows.
     if target_path is None:
         _rematerialize_five_hour_high_water(dest)
+        # #825/#832 spec 8: a rebuild of the whole journal recomputes the
+        # excluded population and compares it with the durable evidence; an
+        # unchanged population keeps its age. A pinned-prefix rebuild saw only
+        # part of the journal, so it leaves the evidence alone.
+        if whole_prefix:
+            _record_legacy_writer_evidence(rebuild_admission)
 
     return RebuildResult(
         rows_by_table=rows_by_table, malformed=malformed,
@@ -12169,17 +14096,29 @@ def find_accounts_cutover_op():
     segment's whole line list before its first-match return, so the early exit
     could not stop reading inside the containing segment. The None-on-absence
     contract is UNCHANGED — the cache and conversations migrations depend on it
-    to defer their backfill.
+    to defer their backfill. An unreadable journal is not absence: it raises
+    `OSError` (fix round K11, K9K10-R9), which those migrations translate into
+    a transient deferral.
     """
     for seg in list_segments():
         seg_path = _cctally_core.JOURNAL_DIR / seg
         try:
             size = os.path.getsize(seg_path)
-        except OSError:
+        except FileNotFoundError:
+            # Removed since the listing: the one supported removal deletes
+            # an EMPTY segment, which holds no op.
             continue
+        # Fix round K11 (K9K10-R9): any other stat failure raises. Skipping
+        # the segment answered None although the op exists — a duplicate
+        # append, or an `unattributed` fallback during a rebuild.
         for _name, _off, raw in _iter_segment_lines(seg_path, 0, size):
             rec = _lib_journal.decode_line(raw)
             if rec is not None and rec.get("id") == CUTOVER_OP_ID:
+                # #825/#832: an op an excluded writer appended after the
+                # account-bound boundary is not the cutover's truth.
+                if not _is_admitted(rec, _name, _off,
+                                    find_account_bound_cutover(publish=False)):
+                    continue
                 return _cutover_value_of(rec)
     return None
 
@@ -12210,14 +14149,1847 @@ def resolve_cutover_claude_account() -> str:
     return value if value is not None else _lib_accounts.UNATTRIBUTED
 
 
+# --------------------------------------------------------------------------
+# #825/#832 account-bound cutover and the journal-anchored legacy spool
+# baseline (spec sections 5.5 and 7)
+# --------------------------------------------------------------------------
+#
+# One immutable `account_bound_cutover` op fences the one journal: records
+# after its historical boundary are admitted only when they carry the current
+# writer generation (or are proven Codex-only). The op is established ONCE,
+# under `journal.lock`, by the first current mutating producer:
+#
+#   (1) locate an existing op, through the verified coordinate cache;
+#   (2) scan a pinned prefix of every segment outside the lock;
+#   (3) under `journal.lock`, rescan the suffix written since the pinned
+#       prefix. An op found now means this producer lost the race: it installs
+#       NOTHING and returns the winner's boundary. Otherwise capture the legacy
+#       spool baseline and the frozen complete-line extents, repair a torn
+#       final line and append the op, whose payload records the baseline
+#       digest;
+#   (4) fsync the segment (and a newly created directory entry), then, still
+#       under the lock, install the baseline file atomically;
+#   (5) only afterwards publish the coordinate cache, which accelerates lookup
+#       and never confers authority.
+#
+# The baseline file is accepted only when its digest equals the digest the
+# LATEST anchoring op (the cutover op, or a later `legacy_spool_activity` op)
+# recorded in journal order. Anything else — a missing, unreadable or
+# differently-digested file — is unavailable, which the reducer journals as a
+# `baseline-unavailable` trigger before installing a fresh baseline under its
+# own anchoring op. Nothing here ever reads a legacy value as authority.
+
+_ACCOUNT_BOUND_CUTOVER_SRC = "account-bound-cutover"
+_LEGACY_SPOOL_ACTIVITY_SRC = "account-bound-reducer"
+_LEGACY_SPOOL_ACTIVITY_REASONS = (
+    "changed", "baseline-unavailable",
+    _lib_account_protocol.INVENTORY_COMPLETE_REASON)
+#: Spec revision 5 (section 7): the reason of the uncertainty op an
+#: incomplete inventory appends — no digest, no baseline advance.
+_INVENTORY_INCOMPLETE = _lib_account_protocol.INVENTORY_INCOMPLETE_REASON
+#: Fix round J (review cycle 3 825-832-CD3-J02, Codex fix-round-4 Q5):
+#: schema 2 caches carry the precedence evidence of the cutover they name and
+#: absence prefixes that were actually traversed. A schema-1 cache could have
+#: been written by the faulty recheck rule (pointing at a duplicate cutover,
+#: or recording an absence prefix recomputed from later file contents), so it
+#: is never trusted: readers reconstruct from the journal.
+_ACCOUNT_BOUND_CACHE_SCHEMA = 2
+#: A cutover/anchor line is a small op; a coordinate read never needs more.
+_ANCHOR_LINE_READ_LIMIT = 1 << 16
+
+#: Test seam: called with a step name at each durability boundary of the
+#: establishment ("after-scan", "after-baseline-capture", "after-append",
+#: "after-fsync", "after-baseline-install") and of the activity append
+#: ("activity-after-append", "activity-after-fsync"). Production leaves None.
+_ACCOUNT_BOUND_CUTOVER_SEAM = None
+
+
+class AccountBoundCutoverDeferred(JournalError):
+    """The store still awaits its one-time journal cutover (stats.db at a
+    legacy `user_version`). Establishing the account-bound boundary first would
+    freeze an empty journal and exclude the bootstrap export that cutover is
+    about to write, so establishment waits for it."""
+
+
+class AccountBoundCutoverUnavailable(JournalError, OSError):
+    """A cutover lookup could not read every byte it needed (review cycle 7
+    825-832-CD3-J02): a journal segment, or its listing entry, could not be
+    stat'ed or read. Absence is then unproven, so the lookup answers neither
+    a boundary nor "no cutover": establishment appends nothing and installs
+    no baseline, and an admission consumer aborts rather than admit every
+    record against a missing boundary. Transient by nature; the caller
+    retries on a later event. An `OSError`, so every caller that already
+    treats an I/O failure as "not now" (the statusline's same-second order
+    lookup answers unknown order) keeps doing so.
+
+    Only genuine absence — a segment removed after it was listed — is not
+    this error: the one supported removal (`_remove_empty_future_segments`,
+    under `journal.lock`) deletes an EMPTY restored future segment, which
+    holds no op."""
+
+
+class LegacySpoolInventoryIncomplete(JournalError, OSError):
+    """The legacy statusline spool could not be fully inventoried (review
+    cycle 7 825-832-CD7-J01): a path or directory entry could not be stat'ed,
+    listed or read. Only genuine absence (the spool root absent, or a file
+    that vanished between its listing and its read) is absent; anything
+    else would let an omitted legacy candidate digest equal to the anchored
+    baseline. An incomplete inventory is never a baseline and never a
+    comparison.
+
+    Spec revision 5 (section 7, operator decision on Codex design-fix-round-5
+    Q4): it is an uncertainty trigger. Before the initial cutover the
+    establishment records it in the cutover op itself; after it, the first
+    failure of an episode appends one `inventory-incomplete` op
+    (`record_legacy_spool_inventory_incomplete`). ``operation`` (``list``,
+    ``stat`` or ``read``), ``path`` (absolute), ``rel`` (relative to the data
+    directory) and ``error`` (the errno name) are the typed evidence."""
+
+    def __init__(self, *args, operation="read", path=None, rel=None,
+                 error=None):
+        super().__init__(*args)
+        self.operation = operation
+        self.failed_path = None if path is None else str(path)
+        self.rel = rel if rel is not None else (
+            "" if path is None else _legacy_relative_name(path))
+        self.error = error or errno.errorcode.get(
+            self.errno or errno.EIO, "EIO")
+
+    def evidence(self) -> dict:
+        """The typed failure evidence an uncertainty record carries."""
+        return _lib_account_protocol.inventory_failure_evidence(
+            path=self.rel, operation=self.operation, error=self.error,
+            message=str(self.strerror or ""))
+
+
+class LegacySpoolUncertaintyNotDurable(LegacySpoolInventoryIncomplete):
+    """The inventory was incomplete AND its `inventory-incomplete` op could
+    not be made durable (spec revision 5, section 7 *Durability*). The pass
+    defers under section 4.3 *Waiting heads* and publishes nothing; no
+    episode is recorded, so a later rescan appends the op. An `OSError`
+    (and a `LegacySpoolInventoryIncomplete`), so a caller that defers on
+    either keeps doing so."""
+
+
+def _account_bound_seam(step: str) -> None:
+    seam = _ACCOUNT_BOUND_CUTOVER_SEAM
+    if seam is not None:
+        seam(step)
+
+
+def _legacy_spool_paths() -> list:
+    """The previous release's statusline coordination paths (spec section 7)."""
+    core = _cctally_core
+    return [
+        core.STATUSLINE_OBSERVE_MARKER_PATH,
+        core.STATUSLINE_PERSIST_LOCK_PATH,
+        core.STATUSLINE_CANDIDATE_DIR,
+        core.STATUSLINE_SELECTED_PATH,
+        core.STATUSLINE_TRANSPORT_MARKER_PATH,
+        core.STATUSLINE_AUTHORITATIVE_7D_PATH,
+        core.STATUSLINE_AUTHORITATIVE_5H_PATH,
+    ]
+
+
+def _legacy_relative_name(path) -> str:
+    path = pathlib.Path(path)
+    try:
+        return path.relative_to(_cctally_core.APP_DIR).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _legacy_inventory_incomplete(path, exc, operation):
+    code = getattr(exc, "errno", None) or errno.EIO
+    return LegacySpoolInventoryIncomplete(
+        code, f"legacy statusline spool inventory is incomplete "
+        f"({operation}: {exc})", str(path),
+        operation=operation, path=path,
+        error=errno.errorcode.get(code, "EIO"))
+
+
+def _legacy_file_entry(path, rel: str):
+    """One `(rel, size, mtime_ns, sha256)` entry, or None when the path is
+    absent (it vanished since it was listed) or not a regular file.
+
+    Review cycle 7 825-832-CD7-J01: only ENOENT is absence. Any other stat or
+    read failure raises `LegacySpoolInventoryIncomplete`, because an entry
+    silently dropped would let the inventory digest equal to a baseline that
+    never saw it."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _legacy_inventory_incomplete(path, exc, "stat") from exc
+    if stat.S_ISDIR(st.st_mode):
+        # A directory where the walk listed a file: its own type check
+        # failed, so its contents were never inventoried.
+        raise _legacy_inventory_incomplete(
+            path, OSError(errno.EIO, "a directory was listed as a file"),
+            "list")
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _legacy_inventory_incomplete(path, exc, "read") from exc
+    return (rel, len(data), int(st.st_mtime_ns),
+            _lib_legacy_spool.content_digest(data))
+
+
+def capture_legacy_spool_state():
+    """Observe the legacy statusline spool. Content is read only to digest it;
+    it is never accounting input.
+
+    Complete or raising (review cycle 7 825-832-CD7-J01): a spool path that
+    is absent, or an entry that vanished since its directory was listed, is
+    absent; every other stat, listing or read failure raises
+    `LegacySpoolInventoryIncomplete`. A directory the walk cannot list is
+    such a failure (``onerror``), except the walk root vanishing after its
+    own `lstat`. An error the walk hands over without a filename names the
+    walked root (fix round K12, K11R-13), never an empty path."""
+    entries = []
+    walking = [None]
+
+    def unlistable(exc):
+        if isinstance(exc, FileNotFoundError):
+            return
+        raise _legacy_inventory_incomplete(
+            getattr(exc, "filename", None) or walking[0], exc, "list") from exc
+
+    for path in _legacy_spool_paths():
+        path = pathlib.Path(path)
+        walking[0] = path
+        try:
+            is_dir = stat.S_ISDIR(os.lstat(path).st_mode)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _legacy_inventory_incomplete(path, exc, "stat") from exc
+        if not is_dir:
+            entry = _legacy_file_entry(path, _legacy_relative_name(path))
+            if entry is not None:
+                entries.append(entry)
+            continue
+        for root, dirs, files in os.walk(path, onerror=unlistable,
+                                         followlinks=False):
+            dirs.sort()
+            for name in sorted(files):
+                child = pathlib.Path(root) / name
+                entry = _legacy_file_entry(child, _legacy_relative_name(child))
+                if entry is not None:
+                    entries.append(entry)
+    return _lib_legacy_spool.make_state(entries)
+
+
+def _decode_anchor_record(raw: bytes):
+    """A stamped cutover or legacy-spool-activity op decoded from ``raw``, or
+    None. An unstamped copy is excluded input and never an anchor."""
+    return _anchor_record(_lib_journal.decode_line(raw))
+
+
+def _anchor_record(rec):
+    """``rec`` when it is a stamped cutover or legacy-spool-activity op, else
+    None."""
+    if (not isinstance(rec, dict) or rec.get("t") != "op"
+            or not _lib_account_protocol.is_stamped(rec)):
+        return None
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    if kind == _lib_account_protocol.CUTOVER_OP_KIND:
+        if rec.get("id") != _lib_account_protocol.CUTOVER_OP_ID:
+            return None
+        try:
+            _lib_account_protocol.boundary_from_op(rec)
+        except ValueError:
+            return None
+        return rec
+    if kind == _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND:
+        digest = payload.get("digest")
+        if not isinstance(digest, str) or not digest.startswith("sha256:"):
+            return None
+        return rec
+    return None
+
+
+def _inventory_uncertainty_record(rec):
+    """``rec`` when it records legacy spool inventory uncertainty (spec
+    revision 5): a stamped `legacy_spool_activity` op with reason
+    `inventory-incomplete` and typed evidence, or a stamped cutover op that
+    recorded its inventory as incomplete. Else None."""
+    if (not isinstance(rec, dict) or rec.get("t") != "op"
+            or not _lib_account_protocol.is_stamped(rec)):
+        return None
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("kind")
+    if kind == _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND:
+        if (payload.get("reason") == _INVENTORY_INCOMPLETE
+                and _lib_account_protocol.is_inventory_failure(
+                    payload.get("failure"))):
+            return rec
+        return None
+    anchor = _anchor_record(rec)
+    if (anchor is not None and kind == _lib_account_protocol.CUTOVER_OP_KIND
+            and payload.get("legacySpoolInventoryFailure") is not None):
+        return rec
+    return None
+
+
+def _cutover_uncertainty(found):
+    """The coordinate of ``found`` (a located cutover) when the cutover
+    recorded inventory uncertainty, else None."""
+    if found is None or _inventory_uncertainty_record(found[2]) is None:
+        return None
+    return (found[0], found[1])
+
+
+def _anchor_digest(rec) -> str:
+    payload = rec["payload"]
+    if payload["kind"] == _lib_account_protocol.CUTOVER_OP_KIND:
+        return payload["legacySpoolBaselineDigest"]
+    return payload["digest"]
+
+
+def _read_line_at(segment: str, offset: int):
+    """The raw complete line starting at ``(segment, offset)``, or None."""
+    if not isinstance(segment, str) or type(offset) is not int or offset < 0:
+        return None
+    try:
+        listed = list_segments()
+    except OSError:
+        # The cache only accelerates; the lookup's own scan then fails
+        # closed on the same listing.
+        return None
+    if "/" in segment or segment not in listed:
+        return None
+    try:
+        with open(_cctally_core.JOURNAL_DIR / segment, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(_ANCHOR_LINE_READ_LIMIT)
+    except OSError:
+        return None
+    end = chunk.find(b"\n")
+    if end < 0:
+        return None
+    return chunk[:end]
+
+
+_CUTOVER_ID_BYTES = _lib_account_protocol.CUTOVER_OP_ID.encode("ascii")
+_ANCHOR_KIND_BYTES = (
+    _lib_account_protocol.CUTOVER_OP_KIND.encode("ascii"),
+    _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND.encode("ascii"),
+)
+
+
+def _cutover_lookup_incomplete(segment, exc):
+    return AccountBoundCutoverUnavailable(
+        getattr(exc, "errno", None) or errno.EIO,
+        f"account-bound cutover lookup could not read journal segment "
+        f"{segment} ({exc}); absence is unproven",
+        str(segment))
+
+
+def _segment_sizes() -> dict:
+    """``{segment: size}`` of every listed segment. A segment removed since
+    the listing is absent (the only supported removal deletes an empty
+    segment); any other stat failure raises `AccountBoundCutoverUnavailable`
+    rather than omit the segment from the ranges a lookup scans (review
+    cycle 7 825-832-CD3-J02)."""
+    sizes = {}
+    for seg in _lookup_segments():
+        try:
+            sizes[seg] = os.path.getsize(_cctally_core.JOURNAL_DIR / seg)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+    return sizes
+
+
+def _lookup_segments() -> list:
+    """`list_segments` for a cutover lookup: a listing failure is an
+    incomplete lookup, never an empty journal."""
+    try:
+        return list_segments()
+    except OSError as exc:
+        if isinstance(exc, AccountBoundCutoverUnavailable):
+            raise
+        raise _cutover_lookup_incomplete(
+            _cctally_core.JOURNAL_DIR, exc) from exc
+
+
+def _scan_for_cutover(ranges):
+    """First stamped cutover op in canonical order over ``ranges``
+    (``{segment: (lo, hi)}``); returns ``(segment, offset, record)`` or None.
+    A cheap byte prefilter keeps the one-time whole-journal scan from decoding
+    every line."""
+    return _scan_for_cutover_traversed(ranges)[0]
+
+
+def _scan_for_cutover_traversed(ranges):
+    """`_scan_for_cutover` plus the traversal evidence: ``(found,
+    traversed)``, where ``traversed`` maps every segment of ``ranges`` the
+    scan reached to the end of the last complete line it actually read from
+    that segment (its ``lo`` when it read none).
+
+    Fix round J (review cycle 3 825-832-CD3-J02, Codex fix-round-4 Q5): the
+    endpoint is where this traversal stopped — never the range's raw ``hi``
+    (a torn suffix past the last newline was never read) and never one
+    recomputed later from file contents, which a concurrent torn-tail repair
+    and append may already have replaced. A segment whose read failed keeps
+    the point the traversal had reached. Segments after the one holding the
+    found op are not traversed and are absent from the map.
+
+    Review cycle 7 825-832-CD3-J02: a segment that could not be read is NOT
+    skipped. Returning None after skipping it proved nothing, and a caller
+    took it as absence (a second cutover; a rebuild that admitted every
+    post-cutover legacy record). A read failure raises
+    `AccountBoundCutoverUnavailable`; only a segment removed since it was
+    listed (ENOENT: the one supported removal deletes an empty segment) is
+    absent."""
+    traversed = {}
+    for seg in sorted(ranges, key=_lib_journal.segment_sort_key):
+        lo, hi = ranges[seg]
+        traversed[seg] = lo
+        if hi <= lo:
+            continue
+        seg_path = _cctally_core.JOURNAL_DIR / seg
+        try:
+            for _name, off, raw in _iter_segment_lines(seg_path, lo, hi):
+                if _CUTOVER_ID_BYTES in raw:
+                    rec = _decode_anchor_record(raw)
+                    if rec is not None and rec["payload"]["kind"] == (
+                            _lib_account_protocol.CUTOVER_OP_KIND):
+                        traversed[seg] = off
+                        return (seg, off, rec), traversed
+                traversed[seg] = off + len(raw) + 1
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+    return None, traversed
+
+
+def _read_account_bound_cache():
+    try:
+        doc = json.loads(
+            _cctally_core.ACCOUNT_BOUND_CUTOVER_CACHE_PATH.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schemaVersion") != (
+            _ACCOUNT_BOUND_CACHE_SCHEMA):
+        return None
+    return doc
+
+
+def _cached_coordinate(doc, key):
+    if doc is None:
+        return None
+    value = doc.get(key)
+    if not isinstance(value, dict):
+        return None
+    seg, off = value.get("segment"), value.get("offset")
+    if not isinstance(seg, str) or type(off) is not int:
+        return None
+    return value
+
+
+def _verified_cutover_from_cache(doc):
+    """``(segment, offset, record)`` when the cache establishes that its
+    cutover coordinate holds the FIRST stamped cutover op of the journal,
+    else None (the caller reconstructs from the journal). A corrupt, stale or
+    untrusted cache is ignored.
+
+    Fix round J (review cycle 3 825-832-CD3-J02, Codex fix-round-4 Q5): a
+    valid cutover-shaped line is not enough, because a duplicate written by
+    the faulty recheck rule is one. The cache must establish
+
+    * the coordinate: a complete line there holds the stamped cutover op
+      under its stable id;
+    * the boundary payload: the op records exactly that coordinate as the
+      place it was appended;
+    * the anchored baseline digest: the digest the cache recorded is the
+      one the op records;
+    * precedence: its absence evidence covers every complete line before the
+      coordinate in canonical order, any bytes it does not cover are scanned
+      now and hold no cutover op.
+
+    So a cached reader chooses exactly the boundary an uncached scan does."""
+    coord = _cached_coordinate(doc, "cutover")
+    if coord is None:
+        return None
+    segment, offset = coord["segment"], coord["offset"]
+    raw = _read_line_at(segment, offset)
+    if raw is None:
+        return None
+    rec = _decode_anchor_record(raw)
+    if rec is None or rec["payload"]["kind"] != (
+            _lib_account_protocol.CUTOVER_OP_KIND):
+        return None
+    try:
+        boundary = _lib_account_protocol.boundary_from_op(rec)
+    except ValueError:
+        return None
+    if (boundary.segment, boundary.end_offset) != (segment, offset):
+        return None
+    if coord.get("digest") != boundary.legacy_spool_baseline_digest:
+        return None
+    if not _cutover_precedence_established(
+            segment, offset, coord.get("absentBefore")):
+        return None
+    return (segment, offset, rec)
+
+
+def _cutover_precedence_established(segment, offset, evidence) -> bool:
+    """Whether no cutover op precedes ``(segment, offset)`` in canonical
+    order, from the cache's absence ``evidence`` (``{segment: complete-line
+    offset}``, the bytes a traversal proved hold none) plus a scan of the
+    bytes it does not cover. Fails closed on malformed evidence, a segment
+    that shrank below it, or an unreadable segment.
+
+    Fix round J2: an uncovered segment that a current versioned summary
+    proves Codex-quota-only (`_summary_proves_no_cutover`) holds no cutover
+    op and is not read — the same proof that lets the rebuild elide it past
+    the frozen extents. Scanning it here re-read, on every cached lookup
+    (the rebuild's admission boundary and the statusline reducer's alike),
+    the segment elision exists to skip. Bytes no such summary covers are
+    still scanned."""
+    if not isinstance(evidence, dict):
+        return False
+    for seg, off in evidence.items():
+        if not isinstance(seg, str) or type(off) is not int or off < 0:
+            return False
+    if evidence.get(segment) != offset:
+        return False
+    floor = _lib_journal.segment_sort_key(segment)
+    gaps = {}
+    summaries = None
+    try:
+        listed = list_segments()
+    except OSError:
+        return False
+    for seg in listed:
+        if _lib_journal.segment_sort_key(seg) >= floor:
+            continue
+        try:
+            st = os.stat(_cctally_core.JOURNAL_DIR / seg)
+        except OSError:
+            return False
+        size = st.st_size
+        lo = evidence.get(seg, 0)
+        if lo > size:
+            return False
+        if size > lo:
+            if summaries is None:
+                summaries = read_segment_summaries()
+            if _summary_proves_no_cutover(summaries.get(seg), st):
+                continue
+            gaps[seg] = (lo, size)
+    for seg, off in evidence.items():
+        if seg == segment or seg in gaps:
+            continue
+        if _lib_journal.segment_sort_key(seg) >= floor:
+            return False
+        try:
+            if os.path.getsize(_cctally_core.JOURNAL_DIR / seg) < off:
+                return False
+        except OSError:
+            return False
+    # Bytes the evidence does not cover (an earlier segment that grew after
+    # the evidence was taken): scanned now, and any read failure proves
+    # nothing.
+    for seg in sorted(gaps, key=_lib_journal.segment_sort_key):
+        lo, hi = gaps[seg]
+        try:
+            for _name, _off, raw in _iter_segment_lines(
+                    _cctally_core.JOURNAL_DIR / seg, lo, hi):
+                if _CUTOVER_ID_BYTES not in raw:
+                    continue
+                rec = _decode_anchor_record(raw)
+                if rec is not None and rec["payload"]["kind"] == (
+                        _lib_account_protocol.CUTOVER_OP_KIND):
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def _summary_proves_no_cutover(summary, st) -> bool:
+    """Whether sidecar ``summary`` proves the WHOLE current segment behind
+    ``st`` holds no cutover op (fix round J2).
+
+    The proof is the rebuild's post-boundary elision proof
+    (`admission_permits_elision`): every decoded record a positively
+    identified Codex quota observation, so no op, and no retained record at
+    all. It binds only the exact file it was written from: the same
+    ``(st_dev, st_ino)`` (any identity change refuses, where elision may
+    settle a device-only change by content: refusing here costs one scan),
+    and a summarized raw size that is both the segment's current size and its
+    complete-line end, so not a byte of the segment — not a torn suffix, not a
+    later append — is left unproven. Anything less is scanned."""
+    if summary is None:
+        return False
+    return (bool(summary.quota_only) and bool(summary.codex_quota_only)
+            and (int(summary.st_dev), int(summary.st_ino))
+            == (st.st_dev, st.st_ino)
+            and int(summary.summarized_size)
+            == int(summary.complete_line_covered_offset)
+            == st.st_size)
+
+
+def _ensure_account_bound_dir() -> None:
+    root = _cctally_core.STATUSLINE_ACCOUNT_BOUND_DIR
+    if root.exists():
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    _fsync_dir(root.parent)
+
+
+def _atomic_write_json(path, doc) -> None:
+    """temp + fsync + os.replace + directory fsync."""
+    path = pathlib.Path(path)
+    _ensure_account_bound_dir()
+    data = (json.dumps(doc, sort_keys=True, separators=(",", ":"))
+            + "\n").encode("utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def _publish_account_bound_cache(cutover, anchor, scanned, *,
+                                 absent_before=None, digest=None,
+                                 uncertain=None) -> None:
+    """Best-effort accelerator; a failure only costs the next lookup a scan.
+
+    ``uncertain`` (spec revision 5) is the coordinate of the latest
+    inventory-uncertainty record AFTER ``anchor`` and up to ``scanned`` (the
+    cutover itself when it recorded uncertainty), or None. A later anchor
+    supersedes it, so a scan resuming from ``scanned`` needs nothing else.
+
+    ``absent_before`` is the cutover's precedence evidence (``{segment:
+    offset}`` a traversal proved free of any cutover op, ending at the op's
+    own coordinate) and ``digest`` the baseline digest the op records. When
+    omitted, the evidence of a currently cached doc naming the same cutover is
+    carried forward; with none, the doc names the cutover without evidence,
+    which readers do not trust (they reconstruct and republish)."""
+    entry = {"segment": cutover[0], "offset": cutover[1]}
+    if absent_before is None:
+        current = _cached_coordinate(_read_account_bound_cache(), "cutover")
+        if (current is not None
+                and (current["segment"], current["offset"])
+                == tuple(cutover[:2])
+                and isinstance(current.get("absentBefore"), dict)):
+            absent_before = current["absentBefore"]
+            if digest is None:
+                digest = current.get("digest")
+    if absent_before is not None:
+        entry["absentBefore"] = dict(sorted(absent_before.items()))
+    if digest is not None:
+        entry["digest"] = digest
+    doc = {
+        "schemaVersion": _ACCOUNT_BOUND_CACHE_SCHEMA,
+        "cutover": entry,
+        "anchor": {"segment": anchor[0], "offset": anchor[1],
+                   "digest": anchor[2]},
+        "scanned": {"segment": scanned[0], "offset": scanned[1]},
+        "uncertain": (None if uncertain is None else
+                      {"segment": uncertain[0], "offset": uncertain[1]}),
+    }
+    try:
+        _atomic_write_json(_cctally_core.ACCOUNT_BOUND_CUTOVER_CACHE_PATH, doc)
+    except OSError:
+        pass
+
+
+def _publish_account_bound_absence(absent_through) -> None:
+    """Record that no cutover op exists in the complete-line prefix
+    ``absent_through`` (``{segment: offset}``, the endpoints a scan actually
+    traversed — fix round J: never recomputed afterwards from file contents a
+    concurrent repair and append may have replaced). Best-effort accelerator.
+
+    Sound without verification of absence because the op is only ever appended
+    AFTER such a snapshot (at the end of the canonically-last segment, past any
+    torn tail the snapshot excluded), so the suffix scan a later lookup performs
+    from these offsets always reaches it. A stale absence that overwrote a
+    positive cache therefore costs one suffix scan, never a missed boundary."""
+    doc = {
+        "schemaVersion": _ACCOUNT_BOUND_CACHE_SCHEMA,
+        "cutover": None,
+        "absentThrough": dict(sorted(absent_through.items())),
+    }
+    try:
+        _atomic_write_json(_cctally_core.ACCOUNT_BOUND_CUTOVER_CACHE_PATH, doc)
+    except OSError:
+        pass
+
+
+def _cached_absence(doc, pinned):
+    """The cached ``{segment: complete-line offset}`` absence prefix when it is
+    usable against the ``pinned`` sizes, else None (scan everything)."""
+    if doc is None or doc.get("cutover") is not None:
+        return None
+    absent = doc.get("absentThrough")
+    if not isinstance(absent, dict):
+        return None
+    for seg, off in absent.items():
+        if not isinstance(seg, str) or type(off) is not int or off < 0:
+            return None
+        if seg not in pinned or off > pinned[seg]:
+            # A shrunken or vanished segment: the snapshot no longer describes
+            # this journal.
+            return None
+    return absent
+
+
+#: `_locate_account_bound_cutover_traversed` default: read the cache itself.
+_CACHE_UNREAD = object()
+
+
+def _locate_account_bound_cutover(pinned=None, *, publish=True):
+    """``(segment, offset, record)`` of the cutover op, through the verified
+    cache when present, else by one scan of the pinned journal prefix
+    (``pinned``: the ``{segment: size}`` snapshot to scan, taken now when
+    None) — only the suffix past a cached absence prefix; None when absent.
+    ``publish`` refreshes the cache from a scan's result."""
+    doc = _read_account_bound_cache()
+    found = _verified_cutover_from_cache(doc)
+    if found is not None:
+        return found
+    found, _traversed = _locate_account_bound_cutover_traversed(
+        pinned, publish=publish, doc=doc)
+    return found
+
+
+def _locate_account_bound_cutover_traversed(pinned=None, *, publish=True,
+                                            doc=_CACHE_UNREAD):
+    """`_locate_account_bound_cutover` plus the scan's traversal endpoints
+    (``{segment: complete-line end actually read}``; empty when the verified
+    cache answered). A cached absence prefix counts as traversed: it is the
+    traversal evidence of an earlier scan."""
+    if doc is _CACHE_UNREAD:
+        doc = _read_account_bound_cache()
+        found = _verified_cutover_from_cache(doc)
+        if found is not None:
+            return found, {}
+    if pinned is None:
+        pinned = _segment_sizes()
+    absent = _cached_absence(doc, pinned) or {}
+    found, traversed = _scan_for_cutover_traversed({
+        seg: (absent.get(seg, 0), size) for seg, size in pinned.items()})
+    if not publish:
+        return found, traversed
+    if found is not None:
+        digest = found[2]["payload"]["legacySpoolBaselineDigest"]
+        try:
+            # Fix round K13 (825-832-CD7-V01): a trusted cache entry is what
+            # `ensure_account_bound_cutover` accepts without a scan, so it
+            # names only a durable op. A reader still gets the visible
+            # boundary; it just leaves the cache unpublished.
+            _make_cutover_durable(found[0])
+        except OSError:
+            return found, traversed
+        _publish_account_bound_cache(
+            found[:2], (found[0], found[1], digest), found[:2],
+            absent_before=_precedence_evidence(found, traversed),
+            digest=digest, uncertain=_cutover_uncertainty(found))
+    else:
+        _publish_account_bound_absence(traversed)
+    return found, traversed
+
+
+def _precedence_evidence(found, traversed):
+    """The absence evidence of ``found`` from the scan that found it: every
+    segment sorting before the op's own, at the endpoint the scan traversed,
+    plus the op's own segment up to the op."""
+    floor = _lib_journal.segment_sort_key(found[0])
+    evidence = {seg: off for seg, off in traversed.items()
+                if _lib_journal.segment_sort_key(seg) < floor}
+    evidence[found[0]] = found[1]
+    return evidence
+
+
+def _whole_prefix_admission_boundary():
+    """The boundary for a whole-prefix reader that elides certified segments
+    (the rebuild and the prefix matcher), without reading those segments.
+
+    A segment whose sidecar summary certifies it quota-only at exactly its
+    current identity and size holds no retained record, and the cutover op is a
+    retained op, so the lookup may skip it — the same segments the elision
+    planner then never opens. Everything else is scanned (only the suffix past
+    a verified cache answer, when one exists).
+
+    Review cycle 7 825-832-CD3-J02: a segment that cannot be listed, stat'ed
+    or read raises `AccountBoundCutoverUnavailable`, so the rebuild and the
+    completion abort before they publish instead of disabling admission."""
+    found = _verified_cutover_from_cache(_read_account_bound_cache())
+    if found is not None:
+        return _lib_account_protocol.boundary_from_op(found[2])
+    summaries = read_segment_summaries()
+    ranges = {}
+    for seg in _lookup_segments():
+        try:
+            st = os.stat(_cctally_core.JOURNAL_DIR / seg)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+        summary = summaries.get(seg)
+        if (summary is not None and summary.quota_only
+                and int(summary.summarized_size) == st.st_size
+                and (int(summary.st_dev), int(summary.st_ino))
+                == (st.st_dev, st.st_ino)):
+            continue
+        ranges[seg] = (0, st.st_size)
+    found = _scan_for_cutover(ranges)
+    return (None if found is None
+            else _lib_account_protocol.boundary_from_op(found[2]))
+
+
+def find_account_bound_cutover(*, publish=False):
+    """The recorded `CutoverBoundary`, or None when no cutover exists yet.
+
+    This is the boundary every admission consumer applies. It is a function
+    of the journal alone: the cache only accelerates the lookup. ``publish``
+    refreshes the cache from a scan; readers leave it False so a lookup never
+    creates the account-bound directory as a side effect."""
+    found = _locate_account_bound_cutover(publish=publish)
+    if found is None:
+        return None
+    return _lib_account_protocol.boundary_from_op(found[2])
+
+
+def _stats_journal_cutover_pending() -> bool:
+    import _cctally_store
+    path = _cctally_core.DB_PATH
+    if not pathlib.Path(path).exists():
+        return False
+    version = _cctally_store._raw_user_version(path)
+    return 0 < version <= _cctally_core.LEGACY_STATS_HEAD
+
+
+def _open_append_target(now_utc, explicit_now: bool):
+    """Open the canonically-last segment for one append while the caller holds
+    `journal.lock` (the same target resolution and validation as
+    `append_record`). Returns ``(segment, path, created, fd)``; the caller
+    repairs the torn tail, writes, fsyncs and closes, so each durability step
+    stays separately injectable."""
+    journal_dir = _cctally_core.JOURNAL_DIR
+    seg_name = _lib_journal.segment_name(now_utc)
+    if not explicit_now:
+        seg_name = _lib_journal.segment_name(_utc_now())
+        _validate_append_target(journal_dir, seg_name)
+    seg_path = journal_dir / seg_name
+    seg_created = not seg_path.exists()
+    fd = os.open(str(seg_path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    return seg_name, seg_path, seg_created, fd
+
+
+def _journal_dir_for_append():
+    journal_dir = _cctally_core.JOURNAL_DIR
+    dir_created = not journal_dir.exists()
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    if dir_created:
+        try:
+            os.chmod(journal_dir, 0o700)
+        except OSError:
+            pass
+    return journal_dir, dir_created
+
+
+def _make_cutover_durable(segment) -> None:
+    """Make a VISIBLE cutover op durable before it counts as an established
+    boundary (fix round K13, review cycle 7 825-832-CD7-V01; spec 5.5 step
+    4, section 7 *Durability*, C6): fsync its segment, the journal directory
+    entry naming that segment, and the data directory entry naming the
+    journal directory.
+
+    A complete cutover line is readable as soon as its write reaches the
+    page cache, and its producer's own fsync can still fail after that. A
+    later producer that found the line and reported it established — and
+    then appended only to a later month's segment, fsyncing that one — let a
+    host crash keep the later legacy writes and lose the boundary, so a
+    re-established boundary admitted them as historical input. We do not
+    know which entries the failed producer created, so all three are made
+    durable. Raises `OSError` when any cannot be: the caller defers, exactly
+    as the establishing producer's own fsync failure does."""
+    journal_dir = _cctally_core.JOURNAL_DIR
+    seg_fd = os.open(str(journal_dir / segment), os.O_RDONLY)
+    try:
+        os.fsync(seg_fd)
+    finally:
+        os.close(seg_fd)
+    _fsync_dir(journal_dir)
+    _fsync_dir(journal_dir.parent)
+
+
+def ensure_account_bound_cutover(*, now_utc=None):
+    """Return the account-bound cutover boundary, establishing it if absent
+    (spec 5.5). Never establishes a second boundary; a producer that loses the
+    locked race installs nothing. Raises `AccountBoundCutoverDeferred` while
+    the one-time journal cutover is still pending."""
+    doc = _read_account_bound_cache()
+    found = _verified_cutover_from_cache(doc)
+    if found is not None:
+        return _lib_account_protocol.boundary_from_op(found[2])
+    # (2) Scan a pinned prefix outside the lock; the locked recheck below
+    # covers exactly the bytes after what this scan traversed.
+    pinned = _segment_sizes()
+    found, traversed = _locate_account_bound_cutover_traversed(
+        pinned, publish=False, doc=doc)
+    if found is not None:
+        boundary = _lib_account_protocol.boundary_from_op(found[2])
+        # Fix round K13 (825-832-CD7-V01): visible is not durable.
+        _make_cutover_durable(found[0])
+        _publish_account_bound_cache(
+            found[:2], (found[0], found[1],
+                        boundary.legacy_spool_baseline_digest), found[:2],
+            absent_before=_precedence_evidence(found, traversed),
+            digest=boundary.legacy_spool_baseline_digest,
+            uncertain=_cutover_uncertainty(found))
+        return boundary
+    if _stats_journal_cutover_pending():
+        raise AccountBoundCutoverDeferred(
+            "the one-time journal cutover has not run yet; the account-bound "
+            "cutover waits for it")
+    _account_bound_seam("after-scan")
+
+    explicit_now = now_utc is not None
+    if now_utc is None:
+        now_utc = _utc_now()
+    journal_dir, dir_created = _journal_dir_for_append()
+    lock_fd = _acquire_leaf_lock()
+    try:
+        # Fix round J (review cycle 3 825-832-CD3-J02, Codex fix-round-4
+        # Q5): resume from the complete-line endpoint the unlocked scan
+        # actually TRAVERSED, never its raw pinned extent. A winner that
+        # repaired a torn suffix appended its op BELOW that extent; resuming
+        # there started inside the winner's line, missed it, and appended a
+        # second boundary with a replacement baseline. A segment the scan
+        # never reached (absent from the map) is rechecked from its start.
+        current = _segment_sizes()
+        suffix = {seg: (min(traversed.get(seg, 0), size), size)
+                  for seg, size in current.items()}
+        winner, rechecked = _scan_for_cutover_traversed(suffix)
+        if winner is not None:
+            # Lost the race: the FIRST op — the winner's — and its baseline
+            # stand. Install nothing.
+            boundary = _lib_account_protocol.boundary_from_op(winner[2])
+            # Fix round K13 (825-832-CD7-V01): the winner's line can be
+            # visible while its own fsync failed; it stands only once it is
+            # durable, and this producer defers while it cannot be made so.
+            _make_cutover_durable(winner[0])
+            merged = dict(traversed)
+            merged.update(rechecked)
+            _publish_account_bound_cache(
+                winner[:2], (winner[0], winner[1],
+                             boundary.legacy_spool_baseline_digest),
+                winner[:2],
+                absent_before=_precedence_evidence(winner, merged),
+                digest=boundary.legacy_spool_baseline_digest,
+                uncertain=_cutover_uncertainty(winner))
+            return boundary
+
+        # Spec revision 5 (section 7, *Before the initial cutover*): an
+        # incomplete inventory is never a baseline, and deferring the
+        # establishment would stall every current producer while a legacy
+        # file stays unreadable. The uncertainty is recorded atomically IN
+        # the cutover op — no digest, no baseline file — so no crash can
+        # leave a boundary without it.
+        try:
+            state = capture_legacy_spool_state()
+            failure = None
+        except LegacySpoolInventoryIncomplete as exc:
+            state = None
+            failure = exc.evidence()
+        _account_bound_seam("after-baseline-capture")
+
+        seg_name, seg_path, seg_created, fd = _open_append_target(now_utc, explicit_now)
+        try:
+            if seg_created:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+            _repair_torn_tail(fd)
+            start = os.fstat(fd).st_size
+            extents = _frozen_extents(journal_dir, seg_name, seg_created,
+                                      start)
+            boundary = _lib_account_protocol.CutoverBoundary(
+                segment=seg_name,
+                end_offset=start,
+                frozen_extents=extents,
+                legacy_spool_baseline_digest=(
+                    None if state is None else state.digest()),
+                legacy_spool_inventory_failure=failure,
+            )
+            record = _lib_journal.make_op(
+                at=_now_iso(), src=_ACCOUNT_BOUND_CUTOVER_SRC,
+                payload={"kind": _lib_account_protocol.CUTOVER_OP_KIND,
+                         **_lib_account_protocol.boundary_payload(boundary)})
+            # A stable semantic id (precedent: accounts-cutover-v1), so the
+            # op is recognisable without its timestamp.
+            record["id"] = _lib_account_protocol.CUTOVER_OP_ID
+            _write_all(fd, _lib_journal.encode_line(
+                _lib_journal.prepare_record(record)))
+            _account_bound_seam("after-append")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if seg_created:
+            _fsync_dir(journal_dir)
+        if dir_created:
+            _fsync_dir(journal_dir.parent)
+        _account_bound_seam("after-fsync")
+        if state is not None:
+            _atomic_write_json(_cctally_core.LEGACY_SPOOL_BASELINE_PATH,
+                               _lib_legacy_spool.to_document(state))
+        _account_bound_seam("after-baseline-install")
+    finally:
+        _release_leaf_lock(lock_fd)
+    # The locked recheck traversed every complete line up to this op: the
+    # unlocked scan's endpoints, then each segment's recheck to its end.
+    evidence = {seg: off for seg, off in traversed.items()
+                if _lib_journal.segment_sort_key(seg)
+                < _lib_journal.segment_sort_key(seg_name)}
+    evidence.update({seg: off for seg, off in rechecked.items()
+                     if _lib_journal.segment_sort_key(seg)
+                     < _lib_journal.segment_sort_key(seg_name)})
+    evidence[seg_name] = start
+    digest = boundary.legacy_spool_baseline_digest
+    _publish_account_bound_cache(
+        (seg_name, start), (seg_name, start, digest), (seg_name, start),
+        absent_before=evidence, digest=digest,
+        uncertain=None if failure is None else (seg_name, start))
+    return boundary
+
+
+def _frozen_extents(journal_dir, seg_name, seg_created, start) -> dict:
+    """The complete-line extent of every segment that exists while the
+    cutover is appended (under `journal.lock`): the append target's own
+    complete-line end, and every other listed segment's.
+
+    Fix round K11 (K9K10-R5): an extent is frozen into an IMMUTABLE op, so it
+    is read or the establishment fails closed. A segment that cannot be
+    listed, stat'ed or tail-read raises `AccountBoundCutoverUnavailable` —
+    recording 0 for it would make every historical record in it
+    post-boundary forever. Only a segment removed since the listing (the one
+    supported removal deletes an EMPTY segment) is absent."""
+    extents = {}
+    for seg in _lookup_segments():
+        if seg == seg_name:
+            if not seg_created:
+                extents[seg] = start
+            continue
+        path = journal_dir / seg
+        try:
+            extents[seg] = _complete_line_offset(path, os.path.getsize(path))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+    return extents
+
+
+def _latest_anchor(cutover):
+    """``(segment, offset, digest, scanned_segment, scanned_offset,
+    uncertain)`` of the latest stamped anchoring op at or after ``cutover``.
+    Current anchors are appended only by this binary, always to the
+    canonically-last segment, so a forward scan from a verified anchor is
+    complete.
+
+    ``uncertain`` (spec revision 5) is the coordinate of the latest
+    inventory-uncertainty record after that anchor — an `inventory-incomplete`
+    op, or the cutover itself when it recorded its inventory as incomplete —
+    or None. A later anchoring op (a complete inventory) supersedes it.
+
+    Fix round K11 (K9K10-R10): a segment that cannot be sized or read
+    raises `AccountBoundCutoverUnavailable`. Skipping it hid a later anchor,
+    so the reader rejected the valid baseline and the reducer journaled a
+    spurious `baseline-unavailable` trigger; only a segment removed since
+    its listing is absent."""
+    seg0, off0, rec0 = cutover
+    anchor = (seg0, off0, _anchor_digest(rec0))
+    uncertain = _cutover_uncertainty(cutover)
+    start = (seg0, off0)
+    doc = _read_account_bound_cache()
+    cached_anchor = _cached_coordinate(doc, "anchor")
+    cached_scanned = _cached_coordinate(doc, "scanned")
+    cached_cutover = _cached_coordinate(doc, "cutover")
+    cached_uncertain = _cached_uncertain(doc)
+    if (cached_anchor is not None and cached_scanned is not None
+            and cached_cutover is not None
+            and cached_uncertain is not _CACHE_UNREAD
+            and (cached_cutover["segment"], cached_cutover["offset"])
+            == (seg0, off0)):
+        raw = _read_line_at(cached_anchor["segment"], cached_anchor["offset"])
+        rec = _decode_anchor_record(raw) if raw is not None else None
+        scanned = (cached_scanned["segment"], cached_scanned["offset"])
+        if (rec is not None and _anchor_digest(rec) == cached_anchor.get("digest")
+                and _lib_journal.segment_sort_key(scanned[0])
+                >= _lib_journal.segment_sort_key(cached_anchor["segment"])
+                and _verified_uncertain(cached_uncertain)):
+            anchor = (cached_anchor["segment"], cached_anchor["offset"],
+                      _anchor_digest(rec))
+            uncertain = cached_uncertain
+            start = scanned
+    sizes = _segment_sizes()
+    start_key = _lib_journal.segment_sort_key(start[0])
+    scanned_to = start
+    for seg in sorted(sizes, key=_lib_journal.segment_sort_key):
+        key = _lib_journal.segment_sort_key(seg)
+        if key < start_key:
+            continue
+        lo = start[1] if seg == start[0] else 0
+        path = _cctally_core.JOURNAL_DIR / seg
+        try:
+            hi = _complete_line_offset(path, sizes[seg])
+            if hi < lo:
+                continue
+            for _name, off, raw in _iter_segment_lines(path, lo, hi):
+                if not any(token in raw for token in _ANCHOR_KIND_BYTES):
+                    continue
+                rec = _lib_journal.decode_line(raw)
+                # The cutover op is the initial anchor; only a later stamped
+                # activity op advances it.
+                anchored = _anchor_record(rec)
+                if anchored is not None and anchored["payload"]["kind"] == (
+                        _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND):
+                    anchor = (seg, off, _anchor_digest(anchored))
+                    uncertain = None
+                elif (_inventory_uncertainty_record(rec) is not None
+                        and rec["payload"]["kind"]
+                        == _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND):
+                    uncertain = (seg, off)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+        scanned_to = (seg, hi)
+    return anchor + scanned_to + (uncertain,)
+
+
+def _cached_uncertain(doc):
+    """The cache's ``uncertain`` coordinate as a tuple, None, or
+    `_CACHE_UNREAD` when the cache does not carry the key (written before
+    revision 5 tracked it, or malformed): then its scanned point proves
+    nothing about uncertainty, and the scan restarts at the cutover."""
+    if doc is None or "uncertain" not in doc:
+        return _CACHE_UNREAD
+    value = doc.get("uncertain")
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or not isinstance(value.get("segment"), str)
+            or type(value.get("offset")) is not int):
+        return _CACHE_UNREAD
+    return (value["segment"], value["offset"])
+
+
+def _verified_uncertain(coord) -> bool:
+    """Whether a cached uncertainty coordinate still holds an uncertainty
+    record (None trivially does)."""
+    if coord is None:
+        return True
+    raw = _read_line_at(coord[0], coord[1])
+    return raw is not None and _inventory_uncertainty_record(
+        _lib_journal.decode_line(raw)) is not None
+
+
+#: How far the anchor lookup's scanned point may run ahead of the cached one
+#: before the cache is worth rewriting (#901: the detached reducer looks the
+#: anchor up at status-line cadence). Bounds the incremental tail scan of
+#: every later lookup without a cache write per run.
+_ANCHOR_CACHE_REPUBLISH_BYTES = 256 * 1024
+
+
+def _anchor_cache_is_current(cutover, anchor, scanned, uncertain=None) -> bool:
+    """Whether the coordinate cache already names this cutover, anchor and
+    uncertainty record and a scanned point close enough behind ``scanned``
+    to keep later tail scans short. Then republishing would rewrite (and
+    fsync) the same facts."""
+    doc = _read_account_bound_cache()
+    if _cached_uncertain(doc) != uncertain:
+        return False
+    cached_cutover = _cached_coordinate(doc, "cutover")
+    cached_anchor = _cached_coordinate(doc, "anchor")
+    cached_scanned = _cached_coordinate(doc, "scanned")
+    if cached_cutover is None or cached_anchor is None or cached_scanned is None:
+        return False
+    if (cached_cutover["segment"], cached_cutover["offset"]) != tuple(cutover):
+        return False
+    if (cached_anchor["segment"], cached_anchor["offset"],
+            cached_anchor.get("digest")) != tuple(anchor):
+        return False
+    if cached_scanned["segment"] != scanned[0]:
+        return False
+    return 0 <= scanned[1] - cached_scanned["offset"] < (
+        _ANCHOR_CACHE_REPUBLISH_BYTES)
+
+
+@dataclass(frozen=True)
+class LegacySpoolAnchorState:
+    """The journal-anchored legacy spool state (spec section 7).
+
+    ``digest`` is the baseline digest the latest anchoring op recorded (None
+    when that op is a cutover that recorded inventory uncertainty);
+    ``uncertain`` the coordinate of the latest inventory-uncertainty record
+    after it, or None; ``episode_open`` whether that record's failure
+    episode is still open — no complete inventory has ended it since."""
+
+    digest: "str | None"
+    uncertain: "tuple[str, int] | None"
+    episode_open: bool
+
+
+def legacy_spool_anchor_state() -> "LegacySpoolAnchorState | None":
+    """The anchor state, or None when no cutover exists. Raises
+    `AccountBoundCutoverUnavailable` when a segment it needs is unreadable.
+
+    The coordinate cache is republished only when the anchor or uncertainty
+    record moved or the scanned point ran far ahead of the cached one, so a
+    steady-state lookup performs no write and no fsync (#901)."""
+    cutover = _locate_account_bound_cutover()
+    if cutover is None:
+        return None
+    (seg, off, digest, scanned_seg, scanned_off,
+     uncertain) = _latest_anchor(cutover)
+    if not _anchor_cache_is_current(
+            cutover[:2], (seg, off, digest), (scanned_seg, scanned_off),
+            uncertain):
+        _publish_account_bound_cache(cutover[:2], (seg, off, digest),
+                                     (scanned_seg, scanned_off),
+                                     uncertain=uncertain)
+    return LegacySpoolAnchorState(
+        digest=digest, uncertain=uncertain,
+        episode_open=(uncertain is not None
+                      and not _inventory_episode_closed(uncertain)))
+
+
+def latest_legacy_spool_anchor_digest():
+    """The baseline digest recorded by the latest anchoring op (the cutover op
+    or a later current-stamped `legacy_spool_activity`), or None when no
+    cutover exists (or the latest anchor is a cutover that recorded
+    inventory uncertainty, which anchors no baseline)."""
+    state = legacy_spool_anchor_state()
+    return None if state is None else state.digest
+
+
+# --------------------------------------------------------------------------
+# Spec revision 5: the inventory-incomplete failure episode (section 7)
+# --------------------------------------------------------------------------
+#
+# The first failed inventory of an episode appends one `inventory-incomplete`
+# op; later failures of the same episode append nothing. The episode is
+# derived from the journal — open while the latest inventory-uncertainty
+# record follows the latest anchoring op — so a crash or a restart never
+# re-appends for an episode whose op is in the journal. A complete inventory
+# ends it: one that changes the baseline appends an anchoring op (which
+# supersedes the uncertainty record); one that leaves the baseline unchanged
+# appends nothing and records the end in a small closure file naming the
+# record it ended. The closure is diagnostic of the EPISODE only, never of
+# the trigger: the unresolved marker stays (residual 6). Losing it can only
+# fold a later failure into an already-triggered episode, whose marker
+# already withholds every outcome a new trigger would.
+
+
+def _inventory_episode_path():
+    return (_cctally_core.STATUSLINE_ACCOUNT_BOUND_DIR
+            / "legacy-spool-inventory-episode.json")
+
+
+def _inventory_episode_closed(uncertain) -> bool:
+    try:
+        doc = json.loads(_inventory_episode_path().read_bytes())
+    except (OSError, ValueError):
+        return False
+    closed = doc.get("closed") if isinstance(doc, dict) else None
+    return (isinstance(closed, dict)
+            and (closed.get("segment"), closed.get("offset"))
+            == tuple(uncertain))
+
+
+def close_legacy_spool_inventory_episode(uncertain) -> None:
+    """End the failure episode of the uncertainty record at ``uncertain``
+    after a complete inventory that appended nothing. Best-effort (see the
+    section comment); never clears the marker."""
+    if uncertain is None or _inventory_episode_closed(uncertain):
+        return
+    try:
+        _atomic_write_json(_inventory_episode_path(), {
+            "schemaVersion": 1,
+            "closed": {"segment": uncertain[0], "offset": uncertain[1]}})
+    except OSError:
+        pass
+
+
+def record_legacy_spool_inventory_incomplete(failure, *, now_utc=None):
+    """Journal the uncertainty of an incomplete inventory after the cutover
+    (spec revision 5, section 7 *After the cutover*): ONE current-stamped
+    `legacy_spool_activity` op with reason `inventory-incomplete` and the
+    typed evidence of ``failure`` (a `LegacySpoolInventoryIncomplete`), per
+    failure episode. It claims no digest and moves no baseline; it is a
+    section 5.6 trigger whose unresolved marker withholds every automatic
+    outcome while classifiable ordinary recording continues.
+
+    Returns the op id, or None when the episode already has its op (decided
+    under `journal.lock`, from the journal, and counted only once that op is
+    made durable). Raises `LegacySpoolUncertaintyNotDurable` when the op
+    cannot be made durable: the caller defers and publishes nothing."""
+    cutover = _locate_account_bound_cutover()
+    if cutover is None:
+        raise JournalError(
+            "an inventory-incomplete op requires an account-bound cutover")
+    record = _lib_journal.prepare_record(_lib_journal.make_op(
+        at=_now_iso(), src=_LEGACY_SPOOL_ACTIVITY_SRC,
+        payload={
+            "kind": _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND,
+            "reason": _INVENTORY_INCOMPLETE,
+            "failure": failure.evidence(),
+        }))
+    data = _lib_journal.encode_line(record)
+    if len(data) > _MAX_LINE_BYTES:
+        raise JournalError("inventory-incomplete op exceeds the line limit")
+    explicit_now = now_utc is not None
+    if now_utc is None:
+        now_utc = _utc_now()
+    try:
+        journal_dir, dir_created = _journal_dir_for_append()
+        lock_fd = _acquire_leaf_lock()
+        try:
+            (a_seg, a_off, a_digest, _s_seg, _s_off,
+             uncertain) = _latest_anchor(cutover)
+            if (uncertain is not None
+                    and not _inventory_episode_closed(uncertain)):
+                # Fix round K12 (K11R-7, spec section 7 *Durability*): a
+                # visible record need not be durable — an earlier append can
+                # have reached the page cache and then failed its fsync. It
+                # counts as the episode's op only once its segment and the
+                # directory entry are made durable here; a failure defers.
+                seg_fd = os.open(journal_dir / uncertain[0], os.O_RDONLY)
+                try:
+                    os.fsync(seg_fd)
+                finally:
+                    os.close(seg_fd)
+                _fsync_dir(journal_dir)
+                return None
+            seg_name, seg_path, seg_created, fd = _open_append_target(
+                now_utc, explicit_now)
+            try:
+                _repair_torn_tail(fd)
+                start = os.fstat(fd).st_size
+                _write_all(fd, data)
+                _account_bound_seam("inventory-after-append")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if seg_created:
+                _fsync_dir(journal_dir)
+            if dir_created:
+                _fsync_dir(journal_dir.parent)
+            _account_bound_seam("inventory-after-fsync")
+        finally:
+            _release_leaf_lock(lock_fd)
+    except LegacySpoolInventoryIncomplete:
+        raise
+    except OSError as exc:
+        raise LegacySpoolUncertaintyNotDurable(
+            getattr(exc, "errno", None) or errno.EIO,
+            "legacy statusline spool inventory is incomplete and its "
+            f"inventory-incomplete op could not be made durable ({exc})",
+            failure.failed_path, operation=failure.operation,
+            path=failure.failed_path, rel=failure.rel,
+            error=failure.error) from exc
+    _publish_account_bound_cache(
+        cutover[:2], (a_seg, a_off, a_digest),
+        (seg_name, start + len(data)), uncertain=(seg_name, start))
+    return record["id"]
+
+
+def read_anchored_legacy_spool_baseline(boundary_or_latest_anchor=None):
+    """The installed legacy spool baseline, or None when it is missing,
+    unreadable, internally inconsistent, or its digest is not the anchor's.
+
+    ``boundary_or_latest_anchor`` is a digest string, a `CutoverBoundary` (its
+    recorded digest), or None — the latest anchoring op in journal order."""
+    anchor = boundary_or_latest_anchor
+    if anchor is None:
+        anchor = latest_legacy_spool_anchor_digest()
+    elif isinstance(anchor, _lib_account_protocol.CutoverBoundary):
+        anchor = anchor.legacy_spool_baseline_digest
+    if not isinstance(anchor, str):
+        return None
+    try:
+        doc = json.loads(_cctally_core.LEGACY_SPOOL_BASELINE_PATH.read_bytes())
+        state = _lib_legacy_spool.from_document(doc)
+    except (OSError, ValueError):
+        return None
+    if state.digest() != anchor:
+        return None
+    return state
+
+
+def append_legacy_spool_activity(*, changed, new_state, reason, now_utc=None) -> str:
+    """Journal one current-stamped `legacy_spool_activity` op and advance the
+    baseline to ``new_state`` (spec 5.6 item 1(b), section 7). The op is
+    appended and fsync'd first; the baseline file is installed afterwards under
+    the same `journal.lock` hold, so a file never precedes its anchor. Returns
+    the op id."""
+    if reason not in _LEGACY_SPOOL_ACTIVITY_REASONS:
+        raise ValueError(f"legacy spool activity reason {reason!r} is invalid")
+    cutover = _locate_account_bound_cutover()
+    if cutover is None:
+        raise JournalError(
+            "legacy spool activity requires an account-bound cutover")
+    changed = tuple(sorted(set(changed)))
+    record = _lib_journal.prepare_record(_lib_journal.make_op(
+        at=_now_iso(), src=_LEGACY_SPOOL_ACTIVITY_SRC,
+        payload={
+            "kind": _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND,
+            "reason": reason,
+            "changed": list(changed),
+            "evidence": _lib_legacy_spool.change_evidence(changed, new_state),
+            "digest": new_state.digest(),
+        }))
+    data = _lib_journal.encode_line(record)
+    if len(data) > _MAX_LINE_BYTES:
+        raise JournalError("legacy spool activity op exceeds the line limit")
+    explicit_now = now_utc is not None
+    if now_utc is None:
+        now_utc = _utc_now()
+    journal_dir, dir_created = _journal_dir_for_append()
+    lock_fd = _acquire_leaf_lock()
+    try:
+        seg_name, seg_path, seg_created, fd = _open_append_target(now_utc, explicit_now)
+        try:
+            _repair_torn_tail(fd)
+            start = os.fstat(fd).st_size
+            _write_all(fd, data)
+            _account_bound_seam("activity-after-append")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if seg_created:
+            _fsync_dir(journal_dir)
+        if dir_created:
+            _fsync_dir(journal_dir.parent)
+        _account_bound_seam("activity-after-fsync")
+        _atomic_write_json(_cctally_core.LEGACY_SPOOL_BASELINE_PATH,
+                           _lib_legacy_spool.to_document(new_state))
+    finally:
+        _release_leaf_lock(lock_fd)
+    _publish_account_bound_cache(
+        cutover[:2], (seg_name, start, new_state.digest()),
+        (seg_name, start + len(data)), uncertain=None)
+    return record["id"]
+
+
+# --------------------------------------------------------------------------
+# #825/#832 admission before interpretation (spec 5.3, 5.4, section 8)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExcludedRecord:
+    """One complete journal record the admission predicate excluded: its
+    physical coordinate and coarse family. The record itself is never
+    accounting input; it stays only in the raw bytes."""
+
+    coordinate: "_lib_account_protocol.Coordinate"
+    family: str
+
+
+#: Subscribers called as ``hook(record, coordinate)`` for every record ingest or
+#: rebuild excludes (the quarantine engine subscribes to these, spec 5.6 item
+#: 1(a)). Diagnostic readers (doctor, previews) do not notify them.
+ON_EXCLUDED_HOOKS: list = []
+
+
+def admit_records(decoded, boundary, *, on_excluded=None):
+    """The single admission step every accounting consumer applies BEFORE any
+    interpretation — legacy account normalization, last-seen accumulation,
+    correction selection, cache rehydration and derivation.
+
+    ``decoded`` is a list of ``(record, segment, start_offset)``. Returns
+    ``(admitted, excluded)``: ``admitted`` is positionally parallel to
+    ``decoded`` with an excluded record's slot replaced by a ``None``
+    placeholder (so every sequence number and cursor coordinate is unchanged),
+    and ``excluded`` lists each exclusion in input order. ``on_excluded`` is
+    called as ``on_excluded(record, coordinate)`` per exclusion."""
+    admitted = []
+    excluded = []
+    for record, segment, offset in decoded:
+        if record is None:
+            admitted.append((None, segment, offset))
+            continue
+        coord = _lib_account_protocol.Coordinate(segment, offset)
+        verdict = _lib_account_protocol.classify_admission(
+            record, coord, boundary)
+        if verdict.admitted:
+            admitted.append((record, segment, offset))
+            continue
+        admitted.append((None, segment, offset))
+        excluded.append(ExcludedRecord(coordinate=coord, family=verdict.family))
+        if on_excluded is not None:
+            on_excluded(record, coord)
+    return admitted, excluded
+
+
+def _notify_excluded(record, coord) -> None:
+    for hook in ON_EXCLUDED_HOOKS:
+        hook(record, coord)
+
+
+def _is_admitted(record, segment, offset, boundary) -> bool:
+    if boundary is None or record is None:
+        return True
+    return _lib_account_protocol.classify_admission(
+        record, _lib_account_protocol.Coordinate(segment, offset),
+        boundary).admitted
+
+
+class _PassBoundary:
+    """Resolve the account-bound boundary inside ONE journal pass.
+
+    A single-pass reader cannot look the boundary up first without a second
+    traversal, and it cannot classify inline either: canonical order puts an
+    earlier segment (which a legacy writer may still append to) before the
+    segment holding the cutover op. So the reader keeps each record's
+    coordinate, `observe`s every record, and applies admission AFTER the pass
+    and BEFORE any interpretation. `resolve` also scans the unvisited suffix
+    past the pass's high-water, where an op appended after the pin lives."""
+
+    def __init__(self):
+        self._op = None
+
+    def observe(self, record) -> None:
+        if (self._op is None and isinstance(record, dict)
+                and record.get("id") == _lib_account_protocol.CUTOVER_OP_ID):
+            anchor = _anchor_record(record)
+            if anchor is not None and anchor["payload"]["kind"] == (
+                    _lib_account_protocol.CUTOVER_OP_KIND):
+                self._op = anchor
+
+    def resolve(self, high_water):
+        if self._op is not None:
+            return _lib_account_protocol.boundary_from_op(self._op)
+        if high_water is None:
+            return None
+        start_key = _lib_journal.segment_sort_key(high_water[0])
+        ranges = {}
+        for seg, size in _segment_sizes().items():
+            key = _lib_journal.segment_sort_key(seg)
+            if key < start_key:
+                continue
+            ranges[seg] = (high_water[1] if seg == high_water[0] else 0, size)
+        found = _scan_for_cutover(ranges)
+        return (None if found is None
+                else _lib_account_protocol.boundary_from_op(found[2]))
+
+
+def _apply_pass_admission(slots, coordinates, boundary, placeholder=None):
+    """Replace every excluded record in ``slots`` (positionally parallel to
+    ``coordinates``, each ``(segment, start offset)`` or None) with
+    ``placeholder``. Returns the `ExcludedRecord` list in slot order."""
+    excluded = []
+    if boundary is None:
+        return excluded
+    for index, record in enumerate(slots):
+        coord = coordinates[index]
+        if record is None or coord is None:
+            continue
+        if record.get("t") == _lib_account_protocol.EXCLUDED_PLACEHOLDER_TYPE:
+            continue
+        point = _lib_account_protocol.Coordinate(coord[0], coord[1])
+        verdict = _lib_account_protocol.classify_admission(
+            record, point, boundary)
+        if not verdict.admitted:
+            slots[index] = placeholder
+            excluded.append(ExcludedRecord(coordinate=point,
+                                           family=verdict.family))
+    return excluded
+
+
+def excluded_population(boundary) -> list:
+    """Every complete record the admission predicate excludes, in canonical
+    order. Reads only the post-boundary byte ranges (everything outside the
+    frozen extents), since a historical record is always admitted.
+
+    Complete or raising (fix round K11, K9K10-R11): a segment that cannot be
+    listed, sized or read raises `OSError`. Skipping it undercounted the
+    population, and a different population restarts the legacy-writer age;
+    the caller reports the count unavailable instead. Only a segment removed
+    since its listing is absent."""
+    if boundary is None:
+        return []
+    out = []
+    for seg in sorted(_segment_sizes(), key=_lib_journal.segment_sort_key):
+        path = _cctally_core.JOURNAL_DIR / seg
+        lo = boundary.frozen_extents.get(seg, 0)
+        try:
+            hi = _complete_line_offset(path, os.path.getsize(path))
+        except FileNotFoundError:
+            continue
+        if hi <= lo:
+            continue
+        for _name, offset, raw in _iter_segment_lines(path, lo, hi):
+            record = _lib_journal.decode_line(raw)
+            if record is None:
+                continue
+            point = _lib_account_protocol.Coordinate(seg, offset)
+            verdict = _lib_account_protocol.classify_admission(
+                record, point, boundary)
+            if not verdict.admitted:
+                out.append(ExcludedRecord(coordinate=point,
+                                          family=verdict.family))
+    return out
+
+
+def _coordinate_json(coord) -> str | None:
+    if coord is None:
+        return None
+    return json.dumps({"segment": coord.segment, "offset": coord.offset},
+                      sort_keys=True, separators=(",", ":"))
+
+
+def _coordinate_from_json(text):
+    try:
+        value = json.loads(text) if text else None
+    except ValueError:
+        return None
+    if (not isinstance(value, dict) or not isinstance(value.get("segment"), str)
+            or type(value.get("offset")) is not int):
+        return None
+    return _lib_account_protocol.Coordinate(value["segment"], value["offset"])
+
+
+def _coordinate_order(coord):
+    return (_lib_journal.segment_sort_key(coord.segment), coord.offset)
+
+
+@dataclass
+class AdmissionSummary:
+    """The in-memory form of `journal_admission_summary`."""
+
+    cutover_id: str | None = None
+    scanned_high_water: "tuple[str, int] | None" = None
+    excluded_total: int = 0
+    family_counts: dict = field(default_factory=dict)
+    first_excluded: "object | None" = None
+    latest_excluded: "object | None" = None
+    coordinate_digest: str | None = None
+    complete_through: "tuple[str, int] | None" = None
+    boundary: "object | None" = None
+
+    def extend(self, excluded) -> None:
+        if not excluded:
+            return
+        self.excluded_total += len(excluded)
+        for item in excluded:
+            self.family_counts[item.family] = (
+                self.family_counts.get(item.family, 0) + 1)
+            coord = item.coordinate
+            if (self.first_excluded is None or _coordinate_order(coord)
+                    < _coordinate_order(self.first_excluded)):
+                self.first_excluded = coord
+            if (self.latest_excluded is None or _coordinate_order(coord)
+                    > _coordinate_order(self.latest_excluded)):
+                self.latest_excluded = coord
+        self.coordinate_digest = _lib_account_protocol.coordinate_population_digest(
+            (item.coordinate for item in excluded), base=self.coordinate_digest)
+
+
+def _read_admission_summary(conn):
+    row = conn.execute(
+        "SELECT cutover_id, scanned_high_water, excluded_total, "
+        "family_counts_json, first_excluded_coordinate, "
+        "latest_excluded_coordinate, coordinate_digest, complete_through, "
+        "boundary_json "
+        "FROM journal_admission_summary WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    boundary = None
+    if row[8]:
+        try:
+            boundary = _lib_account_protocol.boundary_from_op({
+                "t": "op",
+                "payload": {"kind": _lib_account_protocol.CUTOVER_OP_KIND,
+                            **json.loads(row[8])},
+            })
+        except (ValueError, TypeError):
+            boundary = None
+
+    def _hw(text):
+        coord = _coordinate_from_json(text)
+        return None if coord is None else (coord.segment, coord.offset)
+
+    try:
+        counts = json.loads(row[3] or "{}")
+    except ValueError:
+        counts = {}
+    return AdmissionSummary(
+        cutover_id=row[0],
+        scanned_high_water=_hw(row[1]),
+        excluded_total=int(row[2] or 0),
+        family_counts=counts if isinstance(counts, dict) else {},
+        first_excluded=_coordinate_from_json(row[4]),
+        latest_excluded=_coordinate_from_json(row[5]),
+        coordinate_digest=row[6],
+        complete_through=_hw(row[7]),
+        boundary=boundary,
+    )
+
+
+def _write_admission_summary(conn, summary: AdmissionSummary) -> None:
+    def _hw(value):
+        if value is None:
+            return None
+        return _coordinate_json(_lib_account_protocol.Coordinate(*value))
+
+    conn.execute(
+        "INSERT OR REPLACE INTO journal_admission_summary "
+        "(id, cutover_id, scanned_high_water, excluded_total, "
+        "family_counts_json, first_excluded_coordinate, "
+        "latest_excluded_coordinate, coordinate_digest, complete_through, "
+        "boundary_json) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            summary.cutover_id,
+            _hw(summary.scanned_high_water),
+            summary.excluded_total,
+            json.dumps(summary.family_counts, sort_keys=True,
+                       separators=(",", ":")),
+            _coordinate_json(summary.first_excluded),
+            _coordinate_json(summary.latest_excluded),
+            summary.coordinate_digest,
+            _hw(summary.complete_through),
+            None if summary.boundary is None else json.dumps(
+                _lib_account_protocol.boundary_payload(summary.boundary),
+                sort_keys=True, separators=(",", ":")),
+        ),
+    )
+
+
+def _evidence_now():
+    """The wall clock the legacy-writer evidence records (a test seam)."""
+    return _utc_now()
+
+
+def _record_legacy_writer_evidence(summary) -> None:
+    """Refresh the durable legacy-writer evidence sidecar from a COMPLETE scan
+    result (spec section 8): a new excluded population replaces the evidence
+    and is first observed now; the same population leaves the sidecar
+    untouched, so the seven-day age keeps running. Diagnostic only, never
+    admission input, and best-effort: a failed write costs a doctor report its
+    recency, never a cycle."""
+    if (summary is None or summary.cutover_id is None
+            or summary.excluded_total <= 0):
+        return
+    if summary.complete_through is None:
+        # #825/#832 fix round A (review P3-13): a summary first created
+        # mid-journal counts only what it saw. Recording that partial
+        # population would make the next full rebuild's whole population look
+        # new and restart the seven-day age (case F9); the rebuild records it.
+        return
+    path = _cctally_core.LEGACY_WRITER_EVIDENCE_PATH
+    try:
+        existing = _lib_legacy_writer_evidence.from_document(
+            json.loads(path.read_bytes()))
+    except (OSError, ValueError):
+        existing = None
+    updated = _lib_legacy_writer_evidence.observe(
+        existing, cutover_id=summary.cutover_id,
+        excluded_count=summary.excluded_total,
+        coordinate_digest=summary.coordinate_digest, now=_evidence_now())
+    if updated is None or updated is existing:
+        return
+    try:
+        _atomic_write_json(path, _lib_legacy_writer_evidence.to_document(updated))
+    except OSError:
+        pass
+
+
+def _ingest_admission_boundary(conn, decoded, cursor):
+    """The boundary one ingest cycle classifies its batch against, WITHOUT a
+    journal scan on the interactive path.
+
+    The cutover op is appended at the end of the canonically-last segment, so
+    it is either inside the consumed prefix — where the index remembers it —
+    or inside this batch, or beyond the batch's high-water, in which case every
+    record of the batch was complete before the op and is historical. Only an
+    index that does not describe its own cursor falls back to the lookup."""
+    summary = _read_admission_summary(conn)
+    if summary is not None and summary.boundary is not None:
+        return summary.boundary
+    if cursor is None or (
+            summary is not None and summary.scanned_high_water == cursor):
+        pass_boundary = _PassBoundary()
+        for record, _segment, _offset in decoded:
+            pass_boundary.observe(record)
+        return pass_boundary.resolve(None)
+    return find_account_bound_cutover()
+
+
+def _advance_admission_summary(conn, boundary, excluded, cursor, target) -> None:
+    """Extend the summary with one ingest cycle's exclusions (inside the cycle
+    transaction). A row first created mid-journal is not complete. An idle
+    cycle that changes nothing writes nothing."""
+    before = _read_admission_summary(conn)
+    summary = before
+    if summary is None:
+        summary = AdmissionSummary()
+        if cursor is None:
+            summary.complete_through = (None, 0)
+    else:
+        summary = _dc_replace(
+            summary, family_counts=dict(summary.family_counts))
+    summary.cutover_id = (
+        None if boundary is None else _lib_account_protocol.CUTOVER_OP_ID)
+    summary.boundary = boundary
+    summary.extend(excluded)
+    summary.scanned_high_water = target
+    if summary.complete_through is not None:
+        summary.complete_through = target
+    if summary == before:
+        return
+    _write_admission_summary(conn, summary)
+
+
 def run_epoch_transition(*, claude_json_path=None) -> str:
     """The account epoch-transition coordinator (spec §2). Resolve the cutover
     identity, check/append the canonical cutover op, THEN rebuild — in that exact
     order, so the op is inside the rebuild's input. Returns the resolved
     ``claude_legacy_account``. Exposed for tests; the epoch-mismatch path calls
     it under the maintenance + ingest locks, and the rebuild's common cutover
-    preserves the old index only after the replacement is validated."""
+    preserves the old index only after the replacement is validated.
+
+    #825/#832 (spec C3/F1; Codex fix-round-1 Q1): the rebuild runs the shared
+    derivation-completion step. Every recorder appends its raw observation
+    BEFORE its ingest opens the index, so the tick whose open discovered the
+    mismatch left an admitted reading no current binary derived, and a
+    previous-release ingest may have derived current readings unstamped (its
+    decisions are excluded). The replaced index's applied cursor proves
+    neither, so completion replays from the derivation frontier only a
+    current index can certify, else from the cutover."""
     claude_key = _resolve_claude_cutover_identity(claude_json_path)
     recorded = append_accounts_cutover_op(claude_key)
-    rebuild_stats_index(context=RebuildContext(trigger="epoch-transition"))
+    rebuild_stats_index(context=RebuildContext(trigger="epoch-transition"),
+                        complete_derivation=True)
     return recorded

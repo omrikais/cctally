@@ -99,6 +99,7 @@ def _run(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
         "TZ": "Etc/UTC",
         "PATH": "/usr/bin:/bin",
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
         "CCTALLY_DISABLE_UPDATE_CHECK": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
     }
@@ -129,6 +130,7 @@ def _run_percent_breakdown(
         "NO_COLOR": "1",
         "CCTALLY_AS_OF": _iso(12),
         "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
         "CCTALLY_DISABLE_UPDATE_CHECK": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
     }

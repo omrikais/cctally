@@ -106,7 +106,7 @@ After applying, `cctally report` (and the statusline / dashboard) read **31%** f
 }
 ```
 
-`fromSource` is `hwm` (defaulted, first credit), `explicit` (user-supplied `--from`), or `prior_credit` (defaulted on a completion / `--force` re-apply, read from the existing `weekly_credit_floors` row). Validation and refusal errors stay plain-text on stderr even under `--json`, so consumers should check the exit code, not stdout.
+`fromSource` is `hwm` (defaulted, first credit), `explicit` (user-supplied `--from`), or `prior_credit` (defaulted on a completion / `--force` re-apply, read from the existing `weekly_credit_floors` row). `staleReplaysDeleted` (and the preview's `stale replays` line) counts every stale pre-credit row the credit retires. A retired row that also carries its own 5-hour reading is kept as a weekly-held row, so its weekly value stops counting while its 5-hour reading stays; the count can therefore exceed the number of rows actually deleted. Validation and refusal errors stay plain-text on stderr even under `--json`, so consumers should check the exit code, not stdout.
 
 ## Re-running: completion, refuse, and `--force`
 

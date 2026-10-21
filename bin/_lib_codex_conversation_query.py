@@ -27,11 +27,13 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 from collections import deque
 from types import MappingProxyType
 
 import _lib_codex_conversation as kern
+import _lib_codex_rollout_container as _rc
 import _lib_codex_landmarks as landmarks
 import _lib_codex_segments as segkern
 from _lib_codex_find_projection import (
@@ -1863,6 +1865,29 @@ def codex_conversation_exists(conn: sqlite3.Connection, conversation_key: str) -
     return row is not None
 
 
+def codex_publication_pending(
+    conn: sqlite3.Connection, conversation_key: str,
+) -> bool:
+    """A barrier-population conversation with no publication yet (#968 5.11).
+
+    Such a conversation stays in the existing pending-state handling until it
+    has an eligible publication: it answers ``normalization_pending``, never
+    ``not_found``. Any store error answers False (the caller's ``not_found``).
+    """
+    try:
+        if conn.execute(
+                "SELECT 1 FROM cache_db.codex_barrier_population "
+                "WHERE conversation_key=?", (conversation_key,)).fetchone() is None:
+            return False
+        row = conn.execute(
+            "SELECT published_revision, legacy_uncertified "
+            "FROM main.codex_conversation_publications WHERE conversation_key=?",
+            (conversation_key,)).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is None or (int(row[0] or 0) == 0 and not row[1])
+
+
 def codex_conversation_source_paths(
     conn: sqlite3.Connection, conversation_key: str
 ) -> list[str]:
@@ -2345,6 +2370,9 @@ def get_codex_conversation(
     # ── Phase A: the narrow index pass ───────────────────────────────────────
     rows, detail_bytes = _load_conversation_index_rows(conn, conversation_key)
     if not rows:
+        if codex_publication_pending(conn, conversation_key):
+            return {"status": "normalization_pending",
+                    "conversation_key": conversation_key, "items": [], "children": []}
         return {"status": "not_found", "conversation_key": conversation_key}
     undecodable_keys = undecodable_codex_conversation_keys(conn)
     kept, _suppressed = kern.pair_mirrors(rows)
@@ -3035,6 +3063,9 @@ def _outline_envelope(
     # The outline is not the route F3 bounds, and it stays turn-granular.
     rows = _load_conversation_rows(conn, conversation_key)
     if not rows:
+        if codex_publication_pending(conn, conversation_key):
+            return {"status": "normalization_pending",
+                    "conversation_key": conversation_key, "turns": [], "files": [], "children": []}
         return {"status": "not_found", "conversation_key": conversation_key}
     detail_bytes = _detail_bytes_of(rows)
     kept, _suppressed = kern.pair_mirrors(rows)
@@ -3421,20 +3452,26 @@ def _stored_browse_page_queries(
             "(COALESCE(r.last_activity_utc, '') = ? AND r.conversation_key < ?))")
         page_params.extend((cursor_last, cursor_last, cursor_key))
 
+    # Keep native/parent enrichment inside the page statement. A LEFT JOIN
+    # against the compound last-good view materializes retained history;
+    # correlated probes push these predicates into its indexed branches.
+    # The scalar parent lookup follows the detail reader's same-root lookup.
+    parent_key_sql = (
+        "(SELECT pt.conversation_key FROM codex_conversation_threads pt "
+        "WHERE pt.source_root_key = r.source_root_key "
+        "AND pt.native_thread_id = r.parent_thread_id "
+        "AND pt.conversation_key != r.conversation_key LIMIT 1)"
+    )
     sql = (
         "SELECT r.conversation_key, r.item_count, r.started_utc, "
         "r.last_activity_utc, r.project_key, r.project_label, r.models_json, "
-        "r.title, r.parent_thread_id, r.source_root_key, t.native_thread_id, "
-        "pt.conversation_key, pr.title, pr.project_label, pt.native_thread_id "
+        "r.title, r.parent_thread_id, r.source_root_key, "
+        "(SELECT t.native_thread_id FROM codex_conversation_threads t "
+        "WHERE t.conversation_key = r.conversation_key), "
+        f"{parent_key_sql}, pr.title, pr.project_label, r.parent_thread_id "
         "FROM codex_conversation_rollups r "
-        "LEFT JOIN codex_conversation_threads t "
-        "ON t.conversation_key = r.conversation_key "
-        "LEFT JOIN codex_conversation_threads pt "
-        "ON pt.source_root_key = r.source_root_key "
-        "AND pt.native_thread_id = r.parent_thread_id "
-        "AND pt.conversation_key != r.conversation_key "
         "LEFT JOIN codex_conversation_rollups pr "
-        "ON pr.conversation_key = pt.conversation_key "
+        f"ON pr.conversation_key = {parent_key_sql} "
         f"WHERE {' AND '.join(page_where)} "
         "ORDER BY COALESCE(r.last_activity_utc, '') DESC, r.conversation_key DESC"
     )
@@ -4962,6 +4999,8 @@ def find_in_codex_conversation(
         return {**base, "status": "normalization_pending"}
     rows = _load_conversation_rows(conn, conversation_key)
     if not rows:
+        if codex_publication_pending(conn, conversation_key):
+            return {**base, "status": "normalization_pending"}
         return {"status": "not_found", "conversation_key": conversation_key}
     q = (query or "").strip()
     if not q:
@@ -5021,6 +5060,9 @@ def codex_conversation_prompts(conn: sqlite3.Connection, conversation_key: str) 
                 "conversation_key": conversation_key, "prompts": []}
     rows = _load_conversation_rows(conn, conversation_key)
     if not rows:
+        if codex_publication_pending(conn, conversation_key):
+            return {"status": "normalization_pending",
+                    "conversation_key": conversation_key, "prompts": []}
         return {"status": "not_found", "conversation_key": conversation_key}
     kept, _suppressed = kern.pair_mirrors(rows)
     items = kern.canonical_items(kept)
@@ -5061,7 +5103,40 @@ def _within_root(source_path: str | None, root_path: str | None) -> bool:
         return False
 
 
-def _reread_codex_full_content(conn: sqlite3.Connection, row):
+class CodexContainerReadError(RuntimeError):
+    """A present rollout failed to read; the query envelope reports HTTP 500."""
+
+    def __init__(self, category: str, logical: str) -> None:
+        super().__init__(f"Codex rollout could not be read ({category})")
+        self.category = category
+        self.logical = logical
+
+
+class _CodexPayloadContainmentError(RuntimeError):
+    """Internal 404 signal: the selected physical container escaped its root."""
+
+
+def _select_codex_payload_container(logical):
+    # The discovery leaf deliberately treats stat failures as absent. A payload
+    # request must distinguish a missing container (410) from inaccessible data
+    # (500), including an inaccessible plain file beside a readable zstd twin.
+    for candidate in (logical, _rc.zstd_twin(logical)):
+        try:
+            info = os.stat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            raise CodexContainerReadError("read-error", str(logical)) from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise CodexContainerReadError("read-error", str(logical))
+        selected = _rc.select_container(logical)
+        if selected is not None:
+            return selected
+        # It disappeared between the strict stat and selection; try the twin.
+    return None
+
+
+def _reread_codex_full_content(conn: sqlite3.Connection, row, *, streams: "dict | None" = None):
     """Re-read the physical line at ``(row.source_path, row.line_offset)``, validate
     it against the stored ``codex_conversation_events.payload_json`` for that exact
     position (§3.4 structural gone-check — the canonical FULL record, not
@@ -5073,19 +5148,49 @@ def _reread_codex_full_content(conn: sqlite3.Connection, row):
     The full pre-cap content is re-derived through the SAME ``_extract`` the
     normalizer uses — which is how payload serves content beyond the normalized
     ``CODEX_TEXT_CAP``. Truncation/``truncated`` is against ``_FULL_PAYLOAD_CEILING``
-    (1,000,000 Python characters), the same ceiling the Claude payload path uses."""
+    (1,000,000 Python characters), the same ceiling the Claude payload path uses.
+
+    #968: select plain first, else zstd, and seek in decoded offsets. Streams are
+    request-local and reusable; no decoded copies persist. Present unreadable
+    containers raise CodexContainerReadError, never a false gone result."""
     stored = conn.execute(
         "SELECT payload_json FROM codex_conversation_events "
         "WHERE source_path = ? AND line_offset = ?",
         (row.source_path, row.line_offset)).fetchone()
     if stored is None:
         return None
-    try:
-        with open(row.source_path, "rb") as fh:
-            fh.seek(row.line_offset)
-            line = fh.readline()
-    except OSError:
-        return None
+    for attempt in range(2):
+        selected = _select_codex_payload_container(row.source_path)
+        if selected is None:
+            return None
+        # Validate exactly the descriptor we open, including after a compression
+        # race. The caller has already checked the logical path and known root.
+        root_path = _codex_source_root_path(conn, row.source_root_key)
+        if not _within_root(str(selected.path), root_path):
+            raise _CodexPayloadContainmentError()
+        try:
+            fh = None if streams is None else streams.get(str(selected.path))
+            if fh is None:
+                fh = _rc.open_decoded(selected)
+                if streams is not None:
+                    streams[str(selected.path)] = fh
+            try:
+                fh.seek(row.line_offset)
+                line = fh.readline()
+            finally:
+                if streams is None:
+                    fh.close()
+            break
+        except OSError as exc:
+            # ContainerError subclasses OSError; preserve its approved leaf
+            # category instead of flattening decoder/integrity errors.
+            replacement = _select_codex_payload_container(row.source_path)
+            if replacement is None:
+                return None
+            if replacement.path != selected.path and attempt == 0:
+                continue  # plain vanished during Codex's compression window
+            category = exc.category if isinstance(exc, _rc.ContainerError) else "read-error"
+            raise CodexContainerReadError(category, str(row.source_path)) from exc
     try:
         obj = json.loads(line.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, TypeError):
@@ -5172,7 +5277,9 @@ def read_codex_payload(
     full bounded ``card``, and ``truncated`` reflects ``_FULL_PAYLOAD_CEILING``.
     ``gone`` (→ HTTP 410) means the physical
     record moved/mutated; ``not_found`` (→ 404) means no such block, no output
-    partner, or a containment miss (a read is never attempted outside the root)."""
+    partner, or a containment miss (a read is never attempted outside the root).
+    A present container that cannot be read raises CodexContainerReadError through
+    the existing query-error envelope, including plain-file read failures."""
     miss = {"status": "not_found", "block_key": block_key, "which": which}
     if which not in ("call", "output", "event"):
         return miss
@@ -5187,7 +5294,14 @@ def read_codex_payload(
     root_path = _codex_source_root_path(conn, target.source_root_key)
     if not _within_root(target.source_path, root_path):
         return miss
-    outcome = _reread_codex_full_content(conn, target)
+    streams: dict = {}
+    try:
+        outcome = _reread_codex_full_content(conn, target, streams=streams)
+    except _CodexPayloadContainmentError:
+        return miss
+    finally:
+        for stream in streams.values():
+            stream.close()
     if outcome is None:
         return {"status": "gone", "block_key": block_key, "which": which}
     content, truncated, card = outcome

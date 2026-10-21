@@ -393,6 +393,7 @@ ACCOUNT_FORWARDING_CALL_SITES = frozenset({
     "bin/_cctally_forecast.py:cmd_report",
     "bin/_cctally_percent_breakdown.py:cmd_percent_breakdown",
     "bin/_lib_view_models.py:build_trend_view",
+    "bin/_cctally_journal.py:_first_post_floor_unchanged",
 })
 
 #: Call sites that are DELIBERATELY merged because no account is in scope

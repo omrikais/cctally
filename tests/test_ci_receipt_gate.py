@@ -46,7 +46,7 @@ TEST_MACOS_CONDITION = (
     "needs.receipt-gate.outputs.admitted != 'true' || "
     "needs.receipt-gate.outputs.discharged != 'true') && "
     "github.repository == 'omrikais/cctally-dev' && "
-    "(github.event_name == 'push' || github.event_name == 'schedule' || "
+    "(github.event_name == 'schedule' || "
     "github.event_name == 'workflow_dispatch' || "
     "(github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name == github.repository))"
@@ -54,14 +54,19 @@ TEST_MACOS_CONDITION = (
 
 # Preserve-item 1. These are the fork/self-hosted safety boundary, and this file
 # asserts them byte for byte so that nothing here can widen them by accident.
+# Since the test regime reset (session 1) a push to main runs no full-suite
+# job: the receipt gate and test-macos both dropped their `push` clause, so
+# the receipt gate now admits only a same-repository pull request.
 FORK_GUARD = (
     "github.repository == 'omrikais/cctally-dev' && "
-    "(github.event_name == 'push' || "
     "(github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.repo.full_name == github.repository))"
+    "github.event.pull_request.head.repo.full_name == github.repository)"
 )
 PUSH_ONLY_GUARD = (
     "github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'"
+)
+SCHEDULE_ONLY_GUARD = (
+    "github.event_name == 'schedule' && github.repository == 'omrikais/cctally-dev'"
 )
 
 CONCURRENCY_GROUP = (
@@ -187,7 +192,7 @@ def _evaluate(condition, context):
     return _truthy(_Parser(_tokenize(condition), context).parse())
 
 
-def _context(*, repository=PRIVATE_REPO, event="push", head_repo=None,
+def _context(*, repository=PRIVATE_REPO, event="pull_request", head_repo=None,
              cancelled=False, stamp_result="success", skip_heavy="false",
              receipt_result="success", admitted="true", discharged="false",
              receipt_outputs_present=True):
@@ -274,15 +279,35 @@ def test_the_public_mirror_never_runs_the_receipt_gate():
 
 
 @pytest.mark.parametrize("label,kwargs", [
-    ("a push to main", {}),
     ("a same-repository pull request", {"event": "pull_request"}),
 ])
 def test_the_receipt_gate_still_runs_wherever_its_consumer_can(label, kwargs):
-    """The narrowing must cost nothing that is reachable. Both contexts in
-    which `test-macos` can run must still be able to discharge it, or the guard
-    has traded a real capability for the token fix rather than adding it for
-    free."""
+    """The narrowing must cost nothing that is reachable. The context in which
+    `test-macos` can be discharged must still reach the receipt gate, or the
+    guard has traded a real capability for the token fix rather than adding it
+    for free. (Schedule and dispatch runs are never discharged.)"""
     assert _evaluate(_condition(GATE_JOB), _context(**kwargs)) is True, label
+
+
+def test_a_push_to_main_runs_no_full_suite_and_no_e2e_reader():
+    """Test regime reset, session 1 (spec 4.11): a push to `main` runs no
+    full-suite job (neither the receipt gate nor test-macos) and no
+    e2e-reader. The byte-stable bundle check still runs on the push."""
+    push = _context(event="push", discharged="false")
+    for job in (GATE_JOB, "test-macos", "e2e-reader"):
+        assert _evaluate(_condition(job), push) is False, job
+    assert _evaluate(_condition("dashboard-build-stability"), push) is True
+
+
+def test_a_scheduled_run_still_runs_test_macos():
+    """The scheduled run is the broad backstop: it still runs test-macos (and
+    the e2e-reader), while the receipt gate stays off a scheduled run."""
+    schedule = _context(event="schedule", receipt_result="skipped",
+                        receipt_outputs_present=False)
+    assert _evaluate(_condition("test-macos"), schedule) is True
+    assert _evaluate(_condition("e2e-reader"), schedule) is True
+    assert _evaluate(_condition(GATE_JOB), schedule) is False
+    assert _evaluate(_condition("dashboard-build-stability"), schedule) is False
 
 
 def test_the_receipt_gate_and_test_macos_admit_the_same_contexts():
@@ -290,7 +315,7 @@ def test_the_receipt_gate_and_test_macos_admit_the_same_contexts():
     the reason the guard is written this way is that it mirrors its consumer.
     Anything `test-macos` refuses on repository or event grounds, this refuses
     too — and nothing more."""
-    for kwargs in ({}, {"event": "pull_request"},
+    for kwargs in ({}, {"event": "push"}, {"event": "pull_request"},
                    {"event": "pull_request", "head_repo": "someone/cctally-dev"},
                    {"repository": "omrikais/cctally"}):
         gate = _evaluate(_condition(GATE_JOB), _context(**kwargs))
@@ -301,7 +326,7 @@ def test_the_receipt_gate_and_test_macos_admit_the_same_contexts():
 def test_the_release_classifier_keeps_the_public_mirror_but_refuses_private_forks():
     """Public pushes/PRs retain the classifier; private fork merge code is refused."""
     condition = _condition(STAMP_JOB)
-    assert _evaluate(condition, _context(repository="omrikais/cctally"))
+    assert _evaluate(condition, _context(repository="omrikais/cctally", event="push"))
     assert _evaluate(condition, _context(repository="omrikais/cctally", event="pull_request",
                                          head_repo="someone/cctally"))
     assert _evaluate(condition, _context(event="pull_request", head_repo="someone/fork")) is False
@@ -310,7 +335,11 @@ def test_the_release_classifier_keeps_the_public_mirror_but_refuses_private_fork
 
 def test_the_receipt_gate_is_read_only_and_does_not_persist_credentials():
     body = _ci()["jobs"][GATE_JOB]
-    assert body["permissions"] == {"contents": "read", "actions": "read"}
+    # Reset fix round (B8): nothing in the gate reads Actions any more, so it
+    # holds no `actions` scope and is handed no `gh` token.
+    assert body["permissions"] == {"contents": "read"}
+    classify = next(s for s in body["steps"] if s.get("id") == "classify")
+    assert "GH_TOKEN" not in classify["env"], classify["env"]
     checkout = [s for s in body["steps"] if str(s.get("uses", "")).startswith(
         "actions/checkout")]
     assert len(checkout) == 1, body["steps"]
@@ -365,15 +394,37 @@ def test_e2e_reader_does_not_reap_unowned_port_listeners(tmp_path):
     npx = fake_bin / "npx"
     npx.write_text("#!/bin/sh\n/usr/bin/env\n")
     npx.chmod(0o755)
+    # The listener exports the runner's CCTALLY_RUNNER_* destinations to every
+    # job, so a test inheriting them would drive the launcher against the
+    # real evidence store (and the no-store leg would not be one). A decoy
+    # stands in for that export on every gate, already holding the run's
+    # evidence directory, so a leak fails here rather than only under the
+    # listener; it must come through both legs untouched.
+    decoy = tmp_path / "listener-evidence"
+    (decoy / "ui-qa" / "e2e-reader-897-1").mkdir(parents=True)
+    inherited = {**os.environ, "CCTALLY_RUNNER_EVIDENCE_ROOT": str(decoy)}
     environment = {
-        key: value for key, value in os.environ.items()
-        if not key.startswith(("CCTALLY_E2E_", "PLAYWRIGHT_", "PW_TEST_HTML_"))
+        key: value for key, value in inherited.items()
+        if not key.startswith(("CCTALLY_E2E_", "CCTALLY_RUNNER_", "PLAYWRIGHT_",
+                               "PW_TEST_HTML_"))
     }
     environment.update(
         HOME=str(tmp_path), PATH=f"{fake_bin}:{os.environ['PATH']}",
         GITHUB_RUN_ID="897", GITHUB_RUN_ATTEMPT="1",
         GITHUB_ENV=str(tmp_path / "github-env"),
     )
+    # #940 C4: the run's evidence is retained on the runner's external
+    # evidence store, which the listener exports, never under the home cache.
+    store = tmp_path / "vol" / "evidence" / "ci"
+    without_store = subprocess.run(
+        ["bash", "-e", "-c", run], cwd=tmp_path, env=environment,
+        capture_output=True, text=True,
+    )
+    assert without_store.returncode != 0
+    assert "CCTALLY_RUNNER_EVIDENCE_ROOT" in without_store.stderr
+    assert "PLAYWRIGHT_HTML_OPEN" not in without_store.stdout
+    assert not (tmp_path / ".cache").exists() and not store.exists()
+    environment["CCTALLY_RUNNER_EVIDENCE_ROOT"] = str(store)
     result = subprocess.run(
         ["bash", "-e", "-c", run], cwd=tmp_path, env=environment,
         capture_output=True, text=True, check=True,
@@ -381,10 +432,14 @@ def test_e2e_reader_does_not_reap_unowned_port_listeners(tmp_path):
     exported = dict(
         line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
     )
-    evidence = tmp_path / ".cache/cctally-ui-qa-evidence/ci/e2e-reader-897-1"
+    evidence = store / "ui-qa" / "e2e-reader-897-1"
+    assert evidence.is_dir()
+    assert not (tmp_path / ".cache").exists()
     assert exported.get("PLAYWRIGHT_HTML_OUTPUT_DIR") == str(evidence / "playwright-report")
     assert exported.get("PLAYWRIGHT_HTML_OPEN") == "never"
     assert exported.get("PLAYWRIGHT_JSON_OUTPUT_NAME") == str(evidence / "playwright.json")
+    assert sorted(path.relative_to(decoy).as_posix() for path in decoy.rglob("*")) == [
+        "ui-qa", "ui-qa/e2e-reader-897-1"]
 
 
 def test_test_macos_declares_both_gates_in_needs():
@@ -400,14 +455,15 @@ def test_the_test_macos_condition_is_exactly_the_specified_string():
 def test_the_three_fork_guards_are_byte_unchanged():
     """Preserve-item 1's regression test. Nothing in #630 S4 touches the
     repository or head-repository equalities, and this is what says so."""
-    full_job_guard = FORK_GUARD.replace(
-        "(github.event_name == 'push' || ",
-        "(github.event_name == 'push' || github.event_name == 'schedule' || "
-        "github.event_name == 'workflow_dispatch' || ",
+    full_job_guard = (
+        "github.repository == 'omrikais/cctally-dev' && "
+        "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || "
+        "(github.event_name == 'pull_request' && "
+        "github.event.pull_request.head.repo.full_name == github.repository))"
     )
     assert _condition("test-macos").endswith(full_job_guard)
-    for job in ("dashboard-build-stability", "e2e-reader"):
-        assert PUSH_ONLY_GUARD in _condition(job), _condition(job)
+    assert PUSH_ONLY_GUARD in _condition("dashboard-build-stability")
+    assert SCHEDULE_ONLY_GUARD in _condition("e2e-reader"), _condition("e2e-reader")
 
 
 def test_the_workflow_level_concurrency_group_is_exactly_as_specified():

@@ -110,9 +110,10 @@ PASSES = ("catchUp", "verify")
 #: `provider_sync_certifiable`'s common_clean block, restated over serialized
 #: statistics (a test pins the two together). A field the statistics do not
 #: carry reads clean, exactly as the product's `getattr(..., default)` does.
-COMMON_CLEAN_FIELDS = ("lock_contended", "files_failed", "files_deferred_torn",
-                       "deferred_reason", "prune_refused", "budget_exhausted",
-                       "maintenance_failed")
+COMMON_CLEAN_FIELDS = ("lock_contended", "barrier_retry", "files_failed",
+                       "files_deferred_torn", "container_pending",
+                       "files_deferred_reset", "deferred_reason",
+                       "prune_refused", "budget_exhausted", "maintenance_failed")
 RESIDUAL_SETS = ("walkMissingBefore", "walkMissingAfter",
                  "confirmedAbsentBefore", "confirmedAbsentAfter")
 EXCEPTION_ROUTE = "stable-residual exception"

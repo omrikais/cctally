@@ -12,9 +12,13 @@
 # builder invocations) so it stays in test-all's Phase 1 pool without inner
 # concurrency. Output is line-buffered and emitted in declaration order.
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="$REPO_ROOT/bin/cctally"
-SCRATCH=$(mktemp -d -t cctally-subgroup-XXXXXX)
+SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/cctally-subgroup-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
 # Dev-instance isolation preamble (exports CCTALLY_DISABLE_DEV_AUTODETECT=1 so
 # bin/cctally resolves the PROD data-dir layout under our fake HOMEs, not the

@@ -9,6 +9,7 @@ API response clears the deadline and resets the counter.
 import datetime as dt
 import email.utils
 import threading
+import sys
 import time
 from types import SimpleNamespace
 
@@ -293,7 +294,8 @@ def test_backfill_attempts_when_statusline_stale(monkeypatch, tmp_path):
 
     ns["_statusline_observe_touch"]()
     old = time.time() - (float(ns["OAUTH_BACKFILL_STALE_SECONDS"]) + 60)
-    _os.utime(_cctally_core.STATUSLINE_OBSERVE_MARKER_PATH, (old, old))
+    _os.utime(sys.modules["_cctally_record"]._statusline_observe_path(
+        ns["_capture_binding"]()), (old, old))
 
     status, _ = ns["_hook_tick_oauth_refresh"](throttle_seconds=0)
     assert status.startswith("ok(")
@@ -475,7 +477,7 @@ def test_earlier_force_success_cannot_clear_later_hook_429(monkeypatch, tmp_path
     automatic_registered = threading.Event()
 
     def authoritative_record(args, observed_axes, *, lock_held=False,
-                             nudge_dashboard=True):
+                             nudge_dashboard=True, binding=None):
         def finish():
             force_authority_entered.set()
             assert automatic_started.wait(timeout=PRESENCE_BACKSTOP_SECONDS)

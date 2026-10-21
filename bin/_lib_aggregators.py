@@ -46,6 +46,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+import _lib_codex_rollout_container as _rc
+
 
 def _cctally():
     """Resolve the current `cctally` module at call-time (spec §5.5)."""
@@ -687,6 +689,7 @@ def _session_path_parts(source_path: str) -> tuple[str, str, str]:
     keyed on ``(scope roots, source_path)``. Outside one the roots are
     resolved per call, which is the historic behaviour every CLI caller keeps.
     """
+    source_path = _rc.logical_path(source_path)
     scope = getattr(_CODEX_PATH_SCOPE, "scope", None)
     if scope is not None:
         return scope.parts(source_path)
@@ -713,6 +716,7 @@ def _session_path_parts_for_roots(
     files stay free of maintainer absolute paths), then basename. Direct-JSONL
     roots yield an id relative to <entry> itself (no sessions/ prefix).
     """
+    source_path = _rc.logical_path(source_path)
     p = pathlib.Path(source_path)
     rel: pathlib.PurePath | None = None
     for root in roots:

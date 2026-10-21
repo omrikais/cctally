@@ -32,6 +32,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 
+import _lib_account_protocol
+
 LINE_VERSION = 1
 
 SEGMENT_PREFIX = "observations-"
@@ -379,8 +381,13 @@ def effects_payload_digest(payload: dict, refs: dict | None = None) -> str:
 # fully-formed line records
 # --------------------------------------------------------------------------
 
+_WRITER_GENERATION = _lib_account_protocol.PROTOCOL_GENERATION
+_WPG = _lib_account_protocol.WRITER_GENERATION_KEY
+
+
 def make_obs(at: str, src: str, provider: str, payload: dict,
-             account: str | None = None) -> dict:
+             account: str | None = None, *,
+             writer_generation: str | None = _WRITER_GENERATION) -> dict:
     """Build a complete ``obs`` line record (raw capture; canonicalization is
     derivation-time, never baked into the stored line — spec §4.2).
 
@@ -388,20 +395,126 @@ def make_obs(at: str, src: str, provider: str, payload: dict,
     ``provider``. It is emitted ONLY when supplied, so a pre-epic / single-account
     writer that passes nothing produces a byte-identical line (and a byte-stable
     content id). When supplied it participates in the content id, so two obs that
-    differ only by account are distinct records."""
+    differ only by account are distinct records.
+
+    ``writer_generation`` (#825/#832) is the top-level ``wpg`` stamp naming the
+    writing protocol. It is part of the content-id core, so a current record and
+    a previous-release record of the same capture are distinct lines. ``None``
+    builds the previous release's exact shape (a validator re-deriving a
+    retained pre-stamp record, or a test simulating an old writer)."""
     core = {"t": "obs", "at": at, "src": src, "provider": provider, "payload": payload}
     if account is not None:
         core["account"] = account
+    if writer_generation is not None:
+        core[_WPG] = writer_generation
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
-def make_op(at: str, src: str, payload: dict) -> dict:
-    """Build a complete ``op`` (operator record) line — no ``provider``."""
+def make_op(at: str, src: str, payload: dict, *,
+            writer_generation: str | None = _WRITER_GENERATION) -> dict:
+    """Build a complete ``op`` (operator record) line — no ``provider``.
+    ``writer_generation`` as in ``make_obs``."""
     core = {"t": "op", "at": at, "src": src, "payload": payload}
+    if writer_generation is not None:
+        core[_WPG] = writer_generation
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
+def prepare_record(record: dict) -> dict:
+    """The single shared preparation step both append APIs apply (#825/#832
+    spec 5.1): return ``record`` carrying the current writer generation.
+
+    A content-id record (``id`` starting ``o:``) that is not yet stamped and
+    whose id verifies over its unstamped core is re-identified over the stamped
+    core, exactly as the builders compute it. Every other id — semantic event
+    ids, bootstrap ids, correction batch ids, a content id that does not verify
+    — is preserved. Idempotent: a stamped record is returned unchanged."""
+    if _lib_account_protocol.is_stamped(record):
+        return record
+    stamped = _lib_account_protocol.stamp(record)
+    rid = record.get("id")
+    if (record.get("t") in ("obs", "op") and isinstance(rid, str)
+            and rid.startswith("o:")):
+        core = {k: v for k, v in record.items() if k not in ("v", "id")}
+        if content_id(core) == rid:
+            stamped_core = {k: v for k, v in stamped.items()
+                            if k not in ("v", "id")}
+            stamped["id"] = content_id(stamped_core)
+    return stamped
+
+
+def unstamped_record(record: dict) -> dict:
+    """The previous release's shape of ``record``: the inverse of
+    ``prepare_record``. Drops the writer-generation stamp and, for a content-id
+    record whose id verifies over its stamped core, re-identifies it over the
+    unstamped core. Any other id is preserved. For fixtures and tests that
+    simulate a pre-stamp writer; never used on a production write path."""
+    if not isinstance(record, dict) or _WPG not in record:
+        return record
+    out = {k: v for k, v in record.items() if k != _WPG}
+    rid = record.get("id")
+    if (record.get("t") in ("obs", "op") and isinstance(rid, str)
+            and rid.startswith("o:")):
+        core = {k: v for k, v in record.items() if k not in ("v", "id")}
+        if content_id(core) == rid:
+            out["id"] = content_id(
+                {k: v for k, v in out.items() if k not in ("v", "id")})
+    return out
+
+
+def legacy_writer_view():
+    """A namespace exposing this module with every ``make_*`` builder wrapped by
+    ``unstamped_record``, so a fixture builder written against the module
+    produces the previous release's exact bytes (cross-references between
+    records stay consistent because every id is the unstamped one)."""
+    import types
+
+    def _wrap(fn):
+        def build(*args, **kwargs):
+            out = fn(*args, **kwargs)
+            if isinstance(out, list):
+                return [unstamped_record(item) for item in out]
+            return unstamped_record(out)
+        build.__name__ = fn.__name__
+        build.__doc__ = fn.__doc__
+        return build
+
+    def _legacy_protocol_resolution(**kwargs):
+        # The previous release's acknowledgement kind, which the current
+        # binary never emits (#825/#832 spec 5.1).
+        current = make_protocol_resolution(**kwargs)
+        return make_op(
+            at=current["at"], src=current["src"],
+            payload={**current["payload"], "kind": _PROTOCOL_RESOLUTION_KIND},
+            writer_generation=None)
+
+    attrs = {}
+    for name, value in globals().items():
+        if name.startswith("__"):
+            continue
+        if name.startswith("make_") and callable(value):
+            value = _wrap(value)
+        attrs[name] = value
+    attrs["make_protocol_resolution"] = _legacy_protocol_resolution
+    return types.SimpleNamespace(**attrs)
+
+
+def event_content_hash(record: dict) -> str:
+    """The semantic content hash of an evt line. The writer-generation stamp is
+    transport metadata, so it is stripped before hashing: a current emission
+    that differs from a retained pre-stamp event only by ``wpg`` is the same
+    event (a duplicate), never a same-revision conflict."""
+    return _sha256_canonical(_lib_account_protocol.strip_stamp(record))
+
+
+#: The previous release's exact-key repair acknowledgement. The current binary
+#: never emits it: its validator would reject the writer-generation stamp, so
+#: current acknowledgements use the versioned kind the previous release ignores
+#: as an unknown op (#825/#832 spec 5.1). Current readers accept both.
 _PROTOCOL_RESOLUTION_KIND = "journal_protocol_resolution"
+_PROTOCOL_RESOLUTION_V2_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V2_KIND
+PROTOCOL_RESOLUTION_KINDS = frozenset((
+    _PROTOCOL_RESOLUTION_KIND, _PROTOCOL_RESOLUTION_V2_KIND))
 _PROTOCOL_RESOLUTION_SRC = "journal-repair"
 
 
@@ -441,7 +554,7 @@ def make_protocol_resolution(
         at=at,
         src=_PROTOCOL_RESOLUTION_SRC,
         payload={
-            "kind": _PROTOCOL_RESOLUTION_KIND,
+            "kind": _PROTOCOL_RESOLUTION_V2_KIND,
             "violations": refs,
             "journal_high_water": {
                 "segment": segment,
@@ -449,6 +562,17 @@ def make_protocol_resolution(
             },
             "journal_prefix_hash": journal_prefix_hash,
         },
+    )
+
+
+def is_protocol_resolution(record) -> bool:
+    """Whether ``record`` is a journal-repair acknowledgement of either
+    version."""
+    return (
+        isinstance(record, dict)
+        and record.get("t") == "op"
+        and isinstance(record.get("payload"), dict)
+        and record["payload"].get("kind") in PROTOCOL_RESOLUTION_KINDS
     )
 
 
@@ -463,7 +587,8 @@ def make_evt(kind: str, id: str, at: str, payload: dict, rev: int = 0) -> dict:
     body = dict(payload)
     body["kind"] = kind
     return {"v": LINE_VERSION, "t": "evt", "id": id, "rev": rev,
-            "at": at, "src": "ingest", "payload": body}
+            "at": at, "src": "ingest", "payload": body,
+            _WPG: _WRITER_GENERATION}
 
 
 # --------------------------------------------------------------------------
@@ -501,7 +626,9 @@ def _protocol_violation(
 
 def _validate_protocol_resolution(record: dict) -> dict:
     required = {"v", "t", "id", "at", "src", "payload"}
-    if set(record) != required:
+    # #825/#832: a current record also carries the writer-generation stamp,
+    # which is part of its content-id core.
+    if set(record) not in (required, required | {_WPG}):
         raise JournalProtocolError(
             "journal protocol resolution record shape is invalid"
         )
@@ -521,6 +648,8 @@ def _validate_protocol_resolution(record: dict) -> dict:
         "src": record["src"],
         "payload": record["payload"],
     }
+    if _WPG in record:
+        core[_WPG] = record[_WPG]
     if record.get("id") != content_id(core):
         raise JournalProtocolError(
             "journal protocol resolution record id does not match its content"
@@ -535,7 +664,7 @@ def _validate_protocol_resolution(record: dict) -> dict:
         raise JournalProtocolError(
             "journal protocol resolution payload shape is invalid"
         )
-    if payload.get("kind") != _PROTOCOL_RESOLUTION_KIND:
+    if payload.get("kind") not in PROTOCOL_RESOLUTION_KINDS:
         raise JournalProtocolError(
             "journal protocol resolution kind is invalid"
         )
@@ -672,6 +801,7 @@ def make_correction_batch(
         "family": family,
         "action_count": len(cores),
         "actions_hash": actions_hash,
+        _WPG: _WRITER_GENERATION,
     }
     records = [{**marker, "phase": "begin"}]
     for seq, core in enumerate(cores):
@@ -682,6 +812,7 @@ def make_correction_batch(
                 **core,
                 "batch": batch_id,
                 "seq": seq,
+                _WPG: _WRITER_GENERATION,
             }
         )
     records.append({**marker, "phase": "commit"})
@@ -769,7 +900,7 @@ def _candidate_from_evt(record: dict, sequence: int) -> EffectiveEvent:
         )
     if not isinstance(record.get("payload"), dict):
         raise JournalProtocolError("event payload must be an object")
-    digest = _sha256_canonical(record)
+    digest = event_content_hash(record)
     return EffectiveEvent(
         event_id=event_id,
         rev=rev,
@@ -919,7 +1050,7 @@ def _fold_one(fold: SelectorFold, record, sequence: int) -> None:
     if (
         record_type == "op"
         and isinstance(record.get("payload"), dict)
-        and record["payload"].get("kind") == _PROTOCOL_RESOLUTION_KIND
+        and record["payload"].get("kind") in PROTOCOL_RESOLUTION_KINDS
     ):
         resolutions.append(
             (sequence, _validate_protocol_resolution(record))

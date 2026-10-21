@@ -18,12 +18,14 @@ import contextlib
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 
 import _cctally_core
+import _cctally_store
 import _lib_quota_model as qm
 from _lib_quota_model import (  # re-exported for callers and tests
     BlockingReason, CalibrationEvidence, CalibrationStatus, Verdict,
@@ -56,36 +58,59 @@ def eprint(*args, **kwargs):
 # Part III section 28 require: the kernel has no producer for that status and
 # receives it through `analyse(extra_statuses=...)`.
 # ---------------------------------------------------------------------------
-#: First UTC date whose composition the shipped coefficients are validated
-#: for. Every observation before it is excluded from the analysis window.
-SUPPORTED_COMPOSITION_FROM: dt.date = dt.date.fromisoformat(
-    qm.COEFFICIENT_SUPPORT["supportedCompositionFrom"])
+#: First UTC date of the earliest validated coefficient era. Every
+#: observation before it is covered by no era and is never fitted; the
+#: analysis itself starts at the start of the era the clock selects (#978).
+SUPPORTED_COMPOSITION_FROM: dt.date = qm.COEFFICIENT_ERAS[0].start
 
-#: Provenance, so a later reader can re-test the boundary rather than inherit
-#: it. Each entry states the era, its state and where the state came from.
-COEFFICIENT_ERAS: tuple = (
-    {
-        "from": None,
-        "until": SUPPORTED_COMPOSITION_FROM.isoformat(),
-        "state": "unvalidated",
-        "provenance": (
-            "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 "
-            "units per point against 2.4M for Opus 5, a budget difference the "
-            "shared token-class coefficients do not absorb. The shipped "
-            "estimator gives 1,265,184 to 1,479,027 over the same weeks, and "
-            "spec section 6 declines to adjudicate between the two."
-        ),
-    },
-    {
-        "from": SUPPORTED_COMPOSITION_FROM.isoformat(),
-        "until": None,
-        "state": "validated",
-        "provenance": (
-            "docs/quota-model.md: 2026-07-25 is the Opus 5 changeover, the "
-            "epoch the token-class weights were fitted on."
-        ),
-    },
-)
+#: The history before every validated era, published first in
+#: `method.coefficientEras` so a later reader can re-test the boundary rather
+#: than inherit it. It carries `id: None` and no weights, because no
+#: coefficient set is validated for it.
+UNVALIDATED_ERA_RECORD: dict = {
+    "id": None,
+    "from": None,
+    "until": SUPPORTED_COMPOSITION_FROM.isoformat(),
+    "state": "unvalidated",
+    "provenance": (
+        "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 "
+        "units per point against 2.4M for Opus 5, a budget difference the "
+        "shared token-class coefficients do not absorb. The shipped "
+        "estimator gives 1,265,184 to 1,479,027 over the same weeks, and "
+        "spec section 6 declines to adjudicate between the two."
+    ),
+}
+
+
+def published_coefficient_eras() -> list:
+    """The complete era catalogue in order, as `method.coefficientEras`.
+
+    The unvalidated record first, then each kernel era with its interval,
+    provenance and token-class weights. Built from `qm.COEFFICIENT_ERAS` on
+    every call, so the published table can never drift from the one the
+    kernel weights with.
+    """
+    out = [dict(UNVALIDATED_ERA_RECORD)]
+    for era in qm.COEFFICIENT_ERAS:
+        out.append({
+            "id": era.id,
+            "from": era.start.isoformat(),
+            "until": None if era.end is None else era.end.isoformat(),
+            "state": "validated",
+            "provenance": era.provenance,
+            "tokenClassWeights": era.weight_map(),
+        })
+    return out
+
+
+def select_era(now: "dt.datetime") -> "qm.CoefficientEra | None":
+    """The one era an analysis at `now` is fitted in (#978 spec 4.3).
+
+    The clock decides, never the data: the real clock, or `CCTALLY_AS_OF` in
+    harnesses. None before 2026-07-25, where no era is validated.
+    """
+    return qm.era_for_instant(now)
+
 
 #: Snapshot sources that are synthetic by construction and are never read as
 #: observations (spec section 4). A closed committed set: `record-credit`
@@ -229,6 +254,23 @@ def _probe_bundle(stats_conn, cache_conn) -> tuple:
     )
 
 
+#: How far below the analysis start the SQL text prefilter reaches. Stored
+#: timestamps may carry a non-UTC offset, and text comparison then orders
+#: them by local wall time: `2026-09-22T03:00:00+05:00` sorts at or after
+#: `2026-09-22T00:00:00+00:00` while naming an instant before it, and
+#: `2026-09-21T22:30:00-05:00` sorts before it while naming an instant after
+#: it. Any real offset is under a day, so a one-day margin keeps every
+#: in-range row, and the exact bound is then applied to the parsed instant.
+#: The kernel refuses an out-of-era instant outright (#978 spec 4.2,
+#: invariant 5), so the bound has to be exact rather than textual.
+_TEXT_PREFILTER_MARGIN = dt.timedelta(days=1)
+
+
+def _text_prefilter_floor(start) -> str:
+    """The coarse SQL lower bound for an exact instant bound `start`."""
+    return (start - _TEXT_PREFILTER_MARGIN).isoformat()
+
+
 def _read_stats_component(conn, account_key, start):
     """Meter readings and authoritative credit instants for one account.
 
@@ -250,7 +292,7 @@ def _read_stats_component(conn, account_key, start):
     params: list = list(SYNTHETIC_SNAPSHOT_SOURCES)
     if start is not None:
         sql += " AND captured_at_utc >= ?"
-        params.append(start.isoformat())
+        params.append(_text_prefilter_floor(start))
     clause, extra = _account_clause("account_key", account_key)
     sql += clause
     params.extend(extra)
@@ -262,6 +304,8 @@ def _read_stats_component(conn, account_key, start):
             sql, params):
         at = parse_instant(captured, "captured_at_utc")
         if at is None:
+            continue
+        if start is not None and at < start:
             continue
         anchor = parse_instant(week_at, "week_start_at")
         if anchor is None:
@@ -301,8 +345,12 @@ def _read_stats_component(conn, account_key, start):
     return snapshots, credits, diagnostics
 
 
-def _read_cache_component(conn, account_key, start):
+def _read_cache_component(conn, account_key, start, end=None):
     """Priced requests for one account, plus the store-wide ingest tail.
+
+    Rows are bounded to `[start, end)` on the parsed instant before the
+    fast-mode count, so `fastModeEntriesExcluded` describes the analysed
+    window; `end` is a closed era's exclusive end, or None for an open one.
 
     `newest_entry_at` is deliberately NOT account-scoped. It answers "has the
     ingest finished covering this day", which is a property of the store; an
@@ -318,7 +366,7 @@ def _read_cache_component(conn, account_key, start):
     params: list = []
     if start is not None:
         sql += " AND timestamp_utc >= ?"
-        params.append(start.isoformat())
+        params.append(_text_prefilter_floor(start))
     clause, extra = _account_clause("account_key", account_key)
     sql += clause
     params.extend(extra)
@@ -329,6 +377,10 @@ def _read_cache_component(conn, account_key, start):
     for row in conn.execute(sql, params):
         at = parse_instant(row[0], "timestamp_utc")
         if at is None:
+            continue
+        if start is not None and at < start:
+            continue
+        if end is not None and at >= end:
             continue
         if row[7] == "fast":
             fast_excluded += 1
@@ -369,26 +421,74 @@ def _retained_snapshot_span(conn, account_key):
     return parse_instant(row[0]), parse_instant(row[1])
 
 
-def era_floor_instant() -> "dt.datetime":
-    """The first instant the shipped coefficients are validated for."""
-    return dt.datetime.combine(
-        SUPPORTED_COMPOSITION_FROM, dt.time(0, 0), tzinfo=UTC)
+def era_floor_instant(era) -> "dt.datetime":
+    """The first instant `era`'s coefficients are validated for."""
+    return qm.era_bounds(era)[0]
 
 
-def resolve_analysis_start(since):
-    """`max(--since, the era floor)`.
+def resolve_analysis_start(since, era):
+    """`max(--since, the selected era's start)`.
 
-    A `--since` earlier than the floor does not widen the window: section 6
+    A `--since` earlier than the era does not widen the window: section 6
     says an era whose composition the coefficients are not validated for is
-    not fitted, and a flag cannot licence fitting it.
+    not fitted, and #978 spec 4.3 says neither `--since` nor `--watch-from`
+    reopens a preceding era, so a flag cannot licence fitting one.
     """
-    floor = era_floor_instant()
+    floor = era_floor_instant(era)
     if since is None:
         return floor
     return max(since, floor)
 
 
-def load_population(account_key, *, since, now) -> LoadResult:
+def week_spans_era(week: "CurrentWeek", era) -> bool:
+    """Is the subscription week not wholly inside `era`?
+
+    Either the week starts before the era, or, for a closed era a historical
+    clock selected, it ends after the era's exclusive end. Such a week's
+    units would come from two eras, so its modelled figures are withheld
+    (#978 spec 4.3).
+    """
+    start, end = qm.era_bounds(era)
+    return week.anchor < start or (end is not None and week.end > end)
+
+
+def current_week_units(population, era) -> float:
+    """Summed weighted units of the current week's general-meter entries.
+
+    A dedicated-pool family contributes nothing, and an entry whose
+    cache-write split is unknown is skipped, as `population_units` does. An
+    entry `era` does not cover raises `CoefficientEraMismatch` instead of
+    being skipped (#978 spec 4.2, invariant 5): the week's units are never
+    silently clipped to the part one era covers.
+    """
+    total = 0.0
+    for entry in population:
+        if qm.family_participation(
+                qm.normalize_family(entry.model)) != "general":
+            continue
+        weighed = qm.weigh_entry(entry, era)
+        if weighed.cause == qm.ERA_UNAVAILABLE:
+            raise qm.CoefficientEraMismatch(
+                f"entry.at {entry.at.isoformat()} lies outside coefficient "
+                f"era {era.id!r}")
+        if weighed.units is None:
+            continue
+        total += weighed.units
+    return total
+
+
+def _confine(rows, end):
+    """The rows strictly before a closed era's exclusive `end`.
+
+    The lower bound is already applied at the query; an open era (`end`
+    None) is bounded by the clock exactly as before #978.
+    """
+    if end is None:
+        return list(rows)
+    return [row for row in rows if row.at < end]
+
+
+def load_population(account_key, *, since, now, era) -> LoadResult:
     """Read both stores coherently and return one account's population.
 
     The stores are opened through the guarded helpers, so `CCTALLY_DATA_DIR`,
@@ -396,9 +496,21 @@ def load_population(account_key, *, since, now) -> LoadResult:
     all apply. Every failure is caught and reported as a typed `unavailable`
     result; an uncaught `OperationalError` from a store read is never allowed
     to reach the user.
+
+    `era` is the era `select_era(now)` chose. Snapshots, credits and entries
+    are confined to `[analysis start, era end)` before anything downstream
+    segments, fences or fits them (#978 spec 4.3). A None era — a clock
+    before every validated era — reads nothing and returns the
+    `unvalidated-coefficient-era` status, because no coefficient set could
+    weigh what it would read.
     """
     qm.require_aware(now, "now")
-    start = resolve_analysis_start(since)
+    if era is None:
+        return LoadResult(
+            status=CalibrationStatus.UNVALIDATED_COEFFICIENT_ERA,
+            cause="history-predates-supported-composition")
+    start = resolve_analysis_start(since, era)
+    era_end = qm.era_bounds(era)[1]
     stats_conn = None
     cache_conn = None
     try:
@@ -419,7 +531,7 @@ def load_population(account_key, *, since, now) -> LoadResult:
                 snapshots, credits, diagnostics = _read_stats_component(
                     stats_conn, account_key, start)
                 entries, newest, fast_excluded = _read_cache_component(
-                    cache_conn, account_key, start)
+                    cache_conn, account_key, start, era_end)
             except sqlite3.Error:
                 return LoadResult(analysis_start=start,
                                   status=CalibrationStatus.UNAVAILABLE,
@@ -430,6 +542,18 @@ def load_population(account_key, *, since, now) -> LoadResult:
                                   cause="malformed-retained-instant")
             after = _probe_bundle(stats_conn, cache_conn)
             if before == after:
+                # #825/#832 spec 6: the stats half of a population this
+                # external plan carries into ingest must come from the current
+                # interpretation. The coherence bracket proves the reads saw
+                # one unchanged store (a republication moves the probe), so the
+                # identity of that store is checked at the bracket's edge.
+                try:
+                    with _cctally_store.current_stats_snapshot(stats_conn):
+                        pass
+                except _cctally_store.StatsIndexNotCurrent:
+                    return LoadResult(analysis_start=start,
+                                      status=CalibrationStatus.UNAVAILABLE,
+                                      cause="index-not-current")
                 payload = (earliest, snapshots, credits, diagnostics,
                            entries, newest, fast_excluded)
                 break
@@ -451,6 +575,9 @@ def load_population(account_key, *, since, now) -> LoadResult:
 
     earliest, snapshots, credits, diagnostics, entries, newest, \
         fast_excluded = payload
+    snapshots = _confine(snapshots, era_end)
+    credits = _confine(credits, era_end)
+    entries = _confine(entries, era_end)
     diagnostics = dict(diagnostics)
     diagnostics["analysisStart"] = start.isoformat()
     diagnostics["fastModeEntriesExcluded"] = fast_excluded
@@ -993,6 +1120,10 @@ class PersistMode:
     now: "dt.datetime"
     fingerprint: str
     regime_start: "dt.datetime"
+    #: The id of the coefficient era the clock selected (#978), written on
+    #: every regime. None when the clock precedes every validated era, which
+    #: makes the run persist nothing.
+    coefficient_era: "str | None"
 
 
 def _interval_json(interval):
@@ -1008,6 +1139,7 @@ def _regime_from(evidence, *, effective_from, mode, status):
         "effectiveUntil": None,
         "fingerprint": mode.fingerprint,
         "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+        "coefficientEra": mode.coefficient_era,
         "unitsPerPoint": evidence.value,
         "interval": _interval_json(evidence.interval),
         "support": ({"days": evidence.support.days,
@@ -1068,6 +1200,87 @@ def stored_regimes(state: dict, account_key) -> list:
     bucket = accounts.get(_state_key(account_key)) or {}
     regimes = bucket.get("regimes") or []
     return [dict(r) for r in regimes if isinstance(r, dict)]
+
+
+# #825/#832 spec 5.4 "Calibration sidecar". Recovery (#689) journals a
+# transition an earlier run persisted and failed to record. A transition a
+# previous-release process persisted must never be republished as a
+# current-stamped `meter_rate_change`, so every regime THIS binary writes
+# carries the writer generation plus a digest over its own content: a legacy
+# process's in-place `update()` of a stamped regime keeps the stamp keys but
+# breaks the digest, so it reads as legacy too.
+_REGIME_WRITER_KEY = "wpg"
+_REGIME_WRITER_DIGEST_KEY = "wpgDigest"
+
+
+def _regime_content_digest(regime: dict) -> str:
+    core = {k: v for k, v in regime.items()
+            if k not in (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY)}
+    data = json.dumps(core, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, default=str)
+    return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def stamp_regime(regime: dict) -> dict:
+    """``regime`` stamped as written by the current protocol generation."""
+    import _lib_account_protocol
+    out = {k: v for k, v in regime.items()
+           if k not in (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY)}
+    out[_REGIME_WRITER_KEY] = _lib_account_protocol.PROTOCOL_GENERATION
+    out[_REGIME_WRITER_DIGEST_KEY] = _regime_content_digest(out)
+    return out
+
+
+def regime_writer_is_current(regime) -> bool:
+    import _lib_account_protocol
+    return (isinstance(regime, dict)
+            and regime.get(_REGIME_WRITER_KEY)
+            == _lib_account_protocol.PROTOCOL_GENERATION
+            and regime.get(_REGIME_WRITER_DIGEST_KEY)
+            == _regime_content_digest(regime))
+
+
+def stamp_current_writes(stored: dict, reduced: dict, account_key) -> dict:
+    """``reduced`` with every regime this run created or changed stamped.
+
+    A regime identical to the stored one at its position is left exactly as
+    it was — a legacy regime this run did not touch is never laundered into a
+    current one."""
+    before = stored_regimes(stored, account_key)
+    after = stored_regimes(reduced, account_key)
+    regimes = []
+    for index, regime in enumerate(after):
+        if index < len(before) and regime == before[index]:
+            regimes.append(regime)
+        else:
+            regimes.append(stamp_regime(regime))
+    out = dict(reduced)
+    accounts = dict(out.get("accounts") or {})
+    accounts[_state_key(account_key)] = {
+        **(accounts.get(_state_key(account_key)) or {}), "regimes": regimes}
+    out["accounts"] = accounts
+    return out
+
+
+def recovery_candidates(state: dict, account_key, *, detected_at) -> tuple:
+    """The persisted transitions #689 recovery may journal: every qualified
+    pair whose SUCCESSOR — the regime that constitutes the transition — carries
+    a verifying current-writer stamp. A transition a previous-release process
+    persisted (or edited in place) is withheld. The predecessor is ordinary
+    history: every regime from before the upgrade is legacy-written, and the
+    first current change after it must still be recoverable."""
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    regimes = stored_regimes(state, account_key)
+    current_starts = set()
+    for start, (_predecessor, successor) in mrc._adjacent_pairs(regimes).items():
+        if regime_writer_is_current(successor):
+            current_starts.add(start)
+    return tuple(
+        t for t in mrc.enumerate_transitions(
+            regimes, provider="claude",
+            account_key=_alert_account_key(account_key),
+            detected_at=detected_at)
+        if mrc._instant(t.effective_from) in current_starts)
 
 
 def recorded_regime(state: dict, account_key) -> "dict | None":
@@ -1183,9 +1396,11 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
       split persists BOTH sides, so the baseline is created if it is absent.
     * A trustworthy fit with no detected change updates the open regime in
       place, or opens the first one.
-    * A stored regime under a different fingerprint is marked `stale` and a
-      new regime is APPENDED; its own value is never rewritten, because that
-      value was true under its own constants.
+    * A stored regime under a different fingerprint, or a different
+      coefficient era (#978), is marked `stale` and a new regime is APPENDED;
+      its own value is never rewritten, because that value was true under its
+      own constants. A run whose clock selects an earlier era than the open
+      regime's writes nothing.
     * A withheld analysis that `qm.transition_persistence_permitted` admits
       persists both sides of the split exactly as a confirmed change does,
       with the successor stamped under the withholding status (#688). This
@@ -1211,14 +1426,29 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     successor_ok = successor_ok or permitted
     if not fitted_ok and not successor_ok:
         return stored
+    mode_era = qm.era_by_id(mode.coefficient_era)
+    if mode_era is None:
+        # No validated era: nothing this run fitted could name one.
+        return stored
 
     open_regime = _open_regime(regimes)
-    # A stored regime fitted under different constants is marked stale and
-    # left otherwise untouched. It is marked HERE, together with the append
-    # below, because section 20 also says a run that writes nothing leaves the
-    # stored state alone — and a run reaching this point is writing.
-    if open_regime is not None and open_regime.get("fingerprint") != \
-            mode.fingerprint:
+    # #978 spec 4.5: a run whose clock selects an EARLIER era than the open
+    # regime's — a `CCTALLY_AS_OF` inside the Opus 5 era against a stored
+    # Opus 5.5 calibration — never replaces the present with the past.
+    open_era = (qm.era_by_id(open_regime.get("coefficientEra"))
+                if open_regime is not None else None)
+    if open_era is not None and open_era.start > mode_era.start:
+        return stored
+    # A stored regime fitted under different constants, or in a different
+    # coefficient era (#978), is marked stale and left otherwise untouched.
+    # It is marked HERE, together with the append below, because section 20
+    # also says a run that writes nothing leaves the stored state alone — and
+    # a run reaching this point is writing. The era comparison uses `.get()`,
+    # so an old-build regime with no era rolls over here too (its fingerprint
+    # already differs).
+    if open_regime is not None and (
+            open_regime.get("fingerprint") != mode.fingerprint
+            or open_regime.get("coefficientEra") != mode.coefficient_era):
         open_regime["status"] = CalibrationStatus.STALE.value
         open_regime["effectiveUntil"] = mode.now.astimezone(UTC).isoformat()
         open_regime = None
@@ -1360,6 +1590,8 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
         detected_at = mode.now.astimezone(UTC).isoformat()
         transitions: tuple = ()
         if reduced is not loaded.state:
+            reduced = stamp_current_writes(
+                loaded.state, reduced, mode.account_key)
             save_calibrations(reduced)
             # #688: `detect_transitions` compares two stored states and does
             # not know WHY this run was admitted, so the disclosure is
@@ -1393,10 +1625,8 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
         # later run finds the state unchanged and takes neither branch above.
         # Recovery therefore cannot be derived from freshness; it comes from
         # what is persisted right now.
-        candidates = mrc.enumerate_transitions(
-            stored_regimes(reduced, mode.account_key),
-            provider="claude", account_key=account_key,
-            detected_at=detected_at)
+        candidates = recovery_candidates(
+            reduced, mode.account_key, detected_at=detected_at)
         return loaded.quarantined, transitions, candidates
 
 
@@ -1760,17 +1990,45 @@ class AccountResult:
     #: being accepted; `analysis` is what the user is shown.
     clean: object = None
     quarantined: "str | None" = None
+    #: The coefficient era the clock selected, or None before every
+    #: validated era (#978). The method metadata names it.
+    era: "qm.CoefficientEra | None" = None
+
+
+def recorded_prior_is_stale(recorded, era) -> bool:
+    """Is the recorded calibration from other constants or another era?
+
+    Spec 4.3's status table: either one is the `stale` overlay, as a
+    fingerprint mismatch already was. A run with no selected era compares
+    against no era id, so any recorded regime is stale to it.
+    """
+    if recorded is None:
+        return False
+    if recorded.get("fingerprint") != qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT:
+        return True
+    return recorded.get("coefficientEra") != (
+        None if era is None else era.id)
 
 
 def analyse_account(account_key, *, now, since, watch_from,
                     stored_state) -> AccountResult:
     """Read one account's population and run the kernel over it."""
-    load = load_population(account_key, since=since, now=now)
+    # #978 spec 4.3: ONE era per analysis, chosen once from the clock. The
+    # population is confined to it, so every kernel call below sees only
+    # in-era instants and weighs them with this era's coefficients.
+    era = select_era(now)
+    load = load_population(account_key, since=since, now=now, era=era)
     extra = [load.status] if load.status is not None else []
+    # A clock before every validated era read nothing, so the population is
+    # empty and no weight is ever applied. The kernel still requires an era
+    # to type its arguments; the earliest one is an inert placeholder here.
+    kernel_era = era if era is not None else qm.COEFFICIENT_ERAS[0]
     segments = qm.build_segments(load.snapshots, load.credits)
     series = qm.build_daily_series(
-        segments, load.entries, now=now, newest_entry_at=load.newest_entry_at)
+        segments, load.entries, now=now, newest_entry_at=load.newest_entry_at,
+        era=kernel_era)
     week = current_week_window(segments, now=now)
+    week_withheld = None
     if week is None:
         forecast_population: tuple = ()
         week_units = None
@@ -1779,24 +2037,22 @@ def analyse_account(account_key, *, now, since, watch_from,
     else:
         horizon = min(now, week.end)
         forecast_population = tuple(
-            e for e in load.entries if week.units_start <= e.at < horizon)
-        week_units = 0.0
-        for entry in forecast_population:
-            units = qm.weighted_units(entry)
-            if units is None:
-                continue
-            if qm.family_participation(
-                    qm.normalize_family(entry.model)) != "general":
-                continue
-            week_units += units
+            e for e in load.entries if week.units_start <= e.at < horizon
+            and qm.era_contains(kernel_era, e.at))
         observed = week.observed_percent
         week_start, week_end = week.units_start, week.end
+        if week_spans_era(week, kernel_era):
+            # The week's units would come from two eras, and the in-era part
+            # is not the whole week, so consumption, the residual, headroom
+            # and the projection are withheld. The observed reading and an
+            # independently valid fit are still published.
+            week_withheld = "unvalidated-coefficient-era"
+            week_units = None
+        else:
+            week_units = current_week_units(forecast_population, kernel_era)
 
     recorded = recorded_regime(stored_state, account_key)
-    stale_prior = bool(
-        recorded is not None
-        and recorded.get("fingerprint")
-        != qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT)
+    stale_prior = recorded_prior_is_stale(recorded, era)
     mode_kind = "automatic"
     if watch_from is not None:
         mode_kind = "diagnostic"
@@ -1806,13 +2062,15 @@ def analyse_account(account_key, *, now, since, watch_from,
             mode_kind = "diagnostic"
 
     common = dict(
-        now=now, newest_at=load.newest_entry_at,
+        now=now, newest_at=load.newest_entry_at, era=kernel_era,
+        current_week_withheld=week_withheld,
         forecast_population=forecast_population,
         observed_percent=observed, current_week_units=week_units,
         current_week_start=week_start, current_week_end=week_end,
         override_split=watch_from.date() if watch_from is not None else None,
         extra_statuses=tuple(extra),
-        unattributed=qm.unattributed_units(segments, load.entries, now=now),
+        unattributed=qm.unattributed_units(segments, load.entries, now=now,
+                                           era=kernel_era),
         in_progress_excluded=qm.in_progress_dates(segments, now=now),
         diagnostics={"snapshots": len(load.snapshots),
                      "segments": len(segments),
@@ -1833,7 +2091,7 @@ def analyse_account(account_key, *, now, since, watch_from,
         account_key=account_key,
         label=account_display_label(account_key),
         analysis=reported, load=load, week=week, recorded=recorded,
-        stale_prior=stale_prior, mode_kind=mode_kind, clean=clean)
+        stale_prior=stale_prior, mode_kind=mode_kind, clean=clean, era=era)
 
 
 # ---------------------------------------------------------------------------
@@ -1892,6 +2150,10 @@ def account_payload(result: AccountResult) -> dict:
     # any caller could omit, and section 24 requires it published.
     diagnostics.pop("detector", None)
     detector = qm.detector_diagnostics(analysis.detector)
+    era = result.era
+    supported_from = None if era is None else era.start.isoformat()
+    supported_until = (None if era is None or era.end is None
+                       else era.end.isoformat())
     return {
         "status": analysis.status.value,
         "verdict": analysis.verdict.value,
@@ -1958,9 +2220,14 @@ def account_payload(result: AccountResult) -> dict:
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
             "constantsFingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "verifiedAt": qm.QUOTA_MODEL_VERIFIED_AT,
-            "supportedCompositionFrom": SUPPORTED_COMPOSITION_FROM.isoformat(),
-            "coefficientSupport": dict(qm.COEFFICIENT_SUPPORT),
-            "coefficientEras": [dict(era) for era in COEFFICIENT_ERAS],
+            "supportedCompositionFrom": supported_from,
+            "coefficientSupport": {
+                "supportedCompositionFrom": supported_from,
+                "supportedCompositionUntil": supported_until,
+                "coefficientEra": None if era is None else era.id,
+                "fastModeParticipation": qm.FAST_MODE_PARTICIPATION,
+            },
+            "coefficientEras": published_coefficient_eras(),
             "detector": detector,
             "dedicatedPoolScope": qm.DEDICATED_POOL_SCOPE_NOTE,
         },
@@ -2018,6 +2285,15 @@ def _evidence_line(label, evidence, formatter) -> str:
     return f"  {label:26} {formatter(evidence.value)}{span}{marks}"
 
 
+def _supported_composition_text(era) -> str:
+    """The selected era's interval, as the DATA line names it (#978)."""
+    if era is None:
+        return f"none validated before {SUPPORTED_COMPOSITION_FROM.isoformat()}"
+    if era.end is None:
+        return f"{era.start.isoformat()} onward"
+    return f"{era.start.isoformat()} to {era.end.isoformat()}"
+
+
 def render_text(results, *, now, decorated) -> list:
     """The human report, as a list of lines."""
     out: list = []
@@ -2032,9 +2308,9 @@ def render_text(results, *, now, decorated) -> list:
         out.append(f"  entries through            "
                    f"{_iso(result.load.newest_entry_at) or '-'}")
         out.append(f"  analysis start             "
-                   f"{_iso(result.load.analysis_start)}"
+                   f"{_iso(result.load.analysis_start) or '-'}"
                    f"   (supported composition: "
-                   f"{SUPPORTED_COMPOSITION_FROM.isoformat()} onward)")
+                   f"{_supported_composition_text(result.era)})")
         out.append(f"  eligible days              "
                    f"{analysis.diagnostics.get('eligibleDays', 0)}"
                    f"   ({analysis.diagnostics.get('withheldDays', 0)} withheld)")
@@ -2215,7 +2491,8 @@ def cmd_quota(args) -> int:
         mode = PersistMode(
             kind=result.mode_kind, account_key=account_key, now=now,
             fingerprint=qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
-            regime_start=result.load.analysis_start)
+            regime_start=result.load.analysis_start,
+            coefficient_era=None if result.era is None else result.era.id)
         # §6.5 step 1-2: the descriptor is decided under the calibration
         # file's leaf lock, and that lock is released before any stats lock is
         # taken — `persist_and_detect` returns from its `with` block first.

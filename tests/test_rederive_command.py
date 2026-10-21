@@ -19,6 +19,15 @@ from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 #: recovery test. Three presence backstops, because each run is a real
 #: child process rather than an in-process wait, and the three are
 #: sequential: the crash run cannot start until the preview has returned.
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 _CHILD_RUNS_BUDGET_S = 3 * PRESENCE_BACKSTOP_SECONDS
 
 
@@ -386,7 +395,8 @@ def test_reviewed_weekly_decision_command_is_durable_and_idempotent(
     assert sum(
         record.get("t") == "op"
         and (record.get("payload") or {}).get("kind")
-        == "claude_weekly_observation_decision"
+        # #825/#832: the current binary emits the versioned kind.
+        == "claude_weekly_observation_decision_v2"
         for record in after
     ) == 1
     stable = _journal_bytes(mod)
@@ -2166,7 +2176,10 @@ def test_the_whole_rederive_apply_takes_one_prefix_traversal(
     rebuilt = []
 
     def _stub_rebuild(*, context, high_water, update_quota_cache,
-                      before_swap=None):
+                      before_swap=None, complete_derivation=False):
+        # #825/#832 fix round A: every production rebuild completes
+        # derivation first.
+        assert complete_derivation is True
         rebuilt.append(high_water)
         return _StubRebuildResult()
 
@@ -2456,14 +2469,17 @@ def test_a_rederive_converges_over_a_credit_that_preserved_a_held_row(
 
     The two seeded rows carry the same weekly 63.0 and differ only in
     `weekly_observation_held`, and the credit's effective instant precedes both, so
-    they enter the stale-replica band together. The non-held one is removed through
-    the journalled suppression list; the held one is preserved, because it is the
-    only carrier of its tick's five-hour reading.
+    they enter the stale-replica band together. The non-held one is named by the
+    journalled suppression list; the held one is preserved, because it is the
+    only carrier of its tick's five-hour reading. Since spec 4.7 revision 7
+    (#825/#832 fix round K16b) the named row also carries its own five-hour
+    reading, so the credit retires only its weekly effect and keeps it
+    weekly-held.
 
     A rederive then reruns the pipeline and must reproduce exactly that: it must
-    not resurrect the suppressed row — which is the failure the suppression list
-    exists to prevent, since the poisoned row is itself a retained
-    `snapshot_accept` — and it must not drop the preserved held row either."""
+    not resurrect the suppressed row's weekly value — the failure the suppression
+    list exists to prevent, since the poisoned row is itself a retained
+    `snapshot_accept` — and it must not drop either held row."""
     mod = _isolated(tmp_path, monkeypatch)
     _r5_drive_held_sequence_unattributed(mod)
     week = _r5_week_start_date(mod)
@@ -2478,14 +2494,17 @@ def test_a_rederive_converges_over_a_credit_that_preserved_a_held_row(
 
     before = _held_logical_state(mod)
     held = [row for row in before["snapshots"] if row[1] == 1]
-    assert len(held) == 1, (
-        "the credit removed the held row the preservation rule keeps")
-    assert held[0][2] == 25.0, (
+    assert sorted(row[2] for row in held) == sorted(
+        [row[2] for row in seeded["snapshots"]]), (
+        "the credit removed a row carrying its own five-hour reading: the held "
+        "row the preservation rule keeps, or the replica revision 7 keeps "
+        f"weekly-held: {before['snapshots']}")
+    assert 25.0 in [row[2] for row in held], (
         "the held row survived but lost the five-hour reading it exists to hold")
     assert not [row for row in before["snapshots"]
                 if row[1] == 0 and row[0] == 63.0], (
-        "non-vacuity: the NON-held stale replica must have been removed, or "
-        "there is no suppression list for the rederive to honour")
+        "non-vacuity: the NON-held stale replica's weekly effect must have been "
+        "retired, or there is no suppression list for the rederive to honour")
 
     assert mod.cmd_db_rederive(_args()) == 0
     preview = json.loads(capsys.readouterr().out)

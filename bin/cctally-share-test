@@ -37,6 +37,10 @@
 # runner are required.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -44,7 +48,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
-FIXTURE_STAGE=$(mktemp -d -t cctally-share-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-share-fixstage.XXXXXX") || exit 1
 FIXTURES_DIR="$FIXTURE_STAGE/share"
 # Goldens address the COMMITTED root, never the staging copy above: this
 # harness's EXIT trap removes that copy, so a regenerate run writing there
@@ -64,7 +68,7 @@ export CCTALLY_AS_OF="${CCTALLY_AS_OF:-2026-05-09T12:00:00Z}"
 export TZ=Etc/UTC
 
 # Single scratch root for the entire run. One trap, one cleanup point.
-SCRATCH_ROOT="$(mktemp -d -t cctally-share-fixtures-XXXXXX)"
+SCRATCH_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cctally-share-fixtures-XXXXXX")" || exit 1
 trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 export GOLDEN_DIFF_TMPDIR="$SCRATCH_ROOT"
 

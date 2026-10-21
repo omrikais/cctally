@@ -458,7 +458,8 @@ def test_e2e_debug_report_on_stderr(cmd, tmp_path):
     home.mkdir()
     _stage_codex_session(home)
     env = {"HOME": str(home), "PATH": __import__("os").environ.get("PATH", ""),
-           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     r = subprocess.run(
         [sys.executable, str(CCTALLY), cmd, "--debug"],
         capture_output=True, text=True, env=env, timeout=60,
@@ -479,7 +480,8 @@ def test_e2e_debug_samples_zero_suppresses_block(tmp_path):
     home.mkdir()
     _stage_codex_session(home)
     env = {"HOME": str(home), "PATH": __import__("os").environ.get("PATH", ""),
-           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     r = subprocess.run(
         [sys.executable, str(CCTALLY), "codex-daily", "--debug", "--debug-samples", "0"],
         capture_output=True, text=True, env=env, timeout=60,
@@ -494,7 +496,8 @@ def test_e2e_no_debug_flag_no_report(tmp_path):
     home.mkdir()
     _stage_codex_session(home)
     env = {"HOME": str(home), "PATH": __import__("os").environ.get("PATH", ""),
-           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
     r = subprocess.run(
         [sys.executable, str(CCTALLY), "codex-daily"],
         capture_output=True, text=True, env=env, timeout=60,
@@ -518,7 +521,8 @@ def test_e2e_debug_total_cost_honors_fast_speed(tmp_path):
     home.mkdir()
     _stage_codex_session(home, model="gpt-5.5")  # gpt-5.5 → fast ×2.5
     env = {"HOME": str(home), "PATH": __import__("os").environ.get("PATH", ""),
-           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
+           "TZ": "Etc/UTC", "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+           "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1"}
 
     def _run(speed):
         r = subprocess.run(

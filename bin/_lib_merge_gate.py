@@ -2,23 +2,19 @@
 
 This is a reviewed component policy, not proof of every possible dependency.
 Unknown paths and shared/infrastructure changes require the full estate. The
-full background/release runs remain the cross-component backstop.
+scheduled full run and the release run remain the cross-component backstop.
 """
 from __future__ import annotations
 
 import argparse
-import base64
-from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
-import re
 import signal
 import subprocess
 import sys
-import time
 
 GATE_ID = 'cctally-test-remote/merge-focused@1'
 MAX_SECONDS = 300
@@ -299,17 +295,6 @@ def select(repo, paths, *, irregular=None, instruction_evidence=None):
     if any(not (repo / p).is_file() for p in files):
         reasons.append('required merge pytest file absent')
     full = bool(reasons)
-    # Whether the wrapper must read background full-verification health before
-    # trusting this focus. Only a memory-only selection derived with its
-    # irregular-file evidence is exempt: memory publication is certified by the
-    # memory focus whatever the background state. Containing memory is not
-    # enough, and a full selection has nothing to read health for.
-    if full:
-        background_health = 'not-applicable'
-    elif sorted(components) == ['memory'] and memory:
-        background_health = 'exempt'
-    else:
-        background_health = 'required'
     return {
         'mode': 'full' if full else 'merge-focused',
         'pytest': 'full' if full else 'selected',
@@ -317,7 +302,7 @@ def select(repo, paths, *, irregular=None, instruction_evidence=None):
         'omittedHarnesses': [n for n in names if not full and n not in harnesses],
         'selectedPytestFiles': [] if full else sorted(files),
         'components': sorted(components), 'reasons': reasons,
-        'policyDigest': policy_digest(repo), 'backgroundHealth': background_health,
+        'policyDigest': policy_digest(repo),
         'maxWallSeconds': MAX_SECONDS,
     }
 
@@ -336,8 +321,13 @@ def plan(repo, base_rev, head='HEAD', *, working=True):
     return result
 
 
-def filter_legs(plan_record, directory):
-    """Narrow both expected-node legs to selected files; retain serial ownership."""
+def filter_legs(plan_record, directory, quarantined=()):
+    """Narrow both expected-node legs to selected files; retain serial ownership.
+
+    bin/cctally-test-all applies tests/quarantine.json to the legs first, so a
+    selected file whose every node is quarantined has none left. Such a file
+    (one that ``quarantined``, the list's node ids, names) contributes no
+    targets; any other selected file without a recorded node refuses."""
     directory = Path(directory)
     selected = set(plan_record['selectedPytestFiles'])
     found = set()
@@ -346,284 +336,20 @@ def filter_legs(plan_record, directory):
         nodes = [n for n in path.read_text().splitlines() if n.split('::')[0] in selected]
         found.update(n.split('::')[0] for n in nodes)
         path.write_text(''.join(n + '\n' for n in nodes))
-    if found != selected:
-        raise ValueError('selected files absent from recorded pytest estate: ' + ', '.join(sorted(selected - found)))
+    absent = selected - found - {node.split('::')[0] for node in quarantined}
+    if absent:
+        raise ValueError('selected files absent from recorded pytest estate: ' + ', '.join(sorted(absent)))
 
 
-# Health reads one unfiltered ci.yml page and selects main on the client:
-# GitHub's `branch=` index can lag the unfiltered listing by weeks (#892).
-_HEALTH_LISTED_RUNS = 100  # one page at GitHub's maximum size; never a second
-_HEALTH_MAIN_DEPTH = 20    # the retired branch-filtered read's depth: no older evidence
+def quarantine_ids(repo):
+    """The pytest node ids tests/quarantine.json lists; none when the tree carries no list.
 
-
-def background_health(rows):
-    """Newest completed full verification wins; running work hides nothing."""
-    for row in rows:
-        if row.get('head_branch') != 'main' or row.get('status') != 'completed':
-            continue
-        if row.get('event') not in ('schedule', 'workflow_dispatch') and row.get('fullSuite') is not True:
-            continue
-        passed = row.get('conclusion') == 'success'
-        return {'state': 'passed' if passed else 'failed', 'allowFocused': passed,
-                'runId': row.get('id'), 'headSha': row.get('head_sha')}
-    return {'state': 'unavailable', 'allowFocused': False, 'runId': None, 'headSha': None}
-
-
-# D1(b): a scheduled test-macos job whose suite failed only on the runtime
-# budget. ci.yml runs the marker step when the suite's outcome record says so;
-# the reader also requires the suite step to be the job's only failed step.
-_SUITE_STEP = 'Run cctally test suite'
-_BUDGET_MARKER_STEP = 'Runtime budget is the only failure'
-# D1(a): how many first-parent main commits are searched for a receipt.
-_HEALTH_RECEIPT_COMMITS = 20
-# D1(a) receipt discovery's overall time budget (#899 S2): once spent, the CI-derived
-# result stands; it never waits out twenty commits of slow reads.
-_HEALTH_RECEIPT_BUDGET_S = 60
-_RECEIPT_RUN_ID = re.compile(r'^(\d{8}T\d{6}Z)-')
-
-
-def _attempt_start(value):
-    """The UTC instant of a GitHub ISO-8601 timestamp; ValueError when absent or malformed."""
-    if not isinstance(value, str) or not value:
-        raise ValueError('a run has no attempt start time')
-    moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-    if moment.tzinfo is None:
-        raise ValueError('a run attempt start time carries no timezone')
-    return moment.astimezone(timezone.utc)
-
-
-def _receipt_start(run_id):
-    """The UTC start a receipt's run ID embeds, or None."""
-    match = _RECEIPT_RUN_ID.match(run_id) if isinstance(run_id, str) else None
-    if match is None:
-        return None
-    try:
-        return datetime.strptime(match.group(1), '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
-
-
-def _budget_only(row, job):
-    """D1(b): a scheduled run's failed test-macos whose only failure is the runtime budget."""
-    if row.get('event') != 'schedule' or job.get('status') != 'completed' or job.get('conclusion') != 'failure':
-        return False
-    steps = [step for step in (job.get('steps') or []) if isinstance(step, dict)]
-    markers = [step for step in steps if step.get('name') == _BUDGET_MARKER_STEP]
-    failed = {step.get('name') for step in steps if step.get('conclusion') == 'failure'}
-    return (len(markers) == 1 and markers[0].get('conclusion') == 'success'
-            and failed == {_SUITE_STEP})
-
-
-def _run_item(row, jobs_of):
-    """The full-verification item one main run contributes: 'pass', 'fail', 'unknown'
-    (decisive, never a pass), or None when the run is skipped."""
-    if row.get('status') != 'completed':
-        # GitHub reuses the run ID on retry: the earlier failed attempt
-        # disappears from this listing while the retry runs. Do not let that
-        # mutation reveal an older successful run. A first attempt that is
-        # still running hides nothing.
-        return 'unknown' if row.get('run_attempt', 1) != 1 else None
-    jobs = jobs_of(row)
-    full = next((j for j in jobs if j.get('name') == 'test-macos'
-                 and j.get('status') == 'completed'
-                 and j.get('conclusion') != 'skipped'), None)
-    if full is not None:
-        if full.get('conclusion') == 'success' or _budget_only(row, full):
-            return 'pass'
-        return 'fail'
-    if row.get('event') in ('schedule', 'workflow_dispatch'):
-        # A scheduled/manual attempt must actually run the full job. Only
-        # receipt-discharged ordinary pushes may be skipped while looking for
-        # the last full verification.
-        return 'unknown'
-    # ci.yml can skip its declared full job on a successful private main push
-    # only through a successful release/receipt gate. The skipped job plus
-    # successful workflow is evidence of discharge; a merely successful
-    # classifier job alone is not (it may emit discharged=false). Missing
-    # jobs, cancellation, and failures must not silently inherit an older pass.
-    discharged = (
-        row.get('event') == 'push' and row.get('conclusion') == 'success'
-        and any(j.get('name') == 'test-macos'
-                and j.get('status') == 'completed'
-                and j.get('conclusion') == 'skipped' for j in jobs)
-        and any(j.get('name') in ('receipt-gate', 'release-stamp-gate')
-                and j.get('status') == 'completed'
-                and j.get('conclusion') == 'success' for j in jobs)
-    )
-    return None if discharged else 'unknown'
-
-
-def _ci_item(rows, jobs_of):
-    """(kind, start, row) of the newest decisive run, or None.
-
-    The window is sorted by attempt start, newest first, BEFORE the walk, so a
-    retry of an older-created run is read in its true place. Equal starts are
-    decided together and a non-pass among them wins.
-    """
-    dated = [(_attempt_start(row.get('run_started_at')), index, row) for index, row in enumerate(rows)]
-    dated.sort(key=lambda item: (-item[0].timestamp(), item[1]))
-    index = 0
-    while index < len(dated):
-        start = dated[index][0]
-        group = []
-        while index < len(dated) and dated[index][0] == start:
-            group.append(dated[index][2])
-            index += 1
-        items = [(kind, row) for row in group if (kind := _run_item(row, jobs_of)) is not None]
-        if items:
-            kind, row = next((item for item in items if item[0] != 'pass'), items[0])
-            return kind, start, row
-    return None
-
-
-def _receipt_pass(gh, name, repo, newer_than, digest_of=None):
-    """D1(a): (runId, commit sha) of the first valid passing full-suite receipt for
-    the exact tree of a recent first-parent main commit, newer than `newer_than`
-    (any age when None); None when there is none. Raises on any read error.
-
-    `digest_of(sha)`, when given, reconstructs a commit's tree-manifest digest in
-    its caller's stead (bounded by the caller's budget); by default it is built
-    in-process."""
-    # The validator of this reader's own tree, the one receipt-gate runs.
-    spec = importlib.util.spec_from_file_location(
-        '_merge_gate_receipts',
-        Path(__file__).resolve().parents[1] / '.github' / 'scripts' / 'classify_receipt.py')
-    receipts = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(receipts)
-    toolchain = receipts.toolchain_digest(str(repo))
-    if toolchain is None:
-        return None
-    listing = gh('api', f'repos/{name}/commits?sha=main&per_page=100')
-    by_sha = {commit['sha']: commit for commit in listing}
-    commit = listing[0] if listing else None
-    for _ in range(_HEALTH_RECEIPT_COMMITS):
-        if commit is None:
-            break
-        sha, tree = commit['sha'], commit['commit']['tree']['sha']
-        digest = None
-        refs = gh('api', f'repos/{name}/git/matching-refs/cctally/receipts/{tree}/')
-        for ref in sorted(refs, key=lambda r: r['ref'], reverse=True):
-            run_id = ref['ref'].rsplit('/', 1)[-1]
-            when = _receipt_start(run_id)
-            if when is None or (newer_than is not None and when <= newer_than):
-                continue
-            blob = gh('api', f'repos/{name}/git/blobs/{ref["object"]["sha"]}')
-            receipt = json.loads(base64.b64decode(blob['content']))
-            if not isinstance(receipt, dict) or receipt.get('runId') != run_id:
-                continue  # dated by the run it records, and filed under that run
-            if digest is None:
-                digest = (digest_of(sha) if digest_of is not None
-                          else receipts.manifest_digest(receipts.reconstruct_manifest(sha, str(repo))))
-            if receipts.verify_candidate(receipt, tree_oid=tree, ref_namespace=tree,
-                                         reconstructed_digest=digest,
-                                         toolchain_digest=toolchain) is None:
-                return run_id, sha
-        parents = commit.get('parents') or []
-        commit = by_sha.get(parents[0]['sha']) if parents else None
-    return None
-
-
-def read_background_health(repo):
-    """The state of the newest completed full-verification item.
-
-    Items are actual full test-macos job results, never a receipt-discharge
-    skip (a successful workflow with a skipped full job is not full
-    verification), with two additions (operator decision D1 of #899):
-
-    (b) a scheduled run whose suite failed only on the runtime budget, proven by
-        its marker step and its final step conclusions, is a pass;
-    (a) a valid passing full-suite receipt for the exact tree of a recent
-        first-parent main commit, newer than the newest CI item, is a pass.
-
-    Runs are ordered by attempt start. A missing start, an unreadable listing
-    and a malformed row are missing evidence; a failed receipt read leaves the
-    CI-derived result unchanged and never manufactures a pass, and so does a
-    receipt discovery that outlives its overall budget (_HEALTH_RECEIPT_BUDGET_S).
-    That budget bounds the whole discovery, the reconstruction of a receipt's
-    tree manifest included: it runs as a subprocess stopped when the budget is
-    spent, after which nothing further is discovered (#899 S2).
-    """
-    def gh(*args):
-        process = subprocess.run(['gh', *args], cwd=repo, capture_output=True,
-                                 text=True, timeout=20)
-        if process.returncode:
-            raise ValueError('GitHub full-verification evidence is unavailable')
-        return json.loads(process.stdout)
-
-    def jobs_of(row):
-        return gh('api', f'repos/{name}/actions/runs/{row["id"]}/jobs?per_page=100')['jobs']
-    try:
-        name = gh('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
-        listed = gh('api', f'repos/{name}/actions/workflows/ci.yml/runs'
-                           f'?per_page={_HEALTH_LISTED_RUNS}')['workflow_runs']
-        # Other branches are never main's evidence, so they are dropped before
-        # any rule below can decide on them or count toward the depth.
-        rows = [row for row in listed if row.get('head_branch') == 'main']
-        item = _ci_item(rows[:_HEALTH_MAIN_DEPTH], jobs_of)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError,
-            subprocess.TimeoutExpired):
-        # A malformed listing (a null or non-object row) is missing evidence.
-        return background_health([])
-    if item is not None and item[0] == 'pass':
-        return background_health([dict(item[2], fullSuite=True, conclusion='success')])
-    if item is not None and item[0] == 'fail':
-        result = background_health([dict(item[2], fullSuite=True, conclusion='failure')])
-    else:
-        result = background_health([])
-    budget_end = time.monotonic() + _HEALTH_RECEIPT_BUDGET_S
-
-    def budgeted_gh(*args):
-        # Every discovery read gets only what is left of the overall budget, and a read
-        # that ends past it voids the discovery: the CI-derived result stands.
-        left = budget_end - time.monotonic()
-        if left <= 0:
-            raise ValueError('the receipt discovery budget is spent')
-        process = subprocess.run(['gh', *args], cwd=repo, capture_output=True, text=True,
-                                 timeout=min(20.0, left))
-        if process.returncode:
-            raise ValueError('GitHub full-verification evidence is unavailable')
-        if time.monotonic() > budget_end:
-            raise ValueError('the receipt discovery budget is spent')
-        return json.loads(process.stdout)
-
-    def budgeted_digest(sha):
-        # The tree-manifest reconstruction runs as the classifier's own `--self-test-manifest`
-        # in a separate session, stopped (with every process it started) when the budget is spent.
-        left = budget_end - time.monotonic()
-        if left <= 0:
-            raise ValueError('the receipt discovery budget is spent')
-        script = Path(__file__).resolve().parents[1] / '.github' / 'scripts' / 'classify_receipt.py'
-        process = subprocess.Popen([sys.executable, str(script), '--sha', sha, '--repo', str(repo),
-                                    '--self-test-manifest'], stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-        try:
-            out, _ = process.communicate(timeout=left)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            try:
-                process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            raise ValueError('the receipt discovery budget is spent') from None
-        if process.returncode:
-            raise ValueError('the tree manifest could not be reconstructed')
-        if time.monotonic() > budget_end:
-            raise ValueError('the receipt discovery budget is spent')
-        return out.strip()
-    try:
-        found = _receipt_pass(budgeted_gh, name, repo, item[1] if item is not None else None,
-                              digest_of=budgeted_digest)
-        if found is not None and time.monotonic() > budget_end:
-            found = None  # validated after the budget: the CI-derived result stands
-    except Exception:  # any read error, or a spent budget, leaves the CI-derived result unchanged
-        found = None
-    if found is None:
-        return result
-    run_id, sha = found
-    return {'state': 'passed', 'allowFocused': True, 'runId': run_id, 'headSha': sha}
+    Parsed by the shared bin/_lib_quarantine.py; harness cases are not pytest
+    nodes and are left to their harness. bin/cctally-test-all validated the
+    list at admission, before this runs."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import _lib_quarantine
+    return _lib_quarantine.pytest_ids(_lib_quarantine.load(repo))
 
 
 def supervise(command, seconds):
@@ -682,7 +408,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument('--base')
-    parser.add_argument('--health', action='store_true')
     parser.add_argument('--required-mode', action='store_true')
     parser.add_argument('--shell', action='store_true')
     parser.add_argument('--filter-legs')
@@ -693,18 +418,20 @@ def main(argv=None):
         if len(args.deadline) < 2:
             parser.error('deadline requires seconds and a command')
         return supervise(args.deadline[1:], int(args.deadline[0]))
-    if args.health:
-        health = read_background_health(args.repo)
-        print(json.dumps(health, sort_keys=True))
-        return 0 if health['allowFocused'] else 3
     if not args.base:
-        parser.error('--base is required outside --health')
+        parser.error('--base is required')
     try:
         result = plan(args.repo, args.base)
         if args.required_mode:
-            print(f"{result['mode']} {result['backgroundHealth']}")
+            # `<mode> <reason>`: the wrapper decides on the mode alone; the
+            # reason names the focused components for whoever reads the log.
+            if result['mode'] == 'full':
+                reason = 'reviewed-selection'
+            else:
+                reason = '+'.join(result['components']) or 'none'
+            print(f"{result['mode']} {reason}")
         elif args.filter_legs:
-            filter_legs(result, args.filter_legs)
+            filter_legs(result, args.filter_legs, quarantined=quarantine_ids(args.repo))
         elif args.shell:
             print('mode\t' + result['mode'])
             print('harnesses\t' + ' '.join(result['selectedHarnesses']))

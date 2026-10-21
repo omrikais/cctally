@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -uo pipefail
 pushd ../public >/dev/null
 git remote remove origin 2>/dev/null || true

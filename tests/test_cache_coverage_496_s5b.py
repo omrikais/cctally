@@ -33,6 +33,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 import _lib_test_estate as _estate  # noqa: E402  -- bin/ joins sys.path above
 
 from conftest import load_script, redirect_paths  # noqa: E402
+from test_codex_container_transitions import env as container_env  # noqa: F401,E402
+from test_codex_prune_drain import _no_detached_drains  # noqa: F401,E402
 
 
 SEG_A = "bootstrap-0001.jsonl"
@@ -1110,9 +1112,17 @@ def test_the_whole_scan_propagates_an_unreadable_candidate(core, monkeypatch):
 #: fixed pair this module chooses — the live title/rollup table or its staging
 #: twin — so a rebuild can build its replacement generation without touching
 #: what readers are reading (#752). None substitutes a caller-supplied string.
+#: #968's three container writers accept only the fixed cache/conversation
+#: cursor pair. The boundary tests below exercise pending marks, adoption,
+#: unverified and target reconciliation in both stores, reject covered table
+#: names, and distinguish reset's literal quota deletion/invalidation from
+#: these metadata-only computed writes. The scanner remains fail-closed.
 _COMPUTED_TABLE_SITES = frozenset({
+    "_cctally_cache._adopt_codex_container",
     "_cctally_cache._ai_title_upsert_sql",
+    "_cctally_cache._apply_codex_verdict",
     "_cctally_cache._fill_conversation_sessions_filter_columns",
+    "_cctally_cache._mark_codex_containers_pending",
     "_cctally_cache._recompute_conversation_sessions",
     "_cctally_cache.sync_claude_conversations",
     "_cctally_db._migration_budget_milestone_period_keys",
@@ -1121,6 +1131,10 @@ _COMPUTED_TABLE_SITES = frozenset({
     "_cctally_journal._apply_reset_with_suppression",
     "_cctally_journal._apply_weekly_credit_effects",
     "_cctally_journal._converge_row_from_effective",
+    # #825/#832 fix round E: a derivation-completion SCRATCH projection's
+    # tombstoned row; the table is a stats journal family's own
+    # (`_EVT_SPECS`/`_HARVEST_SPECS`), never a cache family.
+    "_cctally_journal._delete_scratch_row",
     "_cctally_journal._emit_harvest_row",
     "_cctally_journal._insert_or_ignore",
     "_cctally_journal._replace_block_children",
@@ -1218,6 +1232,191 @@ def test_no_covered_write_hides_behind_a_computed_table_name(core):
     the position visible; this test refuses to let a NEW one through unread.
     """
     assert _scan_computed_table_sites() == _COMPUTED_TABLE_SITES
+
+
+def _container_coverage_state(ns):
+    """Full covered rows, certificate and mutation clock, independently read."""
+    from _codex_zstd_fixtures import snapshot_tables
+
+    conn = ns["open_cache_db"]()
+    try:
+        rows = snapshot_tables(conn, _cache().COVERAGE_CACHE_FAMILIES)
+        cert = _cache().load_codex_journal_coverage_certificate(conn)
+        seq = conn.execute("SELECT value FROM cache_meta WHERE "
+                           "key='codex_physical_mutation_seq'").fetchall()
+        return rows, cert, [tuple(row) for row in seq]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("table,opener,outcome", [
+    (table, opener, outcome)
+    for table, opener in (("codex_session_files", "open_cache_db"),
+                          ("codex_conversation_source_files", "open_conversations_db"))
+    for outcome in ("adopt", "unverified", "reconcile")
+] + [("codex_session_files", "open_cache_db", "reset")])
+def test_container_cursor_writes_preserve_coverage_except_a_real_cache_reset(
+        container_env, table, opener, outcome):
+    """#968 computed DML is cursor-only; a reset's STATIC quota deletion is not.
+
+    A covered-row write, certificate invalidation during metadata-only work,
+    or a missing invalidation at the real reset makes this fail. Both stores
+    run the actual admission, verification and targeted-sync paths.
+    """
+    from _codex_zstd_fixtures import conversation_records, write_rollout, zstd_bytes
+    from test_codex_bounded_ingest import _auth_json
+    from test_codex_container_transitions import _sync_both
+    from test_codex_publication_barrier import _with_quota
+    import _lib_codex_drain_admission as adm
+    import _lib_codex_rollout_container as rc
+    import _sql_plan_guard as guard
+
+    ns, provider, day = container_env
+    cache = _cache()
+    path = day / "rollout-2026-07-20T11-00-00-coverage.jsonl"
+    (provider / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    records = _with_quota(conversation_records(3, session_id="coverage-container"))
+    write_rollout(path, records)
+    complete = path.read_bytes()
+    if outcome == "reconcile":
+        with path.open("ab") as fh:
+            fh.write(b'{"type":"event_msg"')
+    _sync_both(ns, quota_reconcile="defer")
+    conn = ns["open_cache_db"]()
+    try:
+        # An unrelated retained operator attribution must survive too. It has
+        # no claiming window in this fixture and cannot change spend adoption.
+        conn.execute(
+            "INSERT INTO codex_window_attributions (op_id,account_key,"
+            "source_root_key,logical_limit_key,observed_slot,window_minutes,"
+            "raw_resets_at_utc,asserted_at_utc) VALUES "
+            "('coverage-sentinel','unattributed','unrelated-root','codex',"
+            "'secondary',10080,'2026-07-27T00:00:00Z','2026-07-20T00:00:00Z')")
+        conn.commit()
+        vector = _journal().coverage_pinned_vector()
+        assert vector
+        seq = int(conn.execute("SELECT value FROM cache_meta WHERE "
+                               "key='codex_physical_mutation_seq'").fetchone()[0])
+        last_segment, extent, covered = vector[-1]
+        cert = _kernel().advance(
+            None, covered=(last_segment, covered),
+            applied_through=(last_segment, extent),
+            pinned_vector=vector, physical_seq=seq)
+        cache._store_codex_journal_coverage_certificate(conn, cert)
+        conn.commit()
+    finally:
+        conn.close()
+    before = _container_coverage_state(ns)
+    assert all(before[0].values()), "every covered family needs retained rows"
+    assert before[1] is not None and before[2]
+    assert _kernel().certificate_is_valid(
+        before[1], pinned_vector=vector, physical_seq=seq)[0]
+    target = path.with_name(path.name + ".zst")
+    if outcome == "reset":
+        # Retain normalized messages, but no quota event: the cache must drop
+        # its covered quota rows and the conversation must rebuild its rows.
+        write_rollout(path, records[:4])  # below the committed cursor
+        complete = path.read_bytes()
+    target.write_bytes(zstd_bytes(complete))
+    path.unlink()
+    selected = rc.select_container(path)
+    conn = ns[opener]()
+    pending_sql = []
+    conn.set_trace_callback(pending_sql.append)
+    try:
+        assert cache._mark_codex_containers_pending(conn, table, [
+            (str(path), selected.fingerprint.to_json(), "verification-pending")]) == 1
+        assert cache._mark_codex_containers_pending(conn, table, [
+            (str(path), selected.fingerprint.to_json(), "verification-pending")]) == 0
+        snap = cache._load_cursor_snapshot(conn, table, str(path))
+        verdict = cache._verify_codex_container(conn, table, snap, selected)
+    finally:
+        conn.close()
+    assert _container_coverage_state(ns) == before
+    pending_dml = [sql for sql in pending_sql if _DML.search(sql)]
+    assert pending_dml
+    assert {_DML.search(sql).group(1) for sql in pending_dml} == {table}
+    if outcome == "unverified":
+        # The verifier's inconclusive verdict reaches the real persistence
+        # branch without corrupting the retained rows to manufacture it.
+        verdict = verdict._replace(outcome="unverified", reason="legacy-mismatch")
+    else:
+        assert verdict.outcome == {"adopt": "adopt", "reconcile": "adopt-ingest",
+                                   "reset": "reset"}[outcome]
+    counts = dict(adopted=0, ingested=0, reset=0, unverified=0, pending=0,
+                  yielded=0, retried=0)
+    with guard.capture_sql_plans() as recorder:
+        assert cache._apply_codex_verdict(
+            table, str(path), snap, verdict, adm, counts,
+            wait_for_requests=False) == "done"
+    conn = ns[opener]()
+    try:
+        state = conn.execute(f"SELECT container_state FROM {table} WHERE path=?",
+                             (str(path),)).fetchone()[0]
+    finally:
+        conn.close()
+    assert state == ("unverified" if outcome == "unverified" else "accepted")
+    assert counts[{"adopt": "adopted", "unverified": "unverified",
+                   "reconcile": "ingested", "reset": "reset"}[outcome]] == 1
+    after = _container_coverage_state(ns)
+    if outcome == "reset" and table == "codex_session_files":
+        assert after[0]["quota_window_snapshots"] == []
+        assert after[1] is None, "the static quota delete must invalidate coverage"
+        assert after[2] != before[2]
+        deletes = [s for s in recorder.statements
+                   if s.sql.startswith("DELETE FROM quota_window_snapshots")]
+        assert deletes and all("_cctally_cache._delete_codex_file_derived_rows"
+                               in s.call_sites for s in deletes)
+    else:
+        assert after == before
+        assert _kernel().certificate_is_valid(
+            after[1], pinned_vector=_journal().coverage_pinned_vector(),
+            physical_seq=int(after[2][0][0]))[0]
+    sites = {"_cctally_cache._adopt_codex_container",
+             "_cctally_cache._apply_codex_verdict"}
+    direct = [s.sql for s in recorder.statements if s.call_sites
+              and s.call_sites[0] in sites and _DML.search(s.sql)]
+    if outcome != "reset":
+        assert direct, "the classified computed write must actually execute"
+        assert {_DML.search(sql).group(1) for sql in direct} == {table}
+    print(json.dumps({"store": table, "outcome": outcome,
+                      "pendingDmlTargets": sorted({_DML.search(sql).group(1) for sql in pending_dml}),
+                      "computedDml": direct,
+                      "coverageInvalidated": after[1] is None}))
+
+
+def test_container_computed_writers_reject_covered_tables_before_dml(
+        container_env):
+    """An interpolated covered family must be rejected, including by adoption's
+    snapshot loader and the executor's pre-write revalidation."""
+    from _codex_zstd_fixtures import conversation_records, write_rollout
+    from test_codex_container_transitions import _compress, _sync_both
+    import _lib_codex_drain_admission as adm
+    import _lib_codex_rollout_container as rc
+
+    ns, _provider, day = container_env
+    cache = _cache()
+    path = day / "rollout-2026-07-20T11-00-00-coverage.jsonl"
+    write_rollout(path, conversation_records(1, session_id="coverage-reject"))
+    _sync_both(ns, quota_reconcile="defer")
+    _compress(path)
+    _sync_both(ns, quota_reconcile="defer")
+    conn = ns["open_cache_db"]()
+    try:
+        snap = cache._load_cursor_snapshot(conn, "codex_session_files", str(path))
+        verdict = cache._verify_codex_container(
+            conn, "codex_session_files", snap, rc.select_container(path))
+        assert verdict.outcome == "adopt"
+        for table in (*cache.COVERAGE_CACHE_FAMILIES, "not_a_cursor"):
+            with pytest.raises(ValueError):
+                cache._mark_codex_containers_pending(conn, table, [])
+            with pytest.raises(ValueError):
+                cache._adopt_codex_container(conn, table, snap, verdict)
+            with pytest.raises(ValueError):
+                cache._apply_codex_verdict(
+                    table, str(path), snap, verdict, adm, {}, wait_for_requests=False)
+    finally:
+        conn.close()
 
 
 def test_the_non_leaf_keys_are_exactly_the_unscannable_ones(core):

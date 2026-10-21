@@ -57,14 +57,22 @@ def main() -> int:
     forecast = c._load_sibling("_cctally_forecast")
     entries = forecast._week_entry_records(
         week_start_at, horizon, account_key=None)
-    aggregated = qm.aggregate_composition(entries)
+    # A regime is applied only inside its own coefficient era (#978), so the
+    # seeded calibration takes the era covering the whole current week.
+    era = qm.era_for_instant(week_start_at)
+    if era is None or not qm.era_contains(
+            era, week_end_at - dt.timedelta(microseconds=1)):
+        print("the fixture's current week is not inside one validated "
+              "coefficient era", file=sys.stderr)
+        return 1
+    aggregated = qm.aggregate_composition(entries, era=era)
     if aggregated is None:
         print("the fixture's current week has no weighted population",
               file=sys.stderr)
         return 1
     family_shares, class_shares = aggregated
 
-    units = sum(u for u in (qm.weighted_units(e) for e in entries)
+    units = sum(u for u in (qm.weighted_units(e, era) for e in entries)
                 if u is not None)
     if units <= 0:
         print("the fixture's current week weighs zero units", file=sys.stderr)
@@ -81,6 +89,7 @@ def main() -> int:
             "effectiveUntil": None,
             "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": era.id,
             "unitsPerPoint": units_per_point,
             "interval": {"lo": units_per_point * 0.95,
                          "hi": units_per_point * 1.05},

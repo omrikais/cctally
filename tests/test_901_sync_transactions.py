@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 
 BIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "bin"
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
@@ -50,6 +50,44 @@ TURN_SPACING = 10
 
 
 # ── synthetic rollout records ────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
 
 
 def _ts(seconds: int) -> str:
@@ -363,7 +401,7 @@ class Store:
         return self.data_dir / ".local" / "share" / "cctally" / "conversations.db"
 
     def activate(self) -> None:
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             self.env.ns, self.env.mp, self.data_dir)
 
     def close(self) -> None:
@@ -770,13 +808,14 @@ import os, sys
 sys.path.insert(0, sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 import pytest
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 import pathlib
 os.environ["CODEX_HOME"] = sys.argv[4]
 os.environ["CCTALLY_TEST_W9_DISABLE"] = "1"
 ns = load_script()
 patch = pytest.MonkeyPatch()
-redirect_paths_without_conversation_retention(ns, patch, pathlib.Path(sys.argv[3]))
+patch.setattr(sys.modules["_cctally_update"], "_spawn_detached", lambda command: True)
+redirect_paths(ns, patch, pathlib.Path(sys.argv[3]))
 import _lib_codex_conversation_query as query
 real = query.materialize_codex_find_projection
 
@@ -926,7 +965,7 @@ def _no_op_fixture(env: Env, tmp_path: pathlib.Path) -> pathlib.Path:
     for index in range(3):
         env.rollout(f"0{index}", f"conv{index}", 2)
     data = tmp_path / "store"
-    redirect_paths_without_conversation_retention(env.ns, env.mp, data)
+    redirect_paths(env.ns, env.mp, data)
     projects = data / ".claude" / "projects" / "-synthetic-g10-claude"
     projects.mkdir(parents=True, exist_ok=True)
     (projects / "session-g10.jsonl").write_text(
@@ -1051,7 +1090,7 @@ class CacheStore:
         self.conn.commit()
 
     def activate(self) -> None:
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             self.env.ns, self.env.mp, self.data_dir)
 
     def close(self) -> None:
@@ -1177,14 +1216,30 @@ def test_d_the_cursor_upsert_sets_every_column_of_the_table(env):
                 "PRAGMA table_info(codex_session_files)")}
         import inspect
         source = inspect.getsource(env.cache._write_codex_file_batch)
-        statement = source[source.index("INTO codex_session_files"):]
-        statement = statement[:statement.index('"""', 3)]
+        # #968 shares the authoritative statements with legacy callers and
+        # the container-aware walks. The latter must cover the entire table;
+        # the former deliberately preserves previously accepted evidence.
+        statement = env.cache._CODEX_CURSOR_UPSERT_WITH_CONTAINER_SQL
+        assert "_CODEX_CURSOR_UPSERT_WITH_CONTAINER_SQL" in source
         assert "ON CONFLICT(path) DO UPDATE SET" in statement
         updated = {
             part.split("=")[0].strip()
             for part in statement.split("DO UPDATE SET", 1)[1].split(",")
         }
         assert updated == columns - {"path"}
+        container_columns = {
+            name for name, _decl in (
+                env.cache._cctally_db_sib._CODEX_CONTAINER_CURSOR_COLUMNS
+                + env.cache._cctally_db_sib._CODEX_CONTAINER_CACHE_ONLY_COLUMNS)
+        }
+        legacy = env.cache._CODEX_CURSOR_UPSERT_SQL
+        assert "_CODEX_CURSOR_UPSERT_SQL" in source
+        assert "ON CONFLICT(path) DO UPDATE SET" in legacy
+        legacy_updated = {
+            part.split("=")[0].strip()
+            for part in legacy.split("DO UPDATE SET", 1)[1].split(",")
+        }
+        assert legacy_updated == columns - {"path"} - container_columns
     finally:
         store.close()
 
@@ -1951,14 +2006,15 @@ def _account_tail_cycle(env: Env, key: str, account: str, path: str,
             out["stats"] = kwargs["ingest"](changed)
             return out["stats"]
 
-        cached = kwargs["cached_sigs"]
+        probe = kwargs["stat_fn"]
+        committed = kwargs["committed_sig"]
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(conv, "sync_codex_conversations", transcript)
             if inject is not None:
                 out["losses"] = inject(patch)
             out["seen"], out["emitted"] = watch.watch_step(
-                [path], dict(seen), ingest_fn=ingest,
-                committed_sig_fn=lambda p: cached([p]).get(p))
+                [path], dict(seen), stat_fn=probe, ingest_fn=ingest,
+                committed_sig_fn=committed)
 
     handler = _TailHandler()
     with pytest.MonkeyPatch.context() as patch:
@@ -1970,7 +2026,7 @@ def _account_tail_cycle(env: Env, key: str, account: str, path: str,
 
 
 def _tail_state(env: Env, name: str) -> dict:
-    redirect_paths_without_conversation_retention(
+    redirect_paths(
         env.ns, env.mp, env.tmp / name)
     out = {}
     conn = env.ns["open_conversations_db"]()
@@ -2016,7 +2072,7 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
     env.ns["DashboardHTTPHandler"]  # loads the dashboard siblings
     keys = {}
     for name in ("store", "control"):
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             env.ns, env.mp, env.tmp / name)
         cache = env.ns["open_cache_db"]()
         try:
@@ -2036,7 +2092,7 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
             conn.close()
     assert keys["store"] == keys["control"]
     key = keys["store"]
-    seen = {path: rollout.stat().st_size}
+    seen = {path: ("plain", rollout.stat().st_size)}
 
     # The account switches, and the rollout grows under B.
     active["key"] = _ACCOUNT_B
@@ -2058,7 +2114,7 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
              "timestamp": "2026-07-14T12:21:00Z", "type": "event_msg"},
         ]))
 
-    redirect_paths_without_conversation_retention(
+    redirect_paths(
         env.ns, env.mp, env.tmp / "store")
     lost = _account_tail_cycle(
         env, key, _ACCOUNT_A, path, seen,
@@ -2074,15 +2130,15 @@ def test_n_a_lost_targeted_accounting_batch_holds_the_account_switch_tail(
     assert (lost["seen"], lost["emitted"]) == (seen, False), (
         "the watch acknowledged a lost accounting batch", lost["seen"])
 
-    redirect_paths_without_conversation_retention(
+    redirect_paths(
         env.ns, env.mp, env.tmp / "control")
     control = _account_tail_cycle(env, key, _ACCOUNT_A, path, seen)
     assert control["stats"].targeted_clean
     assert control["transcript"] == [[path]]
-    assert control["seen"] == {path: rollout.stat().st_size}
+    assert control["seen"] == {path: ("plain", rollout.stat().st_size)}
 
     # The retry: the watch still owes the growth, and this time it is clean.
-    redirect_paths_without_conversation_retention(
+    redirect_paths(
         env.ns, env.mp, env.tmp / "store")
     retry = _account_tail_cycle(env, key, _ACCOUNT_A, path, lost["seen"])
     assert retry["stats"].targeted_clean
@@ -2189,13 +2245,14 @@ import os, sys
 sys.path.insert(0, sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 import pytest
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 import pathlib
 os.environ["CODEX_HOME"] = sys.argv[4]
 os.environ["CCTALLY_TEST_W9_DISABLE"] = "1"
 ns = load_script()
 patch = pytest.MonkeyPatch()
-redirect_paths_without_conversation_retention(ns, patch, pathlib.Path(sys.argv[3]))
+patch.setattr(sys.modules["_cctally_update"], "_spawn_detached", lambda command: True)
+redirect_paths(ns, patch, pathlib.Path(sys.argv[3]))
 import _cctally_cache as cache
 cache._CODEX_BATCH_PRECOMMIT_HOOK = lambda: os._exit(19)
 conn = ns["open_cache_db"]()

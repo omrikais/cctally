@@ -77,9 +77,8 @@ pytest-no-failing-node-ids
 pytest-unavailable
 regeneration-enabled
 merge-runtime-budget-exceeded
-runtime-budget-exceeded
-runtime-budget-unavailable
 summary-unreadable
+temp-generation-cleanup-failed
 visibility-classifier-failed
 visibility-classifier-unavailable
 visibility-drift
@@ -127,13 +126,12 @@ _CONTRACT_TOP_KEYS='schemaVersion seededAt seededFrom minHarnessRows harnesses c
 _CONTRACT_HARNESS_KEYS='name visibility minCases countPolicy countAxis'
 _CONTRACT_CAPABILITY_KEYS='name probe hard visibility'
 
-contract_manifest_load() {  # contract_manifest_load <path>
-    local path=$1 out rc code subject
-    out=$(CONTRACT_TOP_KEYS="$_CONTRACT_TOP_KEYS" \
-          CONTRACT_HARNESS_KEYS="$_CONTRACT_HARNESS_KEYS" \
-          CONTRACT_CAPABILITY_KEYS="$_CONTRACT_CAPABILITY_KEYS" \
-          python3 - "$path" <<'PY'
-import json, os, re, sys
+# The program contract_manifest_load() runs, held in a variable and run with `python3 -c`
+# rather than fed as a here-document: /bin/bash 3.2 writes every
+# here-document body to /private/var/tmp whatever TMPDIR says (#940 C11),
+# and bin/cctally-test-all sources this library under that shell. It must
+# never contain a single quote.
+_CONTRACT_MANIFEST_PY='import json, os, re, sys
 
 path = sys.argv[1]
 
@@ -157,7 +155,7 @@ except OSError as exc:
 # explicitly so a non-UTF-8 manifest is refused with a cause the operator can
 # act on, rather than escaping the handler and printing an empty cause beside a
 # raw traceback. contract_budget_load carries the identical shape, which is what
-# makes docs/remote-testing.md's equal-strictness claim true of the shipped code.
+# makes the equal-strictness claim in docs/remote-testing.md true of the shipped code.
 except UnicodeDecodeError:
     print("manifest-unreadable:not UTF-8")
     sys.exit(1)
@@ -229,8 +227,14 @@ if len(doc.get("harnesses", [])) < floor:
     sys.exit(1)
 
 json.dump(doc, sys.stdout, sort_keys=True)
-PY
-    ) ; rc=$?
+'
+
+contract_manifest_load() {  # contract_manifest_load <path>
+    local path=$1 out rc code subject
+    out=$(CONTRACT_TOP_KEYS="$_CONTRACT_TOP_KEYS" \
+          CONTRACT_HARNESS_KEYS="$_CONTRACT_HARNESS_KEYS" \
+          CONTRACT_CAPABILITY_KEYS="$_CONTRACT_CAPABILITY_KEYS" \
+          python3 -c "$_CONTRACT_MANIFEST_PY" "$path") ; rc=$?
     if [ $rc -ne 0 ]; then
         code=${out%%:*}
         subject=${out#*:}
@@ -349,9 +353,7 @@ contract_partition_counts_agree() {  # <names, newline-sep> <selected> <omitted>
     while IFS= read -r n; do
         [ -n "$n" ] || continue
         CONTRACT_PARTITION_MANIFEST_COUNT=$((CONTRACT_PARTITION_MANIFEST_COUNT + 1))
-    done <<EOF
-$names
-EOF
+    done < <(printf '%s\n' "$names")
     case $- in *f*) ;; *) restore_glob=1; set -f ;; esac
     for n in $selected; do
         CONTRACT_PARTITION_SELECTED_COUNT=$((CONTRACT_PARTITION_SELECTED_COUNT + 1))
@@ -370,23 +372,24 @@ contract_admit_harnesses() {  # contract_admit_harnesses <repo_root> <profile>
     local root=$1 profile=$2 path base name ok=0 n exp_file act_file
 
     # The `.XXXXXX` suffix is required, not cosmetic. GNU coreutils rejects a
-    # template carrying fewer than three consecutive X's and exits 1 BEFORE it
-    # interprets -t, while BSD mktemp treats the argument as a prefix and
-    # appends its own randomness — so a bare prefix works on macOS and fails on
-    # every Linux lane. This matches bin/cctally-test-all's own LOGDIR template.
+    # template carrying fewer than three consecutive X's and exits 1. The
+    # template is explicit and under TMPDIR (#940 C11): BSD `mktemp -t`
+    # ignores TMPDIR and allocates in the per-user temporary directory, which
+    # the runners' confinement kills. This matches bin/cctally-test-all's own
+    # LOGDIR template.
     #
     # Both allocations are fail-closed. Admission that cannot allocate its
     # scratch space must REFUSE, because the alternative is what this session
     # exists to close: an empty variable makes both redirections and both `comm`
     # invocations fail, the executable-bit loop read nothing, and the whole of
     # admission return 0 while verifying nothing at all.
-    exp_file=$(mktemp -t cctally-contract-exp.XXXXXX) || exp_file=""
+    exp_file=$(mktemp "${TMPDIR:-/tmp}/cctally-contract-exp.XXXXXX") || exp_file=""
     if [ -z "$exp_file" ]; then
         contract_note "admission: could not allocate a scratch file for the manifest comparison (mktemp failed; check TMPDIR) — admission refuses rather than skip the comparison"
         contract_fail infrastructure admission-scratch-failed "" admission
         return 1
     fi
-    act_file=$(mktemp -t cctally-contract-act.XXXXXX) || act_file=""
+    act_file=$(mktemp "${TMPDIR:-/tmp}/cctally-contract-act.XXXXXX") || act_file=""
     if [ -z "$act_file" ]; then
         rm -f "$exp_file"
         contract_note "admission: could not allocate a scratch file for the on-disk harness listing (mktemp failed; check TMPDIR) — admission refuses rather than skip the comparison"
@@ -431,26 +434,12 @@ contract_admit_harnesses() {  # contract_admit_harnesses <repo_root> <profile>
     return $ok
 }
 
-# Cross-check each declared row against the allowlist classifier, so a row that
-# claims to be public while .mirror-allowlist excludes it (or the reverse) is
-# caught here rather than at the next release snapshot. Private profile only:
-# the public tree ships neither .mirror-allowlist nor .githooks/_match.py.
-contract_admit_visibility() {  # <repo_root> <profile>
-    local root=$1 profile=$2 ok=0 out line name declared actual
-    [ "$profile" = "private" ] || return 0
-    # The profile is ALREADY private here, which means .mirror-allowlist is
-    # present — that file's presence is what selects the profile, so a third
-    # guard on it would be unreachable and is deliberately absent. The tree
-    # therefore claims to be private, so an absent classifier means a declared
-    # check cannot run, and that is a refusal rather than a silent success.
-    if [ ! -f "$root/.githooks/_match.py" ]; then
-        contract_note "admission: this tree is the PRIVATE profile (.mirror-allowlist is present) but the allowlist classifier $root/.githooks/_match.py is absent, so the declared visibility of every manifest row cannot be checked — restore .githooks/_match.py, or remove .mirror-allowlist if this tree is meant to be the public subset"
-        contract_fail infrastructure visibility-classifier-unavailable ""
-        return 1
-    fi
-
-    out=$(CONTRACT_TABLE="$CONTRACT_HARNESS_TABLE" python3 - "$root" <<'PY'
-import os
+# The program contract_admit_visibility() runs, held in a variable and run with `python3 -c`
+# rather than fed as a here-document: /bin/bash 3.2 writes every
+# here-document body to /private/var/tmp whatever TMPDIR says (#940 C11),
+# and bin/cctally-test-all sources this library under that shell. It must
+# never contain a single quote.
+_CONTRACT_VISIBILITY_PY='import os
 import sys
 
 root = sys.argv[1]
@@ -472,8 +461,27 @@ for (name, declared), path in zip(rows, paths):
     actual = "public" if path in public else "private"
     if actual != declared:
         print("%s\t%s\t%s" % (name, declared, actual))
-PY
-    ) || {
+'
+
+# Cross-check each declared row against the allowlist classifier, so a row that
+# claims to be public while .mirror-allowlist excludes it (or the reverse) is
+# caught here rather than at the next release snapshot. Private profile only:
+# the public tree ships neither .mirror-allowlist nor .githooks/_match.py.
+contract_admit_visibility() {  # <repo_root> <profile>
+    local root=$1 profile=$2 ok=0 out line name declared actual
+    [ "$profile" = "private" ] || return 0
+    # The profile is ALREADY private here, which means .mirror-allowlist is
+    # present — that file's presence is what selects the profile, so a third
+    # guard on it would be unreachable and is deliberately absent. The tree
+    # therefore claims to be private, so an absent classifier means a declared
+    # check cannot run, and that is a refusal rather than a silent success.
+    if [ ! -f "$root/.githooks/_match.py" ]; then
+        contract_note "admission: this tree is the PRIVATE profile (.mirror-allowlist is present) but the allowlist classifier $root/.githooks/_match.py is absent, so the declared visibility of every manifest row cannot be checked — restore .githooks/_match.py, or remove .mirror-allowlist if this tree is meant to be the public subset"
+        contract_fail infrastructure visibility-classifier-unavailable ""
+        return 1
+    fi
+
+    out=$(CONTRACT_TABLE="$CONTRACT_HARNESS_TABLE" python3 -c "$_CONTRACT_VISIBILITY_PY" "$root") || {
         contract_note "admission: could not run the allowlist classifier at $root/.githooks/_match.py"
         contract_fail infrastructure visibility-classifier-failed ""
         return 1
@@ -483,9 +491,7 @@ PY
         [ -n "$name" ] || continue
         contract_note "admission: manifest row '$name' declares visibility '$declared' but .githooks/_match.py classifies bin/cctally-${name}-test as '$actual' — fix the row or fix .mirror-allowlist"
         contract_fail infrastructure visibility-drift "$name"; ok=1
-    done <<EOF
-$out
-EOF
+    done < <(printf '%s\n' "$out")
     return $ok
 }
 
@@ -537,11 +543,20 @@ CONTRACT_USAGE=0           # 1 once contract_usage_abort has been called
 # budget's purpose is catching a step change, and a step change large enough to
 # matter appears on both hosts.
 CONTRACT_BUDGET_MAX=""     # the committed maximum, as a decimal string
+# Report-only since the test regime reset (session 1, spec 4.2/4.11): the
+# budget never fails or refuses a run. Its result is published as the additive
+# outcome field `runtimeBudget` (schemaVersion 1) whenever the check ran:
+# CONTRACT_BUDGET_CHECKED=1, and CONTRACT_BUDGET_EXCEEDED is `true`, `false`,
+# or empty when the budget could not be evaluated.
+CONTRACT_BUDGET_CHECKED=0
+CONTRACT_BUDGET_EXCEEDED=""
 
-contract_budget_load() {  # contract_budget_load <path>
-    local path=$1 out rc
-    out=$(python3 - "$path" <<'PY'
-import json, math, sys
+# The program contract_budget_load() runs, held in a variable and run with `python3 -c`
+# rather than fed as a here-document: /bin/bash 3.2 writes every
+# here-document body to /private/var/tmp whatever TMPDIR says (#940 C11),
+# and bin/cctally-test-all sources this library under that shell. It must
+# never contain a single quote.
+_CONTRACT_BUDGET_PY='import json, math, sys
 
 
 def no_dupes(pairs):
@@ -598,7 +613,7 @@ value = doc["maxSecondsPerThousandCases"]
 if isinstance(value, bool) or not isinstance(value, (int, float)):
     print("maxSecondsPerThousandCases:%r" % (value,))
     sys.exit(1)
-# FINITENESS IS TESTED BEFORE THE SIGN, and it is not defensive. Python's json
+# FINITENESS IS TESTED BEFORE THE SIGN, and it is not defensive. The json module
 # parses the bare `NaN` and `Infinity` literals by default, and both survive a
 # sign test: every comparison against a NaN is false, and infinity is not below
 # zero. Either value then makes `raw > cap` false for every run that can exist,
@@ -609,21 +624,27 @@ if not math.isfinite(value) or value <= 0:
     print("maxSecondsPerThousandCases:%r" % (value,))
     sys.exit(1)
 print(repr(float(value)))
-PY
-    ) ; rc=$?
+'
+
+contract_budget_load() {  # contract_budget_load <path>
+    # A missing or malformed file is a note, never an admission failure: the
+    # run proceeds, CONTRACT_BUDGET_MAX stays empty and the budget is recorded
+    # as unevaluated. It therefore always returns 0; a caller that needs to
+    # know reads CONTRACT_BUDGET_MAX.
+    local path=$1 out rc
+    out=$(python3 -c "$_CONTRACT_BUDGET_PY" "$path") ; rc=$?
     if [ $rc -ne 0 ]; then
-        contract_note "runtime budget: $out — fix tests/authoritative-runtime-budget.json"
-        contract_fail infrastructure runtime-budget-unavailable "${out%%:*}" admission
-        return 1
+        contract_note "runtime budget: $out — the run proceeds with the budget unevaluated; fix tests/authoritative-runtime-budget.json"
+        return 0
     fi
     CONTRACT_BUDGET_MAX=$out
     return 0
 }
 
-# The ONE eligibility predicate, read twice: at admission, so a malformed or
-# missing budget refuses the run in seconds rather than after twenty minutes,
-# and again at the verdict, when CONTRACT_CLASS is final. Stated once so the two
-# readings cannot drift apart.
+# The ONE eligibility predicate, read twice: at admission, where an eligible
+# run loads the budget (a malformed or missing one is only noted), and again at
+# the verdict, when CONTRACT_CLASS is final. Stated once so the two readings
+# cannot drift apart.
 #
 # Keyed on the AUTHORITATIVE marker and deliberately NOT on CCTALLY_REMOTE_EXEC.
 # .github/workflows/ci.yml's test-macos job sets CCTALLY_AUTHORITATIVE_RUN=1 and
@@ -729,35 +750,35 @@ print("%.6f %s" % (raw, "over" if raw > cap else "ok"))
 '
 }
 
-# Called once the class is final and before the verdict is printed, so the
-# printed verdict and the exit code agree. Never changes an existing verdict:
-# the eligibility predicate above refuses to speak unless the class is still
-# `none`.
+# Called once the class is final and before the verdict is printed. REPORT-ONLY
+# (test regime reset, session 1): it records the result in
+# CONTRACT_BUDGET_EXCEEDED and adds notes, and it never changes the verdict or
+# the exit code. The eligibility predicate above still refuses to speak unless
+# the class is `none`.
 contract_check_runtime_budget() {
     local cases verdict shown raw_shown max_shown
     contract_budget_is_eligible || return 0
     contract_freeze_wall_seconds
+    CONTRACT_BUDGET_CHECKED=1
+    CONTRACT_BUDGET_EXCEEDED=""
     if [ -z "$CONTRACT_BUDGET_MAX" ]; then
         contract_note "runtime budget: no committed threshold was loaded for this run, so the budget could not be evaluated; a budget that could not be evaluated is never recorded as one that was satisfied"
-        contract_fail infrastructure runtime-budget-unavailable "threshold" budget
         return 0
     fi
     if [ "${CONTRACT_PYTEST_UNPARSED:-0}" = "1" ]; then
         contract_note "runtime budget: pytest's passed-item count was unreadable, so the denominator could not be assembled; the budget is recorded as unavailable rather than satisfied"
-        contract_fail infrastructure runtime-budget-unavailable "denominator" budget
         return 0
     fi
     cases=$((CONTRACT_PASSED + CONTRACT_PYTEST_PASSED))
     if [ "$cases" -le 0 ]; then
         contract_note "runtime budget: the run passed no cases, so it supports no claim about cost per case"
-        contract_fail infrastructure runtime-budget-unavailable "denominator" budget
         return 0
     fi
     verdict=$(contract_budget_verdict "$CONTRACT_WALL_SECONDS" "$cases" "$CONTRACT_BUDGET_MAX") || {
         contract_note "runtime budget: the normalized metric could not be computed from wallSeconds=$CONTRACT_WALL_SECONDS passedCases=$cases max=$CONTRACT_BUDGET_MAX"
-        contract_fail infrastructure runtime-budget-unavailable "metric" budget
         return 0
     }
+    CONTRACT_BUDGET_EXCEEDED=false
     case "$verdict" in
         *" over")
             # Display only, and computed AFTER the verdict: the comparison above
@@ -766,8 +787,8 @@ contract_check_runtime_budget() {
             shown=$(contract_budget_format "${verdict%% *}" "$CONTRACT_BUDGET_MAX")
             raw_shown=${shown%% *}
             max_shown=${shown##* }
-            contract_note "runtime budget: $raw_shown seconds per 1,000 cases exceeds the committed maximum of $max_shown (tests/authoritative-runtime-budget.json). This NORMALIZED measure uses elapsed wall time and passed cases; a breach alone does not distinguish test cost, changed case mix, host contention, or other environmental delays. Inspect retained phase and host observations to establish the cause."
-            contract_fail product runtime-budget-exceeded "$raw_shown > $max_shown" budget ;;
+            CONTRACT_BUDGET_EXCEEDED=true
+            contract_note "runtime budget: $raw_shown seconds per 1,000 cases exceeds the committed maximum of $max_shown (tests/authoritative-runtime-budget.json). The budget is report-only: the run's verdict is unchanged and the overrun is recorded as runtimeBudget.exceeded. This NORMALIZED measure uses elapsed wall time and passed cases; an overrun alone does not distinguish test cost, changed case mix, host contention, or other environmental delays. Inspect retained phase and host observations to establish the cause." ;;
     esac
     return 0
 }
@@ -816,6 +837,9 @@ contract_emit_outcome() {  # <exit_code>
     CONTRACT_WALL="$CONTRACT_WALL_SECONDS" CONTRACT_OUTER="${OUTER:-0}" \
     CONTRACT_INNER="${INNER:-0}" CONTRACT_PYTEST_JOBS="${PYTEST:-0}" \
     CONTRACT_MERGE_RECORD="${MERGE_RECORD:-}" \
+    CONTRACT_BUDGET_CHECKED="$CONTRACT_BUDGET_CHECKED" \
+    CONTRACT_BUDGET_MAX="$CONTRACT_BUDGET_MAX" \
+    CONTRACT_BUDGET_EXCEEDED="$CONTRACT_BUDGET_EXCEEDED" \
     CONTRACT_COV_RESOLVED="${COVERAGE_RESOLVED:-0}" \
     CONTRACT_COV_MODE="${COVERAGE_MODE:-full}" \
     CONTRACT_COV_SELECTED="${COVERAGE_SELECTED:-}" \
@@ -917,6 +941,17 @@ if os.environ.get("CONTRACT_COV_RESOLVED") == "1":
 
 if os.environ.get("CONTRACT_MERGE_RECORD"):
     doc["coverage"]["mergeSelection"] = json.loads(os.environ["CONTRACT_MERGE_RECORD"])
+
+# Additive at schemaVersion 1 (test regime reset, session 1): the report-only
+# runtime budget, present only when the check ran. `exceeded` is null when the
+# budget could not be evaluated, and the maximum is null when none was loaded.
+if os.environ.get("CONTRACT_BUDGET_CHECKED") == "1":
+    raw_max = os.environ.get("CONTRACT_BUDGET_MAX", "")
+    exceeded = os.environ.get("CONTRACT_BUDGET_EXCEEDED", "")
+    doc["runtimeBudget"] = {
+        "maxSecondsPerThousandCases": float(raw_max) if raw_max else None,
+        "exceeded": {"true": True, "false": False}.get(exceeded),
+    }
 
 print(json.dumps(doc, sort_keys=True))
 ' > "$tmp" && mv -f "$tmp" "$dest"
@@ -1070,9 +1105,7 @@ contract_admit_capabilities() {  # <profile>
             contract_fail incomplete capability-missing "$name"
         fi
         ok=1
-    done <<EOF
-$CONTRACT_CAPABILITY_TABLE
-EOF
+    done < <(printf '%s\n' "$CONTRACT_CAPABILITY_TABLE")
     return $ok
 }
 
@@ -1103,9 +1136,7 @@ contract_admit_regeneration() {
             contract_fail infrastructure regeneration-enabled "$var"
             ok=1
         fi
-    done <<EOF
-$CONTRACT_FORBIDDEN_LIST
-EOF
+    done < <(printf '%s\n' "$CONTRACT_FORBIDDEN_LIST")
     return $ok
 }
 
@@ -1166,9 +1197,7 @@ contract_admit_estate_plan() {  # contract_admit_estate_plan <repo_root> <profil
     while IFS="$tab" read -r f1 f2 f3 f4; do
         [ "$f1" = selector ] || continue
         CONTRACT_ESTATE_SELECTORS="${CONTRACT_ESTATE_SELECTORS}${f3}${tab}${f4}"$'\n'
-    done <<EOF
-$out
-EOF
+    done < <(printf '%s\n' "$out")
     return 0
 }
 
@@ -1209,8 +1238,8 @@ contract_admit_estate() {  # contract_admit_estate <repo_root> <profile>
     # reads either. A sixth name would be assigned and never used.
     local f1 f2 f3 f4 f5
 
-    report=$(mktemp -t cctally-estate-report.XXXXXX) || report=""
-    errfile=$(mktemp -t cctally-estate-stderr.XXXXXX) || errfile=""
+    report=$(mktemp "${TMPDIR:-/tmp}/cctally-estate-report.XXXXXX") || report=""
+    errfile=$(mktemp "${TMPDIR:-/tmp}/cctally-estate-stderr.XXXXXX") || errfile=""
     if [ -z "$report" ] || [ -z "$errfile" ]; then
         rm -f "$report" "$errfile"
         contract_note "admission: could not allocate a scratch file for the estate check (mktemp failed; check TMPDIR) — admission refuses rather than skip the comparison"
@@ -1493,7 +1522,7 @@ contract_classify_pytest() {  # <rc> [subject] [passed_items] [node_ids]
     case "$passed" in
         ''|*[!0-9]*)
             CONTRACT_PYTEST_UNPARSED=1
-            contract_note "pytest: the $subject leg's passed-item count could not be read from its log, so this run's passed-case total and normalized metric are recorded as null; on a run the runtime budget is eligible to judge that missing denominator is itself runtime-budget-unavailable (infrastructure, exit 3), and on every other run the verdict is unaffected"
+            contract_note "pytest: the $subject leg's passed-item count could not be read from its log, so this run's passed-case total and normalized metric are recorded as null, and the report-only runtime budget is recorded as unevaluated; the verdict is unaffected"
             passed=0 ;;
     esac
     CONTRACT_PYTEST_PASSED=$((CONTRACT_PYTEST_PASSED + passed))

@@ -36,6 +36,15 @@ from conftest import load_script, redirect_paths
 
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 FIXED = dt.datetime(2026, 7, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
 
 

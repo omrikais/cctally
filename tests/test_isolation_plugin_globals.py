@@ -12,6 +12,7 @@ import types
 
 import pytest
 
+import _temp_hygiene as _hyg
 from tests._pytest_isolation_plugin import (
     PROJECT_MANIFEST, STDLIB_MANIFEST, UNREACHABLE, _comparison_key,
 )
@@ -427,7 +428,8 @@ def _run_child(tmp_path, source, name):
     test_file.write_text(source, encoding="utf-8")
     return subprocess.run(
         [sys.executable, "-m", "pytest", str(test_file), "-p",
-         "tests._pytest_isolation_plugin", "-q", "-p", "no:randomly"],
+         "tests._pytest_isolation_plugin", "-q", "-p", "no:randomly",
+         *_hyg.nested_basetemp_args(tmp_path)],
         capture_output=True, text=True, timeout=120,
     )
 

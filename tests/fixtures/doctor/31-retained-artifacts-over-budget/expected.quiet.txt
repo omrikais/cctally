@@ -9,7 +9,7 @@ Hooks
 Auth
 Database
   ⚠ cache.db                 absent (fresh install)
-  ⚠ Pending migrations       61 pending
+  ⚠ Pending migrations       62 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ⚠ Retained evidence        9.0 MiB retained, 9.0 MiB reclaimable — over the 1-day age bound
       → Run `cctally db prune` to preview, `--yes` to apply.
@@ -18,6 +18,9 @@ Journal
       → A DB corrupted and self-healed — inspect the forensics bundle in ~/.local/share/cctally/logs/
 Data
 Accounts
+Accounting
+  ⚠ Outcome quarantine       unavailable (no validated stats index)
+      → Run any cctally command to bring the stats index up to date, then run `cctally doctor` again.
 Pricing
 Quota
 Safety
@@ -26,4 +29,4 @@ Safety
 Telemetry
 Performance
 
-Summary: 60 OK · 7 WARN · 0 FAIL
+Summary: 62 OK · 8 WARN · 0 FAIL

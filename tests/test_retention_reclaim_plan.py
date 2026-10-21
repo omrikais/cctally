@@ -5,7 +5,8 @@ charge (G3c).
 
 Each chunk is judged on its own complete transaction, exactly as the product
 runs it (plan, steps, state write, COMMIT): its frames repeat no page, it
-writes no temp file, its distinct pages W satisfy |W| <= |ID| + UNID + 1 and
+writes no temp file (counted directly by the write accounting VFS, #940
+revision 7j, spec §6.7), its distinct pages W satisfy |W| <= |ID| + UNID + 1 and
 |W \\ ID| <= UNID + 1 (both, so a missed page and an unused reserved page
 cannot cancel), and its attributable bytes are at most its own charge, which
 equals the reservation recomputed from its record. No chunk is exempt and no
@@ -36,10 +37,17 @@ KiB = 1024
 MiB = 1024 * KiB
 NOW = dt.datetime(2026, 7, 17, 11, 58, tzinfo=UTC)
 KEY = "conversation_retention_reclaim_pending"
-#: Logical bytes a chunk may write beyond its WAL frames: SQLite's own
-#: wal-index bookkeeping, never a temp file (a statement journal is far
-#: larger than this and reclaim keeps it in memory).
+#: Temp-file bytes a chunk may write (a statement journal is far larger than
+#: this and reclaim keeps it in memory).
 TEMP_SLACK = 64 * KiB
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _write_accounting():
+    """Active before any builder (the module template too) opens a
+    connection, in this process."""
+    with fx.write_accounting():
+        yield
 
 
 def _env(tmp_path, monkeypatch):
@@ -84,23 +92,23 @@ def _run_chunks(retention, db_path, *, count, max_steps=16, start=NOW,
     reader = sqlite3.connect(db_path)
     reader.execute("BEGIN")
     reader.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
-    rc = retention.open_reclaim_connection(db_path)
+    rc = None
     out = []
     try:
+        rc = retention.open_reclaim_connection(db_path)
+        fx.require_attributed(rc, "reclaim connection")
         offset, _pages = fx.frames_between(db_path, 1 << 62)
         for index in range(count):
             charged_before = _ledger_total(db_path, retention)
-            before = fx.logical_write_bytes()
-            result = retention.reclaim_chunk(
-                rc, now_utc=start + dt.timedelta(minutes=index),
-                pages=max_steps)
-            after = fx.logical_write_bytes()
+            with fx.measure("chunk %d" % index) as interval:
+                result = retention.reclaim_chunk(
+                    rc, now_utc=start + dt.timedelta(minutes=index),
+                    pages=max_steps)
             new_offset, pages = fx.frames_between(db_path, offset)
             out.append({"result": result, "pages": pages,
                         "restart": offset == fx.WAL_HEADER_BYTES,
                         "first_offset": offset,
-                        "logical": None if before is None or after is None
-                        else after - before,
+                        "writes": interval.writes,
                         "ledger": _ledger_total(db_path, retention)
                         - charged_before})
             if result.outcome != "ok":
@@ -109,7 +117,8 @@ def _run_chunks(retention, db_path, *, count, max_steps=16, start=NOW,
                 continue
             offset = new_offset
     finally:
-        rc.close()
+        if rc is not None:
+            rc.close()
         reader.rollback()
         reader.close()
     return out
@@ -126,12 +135,11 @@ def _judge(retention, chunk, plan, page_size):
     measurement = {"op": result.op_id, "W": len(written),
                    "frames": len(pages), "charge": result.charged_bytes,
                    "attributable": attributable, "ledger": chunk["ledger"],
-                   "logical": chunk["logical"]}
+                   "writes": chunk["writes"].summary()}
     assert len(pages) == len(written), ("a page reached the WAL twice",
                                         measurement)
-    if chunk["logical"] is not None:
-        temp = chunk["logical"] - len(pages) * (page_size + 24)
-        assert temp <= TEMP_SLACK, ("a temp file was written", measurement)
+    temp = chunk["writes"].temp
+    assert temp <= TEMP_SLACK, ("a temp file was written", measurement)
     assert attributable <= result.charged_bytes, (
         "coverage: the chunk wrote more than its charge", measurement)
     assert chunk["ledger"] == result.charged_bytes
@@ -162,16 +170,21 @@ def interior_template(tmp_path_factory):
     mp = pytest.MonkeyPatch()
     try:
         ns, conn, retention, db_path = _env(root, mp)
-        geometry = fx.build_interior_tail(conn)
-        retention_mod = importlib.import_module("_lib_conversation_retention")
-        if hasattr(retention_mod, "normalize_reclaim_record"):
-            retention_mod.normalize_reclaim_record(conn, NOW)
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        template = root / "interior-template.db"
-        dst = sqlite3.connect(template)
-        conn.backup(dst)
-        dst.close()
-        conn.close()
+        try:
+            geometry = fx.build_interior_tail(conn)
+            retention_mod = importlib.import_module(
+                "_lib_conversation_retention")
+            if hasattr(retention_mod, "normalize_reclaim_record"):
+                retention_mod.normalize_reclaim_record(conn, NOW)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            template = root / "interior-template.db"
+            dst = sqlite3.connect(template)
+            try:
+                conn.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            conn.close()
     finally:
         mp.undo()
     return template, geometry
@@ -181,14 +194,20 @@ def _store_from(template, tmp_path, monkeypatch):
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
     conn.close()
     src = sqlite3.connect(template)
-    dst = sqlite3.connect(db_path)
-    src.backup(dst)
-    dst.close()
-    src.close()
+    try:
+        dst = sqlite3.connect(db_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
-    conn.close()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    finally:
+        conn.close()
     return ns, retention, db_path, page_size
 
 
@@ -244,7 +263,6 @@ def test_every_chunk_of_a_fragmented_drain_is_bounded_on_its_own(
     lands on its destination), chunks across an hour boundary that roll the
     ledger, and pointer-map pages inside the tail."""
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
-    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
     marks = {}
 
     def normalize(c):
@@ -252,9 +270,12 @@ def test_every_chunk_of_a_fragmented_drain_is_bounded_on_its_own(
         retention.normalize_reclaim_record(c, NOW)
         marks["after"] = fx.page_count(c)
 
-    fx.build_overflow_tail(conn, normalize=normalize)
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    conn.close()
+    try:
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        fx.build_overflow_tail(conn, normalize=normalize)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
     plans = []
     _capture_plans(monkeypatch, retention, plans)
     chunks = _run_chunks(retention, db_path, count=40)
@@ -282,7 +303,11 @@ def test_every_chunk_of_a_fragmented_drain_is_bounded_on_its_own(
                for plan in plans
                for p in range(plan.new_end + 1, plan.page_count + 1)), (
         "a chunk crosses a pointer-map page")
-    record = retention.read_reclaim_pending(sqlite3.connect(db_path))
+    reader = sqlite3.connect(db_path)
+    try:
+        record = retention.read_reclaim_pending(reader)
+    finally:
+        reader.close()
     hours = {b["hour"] for b in record["ledger"]}
     assert len(hours) >= 2, "the chunks rolled the hourly ledger"
 
@@ -295,29 +320,34 @@ def test_the_first_chunk_after_a_legacy_record_is_normalized_separately(
     ns, retention, db_path, page_size = _store_from(template, tmp_path,
                                                     monkeypatch)
     conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE cache_meta SET value=? WHERE key=?",
-                 (json.dumps({"freelist_count": 7, "made_progress": True}),
-                  KEY))
-    conn.commit()
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    reader = sqlite3.connect(db_path)
-    reader.execute("BEGIN")
-    reader.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
-    rc = retention.open_reclaim_connection(db_path)
     try:
-        assert retention.normalize_reclaim_record(rc, NOW) is True
+        conn.execute("UPDATE cache_meta SET value=? WHERE key=?",
+                     (json.dumps({"freelist_count": 7, "made_progress": True}),
+                      KEY))
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        reader = sqlite3.connect(db_path)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+            rc = retention.open_reclaim_connection(db_path)
+            try:
+                assert retention.normalize_reclaim_record(rc, NOW) is True
+            finally:
+                rc.close()
+            _end, normalization = fx.frames_between(db_path,
+                                                    fx.WAL_HEADER_BYTES)
+            reader.rollback()
+        finally:
+            reader.close()
+        assert 1 <= len(normalization) <= 4, normalization
+        assert _ledger_total(db_path, retention) == 0, "uncharged"
+        plans = []
+        _capture_plans(monkeypatch, retention, plans)
+        [chunk] = _run_chunks(retention, db_path, count=1)
+        _judge(retention, chunk, plans[0], page_size)
     finally:
-        rc.close()
-    _end, normalization = fx.frames_between(db_path, fx.WAL_HEADER_BYTES)
-    reader.rollback()
-    reader.close()
-    assert 1 <= len(normalization) <= 4, normalization
-    assert _ledger_total(db_path, retention) == 0, "uncharged"
-    plans = []
-    _capture_plans(monkeypatch, retention, plans)
-    [chunk] = _run_chunks(retention, db_path, count=1)
-    _judge(retention, chunk, plans[0], page_size)
-    conn.close()
+        conn.close()
 
 
 # ── G3q: the SQLite behavior gate ────────────────────────────────────────
@@ -328,55 +358,59 @@ def test_the_runtime_sqlite_is_audited_and_recorded(tmp_path, monkeypatch):
     records `sqlite_source_id()`; the compile options are recorded here."""
     planner = importlib.import_module("_lib_reclaim_planner")
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
-    runtime = sqlite3.sqlite_version_info
-    source_id = conn.execute("SELECT sqlite_source_id()").fetchone()[0]
-    options = [row[0] for row in conn.execute("PRAGMA compile_options")]
-    print(json.dumps({"sqlite": sqlite3.sqlite_version,
-                      "sourceId": source_id, "compileOptions": options}))
-    assert planner.sqlite_audited(runtime), (
-        "this runtime's SQLite is outside the audited range; run G3q on it "
-        "and review its incremental-vacuum sources before widening",
-        sqlite3.sqlite_version)
-    fx_rows = conn.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
-    assert fx_rows is not None
-    conn.execute("CREATE TABLE q_fill(payload BLOB)")
-    conn.executemany("INSERT INTO q_fill VALUES (?)",
-                     [(os.urandom(3000),) for _ in range(300)])
-    conn.commit()
-    conn.execute("DELETE FROM q_fill")
-    conn.commit()
-    retention.normalize_reclaim_record(conn, NOW)
-    rc = retention.open_reclaim_connection(db_path)
     try:
-        result = retention.reclaim_chunk(rc, now_utc=NOW, pages=16)
+        runtime = sqlite3.sqlite_version_info
+        source_id = conn.execute("SELECT sqlite_source_id()").fetchone()[0]
+        options = [row[0] for row in conn.execute("PRAGMA compile_options")]
+        print(json.dumps({"sqlite": sqlite3.sqlite_version,
+                          "sourceId": source_id, "compileOptions": options}))
+        assert planner.sqlite_audited(runtime), (
+            "this runtime's SQLite is outside the audited range; run G3q on it "
+            "and review its incremental-vacuum sources before widening",
+            sqlite3.sqlite_version)
+        fx_rows = conn.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+        assert fx_rows is not None
+        conn.execute("CREATE TABLE q_fill(payload BLOB)")
+        conn.executemany("INSERT INTO q_fill VALUES (?)",
+                         [(os.urandom(3000),) for _ in range(300)])
+        conn.commit()
+        conn.execute("DELETE FROM q_fill")
+        conn.commit()
+        retention.normalize_reclaim_record(conn, NOW)
+        rc = retention.open_reclaim_connection(db_path)
+        try:
+            result = retention.reclaim_chunk(rc, now_utc=NOW, pages=16)
+        finally:
+            rc.close()
+        assert result.outcome == "ok", result
+        assert result.as_phase_payload()["sqlite_source_id"] == source_id
     finally:
-        rc.close()
-    assert result.outcome == "ok", result
-    assert result.as_phase_payload()["sqlite_source_id"] == source_id
-    conn.close()
+        conn.close()
 
 
 def test_an_unaudited_sqlite_refuses_reclaim(tmp_path, monkeypatch):
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
-    conn.execute("CREATE TABLE q_fill(payload BLOB)")
-    conn.executemany("INSERT INTO q_fill VALUES (?)",
-                     [(os.urandom(3000),) for _ in range(100)])
-    conn.commit()
-    conn.execute("DELETE FROM q_fill")
-    conn.commit()
-    retention.normalize_reclaim_record(conn, NOW)
-    free = conn.execute("PRAGMA freelist_count").fetchone()[0]
-    monkeypatch.setattr(retention, "_sqlite_version_info", lambda: (3, 55, 0))
-    rc = retention.open_reclaim_connection(db_path)
     try:
-        result = retention.reclaim_chunk(rc, now_utc=NOW, pages=16)
+        conn.execute("CREATE TABLE q_fill(payload BLOB)")
+        conn.executemany("INSERT INTO q_fill VALUES (?)",
+                         [(os.urandom(3000),) for _ in range(100)])
+        conn.commit()
+        conn.execute("DELETE FROM q_fill")
+        conn.commit()
+        retention.normalize_reclaim_record(conn, NOW)
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        monkeypatch.setattr(retention, "_sqlite_version_info", lambda: (3, 55, 0))
+        rc = retention.open_reclaim_connection(db_path)
+        try:
+            result = retention.reclaim_chunk(rc, now_utc=NOW, pages=16)
+        finally:
+            rc.close()
+        assert (result.outcome, result.skip_reason, result.charged_bytes) == (
+            "skipped", "sqlite_unaudited", 0)
+        assert conn.execute("PRAGMA freelist_count").fetchone()[0] == free
+        assert _ledger_total(db_path, retention) == 0
     finally:
-        rc.close()
-    assert (result.outcome, result.skip_reason, result.charged_bytes) == (
-        "skipped", "sqlite_unaudited", 0)
-    assert conn.execute("PRAGMA freelist_count").fetchone()[0] == free
-    assert _ledger_total(db_path, retention) == 0
-    conn.close()
+        conn.close()
 
 
 # ── G3c: crash points inside the chunk's transaction ─────────────────────
@@ -436,15 +470,17 @@ def test_a_crash_at_each_point_of_the_chunk(tmp_path, monkeypatch, point):
     import _cctally_core
 
     ns, conn, retention, db_path = _env(tmp_path, monkeypatch)
-    conn.execute("CREATE TABLE c_fill(payload BLOB)")
-    conn.executemany("INSERT INTO c_fill VALUES (?)",
-                     [(os.urandom(3000),) for _ in range(300)])
-    conn.commit()
-    conn.execute("DELETE FROM c_fill")
-    conn.commit()
-    retention.normalize_reclaim_record(conn, NOW)
-    free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
-    conn.close()
+    try:
+        conn.execute("CREATE TABLE c_fill(payload BLOB)")
+        conn.executemany("INSERT INTO c_fill VALUES (?)",
+                         [(os.urandom(3000),) for _ in range(300)])
+        conn.commit()
+        conn.execute("DELETE FROM c_fill")
+        conn.commit()
+        retention.normalize_reclaim_record(conn, NOW)
+        free_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    finally:
+        conn.close()
     env = {**os.environ, "HOME": str(tmp_path),
            "CCTALLY_DATA_DIR": str(_cctally_core.APP_DIR),
            "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}

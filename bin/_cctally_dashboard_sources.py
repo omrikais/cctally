@@ -86,7 +86,10 @@ from _lib_codex_pools import (
 from _lib_codex_conversation import _display_title as _codex_display_title
 from _lib_fmt import stable_sum
 from _lib_aggregators import _aggregate_codex_buckets, codex_path_scope
-from _lib_five_hour import _FIVE_HOUR_JITTER_FLOOR_SECONDS
+from _lib_five_hour import (
+    _FIVE_HOUR_JITTER_FLOOR_SECONDS,
+    latest_five_hour_reading,
+)
 from _lib_source_analytics import (
     QualifiedCodexEntry,
     assign_collision_safe_project_labels,
@@ -6328,6 +6331,11 @@ def _claude_accounts_wire(
         # load-bearing, which is the same reason every other weekly consumer
         # excludes held rows rather than trusting it.
         #
+        # The five-hour figure is the account's newest five-hour READING
+        # (#825/#832 spec 4.7 revision 7, the one shared selection): a retired
+        # replica or a weekly-only reading can be the newest row and carries
+        # no five-hour value, so "the latest row" is not the latest reading.
+        #
         # None is still returned only when the account retained NO row at all,
         # because the caller uses that to decide whether the unattributed
         # bucket appears.
@@ -6338,17 +6346,18 @@ def _claude_accounts_wire(
             "ORDER BY captured_at_utc DESC LIMIT 1",
             (key,),
         ).fetchone()
-        five_hour = stats_conn.execute(
-            "SELECT five_hour_percent FROM weekly_usage_snapshots "
-            "WHERE account_key=? "
-            "ORDER BY captured_at_utc DESC LIMIT 1",
-            (key,),
-        ).fetchone()
+        five_hour = latest_five_hour_reading(stats_conn, account_key=key)
         if weekly is None and five_hour is None:
-            return None
+            retained = stats_conn.execute(
+                "SELECT 1 FROM weekly_usage_snapshots WHERE account_key=? "
+                "LIMIT 1",
+                (key,),
+            ).fetchone()
+            if retained is None:
+                return None
         return (
             None if weekly is None else weekly[0],
-            None if five_hour is None else five_hour[0],
+            None if five_hour is None else five_hour.percent,
             None if weekly is None else weekly[1],
         )
 

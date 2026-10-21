@@ -52,10 +52,12 @@ the npm `files[]` list for the same reason `bin/_lib_test_evidence.py` is.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -99,8 +101,12 @@ class Violation:
     event: str
     path: str
     kind: str = "write"
+    detail: str = ""
 
     def describe(self) -> str:
+        if self.kind == "temp-hygiene":
+            # #963 spec section 8: the wording the temp hygiene guard reports.
+            return f"temp hygiene: {self.path} left {self.detail} by {self.node_id}"
         return (
             f"{self.kind} violation: {self.event} -> {self.path} "
             f"(node={self.node_id} worker={self.worker_id} pid={self.pid})"
@@ -350,9 +356,21 @@ def _published_session_id(env) -> str:
 
 
 def session_dir(env=None) -> pathlib.Path:
+    """The per-session directory, inside the suite generation when there is one.
+
+    #963 (note R11): bin/cctally-test-all exports PYTEST_DEBUG_TEMPROOT, the
+    generation's private pytest temp root; the session directory lives beneath
+    it and is removed with the generation. Without it (a bare pytest run, or a
+    root that does not exist) the location is the one it always was.
+    """
     import tempfile
 
-    base = pathlib.Path(tempfile.gettempdir()) / "cctally-isolation"
+    source = os.environ if env is None else env
+    root = (source.get("PYTEST_DEBUG_TEMPROOT") or "").strip()
+    if root and os.path.isabs(root) and os.path.isdir(root):
+        base = pathlib.Path(root) / "cctally-isolation"
+    else:
+        base = pathlib.Path(tempfile.gettempdir()) / "cctally-isolation"
     return base / session_id(env)
 
 
@@ -499,6 +517,7 @@ def _violations(records) -> list[Violation]:
             event=r.get("event", ""),
             path=r.get("path", ""),
             kind=r.get("kind", "write"),
+            detail=r.get("detail", ""),
         )
         for r in records
     ]
@@ -545,6 +564,456 @@ def _record(event: str, path: str, kind: str = "write") -> Violation:
         },
     )
     return violation
+
+
+
+def record_finding(node_id: str, kind: str, event: str, path: str, detail: str = "") -> Violation:
+    """Record a finding for an explicit owner (#963). The hygiene guard knows
+    the owning node or fixture itself, which may not be the running test, so
+    it does not go through ``_current_node_id``."""
+    violation = Violation(
+        node_id=node_id,
+        worker_id=_WORKER_ID or worker_id(),
+        pid=os.getpid(),
+        event=event,
+        path=path,
+        kind=kind,
+        detail=detail,
+    )
+    _append_json_line(
+        _LEDGER_PATH,
+        {
+            "node_id": violation.node_id,
+            "worker_id": violation.worker_id,
+            "pid": violation.pid,
+            "event": violation.event,
+            "path": violation.path,
+            "kind": violation.kind,
+            "detail": violation.detail,
+            "at": time.time(),
+        },
+    )
+    return violation
+
+# --- the #965 test retention policy: declared launch controls -------------
+
+RETENTION_SWITCH = "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"
+RETENTION_CONTROL_KINDS = ("production-behavior", "independent-start")
+
+
+@contextlib.contextmanager
+def retention_launch_control(kind: str, reason: str):
+    """Declare the launches inside this block a deliberate #965 control.
+
+    ``production-behavior``: the switch is deliberately absent, or the code is
+    deliberately packaged, so production retention applies.
+    ``independent-start``: the switch is deliberately absent to prove an entry
+    point sets it itself; the executed code must still be checkout code. The
+    declaration is thread-local, ends with the block and is the only way a
+    covered launch may run without the test policy (spec 5.7)."""
+    if kind not in RETENTION_CONTROL_KINDS:
+        raise ValueError(f"unknown retention control kind {kind!r}")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("a retention control needs a stated reason")
+    previous = getattr(_LOCAL, "retention_control", None)
+    _LOCAL.retention_control = kind
+    try:
+        yield
+    finally:
+        _LOCAL.retention_control = previous
+
+
+# --- the #965 test retention launch guard (spec 5.7) ----------------------
+
+RETENTION_POLICY_KIND = "retention-policy"
+#: The standalone transcript builders of spec 4.3. tests/_retention_entry_points.py
+#: derives the same set from the builders' own AST, and
+#: tests/test_harness_dev_autodetect_coverage.py::
+#: test_965_the_builder_population_is_derived_not_listed asserts equality.
+RETENTION_COVERED_BUILDERS = ("build-bench-fixtures.py", "build-codex-reader-fixtures.py")
+_RETENTION_AUDIT = False
+_RET_SHELLS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
+#: Long shell options whose argument is the next word. A short-option cluster
+#: consumes one following word per `o` / `O` in it (`-o pipefail`, `+o posix`,
+#: `-eo pipefail`, `-O extglob`).
+_RET_SHELL_ARG_OPTIONS = frozenset(("--rcfile", "--init-file", "--emulate"))
+_RET_SHELL_PREFIXES = frozenset(("exec", "command", "nohup", "time", "builtin"))
+#: Per command prefix: the single-letter options it takes, and the ones among
+#: them whose argument follows (attached, or as the next word). Any other
+#: option fails closed (965-DIFF-002).
+_RET_PREFIX_OPTIONS = {"exec": ("cla", "a"), "command": ("pvV", ""), "time": ("p", ""),
+                       "nohup": ("", ""), "builtin": ("", "")}
+#: Reserved words that may open a command (`if cmd`, `! cmd`, `{ cmd; }`, `do cmd`).
+_RET_RESERVED = frozenset(("!", "{", "if", "then", "elif", "else", "do", "while", "until"))
+#: `env`'s short options (GNU `+C:iS:u:v0`, BSD `0iL:P:S:U:u:v`) that take an
+#: argument, and its long options. -C / --chdir, -P, -L and -U change where the
+#: program resolves or what its environment holds, so they fail closed.
+_RET_ENV_ARG_FLAGS = "CLPSUu"
+_RET_ENV_LONG = ("ignore-environment", "unset", "split-string", "chdir", "null", "debug",
+                 "block-signal", "default-signal", "ignore-signal",
+                 "list-signal-handling", "help", "version")
+#: Python long options whose argument is the next word.
+_RET_PYTHON_ARG_LONG = frozenset(("--check-hash-based-pycs",))
+_RET_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_RET_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+class RetentionPolicyBlocked(IsolationBypassBlocked):
+    """Raised when a covered cctally or transcript-builder launch would run
+    without the #965 test retention policy."""
+
+
+def install_retention_launch_audit() -> None:
+    """Enable the retention arm in THIS process. tests/conftest.py calls it;
+    `install_child_from_env` never does, so only pytest processes judge."""
+    global _RETENTION_AUDIT
+    _RETENTION_AUDIT = True
+
+
+def _ret_covered(token) -> bool:
+    """Token-level and deliberately broad: any basename `cctally` or a covered
+    builder. `_ret_is_stub` narrows it once the program is resolved."""
+    name = os.path.basename(token)
+    return name == "cctally" or name in RETENTION_COVERED_BUILDERS
+
+
+def _ret_is_stub(resolved) -> bool:
+    """A resolved `cctally` with no `_cctally_core.py` beside it is a stub (the
+    fake installs of setup, update and doctor tests), not cctally code: every
+    real entry point -- a checkout, a worktree, a copied layout, an npm package,
+    a Cellar libexec, the frozen release -- imports its siblings from its own
+    directory, so such a file cannot reach a prune path and is not a covered
+    launch (spec 5.7: "a `bin/cctally` invocation"). An unresolvable program is
+    never a stub: it fails closed. That includes a path that names no file, such
+    as a relative program the guard resolves against the launch's cwd after a
+    `cd` inside the shell string moved the real one: only an existing file can
+    be shown to be a stub."""
+    if resolved is None:
+        return False
+    path = pathlib.Path(resolved)
+    return (path.name == "cctally" and path.is_file()
+            and not (path.parent / "_cctally_core.py").is_file())
+
+
+def _ret_expand(token: str, env: dict) -> str:
+    return _RET_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), token)
+
+
+def _ret_unparsed(words, env):
+    """Fail closed: words the guard cannot interpret that name a covered program."""
+    if any(_ret_covered(word) for word in words):
+        yield (None, env)
+
+
+def _ret_env_long(name):
+    """GNU getopt_long resolution: an exact name, else an unambiguous prefix."""
+    if name in _RET_ENV_LONG:
+        return name
+    matches = [option for option in _RET_ENV_LONG if option.startswith(name)]
+    return matches[0] if name and len(matches) == 1 else None
+
+
+def _ret_env_launches(argv, env, depth):
+    """`env [OPTION]... [NAME=VALUE]... [COMMAND [ARG]...]`: every option is
+    interpreted, `-S` / `--split-string` is split into the arguments it stands
+    for, and anything else fails closed (965-DIFF-002)."""
+    import shlex
+    child, rest, index = dict(env), list(argv), 1
+    while index < len(rest):
+        arg, after = rest[index], index + 1
+        action = value = None
+        if arg == "--":
+            index += 1
+            break
+        if arg == "-":  # the obsolete spelling of -i
+            child, index = {}, after
+            continue
+        if arg.startswith("--"):
+            name, has_value, value = arg[2:].partition("=")
+            action = _ret_env_long(name)
+            if action in ("unset", "split-string", "chdir") and not has_value:
+                value, after = (rest[after] if after < len(rest) else None), after + 1
+        elif arg.startswith("-"):
+            cluster = arg[1:]
+            for pos, flag in enumerate(cluster):
+                if flag == "i":
+                    child = {}
+                elif flag in "v0":
+                    continue
+                elif flag in _RET_ENV_ARG_FLAGS:
+                    action = {"u": "unset", "S": "split-string"}.get(flag, "chdir")
+                    value = cluster[pos + 1:]
+                    if not value:
+                        value, after = (rest[after] if after < len(rest) else None), after + 1
+                    break
+                else:
+                    action = None
+                    yield from _ret_unparsed(rest[index:], child)
+                    return
+            else:
+                index = after
+                continue
+        elif _RET_ASSIGNMENT_RE.match(arg):
+            key, value = arg.split("=", 1)
+            child[key], index = value, after
+            continue
+        else:
+            break
+        if action == "ignore-environment":
+            child = {}
+        elif action in ("help", "version"):
+            return  # prints and runs nothing
+        elif action == "unset" and value is not None:
+            child.pop(value, None)
+        elif action == "split-string" and value is not None:
+            try:
+                rest = rest[:after] + shlex.split(value) + rest[after:]
+            except ValueError:
+                yield from _ret_unparsed(rest[index:], child)
+                return
+        elif action not in ("null", "debug", "block-signal", "default-signal",
+                            "ignore-signal", "list-signal-handling"):
+            # chdir, -P, -L, -U, an unknown or ambiguous option, a missing argument
+            yield from _ret_unparsed(rest[index:], child)
+            return
+        index = after
+    yield from _ret_argv_launches(rest[index:], child, depth + 1)
+
+
+def _ret_argv_launches(argv, env, depth=0):
+    """Yield (program, final child env) for every covered program argv starts.
+    A program of None marks a launch the guard cannot interpret (fail closed)."""
+    if depth > 6 or not argv:
+        return
+    argv = [os.fsdecode(a) for a in argv]
+    head = os.path.basename(argv[0])
+    if head == "env":
+        yield from _ret_env_launches(argv, env, depth)
+        return
+    if head in _RET_SHELLS:
+        # Options first, wherever -c sits among them; the command string is the
+        # first operand after them (`bash -c -e 'cmd'`, `bash -o pipefail -c ...`).
+        index, command_mode = 1, False
+        while index < len(argv):
+            arg = argv[index]
+            if arg in ("--", "-"):
+                index += 1
+                break
+            if arg in _RET_SHELL_ARG_OPTIONS:
+                index += 2
+                continue
+            if arg.startswith("--"):
+                index += 1
+                continue
+            if len(arg) > 1 and arg[0] in "-+":
+                command_mode = command_mode or (arg[0] == "-" and "c" in arg[1:])
+                index += 1 + sum(1 for flag in arg[1:] if flag in "oO")
+                continue
+            break
+        if command_mode and index < len(argv):
+            yield from _ret_shell_launches(argv[index], env, depth + 1)
+        return  # `bash script.sh`: a script file is the static check's job
+    if head.startswith("python"):
+        index = 1
+        while index < len(argv):
+            arg = argv[index]
+            if arg in _RET_PYTHON_ARG_LONG:
+                index += 2
+                continue
+            if arg.startswith("--"):
+                index += 1
+                continue
+            if arg.startswith("-") and arg != "-":
+                # A short cluster: -W / -X take the rest of it or the next
+                # word (`-W error`, `-bW error`, `-Xdev`); -c / -m start a driver.
+                cluster = arg[1:]
+                for pos, flag in enumerate(cluster):
+                    if flag in "cm":
+                        return
+                    if flag in "WX":
+                        index += pos == len(cluster) - 1
+                        break
+                index += 1
+                continue
+            if _ret_covered(arg):
+                yield (arg, env)
+            return
+        return
+    if _ret_covered(argv[0]):
+        yield (argv[0], env)
+
+
+def _ret_shell_launches(command, env, depth):
+    import shlex
+    # A backslash-newline is a line continuation, removed before parsing (POSIX
+    # 2.2.1): it must not become a `;` that splits one command into two.
+    text = os.fsdecode(command).replace("\\\n", "")
+    try:
+        lexer = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        if any(_ret_covered(word) for word in re.split(r"[\s;&|()'\"]+", text) if word):
+            yield (None, {})  # names a covered program but cannot be parsed: fail closed
+        return
+    shell_env, segment = dict(env), []
+    for token in tokens + [";"]:
+        if token and set(token) <= set(";&|()"):
+            yield from _ret_segment_launches(segment, shell_env, depth)
+            segment = []
+        else:
+            segment.append(token)
+
+
+def _ret_prefixes(words):
+    """Parse the command prefixes (`exec`, `command`, `nohup`, `time`,
+    `builtin`) heading ``words``, with their options.
+
+    Returns (rest, clears): ``rest`` is what then runs -- empty after `command
+    -v` / `-V`, which only describe a program -- and ``clears`` says `exec -c`
+    emptied the environment. None when a prefix carries an option the guard
+    cannot interpret: the caller fails closed, never skips the segment
+    (965-DIFF-002)."""
+    clears = False
+    while words and words[0] in _RET_SHELL_PREFIXES:
+        prefix, index = words[0], 1
+        flags, with_argument = _RET_PREFIX_OPTIONS[prefix]
+        while index < len(words) and len(words[index]) > 1 and words[index][0] == "-":
+            word = words[index]
+            index += 1
+            if word == "--":
+                break
+            seen = ""
+            for pos, flag in enumerate(word[1:]):
+                if flag not in flags:
+                    return None
+                seen += flag
+                if flag in with_argument:
+                    index += pos == len(word) - 2  # the argument is the next word
+                    break
+            if "v" in seen or "V" in seen:
+                return [], clears
+            clears = clears or "c" in seen
+        words = words[index:]
+    return words, clears
+
+
+def _ret_segment_launches(words, shell_env, depth):
+    while words and words[0] in _RET_RESERVED:
+        words = words[1:]
+    parsed = _ret_prefixes(words)
+    if parsed is None:
+        yield from _ret_unparsed([_ret_expand(w, shell_env) for w in words], shell_env)
+        return
+    words, clears = parsed
+    if not words:
+        return
+    if words[0] == "export":
+        for word in words[1:]:
+            if _RET_ASSIGNMENT_RE.match(word):
+                key, value = word.split("=", 1)
+                shell_env[key] = _ret_expand(value, shell_env)
+        return
+    if words[0] == "unset":
+        for word in words[1:]:
+            if not word.startswith("-"):
+                shell_env.pop(word, None)
+        return
+    local, index = dict(shell_env), 0
+    while index < len(words) and _RET_ASSIGNMENT_RE.match(words[index]):
+        key, value = words[index].split("=", 1)
+        local[key] = _ret_expand(value, shell_env)
+        index += 1
+    if index == len(words) and not clears:  # a bare assignment changes an exported variable
+        for word in words:
+            key, value = word.split("=", 1)
+            if key in shell_env:
+                shell_env[key] = _ret_expand(value, shell_env)
+        return
+    # A prefix may also follow the assignments (`FOO=1 exec cmd`), which reach it.
+    parsed = _ret_prefixes(words[index:])
+    if parsed is None:
+        yield from _ret_unparsed([_ret_expand(w, local) for w in words[index:]], local)
+        return
+    rest, cleared = parsed
+    argv = [_ret_expand(w, local) for w in rest]
+    yield from _ret_argv_launches(argv, {} if clears or cleared else local, depth + 1)
+
+
+def _ret_resolve(program, cwd, env):
+    if not program:
+        return None
+    token = _ret_expand(program, env)
+    if "$" in token:
+        return None
+    if "/" not in token:
+        import shutil
+        found = shutil.which(token, path=env.get("PATH", os.defpath))
+        return os.path.realpath(found) if found else None
+    return os.path.realpath(os.path.join(cwd, os.path.expanduser(token)))
+
+
+def _retention_launch_failure(event, args) -> str | None:
+    """The #965 retention arm of the launch audit (spec 5.7).
+
+    A covered launch -- `bin/cctally` or a standalone transcript builder --
+    must reach its child with the switch at exactly "1" AND execute code with a
+    .git entry at its root, unless the calling thread declared a control. It
+    records to the ledger before the caller raises, and never repairs or
+    injects the switch."""
+    if not (_RETENTION_AUDIT and _INTERCEPTOR_INSTALLED):
+        return None
+    if event == "os.system":
+        command = args[0] if args else None
+        if command is None:
+            return None
+        launches, cwd = list(_ret_shell_launches(command, dict(os.environ), 0)), os.getcwd()
+    else:
+        if event == "subprocess.Popen":
+            executable, argv, cwd, env = (list(args) + [None] * 4)[:4]
+        else:  # os.posix_spawn and os.exec: (path, argv, env)
+            executable, argv, env = (list(args) + [None] * 3)[:3]
+            cwd = None
+        if isinstance(argv, (str, bytes, os.PathLike)):
+            argv = [argv]
+        argv = [os.fsdecode(a) for a in (argv or [])]
+        if executable is not None and argv:
+            argv[0] = os.fsdecode(executable)
+        effective = dict(os.environ) if env is None else {
+            os.fsdecode(k): os.fsdecode(v) for k, v in dict(env).items()}
+        launches = list(_ret_argv_launches(argv, effective))
+        cwd = os.fsdecode(cwd) if cwd is not None else os.getcwd()
+    control = getattr(_LOCAL, "retention_control", None)
+    if control == "production-behavior":
+        return None
+    for program, final_env in launches:
+        resolved = _ret_resolve(program, cwd, final_env)
+        if _ret_is_stub(resolved):
+            continue
+        eligible = resolved is not None and (
+            pathlib.Path(resolved).parent.parent / ".git").exists()
+        value = final_env.get(RETENTION_SWITCH)
+        if eligible and (value == "1" or control == "independent-start"):
+            continue
+        reasons = []
+        if program is None:
+            reasons.append("the launch names a covered program but cannot be parsed")
+        elif not eligible:
+            reasons.append(f"it executes {resolved or program!r}, which has no .git "
+                           "entry at its root")
+        if value != "1" and control != "independent-start":
+            reasons.append(f"{RETENTION_SWITCH} is absent" if value is None
+                           else f"{RETENTION_SWITCH} is {value!r}, not '1'")
+        violation = _record(event, resolved or program or "<shell>",
+                            kind=RETENTION_POLICY_KIND)
+        return (violation.describe()
+                + " -- a covered launch would run without the #965 test retention "
+                "policy: " + "; ".join(reasons) + ". Carry "
+                f"{RETENTION_SWITCH}=1 into the child from checkout code, or declare "
+                "a deliberate control with _lib_test_isolation.retention_launch_control"
+                "(kind, reason). See docs/fixtures-gotchas.md, \"Conversation "
+                "retention is off in test environments (#965)\".")
+    return None
 
 
 # --- path matching --------------------------------------------------------
@@ -644,9 +1113,12 @@ def _audit_hook(event, args):
     if event in _LAUNCH_EVENTS:
         _LOCAL.busy = True
         try:
-            failure = _launch_backstop_failure(event, args)
+            retention = _retention_launch_failure(event, args)
+            failure = None if retention is not None else _launch_backstop_failure(event, args)
         finally:
             _LOCAL.busy = False
+        if retention is not None:
+            raise RetentionPolicyBlocked(retention)
         if failure is not None:
             raise IsolationBypassBlocked(failure)
         return
@@ -909,6 +1381,122 @@ def export_env_envelope(env=None) -> None:
     target["PYTHONPATH"] = _pythonpath_with_bootstrap(target.get("PYTHONPATH", ""))
 
 
+#: The temporary-directory variables a fresh child environment must not lose
+#: (#940 D4, spec 6.5). Without them Python's `tempfile` falls back to `/tmp`
+#: and SQLite to `/var/tmp`, which the confined runner kills.
+_TEMP_VARIABLES = ("TMPDIR", "TMP", "TEMP", "SQLITE_TMPDIR")
+
+
+def _restore_temp_variables(child, parent, platform=None) -> None:
+    """Give `child` each temporary variable it lacks, from `parent`.
+
+    Only a missing or empty value is filled; any value the caller set is a
+    deliberate override and is kept exactly, valid or not, because tests drive
+    precisely that. A parent value is copied only when it names an absolute,
+    existing directory, so nothing is invented for a child whose parent has no
+    usable one.
+
+    #940 D-2 F9: a copied TMP or TEMP is the root `tempfile` reads when the
+    child has no TMPDIR, so the same bound applies to it as to TMPDIR at
+    session start (`multiprocessing_temp_root_problem`): a copied value that
+    the child would read and Darwin multiprocessing could not use is not
+    copied.
+
+    Fix round 2 (V2): a long copy is dropped only when the child still keeps
+    a root to read without it: the first remaining variable in `tempfile`'s
+    order (TMPDIR, TEMP, TMP) that names an existing directory, when that one
+    is bounded or the caller's own. `tempfile` skips a variable that names no
+    usable directory, so a caller's own unusable value is not such a root
+    (#940 F2, D-2 P3 #5). Dropping the child's only root would send its
+    `tempfile` to /tmp, the failure this chokepoint exists to stop, so a long
+    copy with nothing to read instead is kept: the child's `tempfile` keeps
+    the long root, and only multiprocessing, which cannot use it, falls back
+    to /tmp, where confinement kills the write. A caller's own value is never
+    dropped, long or not.
+    """
+    copied = []
+    for name in _TEMP_VARIABLES:
+        if child.get(name):
+            continue
+        value = parent.get(name)
+        if value and os.path.isabs(value) and os.path.isdir(value):
+            child[name] = value
+            copied.append(name)
+
+    def long_copy(name):
+        return name in copied and bool(child.get(name)) and \
+            multiprocessing_temp_root_problem({name: child[name]}, platform) is not None
+
+    def usable(name):
+        """A variable `tempfile` would read: set, naming an existing
+        directory."""
+        return bool(child.get(name)) and os.path.isdir(child[name])
+
+    order = ("TMPDIR", "TEMP", "TMP")  # tempfile's order
+    for k in (2, 1):  # TMP, then TEMP: each against what the child reads
+        name = order[k]
+        if not long_copy(name):
+            continue
+        others = [n for n in order if n != name and usable(n)]
+        # What the child reads with this copy gone: the first remaining
+        # variable in tempfile's order that names a usable directory; it is
+        # a root to keep when it is bounded or the caller's own.
+        if others and not long_copy(others[0]):
+            del child[name]
+
+
+#: The longest temporary root Darwin multiprocessing may use (#940, spec 6.5):
+#: a longer one no longer fits its AF_UNIX socket paths, and multiprocessing
+#: then ignores it and falls back to `/tmp` -- killed at 68 bytes, fine at 45.
+MULTIPROCESSING_TEMP_ROOT_MAX_BYTES = 63
+
+
+def _restore_suite_temp_root(child, parent) -> None:
+    """Give a fresh child environment the suite's private pytest temp root (#963 spec 5.4).
+
+    Only when the child lacks it, the parent's value is an absolute existing
+    directory, and the child still reads the parent's TMPDIR: a caller that
+    pointed the child's TMPDIR elsewhere decided where its temp goes, and that
+    decision is kept. Deliberately not a member of _TEMP_VARIABLES, whose
+    membership tests/test_isolation_contract.py pins.
+    """
+    value = parent.get("PYTEST_DEBUG_TEMPROOT") or ""
+    if not value or child.get("PYTEST_DEBUG_TEMPROOT"):
+        return
+    if not os.path.isabs(value) or not os.path.isdir(value):
+        return
+    if (child.get("TMPDIR") or "") != (parent.get("TMPDIR") or ""):
+        return
+    child["PYTEST_DEBUG_TEMPROOT"] = value
+
+
+def multiprocessing_temp_root_problem(env=None, platform=None):
+    """Why Darwin multiprocessing would leave this temporary root, or None.
+
+    Measures the variable `tempfile` would read -- TMPDIR, then TEMP, then
+    TMP, skipping empty ones -- in its exact exported spelling, trailing
+    separator included. Only Darwin is affected; elsewhere this is None.
+    """
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    if platform != "darwin":
+        return None
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        value = env.get(name)
+        if not value:
+            continue
+        size = len(os.fsencode(value))
+        if size <= MULTIPROCESSING_TEMP_ROOT_MAX_BYTES:
+            return None
+        return (
+            f"{name} is {size} bytes; Darwin multiprocessing needs a temporary "
+            f"root of at most {MULTIPROCESSING_TEMP_ROOT_MAX_BYTES} bytes and "
+            "otherwise falls back to /tmp (#940, spec 6.5). Run the tests with "
+            "a shorter temporary root."
+        )
+    return None
+
+
 def _child_environment(base) -> dict:
     """A COPY of the caller's environment with only the reserved keys overwritten.
 
@@ -916,10 +1504,15 @@ def _child_environment(base) -> dict:
     dict that deliberately omits os.environ -- tests/test_five_hour_blocks_json.py
     says so in its own comment -- and those launches are load-bearing: they exist
     so the child resolves a specific data-directory layout.
+    The one exception is the temporary variables: a fresh dict that omits them
+    sends the child's scratch to `/tmp`, so `_restore_temp_variables` fills
+    the ones it lacks from this process.
     """
     child = dict(os.environ) if base is None else {
         os.fsdecode(k): os.fsdecode(v) for k, v in dict(base).items()
     }
+    _restore_temp_variables(child, os.environ)
+    _restore_suite_temp_root(child, os.environ)
 
     extra_roots = list(_ROOTS)
     app_dir = resolve_child_app_dir(child)

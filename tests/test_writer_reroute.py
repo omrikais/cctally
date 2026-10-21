@@ -38,6 +38,15 @@ from conftest import load_script, redirect_paths
 # redirect_paths() patch would be clobbered by the next one.
 pytestmark = pytest.mark.usefixtures("isolated_home")
 
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 _BIN_DIR = str(pathlib.Path(__file__).resolve().parent.parent / "bin")
 
 
@@ -2462,7 +2471,7 @@ def test_authoritative_record_observed_by_stable_projection(ns):
     assert rc == 0
     # The statusline's stable-projection read (the authoritative-publication
     # observe step) reflects the just-recorded 7d value synchronously.
-    projection = ns["_read_db_projection_stable"]()
+    projection = ns["_read_db_projection_stable"](account_key="unattributed")
     assert projection.seven_day is not None
     assert projection.seven_day.percent == 42.0
 
@@ -2617,9 +2626,12 @@ def test_a_preserved_held_row_survives_the_writer_reroute(ns):
 
     Both rows carry the same weekly 63.0 and differ only in
     `weekly_observation_held`, and the credit's effective instant precedes both, so
-    the two are in the band together. The non-held one must go and the held one
-    must stay, with its five-hour reading intact — it is the only carrier of that
-    reading, which is why #824 wrote it."""
+    the two are in the band together. The held one must stay, with its five-hour
+    reading intact — it is the only carrier of that reading, which is why #824
+    wrote it — and the list must not name it. The non-held one is named; since
+    spec 4.7 revision 7 (#825/#832 fix round K16b) the credit retires only its
+    WEEKLY effect, and because it carries its own five-hour reading it is kept
+    weekly-held rather than deleted, live and on replay."""
     jr = _jr()
     J = _jlib()
     _held_sequence(jr, J)
@@ -2659,15 +2671,20 @@ def test_a_preserved_held_row_survives_the_writer_reroute(ns):
         "non-vacuity: the credit must have journalled a weekly_credit_effects "
         "evt for there to be a suppression list at all")
 
-    held = [r for r in after if r["weekly_observation_held"] == 1]
-    assert len(held) == 1, (
+    held = {r["journal_id"]: r for r in after if r["weekly_observation_held"] == 1}
+    assert held_journal_id in held, (
         "the held row did not survive the journalled stale-replica removal")
-    assert held[0]["five_hour_percent"] == 25.0, (
+    assert held[held_journal_id]["five_hour_percent"] == 25.0, (
         "the held row survived but lost the five-hour reading it exists to hold")
+    replica_journal_id = seeded[0]["journal_id"]
+    assert replica_journal_id in held and (
+        held[replica_journal_id]["five_hour_percent"] == seeded[0]["five_hour_percent"]), (
+        "the NON-held stale replica carries its own five-hour reading, so the "
+        "weekly credit keeps it weekly-held with that reading (revision 7)")
     assert not [r for r in after
                 if r["weekly_observation_held"] == 0
                 and r["weekly_percent"] == 63.0], (
-        "the NON-held stale replica must still be removed")
+        "the NON-held stale replica's weekly effect must still be retired")
     named = set()
     for line in suppressed:
         named.update(_r5_evt_suppression(line))

@@ -3,7 +3,8 @@ import argparse
 import json
 import time
 
-from conftest import load_script, redirect_paths
+from conftest import (bound_tombstone, bound_tombstone_files, load_script,
+                      redirect_paths, write_bound_candidate)
 
 
 def _newest_source(ns):
@@ -44,24 +45,17 @@ def test_authoritative_equality_crash_leaves_seven_day_fail_closed(
     seed = _record_args(percent=20.0, resets_at=resets_at)
     assert ns["cmd_record_usage"](seed) == 0
 
-    ns["_atomic_write_json"](
-        ns["STATUSLINE_CANDIDATE_DIR"] / ("a" * 64 + ".json"),
-        {
-            "schemaVersion": 1,
-            "receivedAt": now,
-            "sevenDay": {"percent": 21.0, "resetsAt": resets_at},
-        },
-    )
+    write_bound_candidate("a" * 64, received_at=now, seven_day=(21.0, resets_at))
     monkeypatch.setitem(
         ns,
         "_after_authoritative_record",
         lambda: (_ for _ in ()).throw(RuntimeError("injected crash")),
     )
 
-    result = ns["_authoritative_record_usage"](seed, {"sevenDay"})
+    result = ns["_authoritative_record_usage"](seed, {"sevenDay"}, binding=ns["_capture_binding"]())
 
     assert result.status == "record_failed"
-    tombstone = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    tombstone = bound_tombstone(ns, "sevenDay")
     assert tombstone["state"] == "inflight"
     ns["_statusline_reduce_and_publish"]()
     conn = ns["open_db"]()
@@ -85,22 +79,17 @@ def test_authoritative_seven_day_only_does_not_tombstone_five_hour(
     result = ns["_authoritative_record_usage"](
         _record_args(percent=20.0, resets_at=now + 3 * 86400),
         {"sevenDay"},
+        binding=ns["_capture_binding"](),
     )
 
     assert result.status == "ok"
-    seven = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    seven = bound_tombstone(ns, "sevenDay")
     assert seven["state"] == "committed"
-    assert not ns["STATUSLINE_AUTHORITATIVE_5H_PATH"].exists()
+    assert bound_tombstone_files(ns, "fiveHour") == []
     # The inclusive cutoff covers the entire accepted five-second future-skew
     # interval; a candidate admitted at exactly completion+5 cannot replay.
-    ns["_atomic_write_json"](
-        ns["STATUSLINE_CANDIDATE_DIR"] / ("b" * 64 + ".json"),
-        {
-            "schemaVersion": 1,
-            "receivedAt": seven["blockReceivedAtThrough"],
-            "sevenDay": {"percent": 21.0, "resetsAt": now + 3 * 86400},
-        },
-    )
+    write_bound_candidate("b" * 64, received_at=seven["blockReceivedAtThrough"],
+                          seven_day=(21.0, now + 3 * 86400))
     ns["_statusline_reduce_and_publish"]()
     conn = ns["open_db"]()
     try:

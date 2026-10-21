@@ -27,6 +27,7 @@ import time
 import pytest
 import yaml
 
+import _temp_hygiene as _hyg
 from helpers.authoritative_runtime_budget import write_budget
 from tests import _estate_stub
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
@@ -39,6 +40,16 @@ EVIDENCE_KERNEL = BIN / "_lib_test_evidence.py"
 PRIVATE_TEST_REMOTE_HARNESS = BIN / "cctally-test-remote-test"
 
 DEFAULT_SUMMARY = "passed: 5   failed: 0"
+
+def _aggregator_bridge(source):
+    """The evidence bridge program `bin/cctally-test-all` feeds its interpreter.
+
+    #940 C11 replaced the `EVPY` here-document with `_ev_bridge`, a function
+    that prints the program from one single-quoted string; undo that quoting."""
+    start = "_ev_bridge() {\n    printf '%s\\n' '"
+    assert start in source, "bin/cctally-test-all no longer defines _ev_bridge"
+    return source.split(start, 1)[1].split("'\n}\n", 1)[0].replace("'\\''", "'")
+
 
 
 def _kernels():
@@ -197,26 +208,29 @@ def _sq(text):
 def _env(tmp_path, extra=None):
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
-    env = {
+    # #963 J4: the child's TMPDIR lies inside this test's allocation, never
+    # the outer run's TMPDIR, so a child generation retained by an intended
+    # failure lies inside the outer generation instead of beside it.
+    env = _hyg.child_aggregator_env({
         "PATH": os.environ["PATH"],
         "HOME": str(home),
         "TZ": "Etc/UTC",
         "CCTALLY_TEST_JOBS": "1",
-    }
-    if "TMPDIR" in os.environ:
-        env["TMPDIR"] = os.environ["TMPDIR"]
+    }, tmp_path)
     env.update(extra or {})
     return env
 
 
 def _drive(est, tmp_path, extra=None, timeout=240):
-    return subprocess.run(
+    proc = subprocess.run(
         [str(est / "bin" / "cctally-test-all")],
         env=_env(tmp_path, extra),
         capture_output=True,
         text=True,
         timeout=timeout,
     )
+    _hyg.reclaim_child_generations(tmp_path)
+    return proc
 
 
 def _run_dirs(root):
@@ -226,8 +240,7 @@ def _run_dirs(root):
 def _embedded_pid_start(pid, zone):
     """Run the aggregator's exact embedded process-identity producer."""
     source = RUNNER.read_text(encoding="utf-8")
-    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
-    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    bridge = _aggregator_bridge(source)
     # `pid-start` needs only the public evidence kernel. Feed the optional
     # private-kernel slot a portable non-module so this public test keeps the
     # same dependency closure as the public mirror.
@@ -1252,6 +1265,7 @@ def test_an_interrupted_run_is_recorded_aborted_and_reaps_its_pool(
         lambda: not _descendants_mentioning(str(est / "bin" / "cctally-alpha-test")),
         timeout=remaining(deadline),
     ), _descendants_mentioning(str(est / "bin" / "cctally-alpha-test"))
+    _hyg.reclaim_child_generations(tmp_path)
 
 
 def _scheduler_record(root):
@@ -1523,8 +1537,7 @@ def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL):
     transformer rather than an injected violation supplies a mangled copy.
     """
     source = RUNNER.read_text(encoding="utf-8")
-    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
-    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    bridge = _aggregator_bridge(source)
 
     shim = tmp_path / "_lib_test_evidence_shim.py"
     shim.write_text(_VALIDATOR_SHIM, encoding="utf-8")
@@ -1892,8 +1905,7 @@ def _embedded_export(tmp_path, log_lines, extra_env=None,
     also mutating the transformer.
     """
     source = RUNNER.read_text(encoding="utf-8")
-    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
-    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    bridge = _aggregator_bridge(source)
     evidence = tmp_path / "run"
     (evidence / "export").mkdir(parents=True)
     logs = tmp_path / "logs"
@@ -2237,8 +2249,7 @@ def _embedded_retention(root, current_run, extra_env=None):
     """The aggregator's OWN retention pass, run exactly as the aggregator runs
     it — the same extraction idiom `_embedded_pid_start` uses."""
     source = RUNNER.read_text(encoding="utf-8")
-    marker = "python3 - \"$EVIDENCE_KERNEL\" \"$EVIDENCE_PRIVATE\" \"$@\" <<'EVPY'\n"
-    bridge = source.split(marker, 1)[1].split("\nEVPY\n", 1)[0]
+    bridge = _aggregator_bridge(source)
     env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
     env.update(extra_env or {})
     result = subprocess.run(
@@ -2954,7 +2965,12 @@ def _upload_steps(steps):
             continue
         if not str(step.get("uses", "")).startswith("actions/upload-artifact"):
             continue
-        if "cctally-test-evidence" not in str(step.get("with", {}).get("path", "")):
+        path = str(step.get("with", {}).get("path", ""))
+        # A lane names the tree either by its runner-temp directory or, on a
+        # runner whose evidence lives on its external store (#940), by the
+        # root variable a resolver step exported.
+        if ("cctally-test-evidence" not in path
+                and "env.CCTALLY_TEST_EVIDENCE_ROOT" not in path):
             continue
         out.append(step)
     return out
@@ -3064,6 +3080,52 @@ def test_every_evidence_enabled_job_uploads_its_sanitized_extract():
             f"surviving copy of what it redacted — which is worse than not "
             f"sanitizing at all. Add the failure-only upload in the same change."
         )
+
+
+def test_the_macos_lane_keeps_its_evidence_on_the_runner_store(tmp_path):
+    """#940 C4: the self-hosted suite lane's evidence root is the runner's
+    external evidence store, which its listener exports as
+    CCTALLY_RUNNER_EVIDENCE_ROOT, never the job temp; a runner without one
+    refuses before any suite step. The public Ubuntu lane is unchanged."""
+    jobs = _evidence_jobs()
+    _body, steps, text = jobs["ci.yml:test-macos"]
+    assert "runner.temp }}/cctally-test-evidence" not in text
+    names = [step.get("name") for step in steps if isinstance(step, dict)]
+    resolver = steps[names.index("Resolve the runner's evidence store")]
+    assert names.index("Resolve the runner's evidence store") < names.index(
+        "Run cctally test suite")
+    assert "${CCTALLY_RUNNER_EVIDENCE_ROOT:?}" in resolver["run"]
+    for step in steps:
+        env = step.get("env") if isinstance(step, dict) else None
+        if isinstance(env, dict):
+            assert "CCTALLY_TEST_EVIDENCE_ROOT" not in env, step.get("name")
+            for key in ("CCTALLY_TEST_ALL_OUTCOME_FILE", "CCTALLY_EXTRACT"):
+                if key in env:
+                    assert env[key].startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), (
+                        step.get("name"), env[key])
+    for step in _upload_steps(steps):
+        for entry in _upload_paths(step):
+            assert entry.startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), entry
+    # Execute the resolver: it exports the store for the later steps, and
+    # without the listener's variable it fails and exports nothing.
+    github_env = tmp_path / "github-env"
+    store = tmp_path / "vol" / "evidence" / "ci"
+    base = {"PATH": os.environ["PATH"], "GITHUB_ENV": str(github_env)}
+    done = subprocess.run(["bash", "-e", "-c", resolver["run"]],
+                          env={**base, "CCTALLY_RUNNER_EVIDENCE_ROOT": str(store)},
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert github_env.read_text() == "CCTALLY_TEST_EVIDENCE_ROOT=%s\n" % store
+    github_env.unlink()
+    refused = subprocess.run(["bash", "-e", "-c", resolver["run"]], env=base,
+                             capture_output=True, text=True, timeout=30)
+    assert refused.returncode != 0
+    assert "CCTALLY_RUNNER_EVIDENCE_ROOT" in refused.stderr
+    assert not github_env.exists()
+    # The public Ubuntu lane keeps its job-temp evidence root.
+    _pr_body, pr_steps, pr_text = jobs["ci.yml:test-pr"]
+    assert "${{ runner.temp }}/cctally-test-evidence" in pr_text
+    assert "CCTALLY_RUNNER_" not in pr_text
 
 
 def test_every_evidence_upload_is_failure_only_and_names_only_the_export_files():
@@ -3206,6 +3268,37 @@ def test_both_legs_survive_the_merge(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     records = _read_jsonl_gz(_durations_path(root))
     assert {r["leg"] for r in records if "leg" in r} >= {"pytest", "benchmark"}
+    footer = records[-1]
+    phases = records[:-1]
+    # Actual xdist serialization -> controller writer -> merged artifact.
+    # The benchmark is a separate serial process and must not inherit gw0.
+    assert footer["complete"] is True, footer
+    assert footer["records"] == len(phases) == 9, records
+    assert all("nodeId" in row for row in phases), records
+    for leg in footer["legs"]:
+        rows = [row for row in phases if row["leg"] == leg["leg"]]
+        timeline = leg["lifecycle"]
+        assert (timeline["configuredAt"] <= timeline["sessionStartedAt"]
+                <= min(row["startedAt"] for row in rows)
+                <= max(row["finishedAt"] for row in rows)
+                <= timeline["sessionFinishedAt"]), (leg, rows)
+        assert leg["records"] == leg["declaredRecords"] == len(rows)
+        for row in rows:
+            assert row["startedAt"] <= row["finishedAt"], row
+            assert row["durationSeconds"] >= 0, row
+        if leg["leg"] == "benchmark":
+            assert {row["workerId"] for row in rows} == {None}, rows
+            assert (timeline["sessionStartedAt"] <= timeline["collectionStartedAt"]
+                    <= timeline["collectionFinishedAt"]
+                    <= min(row["startedAt"] for row in rows)), leg
+        else:
+            assert {row["workerId"] for row in rows} == {"gw0"}, rows
+            # xdist workers collect; these controller hooks did not run.
+            assert timeline["collectionStartedAt"] is None, leg
+            assert timeline["collectionFinishedAt"] is None, leg
+    # A bounded proof retained by the invoking remote RED/GREEN log. Contains
+    # only this synthetic estate's node ids and its real merged JSONL records.
+    print("DURATION_TIMELINE_PROOF=" + json.dumps(records, sort_keys=True))
 
 
 def test_merged_artifact_is_deterministically_ordered(tmp_path):
@@ -3266,6 +3359,8 @@ def test_an_incomplete_durations_artifact_is_reported_on_the_run(tmp_path):
     main_leg = legs.get("pytest") or next(iter(legs.values()))
     assert main_leg["sessionFinished"] is True, footer
     assert main_leg["exitStatus"] not in (0, 1, 5), footer
+    # A timestamp proves the boundary was observed, never population coverage.
+    assert main_leg["lifecycle"]["sessionFinishedAt"] is not None, footer
 
 
 def test_a_worker_never_opens_the_output(tmp_path):
@@ -3305,7 +3400,7 @@ def test_the_writer_is_disabled_without_an_output_path():
 
 
 @pytest.mark.parametrize("status", [0, 1, 2, 3, 4, 5])
-def test_the_footer_records_the_real_exit_status(tmp_path, status):
+def test_the_footer_records_the_real_exit_status(tmp_path, status, monkeypatch):
     # `pytest_sessionfinish` used to write `"sessionFinished": True`
     # unconditionally and discard the `exitstatus` it was handed, so a session
     # that ended in an INTERNALERROR published `complete: true` over a
@@ -3318,9 +3413,41 @@ def test_the_footer_records_the_real_exit_status(tmp_path, status):
     previous = os.environ.get("CCTALLY_DURATIONS_PATH")
     os.environ["CCTALLY_DURATIONS_PATH"] = str(out)
     try:
-        config = _FakeConfig()
-        plugin.pytest_configure(config)
-        config.registered[0][0].pytest_sessionfinish(None, status)
+        # Clock values are independent, literal boundaries. Report timestamps
+        # must remain their own values, rather than controller arrival time.
+        clock = [100.0]
+        with monkeypatch.context() as patch:
+            patch.setattr(time, "time", lambda: clock[0])
+            config = _FakeConfig()
+            plugin.pytest_configure(config)
+            writer = config.registered[0][0]
+            clock[0] = 110.0
+            writer.pytest_sessionstart(None)
+            clock[0] = 120.0
+            writer.pytest_collection(None)
+            clock[0] = 130.0
+            writer.pytest_collection_finish(None)
+            report = pytest.TestReport(
+                nodeid="test_synthetic.py::test_timing", location=("test_synthetic.py", 0, ""),
+                keywords={}, outcome="passed", longrepr=None, when="call",
+                duration=0.5000004, start=140.125, stop=140.625,
+            )
+            report.worker_id = "gw7"
+            clock[0] = 170.0
+            writer.pytest_runtest_logreport(report)
+            # Missing metadata stays unknown; node names are not identities.
+            del report.worker_id
+            del report.start
+            del report.stop
+            writer.pytest_runtest_logreport(report)
+            # Malformed upstream metadata must neither invent evidence nor
+            # prevent the reporter from observing an ordinary test outcome.
+            report.worker_id = 7
+            report.start = float("inf")
+            report.stop = "unknown"
+            writer.pytest_runtest_logreport(report)
+            clock[0] = 200.0
+            writer.pytest_sessionfinish(None, status)
     finally:
         if previous is None:
             os.environ.pop("CCTALLY_DURATIONS_PATH", None)
@@ -3329,6 +3456,23 @@ def test_the_footer_records_the_real_exit_status(tmp_path, status):
     footer = _read_jsonl_gz(out)[-1]
     assert footer["footer"] is True, footer
     assert footer["exitStatus"] == status, footer
+    assert footer["records"] == 3, footer
+    assert footer["lifecycle"] == {
+        "configuredAt": 100.0, "sessionStartedAt": 110.0,
+        "collectionStartedAt": 120.0, "collectionFinishedAt": 130.0,
+        "sessionFinishedAt": 200.0,
+    }, footer
+    phases = _read_jsonl_gz(out)[:-1]
+    assert phases[0] == {
+        "nodeId": "test_synthetic.py::test_timing", "phase": "call",
+        "durationSeconds": 0.5, "outcome": "passed", "leg": "pytest",
+        "workerId": "gw7", "startedAt": 140.125, "finishedAt": 140.625,
+    }, phases
+    for row in phases[1:]:
+        assert row["workerId"] is None, row
+        assert row["startedAt"] is None, row
+        assert row["finishedAt"] is None, row
+        assert row["durationSeconds"] == 0.5, row
 
 
 
@@ -3367,3 +3511,132 @@ def test_a_forced_control_arm_records_itself_as_its_own_mode(tmp_path):
     assert record["table_digest"] == (
         "sha256:" + hashlib.sha256(table.read_bytes()).hexdigest()
     ), record
+
+
+# ------------------------------------- #940 C3: store identity, seeded loss, the index
+
+_STORE_B = "11111111-2222-3333-4444-555555555555+66666666-7777-8888-9999-BBBBBBBBBBBB:2"
+
+
+def _ev_kernel():
+    spec = importlib.util.spec_from_file_location("_ev_kernel_940", EVIDENCE_KERNEL)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+def _embedded_bridge(args, extra_env=None):
+    """The aggregator's own evidence bridge, run with `args` as it runs it."""
+    source = RUNNER.read_text(encoding="utf-8")
+    bridge = _aggregator_bridge(source)
+    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
+    for name in ("CCTALLY_RUNNER_STORE_ID", "CCTALLY_RUNNER_EVIDENCE_INDEX"):
+        env.pop(name, None)
+    env.update(extra_env or {})
+    return subprocess.run([sys.executable, "-", str(EVIDENCE_KERNEL), os.devnull] + list(args),
+                          input=bridge, env=env, capture_output=True, text=True, check=False)
+
+
+def test_the_retention_pass_stamps_the_runner_store(tmp_path):
+    """C3 (F20, C8): the record carries the store the pass ran on, so the
+    observability reader de-duplicates on (host, store, passes)."""
+    root = tmp_path / "ev"
+    _seed_run(root, "current", started=int(time.time()) - 60)
+    record, _result = _embedded_retention(root, "current",
+                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
+    assert record["store"] == _STORE_B
+    assert record["passes"] == 1
+
+
+def test_seeded_loss_survives_a_successful_run_until_it_ages_out(tmp_path):
+    """E: lost A -> enrolled B -> a successful run stays `coverage: degraded`
+    while the seeded loss is inside the retention horizon; an interval that
+    aged out is dropped and coverage recovers."""
+    EV = _ev_kernel()
+    root = tmp_path / "ev"
+    root.mkdir()
+    now = int(time.time())
+    recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
+    ancient = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 400 * 86400))
+    EV.seed_retention_record(str(root / ".retention.json"), store_id=_STORE_B, loss=[
+        {"start": ancient, "end": recent, "reason": "drive A lost"}])
+    _seed_run(root, "current", started=now - 60)
+    record, _result = _embedded_retention(root, "current",
+                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
+    assert record["coverage"] == "degraded"
+    assert [e["reason"] for e in record["seededLoss"]] == ["drive A lost"]
+    EV.seed_retention_record(str(root / ".retention.json"), store_id=_STORE_B, loss=[])
+    record_doc = json.loads((root / ".retention.json").read_text())
+    record_doc["seededLoss"] = [{"start": ancient, "end": ancient, "reason": "old"}]
+    (root / ".retention.json").write_text(json.dumps(record_doc))
+    record, _result = _embedded_retention(root, "current",
+                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
+    assert record["seededLoss"] == [] and record["coverage"] == "complete"
+
+
+def test_a_finished_run_is_indexed_with_its_length_and_digest(tmp_path):
+    """C3 (R7-F7): with CCTALLY_RUNNER_EVIDENCE_INDEX set, a finished run's
+    manifest is recorded under its store with its expected length and
+    digest."""
+    EV = _ev_kernel()
+    root = tmp_path / "ev"
+    run = _seed_run(root, "run-1", started=int(time.time()) - 600)
+    index = tmp_path / "evidence-index.json"
+    result = _embedded_bridge(["index", str(root), str(run), "run-1"], extra_env={
+        "CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index)})
+    assert result.returncode == 0, result.stderr
+    doc = EV.read_evidence_index(str(index))
+    [entry] = doc["stores"][_STORE_B]["runs"]
+    data = (run / "manifest.json").read_bytes()
+    assert entry["runId"] == "run-1" and entry["length"] == len(data)
+    assert entry["digest"] == "sha256:" + __import__("hashlib").sha256(data).hexdigest()
+
+
+@pytest.mark.parametrize("damage", ["truncate", "delete"])
+def test_a_damaged_indexed_run_is_discovered_without_a_seeded_flag(tmp_path, damage):
+    """C3 (R7-F7): deletion or truncation of indexed evidence, with the store
+    unchanged, is discovered by the next retention pass from the index alone:
+    the record degrades and names the run, and the index records the loss."""
+    EV = _ev_kernel()
+    root = tmp_path / "ev"
+    now = int(time.time())
+    run = _seed_run(root, "victim", started=now - 7200)
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index)}
+    assert _embedded_bridge(["index", str(root), str(run), "victim"], extra_env=env
+                            ).returncode == 0
+    if damage == "truncate":
+        data = (run / "manifest.json").read_bytes()
+        (run / "manifest.json").write_bytes(data[: len(data) // 2])
+    else:
+        shutil.rmtree(str(run))
+    _seed_run(root, "current", started=now - 60)
+    record, _result = _embedded_retention(root, "current", extra_env=env)
+    assert record["coverage"] == "degraded"
+    assert any("victim" in e["reason"] for e in record["seededLoss"]), record
+    loss = EV.read_evidence_index(str(index))["stores"][_STORE_B]["loss"]
+    assert any("victim" in e["reason"] for e in loss), loss
+
+
+def test_an_evicted_indexed_run_is_not_a_loss(tmp_path):
+    """Retention's own eviction is planned, not lost: the evicted run leaves
+    the index and the record stays complete."""
+    EV = _ev_kernel()
+    root = tmp_path / "ev"
+    now = int(time.time())
+    run = _seed_run(root, "aged", started=now - 30 * 86400)
+    index = tmp_path / "evidence-index.json"
+    env = {"CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
+           "EV_MAX_AGE_DAYS": "12"}
+    assert _embedded_bridge(["index", str(root), str(run), "aged"], extra_env=env
+                            ).returncode == 0
+    _seed_run(root, "current", started=now - 60)
+    record, _result = _embedded_retention(root, "current", extra_env=env)
+    assert not run.exists(), "the aged run was evicted"
+    assert record["seededLoss"] == [], record
+    assert EV.read_evidence_index(str(index))["stores"][_STORE_B]["runs"] == []

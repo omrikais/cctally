@@ -19,8 +19,7 @@ import sys
 
 import pytest
 
-from conftest import (load_script, redirect_paths,
-                      redirect_paths_without_conversation_retention)
+from conftest import (load_script, redirect_paths)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -40,8 +39,9 @@ def _rollout_bytes(scenario: str) -> bytes:
 def _setup(tmp_path, monkeypatch):
     """A live Codex cache seam with one provider root at ``<tmp>/provider``."""
     ns = load_script()
-    # Live-tail assertions use retained synthetic transcripts, independent of age.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     (provider_root / "sessions").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CODEX_HOME", str(provider_root))

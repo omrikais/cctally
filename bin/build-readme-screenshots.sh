@@ -98,7 +98,7 @@ fi
 # Scratch dir + trap, hoisted ahead of the fixture build so the selftest hook
 # can use them and so the trap covers more of the run. Nothing between the old
 # and new positions touches scratch state.
-SCRATCH="$(mktemp -d -t cctally-readme-XXXXXX)"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/cctally-readme-XXXXXX")" || exit 1
 DASH_PID=""
 cleanup() {
     if [[ -n "$DASH_PID" ]]; then

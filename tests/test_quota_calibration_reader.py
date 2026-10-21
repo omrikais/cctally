@@ -38,6 +38,7 @@ def _good(**over):
                         "cache_1h": 0.0, "cache_read": 0.0},
         "familyRadius": 0.02,
         "classRadius": 0.05,
+        "coefficientEra": "opus-5",
     }
     base.update(over)
     return base
@@ -74,6 +75,24 @@ def test_a1_a_good_regime_validates_to_aware_instants():
     assert out.family_shares == {"claude-opus-5": 1.0}
     assert out.family_radius == 0.02
     assert out.qualifications == ()
+
+
+def test_unknown_era_id_is_malformed():
+    # #978 spec 4.5: under the current fingerprint a regime must name a known
+    # coefficient era. The fingerprint is checked first, so a regime from an
+    # older build is still reported as a fingerprint mismatch.
+    assert _validate(_good()).coefficient_era == "opus-5"
+    assert _validate(_good(coefficientEra="opus-5-5")).coefficient_era == \
+        "opus-5-5"
+    missing = _good()
+    del missing["coefficientEra"]
+    assert _validate(missing) is qc.RegimeRejection.MALFORMED
+    for bad in (None, "opus-6", 5, True, ""):
+        assert _validate(_good(coefficientEra=bad)) is \
+            qc.RegimeRejection.MALFORMED, bad
+    legacy = _good(fingerprint="OLD")
+    del legacy["coefficientEra"]
+    assert _validate(legacy) is qc.RegimeRejection.FINGERPRINT
 
 
 def test_a1_fingerprint_mismatch_is_rejected_not_repaired():

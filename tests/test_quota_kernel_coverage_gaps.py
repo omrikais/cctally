@@ -74,7 +74,7 @@ def test_the_daily_series_applies_the_low_reading_midpoints(
          _snap(qm, 5, readings[1], rowid=2)], [])
     series = qm.build_daily_series(
         segments, [], now=DAY + dt.timedelta(days=2),
-        newest_entry_at=DAY + dt.timedelta(days=2))
+        newest_entry_at=DAY + dt.timedelta(days=2), era=qm.era_by_id("opus-5"))
     if expected_midpoint < qm.DETECTOR["min_daily_gain"]:
         # Below the minimum daily gain the day is absent from the series
         # entirely, and the raw rule would have kept it. That difference is

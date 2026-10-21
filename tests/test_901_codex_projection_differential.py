@@ -8,9 +8,10 @@ transaction that changes the find-visible state (its own row changes, or a
 writer's message deletions that cascade projection rows away) and never for a
 true no-op. Every conversation here is built through the product's own ingest
 (``sync_codex_cache`` + ``sync_codex_conversations`` over synthetic rollouts in a
-temporary ``CODEX_HOME``). Projection mutations are counted by TEMP triggers that
-exist only on the test's connection, and the generation's committed advances by
-a TEMP log on ``cache_meta``; both roll back with the transaction they observe.
+temporary ``CODEX_HOME``). Projection mutations and generation advances are counted by test-only tables
+and triggers in the disposable store. They observe every writer connection,
+including the detached executor's connection, and roll back with the same
+transaction as the mutations they record.
 
 A rebuild reference is a fresh store that ingests the same rollout files from
 byte zero (compared on every column, the surrogate ``message_id`` replaced by
@@ -33,7 +34,7 @@ import sys
 
 import pytest
 
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 
 BIN_DIR = pathlib.Path(__file__).resolve().parent.parent / "bin"
 if str(BIN_DIR) not in sys.path:
@@ -60,6 +61,44 @@ _PROJECTION_COLUMNS = (
 
 
 # ── synthetic rollout records ────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
 
 
 def _ts(seconds: int) -> str:
@@ -188,26 +227,26 @@ def _turns_for(messages: int) -> int:
 
 
 _COUNTERS = """
-CREATE TEMP TABLE IF NOT EXISTS g9_projection_ops(op TEXT NOT NULL);
-CREATE TEMP TABLE IF NOT EXISTS g9_generation_log(old_value TEXT, new_value TEXT);
-CREATE TEMP TRIGGER IF NOT EXISTS g9_projection_ai
+CREATE TABLE IF NOT EXISTS g9_projection_ops(op TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS g9_generation_log(old_value TEXT, new_value TEXT);
+CREATE TRIGGER IF NOT EXISTS g9_projection_ai
 AFTER INSERT ON codex_find_projection BEGIN
     INSERT INTO g9_projection_ops(op) VALUES ('insert');
 END;
-CREATE TEMP TRIGGER IF NOT EXISTS g9_projection_au
+CREATE TRIGGER IF NOT EXISTS g9_projection_au
 AFTER UPDATE ON codex_find_projection BEGIN
     INSERT INTO g9_projection_ops(op) VALUES ('update');
 END;
-CREATE TEMP TRIGGER IF NOT EXISTS g9_projection_ad
+CREATE TRIGGER IF NOT EXISTS g9_projection_ad
 AFTER DELETE ON codex_find_projection BEGIN
     INSERT INTO g9_projection_ops(op) VALUES ('delete');
 END;
-CREATE TEMP TRIGGER IF NOT EXISTS g9_generation_ai
+CREATE TRIGGER IF NOT EXISTS g9_generation_ai
 AFTER INSERT ON cache_meta WHEN new.key = 'codex_find_projection_generation'
 BEGIN
     INSERT INTO g9_generation_log VALUES (NULL, new.value);
 END;
-CREATE TEMP TRIGGER IF NOT EXISTS g9_generation_au
+CREATE TRIGGER IF NOT EXISTS g9_generation_au
 AFTER UPDATE ON cache_meta WHEN new.key = 'codex_find_projection_generation'
 BEGIN
     INSERT INTO g9_generation_log VALUES (old.value, new.value);
@@ -270,7 +309,7 @@ class Store:
     # -- passes ----------------------------------------------------------------
 
     def _activate(self, data_dir: pathlib.Path) -> None:
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             self.ns, self.monkeypatch, data_dir)
 
     def _sync_cache(self) -> None:
@@ -295,6 +334,10 @@ class Store:
         return self.conn.execute(
             "SELECT old_value, new_value FROM g9_generation_log ORDER BY rowid"
         ).fetchall()
+
+    def drain_prune(self):
+        return self.cache.run_codex_conversation_prune_drain(
+            wait_for_requests=False)
 
     def sync(self):
         """One ordinary conversation-sync pass, counters reset first."""
@@ -599,7 +642,8 @@ def test_c_a_deleted_message_cascade_equals_a_rebuild_and_advances(store):
 
     store.path("side").unlink()
     stats = store.sync()
-    assert stats.files_pruned == 1
+    assert stats.files_pruned == 0
+    assert store.drain_prune().identities_deleted == 1
     assert _render_order_of(store, key, "Answer a7 names") < later, (
         "removing the interleaved file must shift later ordinals")
     assert assert_single_advance_or_none(store, before_generation) == 1
@@ -800,7 +844,8 @@ def test_g_a_cascade_only_change_advances_once_and_invalidates_cursors(
     if mutation == "truncation":
         assert stats.files_reset_truncated == 1
     else:
-        assert stats.files_pruned == 1
+        assert stats.files_pruned == 0
+        assert store.drain_prune().identities_deleted == 1
     # Only the cascade removed rows: the builder found no difference.
     assert store.ops() == {"delete": tail_rows}
     assert store.exact(key) == surviving
@@ -822,9 +867,13 @@ def test_g_the_same_cascade_rolled_back_changes_nothing(
     before_generation = store.generation()
 
     real = store.query.materialize_codex_find_projection
+    injected = []
 
     def fail_after_projection(conn, keys, **kwargs):
         real(conn, keys, **kwargs)
+        injected.append((conn is store.conn, conn.in_transaction,
+                         conn.execute("SELECT COUNT(*) FROM g9_projection_ops").fetchone()[0],
+                         conn.execute("SELECT COUNT(*) FROM g9_generation_log").fetchone()[0]))
         raise sqlite3.OperationalError("g9 injected failure after projection")
 
     _mutate_tail(store, mutation)
@@ -833,12 +882,26 @@ def test_g_the_same_cascade_rolled_back_changes_nothing(
     store._sync_cache()
     store.reset_counters()
     try:
-        store.ns["sync_codex_conversations"](store.conn)
+        stats = store.ns["sync_codex_conversations"](store.conn)
+        if mutation == "stale-source-prune":
+            assert stats.files_pruned == 0
+            with pytest.raises(sqlite3.OperationalError,
+                               match="g9 injected failure after projection"):
+                store.drain_prune()
     except sqlite3.OperationalError:
-        # The prune transaction does not catch; its caller rolls back.
+        # The ordinary writer may propagate after rolling back its batch;
+        # the real prune executor rolls back its own connection before raising.
         store.conn.rollback()
     finally:
         monkeypatch.setattr(store.query, "materialize_codex_find_projection", real)
+    assert injected, "the failure injection must reach the mutating projector"
+    assert all(in_transaction and changes > 0 and advances == 1
+               for _primary, in_transaction, changes, advances in injected), injected
+    if mutation == "stale-source-prune":
+        assert len(injected) == 1 and injected[0][0] is False, injected
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM codex_conversation_prune_debt").fetchone()[0] == 1
+    assert store.ops() == {}, "rolled-back projection mutations must not be counted"
     assert store.exact(key) == before_rows
     assert store.generation() == before_generation
     assert store.generation_log() == []

@@ -1,0 +1,27 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+Journal
+  ⚠ Legacy writer            1 record(s) an older cctally process wrote after the upgrade were excluded from accounting (last seen 2026-05-13T14:20:00+00:00)
+      → an older cctally process (for example a dashboard started before the upgrade) is still writing; restart it
+Data
+Accounts
+Accounting
+  ⚠ Outcome quarantine       automatic outcomes paused for 1 account(s)
+      → Automatic credit and reset detection is paused for fixture@example.test since 2026-05-13T14:10:00Z because an older cctally process wrote data after the upgrade. It resumes only after cctally verifies a clean reading for this account, typically the first one after an idle period spanning a weekly reset; there is no guaranteed time. If your usage was reset in place meanwhile, record it with `cctally record-credit`. Status-line drop detection also waits for a successful usage refresh for this account.
+Pricing
+Quota
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+Telemetry
+Performance
+
+Summary: 65 OK · 5 WARN · 0 FAIL

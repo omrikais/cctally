@@ -29,8 +29,7 @@ if str(REPO_ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import _cctally_core  # noqa: E402
-from conftest import (load_script, redirect_paths,
-                      redirect_paths_without_conversation_retention)  # noqa: E402
+from conftest import (load_script, redirect_paths)  # noqa: E402
 
 CORPUS = REPO_ROOT / "tests" / "fixtures" / "codex-parity" / "v1"
 PER_MIGRATION = REPO_ROOT / "tests" / "fixtures" / "migrations" / "per-migration"
@@ -54,8 +53,9 @@ def install(tmp_path, monkeypatch):
     """A pre-upgrade install: cache.db at 034-head, conversations.db at 001-head,
     plus one real Codex rollout on disk."""
     ns = load_script()
-    # Migration/replay assertions need the fixed rollout after a forced rebuild.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy(CACHE_PRE, _cctally_core.CACHE_DB_PATH)
     shutil.copy(CONV_PRE, _cctally_core.CONVERSATIONS_DB_PATH)

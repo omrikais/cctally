@@ -285,11 +285,14 @@ def test_apply_commits_only_weekly_authoritative_tombstone(ns, monkeypatch):
 
     assert ns["cmd_record_credit"](_authorized_credit_args()) == 0
 
-    import json
-    tombstone = json.loads(ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].read_text())
+    from conftest import bound_tombstone, bound_tombstone_files
+    # #825/#832: the fence is the credit account's own, for its exact week.
+    tombstone = bound_tombstone(ns, "sevenDay")
     assert tombstone["axis"] == "sevenDay"
     assert tombstone["state"] == "committed"
-    assert not ns["STATUSLINE_AUTHORITATIVE_5H_PATH"].exists()
+    assert tombstone["accountKey"] == "unattributed"
+    assert bound_tombstone_files(ns, "fiveHour") == []
+    assert not ns["STATUSLINE_AUTHORITATIVE_7D_PATH"].exists()
 
 
 def test_plan_drift_after_credit_authorization_aborts_before_tombstone(

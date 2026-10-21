@@ -7818,6 +7818,95 @@ def build_per_migration_048_codex_quota_physical_group_order(
     _build_post(pre, post)
 
 
+def build_per_migration_049_codex_rollout_containers(scenario_dir: Path) -> None:
+    """Per-migration goldens for #968's container evidence and maintenance state.
+
+    ``pre.sqlite`` is a genuine 048-head install: the current schema apply
+    declares the container columns and creates the seven #968 tables, so both
+    are removed again. The seeded cursor row proves the columns arrive over
+    existing data as plain/accepted with every evidence column NULL.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "049_codex_rollout_containers"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths",
+                         "048_codex_quota_physical_group_order"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at) VALUES (?,?,?,?,?)",
+                ("/fixtures/codex/sessions/2026/10/14/rollout.jsonl",
+                 512, 1700000000000000000, 512, _TS_PUBLIC_5),
+            )
+            for table in db._CODEX_968_CACHE_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            for column, _decl in reversed(
+                    db._CODEX_CONTAINER_CURSOR_COLUMNS
+                    + db._CODEX_CONTAINER_CACHE_ONLY_COLUMNS):
+                conn.execute(
+                    f"ALTER TABLE codex_session_files DROP COLUMN {column}")
+            conn.execute("PRAGMA user_version=48")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=49")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
 def build_per_migration_conversations_010_codex_conversation_source_file_identity(
     scenario_dir: Path,
 ) -> None:
@@ -7992,6 +8081,87 @@ def build_per_migration_conversations_011_conversation_latest_meta_indexes(
         lock = post.with_name(post.name + suffix)
         if lock.exists():
             lock.unlink()
+
+
+def build_per_migration_conversations_012_codex_conversation_containers(
+    scenario_dir: Path,
+) -> None:
+    """Build a genuine 011-head cursor and its additive 012-head successor.
+
+    The existing logical path and NULL physical identity stay unchanged; the
+    migration starts its debt and publication tables empty.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "012_codex_conversation_containers"
+
+    if pre.exists():
+        pre.unlink()
+    register_fixture_db(pre)
+    mod = _load_db_module()
+    conn = sqlite3.connect(pre)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        mod._apply_conversations_schema(conn)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        for name in (
+            "001_adopt_schema_version_marker",
+            "002_codex_thread_source_inference_replay",
+            "003_background_mcp_result_replay",
+            "004_codex_find_projection",
+            "005_conversation_account_dimension",
+            "006_backfill_codex_file_touches",
+            "007_codex_find_projection_v2_meta",
+            "008_conversation_render_revision",
+            "009_conversation_title_staging_and_account_stamps",
+            "010_codex_conversation_source_file_identity",
+            "011_conversation_latest_meta_indexes",
+        ):
+            conn.execute(
+                "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+                (name, TS_STATS_FIVE_APPLIED),
+            )
+        conn.execute(
+            "INSERT INTO codex_conversation_source_files "
+            "(path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at, "
+            "source_root_key) VALUES (?,?,?,?,?,?)",
+            ("/fixtures/codex/sessions/2026/10/14/rollout.jsonl",
+             512, 1700000000000000000, 512, TS_STATS_FIVE_APPLIED, ""),
+        )
+        for table in mod._CODEX_968_CONVERSATIONS_TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        for column, _decl in reversed(mod._CODEX_CONTAINER_CURSOR_COLUMNS):
+            conn.execute(
+                f"ALTER TABLE codex_conversation_source_files DROP COLUMN {column}")
+        conn.execute("PRAGMA user_version=11")
+        conn.commit()
+    finally:
+        conn.close()
+
+    if post.exists():
+        post.unlink()
+    import shutil
+    shutil.copy(pre, post)
+    register_fixture_db(post)
+    handler = next(
+        m.handler for m in mod._CONVERSATIONS_MIGRATIONS if m.name == migration
+    )
+    conn = sqlite3.connect(post)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        handler(conn)
+        conn.execute(
+            "INSERT INTO schema_migrations(name,applied_at_utc) VALUES(?,?)",
+            (migration, TS_STATS_FIVE_APPLIED),
+        )
+        conn.execute("PRAGMA user_version=12")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def build_per_migration_002_five_hour_block_projects_backfill_v1(
@@ -8758,6 +8928,9 @@ def main() -> int:
         FIXTURES_ROOT / "per-migration"
         / "048_codex_quota_physical_group_order"
     )
+    build_per_migration_049_codex_rollout_containers(
+        FIXTURES_ROOT / "per-migration" / "049_codex_rollout_containers"
+    )
     build_per_migration_conversations_010_codex_conversation_source_file_identity(
         FIXTURES_ROOT / "per-migration"
         / "conversations_010_codex_conversation_source_file_identity"
@@ -8765,6 +8938,10 @@ def main() -> int:
     build_per_migration_conversations_011_conversation_latest_meta_indexes(
         FIXTURES_ROOT / "per-migration"
         / "conversations_011_conversation_latest_meta_indexes"
+    )
+    build_per_migration_conversations_012_codex_conversation_containers(
+        FIXTURES_ROOT / "per-migration"
+        / "conversations_012_codex_conversation_containers"
     )
     print(f"Wrote fixtures to {FIXTURES_ROOT}")
     return 0

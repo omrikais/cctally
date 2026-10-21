@@ -1566,8 +1566,8 @@ def test_dashboard_soak_prior_schema_artifacts_must_reach_current_heads(tmp_path
         upgrade_temp_parent=tmp_path,
     )
     for name, expected in {
-        "cache-044": (44, 48, 4),
-        "conversations-009": (9, 11, 2),
+        "cache-044": (44, 49, 5),
+        "conversations-009": (9, 12, 3),
     }.items():
         probe = soak._run_upgrade_probe(args, name)
         assert probe["provenance"]["command"]["exitCode"] == 0

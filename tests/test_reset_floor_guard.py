@@ -121,11 +121,17 @@ ALLOWLIST: dict[tuple[str, str], tuple[str, str]] = {
 #: here rather than silently unbounding a cycle.
 SEGMENT_REDUCER_NAMES = frozenset({"latest_usage_by_segment"})
 SEGMENT_BOUNDS_NAMES = frozenset({"segment_capture_bounds"})
+#: #825/#832 fix round K14b (spec revision 6, section 4.7): the fold resolves its
+#: weekly floor through the shared post-floor helper that the statusline
+#: projection also uses, so the chain gained one frame. Both are pinned.
+WEEKLY_AXIS_FLOOR_NAMES = frozenset({"resolve_weekly_axis_floor"})
 
 MUST_CALL_FLOOR: list[tuple[str, str, frozenset]] = [
     ("_cctally_statusline.py",
      "_build_statusline_injections.<locals>._hwm_clamp", FLOOR_NAMES),
-    ("_cctally_journal.py", "_usage_snapshot_fold_decision", FLOOR_NAMES),
+    ("_cctally_journal.py", "_usage_snapshot_fold_decision",
+     WEEKLY_AXIS_FLOOR_NAMES),
+    ("_cctally_journal.py", "resolve_weekly_axis_floor", FLOOR_NAMES),
     ("_cctally_record.py", "_resolve_reset_aware_hwm", FLOOR_NAMES),
     # #750 S4 §2.1 moved this site's floor one frame down. `project`'s read
     # is now per BILLING CYCLE, so the floor has to be resolved per segment
@@ -156,7 +162,16 @@ def _scanned_files() -> list[pathlib.Path]:
     files = [BIN / "cctally"]
     files += sorted(BIN.glob("_cctally_*.py"))
     files += sorted(BIN.glob("_lib_*.py"))
-    return [f for f in files if f.exists()]
+    return [f for f in files if f.exists() and not _is_sql_data_only(f)]
+
+
+# #825/#832 spec 5.6 item 6: the access-contract registry holds the SQL TEXT
+# of every registered strict-path access as DATA (its fingerprints), never
+# executed. It is skipped only while it contains no `execute(` call at all;
+# the moment it gains one, it is scanned like any other source.
+def _is_sql_data_only(path) -> bool:
+    return (path.name == "_lib_detector_access_registry.py"
+            and "execute(" not in path.read_text(encoding="utf-8"))
 
 
 def _qualname(scopes: list[tuple[str, str]]) -> str:

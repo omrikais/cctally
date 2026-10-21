@@ -20,6 +20,7 @@ import sys
 
 import pytest
 
+import _temp_hygiene as _hyg
 from tests import _estate_stub
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -166,6 +167,9 @@ def _copy_python_kernels(bindir, *, validator_body=None, estate_report=None,
     """
     for kernel in sorted(BIN.glob("_lib_test_*.py")):
         shutil.copy2(kernel, bindir / kernel.name)
+    # The quarantine applier parses tests/quarantine.json through this one
+    # shared parser (test regime reset, session 2).
+    shutil.copy2(BIN / "_lib_quarantine.py", bindir / "_lib_quarantine.py")
     # #648 D10. The glob acquires the estate checker, and a scratch tree records
     # no artifact for it to compare against. `estate_legs` is how the one case
     # that asserts the two pytest execution legs declares them, since the
@@ -407,11 +411,17 @@ def _git_commit_all(repo, message):
 def _admit(runner, env_overrides=None):
     """Drive the runner past plan mode so admission actually runs. Admission
     precedes LOGDIR creation, so a refusal never reaches the harness pool."""
-    env = {"PATH": os.environ["PATH"], "CCTALLY_TEST_JOBS": "1"}
+    # #963 J4: <parent>/<repo>/bin/cctally-test-all; the child's suite
+    # generation lies inside the test's allocation and is removed after.
+    parent = pathlib.Path(runner).parents[2]
+    env = _hyg.child_aggregator_env(
+        {"PATH": os.environ["PATH"], "CCTALLY_TEST_JOBS": "1"}, parent)
     env.update(env_overrides or {})
-    return subprocess.run(
+    proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
+    _hyg.reclaim_child_generations(parent)
+    return proc
 
 
 def test_non_executable_test_remote_is_a_manifest_admission_error(tmp_path):
@@ -568,12 +578,13 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
     )
     fake_python.chmod(0o755)
 
-    env = {
+    # #963 J4: the child's TMPDIR lies inside this test's allocation.
+    env = _hyg.child_aggregator_env({
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "CCTALLY_FAKE_PYTHON_LOG": str(calls),
         "CCTALLY_REAL_PYTHON3": sys.executable,
         "CCTALLY_TEST_JOBS": "2",
-    }
+    }, tmp_path)
     env.update(extra_env or {})
     return runner, calls, env
 
@@ -584,6 +595,7 @@ def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
     proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
+    _hyg.reclaim_child_generations(tmp_path)
 
     assert proc.returncode == 0, proc.stderr
     invocations = calls.read_text(encoding="utf-8").splitlines()
@@ -630,6 +642,7 @@ def test_both_legs_are_built_from_the_execution_declaration(tmp_path):
     proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
+    _hyg.reclaim_child_generations(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     bulk, benchmark = calls.read_text(encoding="utf-8").splitlines()
     assert "--ignore=tests/test_moved_benchmark.py" in bulk
@@ -654,6 +667,7 @@ def test_pytest_addopts_does_not_reach_either_execution_leg(tmp_path):
     proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
+    _hyg.reclaim_child_generations(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     for line in calls.read_text(encoding="utf-8").splitlines():
         assert line.startswith("ADDOPTS=[] "), line
@@ -677,6 +691,7 @@ def test_the_durations_variable_is_the_supported_route_addopts_used_to_be(
     proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
+    _hyg.reclaim_child_generations(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     for line in calls.read_text(encoding="utf-8").splitlines():
         assert "--durations=0" in line, line
@@ -1483,3 +1498,83 @@ def test_a_tier_plan_writes_no_bytecode_into_the_tree_it_reads(tmp_path):
     assert _kv(p.stdout)["tier_omitted"].split(), p.stdout
     caches = sorted(str(x.relative_to(repo)) for x in repo.rglob("__pycache__"))
     assert caches == [], caches
+
+
+# ---------------------------------------------------------------- the quarantine list (reset session 1)
+# Moved from tests/test_merge_gate.py (test regime reset session 2, Codex Q7):
+# full-run expected-leg filtering is test-all behaviour, not the merge selector's.
+QUARANTINE_OBSERVER = '''\
+import os, pathlib, sys
+argv = sys.argv[1:]
+deselected = [a.split("=", 1)[1] for a in argv if a.startswith("--deselect=")]
+deselected += [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--deselect"]
+observed = pathlib.Path(os.environ["CCTALLY_ESTATE_OBSERVED_DIR"])
+declared = pathlib.Path(os.environ["QUARANTINE_LEGS"]) / (observed.name + ".txt")
+# pytest's own --deselect semantics: a prefix match on the node id.
+kept = [n for n in declared.read_text().split() if not n.startswith(tuple(deselected))]
+observed.mkdir(parents=True, exist_ok=True)
+(observed / "fake.txt").write_text("".join(n + "\\n" for n in kept))
+print("%d passed in 0.01s" % len(kept))
+'''
+
+
+def _quarantine_entry(node):
+    return {'id': node, 'evidence': 'inconsistent on unchanged code', 'invariant': 'x',
+            'issue': '#1', 'replacement': 'none needed', 'reviewBy': '2026-10-27'}
+
+
+def _quarantine_tree(tmp_path, quarantine):
+    """A full run whose fake pytest collects each declared leg minus what it was
+    told to deselect, exactly as the real observer plugin records it."""
+    legs = [
+        {'name': 'pytest', 'selectors': [],
+         'nodes': ['tests/test_alpha.py::test_kept', 'tests/test_alpha.py::test_flaky']},
+        {'name': 'benchmark', 'selectors': [['file', 'tests/test_rebuild_benchmark.py']],
+         'nodes': ['tests/test_rebuild_benchmark.py::test_slow[one]',
+                   'tests/test_rebuild_benchmark.py::test_slow[two]',
+                   'tests/test_rebuild_benchmark.py::test_other']},
+    ]
+    declared = tmp_path / 'declared-legs'
+    declared.mkdir()
+    for leg in legs:
+        (declared / (leg['name'] + '.txt')).write_text(''.join(n + '\n' for n in leg['nodes']))
+    observer = tmp_path / 'observer.py'
+    observer.write_text(QUARANTINE_OBSERVER)
+    runner, calls, env = _fake_pytest_tree(tmp_path, legs=legs, extra_env={
+        'QUARANTINE_LEGS': str(declared), 'QUARANTINE_OBSERVER': str(observer)})
+    fake = tmp_path / 'fake-bin/python3'
+    text = fake.read_text()
+    old = '>> "$CCTALLY_FAKE_PYTHON_LOG"\n    exit 0\n'
+    assert old in text, text
+    fake.write_text(text.replace(old, '>> "$CCTALLY_FAKE_PYTHON_LOG"\n'
+                                 '    exec "$CCTALLY_REAL_PYTHON3" "$QUARANTINE_OBSERVER" "$@"\n'))
+    if quarantine is not None:
+        (runner.parent.parent / 'tests/quarantine.json').write_text(json.dumps(quarantine))
+    return runner, calls, env
+
+
+def test_quarantined_nodes_leave_the_expected_legs(tmp_path):
+    # Review Focus 3: a node deselected from a leg but still in that leg's
+    # expected list would fail the observed-collection check with
+    # manifest-missing-pytest-node. The listed nodes are deselected from both
+    # legs (a prefix id covers every parameter) and the run stays green.
+    runner, calls, env = _quarantine_tree(tmp_path, [
+        _quarantine_entry('tests/test_alpha.py::test_flaky'),
+        _quarantine_entry('tests/test_rebuild_benchmark.py::test_slow')])
+    proc = subprocess.run([str(runner)], env=env, text=True, capture_output=True, timeout=60)
+    _hyg.reclaim_child_generations(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert 'manifest-missing-pytest-node' not in proc.stdout + proc.stderr
+    bulk, benchmark = calls.read_text().splitlines()
+    assert '--deselect=tests/test_alpha.py::test_flaky' in bulk, bulk
+    assert '--deselect=tests/test_rebuild_benchmark.py::test_slow' in benchmark, benchmark
+
+
+def test_a_tree_without_a_quarantine_list_deselects_nothing(tmp_path):
+    # The public mirror may carry no list: nothing is deselected and the
+    # full declared legs are expected and collected.
+    runner, calls, env = _quarantine_tree(tmp_path, None)
+    proc = subprocess.run([str(runner)], env=env, text=True, capture_output=True, timeout=60)
+    _hyg.reclaim_child_generations(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert '--deselect=tests/test_alpha.py' not in calls.read_text()

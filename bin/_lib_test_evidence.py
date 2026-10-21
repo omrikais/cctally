@@ -10,17 +10,28 @@ That import is not written yet — this module lands ahead of the aggregator
 work that consumes it — so treat the dependency as the reason for the
 placement rather than as a description of the current tree.
 
-ONE exception to "pure functions only", recorded rather than quietly taken:
-`merge_duration_legs` (#630 S1, F3) reads the two per-leg duration files and
-publishes the merged artifact. It lives here because it is evidence-artifact
-handling, which this module already owns, and because the aggregator's own
-embedded Python is not importable — logic placed there could only ever be
-tested end to end. Its decision logic is factored into `_merge_duration_plan`,
-which is pure and takes the decoded legs.
+Exceptions to "pure functions only", recorded rather than quietly taken:
+
+- `merge_duration_legs` (#630 S1, F3) reads the two per-leg duration files and
+  publishes the merged artifact. It lives here because it is evidence-artifact
+  handling, which this module already owns, and because the aggregator's own
+  embedded Python is not importable — logic placed there could only ever be
+  tested end to end. Its decision logic is factored into
+  `_merge_duration_plan`, which is pure and takes the decoded legs.
+- The evidence-store functions (#940, contract C8) read and atomically write
+  one retention record or the internal evidence index each:
+  `seed_retention_record`, `read_evidence_index`, `update_evidence_index`,
+  `record_store_loss`, `forget_indexed_runs` and `verify_indexed_runs` (which
+  also reads the indexed run files). Their policy (`retention_store`,
+  `carried_seeded_loss`, `retention_coverage`) stays pure. The index writers
+  take no lock of their own: a caller that can race another writer passes
+  `lock`, a context manager held over the whole read-modify-write, and the
+  lock's layout stays with that caller.
 """
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -2514,6 +2525,9 @@ def _merge_duration_plan(legs):
             "populationWhole": whole,
             "records": len(records),
             "declaredRecords": (footer or {}).get("records"),
+            # Reporting only: timestamps never decide population completeness.
+            # Historical artifacts without this metadata remain readable.
+            "lifecycle": (footer or {}).get("lifecycle"),
         })
         ordered.extend(records)
     ordered.sort(key=lambda r: (
@@ -2585,3 +2599,247 @@ def render_retention_notice(plan) -> str:
         f"({passes} pass, {fails} fail){reason_clause}; "
         f"{len(plan.get('gaps') or [])} coverage gaps{tail}"
     )
+
+
+# ------------------------------------------------ evidence store identity and loss
+#
+# A second recorded exception to "pure functions only": the record seeding
+# and the internal evidence index below read and atomically replace small
+# JSON files, because the runner's enrollment and the aggregator's retention
+# pass must share one implementation of their shape (#940, contract C8).
+# Python 3.9 compatible: the runner tooling imports these functions.
+
+LEGACY_STORE = "legacy"
+EVIDENCE_INDEX_SCHEMA = 1
+
+
+def _write_json_atomic(path, doc, mode=0o644):
+    """Temporary sibling, fsync, rename, fsync of the parent directory."""
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(parent, ".%s.tmp-%d" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.rename(tmp, path)
+    dfd = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _read_json_or_none(path):
+    try:
+        with open(path, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+    except FileNotFoundError:
+        return None
+
+
+def retention_store(record):
+    """The store identity a retention record belongs to; `legacy` when absent."""
+    if isinstance(record, dict) and record.get("store"):
+        return record["store"]
+    return LEGACY_STORE
+
+
+def _loss_key(entry):
+    return (entry.get("start"), entry.get("end"), entry.get("reason"))
+
+
+def seed_retention_record(record_path, *, store_id, loss):
+    """Seed a new evidence store's retention record before its first run.
+
+    The record carries `store` and the seeded loss intervals (each
+    `{"start": iso, "end": iso | None, "reason": text}`), and stays
+    `coverage: degraded` while any is present. Seeding the same store again
+    merges the intervals; a record that belongs to another store is refused,
+    so drive B's passes never collide with drive A's.
+    """
+    previous = _read_json_or_none(record_path)
+    if previous is not None and retention_store(previous) != store_id:
+        raise ValueError("retention record %s belongs to store %s, not %s"
+                         % (record_path, retention_store(previous), store_id))
+    record = dict(previous) if isinstance(previous, dict) else {
+        "schemaVersion": 1, "passes": 0, "gaps": [], "retainedRuns": 0}
+    merged = list(record.get("seededLoss") or [])
+    seen = {_loss_key(e) for e in merged}
+    for entry in loss or ():
+        item = {"start": entry.get("start"), "end": entry.get("end"),
+                "reason": entry.get("reason")}
+        if _loss_key(item) not in seen:
+            merged.append(item)
+            seen.add(_loss_key(item))
+    record["store"] = store_id
+    record["seededLoss"] = merged
+    record["coverage"] = retention_coverage(
+        gaps=record.get("gaps") or [], orphans=int(record.get("orphanDirs") or 0),
+        seeded_loss=merged)
+    _write_json_atomic(record_path, record)
+    return record
+
+
+_ISO_INSTANT = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?"
+                          r"(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def _iso_epoch(value):
+    """Epoch seconds of an ISO-8601 instant: whole or fractional seconds,
+    with a `Z`, a `+HH:MM`/`-HH:MM` offset, or none (read as UTC)."""
+    import datetime
+    m = _ISO_INSTANT.match(str(value).strip())
+    if not m:
+        raise ValueError("not an ISO-8601 instant: %r" % (value,))
+    base = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(
+        tzinfo=datetime.timezone.utc).timestamp()
+    if m.group(2):
+        base += float(m.group(2))
+    zone = m.group(3)
+    if zone and zone != "Z":
+        digits = zone[1:].replace(":", "")
+        offset = int(digits[:2]) * 3600 + int(digits[2:]) * 60
+        base -= offset if zone[0] == "+" else -offset
+    return base
+
+
+def carried_seeded_loss(previous, now_epoch, max_age_days=DEFAULT_MAX_AGE_DAYS):
+    """The seeded loss a later retention pass preserves: every interval that
+    has not aged out of the retention horizon (an open interval never does)."""
+    if not isinstance(previous, dict):
+        return []
+    horizon = now_epoch - (max_age_days * 86400)
+    kept = []
+    for entry in previous.get("seededLoss") or []:
+        end = entry.get("end")
+        if end is None or _iso_epoch(end) >= horizon:
+            kept.append(entry)
+    return kept
+
+
+def retention_coverage(*, gaps, orphans, seeded_loss):
+    """`degraded` while any gap, orphan or seeded loss is present."""
+    return "degraded" if (gaps or orphans or seeded_loss) else "complete"
+
+
+def read_evidence_index(path):
+    """The internal evidence index, `{"schema": 1, "stores": {...}}`."""
+    doc = _read_json_or_none(path)
+    if doc is None:
+        return {"schema": EVIDENCE_INDEX_SCHEMA, "stores": {}}
+    if not isinstance(doc, dict) or doc.get("schema") != EVIDENCE_INDEX_SCHEMA:
+        raise ValueError("evidence index %s is not schema %d" % (path, EVIDENCE_INDEX_SCHEMA))
+    doc.setdefault("stores", {})
+    return doc
+
+
+def _writer_lock(lock):
+    """The caller's writer lock, required (#940, C8 and D0b). The kernel names
+    no lock layout, so each caller owns its locking: a writer that can race
+    another passes the lock they share, and a sole writer (a test, a
+    single-threaded seeding) says so with `contextlib.nullcontext()`. A missing
+    lock is refused rather than run unlocked."""
+    if lock is None:
+        raise TypeError("an evidence index writer needs its caller's lock: pass lock=, "
+                        "or contextlib.nullcontext() for a sole writer")
+    return lock
+
+
+def _store_entry(doc, store_id):
+    return doc["stores"].setdefault(store_id, {"runs": [], "loss": []})
+
+
+def update_evidence_index(path, *, store_id, run_id, started_at, ended_at, length, digest,
+                          relpath=None, lock):
+    """Record one run's expected length and digest under its store, for loss
+    detection. `relpath` (relative to the store's evidence root) locates the
+    indexed file; without it `verify_indexed_runs` looks for
+    `<remote_dir>/<run_id>/manifest.json`. `lock` is the caller's writer lock,
+    held over the read-modify-write."""
+    lock = _writer_lock(lock)
+    if not validate_run_id(run_id):
+        raise ValueError(f"unsafe run id: {run_id!r}")
+    with lock:
+        doc = read_evidence_index(path)
+        entry = _store_entry(doc, store_id)
+        run = {"runId": run_id, "startedAt": started_at, "endedAt": ended_at,
+               "length": int(length), "digest": digest}
+        if relpath is not None:
+            run["relpath"] = relpath
+        entry["runs"] = [r for r in entry["runs"] if r.get("runId") != run_id] + [run]
+        _write_json_atomic(path, doc, mode=0o600)
+    return run
+
+
+def record_store_loss(path, *, store_id, start, end, reason, lock):
+    """Record a loss interval for a store (a failed drive, a detected loss),
+    under the caller's writer `lock`."""
+    with _writer_lock(lock):
+        doc = read_evidence_index(path)
+        entry = _store_entry(doc, store_id)
+        item = {"start": start, "end": end, "reason": reason}
+        if _loss_key(item) not in {_loss_key(e) for e in entry["loss"]}:
+            entry["loss"].append(item)
+        _write_json_atomic(path, doc, mode=0o600)
+    return item
+
+
+def forget_indexed_runs(path, *, store_id, run_ids, lock):
+    """Drop `run_ids` from a store's indexed runs (runs retention evicted on
+    purpose, and runs whose loss was just recorded), under the caller's writer
+    `lock`. A store, or a set, with nothing to drop leaves the file untouched."""
+    lock = _writer_lock(lock)
+    run_ids = set(run_ids or ())
+    if not run_ids:
+        return
+    with lock:
+        doc = read_evidence_index(path)
+        entry = doc["stores"].get(store_id)
+        if not entry:
+            return
+        kept = [r for r in entry.get("runs") or [] if r.get("runId") not in run_ids]
+        if len(kept) == len(entry.get("runs") or []):
+            return
+        entry["runs"] = kept
+        _write_json_atomic(path, doc, mode=0o600)
+
+
+def _indexed_file(root, run):
+    if run.get("relpath"):
+        return os.path.join(root, run["relpath"])
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return None
+    for name in names:
+        candidate = os.path.join(root, name, run["runId"], "manifest.json")
+        if os.path.lexists(candidate):
+            return candidate
+    return None
+
+
+def verify_indexed_runs(path, *, store_id, root):
+    """Indexed runs of `store_id` whose file under `root` is missing, shorter
+    than recorded (truncated) or different (digest), each as
+    `{"runId", "kind", "expected", "found"}`. No pre-seeded flag is read."""
+    doc = read_evidence_index(path)
+    out = []
+    for run in (doc["stores"].get(store_id) or {}).get("runs") or []:
+        target = _indexed_file(root, run)
+        if target is None or not os.path.isfile(target):
+            out.append({"runId": run["runId"], "kind": "missing", "expected": run["length"],
+                        "found": None})
+            continue
+        with open(target, "rb") as fh:
+            data = fh.read()
+        if len(data) < run["length"]:
+            kind = "truncated"
+        elif "sha256:" + hashlib.sha256(data).hexdigest() != run["digest"]:
+            kind = "digest"
+        else:
+            continue
+        out.append({"runId": run["runId"], "kind": kind, "expected": run["length"],
+                    "found": len(data)})
+    return out

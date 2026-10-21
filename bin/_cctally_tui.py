@@ -348,6 +348,10 @@ def _fetch_current_week_snapshots(*args, **kwargs):
     return sys.modules["cctally"]._fetch_current_week_snapshots(*args, **kwargs)
 
 
+def _current_week_five_hour_reading(*args, **kwargs):
+    return sys.modules["cctally"]._current_week_five_hour_reading(*args, **kwargs)
+
+
 def _load_forecast_inputs(*args, **kwargs):
     return sys.modules["cctally"]._load_forecast_inputs(*args, **kwargs)
 
@@ -1682,12 +1686,14 @@ def _tui_build_current_week(
     # controls decoration, not the physical population used for computation.
     # Cost and forecast retain their existing merged semantics.
     fetched = _fetch_current_week_snapshots(
-        conn, now_utc, include_held=True, include_account=True)
+        conn, now_utc, include_held=True, include_account=True,
+        include_scope=True)
     if fetched is None:
         return None
-    week_start_at, week_end_at, observations = fetched
+    week_start_at, week_end_at, observations, week_scope = fetched
     if not observations:
         return None
+    week_start_before_override = week_start_at
     # Mirror the reset override applied by `_load_forecast_inputs` so the
     # Current Week card's spent_usd and $/1% reflect the post-reset window.
     week_start_at, observations = _apply_midweek_reset_override(
@@ -1698,8 +1704,8 @@ def _tui_build_current_week(
     # Held-inclusive sample shape: (captured_at_utc, weekly_percent,
     # five_hour_percent, weekly_observation_held[, account_key]). The optional
     # account key identifies the displayed weekly sample on a decorated store.
-    # The helper does not surface five_hour_resets_at, so do a targeted lookup
-    # below for the freshest non-NULL reset timestamp on the current week.
+    # The helper does not surface five_hour_resets_at; the five-hour reading
+    # selected below supplies it, with its percentage.
     #
     # #769 S11 (#824). This card publishes BOTH axes, and the dashboard
     # envelope reads `used_pct` and `latest_snapshot_at` straight off it for
@@ -1716,10 +1722,16 @@ def _tui_build_current_week(
     used_pct = float(latest[1])
     weekly_account = latest[4]
     # Five-hour readings may be newer held observations, but must remain on
-    # the account that supplied the displayed weekly reading.
-    five_hour_samples = [s for s in observations if s[4] == weekly_account]
-    five_hr_raw = five_hour_samples[-1][2]
-    five_hr_pct = float(five_hr_raw) if five_hr_raw is not None else None
+    # the account that supplied the displayed weekly reading. The reading is
+    # the newest five-hour READING under this card's own week and as-of scope
+    # (#825/#832 spec 4.7 revision 7, the one shared selection): the newest
+    # sample can be a retired replica or a weekly-only reading, which carries
+    # no five-hour value and used to render as 0 %.
+    five_hour = _current_week_five_hour_reading(
+        conn, now_utc, week_scope, account_key=weekly_account,
+        week_start_at=week_start_at,
+        week_start_before_override=week_start_before_override)
+    five_hr_pct = None if five_hour is None else five_hour.percent
     # #556 S1 §3.3: one walk yields both halves. The range is whatever
     # `spent_usd` already used — taken AFTER `_apply_midweek_reset_override`
     # above, so a mid-week reset shortens the accumulation and the published
@@ -1738,47 +1750,23 @@ def _tui_build_current_week(
     used_pct_corrected = corrected_percent_point(used_pct)
     dpp_divisor = used_pct if used_pct_corrected is None else used_pct_corrected
     dpp = (spent / dpp_divisor) if used_pct > 0 else None
-    # Collect every textual variant of week_start_at that parses to the same
-    # instant — mirrors `_fetch_current_week_snapshots` lines 9199-9210 so
-    # legacy local-offset rows and newly UTC-canonicalized rows both contribute.
-    ws_texts = conn.execute(
-        "SELECT DISTINCT week_start_at FROM weekly_usage_snapshots "
-        "WHERE week_start_at IS NOT NULL"
-    ).fetchall()
-    matching_ws_texts: list[str] = []
-    for r in ws_texts:
-        try:
-            rws = parse_iso_datetime(r[0], "week_start_at")
-        except ValueError:
-            continue
-        if rws == week_start_at:
-            matching_ws_texts.append(r[0])
+    # The reset instant comes from the SAME reading as the percentage beside
+    # it (#825/#832 spec 4.7 revision 7: the shared selection returns the
+    # percent and the reset together from one row), so the countdown never
+    # describes another row. That reading is held-inclusive (#769 S11, #824),
+    # because a held row's five-hour fields are the writing tick's own.
     five_hr_resets_at: dt.datetime | None = None
-    if matching_ws_texts:
-        placeholders = ",".join("?" * len(matching_ws_texts))
-        # HELD-INCLUSIVE, deliberately (#769 S11, #824): the reset instant is a
-        # five-hour fact, and a held row's five-hour fields are the writing
-        # tick's own. Excluding held rows here would make the countdown lag the
-        # five-hour percentage rendered beside it.
-        reset_row = conn.execute(
-            f"SELECT five_hour_resets_at FROM weekly_usage_snapshots "
-            f"WHERE week_start_at IN ({placeholders}) "
-            f"  AND five_hour_resets_at IS NOT NULL "
-            f"  AND account_key = ? "
-            f"ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
-            tuple(matching_ws_texts) + (weekly_account,),
-        ).fetchone()
-        if reset_row is not None:
-            try:
-                five_hr_resets_at = parse_iso_datetime(
-                    reset_row[0], "five_hour_resets_at"
-                )
-            except ValueError:
-                five_hr_resets_at = None
-            # Suppress stale resets that have already elapsed so renderers
-            # don't show "resets 0h 00m" or a negative duration at the boundary.
-            if five_hr_resets_at is not None and five_hr_resets_at <= now_utc:
-                five_hr_resets_at = None
+    if five_hour is not None and five_hour.resets_at is not None:
+        try:
+            five_hr_resets_at = parse_iso_datetime(
+                five_hour.resets_at, "five_hour_resets_at"
+            )
+        except ValueError:
+            five_hr_resets_at = None
+        # Suppress stale resets that have already elapsed so renderers
+        # don't show "resets 0h 00m" or a negative duration at the boundary.
+        if five_hr_resets_at is not None and five_hr_resets_at <= now_utc:
+            five_hr_resets_at = None
     # Freshness — compute label/age from latest snapshot vs. now using the
     # configured oauth_usage thresholds. Mirrors the dashboard envelope's
     # cw_freshness derivation in `snapshot_to_envelope`. Refs spec §3.4.
@@ -6878,7 +6866,6 @@ def _tui_panel_current_week(
     bar_fill = _tui_bar_string(cw.used_pct, bar_w)
 
     five = cw.five_hour_pct or 0.0
-    five_bar = _tui_bar_string(five, bar_w)
 
     reset_delta = cw.week_end_at - snap.generated_at
     reset_days = max(0, reset_delta.days)
@@ -6914,6 +6901,17 @@ def _tui_panel_current_week(
                 for c in fh_credits
             )
             fh_credit_badge = f" {{bright}}⚡ {deltas}{{/}}"
+    # The 5-hour row is " 5-hour " (8 cells) + bar + " NNN%" (5) + badge, and
+    # it must fit the panel interior (width - 2). A bar of the Used row's width
+    # leaves five cells, while the badge's wide ⚡ glyph alone costs two, so a
+    # badge shortens the 5-hour bar instead of spilling into the next panel.
+    # It also leaves one blank cell before the right border, as every other
+    # row of the panel does.
+    five_w = bar_w
+    if fh_credit_badge:
+        badge_cells = _tui_lines_to_text([fh_credit_badge]).cell_len
+        five_w = max(10, min(bar_w, width - 2 - 13 - badge_cells - 1))
+    five_bar = _tui_bar_string(five, five_w)
     lines = [
         "",
         f" Used   {{{used_cls}}}{bar_fill}{{/}} {{{used_cls}.b}}{cw.used_pct:>5.1f}%{{/}}",
@@ -7648,7 +7646,13 @@ def _tui_tagged_box_lines(
     When a body line's plain length exceeds the interior width it is truncated
     with ``{/}`` appended as a safety net — callers should size their content
     to avoid this branch.
+
+    Lengths are terminal CELLS, not characters: a wide glyph such as the
+    5-hour credit badge's ``⚡`` is one character but two cells, and padding
+    by characters pushed that row's right border one cell out of the box
+    (#825/#832, UI-QA of fix round K16c).
     """
+    from rich.cells import cell_len, set_cell_size
     H, V = _TUI_BOX["h"], _TUI_BOX["v"]
     TL, TR, BL, BR = _TUI_BOX["tl"], _TUI_BOX["tr"], _TUI_BOX["bl"], _TUI_BOX["br"]
     interior = width - 2
@@ -7662,12 +7666,12 @@ def _tui_tagged_box_lines(
         t_seg = f" {title} " if title else ""
         p_seg = f" {pin} " if pin else ""
         if title and pin:
-            fill = width - 4 - len(_tui_strip_tags(t_seg)) - len(_tui_strip_tags(p_seg))
+            fill = width - 4 - cell_len(_tui_strip_tags(t_seg)) - cell_len(_tui_strip_tags(p_seg))
             if fill >= 1:
                 return (_wrap_border(TL + H) + t_seg
                         + _wrap_border(H * fill) + p_seg + _wrap_border(H + TR))
         if title:
-            fill = width - 3 - len(_tui_strip_tags(t_seg))
+            fill = width - 3 - cell_len(_tui_strip_tags(t_seg))
             if fill >= 1:
                 return _wrap_border(TL + H) + t_seg + _wrap_border(H * fill + TR)
         return _wrap_border(TL + H * interior + TR)
@@ -7675,14 +7679,14 @@ def _tui_tagged_box_lines(
     lines: list[str] = [_top()]
     for line in body_tagged:
         plain = _tui_strip_tags(line)
-        if len(plain) > interior:
+        if cell_len(plain) > interior:
             # On overflow, drop color markup entirely — partial-tag truncation
             # would produce malformed tokens that crash _tui_colortag. Plain-
             # text is always safe, and callers are expected to size content
             # to fit (this branch is a safety net only).
-            line = plain[: max(0, interior - 1)] + "…"
+            line = set_cell_size(plain, max(0, interior - 1)) + "…"
             plain = line
-        pad = interior - len(plain)
+        pad = interior - cell_len(plain)
         lines.append(_wrap_border(V) + line + " " * pad + _wrap_border(V))
     lines.append(_wrap_border(BL + H * interior + BR))
     return lines

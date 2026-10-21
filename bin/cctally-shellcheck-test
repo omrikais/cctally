@@ -6,6 +6,10 @@
 # real-tree leg proves the checked-out shell estate itself is clean.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Universal harness isolation: keep dev-checkout path detection and detached
 # post-command workers out of synthetic HOME fixtures.
@@ -18,7 +22,7 @@ SHELLCHECK_BIN=${SHELLCHECK_BIN:-$(command -v shellcheck 2>/dev/null || true)}
 
 pass_count=0
 fail_count=0
-SCRATCH_DIR=$(mktemp -d -t cctally-shellcheck-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-shellcheck-XXXXXX") || exit 1
 
 cleanup_on_exit () {
     local rc=$?

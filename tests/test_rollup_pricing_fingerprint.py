@@ -26,7 +26,6 @@ import pytest
 from conftest import (  # type: ignore
     load_script,
     redirect_paths,
-    redirect_paths_without_conversation_retention,
 )
 
 FLAG = "conversation_sessions_backfill_pending"
@@ -120,7 +119,7 @@ def _synced_retained(tmp_path, monkeypatch, *, model="claude-opus-4-8"):
     reports fixture expiry as a pricing-authorization defect.
     """
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     _bin_on_path(ns)
     import _cctally_cache as cache
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"

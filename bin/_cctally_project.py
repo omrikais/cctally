@@ -58,9 +58,11 @@ def _cctally():
 #: Why modelled quota is not published for a week or a whole run. A closed
 #: set. `account-not-resolved` is the run-level one (§5.3); the rest are
 #: per-week and are the reasons that week fell back to the cost share.
+#: `unvalidated-coefficient-era` is `apply_regime`'s rejection of a week
+#: outside the stored regime's coefficient era (#978 spec 4.6).
 ATTRIBUTION_CAUSES = ("account-not-resolved", "calibration-absent",
                       "regime-boundary", "unsupported-composition",
-                      "no-local-history")
+                      "no-local-history", "unvalidated-coefficient-era")
 
 #: The three bases a row or a run can carry.
 ATTRIBUTION_BASES = ("modelled", "cost-share", "withheld")
@@ -219,7 +221,8 @@ def resolve_week_attribution(regime, records, *, week_start, week_end):
             and week_end > regime.effective_until:
         return WeekAttribution("cost-share", "regime-boundary", None)
     qcg = _cctally()._load_sibling("_cctally_quota_calibration")
-    applied = qcg.apply_regime(regime, list(records))
+    applied = qcg.apply_regime(regime, list(records),
+                               interval=(week_start, week_end))
     if isinstance(applied, qcg.ApplyRejection):
         return WeekAttribution("cost-share", applied.value, None)
     return WeekAttribution("modelled", None, regime.units_per_point)
@@ -282,6 +285,9 @@ _ATTRIBUTION_CAUSE_COPY: dict = {
     "unsupported-composition":
         "the week's model mix sits outside the calibration's support",
     "no-local-history": "no local entries to model",
+    "unvalidated-coefficient-era":
+        "the week is not inside the coefficient era the calibration's token "
+        "weights are validated for",
     RESIDUAL_MISALIGNED:
         "the account, the window or the population does not align",
     RESIDUAL_OBSERVED_ABSENT:

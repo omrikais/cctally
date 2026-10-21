@@ -171,7 +171,10 @@ CARD_DIGESTS = {
     "claude-sonnet-5":
         "184b8281376b30d1c612040274997cd45350d92cd80b4f0d42618d5c4c4b2c88",
     "claude-sonnet-5-5":
-        "184b8281376b30d1c612040274997cd45350d92cd80b4f0d42618d5c4c4b2c88",
+        # #936: intentional $0.10/MTok cache-read cut, recaptured on c9c0896e2.
+        # Restoring only the old read rate reproduces the merge-base digest;
+        # every other card and the complete grid remain unchanged.
+        "9f787b76753dbf9ef74acc3fe6c8358737a270500206c62b54e9a27137910f6a",
 }
 
 _INPUTS = (0, 7, 300_000)

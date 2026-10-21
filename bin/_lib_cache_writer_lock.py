@@ -12,18 +12,28 @@ import fcntl
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 
 def acquire_ordered_flocks(
     locks: list[tuple[Path, int]],
     *,
     timeout: float | None = None,
+    on_failure: Callable[[Path, BaseException], None] | None = None,
 ) -> list[int] | None:
-    """Acquire ``(path, LOCK_SH|LOCK_EX)`` entries in caller-supplied order."""
+    """Acquire ``(path, LOCK_SH|LOCK_EX)`` entries in caller-supplied order.
+
+    ``on_failure(path, exc)``, when given, is told which lock the set lost to
+    before this returns None (``exc`` a ``BlockingIOError``: the lock was
+    held) or re-raises an ``OSError`` (an I/O error no holder caused), so a
+    caller can wait for exactly that lock's release (#825/#832).
+    """
     deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
     held: list[int] = []
+    current: Path | None = None
     try:
         for path, mode in locks:
+            current = path
             fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
             os.fchmod(fd, 0o600)
             held.append(fd)
@@ -31,14 +41,18 @@ def acquire_ordered_flocks(
                 try:
                     fcntl.flock(fd, mode | fcntl.LOCK_NB)
                     break
-                except BlockingIOError:
+                except BlockingIOError as exc:
                     if deadline is None or time.monotonic() >= deadline:
                         release_cache_writer_flocks(held)
+                        if on_failure is not None:
+                            on_failure(path, exc)
                         return None
                     time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
         return held
-    except BaseException:
+    except BaseException as exc:
         release_cache_writer_flocks(held)
+        if on_failure is not None and current is not None and isinstance(exc, OSError):
+            on_failure(current, exc)
         raise
 
 
@@ -47,6 +61,7 @@ def acquire_cache_writer_flocks(
     provider_path: Path | None = None,
     *,
     timeout: float | None = None,
+    on_failure: Callable[[Path, BaseException], None] | None = None,
 ) -> list[int] | None:
     """Acquire global then optional provider flock, or return ``None``.
 
@@ -61,6 +76,7 @@ def acquire_cache_writer_flocks(
     return acquire_ordered_flocks(
         [(path, fcntl.LOCK_EX) for path in paths],
         timeout=timeout,
+        on_failure=on_failure,
     )
 
 

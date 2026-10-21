@@ -19,8 +19,7 @@ import sys
 
 import pytest
 
-from conftest import (load_script, redirect_paths,
-                      redirect_paths_without_conversation_retention)
+from conftest import (load_script, redirect_paths)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "bin"
@@ -993,6 +992,44 @@ def test_session_a_injected_taxonomy_and_turn_correlation_kernel():
         "agents", "environment"]
 
 
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
+
+
 # ── Task 4: ingest integration ───────────────────────────────────────────────
 
 
@@ -1035,8 +1072,9 @@ def _split_namespace(ns, monkeypatch):
 def _stage_codex_provider(tmp_path, monkeypatch, scenarios):
     """Stage one Codex provider root with the given scenarios as rollout files."""
     ns = load_script()
-    # Normalization and replay assertions use fixed corpus dates, independent of age.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
     provider_root = tmp_path / "provider"
     rollouts = {}
     for scenario in scenarios:
@@ -1316,6 +1354,15 @@ def test_rebuild_with_empty_root_preserves_all_three_normalized_tables(
 def test_orphan_prune_repairs_rollups_and_survivor_stays_searchable(tmp_path, monkeypatch):
     ns, _root, rollouts = _stage_codex_provider(
         tmp_path, monkeypatch, ["modern-full", "mirror-pairing"])
+    conversation_passes = []
+    sync_conversations = ns["sync_codex_conversations"]
+
+    def observe_conversations(*args, **kwargs):
+        stats = sync_conversations(*args, **kwargs)
+        conversation_passes.append(stats)
+        return stats
+
+    monkeypatch.setitem(ns, "sync_codex_conversations", observe_conversations)
     conn = ns["open_cache_db"]()
     try:
         ns["sync_codex_cache"](conn)
@@ -1323,7 +1370,14 @@ def test_orphan_prune_repairs_rollups_and_survivor_stays_searchable(tmp_path, mo
             "SELECT COUNT(*) FROM codex_conversation_rollups").fetchone()[0] == 2
         # Delete conversation A (mirror-pairing) from disk -> orphan prune.
         rollouts["mirror-pairing"].unlink()
-        ns["sync_codex_cache"](conn)
+        foreground = ns["sync_codex_cache"](conn)
+        assert foreground.files_pruned == 0
+        assert conversation_passes[-1].files_pruned == 0
+        cache = sys.modules["_cctally_cache"]
+        assert cache.run_codex_prune_drain(
+            wait_for_requests=False).identities_deleted == 1
+        assert cache.run_codex_conversation_prune_drain(
+            wait_for_requests=False).identities_deleted == 1
         assert conn.execute(
             "SELECT COUNT(*) FROM codex_conversation_rollups").fetchone()[0] == 1
         assert conn.execute(
@@ -8825,8 +8879,9 @@ def _v850_raw_thread_passes(conn):
     The viewer's key set and the anonymization planner's fail-closed count are
     the only two readers that qualify the table name, so a statement is one of
     theirs exactly when it selects `CAST(cwd AS BLOB)` from a schema-qualified
-    `codex_conversation_threads`. `_thread_facts` keeps the unqualified name
-    and honors account scoping, so it is deliberately not counted.
+    `codex_conversation_threads` or the #968 last-good TEMP view.
+    `_thread_facts` keeps the unqualified name and honors account scoping,
+    so it is deliberately not counted.
     """
     seen = []
 
@@ -8835,6 +8890,7 @@ def _v850_raw_thread_passes(conn):
         if "CAST(cwd AS BLOB)" in text and (
             "main.codex_conversation_threads" in text
             or "cache_db.codex_conversation_threads" in text
+            or "temp.codex_last_good_threads" in text
         ):
             seen.append(text)
 

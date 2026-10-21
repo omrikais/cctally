@@ -17,7 +17,9 @@ puts that root on `sys.path` and `tests` resolves as a namespace package.
 """
 import gzip
 import json
+import math
 import os
+import time
 
 _OUT_ENV = "CCTALLY_DURATIONS_PATH"
 _LEG_ENV = "CCTALLY_DURATIONS_LEG"
@@ -46,6 +48,15 @@ def _exit_status_int(exitstatus):
         return None
 
 
+def _report_timestamp(report, attribute):
+    """Keep a report's epoch seconds, or explicitly retain the unknown value."""
+    value = getattr(report, attribute, None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(value):
+            return value
+    return None
+
+
 class _DurationsWriter:
     """Holds the open handle.
 
@@ -55,24 +66,50 @@ class _DurationsWriter:
     module-level so the worker guard can be called directly by a test.
     """
 
-    def __init__(self, path, leg):
+    def __init__(self, path, leg, distributed=False):
+        self._distributed = distributed
+        self._lifecycle = {
+            "configuredAt": time.time(),
+            "sessionStartedAt": None,
+            "collectionStartedAt": None,
+            "collectionFinishedAt": None,
+            "sessionFinishedAt": None,
+        }
         self._handle = gzip.open(
             path, "wt", encoding="utf-8", compresslevel=_COMPRESS_LEVEL
         )
         self._leg = leg
         self._count = 0
 
+    def pytest_sessionstart(self, session):
+        self._lifecycle["sessionStartedAt"] = time.time()
+
+    def pytest_collection(self, session):
+        # xdist's controller skips local collection; its collection hook is a
+        # dispatch boundary, not evidence of when workers collected tests.
+        if not self._distributed:
+            self._lifecycle["collectionStartedAt"] = time.time()
+
+    def pytest_collection_finish(self, session):
+        if not self._distributed:
+            self._lifecycle["collectionFinishedAt"] = time.time()
+
     def pytest_runtest_logreport(self, report):
+        worker_id = getattr(report, "worker_id", None)
         self._handle.write(json.dumps({
             "nodeId": report.nodeid,
             "phase": report.when,
             "durationSeconds": round(report.duration, 6),
             "outcome": report.outcome,
             "leg": self._leg,
+            "workerId": worker_id if isinstance(worker_id, str) and worker_id else None,
+            "startedAt": _report_timestamp(report, "start"),
+            "finishedAt": _report_timestamp(report, "stop"),
         }) + "\n")
         self._count += 1
 
     def pytest_sessionfinish(self, session, exitstatus):
+        self._lifecycle["sessionFinishedAt"] = time.time()
         # The footer is the completeness signal the merge reads, and it needs
         # BOTH facts. A leg whose process was killed outright — a worker
         # crash, the aggregator's own TERM-then-KILL of the pytest process
@@ -91,6 +128,7 @@ class _DurationsWriter:
             "records": self._count,
             "sessionFinished": True,
             "exitStatus": _exit_status_int(exitstatus),
+            "lifecycle": self._lifecycle,
         }) + "\n")
         self._handle.close()
 
@@ -100,6 +138,8 @@ def pytest_configure(config):
         return
     config.pluginmanager.register(
         _DurationsWriter(os.environ[_OUT_ENV],
-                         os.environ.get(_LEG_ENV, "pytest")),
+                         os.environ.get(_LEG_ENV, "pytest"),
+                         distributed=bool(getattr(getattr(config, "option", None),
+                                                  "numprocesses", None))),
         name="cctally-durations-writer",
     )

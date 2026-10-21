@@ -250,17 +250,19 @@ def test_candidate_artifacts_stay_in_redirected_app_dir(app, tmp_path):
         seven_resets_epoch=_future_week(),
     )
     app._statusline_persist(parsed, sync_for_test=True)
-    files = list(app.STATUSLINE_CANDIDATE_DIR.iterdir())
+    candidate_dir = app._cctally_statusline._candidate_dir("unattributed")
+    files = list(candidate_dir.iterdir())
     assert len(files) == 1
     assert re.fullmatch(r"[0-9a-f]{64}\.json", files[0].name)
-    assert stat.S_IMODE(app.STATUSLINE_CANDIDATE_DIR.stat().st_mode) == 0o700
+    assert stat.S_IMODE(candidate_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
     body = files[0].read_text()
     assert "secret-session" not in body
     assert "/private/work" not in body
     assert files[0].is_relative_to(tmp_path)
-    assert app.STATUSLINE_TRANSPORT_MARKER_PATH.is_relative_to(tmp_path)
-    assert app.STATUSLINE_SELECTED_PATH.is_relative_to(tmp_path)
+    assert app._cctally_statusline._transport_marker_path().is_relative_to(tmp_path)
+    assert app._cctally_statusline._transition_path("unattributed").is_relative_to(tmp_path)
+    assert not app.STATUSLINE_CANDIDATE_DIR.exists()
 
 
 def test_the_statusline_persist_nudge_fires_outside_the_persist_lock(
@@ -328,8 +330,9 @@ def test_the_forked_persist_child_nudges_outside_its_own_lock(
 
 
 def test_reducer_ignores_incomplete_candidate_temp(app):
-    app.STATUSLINE_CANDIDATE_DIR.mkdir(mode=0o700)
-    temp = app.STATUSLINE_CANDIDATE_DIR / (
+    candidate_dir = app._cctally_statusline._candidate_dir("unattributed")
+    candidate_dir.mkdir(parents=True, mode=0o700)
+    temp = candidate_dir / (
         "." + "a" * 64 + ".json.tmp.1." + "b" * 32
     )
     temp.write_text('{"schemaVersion":')
@@ -349,14 +352,21 @@ def test_stale_first_fresh_second_is_order_independent(app):
     assert _newest_row(app)["weekly_percent"] == 24
 
 
-def test_lock_loser_candidate_publishes_on_next_tick(app, monkeypatch):
+def test_lock_loser_candidate_is_captured_and_published_by_the_continuation(
+        app, monkeypatch):
+    """#825/#832 spec 4.3 revision 3 (Codex design-fix-round-4 Q4): a render
+    that loses the selected-state try-lock has already captured its reading
+    in the durable intake, and it registers the wake a continuation worker
+    answers (in-process, the worker runs inline) — it no longer waits for a
+    next tick. A later stale tick never regresses it."""
     fresh = _status_input(
         app, session_id="fresh", seven_pct=24, seven_resets_epoch=_future_week()
     )
     real_lock = app._try_acquire_persist_lock
     monkeypatch.setattr(app, "_try_acquire_persist_lock", lambda: None)
     app._statusline_persist(fresh, sync_for_test=True)
-    assert _snapshot_count(app) == 0
+    assert _snapshot_count(app) == 1
+    assert _newest_row(app)["weekly_percent"] == 24
     monkeypatch.setattr(app, "_try_acquire_persist_lock", real_lock)
     stale = _status_input(
         app, session_id="stale", seven_pct=20, seven_resets_epoch=_future_week()
@@ -425,7 +435,7 @@ def test_missing_control_reconciles_db_once_then_unchanged_tick_is_child_free(ap
         app, session_id="equal", seven_pct=50, seven_resets_epoch=now + 3 * 86400,
     )
     app._statusline_persist(parsed, sync_for_test=True)
-    assert app.STATUSLINE_SELECTED_PATH.exists()
+    assert app._cctally_statusline._transition_path("unattributed").exists()
     calls = []
     real_reduce = app._cctally_statusline._statusline_reduce_and_publish
 
@@ -468,7 +478,7 @@ def test_legacy_db_write_forces_one_control_only_reconciliation_child(app, monke
     monkeypatch.setattr(app._cctally_statusline, "_statusline_reduce_and_publish", counted_reduce)
     app._statusline_persist(parsed, sync_for_test=True)
     assert calls == [True]
-    control = app._read_control_state(now_epoch=int(time.time()))
+    control = app._read_control_state(now_epoch=int(time.time()), account_key="unattributed")
     assert control is not None
     assert control.db_projection.five_hour is not None
     assert control.db_projection.five_hour.percent == 11
@@ -480,16 +490,17 @@ def test_legacy_db_write_forces_one_control_only_reconciliation_child(app, monke
 
 def test_authoritative_observation_clears_only_its_axis_pending_drop(app):
     assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3, source="api")) == 0
-    projection = app._read_db_projection_stable()
+    projection = app._read_db_projection_stable(account_key="unattributed")
     pending = _pending_drop(app)
     app._write_control_state(candidate_lib.ControlState(
         projection, {"fiveHour": pending, "sevenDay": pending},
-    ))
+    ), binding=app._capture_binding())
     result = app._authoritative_record_usage(
-        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"}
+        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"},
+        binding=app._capture_binding(),
     )
     assert result.status == "ok"
-    control = app._read_control_state(now_epoch=int(time.time()))
+    control = app._read_control_state(now_epoch=int(time.time()), account_key="unattributed")
     assert control is not None
     assert control.pending_drops["sevenDay"] is None
     assert control.pending_drops["fiveHour"] is not None
@@ -502,16 +513,17 @@ def test_authoritative_equal_fifty_clears_an_actual_pending_twenty_generation(ap
         app, session_id="lower", seven_pct=20, seven_resets_epoch=now + 3 * 86400,
     )
     app._statusline_persist(lower, sync_for_test=True)
-    pending_control = app._read_control_state(now_epoch=int(time.time()))
+    pending_control = app._read_control_state(now_epoch=int(time.time()), account_key="unattributed")
     assert pending_control is not None
     pending = pending_control.pending_drops["sevenDay"]
     assert pending is not None and pending.reduced_percent == 20
 
     result = app._authoritative_record_usage(
-        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"}
+        _record_ns(percent=50, resets_in_days=3, source="api"), {"sevenDay"},
+        binding=app._capture_binding(),
     )
     assert result.status == "ok"
-    control = app._read_control_state(now_epoch=int(time.time()))
+    control = app._read_control_state(now_epoch=int(time.time()), account_key="unattributed")
     assert control is not None and control.pending_drops["sevenDay"] is None
 
 
@@ -525,13 +537,15 @@ def test_empty_spool_clears_an_evidence_free_pending_drop(app):
     record `_pending_drop` builds.
     """
     assert app.cmd_record_usage(_record_ns(percent=50, resets_in_days=3)) == 0
-    projection = app._read_db_projection_stable()
+    projection = app._read_db_projection_stable(account_key="unattributed")
     app._write_control_state(candidate_lib.ControlState(
         projection, {"fiveHour": None, "sevenDay": _pending_drop(app)},
-    ))
-    decision = app._statusline_reduce_and_publish()
+    ), binding=app._capture_binding())
+    results = app._statusline_reduce_and_publish()
+    assert len(results) == 1
+    decision = results[0].decision
     assert decision is not None and decision.action == "WRITE_CONTROL"
-    control = app._read_control_state(now_epoch=int(time.time()))
+    control = app._read_control_state(now_epoch=int(time.time()), account_key="unattributed")
     assert control is not None and control.pending_drops["sevenDay"] is None
 
 
@@ -548,17 +562,7 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
     seconds apart; the test has to be too.
     """
     now = int(time.time())
-    assert app.cmd_record_usage(_record_ns(percent=20, resets_in_days=3)) == 0
-    parsed = _status_input(
-        app, session_id="zero", seven_pct=0, seven_resets_epoch=now + 3 * 86400,
-    )
     clock = {"value": now}
-    # #630 S2: patch the IMPORTER's reference, never the shared
-    # stdlib module object, which every other importer and every
-    # concurrent thread resolves through.
-    _iso_time = types.SimpleNamespace(**vars(app._cctally_statusline.time))
-    _iso_time.time = lambda: clock["value"]
-    monkeypatch.setattr(app._cctally_statusline, "time", _iso_time)
 
     def _pin_capture():
         stamp = dt.datetime.fromtimestamp(clock["value"], tz=dt.timezone.utc)
@@ -566,13 +570,28 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
         monkeypatch.setenv(
             "CCTALLY_AS_OF", stamp.isoformat().replace("+00:00", "Z"))
 
+    # The 20% reading is pinned to `now` as well. Unpinned, a wall clock
+    # that crosses a second boundary here records it at now+1, so the
+    # baseline evaluation at `now` precedes it and is (correctly) fenced,
+    # and the zero is first seen at now+1, one stage behind this script.
     _pin_capture()
+    assert app.cmd_record_usage(_record_ns(percent=20, resets_in_days=3)) == 0
+    parsed = _status_input(
+        app, session_id="zero", seven_pct=0, seven_resets_epoch=now + 3 * 86400,
+    )
+    # #630 S2: patch the IMPORTER's reference, never the shared
+    # stdlib module object, which every other importer and every
+    # concurrent thread resolves through.
+    _iso_time = types.SimpleNamespace(**vars(app._cctally_statusline.time))
+    _iso_time.time = lambda: clock["value"]
+    monkeypatch.setattr(app._cctally_statusline, "time", _iso_time)
+
     app._statusline_persist(parsed, sync_for_test=True)  # settle baseline
     clock["value"] += 1
     _pin_capture()
     app._statusline_persist(parsed, sync_for_test=True)  # first kernel attempt arms zero
     assert _newest_row(app)["weekly_percent"] == 20
-    control = app._read_control_state(now_epoch=clock["value"])
+    control = app._read_control_state(now_epoch=clock["value"], account_key="unattributed")
     assert control is not None
     pending = control.pending_drops["sevenDay"]
     assert pending is not None and pending.kernel_stage == "zero_armed"
@@ -581,7 +600,7 @@ def test_reset_zero_keeps_armed_consensus_until_the_next_revalidated_tick(
     _pin_capture()
     app._statusline_persist(parsed, sync_for_test=True)  # revalidated second attempt commits
     assert _newest_row(app)["weekly_percent"] == 0
-    control = app._read_control_state(now_epoch=clock["value"])
+    control = app._read_control_state(now_epoch=clock["value"], account_key="unattributed")
     assert control is not None and control.pending_drops["sevenDay"] is None
 
 
@@ -596,7 +615,7 @@ def test_projection_keeps_active_five_hour_when_newer_weekly_only_row_exists(app
     _insert_snapshot(
         app, weekly_percent=21, weekly_resets_epoch=reset, captured_epoch=now - 1,
     )
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key="unattributed")
     assert projection.seven_day is not None and projection.seven_day.percent == 21
     assert projection.five_hour is not None and projection.five_hour.percent == 30
 
@@ -611,7 +630,7 @@ def test_projection_normalizes_weekly_jitter_and_uses_capture_order_not_row_id(a
     _insert_snapshot(
         app, weekly_percent=20, weekly_resets_epoch=reset + 5, captured_epoch=now - 2,
     )
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key="unattributed")
     assert projection.seven_day is not None
     assert projection.seven_day.percent == 24
     expected = int(app._normalize_week_boundary_dt(
@@ -650,11 +669,11 @@ def test_projection_selects_latest_post_credit_weekly_and_five_hour_segments(app
         app, weekly_percent=20, weekly_resets_epoch=reset, captured_epoch=now - 1,
         five_percent=5, five_resets_epoch=five_reset,
     )
-    projection = app._read_db_projection_once()
+    projection = app._read_db_projection_once(account_key="unattributed")
     assert projection.seven_day is not None and projection.seven_day.percent == 20
     assert projection.seven_day.reset_generation > 0
     assert projection.five_hour is not None and projection.five_hour.percent == 5
-    assert projection.five_hour.reset_generation > 0
+    assert projection.five_hour.reset_generation != ""  # logical event generation (#832)
 
 
 def test_unchanged_statusline_candidate_touches_transport_not_selected(app):
@@ -662,7 +681,7 @@ def test_unchanged_statusline_candidate_touches_transport_not_selected(app):
         app, session_id="same", seven_pct=20, seven_resets_epoch=_future_week()
     )
     app._statusline_persist(parsed, sync_for_test=True)
-    selected = app.STATUSLINE_OBSERVE_MARKER_PATH
+    selected = app._cctally_statusline._observe_marker_path("unattributed")
     selected.unlink()
     app._statusline_persist(parsed, sync_for_test=True)
     assert app._statusline_transport_age_seconds() < 5
@@ -815,7 +834,7 @@ def test_same_value_render_does_not_touch_selected_marker_on_dedup(app):
     assert _snapshot_count(app) == 1
 
     # Remove the selected marker; the same candidate must not recreate it.
-    _cctally_core.STATUSLINE_OBSERVE_MARKER_PATH.unlink()
+    sys.modules["_cctally_statusline"]._observe_marker_path("unattributed").unlink()
     assert app._statusline_observe_age_seconds() == float("inf")
 
     app._statusline_persist(parsed, sync_for_test=True)
@@ -1033,7 +1052,7 @@ def test_statusline_tick_fetches_authoritative_usage_within_one_cycle(
 
     interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
     assert interval <= 30.0
-    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda **_: interval + 1)
     monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
 
     calls = []
@@ -1054,7 +1073,7 @@ def test_statusline_oauth_tick_is_account_wide_throttled(app, monkeypatch):
     import _cctally_core
 
     interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
-    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda **_: interval + 1)
     monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
     calls = []
     monkeypatch.setattr(
@@ -1085,11 +1104,11 @@ def test_statusline_oauth_tick_honors_selected_freshness_and_backoff(
         lambda *, throttle_seconds: (calls.append(throttle_seconds), None),
     )
 
-    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval - 1)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda **_: interval - 1)
     monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
     app._statusline_oauth_tick(sync_for_test=True)
 
-    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda **_: interval + 1)
     monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 60.0)
     app._statusline_oauth_tick(sync_for_test=True)
 
@@ -1102,7 +1121,7 @@ def test_statusline_oauth_tick_never_waits_for_another_session(app, monkeypatch)
     import _cctally_core
 
     interval = float(_cctally_core.STATUSLINE_OAUTH_POLL_SECONDS)
-    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda: interval + 1)
+    monkeypatch.setattr(app, "_statusline_observe_age_seconds", lambda **_: interval + 1)
     monkeypatch.setattr(app, "_oauth_backoff_remaining_seconds", lambda: 0.0)
     monkeypatch.setattr(app, "_hook_tick_throttle_age_seconds", lambda: interval + 1)
     monkeypatch.setattr(

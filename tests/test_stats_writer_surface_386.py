@@ -71,6 +71,24 @@ STATS_TABLES = frozenset({
     # table — `open_db` creates it and the journal fold writes it — and it
     # joins with NO exemption.
     "meter_rate_change_events",
+    # #825/#832 epoch 1018: the disposable admission summary (spec section 8).
+    # Ingest extends it inside `_run_cycle`'s BEGIN IMMEDIATE and the rebuild
+    # writes it into its private scratch, so it joins the freeze from its
+    # first epoch rather than repeating #768.
+    "journal_admission_summary",
+    # #825/#832 epoch 1018 (spec 5.6 item 9): the outcome quarantine — the
+    # trigger log, the whole-prefix envelope and the per-account
+    # certificates. Ingest writes them inside `_run_cycle`'s BEGIN IMMEDIATE
+    # and the rebuild into its private scratch, so they join the freeze from
+    # their first epoch.
+    "outcome_quarantine_triggers",
+    "outcome_quarantine_envelope",
+    "outcome_quarantine_certificates",
+    # #825/#832 Task 4.0 (epoch 1018): the snapshot-suppression tombstone. Its
+    # only writer is `trg_usage_snapshot_suppression`, so it is written inside
+    # whatever DELETE fires the trigger — every one of which already runs in a
+    # sanctioned scope — and created by `open_db` under the open-time guard.
+    "usage_snapshot_suppressions",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -118,9 +136,19 @@ FROZEN_WRITE_SITES = {
         "five_hour_block_models": 1,
         "five_hour_block_projects": 1,
         "five_hour_blocks": 1,
-        "five_hour_milestones": 1,
+        # #825/#832 Task 4.0: the CREATE TABLE plus the
+        # `trg_usage_snapshot_suppression` body's UPDATE, which points a
+        # milestone at the 0 "no snapshot row" sentinel when the snapshot it
+        # names is deleted. The trigger fires only inside the stale-replica
+        # removals and the suppression appliers, all of which already hold a
+        # sanctioned scope.
+        "five_hour_milestones": 2,
         "five_hour_reset_events": 1,
+        "journal_admission_summary": 1,
         "journal_cursor": 2,
+        "outcome_quarantine_certificates": 1,
+        "outcome_quarantine_envelope": 1,
+        "outcome_quarantine_triggers": 1,
         "journal_effective_events": 1,
         "journal_protocol_violations": 1,
         # #496 S5b epoch 1009: the four `CREATE TABLE IF NOT EXISTS` statements
@@ -139,11 +167,16 @@ FROZEN_WRITE_SITES = {
         # + `stats_write_scope("open-time")`), and stats migration 013
         # reaches it through the dispatcher inside that same block.
         "meter_rate_change_events": 1,
-        "percent_milestones": 1,
+        # #825/#832 Task 4.0: the CREATE TABLE plus the trigger body's UPDATE
+        # (see `five_hour_milestones` above).
+        "percent_milestones": 2,
         "project_budget_milestones": 1,
         "projected_milestones": 1,
         "quota_alert_arming": 1,
         "quota_percent_milestones": 1,
+        # #825/#832 Task 4.0: the CREATE TABLE and the trigger body's
+        # `INSERT OR IGNORE`, the tombstone's only writer.
+        "usage_snapshot_suppressions": 2,
         # public #5: the `CREATE TABLE IF NOT EXISTS` for the incremental
         # projector's own state, inside `_apply_quota_projection_schema` — which
         # runs under `stats_open_time_guard` (maintenance EX +
@@ -208,6 +241,9 @@ FROZEN_WRITE_SITES = {
     "_cctally_journal.py": {
         "accounts": 8,
         "five_hour_blocks": 1,
+        # #825/#832: `_write_admission_summary`'s INSERT OR REPLACE, reached
+        # from the ingest cycle transaction and the rebuild scratch.
+        "journal_admission_summary": 1,
         "journal_cursor": 1,
         "journal_effective_events": 5,
         # Four: `_replace_protocol_violations`' DELETE + INSERT pair — the ONE
@@ -255,6 +291,28 @@ FROZEN_WRITE_SITES = {
         # that was never rewritten.
         "stats_quota_projection_state": 2,
         "weekly_credit_floors": 1,
+        # #825/#832 fix round K14b (spec 4.7 revision 6) added one; fix
+        # round K15 made it TWO. `_apply_reset_with_suppression` applies a
+        # five-hour credit's `suppression` list (the whole stale-replica
+        # band) with an UPDATE that clears only the five-hour fields of an
+        # UNHELD row and a DELETE that removes a HELD row, both by
+        # `journal_id`; every other suppression kind keeps the dynamic
+        # `DELETE FROM {supp_table}` beside them. Reached only through
+        # `_apply_evt`, so live they run on `ctx.conn` inside `_run_cycle`'s
+        # `BEGIN IMMEDIATE` under `stats_write_scope("ingest",
+        # ingest_lock=True)`, and on rebuild and rederive against their
+        # private scratch index under the maintenance and rederive scopes,
+        # exactly as the suppression DELETE they replace for this kind.
+        # Fix round K16b (spec 4.7 revision 7): TWO became FOUR.
+        # `_retire_weekly_effects` replays a weekly stale-replica suppression
+        # (`week_reset` through `_apply_reset_with_suppression`, and the
+        # stale-replica effects of `weekly_credit_effects` through
+        # `_apply_weekly_credit_effects`) with an UPDATE that makes a named
+        # unheld row carrying its own five-hour reading weekly-held and a
+        # DELETE that removes a row keeping no evidence on either axis, both
+        # by `journal_id`, in place of the dynamic DELETE for those kinds.
+        # Reached only through `_apply_evt`, in exactly the same scopes.
+        "weekly_usage_snapshots": 4,
     },
     "_cctally_milestones.py": {
         "budget_milestones": 3,
@@ -267,6 +325,12 @@ FROZEN_WRITE_SITES = {
     # statement per child table alongside the whole-root one it did not replace,
     # and `quota_projection_state` gained the DELETE that retires an account
     # partition the projection no longer names.
+    # #825/#832 spec 5.6 item 9: the outcome-quarantine fold's persistence.
+    "_cctally_quarantine.py": {
+        "outcome_quarantine_certificates": 1,
+        "outcome_quarantine_envelope": 1,
+        "outcome_quarantine_triggers": 1,
+    },
     "_cctally_quota.py": {
         "quota_alert_arming": 2,
         "quota_percent_milestones": 3,
@@ -314,7 +378,30 @@ FROZEN_WRITE_SITES = {
         # band at DELETION time, so a row entering it between classification and
         # deletion cannot escape, and it takes four parameters whatever the
         # population. See docs/journal-gotchas.md, R1 section.
-        "weekly_usage_snapshots": 5,
+        #
+        # #825/#832 fix round K14b: FIVE became SIX. `detect_reset_and_credit`'s
+        # five-hour credit retires the five-hour fields of every UNHELD stale
+        # replica with one UPDATE before the unchanged DELETE removes the held
+        # ones (fix round K15: under every fold policy, no longer only policy
+        # 1). It runs on the caller's connection right beside that DELETE:
+        # `ctx.conn` inside `_run_cycle`'s `BEGIN IMMEDIATE` under
+        # `stats_write_scope("ingest", ingest_lock=True)`.
+        #
+        # Fix round K15: SIX became SEVEN. Because the retirement now runs for
+        # historical stores too, it is two literal UPDATEs on one branch:
+        # `AND weekly_observation_held = 0` where the column exists, and the
+        # unfiltered band where a hand-built pre-1015 fixture store lacks it
+        # (such a store holds no held row, so the populations are identical).
+        # Same connection, same transaction, same scope as above.
+        # Fix round K16b (spec 4.7 revision 7): SEVEN became EIGHT.
+        # `_delete_doomed_snapshot_rows` (the weekly credit's stale-replica
+        # cleanup, both the automatic pivot 2 and `record-credit`'s inline
+        # step 4c) first runs one UPDATE over the same band that makes every
+        # band row carrying its own five-hour reading weekly-held, so the
+        # band DELETE beside it removes only rows keeping no evidence on
+        # either axis. It executes on the caller's connection, in exactly the
+        # regime of that DELETE.
+        "weekly_usage_snapshots": 8,
     },
     "_cctally_store.py": {
         "stats_open_fixups": 2,
@@ -380,10 +467,19 @@ FROZEN_WRITE_SITES = {
 #: chunked stale-source-file cleanup. Every one of them substitutes a name from
 #: a fixed pair chosen in this module, never a caller-supplied string, and the
 #: staging names are declared in `CONVERSATIONS_REDERIVABLE_OBJECTS`.
+#: #825/#832 fix round E raised `_cctally_journal.py` from 9 to 10:
+#: `_delete_scratch_row` removes a tombstoned row from a derivation-completion
+#: scratch projection (never the live index); its table is a journal family's
+#: own, from `_HARVEST_SPECS`/`_EVT_SPECS`.
+# #968 adds four cursor UPDATE sites (_mark, _adopt, and _apply's
+# unverified/accepted-EOF branches) and two fixed TEMP-view DROP/CREATE sites.
+# The real-store authorizer regression in test_codex_container_transitions
+# observes all six on both stores, restricts targets and proves zero stats-main
+# writes; docs/journal-gotchas.md records the negative reachability audit.
 FROZEN_DYNAMIC_SITES = {
-    "_cctally_cache.py": 10,
+    "_cctally_cache.py": 16,
     "_cctally_db.py": 9,
-    "_cctally_journal.py": 9,
+    "_cctally_journal.py": 10,
     "_cctally_store.py": 1,
 }
 
@@ -397,8 +493,17 @@ def _runtime_sources():
     """
     yield BIN / "cctally"          # extensionless — a bin/*.py glob MISSES this
     for p in sorted(BIN.glob("*.py")):
-        if not p.name.startswith("build-"):
+        if not p.name.startswith("build-") and not _is_sql_data_only(p):
             yield p
+
+
+# #825/#832 spec 5.6 item 6: the access-contract registry holds the SQL TEXT
+# of every registered strict-path access as DATA (its fingerprints), never
+# executed. It is skipped only while it contains no `execute(` call at all;
+# the moment it gains one, it is scanned like any other source.
+def _is_sql_data_only(path) -> bool:
+    return (path.name == "_lib_detector_access_registry.py"
+            and "execute(" not in path.read_text(encoding="utf-8"))
 
 
 def _scan_text(text: str):

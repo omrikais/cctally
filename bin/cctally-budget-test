@@ -17,6 +17,10 @@
 # datetime suffixes render UTC regardless of host zone.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -28,7 +32,7 @@ HARNESS_BIN="$REPO_ROOT/bin/cctally"
 # SQLite writes — keeps in-tree fixture .db files byte-stable across runs.
 # HARNESS_FAKE_HOME_BASE redirects FAKE_HOME in _lib-fixture-harness.sh;
 # input.env / golden-*.txt are still read from the in-tree HARNESS_FIXTURES_DIR.
-SCRATCH_DIR=$(mktemp -d -t cctally-budget-fixtures-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-budget-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 export HARNESS_FAKE_HOME_BASE="$SCRATCH_DIR"
 

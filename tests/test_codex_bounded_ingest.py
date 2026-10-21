@@ -1015,6 +1015,7 @@ def test_a_contended_drain_does_not_report_success(root, monkeypatch):
     ns, provider_root, _rollout = root
     import _cctally_cache as cc
     import _cctally_core
+    _arm(ns, cc.CODEX_REPLAY_FROM_ZERO_KEY, "1")
 
     monkeypatch.setattr(
         cc, "sync_codex_cache",

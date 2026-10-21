@@ -13,6 +13,10 @@
 # coherent under parallelism.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -32,7 +36,7 @@ JOBS=${CCTALLY_TEST_JOBS:-$(default_jobs)}
 
 # Scratch root for the three parallelized-iteration tests' per-run
 # verdict files. One subdir per test (test10, test11, test20).
-TALLY_ROOT=$(mktemp -d -t cctally-config-test.XXXXXX)
+TALLY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 trap 'rm -rf "$TALLY_ROOT"' EXIT
 export TALLY_ROOT BIN
 
@@ -80,7 +84,7 @@ assert_contains () {
 with_home () {
     # Run cctally with a fresh HOME and stable TZ. Echoes a unique HOME path.
     local h
-    h=$(mktemp -d)
+    h=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
     HOME="$h" TZ=Etc/UTC "$BIN" "$@"
     rm -rf "$h"
 }
@@ -90,7 +94,7 @@ out=$(with_home config get display.tz)
 assert_eq "get default" "display.tz=local" "$out"
 
 # 2. set valid IANA
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get display.tz)
 assert_eq "get after set IANA" "display.tz=America/New_York" "$out"
@@ -150,7 +154,7 @@ rm -rf "$home"
 _test10_iter() {
     local run="$1"
     local home
-    home=$(mktemp -d)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
     ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz America/New_York >/dev/null ) &
     ( HOME="$home" TZ=Etc/UTC "$BIN" config set display.tz Asia/Jerusalem >/dev/null ) &
     wait
@@ -197,7 +201,7 @@ fi
 _test11_iter() {
     local run="$1"
     local home
-    home=$(mktemp -d)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
     local candidates="America/New_York Asia/Jerusalem Europe/London Australia/Sydney America/Los_Angeles"
     local tz
     for tz in $candidates; do
@@ -245,7 +249,7 @@ fi
 # next save_config call (under config_writer_lock) is what overwrites — a
 # bare `cctally config get` MUST NOT silently re-default and lose the prior
 # state.
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 mkdir -p "$home/.local/share/cctally"
 # Truncated/garbled JSON (mimics the byte-interleave artifact that caused
 # the original race; trailing stray brace makes it unparseable).
@@ -343,7 +347,7 @@ assert_eq "alerts bool normalize exit" "0" "$ec"
 assert_contains "alerts bool normalize output" "OK bool normalize" "$out"
 
 # 16. cctally config set alerts.enabled yes round-trips via JSON get
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled yes >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled --json)
 assert_contains "alerts.enabled JSON round-trip" "\"enabled\": true" "$out"
@@ -364,7 +368,7 @@ rm -rf "$home"
 # 17. alerts.enabled unset: set true → unset → get returns canonical default (false).
 # Pre-fix _cmd_config_unset only branched on display.tz; alerts.enabled fell
 # through to `return 2` silently and the persisted true was never cleared.
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get alerts.enabled)
 assert_eq "alerts.enabled set before unset" "alerts.enabled=true" "$out"
@@ -386,7 +390,7 @@ rm -rf "$home"
 # 19. alerts.enabled unset preserves co-existing alerts.* keys (e.g. user-customized
 # thresholds). Hand-write a config with both `enabled` and `weekly_thresholds`,
 # unset only `enabled`, and verify the threshold list survives.
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 mkdir -p "$home/.local/share/cctally"
 cat > "$home/.local/share/cctally/config.json" <<'JSON'
 {
@@ -417,7 +421,7 @@ rm -rf "$home"
 _test20_iter() {
     local run="$1"
     local home
-    home=$(mktemp -d)
+    home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
     HOME="$home" TZ=Etc/UTC "$BIN" config set alerts.enabled true >/dev/null
     ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
     ( HOME="$home" TZ=Etc/UTC "$BIN" config unset alerts.enabled >/dev/null ) &
@@ -489,7 +493,7 @@ fi
 # the dict() copy ran before _get_alerts_config could classify the failure,
 # locking the user out of the documented recovery toggle. Also asserts
 # config.json is left untouched on the error path (no partial write).
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 mkdir -p "$home/.local/share/cctally"
 cat > "$home/.local/share/cctally/config.json" <<'JSON'
 {"alerts": "bad"}
@@ -504,7 +508,7 @@ assert_eq "malformed alerts block no partial write" "$before21" "$after21"
 rm -rf "$home"
 
 # 22-29. dashboard.bind round-trips
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 
 # default unset
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get dashboard.bind 2>&1)
@@ -549,7 +553,7 @@ assert_eq "dashboard.bind unset default" "dashboard.bind=loopback" "$out"
 rm -rf "$home"
 
 # 30-33. dashboard.bind whitespace + bracketed IPv6 rejections
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 
 # embedded tab → exit 2
 err=$(HOME="$home" TZ=Etc/UTC "$BIN" config set dashboard.bind $'foo\tbar' 2>&1 >/dev/null)
@@ -578,7 +582,7 @@ rm -rf "$home"
 # alerts.enabled / dashboard.bind branches: get default → set → get →
 # unset → get default. Also exercise the validators (out-of-range
 # ttl_hours, non-bool enabled, malformed stored block).
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 
 # defaults match `_is_update_check_due` (true / 24).
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.check.enabled 2>&1)
@@ -720,7 +724,7 @@ rm -rf "$home"
 # enum-key branches: get default → set → get → invalid rejection → unset →
 # default; nested `--json` shape; sibling update.check preserved.
 # ---------------------------------------------------------------------------
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 
 # default get → stable.
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get update.channel 2>&1)
@@ -777,7 +781,7 @@ rm -rf "$home"
 # ---------------------------------------------------------------------------
 
 # 34. budget.weekly_usd set/get round-trip (float-coerced)
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 HOME="$home" TZ=Etc/UTC "$BIN" config set budget.weekly_usd 300 >/dev/null
 out=$(HOME="$home" TZ=Etc/UTC "$BIN" config get budget.weekly_usd)
 assert_eq "budget.weekly_usd round-trip" "budget.weekly_usd=300.0" "$out"
@@ -822,7 +826,7 @@ assert_eq "budget unset clears weekly_usd" "budget.weekly_usd=" "$out"
 rm -rf "$home"
 
 # 41. invalid stored budget block: a write that re-validates the block exits 2
-home=$(mktemp -d)
+home=$(mktemp -d "${TMPDIR:-/tmp}/cctally-config-test.XXXXXX") || exit 1
 mkdir -p "$home/.local/share/cctally"
 cat > "$home/.local/share/cctally/config.json" <<'JSON'
 {"budget": "bad"}

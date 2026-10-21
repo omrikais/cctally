@@ -542,6 +542,190 @@ def _gather_dashboard_disk_writes(
     return {"mode": "discovery", "instances": instances}
 
 
+def _gather_legacy_writer(deep_excluded, deep_boundary,
+                          deep_error=None) -> dict:
+    """The `journal.legacy_writer` evidence (#825/#832 spec section 8).
+
+    Reads the admission summary on a validated current snapshot (an
+    unvalidated or missing summary is unavailable, never zero — the durable
+    evidence sidecar is still returned beside it, for the leg to report from)
+    and the durable evidence sidecar. A deep run substitutes its own whole-journal
+    recomputation of the excluded population; ``deep_error`` names why that
+    recomputation could not complete (fix round K11, K9K10-R6/R11), and then
+    the count is unavailable — never zero.
+
+    Spec revision 5: the leg also reports an incomplete legacy spool
+    inventory (``legacySpoolInventory``), independently of the count, and
+    says the detection pause exists only when the validated index holds the
+    durable `inventory-incomplete` marker. Read-only: the sidecar is never
+    written here, the spool is only read, and nothing is journaled."""
+    import _cctally_store
+    import _lib_account_protocol
+
+    out: dict = {"available": False}
+    row = None
+    inventory_marker = False
+    try:
+        if _cctally_core.DB_PATH.exists():
+            pc = _stats_ro_guarded()
+            try:
+                with _cctally_store.current_stats_snapshot(pc):
+                    row = pc.execute(
+                        "SELECT cutover_id, excluded_total, coordinate_digest "
+                        "FROM journal_admission_summary WHERE id = 1"
+                    ).fetchone()
+                    inventory_marker = _durable_inventory_marker(pc)
+            finally:
+                pc.close()
+    except Exception:  # noqa: BLE001 — a diagnostic read degrades to unavailable
+        row = None
+    try:
+        evidence = json.loads(
+            _cctally_core.LEGACY_WRITER_EVIDENCE_PATH.read_bytes())
+    except (OSError, ValueError):
+        evidence = None
+    inventory = _legacy_spool_inventory_probe(inventory_marker)
+    if inventory is not None:
+        out["legacySpoolInventory"] = inventory
+    if deep_error is not None:
+        return {**out, "unavailableCause": str(deep_error),
+                "evidence": evidence}
+    if deep_excluded is not None:
+        cutover_id = (None if deep_boundary is None
+                      else _lib_account_protocol.CUTOVER_OP_ID)
+        count = len(deep_excluded)
+        digest = (_lib_account_protocol.coordinate_population_digest(
+            item.coordinate for item in deep_excluded) if count else None)
+    elif row is not None:
+        cutover_id, count, digest = row[0], int(row[1] or 0), row[2]
+    else:
+        # No current summary — exactly what an older process's epoch
+        # republish leaves behind. The durable sidecar still carries the
+        # excluded population and when it was first observed (#825/#832 fix
+        # round B, P2-2), so the leg reports from it rather than "unavailable".
+        return {**out, "evidence": evidence}
+    return {**out, "available": True, "cutoverId": cutover_id,
+            "excludedCount": count, "coordinateDigest": digest,
+            "evidence": evidence}
+
+
+def _scan_cause(exc: BaseException) -> str:
+    """A journal read failure as a doctor cause (K9K10-R6): the message and,
+    for an OS error, its errno name — never an empty string."""
+    import errno as _errno
+    name = _errno.errorcode.get(getattr(exc, "errno", None) or 0)
+    text = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+    filename = getattr(exc, "filename", None)
+    if filename:
+        text = f"{text}: {filename}"
+    return f"{text} [{name}]" if name else text
+
+
+def _durable_inventory_marker(conn) -> bool:
+    """Whether the validated index holds an unresolved spool marker left by
+    an incomplete inventory (spec revision 5, section 8). Read inside the
+    caller's validated snapshot; a missing quarantine table is no marker."""
+    import _cctally_quarantine
+    import _lib_account_protocol
+    try:
+        state = _cctally_quarantine.load_state(conn)
+    except Exception:  # noqa: BLE001 — no readable marker claims no pause
+        return False
+    return any(marker.get("reason")
+               == _lib_account_protocol.INVENTORY_INCOMPLETE_REASON
+               for marker in state.spool_markers)
+
+
+def _legacy_spool_inventory_probe(paused: bool):
+    """The legacy spool inventory doctor itself takes (spec revision 5,
+    section 8): None when it completes, else ``{"available": False, "path",
+    "operation", "error", "paused"}``. Doctor can be the first process to
+    meet the error, so it probes rather than reading what the reducer saw.
+    Read-only: the spool is listed and read to digest it, never changed.
+
+    Fix round K12 (K11R-13): any other failure leaves the inventory
+    unavailable with its cause (``{"available": False, "unavailableCause",
+    "paused"}``), never complete."""
+    import errno as _errno
+    import _cctally_journal
+    try:
+        _cctally_journal.capture_legacy_spool_state()
+    except _cctally_journal.LegacySpoolInventoryIncomplete as exc:
+        code = exc.errno or _errno.EIO
+        return {"available": False,
+                "path": exc.failed_path or exc.rel,
+                "operation": exc.operation,
+                "error": f"{os.strerror(code)} [{exc.error}]",
+                "paused": bool(paused)}
+    except Exception as exc:  # noqa: BLE001 — a diagnostic probe never crashes doctor
+        return {"available": False, "unavailableCause": _scan_cause(exc),
+                "paused": bool(paused)}
+    return None
+
+
+def _statusline_authority_commits() -> dict:
+    """Each account partition's reconciled `authorityCommit` (#825/#832 spec
+    5.6 item 7, fix-round-1 Q6): control recovery is complete only when the
+    account's statusline control transition records the commit of the
+    observation witnessing its control certificate. Read-only; a missing or
+    unreadable transition contributes nothing, so its account stays paused."""
+    import _cctally_statusline
+
+    now_epoch = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    commits = {}
+    for account_key in _cctally_statusline._account_keys_on_disk():
+        try:
+            transition = _cctally_statusline._read_transition(
+                account_key, now_epoch=now_epoch)
+        except Exception:  # noqa: BLE001 — unreadable state stays paused
+            continue
+        quarantine = None if transition is None else transition.quarantine
+        commit = None if quarantine is None else quarantine.get(
+            "authorityCommit")
+        if commit is not None:
+            commits[account_key] = commit
+    return commits
+
+
+def _gather_outcome_quarantine() -> dict:
+    """The `accounting.outcome_quarantine` evidence (#825/#832 spec 8, 5.6).
+
+    Read from ONE snapshot proven current (epoch and protocol); an absent,
+    unreadable or unvalidated index is unavailable, never "no quarantine".
+    Read-only."""
+    import _cctally_quarantine
+    import _cctally_store
+
+    out: dict = {"available": False, "accounts": []}
+    try:
+        if not _cctally_core.DB_PATH.exists():
+            return out
+        commits = _statusline_authority_commits()
+        pc = _stats_ro_guarded()
+        try:
+            with _cctally_store.current_stats_snapshot(pc):
+                report = _cctally_quarantine.report(
+                    pc, authority_commits=commits)
+                labels = {}
+                for row in pc.execute(
+                        "SELECT account_key, label, email FROM accounts"):
+                    labels[row[0]] = row[1] or row[2] or row[0]
+        finally:
+            pc.close()
+    except Exception:  # noqa: BLE001 — a diagnostic read degrades to unavailable
+        return out
+    accounts = []
+    for row in report["accounts"]:
+        accounts.append({**row, "accountLabel": labels.get(
+            row["account"], row["account"])})
+    out = {"available": True, "triggered": report["triggered"],
+           "accounts": accounts}
+    # Spec revision 3: the unresolved spool markers, only while one exists.
+    if report.get("unresolvedSpoolMarkers"):
+        out["unresolvedSpoolMarkers"] = report["unresolvedSpoolMarkers"]
+    return out
+
+
 def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
     """Read the #318 statusline pipeline without creating or pruning files."""
     now_epoch = int(now_utc.timestamp())
@@ -586,21 +770,12 @@ def _gather_statusline_pipeline(c, *, now_utc: dt.datetime) -> dict:
         )
     except Exception:
         pass
-    for axis, path in (
-        ("fiveHour", _cctally_core.STATUSLINE_AUTHORITATIVE_5H_PATH),
-        ("sevenDay", _cctally_core.STATUSLINE_AUTHORITATIVE_7D_PATH),
-    ):
-        try:
-            if not path.exists():
-                continue
-            tombstone = c._read_tombstone(
-                axis, now_epoch=now_epoch, fail_closed=False
-            )
-            result["tombstones"][axis] = (
-                tombstone.state if tombstone is not None else "invalid"
-            )
-        except Exception:
-            result["tombstones"][axis] = "invalid"
+    # #825/#832 section 7: the current protocol's fences are per exact
+    # account and window under the account-bound root; only live windows count.
+    try:
+        result["tombstones"] = c._statusline_tombstone_states(now_epoch=now_epoch)
+    except Exception:
+        result["tombstones"] = {"fiveHour": "invalid", "sevenDay": "invalid"}
     return result
 
 
@@ -1436,6 +1611,132 @@ def doctor_gather_state(
                 cache_lock.close()
 
 
+def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
+    """Live, read-only #968 census; never opens/migrates a writable store.
+
+    Presence is independent of decoder availability. Missing pre-migration
+    tables mean no retained evidence; an unreadable probe means unknown, not
+    an invented zero population. No decoding or detached work runs here.
+    """
+    import _cctally_cache as cache
+    import _lib_codex_rollout_container as rc
+
+    def table_exists(conn, name):
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone() is not None
+
+    def deletion_debt(conn, table):
+        if not table_exists(conn, table):
+            return 0, None
+        row = conn.execute(
+            f"SELECT COUNT(*), MIN(recorded_at_utc) FROM {table}").fetchone()
+        return int(row[0]), row[1]
+
+    try:
+        decoder = rc.decoder_capability()
+        selected = [item for item in cache._iter_codex_logical_containers(
+            c._codex_session_roots()) if item.kind == rc.ZSTD]
+        census = dict(compressedOnly=len(selected), retainedComplete=0,
+                      retainedIncomplete=0, neverIngested=0, unverified=0)
+        status = None
+        verifications, deletions = 0, 0
+        deletion_starts = []
+        path = _cctally_core.CACHE_DB_PATH
+        if path.exists():
+            if not cache_probe_allowed:
+                return None, decoder, None, None
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.0)
+            try:
+                conn.row_factory = sqlite3.Row
+                cursor_exists = table_exists(conn, "codex_session_files")
+                columns = ({row[1] for row in conn.execute(
+                    "PRAGMA table_info(codex_session_files)")} if cursor_exists else set())
+                if "container_state" in columns:
+                    verifications = int(conn.execute(
+                        "SELECT COUNT(*) FROM codex_session_files "
+                        "WHERE container_state='pending'").fetchone()[0])
+                for item in selected:
+                    row = (conn.execute("SELECT * FROM codex_session_files WHERE path=?",
+                                        (str(item.logical),)).fetchone()
+                           if cursor_exists else None)
+                    if row is None:
+                        census["neverIngested"] += 1
+                        continue
+                    row = dict(row)
+                    state = row.get("container_state")
+                    if state == "unverified":
+                        census["unverified"] += 1
+                    elif state == "pending":
+                        continue  # verification work, never read debt (D3)
+                    elif (row.get("container_kind") == rc.ZSTD
+                          and state == "accepted"
+                          and row.get("ingest_complete") == 1
+                          and row.get("size_bytes") == row.get("decoded_size_bytes")
+                          and all(row.get(key) == value for key, value in (
+                              ("container_size_bytes", item.fingerprint.size),
+                              ("mtime_ns", item.fingerprint.mtime_ns),
+                              ("device_id", item.fingerprint.device),
+                              ("inode", item.fingerprint.inode)))):
+                        census["retainedComplete"] += 1
+                    else:
+                        census["retainedIncomplete"] += 1
+                if table_exists(conn, "cache_meta"):
+                    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                                       (cache.CODEX_CONTAINER_STATUS_KEY,)).fetchone()
+                    if row:
+                        parsed = json.loads(row[0])
+                        status = parsed if isinstance(parsed, dict) else None
+                count, since = deletion_debt(conn, "codex_prune_debt")
+                deletions += count
+                if count:
+                    deletion_starts.append(since)
+            finally:
+                conn.close()
+        else:
+            census["neverIngested"] = len(selected)
+        maintenance_coverage = "complete"
+        if _cctally_core.CONVERSATIONS_DB_PATH.exists():
+            # An unavailable second store cannot erase the first store's known
+            # counts or ages. Its missing contribution remains explicitly unknown.
+            try:
+                with _conversation_ro_guarded(timeout=0.0) as conn:
+                    if conn is None:
+                        maintenance_coverage = "partial"
+                    else:
+                        count, since = deletion_debt(conn, "codex_conversation_prune_debt")
+                        deletions += count
+                        if count:
+                            deletion_starts.append(since)
+            except Exception:
+                maintenance_coverage = "partial"
+        record = status or {}
+        starts = list(deletion_starts)
+        if verifications:
+            starts.append(record.get("verificationPendingSince"))
+        reads = (census["neverIngested"] + census["retainedIncomplete"]
+                 if decoder != "unavailable" else 0)
+        if reads:
+            starts.append(record.get("readsPendingSince"))
+        old = False
+        for stamp in starts:
+            if not stamp:
+                continue
+            try:
+                age = (now_utc - parse_iso_datetime(
+                    stamp, "codex maintenance start")).total_seconds()
+                old = old or age > 86400
+            except (TypeError, ValueError):
+                pass
+        debt = dict(verifications=verifications, deletions=deletions,
+                    olderThan24h=old)
+        if maintenance_coverage != "complete":
+            debt["coverage"] = maintenance_coverage
+        return census, decoder, status, debt
+    except Exception:
+        return None, None, None, None
+
+
 def _doctor_gather_state_impl(
     *,
     now_utc: "dt.datetime | None" = None,
@@ -2032,11 +2333,17 @@ def _doctor_gather_state_impl(
         codex_jsonl_present = False
         try:
             for codex_dir in c._codex_session_roots():
-                if next(codex_dir.glob("**/*.jsonl"), None) is not None:
+                if (next(codex_dir.glob("**/*.jsonl"), None) is not None
+                        or next(codex_dir.glob("**/*.jsonl.zst"), None) is not None):
                     codex_jsonl_present = True
                     break
         except Exception:
             pass
+
+    with _lib_perf.phase("doctor.codex_containers"):
+        (codex_compressed_census, codex_decoder_capability,
+         codex_container_status, codex_maintenance_debt) = _gather_codex_container_state(
+             c, now_utc=now_utc, cache_probe_allowed=_cache_probe_allowed)
 
     with _lib_perf.phase("doctor.quota_summary"):
         # ── Codex quota lifecycle (#294 S2) ──────────────────────────────
@@ -2496,10 +2803,17 @@ def _doctor_gather_state_impl(
         journal_cursor_lag_bytes = None
         journal_hw_segment = None
         journal_cursor_segment = None
+        journal_cursor_invalid = False
         journal_conflicts = None
         journal_protocol_violations = None
         journal_protocol_acknowledged = None
         journal_protocol_error = None
+        # #825/#832 spec 8: the deep scan's whole-journal excluded population.
+        deep_excluded = None
+        deep_admission_boundary = None
+        # K9K10-R6/R11: why the listing or the deep scan could not complete.
+        journal_listing_error = None
+        journal_scan_error = None
         try:
             jdir = _cctally_core.JOURNAL_DIR
             journal_present = jdir.exists()
@@ -2511,8 +2825,14 @@ def _doctor_gather_state_impl(
                 import _cctally_journal as _jr
                 try:
                     segs = _jr.list_segments()  # canonical (segment) order
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 — reported, never empty
+                    # K9K10-R6: an unlistable journal is unreadable, not an
+                    # empty one; the presence leg names the cause.
                     segs = []
+                    journal_listing_error = _scan_cause(exc)
+                    if deep:
+                        # The deep recomputation cannot run either.
+                        journal_scan_error = journal_listing_error
                 journal_segment_count = len(segs)
                 # #402: the disposable stats index persists the most recent complete
                 # selector result. Shallow Dashboard/TUI gathers read that bounded
@@ -2556,13 +2876,28 @@ def _doctor_gather_state_impl(
                     torn = 0
                     decoded_records: list = []
                     protocol_evidence = []
+                    protocol_evidence_owners = []
                     prior_high_water = None
                     cutover_value = None
+                    # #825/#832 (spec 5.3, 8): the deep scan applies the same
+                    # admission predicate as ingest and rebuild — resolved
+                    # within this one pass and applied after it — and
+                    # recomputes the excluded population the legacy-writer leg
+                    # compares.
+                    pass_boundary = _jr._PassBoundary()
+                    deep_coordinates: list = []
+                    cutover_candidates: list = []
+                    deep_excluded: list = []
                     for seg in segs:
                         try:
                             data = (jdir / seg).read_bytes()
-                        except OSError:
+                        except FileNotFoundError:
                             continue
+                        except OSError as exc:
+                            # K9K10-R6: a skipped segment would let every
+                            # check below report a partial journal as whole.
+                            journal_scan_error = _scan_cause(exc)
+                            break
                         if not data:
                             continue
                         if not data.endswith(b"\n"):
@@ -2585,20 +2920,22 @@ def _doctor_gather_state_impl(
                                 )
                                 offset += len(raw) + 1
                                 continue
+                            pass_boundary.observe(record)
                             _jr._capture_protocol_prefix_evidence(
                                 record,
                                 prior_high_water,
                                 protocol_evidence,
                             )
+                            if (len(protocol_evidence)
+                                    > len(protocol_evidence_owners)):
+                                protocol_evidence_owners.append(
+                                    len(decoded_records))
                             # first cutover op wins, exactly as
                             # `find_accounts_cutover_op` scans — captured here so the
                             # conflict scan does not decode the whole journal twice.
-                            if (cutover_value is None
-                                    and record.get("id") == _jr.CUTOVER_OP_ID):
-                                payload = record.get("payload")
-                                if isinstance(payload, dict):
-                                    cutover_value = payload.get(
-                                        "claude_legacy_account")
+                            if record.get("id") == _jr.CUTOVER_OP_ID:
+                                cutover_candidates.append(
+                                    (record, seg, offset))
                             # RETAIN ONLY what the selector consumes. `obs` lines are
                             # ~97% of a real journal (984k of 1.02M) and
                             # `resolve_effective_events` ignores them entirely —
@@ -2609,13 +2946,56 @@ def _doctor_gather_state_impl(
                             decoded_records.append(
                                 _lib_journal_router.selector_slot(record)
                             )
+                            deep_coordinates.append((seg, offset))
                             prior_high_water = (
                                 seg,
                                 offset + len(raw) + 1,
                             )
                             offset += len(raw) + 1
-                    journal_malformed_count = malformed
-                    journal_torn_tail_count = torn
+                    admission_boundary = None
+                    if journal_scan_error is None:
+                        try:
+                            admission_boundary = pass_boundary.resolve(
+                                (segs[-1], sizes.get(segs[-1], 0)))
+                        except Exception as exc:  # noqa: BLE001
+                            # K9K10-R6: a None boundary admits everything:
+                            # zero excluded records and an unfiltered scan.
+                            journal_scan_error = _scan_cause(exc)
+                    if journal_scan_error is None:
+                        try:
+                            deep_excluded = _jr.excluded_population(
+                                admission_boundary)
+                        except Exception as exc:  # noqa: BLE001
+                            # K9K10-R11: an unreadable tail is never a
+                            # smaller population.
+                            journal_scan_error = _scan_cause(exc)
+                    if journal_scan_error is not None:
+                        deep_excluded = None
+                        journal_conflicts = None
+                        journal_protocol_error = None
+                    else:
+                        journal_malformed_count = malformed
+                        journal_torn_tail_count = torn
+                if deep and segs and journal_scan_error is None:
+                    _jr._apply_pass_admission(
+                        decoded_records, deep_coordinates, admission_boundary)
+                    # #825/#832 fix round C (CD2-005): an excluded
+                    # acknowledgement's evidence is excluded with it.
+                    protocol_evidence = _jr._admitted_prefix_evidence(
+                        protocol_evidence, protocol_evidence_owners,
+                        decoded_records)
+                    # Every excluded record counts, obs included, so the
+                    # population matches what ingest and rebuild record. Only
+                    # the post-boundary byte ranges can hold one.
+                    deep_admission_boundary = admission_boundary
+                    for candidate, cand_seg, cand_off in cutover_candidates:
+                        if _jr._is_admitted(candidate, cand_seg, cand_off,
+                                            admission_boundary):
+                            payload = candidate.get("payload")
+                            if isinstance(payload, dict):
+                                cutover_value = payload.get(
+                                    "claude_legacy_account")
+                            break
                     # #374: same-revision quarantine, via the SHARED selector over
                     # rebuild-equivalent input. Raw `(id, rev)` grouping would report
                     # lower-revision groups a completed rev-1 batch legitimately
@@ -2704,7 +3084,23 @@ def _doctor_gather_state_impl(
                     order = {s: i for i, s in enumerate(segs)}
                     if cseg in order:
                         ci = order[cseg]
-                        lag = max(0, sizes.get(segs[ci], 0) - coff)
+                        # #946: the lag of the SAFE applied cursor. A torn
+                        # suffix past it stays outstanding until a repair, and
+                        # a cursor past its segment or inside a line is no
+                        # safe endpoint at all.
+                        csize = sizes.get(segs[ci], 0)
+                        if coff > csize:
+                            journal_cursor_invalid = True
+                        elif coff > 0:
+                            try:
+                                with open(_cctally_core.JOURNAL_DIR / cseg,
+                                          "rb") as _seg_fh:
+                                    _seg_fh.seek(coff - 1)
+                                    if _seg_fh.read(1) != b"\n":
+                                        journal_cursor_invalid = True
+                            except OSError:
+                                journal_cursor_invalid = True
+                        lag = max(0, csize - coff)
                         for s in segs[ci + 1:]:
                             lag += sizes.get(s, 0)
                         journal_cursor_lag_bytes = lag
@@ -2881,6 +3277,10 @@ def _doctor_gather_state_impl(
         codex_replay_blocked=codex_replay_blocked,
         codex_replay_deferred=codex_replay_deferred,
         codex_prune_refusals=codex_prune_refusals or None,
+        codex_compressed_census=codex_compressed_census,
+        codex_decoder_capability=codex_decoder_capability,
+        codex_container_status=codex_container_status,
+        codex_maintenance_debt=codex_maintenance_debt,
         conversation_rollup_pricing_refusal=(
             conversation_rollup_pricing_refusal),
         conversation_rollup_pricing_fp=conversation_rollup_pricing_fp,
@@ -2898,9 +3298,17 @@ def _doctor_gather_state_impl(
         conversations_db_wal_bytes=conversations_db_wal_bytes,
         # #374: quarantined same-revision groups + structural protocol violation.
         journal_conflicts=journal_conflicts,
+        # #825/#832 spec 8: the legacy-writer evidence.
+        legacy_writer=_gather_legacy_writer(
+            deep_excluded, deep_admission_boundary,
+            deep_error=journal_scan_error),
+        # #825/#832 spec 8: the per-account outcome quarantine.
+        outcome_quarantine=_gather_outcome_quarantine(),
         journal_protocol_violations=journal_protocol_violations,
         journal_protocol_acknowledged=journal_protocol_acknowledged,
         journal_protocol_error=journal_protocol_error,
+        journal_listing_error=journal_listing_error,
+        journal_scan_error=journal_scan_error,
         # #496 S5b: the published generation's incomplete-quota-projection flag.
         stats_quota_projection_incomplete=stats_quota_projection_incomplete,
         # #315: read-only cache free-page evidence for the reclaim hint.
@@ -2927,6 +3335,7 @@ def _doctor_gather_state_impl(
         journal_malformed_count=journal_malformed_count,
         journal_torn_tail_count=journal_torn_tail_count,
         journal_cursor_lag_bytes=journal_cursor_lag_bytes,
+        journal_cursor_invalid=journal_cursor_invalid,
         journal_hw_segment=journal_hw_segment,
         journal_cursor_segment=journal_cursor_segment,
         journal_heal_incidents=journal_heal_incidents,

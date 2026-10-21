@@ -35,7 +35,7 @@ WA_RECEIPTS=$OUT/rootmap
   if [ "$WA_MODE" = frozen ]; then
     TMPDIR=$X/tmp/ /opt/homebrew/bin/python3 "$P/frozen_selftest.py" \
       --tree "${TREE:-$P/../..}" --scratch "$X/frozen-selftest" \
-      --rootmap "$ROOTMAP" --wtrace "$DYLIB" --out "$OUT/frozen-selftest.json" &&
+      --rootmap "$ROOTMAP" --wtrace "$DYLIB" --out "$OUT/frozen-selftest.json" --keep &&
     /opt/homebrew/bin/python3 "$P/frozen_roots.py" verify --freeze "$WA_FREEZE" \
       --out "$OUT/freeze-verify-before.json"
   fi &&

@@ -209,7 +209,7 @@ def test_the_destination_check_reports_a_committed_root():
     }
 
     staged = (
-        'FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)\n'
+        'FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixstage.XXXXXX")\n'
         'FIXTURES="$FIXTURE_STAGE/doctor"\n'
         '%s doctor "$FIXTURES"\n' % STAGING_HELPER
     )

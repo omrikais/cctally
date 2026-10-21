@@ -1,0 +1,74 @@
+[
+  {
+    "id": "tests/test_retention_spill_free.py::test_spill_free_deletion_writes_each_dirty_page_once[claude]",
+    "evidence": "#942: the spill-free WAL-frame measurement failed in 10 of the 69 retained failure extracts between 2026-10-08 and 2026-10-19 (runs 20261008T200035Z-39399-28757 through 20261019T234808Z-10e0f65c440e), on changes that do not touch the deletion path, while other full runs over the same code passed; the spec counts it in 8 of the last 40 failure extracts. The measured frame and temp-byte counts vary with runner load.",
+    "invariant": "The retention deletion visit is spill-free: it writes each dirty page to the WAL about once (at most 1.05x an unbounded-cache control) and writes no temp file (#901 spec 5.4, machine safety C4).",
+    "issue": "#942",
+    "replacement": "tests/test_retention_spill_free.py::test_spill_free_connection_configuration keeps the deterministic safety property on the merge path without measuring writes: the deletion connection runs with temp_store=MEMORY under the 256 MiB cache cap ((2, -262144)) and a newly opened writer keeps SQLite's default cache size with in-memory statement journals. The measurement itself runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_retention_spill_free.py::test_spill_free_deletion_writes_each_dirty_page_once[codex]",
+    "evidence": "#942: same node, Codex provider. Its failures are among the 10 retained failure extracts above (the extract redacts the parameter), and the #963 spec records an xdist worker crash in this exact node; other full runs over the same code passed.",
+    "invariant": "The Codex retention deletion visit is spill-free: about one WAL write per dirty page and no temp file (#901 spec 5.4, machine safety C4).",
+    "issue": "#942",
+    "replacement": "tests/test_retention_spill_free.py::test_spill_free_connection_configuration (the deletion connection's (temp_store, cache_size) == (2, -262144) and a fresh writer's default PRAGMAs) stays on the merge path; the measurement runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_retention_pacing.py::test_a_fractional_reclaim_deadline_is_never_earlier_than_the_cadence",
+    "evidence": "#942 comments: failed in run 20261012T104525Z-80030-23839, in the same run as the spill-free node, on a change that does not touch retention pacing; it passed in the other full runs over the same code.",
+    "invariant": "A fractional reclaim deadline is never scheduled earlier than the configured reclaim cadence (retention pacing).",
+    "issue": "#942",
+    "replacement": "none needed: the other tests/test_retention_pacing.py cases keep the pacing contract on the merge path; this node runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_session_queue.py::test_a_cleanup_deferred_by_an_unresolved_settlement_completes_through_the_successors_recovery",
+    "evidence": "#986: failed in run 20261019T042420Z-f94226ac4e41 under the full suite's -n 10 load on a change that does not touch the queue; it passes in isolation and in other full runs over the same code. The issue attributes it to holder admission and readiness latency under -n 10.",
+    "invariant": "A cleanup deferred by an unresolved settlement completes through the successor's recovery (merge-queue crash recovery).",
+    "issue": "#986",
+    "replacement": "none needed: the remaining tests/test_session_queue.py recovery cases stay on the merge path; this node runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_session_queue.py::test_obligation_is_completed_with_the_origins_semantics_after_every_crash[memory-d-task]",
+    "evidence": "#986: this parametrized node failed in runs 20261014T054621Z-f207a3314ee9 and 20261019T042420Z-f94226ac4e41 under -n 10 load on changes that do not touch the queue, and passed in other full runs over the same code; the issue names the memory-d-task case.",
+    "invariant": "After a crash at point d, an obligation started by a memory admission is completed by a task successor with the origin's semantics.",
+    "issue": "#986",
+    "replacement": "none needed: the other 19 origin/crash/successor combinations of the same test stay on the merge path.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_quota_mutation_coverage.py::test_each_mutation_chunk_is_caught_in_an_isolated_tree",
+    "evidence": "#987: chunks of this node failed in 6 of the 69 retained failure extracts (20261008T200035Z-39399-28757, 20261013T162711Z-d71ed7e3868e, 20261013T212048Z-4ca9086080fb, 20261018T221858Z-2f3f4f287ff0, 20261019T050813Z-ad83663669f7, 20261019T051336Z-85d23e020fd6), on changes that do not touch the quota kernel, against its 100/105-second per-chunk bounds under load; other full runs over the same code passed.",
+    "invariant": "Every recorded quota-kernel mutation is caught by at least one detector when applied in an isolated tree (accuracy of quota numbers, C1 priority 2).",
+    "issue": "#987",
+    "replacement": "none needed for the merge path: the mutation ledger's structural tests in tests/test_quota_mutation_coverage.py stay, and the quota kernel's own unit and golden tests cover the arithmetic; the full mutation sweep runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "tests/test_retention_state_record.py::test_a_legacy_record_is_normalized_once_before_the_first_chunk",
+    "evidence": "#990: failed in run 20261019T212818Z-43aebcdd2533 on a change that does not touch the retention state record, and passed in the other full runs over the same code.",
+    "invariant": "A legacy retention state record is normalized exactly once, before the first deletion chunk.",
+    "issue": "#990",
+    "replacement": "none needed: the other tests/test_retention_state_record.py cases keep the record's normalization contract on the merge path; this node runs in the scheduled quarantine leg.",
+    "reviewBy": "2026-10-27"
+  },
+  {
+    "id": "harness:dashboard::all-combined-account-unresolved",
+    "evidence": "#985: the `POST /api/sync (valid Origin)` check returned HTTP 000 under `--max-time 5` in run 20261019T033201Z-b56bc4beb2db on a LAN runner, where the harness took 62 s against 54-59 s in the 15 prior runs. There was no other occurrence in 27 retained dashboard harness logs, and an isolated rerun passed 43/0. The rebuild-under-load explanation is unproven.",
+    "invariant": "The dashboard serves the byte-stable /api/data golden for an All-providers envelope whose account cannot be resolved, and its POST /api/sync with a valid Origin succeeds.",
+    "issue": "#985",
+    "replacement": "tests/test_dashboard_api_sync_refresh.py keeps the POST /api/sync refresh contract and tests/test_dashboard_csrf.py its Origin check on the merge path; the two scenarios run by name in the scheduled quarantine leg (bin/cctally-dashboard-test --cases).",
+    "reviewBy": "2026-10-28"
+  },
+  {
+    "id": "harness:dashboard::all-budget-account-focus",
+    "evidence": "#985: the `POST /api/sync (valid Origin)` check returned HTTP 000 under `--max-time 5` in run 20261019T033201Z-b56bc4beb2db on a LAN runner, where the harness took 62 s against 54-59 s in the 15 prior runs. There was no other occurrence in 27 retained dashboard harness logs, and an isolated rerun passed 43/0. The rebuild-under-load explanation is unproven.",
+    "invariant": "The dashboard serves the byte-stable /api/data golden for an All-providers budget scoped to one focused account, and its POST /api/sync with a valid Origin succeeds.",
+    "issue": "#985",
+    "replacement": "tests/test_dashboard_api_sync_refresh.py keeps the POST /api/sync refresh contract and tests/test_dashboard_csrf.py its Origin check on the merge path; the two scenarios run by name in the scheduled quarantine leg (bin/cctally-dashboard-test --cases).",
+    "reviewBy": "2026-10-28"
+  }
+]

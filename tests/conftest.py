@@ -13,8 +13,9 @@ import types
 import pytest
 
 # Dev-instance isolation and preamble parity (2026-05-26; widened #529 S4).
-# The shell half of the estate neutralizes six variables in
-# bin/_lib-harness-env.sh; this is the pytest half of the same contract.
+# The shell half of the estate neutralizes six variables and exports the #965
+# retention switch in bin/_lib-harness-env.sh; this is the pytest half of the
+# same contract.
 #
 # ASSIGN, never setdefault: setdefault lets an inherited runner value WIN,
 # which is an inheritance hole rather than a pin, and it is exactly the class
@@ -36,6 +37,12 @@ for _name, _value in (
     ("CCTALLY_DISABLE_DEV_AUTODETECT", "1"),
     ("CCTALLY_DISABLE_UPDATE_CHECK", "1"),
     ("CCTALLY_DISABLE_RETENTION_SWEEP", "1"),
+    # #965: fixed-date transcript fixtures must not expire under the wall
+    # clock. Honored only by checkout code with no retention setting; a test
+    # that needs production retention removes it with monkeypatch.delenv or
+    # configures a window. docs/fixtures-gotchas.md, "Conversation retention
+    # is off in test environments (#965)".
+    ("CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF", "1"),
 ):
     os.environ[_name] = _value
 for _name in ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY"):
@@ -81,6 +88,12 @@ def pytest_sessionstart(session) -> None:
     )
     if error:
         raise pytest.UsageError(error)
+    # Before any test can initialise multiprocessing and cache its temporary
+    # directory: on Darwin a root too long for its socket paths sends it to
+    # /tmp, which the confined runner kills (#940, spec 6.5).
+    problem = _iso.multiprocessing_temp_root_problem()
+    if problem:
+        raise pytest.UsageError(problem)
 
 
 def _script_path() -> pathlib.Path:
@@ -114,6 +127,13 @@ _BIN_DIR = str(_SCRIPT_PATH.parent)
 if _BIN_DIR not in sys.path:
     sys.path.insert(0, _BIN_DIR)
 
+# #966(c), spec 4.3: a direct pytest run that inherited the aggregator-owner
+# family (an outcome record, a run id, an evidence store) must not hand it to
+# any child; bin/cctally-test-all removes it at its own boundaries.
+import _lib_test_generation as _owner_env  # noqa: E402
+
+_owner_env.scrub_owner_env(os.environ)
+
 
 # Captured at import under the developer's REAL HOME — before any test
 # monkeypatches HOME — so the guard below watches the ACTUAL prod log a leaking
@@ -132,9 +152,24 @@ _REAL_PROD_MIGRATION_LOG = (
 # hook cannot be removed once installed, so `install()` is idempotent and later
 # calls only rebind the policy it reads.
 import _lib_test_isolation as _iso  # noqa: E402  -- bin/ joins sys.path above
+import _temp_hygiene as _hyg  # noqa: E402  -- tests/ is on sys.path for conftest imports
 
 _iso.install()
 _iso.install_popen_interceptor()
+_iso.install_retention_launch_audit()  # #965: the retention arm judges this worker's launches
+# #963 spec 5.2: every pytest temp allocation is registered with its owner from
+# here on; the guard's hooks are registered in pytest_configure below.
+_hyg.install()
+
+
+def pytest_configure(config):
+    """Register the temp hygiene guard's hooks as a global plugin (#963).
+
+    A global plugin, not hooks in this file: pytest calls the fixture hooks for
+    a session-scoped fixture through the Session's hook proxy, which leaves out
+    this conftest because it sits below the rootdir (see _temp_hygiene.Plugin).
+    """
+    _hyg.register(config)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -152,28 +187,37 @@ def _isolation_scratch_root(tmp_path_factory):
 
 @pytest.fixture(autouse=True)
 def _isolation_detector(request):
-    """Attribute writes to the running test, and fail it from the ledger.
+    """Attribute writes to the running test.
 
     Defined FIRST among the autouse fixtures in this file so it sets up first
     and tears down last: a violation caused by another fixture's teardown still
-    has to be attributed and reported.
+    has to be attributed to this test.
 
-    Failing from the ledger rather than from the raised exception is the whole
-    point. A test that catches `ProductionWriteBlocked` and returns normally is
-    still failed here, because the hook recorded the violation before it raised.
+    The ledger is read and the test failed in the temp hygiene plugin's
+    pytest_runtest_teardown (tests/_temp_hygiene.py), after EVERY finalizer has
+    run, so the result no longer depends on fixture definition order (#963
+    spec 5.2). Failing from the ledger rather than from the raised exception is
+    the whole point: a test that catches `ProductionWriteBlocked` and returns
+    normally is still failed, because the hook recorded the violation before it
+    raised.
     """
     node_id = request.node.nodeid
     _iso.set_node_id_getter(lambda: node_id)
-    try:
-        yield
-    finally:
-        problems = _iso.collect_test_violations(node_id)
-    if problems:
-        pytest.fail(
-            "isolation contract violated by this test (#529 S4):\n  "
-            + "\n  ".join(problems),
-            pytrace=False,
-        )
+    yield
+
+
+@pytest.fixture
+def release_sealed_tmp_path(tmp_path):
+    """Release a test's deliberately sealed temporary tree after its assertions (#963).
+
+    Explicit, never autouse: a test that seals real scratch product trees asks
+    for it, so the hygiene guard still fails any test that leaves a tree
+    undeletable without saying so (spec J2). Requested before the sealing work
+    starts, so a capture that fails half way is released too. A refused release
+    fails the test.
+    """
+    yield tmp_path
+    _hyg.release_or_fail(tmp_path, "release_sealed_tmp_path")
 
 
 # --- the agentmem degradation announcement (#529 S6, M4) -------------------
@@ -296,6 +340,11 @@ def pytest_sessionfinish(session, exitstatus):
     this hook fired in gw0 and gw1. A worker therefore records what it found and
     returns; the controller reads every worker's ledger and decides the run.
     """
+    # Every process: the temp hygiene backstop (#963 spec 5.2) records what no
+    # owner checked into this process's own ledger, before the controller reads
+    # the ledgers, and each process leaves its timing for the summary line.
+    _hyg.session_backstop(session)
+    _hyg.write_stats()
     if os.environ.get("PYTEST_XDIST_WORKER"):
         _iso.flush_late_handshake_problems()
         return
@@ -307,15 +356,33 @@ def pytest_sessionfinish(session, exitstatus):
     if not problems:
         return
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    message = (
-        "isolation contract violated after the reporting test finished "
-        "(#529 S4):\n  " + "\n  ".join(problems)
-    )
+    isolation = [p for p in problems if not p.startswith(_hyg.HYGIENE_PREFIX)]
+    hygiene = [p for p in problems if p.startswith(_hyg.HYGIENE_PREFIX)]
+    blocks = []
+    if isolation:
+        blocks.append(
+            "isolation contract violated after the reporting test finished "
+            "(#529 S4):\n  " + "\n  ".join(isolation)
+        )
+    if hygiene:
+        blocks.append(
+            "temp hygiene violated outside any single test (#963):\n  "
+            + "\n  ".join(hygiene)
+        )
+    message = "\n".join(blocks)
     if reporter is not None:
         reporter.write_line(message, red=True)
     else:  # pragma: no cover - only when the terminal plugin is disabled
         print(message, file=sys.stderr)
     session.exitstatus = 1
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """The controller's one temp hygiene summary line (#963; P1 reads it)."""
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        line = _hyg.summary_line()
+        if line:
+            terminalreporter.write_line(line)
 
 
 def _migration_log_identity():
@@ -817,6 +884,14 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "STATUSLINE_TRANSPORT_MARKER_PATH": share / "statusline-transport.last",
         "STATUSLINE_AUTHORITATIVE_7D_PATH": share / "statusline-authoritative-7d.json",
         "STATUSLINE_AUTHORITATIVE_5H_PATH": share / "statusline-authoritative-5h.json",
+        # #825/#832 account-bound protocol root and its sidecars.
+        "STATUSLINE_ACCOUNT_BOUND_DIR": share / "statusline-account-bound-v1",
+        "LEGACY_SPOOL_BASELINE_PATH": (
+            share / "statusline-account-bound-v1" / "legacy-spool-baseline.json"),
+        "ACCOUNT_BOUND_CUTOVER_CACHE_PATH": (
+            share / "statusline-account-bound-v1" / "cutover-coordinate.json"),
+        "LEGACY_WRITER_EVIDENCE_PATH": (
+            share / "statusline-account-bound-v1" / "legacy-writer-evidence.json"),
         # Host-global statusline cache (#529 S4). NOT under share/ — production
         # keeps it in /tmp because the real Claude Code statusline shares it, so
         # the fixture analogue is a per-test tmp file rather than an APP_DIR
@@ -861,22 +936,6 @@ def redirect_paths(ns, monkeypatch, tmp_path):
     # the kernel patches above propagate directly — no extra block here.
 
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
-
-
-def redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path):
-    """Redirect state and keep non-retention transcript fixtures durable.
-
-    Conversation rebuilds deliberately force the configured retention pass.
-    Ingest, reingest, rollup, and reader tests use fixed JSONL timestamps and
-    are not retention tests, so leaving them on the production default makes
-    their expected rows expire as wall time advances. Dedicated retention tests
-    continue to use ``redirect_paths`` and exercise explicit windows.
-    """
-    redirect_paths(ns, monkeypatch, tmp_path)
-    ns["CONFIG_PATH"].write_text(
-        '{"conversation":{"retention_days":0}}\n',
-        encoding="utf-8",
-    )
 
 
 @pytest.fixture
@@ -1196,3 +1255,45 @@ def tiny_corpus(shared_corpus):
     far too slow for a gate under the pytest phase's --timeout=120.
     """
     return shared_corpus("tiny")
+
+
+# ── #825/#832 account-bound statusline spool helpers ──────────────────────
+# The current protocol keeps candidates, transitions and authoritative fences
+# under `STATUSLINE_ACCOUNT_BOUND_DIR/accounts/<account_key>/`; the legacy
+# flat paths are never written. These helpers locate them for assertions.
+
+
+def bound_account_dir(ns, account_key="unattributed"):
+    return ns["STATUSLINE_ACCOUNT_BOUND_DIR"] / "accounts" / account_key
+
+
+def bound_tombstone_files(ns, axis, account_key="unattributed"):
+    """Every fence file of ``axis`` for one account (any window)."""
+    return sorted((bound_account_dir(ns, account_key) / "tombstones").glob(
+        f"{axis}-*.json"))
+
+
+def bound_tombstone(ns, axis, account_key="unattributed"):
+    """The single fence document of ``axis`` for one account, or None."""
+    import json as _json
+    files = bound_tombstone_files(ns, axis, account_key)
+    assert len(files) <= 1, files
+    return None if not files else _json.loads(files[0].read_text())
+
+
+def write_bound_candidate(token, *, received_at, seven_day=None, five_hour=None):
+    """Spool one current candidate bound to the active identity.
+    ``seven_day``/``five_hour`` are ``(percent, raw_resets_at)`` pairs."""
+    sl = sys.modules["_cctally_statusline"]
+    lib = sys.modules["_lib_statusline_candidates"]
+    binding = sl._capture_binding()
+    assert binding is not None, "the active identity must be stable"
+    sl._write_candidate(lib.Candidate(
+        token=token, received_at=received_at,
+        seven_day=None if seven_day is None else lib.AxisValue(
+            float(seven_day[0]), int(seven_day[1])),
+        five_hour=None if five_hour is None else lib.AxisValue(
+            float(five_hour[0]), int(five_hour[1])),
+        binding=binding,
+    ))
+    return binding

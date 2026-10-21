@@ -49,7 +49,9 @@ def _load_kernel():
         sys.path.insert(0, bin_dir)
     import _lib_journal
 
-    return _lib_journal
+    # The committed fixture is a pre-#825/#832 journal: previous-release record
+    # shapes, no writer-generation stamp.
+    return _lib_journal.legacy_writer_view()
 
 
 SEGMENT_NAME = "observations-2026-07.jsonl"

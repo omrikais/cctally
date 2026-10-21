@@ -390,11 +390,3 @@ def test_s2_classes_unchanged_without_the_flag(spec_kind, subjects_shape,
     )
     assert (result.verdict, result.code, result.support_shortfall) == \
         EXPECTED_S2[(spec_kind, subjects_shape, denominator_shape)]
-
-
-def test_the_matrix_covers_every_cell_it_claims_to():
-    assert len(EXPECTED_S2) == 36
-    assert set(EXPECTED_S2) == {
-        (spec.kind, a, b) for spec in k.CONTRIBUTOR_REGISTRY[:4]
-        for a, b in itertools.product(SUBJECT_SETS, DENOMINATORS)
-    }

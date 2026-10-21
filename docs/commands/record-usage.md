@@ -94,6 +94,15 @@ cctally record-usage \
 - Milestones store cumulative cost **at the moment of crossing** — they
   are deliberately never backfilled.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The reading was recorded (or deliberately dropped as a duplicate). |
+| 2 | Invalid input: an implausible `--percent` or `--resets-at`, or the active Claude account could not be read consistently. |
+
+**A torn identity is refused, not guessed.** Every reading is bound to the Claude account active when it is captured. When `~/.claude.json` cannot be read consistently (for example while Claude Code is rewriting it during an account switch), `record-usage` records nothing and exits 2; the next status-line tick records normally. With no Claude account signed in at all, readings are recorded under `unattributed`.
+
 ## See also
 
 - [`percent-breakdown`](percent-breakdown.md) — render the milestones recorded here

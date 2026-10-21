@@ -195,10 +195,12 @@ def test_c4_the_category_inventory_is_pinned():
     report = _report()
     # `performance` is #901's `performance.dashboard_disk_writes`, the one new
     # check spec §4.6 authorizes, appended last so every other category keeps
-    # its place.
+    # its place. `accounting` is #825/#832's `accounting.outcome_quarantine`
+    # (spec section 8, F16), placed right after `accounts`.
     assert [c.id for c in report.categories] == [
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry", "performance"]
+        "accounting", "pricing", "quota", "safety", "telemetry",
+        "performance"]
 
 
 @pytest.mark.parametrize("rejection,expected", [
@@ -569,3 +571,39 @@ def test_688_the_negative_finding_still_carries_no_remediation():
     assert drift.summary == "no change detected"
     assert drift.remediation is None
     assert drift.details["calibration_status"] is None
+
+
+# #978 spec 4.5: a transition pair requires one fingerprint AND one era.
+def _era_pair(pred_era, succ_era, *, fingerprint="f" * 64):
+    pred = {"effectiveFrom": "2026-07-25T00:00:00+00:00",
+            "effectiveUntil": BOUNDARY, "unitsPerPoint": 2_400_000.0,
+            "status": "ok", "fingerprint": fingerprint}
+    succ = {"effectiveFrom": BOUNDARY, "effectiveUntil": None,
+            "unitsPerPoint": 1_000_000.0, "status": "ok",
+            "fingerprint": fingerprint}
+    if pred_era is not None:
+        pred["coefficientEra"] = pred_era
+    if succ_era is not None:
+        succ["coefficientEra"] = succ_era
+    return [pred, succ]
+
+
+@pytest.mark.parametrize("pred_era, succ_era, paired", [
+    ("opus-5", "opus-5-5", False),
+    ("opus-5-5", "opus-5-5", True),
+    ("opus-5", "opus-5", True),
+    (None, None, True),
+    (None, "opus-5-5", False),
+])
+def test_adjacent_pairs_require_same_era(ns, pred_era, succ_era, paired):
+    mrc = ns["_load_sibling"]("_lib_meter_rate_change")
+    regimes = _era_pair(pred_era, succ_era)
+    assert bool(mrc._adjacent_pairs(regimes)) is paired
+    assert (mrc.active_rate_change(regimes) is not None) is paired
+
+
+def test_adjacent_pairs_require_same_fingerprint(ns):
+    mrc = ns["_load_sibling"]("_lib_meter_rate_change")
+    regimes = _era_pair("opus-5-5", "opus-5-5")
+    regimes[1]["fingerprint"] = "e" * 64
+    assert mrc._adjacent_pairs(regimes) == {}

@@ -27,10 +27,13 @@ from pathlib import Path
 import _cctally_core
 import _cctally_journal as _journal
 import _cctally_record as _record
+import _lib_account_protocol
 import _lib_journal
 import _lib_journal_router
 import _lib_json_envelope
 import _lib_rederive
+import _cctally_store
+from _cctally_store import StatsIndexNotCurrent
 
 
 class RederiveBusy(RuntimeError):
@@ -46,6 +49,14 @@ class RederiveApplyError(RuntimeError):
         self.preview = preview
         self.batch_id = batch_id
         self.cause = cause
+
+
+class RederiveObligationNotDurable(RederiveApplyError):
+    """Fix round K12 (K11R-2): the corrected index IS published, but its
+    residual-derivation obligation could not be made durable. Raised only
+    after the apply's lock context has exited normally, so the locks are
+    released and the holder wake is posted; the command reports it with
+    message N2 and exit 3, never as a failed apply."""
 
 
 @dataclass(frozen=True)
@@ -548,12 +559,19 @@ def _rederivable_raw_records(records: list[dict]) -> list[dict]:
         kind = (record.get("payload") or {}).get("kind")
         if kind in {"weekly_credit_floor", "account_observe",
                     "account_label", "accounts_cutover", "sync_week",
-                    "claude_weekly_observation_decision"}:
+                    *_REVIEWED_WEEKLY_KINDS}:
             out.append(record)
     return out
 
 
-_REVIEWED_WEEKLY_KIND = "claude_weekly_observation_decision"
+#: #825/#832 spec 5.1: the previous release validates a reviewed weekly
+#: decision by exact equality with its own `make_op`, which a stamped record can
+#: never satisfy, so the current binary emits the versioned kind (an unknown op
+#: to the previous release) and reads both.
+_REVIEWED_WEEKLY_KIND = _lib_account_protocol.WEEKLY_OBSERVATION_DECISION_V2_KIND
+_REVIEWED_WEEKLY_LEGACY_KIND = "claude_weekly_observation_decision"
+_REVIEWED_WEEKLY_KINDS = frozenset((
+    _REVIEWED_WEEKLY_LEGACY_KIND, _REVIEWED_WEEKLY_KIND))
 _REVIEWED_MANIFEST_KEYS_V1 = frozenset({
     "schemaVersion", "journalHighWater", "journalPrefixHash",
     "reviewedAt", "reason", "decisions",
@@ -830,7 +848,8 @@ def _reviewed_weekly_state(records):
     ops = []
     for record in records:
         if (record.get("t") != "op" or
-                (record.get("payload") or {}).get("kind") != _REVIEWED_WEEKLY_KIND):
+                (record.get("payload") or {}).get("kind")
+                not in _REVIEWED_WEEKLY_KINDS):
             continue
         payload = record["payload"]
         version = payload.get("schema_version")
@@ -910,11 +929,23 @@ def _reviewed_weekly_state(records):
     ), ops)
 
 
+class _PinnedPrefixDigest:
+    """The one prefix digest a deferred reviewed-decision validation needs,
+    captured inline by the reading pass."""
+
+    def __init__(self, high_water, digest):
+        self._high_water = high_water
+        self._digest = digest
+
+    def digest_at(self, high_water):
+        return self._digest if high_water == self._high_water else None
+
+
 def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
     """Verify an operator decision against the bytes before its journal line."""
     payload = record.get("payload")
     if (not isinstance(payload, dict)
-            or payload.get("kind") != _REVIEWED_WEEKLY_KIND):
+            or payload.get("kind") not in _REVIEWED_WEEKLY_KINDS):
         return
     bound = payload.get("journal_high_water")
     version = payload.get("schema_version")
@@ -933,6 +964,7 @@ def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
             or not payload["reason"].strip()
             or record != _lib_journal.make_op(
                 at=record.get("at"), src=record.get("src"), payload=payload,
+                writer_generation=record.get("wpg"),
             )):
         raise _lib_rederive.RederiveConflict(
             "malformed retained reviewed weekly decision op"
@@ -1015,6 +1047,47 @@ def _derive_desired_events_into(
             + ", ".join(sorted(unknown_ids))
         )
     conn = _cctally_core.open_db(_target_path=str(scratch_path))
+    # #825/#832 spec 5.6 item 8: the scratch replay re-evaluates the same
+    # triggers and certificates over the corrected history in journal order,
+    # so it can never plan an outcome ordinary processing withholds.
+    import _cctally_quarantine
+    fold = _cctally_quarantine.QuarantineFold.empty(held_ids=held_ids)
+    try:
+        return replay_scratch_records(
+            conn, records, cache_conn, fold=fold, held_ids=held_ids,
+            block_sources=block_sources)
+    finally:
+        conn.close()
+
+
+def replay_scratch_records(
+    conn, records, cache_conn, *, fold, held_ids=frozenset(),
+    block_sources: "dict | None" = None, coordinates=None,
+    skip_indexes=frozenset(), on_input=None, read_adapters=None,
+    retention=None,
+) -> list[dict]:
+    """THE scratch derivation: run every rederivable raw record of
+    ``records`` through the live pipeline hooks and harvest, in journal
+    order, on the private scratch connection ``conn``, capturing every derived
+    candidate instead of journaling it (`db rederive` and the #825/#832
+    derivation-completion step share it, so there is one detector
+    implementation).
+
+    ``fold`` is the outcome-quarantine fold, advanced over every slot —
+    excluded placeholders included — so each input's gate is evaluated at its
+    original position. ``coordinates`` (parallel to ``records``, each
+    `(segment, offset)` or None) feeds the fold the physical positions a live
+    ingest gives it. An index in ``skip_indexes`` still advances the fold but
+    its hooks do not run. ``on_input(index, events)`` receives each raw input's
+    own derived candidates. ``read_adapters`` replaces the stable cost/config
+    read adapters over ``cache_conn`` (a context manager), for a caller with no
+    cache to read. ``retention`` (derivation completion only, a
+    `_cctally_journal.ScratchRetention`) keeps the scratch projection on the
+    retained effective decisions: the emitters consult it, and every
+    ``evt``/``correction`` line of ``records`` is offered to it at its own
+    position. Returns every candidate in derivation order."""
+    raw_ids = {id(record) for record in _rederivable_raw_records(
+        [record for record in records if isinstance(record, dict)])}
     events: list[dict] = []
     reviewed_weekly_basis_by_account = {}
     hooks = (
@@ -1023,32 +1096,70 @@ def _derive_desired_events_into(
         _record._pipeline_record_credit,
         _record._pipeline_sync_week,
     )
-    try:
-        with _scratch_read_adapters(cache_conn):
-            for record in raw_records:
-                ctx = _journal.IngestContext(
-                    conn=conn,
-                    batch=[record],
-                    config={},
-                    event_sink=events,
-                    projection_writes=False,
-                    held_weekly_observation_ids=held_ids,
-                    reviewed_weekly_basis_by_account=(
-                        reviewed_weekly_basis_by_account),
-                    block_source_evidence=block_sources,
-                )
+    import _lib_account_protocol as _protocol
+    adapters = (_scratch_read_adapters(cache_conn) if read_adapters is None
+                else read_adapters)
+    with adapters:
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                continue
+            if record.get("t") == _protocol.EXCLUDED_PLACEHOLDER_TYPE:
+                carried = record.get("quarantine") or {}
+                fold.on_excluded(
+                    carried.get("record") or {},
+                    segment=carried.get("segment"),
+                    offset=carried.get("offset"))
+                continue
+            if (retention is not None
+                    and record.get("t") in ("evt", "correction")):
                 conn.execute("BEGIN IMMEDIATE")
                 try:
-                    for hook in hooks:
-                        hook(ctx, record)
-                    _journal._harvest(ctx)
+                    retention.on_journaled(conn, record)
                     conn.commit()
                 except BaseException:
                     conn.rollback()
                     raise
-        return events
-    finally:
-        conn.close()
+            coordinate = (None if coordinates is None
+                          else coordinates[index])
+            if coordinate is None:
+                gate = fold.on_record(record)
+            else:
+                gate = fold.on_record(
+                    record, segment=coordinate[0], offset=coordinate[1])
+            if id(record) not in raw_ids or index in skip_indexes:
+                continue
+            before = len(events)
+            ctx = _journal.IngestContext(
+                conn=conn,
+                batch=[record],
+                config={},
+                event_sink=events,
+                projection_writes=False,
+                held_weekly_observation_ids=held_ids,
+                reviewed_weekly_basis_by_account=(
+                    reviewed_weekly_basis_by_account),
+                block_source_evidence=block_sources,
+                quarantine=fold,
+                outcome_gate=gate,
+                scratch_retention=retention,
+            )
+            if retention is not None:
+                retention.current_input = index
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for hook in hooks:
+                    hook(ctx, record)
+                _journal._harvest(ctx)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                if retention is not None:
+                    retention.current_input = None
+            if on_input is not None:
+                on_input(index, events[before:])
+    return events
 
 
 def _planner_op_kinds() -> "set[str]":
@@ -1186,6 +1297,7 @@ def plan_claude_usage(
     )
     return _lib_rederive.build_claude_usage_plan(
         selection=selection,
+        physical_revisions=_excluded_physical_revisions(records),
         desired_events=desired,
         journal_high_water=journal_high_water,
         cache_fingerprint=cache_fingerprint,
@@ -1200,6 +1312,26 @@ def plan_claude_usage(
         historical_close_markers=historical_markers,
         enforce_guard=enforce_guard,
     )
+
+
+def _excluded_physical_revisions(records) -> dict:
+    """The highest revision per id among the excluded events and correction
+    actions the placeholders of ``records`` carry (#825/#832 fix round A,
+    Codex fix-round-1 Q2)."""
+    import _lib_account_protocol as _protocol
+    out: dict = {}
+    for record in records:
+        if (not isinstance(record, dict)
+                or record.get("t") != _protocol.EXCLUDED_PLACEHOLDER_TYPE):
+            continue
+        carried = (record.get("quarantine") or {}).get("record") or {}
+        event_id = carried.get("id")
+        rev = carried.get("rev", 0)
+        if (carried.get("t") in ("evt", "correction")
+                and isinstance(event_id, str) and type(rev) is int
+                and rev >= 0):
+            out[event_id] = max(rev, out.get(event_id, rev))
+    return out
 
 
 def owned_conflicted_event_ids(selection) -> frozenset:
@@ -1254,9 +1386,17 @@ def read_rederive_journal_prefix(
     records: list[dict] = []
     record_ends: list[tuple[str, int]] = []
     evidence: list = []
+    evidence_owners: list = []
     malformed = 0
     prior_high_water = None
     hasher = _lib_journal_router.PrefixHashAccumulator()
+    # #825/#832 (spec 5.3): admission before interpretation, resolved within
+    # this one pass. A reviewed decision's validation needs the prefix digest
+    # at its own position, so the digest is taken inline and the validation
+    # runs after the pass, for admitted decisions only.
+    pass_boundary = _journal._PassBoundary()
+    coordinates: list = []
+    pending_reviewed: list = []
     for segment, offset, raw in _journal._iter_range_with_segments(
         None,
         high_water,
@@ -1270,19 +1410,57 @@ def read_rederive_journal_prefix(
             malformed += 1
             prior_high_water = record_end
             continue
+        pass_boundary.observe(record)
         if record.get("t") == "op":
-            _validate_retained_reviewed_op(
-                record, prior_high_water, hasher,
-            )
+            if (record.get("payload") or {}).get("kind") in _REVIEWED_WEEKLY_KINDS:
+                pending_reviewed.append((
+                    len(records), record, prior_high_water,
+                    None if prior_high_water is None
+                    else hasher.digest_at(prior_high_water),
+                ))
             _journal._capture_protocol_prefix_evidence(
                 record,
                 prior_high_water,
                 evidence,
                 hasher=hasher,
             )
+            if len(evidence) > len(evidence_owners):
+                evidence_owners.append(len(records))
         records.append(record)
         record_ends.append(record_end)
+        coordinates.append((segment, offset))
         prior_high_water = record_end
+    # An inert placeholder keeps every position and sequence number; an
+    # excluded correction, reviewed decision or Claude record is never planning
+    # input (case F7).
+    originals = list(records)
+    placeholder = _lib_account_protocol.excluded_placeholder()
+    _journal._apply_pass_admission(
+        records, coordinates, pass_boundary.resolve(high_water),
+        placeholder=placeholder)
+    # #825/#832 fix round C (CD2-005): an excluded acknowledgement takes its
+    # raw-prefix evidence with it, so selection reads it as absent.
+    evidence = _journal._admitted_prefix_evidence(
+        evidence, evidence_owners, records)
+    # #825/#832 spec 5.6: each excluded slot keeps its original record and
+    # coordinate for the outcome-quarantine fold of the scratch replay (a
+    # trigger whose readings widen the every-account envelope). Nothing else
+    # reads a placeholder's fields.
+    for index, slot in enumerate(records):
+        if slot is placeholder:
+            records[index] = {
+                **placeholder,
+                "quarantine": {
+                    "record": originals[index],
+                    "segment": coordinates[index][0],
+                    "offset": coordinates[index][1],
+                },
+            }
+    for index, record, prior, digest in pending_reviewed:
+        if records[index] is record:
+            _validate_retained_reviewed_op(
+                record, prior, _PinnedPrefixDigest(prior, digest),
+            )
     # Released before the raise below, so a malformed prefix does not pin the
     # accumulator's buffered segment — 410 MB on the maintainer's journal — on
     # the traceback while the exception unwinds. On the success path the frame
@@ -1455,7 +1633,7 @@ def _preview_from_snapshot(
             index for index, record in enumerate(records)
             if record.get("t") == "op"
             and (record.get("payload") or {}).get("kind")
-            == _REVIEWED_WEEKLY_KIND
+            in _REVIEWED_WEEKLY_KINDS
         ]
         if decision_indexes:
             index = decision_indexes[-1]
@@ -1629,6 +1807,18 @@ def _rederive_locks(*, apply: bool, timeout: float):
     finally:
         _cctally_core.note_stats_maintenance_released()
         release_cache_writer_flocks(held)
+    # #825/#832 spec 4.3 revision 2: a current holder posts a wake once its
+    # locks are released (the fast path; the dependency waiter covers every
+    # other exit) — after a rederive's live index publication or none.
+    _post_statusline_wake("holder:rederive")
+
+
+def _post_statusline_wake(reason: str) -> None:
+    try:
+        import _cctally_statusline
+        _cctally_statusline.post_wake(reason)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -1766,6 +1956,10 @@ def codex_attribution_apply_locks(*, timeout: float = _REDERIVE_LOCK_TIMEOUT_SEC
     finally:
         _cctally_core.note_stats_maintenance_released()
         owner.release_all()
+    # #825/#832 spec 4.3 revision 2: the outer lock owner of a
+    # `run_stats_ingest(locks_held=True)` cycle posts its wake once the whole
+    # set is released.
+    _post_statusline_wake("holder:attribution")
 
 
 def preview_db_rederive(
@@ -1789,14 +1983,16 @@ def _stats_has_batch(batch_id: str) -> bool:
         with _open_sqlite_snapshot(
             path,
             prefix="cctally-rederive-stats-",
-        ) as conn:
+        ) as conn, _cctally_store.current_stats_snapshot(conn):
+            # #825/#832 spec 6: convergence evidence only from a validated
+            # current index; anything else fails closed (rebuild).
             row = conn.execute(
                 "SELECT 1 FROM journal_effective_events "
                 "WHERE batch_id = ? LIMIT 1",
                 (batch_id,),
             ).fetchone()
             return row is not None
-    except (OSError, sqlite3.Error):
+    except (OSError, sqlite3.Error, StatsIndexNotCurrent):
         return False
 
 
@@ -1833,7 +2029,8 @@ def _reviewed_op_needs_materialization(preview: RederivePreview) -> bool:
     last_index = None
     for index, record in enumerate(preview.records):
         if (record.get("t") == "op" and
-                (record.get("payload") or {}).get("kind") == _REVIEWED_WEEKLY_KIND):
+                (record.get("payload") or {}).get("kind")
+                in _REVIEWED_WEEKLY_KINDS):
             last_index = index
     if last_index is None:
         return False
@@ -1933,7 +2130,11 @@ def apply_db_rederive(
     reviewed_op: "dict | None" = None,
     expected_plan_hashes: "tuple[str, str] | None" = None,
 ) -> RederiveCommandResult:
-    with _rederive_locks(apply=True, timeout=lock_timeout):
+    import _cctally_completion
+
+    lost: list = []
+    with _rederive_locks(apply=True, timeout=lock_timeout), \
+            _held_past_unlock(lost):
         appended_reviewed_op = False
         if reviewed_op is not None:
             durable_hashes = _reviewed_op_expected_hashes(
@@ -2049,11 +2250,16 @@ def apply_db_rederive(
                     context=_journal.RebuildContext(trigger="rederive-apply"),
                     high_water=batch_high_water,
                     update_quota_cache=False,
+                    complete_derivation=True,
                     before_swap=lambda: _call_crash_hook(
                         "before-rebuild-swap"
                     ),
                 )
                 _call_crash_hook("after-rebuild")
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                raise _obligation_lost(
+                    "stats rebuild", preview, preview.batch_id, exc
+                ) from exc
             except Exception as exc:
                 raise RederiveApplyError(
                     "stats rebuild", preview, preview.batch_id, exc
@@ -2083,11 +2289,16 @@ def apply_db_rederive(
                     ),
                     high_water=preview.latest_completed_high_water,
                     update_quota_cache=False,
+                    complete_derivation=True,
                     before_swap=lambda: _call_crash_hook(
                         "before-rebuild-swap"
                     ),
                 )
                 _call_crash_hook("after-rebuild")
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                raise _obligation_lost(
+                    "stats recovery", preview, latest, exc
+                ) from exc
             except Exception as exc:
                 raise RederiveApplyError(
                     "stats recovery", preview, latest, exc
@@ -2104,7 +2315,13 @@ def apply_db_rederive(
                     context=_journal.RebuildContext(trigger="rederive-recovery"),
                     high_water=preview.journal_high_water,
                     update_quota_cache=False,
+                    complete_derivation=True,
                 )
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                raise _obligation_lost(
+                    "reviewed decision materialization", report_preview,
+                    latest, exc,
+                ) from exc
             except Exception as exc:
                 raise RederiveApplyError(
                     "reviewed decision materialization", report_preview,
@@ -2122,6 +2339,23 @@ def apply_db_rederive(
             batch_id=latest,
             rebuild=None,
         )
+    raise lost[0]
+
+
+@contextlib.contextmanager
+def _held_past_unlock(lost: list):
+    """Fix round K12 (K11R-2): hold a lost-obligation outcome until the
+    enclosing lock context has exited normally (locks released, holder wake
+    posted); the caller re-raises it from ``lost`` afterwards."""
+    try:
+        yield
+    except RederiveObligationNotDurable as exc:
+        lost.append(exc)
+
+
+def _obligation_lost(stage, preview, batch_id, exc):
+    """The rebuild published; only its residual obligation was lost."""
+    return RederiveObligationNotDurable(stage, preview, batch_id, exc)
 
 
 def _high_water_dict(high_water):
@@ -2330,6 +2564,15 @@ def cmd_db_rederive(args) -> int:
             else:
                 print(f"cctally: db rederive: {message}", file=sys.stderr)
             return 2
+    if apply and _journal.account_bound_cutover_enforced():
+        # #825/#832 spec 5.5: a prefix-bound administrative operation
+        # establishes the account-bound cutover before mutable planning, so
+        # the plan's prefix already contains the boundary. A reviewed manifest
+        # cut from a prefix without it then fails its existing drift check.
+        try:
+            _journal.ensure_account_bound_cutover()
+        except _journal.AccountBoundCutoverDeferred:
+            pass
     try:
         reviewed_path = getattr(args, "reviewed_weekly_decisions", None)
         reviewed_op = (
@@ -2414,6 +2657,28 @@ def cmd_db_rederive(args) -> int:
         else:
             print(f"cctally: db rederive conflict: {exc}", file=sys.stderr)
         return 2
+    except RederiveObligationNotDurable as exc:
+        # Fix round K12 (K11R-2): the corrected index IS published (and its
+        # holder wake posted); only the residual obligation was lost.
+        payload = _command_payload(
+            status="failed",
+            preview=exc.preview,
+            batch_id=exc.batch_id,
+            errors=(str(exc),),
+        )
+        payload["indexPublished"] = True
+        if as_json:
+            _emit_command_payload(payload, as_json=True)
+        else:
+            print(
+                "cctally: the corrected stats.db was published, but the "
+                "record that the inputs written during the rebuild still need "
+                f"deriving could not be saved ({exc.cause}). Those inputs stay "
+                "in the journal and the next ingest derives them; check that "
+                "the data directory is writable.",
+                file=sys.stderr,
+            )
+        return 3
     except RederiveApplyError as exc:
         payload = _command_payload(
             status="failed",

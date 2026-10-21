@@ -18,7 +18,7 @@
 # that the detectors work, and `real-tree` as the reason skipping removes a
 # duplicate rather than coverage.
 #
-# The matrix covers each of the tool's eight CHECKS. It does not cover every
+# The matrix covers each of the tool's nine CHECKS. It does not cover every
 # branch inside them, and the difference matters when reading a green run:
 #
 #   1. compile every Python file in the TREE (#655), selected by `.py`
@@ -100,8 +100,10 @@
 #                              as a second passing shape.
 #                              NOT covered: the classifier-present-but-
 #                              unloadable branch.
-#   8. validate tests/authoritative-runtime-budget.json through the REAL
-#      contract_budget_load (#650) -> cases budget-missing, budget-malformed,
+#   8. report on tests/authoritative-runtime-budget.json through the REAL
+#      contract_budget_load (#650; advisory since the test regime reset, so
+#      every case exits 0 with a note)
+#                           -> cases budget-missing, budget-malformed,
 #                              budget-unparseable, and budget-valid-variant as
 #                              a second passing shape. The green control is
 #                              this check's passing input, because make_tree
@@ -110,6 +112,44 @@
 #                              missing-key and non-finite branches, all of
 #                              which tests/test_authoritative_test_contract.py
 #                              drives against the same loader.
+#   9. refuse a bare, `-t` or `-p` `mktemp` and a here-document reachable by
+#      /bin/bash 3.2 or /bin/sh (#940 section 6.5, C11). Every refusal is
+#      asserted by path, line AND rule text (expect_c11).
+#                           -> cases temp-bare, temp-bare-dir, temp-t-prefix,
+#                              temp-dir-t-prefix, temp-p-option,
+#                              temp-tmpdir-option, temp-short-template,
+#                              temp-unquoted-template, temp-path-qualified and
+#                              temp-prefix-{assignment,env,nice} in shell;
+#                              temp-workflow and temp-python-embedded for the
+#                              other two executable contexts;
+#                              temp-python-argv-{t,p,tmpdir,bare} for Python
+#                              argv lists naming the tool;
+#                              temp-explicit-accepted as the passing shape in
+#                              all of them, with the prose a keyword grep would
+#                              trip on; heredoc-bin-sh, heredoc-here-string,
+#                              heredoc-quoted-hyphen-delimiter and
+#                              heredoc-dash-quoted for a legacy shebang;
+#                              heredoc-sh-invocation and
+#                              heredoc-relative-invocation for a file run by a
+#                              legacy shell; heredoc-source-edge,
+#                              heredoc-dot-edge-transitive and
+#                              heredoc-floor-entry-point for sourced files;
+#                              heredoc-c-payload and heredoc-sh-c for `-c`
+#                              payloads; heredoc-generated-script and
+#                              heredoc-python-generated for generated scripts;
+#                              heredoc-python-{shell-true,os-system,os-popen,
+#                              argv-c,execv,argv-path,argv-sh-path} for what
+#                              Python hands a legacy shell;
+#                              heredoc-workflow-shell-sh for a workflow step on
+#                              sh; heredoc-env-bash-exempt for the Homebrew bash
+#                              5 exemption, the arithmetic shift and a bash
+#                              workflow step; temp-allow-marker(-reason) for the
+#                              per-line exemption of an intentional fixture,
+#                              which needs a stated reason; and
+#                              temp-deterministic.
+#                              NOT covered: the named residuals of
+#                              docs/remote-testing.md, which no static reading
+#                              can see.
 #
 # No case here exercises a check the tool does not perform. The remaining three
 # cases are the green control, the usage refusal, and `real-tree`.
@@ -129,6 +169,10 @@
 # an edge into a directory that exists only inside a scratch tree.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # FIDELITY SCRUB. #630 S3's measurement programme runs whole authoritative
 # suites with CCTALLY_TEST_ALL_DISPATCH exported, and this harness runs inside
@@ -176,7 +220,34 @@ PREFLIGHT="$REPO_ROOT/bin/cctally-preflight"
 pass_count=0
 fail_count=0
 
-SCRATCH_DIR=$(mktemp -d -t cctally-preflight-XXXXXX)
+# How many case groups run at once (see run_case_groups below):
+# CCTALLY_PREFLIGHT_TEST_JOBS, else CCTALLY_TEST_JOBS, the budget
+# bin/cctally-test-all and bin/cctally-test-remote give every harness, else 1,
+# the serial harness. Validated under the name that supplied it before anything
+# is allocated, and refused with this harness's existing failure status rather
+# than read as some other number.
+# The comparison is written as "not at least one" so that a value too large for
+# the shell's integers, which makes `[` itself fail, is refused too; read as
+# "not less than one" it passed, and every later comparison against it failed,
+# so no slot ever freed and the run never ended.
+if [ -n "${CCTALLY_PREFLIGHT_TEST_JOBS:-}" ]; then
+    preflight_jobs_source=CCTALLY_PREFLIGHT_TEST_JOBS
+    PREFLIGHT_TEST_JOBS=$CCTALLY_PREFLIGHT_TEST_JOBS
+else
+    preflight_jobs_source=CCTALLY_TEST_JOBS
+    PREFLIGHT_TEST_JOBS=${CCTALLY_TEST_JOBS:-1}
+fi
+case "$PREFLIGHT_TEST_JOBS" in
+    ''|*[!0-9]*) preflight_jobs_valid=0 ;;
+    *) preflight_jobs_valid=1 ;;
+esac
+if [ "$preflight_jobs_valid" != 1 ] || ! [ "$PREFLIGHT_TEST_JOBS" -ge 1 ] 2>/dev/null; then
+    printf 'cctally-preflight-test: %s must be a positive integer, got %s\n' \
+        "$preflight_jobs_source" "$PREFLIGHT_TEST_JOBS" >&2
+    exit 1
+fi
+
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-preflight-XXXXXX") || exit 1
 
 cleanup_on_exit () {
     local rc=$?
@@ -208,8 +279,8 @@ fi
 # or removed (#655). The difference between them is exactly
 # shell-legacy-only and shell-shebangless-fragment, which state a SKIP where no
 # bash 3.x interpreter exists.
-EXPECTED_CASES_WITH_BASH3=60
-EXPECTED_CASES_WITHOUT_BASH3=58
+EXPECTED_CASES_WITH_BASH3=163
+EXPECTED_CASES_WITHOUT_BASH3=161
 
 report () {
     local case_name="$1"; local status="$2"; local detail="${3-}"
@@ -220,6 +291,126 @@ report () {
         printf 'FAIL %s%s\n' "$case_name" "${detail:+: $detail}"
         fail_count=$((fail_count + 1))
     fi
+}
+
+# ---- case groups and their optional parallel dispatch (#940 F1) ---------
+# Every case below belongs to a CASE GROUP: a function registered with
+# case_group in file order and run by run_case_groups just before the tally. A
+# group's body is deliberately left unindented, so the here-documents and the
+# here-document-fed Python probes inside it keep their column-0 terminators. A
+# helper or a constant that more than one group uses is defined at top level,
+# between groups, so it exists before any group runs.
+#
+# PREFLIGHT_TEST_JOBS (from CCTALLY_PREFLIGHT_TEST_JOBS, else CCTALLY_TEST_JOBS,
+# else 1) is how many groups run at once. At 1
+# the groups run in order in this shell, which is exactly the serial harness.
+# Above 1 each group runs in its own subshell with its own tally, writing its
+# stdout and stderr to files under the scratch directory. Once every group has
+# finished, the outputs are replayed in REGISTRATION order and the tallies are
+# summed, so stdout carries the same lines in the same order as a serial run
+# and the tally invariant at the bottom judges the same total. The groups are
+# independent by construction: every case builds its own scratch tree, logs
+# and stubs under its own name, and the cases that read the shared working
+# tree only read it (CONSTRAINT 1 at `real-tree`).
+#
+# bin/cctally-test-all gives every harness its inner budget as
+# CCTALLY_TEST_JOBS (CCTALLY_TEST_JOBS=1 keeps the full suite serial), and
+# bin/cctally-test-remote gives a targeted run 4; on the slower runner the serial
+# harness had doubled to 135 s once #940 grew it (#940 fix round 2). The
+# maintainer acceptance test that runs this harness end to end inside one
+# pytest item, under that item's 120-second cap, sets its own value: serially
+# the 145 cases cost about 98 seconds there, which no honest hang bound under
+# that cap can cover (#940 F2 added fifteen cases to the 145 measured then).
+#
+# A group marked `slow` is launched before the others, because the two scans
+# of the real tree and the timeout cases dominate the wall time and starting
+# them last would put them on the critical path; its output still lands in its
+# registration slot. Concurrency is bounded with per-group completion markers
+# rather than `wait -n`, which the declared bash 3.2 floor does not have, and a
+# group's marker is written by its EXIT trap, so a group that dies early still
+# releases its slot and is reported as incomplete rather than hanging the run.
+# A group killed by a signal never runs that trap, so a slot also counts as
+# free once the group's recorded PID no longer exists (`kill -0` fails) or is
+# no longer one of this shell's own jobs (`jobs -p`): a killed group's PID can
+# be reused by an unrelated process, which `kill -0` alone would report alive
+# for ever (#940 F2-d). `jobs -p` writes to a file in this shell rather than
+# through a command substitution, whose subshell may not see the job table.
+#
+# A group killed by SIGKILL takes only itself down: any case process it had
+# started (a pre-flight scan, a `sleep` of a timeout case) is orphaned, and
+# can outlive the harness until it finishes on its own, holding nothing the
+# harness waits for (#940 F2-e). The groups deliberately do NOT each run in a
+# process group of their own: that needs job control (`set -m`) or `setsid`,
+# which a non-interactive bash 3.2 does not offer portably, and every case
+# process is bounded by its own timeout already.
+CASE_GROUPS=()
+CASE_GROUP_SLOW=()
+
+case_group () {   # case_group <function> [slow]
+    CASE_GROUPS+=("$1")
+    CASE_GROUP_SLOW+=("${2-}")
+}
+
+run_case_groups () {
+    local g i j n=${#CASE_GROUPS[@]} dir order="" launched="" running p f
+    local group_pids=()
+    dir="$SCRATCH_DIR/.case-groups"
+    if [ "$PREFLIGHT_TEST_JOBS" -le 1 ] || ! mkdir -p "$dir"; then
+        for g in "${CASE_GROUPS[@]}"; do
+            "$g"
+        done
+        return 0
+    fi
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ -n "${CASE_GROUP_SLOW[$i]}" ]; then order="$order $i"; fi
+        i=$((i + 1))
+    done
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ -z "${CASE_GROUP_SLOW[$i]}" ]; then order="$order $i"; fi
+        i=$((i + 1))
+    done
+    for i in $order; do
+        while :; do
+            running=0
+            jobs -p > "$dir/.jobs" 2>/dev/null
+            for j in $launched; do
+                [ -e "$dir/$j.done" ] && continue
+                kill -0 "${group_pids[$j]}" 2>/dev/null || continue
+                grep -qx "${group_pids[$j]}" "$dir/.jobs" && running=$((running + 1))
+            done
+            [ "$running" -lt "$PREFLIGHT_TEST_JOBS" ] && break
+            sleep 0.1
+        done
+        # Each group's tally is subshell-local by design; it is written out and
+        # summed below.
+        (
+            CASE_GROUP_DONE="$dir/$i.done"
+            trap ': > "$CASE_GROUP_DONE"' EXIT
+            pass_count=0
+            fail_count=0
+            "${CASE_GROUPS[$i]}" > "$dir/$i.out" 2> "$dir/$i.err"
+            printf '%s %s\n' "$pass_count" "$fail_count" > "$dir/$i.tally"
+        ) &
+        group_pids[i]=$!
+        launched="$launched $i"
+    done
+    wait
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        if [ -f "$dir/$i.out" ]; then cat "$dir/$i.out"; fi
+        if [ -f "$dir/$i.err" ]; then cat "$dir/$i.err" >&2; fi
+        if [ -f "$dir/$i.tally" ]; then
+            read -r p f < "$dir/$i.tally"
+            pass_count=$((pass_count + p))
+            fail_count=$((fail_count + f))
+        else
+            report "${CASE_GROUPS[$i]}" FAIL \
+                "the case group did not complete; its output so far is above (see $dir/$i.err)"
+        fi
+        i=$((i + 1))
+    done
 }
 
 # The two path segments the scraper keys on, kept as variables so this file
@@ -360,6 +551,7 @@ expect_rc_tool () {   # expect_rc_tool <case name> <binary> <expected rc> <root>
     report "$case_name" PASS
 }
 
+cases_green_control_and_python () {
 # ---- the green control -------------------------------------------------
 # Every mutation below is measured against this. A detector that fires on the
 # clean tree is not a detector.
@@ -391,6 +583,10 @@ d=$(new_tree python-selector-datafile)
 printf '%s\n' 'def broken(:' > "$d/bin/payload.txt"
 expect_rc python-selector-datafile 0 "$d"
 
+}
+case_group cases_green_control_and_python
+
+cases_shell_syntax () {
 # ---- check 2: shell syntax ---------------------------------------------
 d=$(new_tree shell-bash)
 printf '%s\n%s\n' '#!/usr/bin/env bash' 'if [ 1 ]; then' > "$d/bin/cctally-broken-wrapper"
@@ -566,6 +762,10 @@ d=$(new_tree python-subject-outside-bin)
 printf '%s\n%s\n' 'def broken(:' '    pass' > "$d/tests/$FX/$H/broken_syntax.py"
 expect_rc python-subject-outside-bin 3 "$d" "broken_syntax.py"
 
+}
+case_group cases_shell_syntax
+
+cases_shell_read_only_and_walk () {
 # The tool only READS. The control the blind-parser guard feeds is fed on stdin
 # and never written to disk, and the tool goes as far as setting
 # sys.dont_write_bytecode so its own imports leave no __pycache__ in the tree
@@ -637,7 +837,7 @@ fi
 # non-ignored working-tree input; a tracked-only comparison would declare a
 # parity the runner does not have. It runs against the REAL tree for the same
 # reason `real-tree` does, and under the same CONSTRAINT 1 stated there.
-if python3 - "$REPO_ROOT" > "$SCRATCH_DIR/shell-subject-parity.log" 2>&1 <<'PARITY'
+if python3 -B - "$REPO_ROOT" > "$SCRATCH_DIR/shell-subject-parity.log" 2>&1 <<'PARITY'
 import importlib.machinery, importlib.util, pathlib, subprocess, sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
@@ -710,7 +910,7 @@ expect_rc shell-prune-protected-roots 0 "$d"
 # iter_source_files, and it covers iter_python_subjects, which no other case
 # reaches at the iterator level.
 d=$(new_tree walk-prune-matrix)
-if python3 - "$REPO_ROOT/bin/cctally-preflight" "$d" \
+if python3 -B - "$REPO_ROOT/bin/cctally-preflight" "$d" \
         > "$SCRATCH_DIR/walk-prune-matrix.log" 2>&1 <<'PROBE'
 import importlib.machinery, importlib.util, pathlib, sys
 
@@ -786,6 +986,10 @@ else
         "the pruned/re-included walk matrix did not hold (see $SCRATCH_DIR/walk-prune-matrix.log)"
 fi
 
+}
+case_group cases_shell_read_only_and_walk
+
+cases_ownership_and_durations () {
 # ---- check 3: harness-discovery and ownership drift --------------------
 d=$(new_tree missing-harness)
 rm -f "$d/bin/cctally-$H-test"
@@ -875,6 +1079,10 @@ d=$(new_tree durations-uncovered)
 : > "$d/tests/authoritative-harness-durations.tsv"
 expect_rc durations-uncovered 3 "$d" "does not cover"
 
+}
+case_group cases_ownership_and_durations
+
+cases_scheduler () {
 # ---- check 5: the dispatch decision the aggregator would take ----------
 # Check 4 validates the table's BYTES. It cannot see the run-time conditions
 # that make the scheduler fall back silently anyway — no python3, a python3
@@ -932,6 +1140,9 @@ if write_plan_stub "$d" lpt; then
 else
     report scheduler-forced-arm-ignored FAIL "the plan stub could not be rewritten"
 fi
+
+}
+case_group cases_scheduler
 
 # ---- check 6: declared visibility against the mirror allowlist ---------
 # The synthetic tree is PUBLIC (no .mirror-allowlist), so the classification
@@ -1026,6 +1237,7 @@ make_private () {   # make_private <root>
 OVERLAY
 }
 
+cases_visibility_changelog_budget () {
 # The passing input. Without it a check_visibility that reported drift on
 # everything would still pass the failing case below. Every fixture write is
 # checked, so a fixture that could not be built reports as a failure of this
@@ -1116,22 +1328,24 @@ All notable changes to this project are documented in this file.
 CHANGELOG_EOF
 expect_rc changelog-compliant 0 "$d"
 
-# ---- check 8: the committed runtime budget ------------------------------
-# The budget is refused at admission by contract_budget_load after a full round
-# trip. This is where the same parser refuses it at the keyboard instead. The
-# tool cannot reuse check_durations' import-and-degrade structure, because
-# contract_budget_load is embedded Python inside a shell library and there is no
-# module to import; it invokes the real loader through a caught subprocess, so
-# the refusal vocabulary is not duplicated here or in the tool.
+# ---- check 8: the committed runtime budget (advisory) --------------------
+# The budget is report-only since the test regime reset: admission notes a
+# missing or malformed file and the run proceeds. Check 8 states the same
+# loader's cause at the keyboard as a note and never fails the pre-flight, so
+# each case below expects exit 0 with the note. The tool cannot reuse
+# check_durations' import-and-degrade structure, because contract_budget_load
+# is embedded Python inside a shell library and there is no module to import;
+# it invokes the real loader through a caught subprocess, so the vocabulary is
+# not duplicated here or in the tool.
 #
 # The green control above is this check's passing input: make_tree writes a
-# valid budget, and `clean` would go red without it.
+# valid budget.
 # The substring names the ABSENCE, not the filename: every check-8 diagnostic
 # ends with `fix tests/authoritative-runtime-budget.json`, so a case grepping
 # for the filename would accept the malformed case's finding as this one's.
 d=$(new_tree budget-missing)
 rm -f "$d/tests/authoritative-runtime-budget.json"
-expect_rc budget-missing 3 "$d" "No such file or directory"
+expect_rc budget-missing 0 "$d" "No such file or directory"
 
 # Malformed in the SHAPE the parser owns, not merely as broken JSON: a value
 # that is not a positive finite number is the mutation that would silently
@@ -1145,14 +1359,14 @@ cat > "$d/tests/authoritative-runtime-budget.json" <<'BUDGET_EOF'
   "maxSecondsPerThousandCases": -5
 }
 BUDGET_EOF
-expect_rc budget-malformed 3 "$d" "maxSecondsPerThousandCases"
+expect_rc budget-malformed 0 "$d" "maxSecondsPerThousandCases"
 
 # Not JSON at all, so the case that reaches the parse branch is separate from
 # the one that reaches the shape branch. The substring names the parse cause
 # rather than the filename, which check 8's missing case already greps for.
 d=$(new_tree budget-unparseable)
 printf '%s\n' 'not json at all' > "$d/tests/authoritative-runtime-budget.json"
-expect_rc budget-unparseable 3 "$d" "not JSON"
+expect_rc budget-unparseable 0 "$d" "not JSON"
 
 # A second VALID shape, so the passing side of the check is not a copy of the
 # green control: a float maximum, and the keys in a different order.
@@ -1165,6 +1379,814 @@ cat > "$d/tests/authoritative-runtime-budget.json" <<'BUDGET_EOF'
 }
 BUDGET_EOF
 expect_rc budget-valid-variant 0 "$d"
+
+}
+case_group cases_visibility_changelog_budget
+
+# ---- check 9: temporary allocation forms and legacy-shell here-documents --
+# #940 section 6.5 and C11. A bare or `-t` `mktemp` lands in the per-user
+# temporary directory whatever TMPDIR says (BSD `mktemp -t` ignores it), and
+# a here-document executed by /bin/bash 3.2 or /bin/sh writes its body under
+# /private/var/tmp; both are killed under the runners' confinement profiles.
+#
+# Every fixture body is assembled from the variables below at run time, so
+# this harness's own text carries no allocation or here-document form the
+# check would report against the real tree (the `real-tree` case scans this
+# file too). Each refusal names its subject, so a case can only pass through
+# its own detector.
+MK=mk; MK="${MK}temp"
+HD='<'; HD="$HD$HD"
+TT='${TMPDIR:-/tmp}'
+
+write_exec () {   # write_exec <path> <line>...   (mode 0755)
+    local f=$1; shift
+    mkdir -p "$(dirname "$f")"
+    printf '%s\n' "$@" > "$f"
+    chmod +x "$f"
+}
+
+# Every refusal names its subject AND its rule. An exit code plus a file:line
+# cannot tell a finding of the rule a case introduced from one some other rule
+# raised on the same line, so expect_c11 requires the whole
+# `<path>:<line>: <rule>` text of the finding the case exists to provoke.
+R_BARE='mktemp: a bare form'
+R_TP='mktemp: a `-t`/`-p` form'
+R_UNQ='mktemp: an unquoted template'
+R_SHORT='mktemp: a template without six trailing X'
+R_ARGV="$MK argv:"
+R_HD='here-document reachable by /bin/sh or /bin/bash 3.2'
+HD_SHEBANG="$R_HD (a legacy shebang)"
+HD_RUN="$R_HD (run by a legacy shell)"
+HD_SOURCED="$R_HD (sourced by a legacy-shell path)"
+HD_PAYLOAD="$R_HD (a legacy -c payload)"
+HD_GENERATED="$R_HD (a generated legacy script)"
+HD_SHELL_STR="$R_HD (a payload handed to /bin/sh)"
+HD_WORKFLOW="$R_HD (a workflow step run by sh)"
+
+expect_c11 () {   # expect_c11 <case name> <repo root> <path:line> <rule text>
+    expect_rc "$1" 3 "$2" "$3: $4"
+}
+
+cases_temp_shell_forms () {
+# The accepted form, in all three executable contexts, plus the prose a
+# keyword grep would trip on: comments, a Python docstring, a failure message,
+# pytest's own tmp_path_factory.mktemp, a function that forwards "$@", and a
+# Python argv list with an explicit template.
+d=$(new_tree temp-explicit-accepted)
+write_exec "$d/bin/scratch-tool" '#!/usr/bin/env bash' \
+    "# a bare $MK -d or $MK -t prefix in a comment is prose" \
+    "dir=\$($MK -d \"$TT/cctally-tool.XXXXXX\") || exit 1" \
+    "f=\$($MK \"\$dir/cctally-file.XXXXXX\") || exit 1" \
+    "echo \"($MK failed; check TMPDIR)\" >/dev/null" \
+    "shim () { command $MK \"\$@\"; }"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' \
+    "      - run: dir=\$($MK -d \"$TT/cctally-ci.XXXXXX\")" > "$d/.github/workflows/ci.yml"
+printf '%s\n' '"""A docstring may say `'"$MK"' -d -t x` in prose."""' \
+    'import subprocess' \
+    'def test_a(tmp_path_factory, tmp_path):' \
+    "    tmp_path_factory.$MK(\"x\")" \
+    "    subprocess.run([\"$MK\", \"-d\", f\"{tmp_path}/cctally-py.XXXXXX\"])" \
+    "    return 'dir=\$($MK -d \"$TT/cctally-py.XXXXXX\") || exit 1'" > "$d/tests/test_alloc_ok.py"
+expect_rc temp-explicit-accepted 0 "$d"
+
+# The refused shapes in a shell script, each in its own tree.
+d=$(new_tree temp-bare)
+write_exec "$d/bin/scratch-bare" '#!/usr/bin/env bash' "f=\$($MK)"
+expect_c11 temp-bare "$d" bin/scratch-bare:2 "$R_BARE"
+
+d=$(new_tree temp-bare-dir)
+write_exec "$d/bin/scratch-bare-dir" '#!/usr/bin/env bash' "dir=\$($MK -d) || exit 1"
+expect_c11 temp-bare-dir "$d" bin/scratch-bare-dir:2 "$R_BARE"
+
+d=$(new_tree temp-t-prefix)
+write_exec "$d/bin/scratch-t" '#!/usr/bin/env bash' "f=\$($MK -t cctally-x)"
+expect_c11 temp-t-prefix "$d" bin/scratch-t:2 "$R_TP"
+
+d=$(new_tree temp-dir-t-prefix)
+write_exec "$d/bin/scratch-dt" '#!/usr/bin/env bash' \
+    "dir=\$($MK -d -t cctally-x.XXXXXX) || exit 1"
+expect_c11 temp-dir-t-prefix "$d" bin/scratch-dt:2 "$R_TP"
+
+# `-p DIR` and GNU `--tmpdir` choose the directory themselves, so a template
+# that follows them is no defence.
+d=$(new_tree temp-p-option)
+write_exec "$d/bin/scratch-p" '#!/usr/bin/env bash' \
+    "dir=\$($MK -d -p \"\$HOME\" cctally-x.XXXXXX) || exit 1"
+expect_c11 temp-p-option "$d" bin/scratch-p:2 "$R_TP"
+
+d=$(new_tree temp-tmpdir-option)
+write_exec "$d/bin/scratch-tmpdir" '#!/usr/bin/env bash' \
+    "f=\$($MK --tmpdir cctally-x.XXXXXX) || exit 1"
+expect_c11 temp-tmpdir-option "$d" bin/scratch-tmpdir:2 "$R_TP"
+
+# An explicit template is still refused when it is unquoted or has fewer than
+# six trailing X: C11 requires both.
+d=$(new_tree temp-short-template)
+write_exec "$d/bin/scratch-short" '#!/usr/bin/env bash' \
+    "dir=\$($MK -d \"$TT/cctally-x.XXX\") || exit 1"
+expect_c11 temp-short-template "$d" bin/scratch-short:2 "$R_SHORT"
+
+d=$(new_tree temp-unquoted-template)
+write_exec "$d/bin/scratch-unquoted" '#!/usr/bin/env bash' \
+    "dir=\$($MK -d $TT/cctally-x.XXXXXX) || exit 1"
+expect_c11 temp-unquoted-template "$d" bin/scratch-unquoted:2 "$R_UNQ"
+
+# A path-qualified tool is the same tool, inside `$(` as anywhere else.
+d=$(new_tree temp-path-qualified)
+write_exec "$d/bin/scratch-qualified" '#!/usr/bin/env bash' \
+    "dir=\$(/usr/bin/$MK -d) || exit 1"
+expect_c11 temp-path-qualified "$d" bin/scratch-qualified:2 "$R_BARE"
+
+# Command prefixes leave the tool in command position: an environment
+# assignment, `env` with its own assignments, and `nice` with its option.
+d=$(new_tree temp-prefix-assignment)
+write_exec "$d/bin/scratch-assign" '#!/usr/bin/env bash' \
+    "f=\$(LC_ALL=C $MK) || exit 1"
+expect_c11 temp-prefix-assignment "$d" bin/scratch-assign:2 "$R_BARE"
+
+d=$(new_tree temp-prefix-env)
+write_exec "$d/bin/scratch-env" '#!/usr/bin/env bash' \
+    "dir=\$(env LC_ALL=C $MK -d) || exit 1"
+expect_c11 temp-prefix-env "$d" bin/scratch-env:2 "$R_BARE"
+
+d=$(new_tree temp-prefix-nice)
+write_exec "$d/bin/scratch-nice" '#!/usr/bin/env bash' \
+    "f=\$(nice -n 5 $MK -t cctally-x) || exit 1"
+expect_c11 temp-prefix-nice "$d" bin/scratch-nice:2 "$R_TP"
+
+}
+case_group cases_temp_shell_forms
+
+cases_temp_other_contexts_and_shebangs () {
+# A workflow `run:` block.
+d=$(new_tree temp-workflow)
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' "      - run: dir=\$($MK -d -t ci)" \
+    > "$d/.github/workflows/lane.yml"
+expect_c11 temp-workflow "$d" .github/workflows/lane.yml:4 "$R_TP"
+
+# A shell snippet embedded in a Python test source.
+d=$(new_tree temp-python-embedded)
+printf '%s\n' 'SNIPPET = (' "    'dir=\$($MK -d -t cctally-x.XXXXXX) || exit 1\\n'" ')' \
+    > "$d/tests/test_alloc_bad.py"
+expect_c11 temp-python-embedded "$d" tests/test_alloc_bad.py:2 "$R_TP"
+
+# A Python argv list naming the tool: no shell is involved, so quoting is not
+# the question, but the option and template rules are the same.
+d=$(new_tree temp-python-argv-t)
+printf '%s\n' 'import subprocess' "subprocess.run([\"$MK\", \"-t\", \"cctally-x\"])" \
+    > "$d/tests/test_argv_t.py"
+expect_c11 temp-python-argv-t "$d" tests/test_argv_t.py:2 "$R_ARGV a \`-t\`/\`-p\` form"
+
+d=$(new_tree temp-python-argv-p)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"$MK\", \"-d\", \"-p\", \"/var/x\", \"cctally-x.XXXXXX\"])" \
+    > "$d/tests/test_argv_p.py"
+expect_c11 temp-python-argv-p "$d" tests/test_argv_p.py:2 "$R_ARGV a \`-t\`/\`-p\` form"
+
+d=$(new_tree temp-python-argv-tmpdir)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"$MK\", \"--tmpdir\", \"cctally-x.XXXXXX\"])" \
+    > "$d/tests/test_argv_tmpdir.py"
+expect_c11 temp-python-argv-tmpdir "$d" tests/test_argv_tmpdir.py:2 "$R_ARGV a \`-t\`/\`-p\` form"
+
+d=$(new_tree temp-python-argv-bare)
+printf '%s\n' 'import subprocess' "subprocess.run([\"/usr/bin/$MK\", \"-d\"])" \
+    > "$d/tests/test_argv_bare.py"
+expect_c11 temp-python-argv-bare "$d" tests/test_argv_bare.py:2 "$R_ARGV a bare form"
+
+# Here-documents. /bin/sh and /bin/bash shebangs reach the legacy shells.
+d=$(new_tree heredoc-bin-sh)
+write_exec "$d/bin/scratch-posix" '#!/bin/sh' "cat ${HD}EOF" 'body' 'EOF'
+expect_c11 heredoc-bin-sh "$d" bin/scratch-posix:2 "$HD_SHEBANG"
+
+d=$(new_tree heredoc-here-string)
+write_exec "$d/bin/scratch-legacy" '#!/bin/bash' "read -r x ${HD}< \"value\""
+expect_c11 heredoc-here-string "$d" bin/scratch-legacy:2 "$HD_SHEBANG"
+
+# A quoted delimiter may hold characters a bare word may not, and `<<-` strips
+# leading tabs from the terminator: both still open a here-document.
+d=$(new_tree heredoc-quoted-hyphen-delimiter)
+write_exec "$d/bin/scratch-delim" '#!/bin/sh' "cat ${HD}\"END-OF-TEXT\"" 'body' 'END-OF-TEXT'
+expect_c11 heredoc-quoted-hyphen-delimiter "$d" bin/scratch-delim:2 "$HD_SHEBANG"
+
+d=$(new_tree heredoc-dash-quoted)
+TAB=$(printf '\t')
+write_exec "$d/bin/scratch-dash" '#!/bin/sh' 'f () {' "${TAB}cat ${HD}-'X'" "${TAB}body" "${TAB}X" '}'
+expect_c11 heredoc-dash-quoted "$d" bin/scratch-dash:3 "$HD_SHEBANG"
+
+# Exempt: a script only Homebrew bash 5 runs (`#!/usr/bin/env bash` resolves
+# there on every box that runs the suite), an arithmetic shift, which is not a
+# here-document at all, and a workflow step on the runner's own bash.
+d=$(new_tree heredoc-env-bash-exempt)
+write_exec "$d/bin/scratch-modern" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/scratch-shift" '#!/bin/sh' "echo \$((1 ${HD} 4))"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - run: |' "          cat ${HD}EOF" \
+    '          body' '          EOF' > "$d/.github/workflows/bash.yml"
+expect_rc heredoc-env-bash-exempt 0 "$d"
+
+}
+case_group cases_temp_other_contexts_and_shebangs
+
+cases_heredoc_invocations () {
+# An explicit legacy invocation reaches an otherwise exempt script: by path
+# (`/bin/sh <file>`) and by an inline `-c` payload.
+d=$(new_tree heredoc-sh-invocation)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/scratch-caller" '#!/usr/bin/env bash' '/bin/sh bin/scratch-callee'
+expect_c11 heredoc-sh-invocation "$d" bin/scratch-callee:2 "$HD_RUN"
+
+# The same, with the path relative to the invoking file's own directory.
+d=$(new_tree heredoc-relative-invocation)
+write_exec "$d/bin/tools/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/tools/scratch-caller" '#!/usr/bin/env bash' \
+    'sh "$(dirname "$0")/scratch-callee"'
+expect_c11 heredoc-relative-invocation "$d" bin/tools/scratch-callee:2 "$HD_RUN"
+
+d=$(new_tree heredoc-c-payload)
+write_exec "$d/bin/scratch-payload" '#!/usr/bin/env bash' \
+    "/bin/bash -c 'cat ${HD}EOF" "body" "EOF'"
+expect_c11 heredoc-c-payload "$d" bin/scratch-payload:2 "$HD_PAYLOAD"
+
+d=$(new_tree heredoc-sh-c)
+write_exec "$d/bin/scratch-sh-c" '#!/usr/bin/env bash' \
+    "sh -c 'cat ${HD}EOF" "body" "EOF'"
+expect_c11 heredoc-sh-c "$d" bin/scratch-sh-c:2 "$HD_PAYLOAD"
+
+# A file sourced by a legacy-shell path runs in that shell, through `source`
+# and through `.`, and transitively: the first library here holds no
+# here-document of its own and only passes the second one on.
+d=$(new_tree heredoc-source-edge)
+write_exec "$d/bin/scratch-entry" '#!/bin/bash' 'ROOT=$(cd "$(dirname "$0")/.." && pwd)' \
+    'source "$ROOT/bin/_lib-scratch.sh"'
+printf '%s\n' "cat ${HD}EOF" 'body' 'EOF' > "$d/bin/_lib-scratch.sh"
+expect_c11 heredoc-source-edge "$d" bin/_lib-scratch.sh:1 "$HD_SOURCED"
+
+d=$(new_tree heredoc-dot-edge-transitive)
+write_exec "$d/bin/scratch-entry" '#!/bin/sh' '. "$(dirname "$0")/_lib-scratch-a.sh"'
+printf '%s\n' '. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-scratch-b.sh"' \
+    > "$d/bin/_lib-scratch-a.sh"
+printf '%s\n' 'f () {' "    cat ${HD}'PY'" 'body' 'PY' '}' > "$d/bin/_lib-scratch-b.sh"
+expect_c11 heredoc-dot-edge-transitive "$d" bin/_lib-scratch-b.sh:2 "$HD_SOURCED"
+
+# The live instance (#940 D-1 F1): the aggregator is run under /bin/bash 3.2
+# by a test whose interpreter is computed, which no static reading can see, so
+# it is a declared floor-bash entry point, and the contract library it sources
+# is reached through it.
+d=$(new_tree heredoc-floor-entry-point)
+write_plan_stub "$d" lpt
+printf '%s\n' 'REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)' \
+    'source "$REPO_ROOT/bin/_lib-test-contract.sh"' >> "$d/bin/cctally-test-all"
+printf '%s\n' 'contract_load () {' "    python3 - \"\$1\" ${HD}'PY'" 'print(1)' 'PY' '}' \
+    > "$d/bin/_lib-test-contract.sh"
+expect_c11 heredoc-floor-entry-point "$d" bin/_lib-test-contract.sh:2 "$HD_SOURCED"
+
+# A generated script: an exempt harness writes a /bin/bash stub whose body
+# holds a here-document, and a Python source does the same from a string.
+d=$(new_tree heredoc-generated-script)
+write_exec "$d/bin/scratch-generator" '#!/usr/bin/env bash' \
+    "cat > \"\$1\" ${HD}'STUB'" '#!/bin/bash' "cat ${HD}INNER" 'body' 'INNER' 'STUB'
+expect_c11 heredoc-generated-script "$d" bin/scratch-generator:4 "$HD_GENERATED"
+
+d=$(new_tree heredoc-python-generated)
+printf '%s\n' 'STUB = (' "    '#!/bin/sh\\n'" "    'cat ${HD}EOF\\nbody\\nEOF\\n'" ')' \
+    > "$d/tests/test_stub_bad.py"
+expect_c11 heredoc-python-generated "$d" tests/test_stub_bad.py:3 "$HD_GENERATED"
+
+}
+case_group cases_heredoc_invocations
+
+cases_heredoc_python_payloads () {
+# Embedded payloads Python hands to /bin/sh: shell=True, os.system, os.popen,
+# the `-c` element of an argv list, and os.execv.
+d=$(new_tree heredoc-python-shell-true)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run('cat ${HD}EOF\\nbody\\nEOF\\n', shell=True)" \
+    > "$d/tests/test_payload_bad.py"
+expect_c11 heredoc-python-shell-true "$d" tests/test_payload_bad.py:2 "$HD_SHELL_STR"
+
+d=$(new_tree heredoc-python-os-system)
+printf '%s\n' 'import os' "os.system('cat ${HD}EOF\\nbody\\nEOF\\n')" \
+    > "$d/tests/test_system_bad.py"
+expect_c11 heredoc-python-os-system "$d" tests/test_system_bad.py:2 "$HD_SHELL_STR"
+
+d=$(new_tree heredoc-python-os-popen)
+printf '%s\n' 'import os' "os.popen('cat ${HD}EOF\\nbody\\nEOF\\n').read()" \
+    > "$d/tests/test_popen_bad.py"
+expect_c11 heredoc-python-os-popen "$d" tests/test_popen_bad.py:2 "$HD_SHELL_STR"
+
+d=$(new_tree heredoc-python-argv-c)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"/bin/sh\", \"-c\", 'cat ${HD}EOF\\nbody\\nEOF\\n'])" \
+    > "$d/tests/test_argv_c_bad.py"
+expect_c11 heredoc-python-argv-c "$d" tests/test_argv_c_bad.py:2 "$HD_PAYLOAD"
+
+# The program decides here (#940 D0c): "bash" is not a legacy argv[0], so
+# only the os.execv rule can reach the payload.
+d=$(new_tree heredoc-python-execv)
+printf '%s\n' 'import os' \
+    "os.execv(\"/bin/bash\", [\"bash\", \"-c\", 'cat ${HD}EOF\\nbody\\nEOF\\n'])" \
+    > "$d/tests/test_execv_bad.py"
+expect_c11 heredoc-python-execv "$d" tests/test_execv_bad.py:2 "$HD_PAYLOAD"
+
+# A Python argv list that runs a file of this tree under a legacy shell, named
+# by a path expression or by a plain relative string.
+d=$(new_tree heredoc-python-argv-path)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+printf '%s\n' 'import subprocess' 'from pathlib import Path' \
+    'BIN = Path(__file__).resolve().parent.parent / "bin"' \
+    'subprocess.run(["/bin/bash", str(BIN / "scratch-callee")])' \
+    > "$d/tests/test_argv_path_bad.py"
+expect_c11 heredoc-python-argv-path "$d" bin/scratch-callee:2 "$HD_RUN"
+
+d=$(new_tree heredoc-python-argv-sh-path)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+printf '%s\n' 'import subprocess' 'subprocess.run(["sh", "bin/scratch-callee"])' \
+    > "$d/tests/test_argv_sh_path_bad.py"
+expect_c11 heredoc-python-argv-sh-path "$d" bin/scratch-callee:2 "$HD_RUN"
+
+# A workflow step whose shell is sh: unlike the runner's bash, it is legacy.
+d=$(new_tree heredoc-workflow-shell-sh)
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - shell: sh' '        run: |' \
+    "          cat ${HD}EOF" '          body' '          EOF' > "$d/.github/workflows/sh.yml"
+expect_c11 heredoc-workflow-shell-sh "$d" .github/workflows/sh.yml:6 "$HD_WORKFLOW"
+
+# #940 D0c: the review of D-1's fix round. Each fixture below is proven
+# non-vacuous by disabling its route in a copy of the check (the plan's
+# route-off table), which must make exactly that case fail.
+#
+# A `defaults: run: shell: sh` makes every step without its own shell legacy.
+d=$(new_tree heredoc-workflow-defaults-sh)
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'defaults:' '  run:' '    shell: sh' 'jobs:' '  a:' '    steps:' '      - run: |' \
+    "          cat ${HD}EOF" '          body' '          EOF' > "$d/.github/workflows/d.yml"
+expect_c11 heredoc-workflow-defaults-sh "$d" .github/workflows/d.yml:8 "$HD_WORKFLOW"
+
+# The argv wrappers: sandbox-exec and env run their legacy shell argument.
+d=$(new_tree heredoc-python-sandbox-exec)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"sandbox-exec\", \"-p\", \"(version 1)\", \"/bin/sh\", \"-c\", 'cat ${HD}EOF\\nbody\\nEOF\\n'])" \
+    > "$d/tests/test_sandbox_bad.py"
+expect_c11 heredoc-python-sandbox-exec "$d" tests/test_sandbox_bad.py:2 "$HD_PAYLOAD"
+
+d=$(new_tree heredoc-python-env-wrapper)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"env\", \"LC_ALL=C\", \"sh\", \"-c\", 'cat ${HD}EOF\\nbody\\nEOF\\n'])" \
+    > "$d/tests/test_env_wrap_bad.py"
+expect_c11 heredoc-python-env-wrapper "$d" tests/test_env_wrap_bad.py:2 "$HD_PAYLOAD"
+
+}
+case_group cases_heredoc_python_payloads
+
+cases_prefixes_options_and_printf () {
+# The remaining prefix commands keep the tool in command position; `time`
+# with its own option is a prefix, not just the keyword.
+d=$(new_tree temp-prefix-command)
+write_exec "$d/bin/scratch-command" '#!/usr/bin/env bash' "f=\$(command $MK) || exit 1"
+expect_c11 temp-prefix-command "$d" bin/scratch-command:2 "$R_BARE"
+
+d=$(new_tree temp-prefix-exec)
+write_exec "$d/bin/scratch-exec" '#!/usr/bin/env bash' "dir=\$(exec $MK -d) || exit 1"
+expect_c11 temp-prefix-exec "$d" bin/scratch-exec:2 "$R_BARE"
+
+d=$(new_tree temp-prefix-nohup)
+write_exec "$d/bin/scratch-nohup" '#!/usr/bin/env bash' "dir=\$(nohup $MK -d) || exit 1"
+expect_c11 temp-prefix-nohup "$d" bin/scratch-nohup:2 "$R_BARE"
+
+d=$(new_tree temp-prefix-time)
+write_exec "$d/bin/scratch-time" '#!/usr/bin/env bash' "dir=\$(time -p $MK -d) || exit 1"
+expect_c11 temp-prefix-time "$d" bin/scratch-time:2 "$R_BARE"
+
+# A comment that mentions a legacy invocation is not one.
+d=$(new_tree heredoc-comment-not-invocation)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/scratch-caller" '#!/usr/bin/env bash' \
+    '# usage: run it as sh bin/scratch-callee if you must' 'echo hi'
+expect_rc heredoc-comment-not-invocation 0 "$d"
+
+# Long options and an option with its own argument before the script path.
+d=$(new_tree heredoc-bash-long-option)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/scratch-caller" '#!/usr/bin/env bash' '/bin/bash --norc bin/scratch-callee'
+expect_c11 heredoc-bash-long-option "$d" bin/scratch-callee:2 "$HD_RUN"
+
+d=$(new_tree heredoc-bash-o-option)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+write_exec "$d/bin/scratch-caller" '#!/usr/bin/env bash' '/bin/bash -o pipefail bin/scratch-callee'
+expect_c11 heredoc-bash-o-option "$d" bin/scratch-callee:2 "$HD_RUN"
+
+d=$(new_tree heredoc-python-argv-o-option)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+printf '%s\n' 'import subprocess' \
+    'subprocess.run(["/bin/bash", "-o", "pipefail", "bin/scratch-callee"])' \
+    > "$d/tests/test_argv_o_bad.py"
+expect_c11 heredoc-python-argv-o-option "$d" bin/scratch-callee:2 "$HD_RUN"
+
+# A legacy stub written by a shell printf, as one format string and as one
+# `%s\n` argument per line.
+d=$(new_tree heredoc-printf-stub)
+write_exec "$d/bin/scratch-gen" '#!/usr/bin/env bash' \
+    "printf '#!/bin/sh\\ncat ${HD}EOF\\nbody\\nEOF\\n' > \"\$1/stub\"; chmod +x \"\$1/stub\""
+expect_c11 heredoc-printf-stub "$d" bin/scratch-gen:2 "$HD_GENERATED"
+
+d=$(new_tree heredoc-printf-lines-stub)
+write_exec "$d/bin/scratch-gen" '#!/usr/bin/env bash' \
+    "printf '%s\\n' '#!/bin/bash' \\" "    'cat ${HD}EOF' 'body' 'EOF' > \"\$1/stub\""
+expect_c11 heredoc-printf-lines-stub "$d" bin/scratch-gen:2 "$HD_GENERATED"
+
+}
+case_group cases_prefixes_options_and_printf
+
+# Floor-bash callers (#940 D0c). A bare `bash` whose environment's PATH has
+# no Homebrew directory resolves to /bin/bash 3.2: a readable -c payload is
+# a legacy payload, and the call must be declared in _FLOOR_BASH_CALLERS.
+R_FLOOR="a bash run with a PATH that has no Homebrew directory resolves to /bin/bash 3.2"
+HD_FLOOR="$R_HD (a floor-bash entry point)"
+cases_floor_callers () {
+d=$(new_tree heredoc-floor-path-payload)
+printf '%s\n' 'import subprocess' \
+    "subprocess.run([\"bash\", \"-c\", 'cat ${HD}EOF\\nbody\\nEOF\\n'], env={\"PATH\": \"/usr/bin:/bin\"})" \
+    > "$d/tests/test_floor_payload_bad.py"
+expect_c11 heredoc-floor-path-payload "$d" tests/test_floor_payload_bad.py:2 "$HD_PAYLOAD"
+
+d=$(new_tree floor-caller-undeclared)
+printf '%s\n' 'import subprocess' 'def f(script):' \
+    '    subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_floor_undeclared.py"
+expect_c11 floor-caller-undeclared "$d" tests/test_floor_undeclared.py:3 "$R_FLOOR"
+
+d=$(new_tree floor-caller-spread-env)
+printf '%s\n' 'import subprocess' 'def f(script, bindir):' \
+    '    env = {"PATH": f"{bindir}:/usr/bin:/bin"}' \
+    '    subprocess.run(["bash", "-e", "-c", script], env={**env, "X": "1"})' \
+    > "$d/tests/test_floor_spread.py"
+expect_c11 floor-caller-spread-env "$d" tests/test_floor_spread.py:4 "$R_FLOOR"
+
+d=$(new_tree floor-caller-no-path)
+printf '%s\n' 'import subprocess' 'def f(script):' \
+    '    subprocess.run(["bash", "-c", script], env={"HOME": "/x"})' \
+    > "$d/tests/test_floor_no_path.py"
+expect_c11 floor-caller-no-path "$d" tests/test_floor_no_path.py:3 "$R_FLOOR"
+
+d=$(new_tree floor-caller-env-i)
+printf '%s\n' 'import subprocess' 'def f(script):' \
+    '    subprocess.run(["env", "-i", "bash", "-c", script])' \
+    > "$d/tests/test_floor_env_i.py"
+expect_c11 floor-caller-env-i "$d" tests/test_floor_env_i.py:3 "$R_FLOOR"
+
+# An environment that keeps the caller's PATH, or names Homebrew's, is not one.
+d=$(new_tree floor-caller-inherited-accepted)
+printf '%s\n' 'import os' 'import subprocess' 'def f(script):' \
+    '    subprocess.run(["bash", "-c", script], env=dict(os.environ, X="1"))' \
+    '    subprocess.run(["bash", "-c", script], env={"PATH": os.environ["PATH"]})' \
+    '    subprocess.run(["bash", "-c", script], env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin"})' \
+    '    env = {k: v for k, v in os.environ.items() if k != "X"}' \
+    '    subprocess.run(["bash", "-c", script], env=env)' \
+    > "$d/tests/test_floor_inherited_ok.py"
+expect_rc floor-caller-inherited-accepted 0 "$d"
+
+# A name is read in the function that passes it: another function's
+# inherited `env` of the same name neither hides this call nor is refused.
+d=$(new_tree floor-caller-scoped-env)
+printf '%s\n' 'import os' 'import subprocess' 'def f(script):' \
+    '    env = {"PATH": "/usr/bin:/bin"}' \
+    '    subprocess.run(["bash", "-c", script], env=env)' 'def g(script):' \
+    '    env = dict(os.environ)' '    subprocess.run(["bash", "-c", script], env=env)' \
+    > "$d/tests/test_floor_scoped.py"
+expect_c11 floor-caller-scoped-env "$d" tests/test_floor_scoped.py:5 "$R_FLOOR"
+if grep -q 'test_floor_scoped.py:8' "$SCRATCH_DIR/floor-caller-scoped-env.log"; then
+    report floor-caller-scoped-env-other FAIL "the inherited function's call was refused"
+else
+    report floor-caller-scoped-env-other PASS
+fi
+
+# A declared caller's targets lose their exemption: a workflow step, a file
+# and a shell function, each named in _FLOOR_BASH_CALLERS.
+d=$(new_tree heredoc-floor-declared-step)
+printf '%s\n' 'import subprocess' 'def f(script):' \
+    '    subprocess.run(["bash", "-c", script], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_release_npm_workflow.py"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - name: Derive dist-tag' '        run: |' \
+    "          cat ${HD}EOF" '          body' '          EOF' > "$d/.github/workflows/release-npm.yml"
+expect_c11 heredoc-floor-declared-step "$d" .github/workflows/release-npm.yml:6 "$HD_FLOOR"
+
+d=$(new_tree heredoc-floor-declared-file)
+printf '%s\n' "cat ${HD}EOF" 'body' 'EOF' > "$d/bin/_lib-golden-diff.sh"
+expect_c11 heredoc-floor-declared-file "$d" bin/_lib-golden-diff.sh:1 "$HD_FLOOR"
+
+# The declared function target lives in the mirror-private remote wrapper, so
+# this case plants a stand-in of that name in its own scratch tree and never
+# runs or reads the real one; it runs unchanged on the public tree. The name is
+# written as a literal on purpose. The maintainer closure guard that keeps
+# public harnesses from executing private bin siblings records this one write
+# as a scratch-tree fixture, and its exemption holds only while every mention
+# of the name here is that `write_exec "$d/bin/..."` line, so a real use of the
+# wrapper added to this file is still reported. Building the name from
+# variables instead would hide every use from that guard, not just this one.
+d=$(new_tree heredoc-floor-declared-function)
+write_exec "$d/bin/cctally-test-remote" '#!/usr/bin/env bash' 'other () {' "    cat ${HD}EOF" \
+    'body' 'EOF' '}' '_remote_node_resolver_body() {' "    cat ${HD}EOF" 'body' 'EOF' '}'
+expect_c11 heredoc-floor-declared-function "$d" "bin/cctally-test-remote:8" "$HD_FLOOR"
+if grep -q "cctally-test-remote:3" "$SCRATCH_DIR/heredoc-floor-declared-function.log"; then
+    report heredoc-floor-declared-function-scope FAIL "a function outside the declared one was refused"
+else
+    report heredoc-floor-declared-function-scope PASS
+fi
+
+# A declaration whose step is gone is stale, and says so.
+d=$(new_tree floor-caller-stale-declaration)
+printf '%s\n' 'import subprocess' > "$d/tests/test_release_npm_workflow.py"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - name: Renamed' '        run: echo hi' \
+    > "$d/.github/workflows/release-npm.yml"
+expect_rc floor-caller-stale-declaration 3 "$d" \
+    "the floor-bash target .github/workflows/release-npm.yml#Derive dist-tag declared for tests/test_release_npm_workflow.py is not in the tree"
+
+}
+case_group cases_floor_callers
+
+# A declaration names a (caller, target) pair, not a whole caller file (#940
+# D-2 F5): a second stripped-PATH call in a declared caller that runs
+# something other than its declared target is still refused, while the
+# declared one stays exempt.
+R_FLOOR_TARGET="$R_FLOOR and runs none of the targets _FLOOR_BASH_CALLERS declares for this caller"
+cases_floor_targets () {
+d=$(new_tree floor-caller-second-target)
+printf '%s\n' 'import subprocess' 'AGGREGATOR = "bin/cctally-test-all"' 'def plan():' \
+    '    subprocess.run(["bash", AGGREGATOR], env={"PATH": "/usr/bin:/bin"})' \
+    'def other():' \
+    '    subprocess.run(["bash", "bin/cctally-ok"], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_frontend_estate_topology.py"
+expect_c11 floor-caller-second-target "$d" tests/test_frontend_estate_topology.py:6 \
+    "$R_FLOOR_TARGET"
+if grep -q 'test_frontend_estate_topology.py:4' "$SCRATCH_DIR/floor-caller-second-target.log"; then
+    report floor-caller-second-target-declared FAIL "the declared target's own call was refused"
+else
+    report floor-caller-second-target-declared PASS
+fi
+
+# Stale declarations: a caller file gone from a private checkout (a Git
+# checkout, `.git` present, of the private profile, .mirror-allowlist
+# present), and in any tree a caller whose declared FILE target is gone. The
+# public subset lacks the private callers, so a gone caller is not a finding
+# there even in a checkout.
+d=$(new_tree floor-caller-stale-caller)
+printf '%s\n' 'bin/cctally-*' 'tests/**' > "$d/.mirror-allowlist"
+mkdir "$d/.git"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - name: Derive dist-tag' '        run: echo hi' \
+    > "$d/.github/workflows/release-npm.yml"
+expect_rc floor-caller-stale-caller 3 "$d" \
+    "the floor-bash caller tests/test_release_npm_workflow.py declared in _FLOOR_BASH_CALLERS is not in the tree"
+
+d=$(new_tree floor-caller-stale-file-target)
+printf '%s\n' 'import subprocess' > "$d/tests/test_share_golden_discipline.py"
+expect_rc floor-caller-stale-file-target 3 "$d" \
+    "the floor-bash target bin/_lib-golden-diff.sh declared for tests/test_share_golden_discipline.py is not in the tree"
+
+d=$(new_tree floor-caller-stale-public-subset)
+mkdir "$d/.git"
+mkdir -p "$d/.github/workflows"
+printf '%s\n' 'jobs:' '  a:' '    steps:' '      - name: Derive dist-tag' '        run: echo hi' \
+    > "$d/.github/workflows/release-npm.yml"
+if [ -e "$d/.mirror-allowlist" ]; then
+    report floor-caller-stale-public-subset FAIL "the synthetic tree already carries .mirror-allowlist"
+else
+    expect_rc floor-caller-stale-public-subset 0 "$d"
+fi
+
+# A command string handed to /bin/sh (shell=True) whose first word is a bare
+# `bash`, with a stripped PATH, is the same floor call (#940 D-2 F7), and the
+# script it names is run by a legacy shell.
+d=$(new_tree floor-caller-shell-true)
+printf '%s\n' 'import subprocess' 'def f():' \
+    '    subprocess.run("bash -e bin/scratch-callee", shell=True, env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_floor_shell_true.py"
+expect_c11 floor-caller-shell-true "$d" tests/test_floor_shell_true.py:3 "$R_FLOOR"
+
+d=$(new_tree heredoc-floor-shell-true-path)
+write_exec "$d/bin/scratch-callee" '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF'
+printf '%s\n' 'import subprocess' 'def f():' \
+    '    subprocess.run("bash -e bin/scratch-callee", shell=True, env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_floor_shell_true.py"
+expect_c11 heredoc-floor-shell-true-path "$d" bin/scratch-callee:2 "$HD_RUN"
+
+d=$(new_tree floor-caller-shell-true-inherited-accepted)
+printf '%s\n' 'import os' 'import subprocess' 'def f():' \
+    '    subprocess.run("bash -e bin/cctally-ok", shell=True, env=dict(os.environ))' \
+    '    subprocess.run("bash -e bin/cctally-ok", shell=True)' \
+    > "$d/tests/test_floor_shell_true_ok.py"
+expect_rc floor-caller-shell-true-inherited-accepted 0 "$d"
+
+}
+case_group cases_floor_targets
+
+cases_floor_shell_forms_and_markers () {
+# The same call in a file that names `bash` nowhere else (#940 D-2 fix 2,
+# V1): behind a `VAR=x` word, behind `exec`, behind a prefix command with its
+# own options (`env -i`, `nice -n 5`), and with a tab escape after `bash`.
+# Each file holds only that call, so nothing else makes the check read it.
+shell_true_floor_case () {   # shell_true_floor_case <case name> <command literal>
+    local name=$1 command=$2 tree
+    tree=$(new_tree "$name")
+    printf '%s\n' 'import subprocess' 'def f():' \
+        "    subprocess.run(\"$command\", shell=True, env={\"PATH\": \"/usr/bin:/bin\"})" \
+        > "$tree/tests/test_floor_shell_form.py"
+    expect_c11 "$name" "$tree" tests/test_floor_shell_form.py:3 "$R_FLOOR"
+}
+shell_true_floor_case floor-caller-shell-true-assignment 'FOO=1 bash bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-exec 'exec bash bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-env-i 'env -i bash bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-nice 'nice -n 5 bash bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-tab-escape 'bash\tbin/scratch-callee'
+# #940 F2 (D-2 P3 #3): a bare `bash` at the end of the string (the script fed
+# on stdin), and the long escapes that decode to whitespace, also make the
+# check read the file.
+shell_true_floor_case floor-caller-shell-true-exec-bare 'exec bash'
+shell_true_floor_case floor-caller-shell-true-env-i-bare 'env -i bash'
+shell_true_floor_case floor-caller-shell-true-assignment-bare 'FOO=1 bash'
+shell_true_floor_case floor-caller-shell-true-long-escape 'bash\U00000020bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-named-escape 'bash\N{SPACE}bin/scratch-callee'
+# D-2 P3 #4: a prefix option that takes a value (`exec -a NAME`, `env -P DIR`)
+# is read with its value.
+shell_true_floor_case floor-caller-shell-true-exec-a 'exec -a scratch bash bin/scratch-callee'
+shell_true_floor_case floor-caller-shell-true-env-p 'env -P /usr/bin bash bin/scratch-callee'
+
+# D-2 P3 #2: a command string that strips PATH itself (a leading `env -i`, or
+# a `PATH=` assignment without Homebrew, as for argv lists) is a floor call
+# with no `env=`, for `shell=True` and for `os.system` / `os.popen` alike.
+string_strip_floor_case () {   # string_strip_floor_case <case name> <call line>
+    local name=$1 call=$2 tree
+    tree=$(new_tree "$name")
+    printf '%s\n' 'import os' 'import subprocess' 'def f():' "    $call" \
+        > "$tree/tests/test_floor_string_strip.py"
+    expect_c11 "$name" "$tree" tests/test_floor_string_strip.py:4 "$R_FLOOR"
+}
+string_strip_floor_case floor-caller-string-env-i \
+    'subprocess.run("env -i bash bin/scratch-callee", shell=True)'
+string_strip_floor_case floor-caller-string-path \
+    'subprocess.run("PATH=/usr/bin:/bin bash bin/scratch-callee", shell=True)'
+string_strip_floor_case floor-caller-string-os-system \
+    'os.system("env -i bash bin/scratch-callee")'
+string_strip_floor_case floor-caller-string-os-popen \
+    'os.popen("PATH=/usr/bin:/bin bash bin/scratch-callee")'
+# A string that keeps PATH, or names Homebrew's, is not one; nor is a lookup
+# (`command -v bash`), even under a stripped `env=` (D-2 P3 #4).
+d=$(new_tree floor-caller-string-kept-accepted)
+printf '%s\n' 'import os' 'import subprocess' 'def f():' \
+    '    subprocess.run("FOO=1 bash bin/cctally-ok", shell=True)' \
+    '    subprocess.run("PATH=/opt/homebrew/bin:/usr/bin:/bin bash bin/cctally-ok", shell=True)' \
+    '    os.system("bash bin/cctally-ok")' \
+    '    subprocess.run("command -v bash bin/cctally-ok", shell=True, env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_floor_string_kept_ok.py"
+expect_rc floor-caller-string-kept-accepted 0 "$d"
+
+# A bare script name is resolved like a path (V8): against the invoking
+# file's directory, then the root.
+d=$(new_tree heredoc-floor-shell-true-bare-name)
+printf '%s\n' '#!/usr/bin/env bash' "cat ${HD}EOF" 'body' 'EOF' > "$d/tests/scratch-callee.sh"
+printf '%s\n' 'import subprocess' 'def f():' \
+    '    subprocess.run("bash scratch-callee.sh", shell=True, env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_floor_shell_true.py"
+expect_c11 heredoc-floor-shell-true-bare-name "$d" tests/scratch-callee.sh:2 "$HD_RUN"
+
+# A declared target is matched on a basename boundary (V7): a declared
+# caller's call to `bin/cctally-test-all-extra` does not name the declared
+# `bin/cctally-test-all`.
+d=$(new_tree floor-caller-target-boundary)
+printf '%s\n' 'import subprocess' 'def plan():' \
+    '    subprocess.run(["bash", "bin/cctally-test-all-extra"], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_frontend_estate_topology.py"
+expect_c11 floor-caller-target-boundary "$d" tests/test_frontend_estate_topology.py:3 \
+    "$R_FLOOR_TARGET"
+# #940 F2 (D-2 P3 #4): a full stop ending a sentence does not continue the
+# name, so prose naming the declared target names it; a file extension still
+# continues it.
+d=$(new_tree floor-caller-target-full-stop)
+printf '%s\n' 'import subprocess' 'def plan(aggregator):' \
+    '    """Runs bin/cctally-test-all."""' \
+    '    subprocess.run(["bash", aggregator], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_frontend_estate_topology.py"
+expect_rc floor-caller-target-full-stop 0 "$d"
+d=$(new_tree floor-caller-target-extension)
+printf '%s\n' 'import subprocess' 'def plan():' \
+    '    subprocess.run(["bash", "bin/cctally-test-all.sh"], env={"PATH": "/usr/bin:/bin"})' \
+    > "$d/tests/test_frontend_estate_topology.py"
+expect_c11 floor-caller-target-extension "$d" tests/test_frontend_estate_topology.py:3 \
+    "$R_FLOOR_TARGET"
+
+# A narrowly identified intentional fixture is exempt on its own line, and
+# only with a stated reason: the same bare form with a reasonless marker is
+# still refused.
+d=$(new_tree temp-allow-marker)
+AL=cctally-c11; AL="$AL-allow:"
+write_exec "$d/bin/scratch-probe" '#!/usr/bin/env bash' \
+    "dir=\$($MK -d)  # $AL a probe of the third-party shape" \
+    "e=\$($MK -d)  # $AL x"
+expect_c11 temp-allow-marker "$d" bin/scratch-probe:3 "$R_BARE"
+if grep -q 'scratch-probe:2' "$SCRATCH_DIR/temp-allow-marker.log"; then
+    report temp-allow-marker-reason FAIL "the marked line with a reason was still refused"
+else
+    report temp-allow-marker-reason PASS
+fi
+
+# #940 F2 (D-2 P3 #9): an f-string's replacement field is read as `{}` on
+# every Python, so a field that names the tool (`shutil.which("mktemp")`) is
+# not a bare form; before 3.12 an f-string was one token and its field's text
+# read as shell.
+d=$(new_tree temp-fstring-field-accepted)
+printf '%s\n' 'import shutil' \
+    "STUB = f'exec {shutil.which(\"$MK\")} \"\$@\"\\n'" \
+    > "$d/tests/test_fstring_field_ok.py"
+expect_rc temp-fstring-field-accepted 0 "$d"
+
+# #940 F2 fix round (F2X-4): an f-string's text is ONE string on every Python.
+# Python 3.12+ tokenizes an f-string into FSTRING_* tokens, whose middle kept a
+# format spec (`{a:>8}` read `{}>8`) and left escapes undecoded, while before
+# 3.12 the literal is one token read through `ast.JoinedStr`, which drops the
+# spec and the conversion and decodes the escapes. Each literal below is
+# checked twice against one fixed expectation: `_py_fstring_text` directly,
+# and the piece `_py_string_runs` reads from a statement holding it, which on
+# 3.12+ is the tokenize path. The expectations are literals, independent of
+# the tool.
+if python3 -B - "$REPO_ROOT/bin/cctally-preflight" \
+        > "$SCRATCH_DIR/temp-fstring-text-normalized.log" 2>&1 <<'PROBE'
+import importlib.machinery, importlib.util, sys
+
+tool = sys.argv[1]
+loader = importlib.machinery.SourceFileLoader("pf", tool)
+spec = importlib.util.spec_from_loader("pf", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+CASES = [
+    ('f"a{x:>8}b"', "a{}b"),                          # a format spec
+    ('f"{x!r}c"', "{}c"),                              # a conversion
+    ('f"{x:{w}.{p}}d"', "{}d"),                        # a nested spec
+    ('f"e\\n{x}"', "e\n{}"),                          # an escape
+    ('f"\\N{BULLET} {x}"', "\u2022 {}"),                # a named escape
+    ('f"{{lit}} {x}"', "{lit} {}"),                    # doubled braces
+    ('rf"\\n{x}\\d"', "\\n{}\\d"),                     # a raw f-string
+    ('f"{x!r:>{w}} \\t{{y}} \\N{EM DASH}"', "{} \t{y} \u2014"),
+]
+failures = []
+for source, expected in CASES:
+    direct = mod._py_fstring_text(source)
+    if direct != expected:
+        failures.append("_py_fstring_text(%s) = %r, expected %r" % (source, direct, expected))
+    runs = mod._py_string_runs("X = %s\n" % source)
+    if runs != [[(1, expected, source)]]:
+        failures.append("_py_string_runs(X = %s) = %r, expected %r" % (
+            source, runs, [[(1, expected, source)]]))
+if failures:
+    for f in failures:
+        print("FSTRING-DEFECT:", f)
+    raise SystemExit(1)
+print("f-string text normalized: %d literals on Python %s" % (
+    len(CASES), sys.version.split()[0]))
+PROBE
+then
+    report temp-fstring-text-normalized PASS
+else
+    report temp-fstring-text-normalized FAIL \
+        "an f-string's text differs from the ast.JoinedStr reading (see $SCRATCH_DIR/temp-fstring-text-normalized.log)"
+fi
+
+# #940 F2 fix round 2 (G5): a finding inside a multi-line f-string is placed
+# on its own physical line even when that line holds a replacement field,
+# which the decoded text reads as `{}` and the source spells `{name}`.
+d=$(new_tree temp-fstring-field-line)
+printf '%s\n' 'def g(name):' '    s = f"""' 'echo start' "dir=\$($MK -t {name})" '"""' \
+    '    return s' > "$d/tests/test_alloc_field.py"
+expect_c11 temp-fstring-field-line "$d" tests/test_alloc_field.py:4 "$R_TP"
+
+d=$(new_tree heredoc-fstring-field-line)
+printf '%s\n' 'def g(name):' '    s = f"""#!/bin/bash' 'echo {name}' "cat ${HD}EOF > {name}" \
+    'body' 'EOF' '"""' '    return s' > "$d/tests/test_generated_field.py"
+expect_c11 heredoc-fstring-field-line "$d" tests/test_generated_field.py:4 "$HD_GENERATED"
+
+# Determinism: the same tree, scanned twice, reports the same lines in the
+# same order.
+d=$(new_tree temp-deterministic)
+write_exec "$d/bin/scratch-z" '#!/bin/sh' "f=\$($MK)" "cat ${HD}EOF" 'x' 'EOF'
+write_exec "$d/bin/scratch-a" '#!/usr/bin/env bash' "dir=\$($MK -d -t a)"
+"$PREFLIGHT" --repo-root "$d" > "$SCRATCH_DIR/temp-deterministic.1" 2>&1
+"$PREFLIGHT" --repo-root "$d" > "$SCRATCH_DIR/temp-deterministic.2" 2>&1
+if ! cmp -s "$SCRATCH_DIR/temp-deterministic.1" "$SCRATCH_DIR/temp-deterministic.2"; then
+    report temp-deterministic FAIL "two scans of one tree differ (see $SCRATCH_DIR/temp-deterministic.1 and .2)"
+elif [ "$(grep -c 'scratch-[az]:' "$SCRATCH_DIR/temp-deterministic.1")" != 3 ] \
+        || ! grep -n 'scratch-[az]:' "$SCRATCH_DIR/temp-deterministic.1" | head -1 | grep -q 'scratch-a:2'; then
+    report temp-deterministic FAIL "expected three findings, scratch-a first (see $SCRATCH_DIR/temp-deterministic.1)"
+else
+    report temp-deterministic PASS
+fi
+
+}
+case_group cases_floor_shell_forms_and_markers
 
 # ---- the tool's own siblings -------------------------------------------
 # Every case above mutates the tree under test. These mutate the TOOL, because
@@ -1183,6 +2205,7 @@ copy_tool_bin () {   # copy_tool_bin <case name>  -> echoes the copied binary
     printf '%s' "$d/bin/cctally-preflight"
 }
 
+cases_tool_siblings () {
 tool=$(copy_tool_bin lint-absent) && rm -f "$(dirname "$tool")/cctally-changelog-lint"
 if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
     d=$(new_tree lint-absent)
@@ -1217,11 +2240,14 @@ tool=$(copy_tool_bin budget-lib-absent) \
     && rm -f "$(dirname "$tool")/_lib-test-contract.sh"
 if [ -n "${tool:-}" ] && [ -x "$tool" ]; then
     d=$(new_tree budget-lib-absent)
-    expect_rc_tool budget-lib-absent "$tool" 3 "$d" \
+    expect_rc_tool budget-lib-absent "$tool" 0 "$d" \
         "the committed runtime budget cannot be validated"
 else
     report budget-lib-absent FAIL "the tool directory could not be copied"
 fi
+
+}
+case_group cases_tool_siblings
 
 # ---- the tool's timeout bounds (#655) ----------------------------------
 # Every case in this section shortens a timeout constant in a COPIED tool, so
@@ -1245,6 +2271,7 @@ fi
 # seconds taken from a budget that cannot be raised. Measured on an idle
 # runner: 55.6 s wall for 21.8 s of CPU before this trim.
 
+cases_probe_and_ownership_timeouts () {
 # T4/A4. A hang in the blind-parser probe must report in its OWN words. It
 # used to reach the generic `(OSError, SubprocessError)` clause, whose wording
 # names neither the bound nor the operation.
@@ -1339,6 +2366,9 @@ else
     report bash-probe-failure FAIL "the tool directory could not be copied"
 fi
 
+}
+case_group cases_probe_and_ownership_timeouts slow
+
 # The primary parse invokes the BARE interpreter name `shell_interpreter`
 # returns, and subprocess.run resolves a bare name through PATH — verified by
 # running it, not assumed. So a stub earlier in PATH is the seam that makes the
@@ -1357,6 +2387,7 @@ write_path_stub () {   # write_path_stub <dir> <body line>
     chmod +x "$dir/bash"
 }
 
+cases_shell_sweep_timeouts_and_pins () {
 # T1/A1, first half. The AGGREGATE deadline must STOP the sweep and state what
 # went unchecked, rather than reporting a clean tree. Several subjects are each
 # slow but perfectly healthy: none reaches the 30-second per-call bound, and
@@ -1450,6 +2481,10 @@ else
         "a committed timeout constant is not at its documented production value"
 fi
 
+}
+case_group cases_shell_sweep_timeouts_and_pins slow
+
+cases_usage () {
 # ---- invocation and the real tree --------------------------------------
 "$PREFLIGHT" --nonsense > "$SCRATCH_DIR/usage.log" 2>&1
 rc=$?
@@ -1459,6 +2494,10 @@ else
     report usage FAIL "expected exit 2 for an invalid invocation, got $rc"
 fi
 
+}
+case_group cases_usage
+
+cases_real_tree () {
 # The scan of the ACTUAL working tree. This is the leg that makes the coverage
 # genuinely duplicated: the mutations above prove the detectors work, and this
 # proves they are pointed at this repository.
@@ -1490,6 +2529,10 @@ else
     report real-tree FAIL "the working tree does not pass its own pre-flight (exit $rc; see $SCRATCH_DIR/real-tree.log)"
 fi
 
+}
+case_group cases_real_tree slow
+
+cases_no_pytest_collection () {
 # ---- the pre-flight invokes no pytest collection (#648 D10) ------------
 #
 # #648 records the estate by running the real collectors, and the obvious place
@@ -1537,6 +2580,10 @@ else
     report no-pytest-collection PASS
 fi
 
+}
+case_group cases_no_pytest_collection slow
+
+cases_no_estate_collector () {
 # ---- the pre-flight names no estate collector (#648 D10, review P2-5) --------
 #
 # The runtime case above CANNOT see the route by which collection would
@@ -1567,6 +2614,11 @@ if [ -n "$estate_names" ]; then
 else
     report no-estate-collector PASS
 fi
+
+}
+case_group cases_no_estate_collector
+
+run_case_groups
 
 # The tally invariant. See EXPECTED_CASES_WITH_BASH3 at the top of this file
 # for why the manifest's minCases floor is not sufficient on its own.

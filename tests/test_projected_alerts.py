@@ -36,7 +36,9 @@ from conftest import load_script, redirect_paths
 
 
 # Subscription-week window the snapshot anchors. Tuesday 14:00 UTC, 7 days.
-WEEK_START = dt.datetime(2026, 5, 26, 14, 0, 0, tzinfo=dt.timezone.utc)
+# It lies inside the `opus-5` coefficient era, because a stored calibration
+# applies only inside its own era (#978).
+WEEK_START = dt.datetime(2026, 8, 4, 14, 0, 0, tzinfo=dt.timezone.utc)
 WEEK_END = WEEK_START + dt.timedelta(days=7)
 # now_utc placed exactly mid-week (84h in / 84h remaining) so
 # r_avg*remaining == p_now and the week-average projection == 2*p_now.
@@ -135,6 +137,7 @@ def _seed_calibrated_week(ns, *, units_per_point=2_000_000.0):
             "effectiveUntil": None,
             "fingerprint": qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
             "algorithmRevision": qm.QUOTA_MODEL_ALGORITHM_REVISION,
+            "coefficientEra": "opus-5",
             "unitsPerPoint": units_per_point,
             "interval": {"lo": units_per_point * 0.9,
                          "hi": units_per_point * 1.1},

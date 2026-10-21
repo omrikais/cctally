@@ -28,6 +28,8 @@ import textwrap
 
 import pytest
 
+import _temp_hygiene as _hyg
+
 
 pytest.importorskip("pytest_timeout")
 
@@ -56,6 +58,7 @@ def test_pytest_timeout_bounds_a_hang(tmp_path):
             f"--timeout={_CHILD_TIMEOUT_SECONDS}",
             "--timeout-method=thread",
             "-p", "no:cacheprovider",
+            *_hyg.nested_basetemp_args(tmp_path),
             "-q",
         ],
         stdout=subprocess.PIPE,

@@ -59,6 +59,7 @@ true and must not be restored.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime as dt
 import fcntl
 import json
@@ -858,11 +859,12 @@ def stats_open_time_guard(
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
                 if time.monotonic() >= deadline:
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    _GUARD_FAILURE.set(
+                        "contention" if isinstance(exc, BlockingIOError)
+                        else "error")
+                    raise _maintenance_busy_error("exclusive")
                 time.sleep(0.02)
         _cctally_core.note_stats_maintenance_acquired()
         try:
@@ -954,6 +956,27 @@ def _stats_open_maintenance_timeout_message() -> str:
     return _STATS_OPEN_MAINTENANCE_TIMEOUT_MSG
 
 
+#: Why this context's most recent bounded maintenance wait expired
+#: (#825/#832 Codex fix-round-4 Q3): ``contention`` when the lock stayed
+#: held, ``error`` for an OS error no holder caused.
+_GUARD_FAILURE = contextvars.ContextVar("stats_guard_failure", default=None)
+
+
+def _maintenance_busy_error(mode: str) -> "_cctally_db.StatsDbMaintenanceError":
+    """The store guard's bounded-wait expiry, carrying the lock identity the
+    failed acquisition lost to (``blocked_by``: a `_cctally_journal.LockBlock`
+    for ``maintenance`` in the requested ``mode``) so a deferred statusline
+    reduction can leave an obligation for exactly that release (Q3). An
+    expiry an I/O error caused is not contention and wakes nobody."""
+    import _cctally_journal
+
+    exc = _cctally_db.StatsDbMaintenanceError(
+        _stats_open_maintenance_timeout_message())
+    exc.blocked_by = _cctally_journal.LockBlock(
+        "maintenance", mode, _GUARD_FAILURE.get() != "error")
+    return exc
+
+
 def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
     """Poll for ``operation`` on ``lock_fh`` until ``timeout_s`` expires.
 
@@ -964,12 +987,15 @@ def _flock_bounded(lock_fh, operation: int, timeout_s: float) -> bool:
     sequence.
     """
     deadline = time.monotonic() + timeout_s
+    _GUARD_FAILURE.set(None)
     while True:
         try:
             fcntl.flock(lock_fh, operation | fcntl.LOCK_NB)
             return True
-        except (BlockingIOError, OSError):
+        except (BlockingIOError, OSError) as exc:
             if time.monotonic() >= deadline:
+                _GUARD_FAILURE.set(
+                    "contention" if isinstance(exc, BlockingIOError) else "error")
                 return False
             time.sleep(0.02)
 
@@ -1470,19 +1496,39 @@ def _recover_or_reclaim_interrupted_stats_rebuild(
             "stats.db interrupted-rebuild recovery timed out waiting for "
             "journal ingest serialization; retry after active cctally commands exit"
         )
+    import _cctally_completion
+
+    obligation_failure = None
     try:
         with stats_write_scope("maintenance-interrupted-rebuild"):
-            _cctally_journal.rebuild_stats_index(
-                context=_cctally_journal.RebuildContext(
-                    trigger="interrupted-rebuild-recovery"
-                ),
-                high_water=high_water,
-            )
+            try:
+                _cctally_journal.rebuild_stats_index(
+                    context=_cctally_journal.RebuildContext(
+                        trigger="interrupted-rebuild-recovery"
+                    ),
+                    high_water=high_water,
+                    complete_derivation=True,
+                )
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                # Fix round K12 (K11R-1): the recovered index IS published;
+                # only its residual obligation was lost. The recovery is
+                # complete, so its cleanup runs and the open continues; the
+                # caller posts the publication wake once its locks are gone.
+                obligation_failure = exc
         _remove_stale_stats_rebuild_artifacts(artifacts)
         _discard_pending_stats_publication_marker(db_path)
-        return True
     finally:
         _cctally_journal._release_ingest_lock(ingest_fd)
+    if obligation_failure is not None:
+        print(
+            "cctally: stats.db was recovered from an interrupted rebuild, but "
+            "the record that the inputs written during it still need deriving "
+            f"could not be saved ({obligation_failure}). Those inputs stay in "
+            "the journal and the next ingest derives them; check that the "
+            "data directory is writable.",
+            file=sys.stderr,
+        )
+    return True
 
 
 #: #778 — every guarded stats connection is built with the statement cache OFF.
@@ -1547,9 +1593,7 @@ def stats_open_guarded(
             if not _flock_bounded(
                 lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
             ):
-                raise _cctally_db.StatsDbMaintenanceError(
-                    _stats_open_maintenance_timeout_message()
-                )
+                raise _maintenance_busy_error("shared")
             if marker.exists():
                 fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 raise _cctally_db.StatsDbMaintenanceError()
@@ -1561,9 +1605,7 @@ def stats_open_guarded(
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    raise _maintenance_busy_error("exclusive")
                 try:
                     if marker.exists():
                         raise _cctally_db.StatsDbMaintenanceError()
@@ -1586,9 +1628,7 @@ def stats_open_guarded(
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    raise _maintenance_busy_error("exclusive")
                 # Recovery calls `rebuild_stats_index`, whose in-place publisher
                 # reopens the live destination through `stats_open_guarded`.
                 # `flock` conflicts are per open-file-DESCRIPTION and apply
@@ -1628,13 +1668,16 @@ def stats_open_guarded(
                     _cctally_core.note_stats_maintenance_released()
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                 if recovered:
+                    # #825/#832 spec 4.3 revision 2: interrupted-rebuild
+                    # recovery is a live index publication; its wake is
+                    # deferred past any lock the caller of this open holds.
+                    import _cctally_completion
+                    _cctally_completion.post_publication_wake()
                     continue
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
                 ):
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    raise _maintenance_busy_error("shared")
                 if marker.exists() or pending.exists():
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                     continue
@@ -1652,9 +1695,7 @@ def stats_open_guarded(
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_EX, _STATS_OPEN_RESUME_WAIT_S
                 ):
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    raise _maintenance_busy_error("exclusive")
                 try:
                     _resolve_stats_publication_marker(db_path)
                 finally:
@@ -1662,9 +1703,7 @@ def stats_open_guarded(
                 if not _flock_bounded(
                     lock_fh, fcntl.LOCK_SH, _STATS_OPEN_MAINTENANCE_WAIT_S
                 ):
-                    raise _cctally_db.StatsDbMaintenanceError(
-                        _stats_open_maintenance_timeout_message()
-                    )
+                    raise _maintenance_busy_error("shared")
                 if marker.exists() or pending.exists():
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
                     continue
@@ -2633,27 +2672,49 @@ def _run_stats_corruption_heal(request: dict) -> str:
                 )
                 if not confirmed:
                     return "declined-unconfirmed"
+                import _cctally_completion
+                obligation_failure = None
                 with stats_write_scope("maintenance-heal"):
-                    result = _cctally_journal.rebuild_stats_index(
-                        context=_cctally_journal.RebuildContext(
-                            trigger="corruption-heal",
-                            trigger_error=str(request.get("triggerError") or ""),
-                            forensics_path=request.get("forensicsPath"),
-                        ),
-                        high_water=high_water,
-                    )
+                    try:
+                        result = _cctally_journal.rebuild_stats_index(
+                            context=_cctally_journal.RebuildContext(
+                                trigger="corruption-heal",
+                                trigger_error=str(
+                                    request.get("triggerError") or ""),
+                                forensics_path=request.get("forensicsPath"),
+                            ),
+                            high_water=high_water,
+                            complete_derivation=True,
+                        )
+                    except _cctally_completion.ResidualObligationNotDurable \
+                            as exc:
+                        # Fix round K11 (K9K10-R7): the healed index IS
+                        # published; only its residual obligation is lost.
+                        obligation_failure = exc
+                        result = getattr(exc, "result", None)
         finally:
             if ingest_fd is not None:
                 _heal_release_flock(ingest_fd)
-        _record_stats_heal_outcome(heal_id, "rebuilt", result=result)
+        _record_stats_heal_outcome(heal_id, "rebuilt", result=result,
+                                   error=obligation_failure)
+        if obligation_failure is not None:
+            return STATS_HEAL_RESIDUAL_NOT_DURABLE
         return "success"
     finally:
         _heal_release_maintenance_flock(maint_fd)
 
 
+#: Fix round K11 (K9K10-R7): the heal published the rebuilt index, but its
+#: residual-derivation obligation could not be made durable. The heal is
+#: done (the request is finalized and the publication wake posted); the ring
+#: records the rebuild with the obligation error, and the worker log says so.
+STATS_HEAL_RESIDUAL_NOT_DURABLE = "rebuilt-residual-not-durable"
+
+
 def cmd_stats_corruption_heal_internal(args) -> int:
     """Hidden detached worker: heal one corrupt stats index exactly once."""
     del args
+    healed = False
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
         worker_fd = os.open(
@@ -2684,12 +2745,17 @@ def cmd_stats_corruption_heal_internal(args) -> int:
         if outcome in ("maintenance-busy", "ingest-busy"):
             _log_stats_heal(outcome, heal_id=heal_id)
             return 0
-        if outcome != "success":
+        # Fix round K11 (K9K10-R7): a heal that published but lost its
+        # residual obligation is a heal; its ring outcome is already
+        # recorded (with the obligation error) and it wakes like a success.
+        published = outcome in ("success", STATS_HEAL_RESIDUAL_NOT_DURABLE)
+        if not published:
             _record_stats_heal_outcome(heal_id, outcome)
         if not _finalize_stats_heal_request(heal_id):
             _log_stats_heal("finalization-pending", heal_id=heal_id)
             return 0
         _log_stats_heal(outcome, heal_id=heal_id)
+        healed = published
         return 0
     finally:
         try:
@@ -2697,6 +2763,11 @@ def cmd_stats_corruption_heal_internal(args) -> int:
         except OSError:
             pass
         os.close(worker_fd)
+        if healed:
+            # #825/#832 spec 4.3 revision 2: the healed index posts its
+            # completion wake, with the worker flock released.
+            import _cctally_completion
+            _cctally_completion.post_publication_wake()
 
 
 # --------------------------------------------------------------------------
@@ -3108,8 +3179,62 @@ def defer_stats_epoch_rebuild() -> str:
         os.close(admission_fd)
 
 
+def stats_rebuild_worker_blocks() -> tuple:
+    """#825/#832 Codex fix-round-4 Q3: one failed try-lock per detached
+    rebuild worker lock (the epoch worker's and the heal worker's), each a
+    `_cctally_journal.LockBlock` naming the worker lock that refused it,
+    whether it was held (contention) or the probe hit an I/O error. A worker
+    lock that is free, or whose file does not exist, yields nothing: an
+    unlocked probe proves no release."""
+    import _cctally_journal
+
+    blocks = []
+    for name, path in (("epoch-worker", _stats_epoch_rebuild_worker_path()),
+                       ("heal-worker", _stats_heal_worker_path())):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            blocks.append(_cctally_journal.LockBlock(name, "exclusive", False))
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                blocks.append(_cctally_journal.LockBlock(
+                    name, "exclusive", isinstance(exc, BlockingIOError)))
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        finally:
+            os.close(fd)
+    return tuple(blocks)
+
+
 def cmd_stats_epoch_rebuild_internal(args) -> int:
-    """Hidden detached worker: converge a pending stats epoch exactly once."""
+    """Hidden detached worker: converge a pending stats epoch exactly once,
+    then — with the worker flock released — post the completion wake that
+    resumes deferred statusline work (#825/#832 spec 4.3 revision 2). Only a
+    publication wakes: a failed rebuild manufactures no wake."""
+    if _stats_epoch_rebuild_worker(args) in (
+            "success", "current", STATS_EPOCH_RESIDUAL_NOT_DURABLE):
+        import _cctally_completion
+        _cctally_completion.post_publication_wake()
+    return 0
+
+
+#: Fix round K11 (K9K10-R7): the epoch rebuild published a current index, but
+#: its residual-derivation obligation could not be made durable. The epoch
+#: converged (the marker is removed and the publication wake posted); the
+#: worker log records the obligation failure.
+STATS_EPOCH_RESIDUAL_NOT_DURABLE = "success-residual-not-durable"
+
+
+def _stats_epoch_rebuild_worker(args) -> str:
+    """The worker body; returns its outcome."""
     del args
     try:
         pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
@@ -3120,25 +3245,31 @@ def cmd_stats_epoch_rebuild_internal(args) -> int:
         )
     except OSError as exc:
         _log_stats_epoch_rebuild("error", error=exc)
-        return 0
+        return "error"
     try:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            return 0
+            return "busy"
         if not stats_epoch_rebuild_pending():
             _unlink_stats_epoch_marker()
             _log_stats_epoch_rebuild("current")
-            return 0
+            return "current"
+        import _cctally_completion
         try:
             conn = resolve_stats_epoch_mismatch()
             conn.close()
+        except _cctally_completion.ResidualObligationNotDurable as exc:
+            _unlink_stats_epoch_marker()
+            _log_stats_epoch_rebuild(STATS_EPOCH_RESIDUAL_NOT_DURABLE,
+                                     error=exc)
+            return STATS_EPOCH_RESIDUAL_NOT_DURABLE
         except Exception as exc:
             _log_stats_epoch_rebuild("error", error=exc)
-            return 0
+            return "error"
         _unlink_stats_epoch_marker()
         _log_stats_epoch_rebuild("success")
-        return 0
+        return "success"
     finally:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_UN)
@@ -3188,8 +3319,10 @@ def stats_epoch_rebuild_pending(path=None) -> bool:
 
 def resolve_stats_epoch_mismatch():
     """Resolve a version-mismatched stats.db by journal rebuild (spec §7.1).
-    Called by ``open_db`` after ``conn.close()`` — returns a fresh steady-state
-    ``open_db()`` connection over the rebuilt index."""
+    Called by the detached epoch worker (``_stats_epoch_rebuild_worker``);
+    an ordinary ``open_db`` defers the epoch to that worker instead of
+    rebuilding inline. Returns a fresh steady-state ``open_db()`` connection
+    over the rebuilt index."""
     global _EPOCH_MISMATCH_ACTIVE
     import _cctally_journal
 
@@ -3248,6 +3381,15 @@ def resolve_stats_epoch_mismatch():
                     # Append the idempotent account coordinator input, then let
                     # the common rebuild cutover preserve the version-ahead
                     # family and atomically publish the current epoch.
+                    #
+                    # #825/#832 (spec C3/F1; Codex fix-round-1 Q1): the
+                    # rebuild runs the shared derivation-completion step, which
+                    # journals the decisions of every admitted reading no
+                    # current binary derived — including the observation of
+                    # the very tick whose open deferred here, and a reading a
+                    # previous-release ingest derived unstamped. The replaced
+                    # index's applied cursor is never trusted as proof that
+                    # derivation completed.
                     with stats_write_scope("maintenance-epoch"):
                         _cctally_journal.run_epoch_transition()
                 finally:
@@ -3258,3 +3400,100 @@ def resolve_stats_epoch_mismatch():
         return _cctally_core.open_db()
     finally:
         _EPOCH_MISMATCH_ACTIVE = False
+
+
+# --------------------------------------------------------------------------
+# #825/#832 validated read snapshots (spec section 6)
+# --------------------------------------------------------------------------
+
+#: The index object whose presence identifies the account-bound protocol's
+#: interpretation of the journal. A previous-release generation (epoch 1017)
+#: publishes no such table, so an index an old binary republished fails this
+#: check even if its `user_version` were somehow current.
+PROTOCOL_MARKER_TABLE = "journal_admission_summary"
+
+
+class StatsIndexNotCurrent(RuntimeError):
+    """The stats index this snapshot reads is not the current interpretation
+    of the journal (another epoch, or no protocol marker): typically a
+    previous-release process republished it. Nothing read from it may be
+    persisted or decided on.
+
+    Deliberately NOT an `sqlite3.DatabaseError`: a sound index at another epoch
+    is not corruption, and the corruption classifier must never see it so."""
+
+
+def validate_stats_identity(conn: sqlite3.Connection, *, expected_epoch: int,
+                            expected_protocol: "str | None") -> None:
+    """Check epoch and protocol identity on the caller's CURRENT snapshot.
+
+    Inside a transaction both reads come from that transaction's snapshot, so
+    the check and the caller's own queries describe one database state."""
+    epoch = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if (epoch <= _cctally_core.LEGACY_STATS_HEAD
+            and int(expected_epoch) == _cctally_core.STATS_INDEX_EPOCH):
+        # A legacy PRE-JOURNAL index (#825/#832 Task 4 regression fix): the
+        # one-time journal cutover has not converted it yet — typically a
+        # gated recompute migration is still deferred — so it was never
+        # materialized from the journal and is not "another interpretation"
+        # of it. No account-bound boundary exists before that cutover
+        # (`AccountBoundCutoverDeferred`), so admission excludes nothing. The
+        # ingest's own open admits exactly this range (`epoch_ok` in
+        # `_run_stats_ingest_once`); rejecting it here made every recording
+        # on such a store exit 1. A previous release's index is at 1017, far
+        # above the legacy head, and stays rejected.
+        return
+    if epoch != int(expected_epoch):
+        raise StatsIndexNotCurrent(
+            f"stats index epoch {epoch} is not the current {expected_epoch}")
+    if expected_protocol is not None:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (PROTOCOL_MARKER_TABLE,),
+        ).fetchone()
+        if row is None:
+            raise StatsIndexNotCurrent(
+                f"stats index lacks the {expected_protocol} protocol marker")
+
+
+@contextlib.contextmanager
+def validated_read_snapshot(conn: sqlite3.Connection, *, expected_epoch: int,
+                            expected_protocol: "str | None"):
+    """ONE read snapshot whose identity is proven first.
+
+    Joins a transaction the caller already holds; otherwise opens a deferred
+    read transaction and rolls it back afterwards (the `one_read_snapshot`
+    discipline). The epoch and protocol identity are read INSIDE the snapshot
+    the enclosed queries use, so a reader that validated its connection at open
+    cannot read an index a previous-release process republished afterwards.
+    Raises `StatsIndexNotCurrent` before the block runs."""
+    own = not conn.in_transaction
+    if own:
+        conn.execute("BEGIN")
+    try:
+        validate_stats_identity(conn, expected_epoch=expected_epoch,
+                                expected_protocol=expected_protocol)
+        yield
+    finally:
+        if own:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+
+
+def current_stats_snapshot(conn: sqlite3.Connection):
+    """`validated_read_snapshot` at `STATS_INDEX_EPOCH` and the account-bound
+    protocol: the read scope every persisted-decision owner uses."""
+    import _lib_account_protocol
+    return validated_read_snapshot(
+        conn, expected_epoch=_cctally_core.STATS_INDEX_EPOCH,
+        expected_protocol=_lib_account_protocol.PROTOCOL_GENERATION)
+
+
+def require_current_stats_identity(conn: sqlite3.Connection) -> None:
+    """The same check on the caller's own (write) transaction."""
+    import _lib_account_protocol
+    validate_stats_identity(
+        conn, expected_epoch=_cctally_core.STATS_INDEX_EPOCH,
+        expected_protocol=_lib_account_protocol.PROTOCOL_GENERATION)

@@ -144,6 +144,8 @@ import _lib_wal_checkpoint as _wal_checkpoint
 # #845 §4.1: the decode helper is a stdlib-only leaf that imports nothing from
 # this package, so binding it here is circular-safe for the same reason.
 import _lib_codex_metadata
+import _lib_codex_rollout_container as _rc
+import _lib_codex_publication_barrier as _barrier
 
 
 # Module-level back-ref shims for the three out-of-scope JSONL/project
@@ -632,6 +634,13 @@ CODEX_REPLAY_DEFERRED_KEY = (
 #: precedent).
 CODEX_REPLAY_DRAIN_COMMAND = "_codex-replay-drain"
 
+#: #968 spec 5.7: the detached, single-flight orphan-prune worker.
+CODEX_PRUNE_DRAIN_COMMAND = "_codex-prune-drain"
+CODEX_PRUNE_DRAIN_MARKER_NAME = "codex-prune-drain.last-attempt"
+CODEX_PRUNE_DRAIN_SPAWN_THROTTLE_SECONDS = 600
+CODEX_PRUNE_DRAIN_LOCK_NAME = "codex-prune-drain.lock"
+CODEX_PRUNE_ROOT_CLEANUP_KEY = "codex_prune_root_cleanup_pending"
+
 #: Marker whose mtime throttles drain spawns, in ``APP_DIR`` rather than
 #: cache.db because a spawn is process state and the decision is taken with no
 #: cache write transaction open.
@@ -1101,11 +1110,15 @@ class CodexProviderRoot:
 
 @dataclass(frozen=True)
 class CodexDiscoveredFile:
-    """One physical rollout paired with its first matching provider root.
+    """One LOGICAL rollout paired with its first matching provider root.
 
-    ``physical_path`` is only the de-duplication identity. ``source_path``
-    keeps the configured walk spelling because reporting resolves it against
-    the configured ``$CODEX_HOME`` roots.
+    ``source_path`` is the configured walk spelling of the LOGICAL path
+    (``X.jsonl`` even when only ``X.jsonl.zst`` exists), so every persisted key
+    survives compression (#968 spec 5.2, U2). ``physical_path`` is only the
+    de-duplication identity: the canonical logical path, equal to the plain-era
+    identity. The container fields record which physical file discovery
+    selected; a walk re-selects before reading because a plain file may vanish
+    between discovery and read.
     """
 
     source_path: pathlib.Path
@@ -1113,7 +1126,9 @@ class CodexDiscoveredFile:
     provider_root: pathlib.Path
     walk_root: pathlib.Path
     source_root_key: str
-
+    container_kind: str = "plain"
+    container_path: "pathlib.Path | None" = None
+    container_fingerprint: "object | None" = None
 
 def _canonical_codex_path(path: pathlib.Path) -> pathlib.Path:
     """Resolve an absolute Codex path, retaining a safe absolute spelling on I/O failure."""
@@ -1937,26 +1952,57 @@ def _maybe_append_codex_account_observe(identity: "dict | None") -> None:
         pass
 
 
+def _codex_container_is_contained(path: pathlib.Path, root: pathlib.Path) -> bool:
+    """Prove physical containment independently of the identity fallback.
+
+    Discovery retains its existing absolute spelling if Path.resolve fails;
+    strict realpath still checks symlinks rather than treating that spelling
+    as proof that the selected container belongs to the configured root.
+    """
+    try:
+        physical = pathlib.Path(os.path.realpath(path, strict=True))
+        boundary = pathlib.Path(os.path.realpath(root, strict=True))
+        return physical.is_relative_to(boundary)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
-    """Discover each physical rollout once with the first matching root facts."""
+    """Discover each LOGICAL rollout once with the first matching root facts.
+
+    #968 spec 5.2: both container spellings are globbed and grouped by logical
+    path; ``select_container`` picks plain when it exists, else the ``.zst``
+    twin. Ordering is by the logical spelling, which is today's order for a
+    plain-only tree. ``physical_path`` is the canonical LOGICAL identity, so a
+    rollout keeps its identity, attribution map key and journal keys across
+    compression.
+    """
     discovered: list[CodexDiscoveredFile] = []
     seen: set[pathlib.Path] = set()
     for root in _codex_provider_roots():
-        for candidate in sorted(
-            root.walk_root.glob("**/*.jsonl"), key=lambda path: str(path)
-        ):
-            if not candidate.is_file():
+        logicals = {
+            _rc.logical_path(candidate)
+            for pattern in ("**/*.jsonl", "**/*.jsonl.zst")
+            for candidate in root.walk_root.glob(pattern)
+        }
+        for logical in sorted(logicals, key=lambda path: str(path)):
+            selected = _rc.select_container(logical)
+            if selected is None:
                 continue
-            physical_path = _canonical_codex_path(candidate)
+            container = _canonical_codex_path(selected.path)
+            physical_path = _rc.logical_path(container)
             if physical_path in seen:
                 continue
             seen.add(physical_path)
             discovered.append(CodexDiscoveredFile(
-                source_path=candidate,
+                source_path=logical,
                 physical_path=physical_path,
                 provider_root=root.provider_root,
                 walk_root=root.walk_root,
                 source_root_key=root.source_root_key,
+                container_kind=selected.kind,
+                container_path=selected.path,
+                container_fingerprint=selected.fingerprint,
             ))
     return discovered
 
@@ -1980,7 +2026,10 @@ def _codex_file_is_recognizable(path: pathlib.Path) -> bool:
     consumed = 0
     lines = 0
     try:
-        with path.open("rb") as fh:
+        selected = _rc.select_container(path)
+        if selected is None:
+            return False
+        with _rc.open_decoded(selected) as fh:
             while (
                 lines < _CODEX_ROOT_RECOGNITION_MAX_LINES
                 and consumed < _CODEX_ROOT_RECOGNITION_MAX_BYTES
@@ -2171,18 +2220,19 @@ def _clear_codex_prune_refusal(conn: sqlite3.Connection) -> None:
 
 def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
     """Resolve each requested path through the ordered configured roots exactly
-    as full discovery would (spec §5.1) — producing the same per-file facts a
-    ``CodexDiscoveredFile`` carries (configured spelling, physical path, provider
-    root, walk root, source-root key) with first-match containment + physical
-    dedup. A path resolving under no configured root, not a ``*.jsonl`` file, or
-    an alias of an already-resolved physical file is DROPPED (clean, not
-    ingested). Targeted mode's analogue of ``_discover_codex_files_with_roots``:
-    it does NOT walk any tree — it qualifies only the caller's exact paths."""
+    as full discovery would (spec §5.1), producing the same per-file facts a
+    ``CodexDiscoveredFile`` carries.
+
+    #968 spec 5.9: either spelling is accepted and normalized to its LOGICAL
+    target, and containment is enforced on the SELECTED physical container
+    with symlinks resolved, matching ``_lib_ingest_frontier._target_in_roots``.
+    A path under no configured root, not a rollout, escaping its root, or an
+    alias of an already-resolved identity is DROPPED (clean, not ingested).
+    """
     roots = _codex_provider_roots()
     resolved: list[CodexDiscoveredFile] = []
     seen_physical: set[pathlib.Path] = set()
-    # Deterministic order so first-match physical dedup is stable across a set.
-    for p in sorted(only_paths):
+    for p in sorted({str(_rc.logical_path(str(p))) for p in only_paths}):
         candidate = pathlib.Path(p)
         for root in roots:
             try:
@@ -2191,14 +2241,17 @@ def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
                 inside = False
             if not inside:
                 continue
-            # Under this root's walk boundary: it is qualified here (first match)
-            # or dropped — a different-spelled alias never re-qualifies under a
-            # later root, matching full discovery's yielded-source-path identity.
-            if candidate.suffix != ".jsonl" or not candidate.is_file():
-                break  # vanished / non-rollout under this root → drop (clean)
-            physical = _canonical_codex_path(candidate)
+            if candidate.suffix != ".jsonl":
+                break
+            selected = _rc.select_container(candidate)
+            if selected is None:
+                break  # vanished under this root -> drop (clean)
+            container = _canonical_codex_path(selected.path)
+            if not _codex_container_is_contained(selected.path, root.walk_root):
+                break  # the selected container escapes its root -> drop
+            physical = _rc.logical_path(container)
             if physical in seen_physical:
-                break  # first-match physical dedup → drop the alias
+                break
             seen_physical.add(physical)
             resolved.append(CodexDiscoveredFile(
                 source_path=candidate,
@@ -2206,20 +2259,23 @@ def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
                 provider_root=root.provider_root,
                 walk_root=root.walk_root,
                 source_root_key=root.source_root_key,
+                container_kind=selected.kind,
+                container_path=selected.path,
+                container_fingerprint=selected.fingerprint,
             ))
             break
     return resolved
-
 
 def _load_codex_session_files_rows(
     conn: sqlite3.Connection, paths: "list[str]"
 ) -> dict:
     """Cursor rows from ``codex_session_files`` for ONLY the given paths (spec
     §5.1 — the targeted preload must never load every row like the full-sync
-    path). Same 15-tuple value shape as ``sync_codex_cache``'s full ``existing``
-    map, so the per-file delta logic is byte-identical between the two modes.
+    path). The first 15 values match the original cursor shape, followed by
+    the shared container projection and the resume-strike count, exactly as in
+    ``sync_codex_cache``'s full ``existing`` map.
 
-    ``device_id``/``inode`` are the last two members and they are NOT
+    ``device_id``/``inode`` close the original projection and they are NOT
     diagnostics: the resume decision reads them, because a replacement that
     lands at the same size is otherwise indistinguishable from a file nothing
     touched (#769 S6)."""
@@ -2231,7 +2287,7 @@ def _load_codex_session_files_rows(
         "last_session_id, last_model, last_total_tokens, source_root_key, "
         "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
         "last_conversation_key, last_turn_id, ingest_complete, "
-        "device_id, inode"
+        "device_id, inode," + _CODEX_CONTAINER_SELECT + ",container_resume_strikes"
     )
     for i in range(0, len(paths), 400):
         chunk = paths[i:i + 400]
@@ -2242,6 +2298,1753 @@ def _load_codex_session_files_rows(
         ):
             out[row[0]] = tuple(row[1:])
     return out
+
+
+class _CodexContainerStat(NamedTuple):
+    """The stat facts the walks use, taken from the SELECTED container."""
+
+    st_size: int
+    st_mtime_ns: int
+    st_dev: int
+    st_ino: int
+
+
+class _AcceptedContainer(NamedTuple):
+    kind: str
+    container_size: "int | None"
+    decoded_size: "int | None"
+    mtime_ns: "int | None"
+    device: "int | None"
+    inode: "int | None"
+    anchor: "bytes | None"
+    anchor_offset: "int | None"
+    state: str
+    pending_fingerprint: "str | None"
+
+
+#: Appended, in this order, to both walks' cursor SELECTs (#968 spec 5.3).
+_CODEX_CONTAINER_SELECT = (
+    "container_kind,container_size_bytes,decoded_size_bytes,content_anchor,"
+    "content_anchor_offset,container_state,pending_container_fingerprint"
+)
+
+
+def _accepted_container(row, *, ext: int, mtime: int, device: int,
+                        inode: int) -> _AcceptedContainer:
+    kind, csize, dsize, anchor, anchor_off, state, pending = row[ext:ext + 7]
+    return _AcceptedContainer(
+        kind or _rc.PLAIN, csize, dsize, row[mtime], row[device], row[inode],
+        None if anchor is None else bytes(anchor), anchor_off,
+        state or "accepted", pending)
+
+
+class _CodexContainerDecision(NamedTuple):
+    action: str  # "read" | "pending" | "skip"
+    size: "int | None"
+    reason: "str | None"
+    decoded_length: "int | None"
+    complete_line_end: "int | None"
+
+
+_CONTAINER_SKIP_REASONS = {
+    "decoder-unavailable": "decoder-unavailable",
+    "decode-error": "decode-error",
+    "read-error": "decode-error",
+    "unstable-stat": "decode-error",
+}
+
+
+def _container_skip_reason(category: str) -> str:
+    return _CONTAINER_SKIP_REASONS.get(category, "decode-error")
+
+
+def _codex_container_decision(
+    selected: "_rc.SelectedContainer",
+    accepted: "_AcceptedContainer | None",
+    *,
+    executor_path: bool,
+    should_stop,
+) -> _CodexContainerDecision:
+    """#968 spec 5.5: what a walk may do with one logical rollout now.
+
+    * No cursor: plain reads as today; a zstd container is fully validated
+      first (frame completion, decoded length, complete-line end) and only
+      then read from decoded offset 0.
+    * A cursor whose state is not ``accepted`` is held unless the
+      verification executor authorized this identity (Task 5).
+    * The same kind and, for zstd, the identical fingerprint: read with the
+      accepted decoded size, so an unchanged compressed rollout costs no decode.
+    * A kind change or a changed zstd fingerprint is a TRANSITION: hold it
+      pending. Nothing is re-ingested, reset or deleted on the walk.
+    """
+    fp = selected.fingerprint
+    if accepted is None:
+        if selected.kind == _rc.PLAIN:
+            return _CodexContainerDecision("read", fp.size, None, None, None)
+        validation = _rc.validate_full_stream(selected, should_stop=should_stop)
+        if not validation.ok:
+            return _CodexContainerDecision(
+                "skip", None, _container_skip_reason(validation.error),
+                None, None)
+        return _CodexContainerDecision(
+            "read", validation.decoded_length, None,
+            validation.decoded_length, validation.complete_line_end)
+    if accepted.state == "unverified" and not executor_path:
+        # A terminal verdict belongs to the REJECTED candidate, not the old
+        # accepted plain prefix. A genuinely new selected fingerprint rejoins
+        # the existing verifier; an unchanged rejection stays quiet.
+        rejected = _rc.ContainerFingerprint.from_json(accepted.pending_fingerprint)
+        if rejected is not None and rejected != fp:
+            return _CodexContainerDecision(
+                "pending", None, "container-transition", None, None)
+    if accepted.state != "accepted" and not executor_path:
+        reason = ("verification-pending" if accepted.state == "pending"
+                  else "verification-unverified")
+        return _CodexContainerDecision("skip", None, reason, None, None)
+    if executor_path:
+        # The executor validated this container immediately before handing
+        # the identity to the walk (Task 5); read it at its decoded length.
+        validation = _rc.validate_full_stream(selected, should_stop=should_stop)
+        if not validation.ok:
+            return _CodexContainerDecision(
+                "skip", None, _container_skip_reason(validation.error),
+                None, None)
+        return _CodexContainerDecision(
+            "read", validation.decoded_length, None,
+            validation.decoded_length, validation.complete_line_end)
+    if selected.kind != accepted.kind:
+        return _CodexContainerDecision(
+            "pending", None, "container-transition", None, None)
+    if selected.kind == _rc.PLAIN:
+        return _CodexContainerDecision("read", fp.size, None, None, None)
+    unchanged = (
+        accepted.container_size == fp.size
+        and accepted.mtime_ns == fp.mtime_ns
+        # Review P3-2: a compressed container is unchanged only when its
+        # device AND inode both match, as its generation token (5.1, 5.11).
+        # That is stricter than #769 S6 (device only corroborates), which 5.5
+        # permits; a remount therefore sends each retained compressed
+        # container through one verification, never through a re-ingest.
+        and accepted.device is not None and accepted.inode is not None
+        and int(accepted.device) == fp.device
+        and int(accepted.inode) == fp.inode
+        and accepted.decoded_size is not None
+    )
+    if unchanged:
+        return _CodexContainerDecision(
+            "read", int(accepted.decoded_size), None, None, None)
+    return _CodexContainerDecision(
+        "pending", None, "container-transition", None, None)
+
+
+def _mark_codex_containers_pending(
+    conn: sqlite3.Connection, table: str,
+    marks: "list[tuple[str, str, str]]",
+    *, commit: bool = True,
+) -> int:
+    """Durably hold each ``(path, fingerprint_json, reason)`` for verification.
+
+    Writes only container columns: no accounting, quota, journal or mutation
+    sequence change, and no ``codex_session_files`` trigger fires (the
+    accounting trigger watches path, source_root_key and
+    last_native_thread_id only). Re-marking an identical pending fingerprint
+    is a no-op. ``commit=False`` joins the caller's W11 finalization
+    transaction without releasing its deferred-file savepoint.
+    """
+    if table not in ("codex_session_files", "codex_conversation_source_files"):
+        raise ValueError(table)
+    changed = 0
+    for path, fingerprint_json, reason in marks:
+        changed += conn.execute(
+            f"UPDATE {table} SET container_state='pending', "
+            "container_state_reason=?, pending_container_fingerprint=? "
+            "WHERE path=? AND NOT (container_state='pending' "
+            "AND pending_container_fingerprint IS ?)",
+            (reason, fingerprint_json, path, fingerprint_json),
+        ).rowcount
+    if commit:
+        conn.commit()
+    return changed
+
+
+class _CursorSnapshot(NamedTuple):
+    path: str
+    root_key: "str | None"
+    size_bytes: int
+    last_byte_offset: int
+    ingest_complete: int
+    last_session_id: "str | None"
+    last_model: "str | None"
+    last_total_tokens: "int | None"
+    last_native_thread_id: "str | None"
+    last_root_thread_id: "str | None"
+    last_parent_thread_id: "str | None"
+    last_conversation_key: "str | None"
+    anchor: "bytes | None"
+    anchor_offset: "int | None"
+    last_turn_id: "str | None"
+    state: str
+    generation: tuple
+
+
+_VERIFY_TABLES = ("codex_session_files", "codex_conversation_source_files")
+
+
+def _load_cursor_snapshot(conn, table: str, path: str) -> "_CursorSnapshot | None":
+    if table not in _VERIFY_TABLES:
+        raise ValueError(table)
+    cursor = conn.execute(f"SELECT * FROM {table} WHERE path=?", (path,))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    fields = dict(zip((col[0] for col in cursor.description), row))
+    anchor = fields["content_anchor"]
+    # An unsupported/partial anchor is insufficient for byte equivalence;
+    # use the legacy retained-fact comparison instead.
+    if (fields["content_anchor_version"] != _rc.ANCHOR_VERSION
+            or fields["content_anchor_offset"] != fields["last_byte_offset"]):
+        anchor = None
+    return _CursorSnapshot(
+        fields["path"], fields["source_root_key"], fields["size_bytes"],
+        fields["last_byte_offset"], fields.get("ingest_complete", 1),
+        fields["last_session_id"], fields["last_model"], fields["last_total_tokens"],
+        fields["last_native_thread_id"], fields["last_root_thread_id"],
+        fields["last_parent_thread_id"], fields["last_conversation_key"],
+        None if anchor is None else bytes(anchor), fields["content_anchor_offset"],
+        fields["last_turn_id"], fields["container_state"], tuple(row))
+
+
+class _PrefixFacts(NamedTuple):
+    accounting: list
+    quotas: list
+    threads: dict        # conversation_key -> (key, native, root, parent) | None
+    events: list
+    messages: list       # normalized projection, _MESSAGE_PROJECTION order
+    resume: tuple
+
+
+#: The normalized-projection columns legacy equivalence compares (#968 spec
+#: 5.5, review P3-4): what the conversation normalizer derives from the events,
+#: so a prefix whose raw events match but whose projection would differ (a
+#: normalizer-relevant sticky turn or model) is never adopted silently.
+_MESSAGE_PROJECTION = (
+    "line_offset", "conversation_key", "timestamp_utc", "turn_id", "call_id",
+    "kind", "event_type", "record_family", "model", "content_digest",
+    "content_len")
+
+
+def _codex_prefix_facts(selected, *, path_str: str, root_key: "str | None",
+                        end_offset: int) -> _PrefixFacts:
+    """Prepare-only replay of ``[0, end_offset)`` through the production parser.
+
+    No transaction, no write. Collects exactly the facts the walk would derive,
+    in the shapes ``_retained_prefix_facts`` reads back (#968 spec 5.5, legacy
+    rows). Journal-backed attribution and canonical-reset decisions are NOT
+    derived here: they are preserved, never re-inferred.
+    """
+    import _lib_codex_conversation
+    state = _CodexIterState(session_id=None, model=None, total_tokens=0)
+    accounting, quotas, threads, events, physical = [], [], {}, [], []
+    yielded = 0
+    with _rc.open_decoded(selected) as fh:
+        for emission in _iter_codex_fused_records_with_offsets(
+                fh, path_str, initial_session_id=None, initial_model=None,
+                initial_total_tokens=0, source_root_key=root_key, state=state,
+                stop_before=lambda off: off >= end_offset):
+            event = emission.event
+            if event is not None:
+                physical.append(event)
+                events.append((int(event.line_offset), event.conversation_key,
+                               event.record_type, event.event_type,
+                               event.payload_json))
+            for q in emission.quotas:
+                quotas.append((int(q.line_offset), q.captured_at_utc,
+                               q.observed_slot, q.logical_limit_key, q.limit_id,
+                               q.limit_name, q.window_minutes, q.used_percent,
+                               q.resets_at_utc, q.plan_type,
+                               q.individual_limit_json, q.reached_type))
+            t = emission.thread
+            if t is not None and t.conversation_key is not None:
+                threads[t.conversation_key] = (
+                    t.conversation_key, t.native_thread_id, t.root_thread_id,
+                    t.parent_thread_id)
+            entry = emission.accounting
+            if entry is None:
+                continue
+            yielded += 1
+            accounting.append((
+                int(emission.line_offset),
+                entry.timestamp.astimezone(dt.timezone.utc).isoformat(),
+                entry.session_id, entry.model, entry.input_tokens,
+                entry.cached_input_tokens, entry.output_tokens,
+                entry.reasoning_output_tokens, entry.total_tokens,
+                event.conversation_key if event is not None else None))
+    terminal = state.thread
+    # The conversations pass normalizes a file read from offset 0 with an
+    # empty sticky state (`bin/_cctally_cache.py:14522`); the same call here
+    # derives the projection the retained message rows must equal.
+    normalized = _lib_codex_conversation.normalize_codex_events(
+        physical, initial=_lib_codex_conversation.CodexStickyState(
+            turn_id=None, model=None))
+    resume = (
+        state.session_id, state.model,
+        state.total_tokens if yielded > 0 else None,
+        terminal.native_thread_id if terminal else None,
+        terminal.root_thread_id if terminal else None,
+        terminal.parent_thread_id if terminal else None,
+        terminal.conversation_key if terminal else None,
+        normalized.terminal.turn_id,
+    )
+    messages = [tuple(getattr(row, name) for name in _MESSAGE_PROJECTION)
+                for row in normalized.rows]
+    return _PrefixFacts(accounting, sorted(quotas), threads, events,
+                        sorted(messages), resume)
+
+
+def _retained_messages(conn, path: str) -> list:
+    cols = ", ".join(_MESSAGE_PROJECTION)
+    try:
+        return sorted(tuple(r) for r in conn.execute(
+            f"SELECT {cols} FROM codex_conversation_messages WHERE source_path=?",
+            (path,)))
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return []                  # a store that never materialized messages
+
+
+def _retained_thread_facts(conn, path: str, derived_keys) -> dict:
+    """Thread identity per conversation key (#968 review P1-2).
+
+    ``codex_conversation_threads`` holds ONE row per conversation key, and
+    the contributor ingested last overwrites it (`bin/_cctally_cache.py:
+    3769-3788`), so a row read by ``source_path`` misses every earlier
+    contributor of a multi-file conversation. The comparison is per key: each
+    key this file derives must have a retained row with the same identity,
+    whichever sibling's path that row names, and a row naming THIS file must
+    be for a key the file still derives.
+    """
+    keys = set(derived_keys) | {r[0] for r in conn.execute(
+        "SELECT conversation_key FROM codex_conversation_threads "
+        "WHERE source_path=?", (path,))}
+    out = {}
+    for key in sorted(keys):
+        row = conn.execute(
+            "SELECT conversation_key, native_thread_id, root_thread_id, "
+            "parent_thread_id FROM codex_conversation_threads "
+            "WHERE conversation_key=?", (key,)).fetchone()
+        out[key] = None if row is None else tuple(row)
+    return out
+
+
+def _retained_prefix_facts(conn, table: str, snap: _CursorSnapshot,
+                           derived: "_PrefixFacts") -> _PrefixFacts:
+    """The retained rows for one logical identity, in ``_codex_prefix_facts`` shapes."""
+    resume = (snap.last_session_id, snap.last_model, snap.last_total_tokens,
+              snap.last_native_thread_id, snap.last_root_thread_id,
+              snap.last_parent_thread_id, snap.last_conversation_key,
+              snap.last_turn_id)
+    if table == "codex_conversation_source_files":
+        events = [tuple(r) for r in conn.execute(
+            "SELECT line_offset, conversation_key, record_type, event_type, "
+            "payload_json FROM codex_conversation_events WHERE source_path=? "
+            "ORDER BY line_offset", (snap.path,))]
+        return _PrefixFacts(None, None, None, events,
+                            _retained_messages(conn, snap.path), resume)
+    accounting = [tuple(r) for r in conn.execute(
+        "SELECT line_offset, timestamp_utc, session_id, model, input_tokens, "
+        "cached_input_tokens, output_tokens, reasoning_output_tokens, "
+        "total_tokens, conversation_key FROM codex_session_entries "
+        "WHERE source_path=? ORDER BY line_offset", (snap.path,))]
+    quotas = sorted(tuple(r) for r in conn.execute(
+        "SELECT line_offset, captured_at_utc, observed_slot, logical_limit_key, "
+        "limit_id, limit_name, window_minutes, used_percent, resets_at_utc, "
+        "plan_type, individual_limit_json, reached_type "
+        "FROM quota_window_snapshots WHERE source='codex' AND source_path=?",
+        (snap.path,)))
+    threads = _retained_thread_facts(conn, snap.path, derived.threads.keys())
+    events = [tuple(r) for r in conn.execute(
+        "SELECT line_offset, conversation_key, record_type, event_type, "
+        "payload_json FROM codex_conversation_events WHERE source_path=? "
+        "ORDER BY line_offset", (snap.path,))]
+    return _PrefixFacts(accounting, quotas, threads, events,
+                        _retained_messages(conn, snap.path), resume)
+
+
+def _prefix_facts_equal(table: str, derived: _PrefixFacts,
+                        retained: _PrefixFacts) -> bool:
+    # The compact cache preserves an unused legacy turn column; only the
+    # conversations cursor reads it to resume normalization. Its no-token
+    # initial watermark is 0, whereas accounting preserves NULL.
+    resume = derived.resume
+    if table == "codex_conversation_source_files" and not derived.accounting:
+        resume = resume[:2] + (0,) + resume[3:]
+    width = 8 if table == "codex_conversation_source_files" else 7
+    if resume[:width] != retained.resume[:width]:
+        return False                      # 5.5: resume state is part of equivalence
+    if table == "codex_conversation_source_files":
+        # The normalized projection too (review P3-4): equal raw events with a
+        # differing projection are not equivalent.
+        return (derived.events == retained.events
+                and derived.messages == retained.messages)
+    if derived.accounting != retained.accounting:
+        return False
+    if derived.quotas != retained.quotas or derived.threads != retained.threads:
+        return False
+    # Cache-side event and message rows are compared only where materialized.
+    if retained.events and derived.events != retained.events:
+        return False
+    return not retained.messages or derived.messages == retained.messages
+
+
+class ContainerVerdict(NamedTuple):
+    outcome: str
+    reason: "str | None"
+    fingerprint: "_rc.ContainerFingerprint | None"
+    decoded_length: "int | None"
+    anchor: "bytes | None"
+    anchor_offset: "int | None"
+
+    complete_line_end: "int | None" = None
+
+def _verify_codex_container(conn, table: str, snap: _CursorSnapshot,
+                            selected) -> ContainerVerdict:
+    """Prepare without writer locks; every read failure preserves history."""
+    try:
+        verdict = _prepare_codex_container_verdict(conn, table, snap, selected)
+        if (selected is not None and _rc.fingerprint_of(
+                selected.path, selected.kind) != selected.fingerprint):
+            return ContainerVerdict("pending", "unstable-stat", None, None,
+                                    None, None)
+        return verdict
+    except _rc.ContainerReadInterrupted:
+        return ContainerVerdict("pending", "interrupted", None, None, None, None)
+    except _rc.ContainerError as exc:
+        return ContainerVerdict("pending", exc.category, None, None, None, None)
+    except OSError:
+        return ContainerVerdict("pending", "read-error", None, None, None, None)
+
+
+def _prepare_codex_container_verdict(conn, table: str, snap: _CursorSnapshot,
+                                    selected) -> ContainerVerdict:
+    """Prepare-only verdict for one transition (#968 spec 5.5). No writes."""
+    if selected is None:
+        return ContainerVerdict("pending", "container-missing", None, None,
+                                None, None)
+    try:
+        validation = _rc.validate_full_stream(selected)
+    except _rc.ContainerReadInterrupted:
+        return ContainerVerdict("pending", "interrupted", None, None, None, None)
+    if not validation.ok:
+        return ContainerVerdict("pending", validation.error, None, None, None, None)
+    length = int(validation.decoded_length)
+    fp = selected.fingerprint
+    if length < snap.last_byte_offset:
+        return ContainerVerdict("reset", "shorter", fp, length, None, None)
+    if snap.anchor is not None and snap.anchor_offset is not None:
+        with _rc.open_decoded(selected) as fh:
+            chain, reached = _rc.anchor_over(
+                fh, start_offset=0, start_anchor=_rc.anchor_seed(),
+                end_offset=int(snap.anchor_offset))
+        if reached != snap.anchor_offset or chain != snap.anchor:
+            return ContainerVerdict("reset", "prefix-mismatch", fp, length,
+                                    None, None)
+        unchanged = (length == snap.size_bytes and int(snap.ingest_complete) == 1)
+        return ContainerVerdict("adopt" if unchanged else "adopt-ingest", None,
+                                fp, length, snap.anchor, snap.anchor_offset,
+                                validation.complete_line_end)
+    # Legacy row: derived-content equivalence over [0, last_byte_offset).
+    derived = _codex_prefix_facts(selected, path_str=snap.path,
+                                  root_key=snap.root_key,
+                                  end_offset=int(snap.last_byte_offset))
+    retained = _retained_prefix_facts(conn, table, snap, derived)
+    if not _prefix_facts_equal(table, derived, retained):
+        return ContainerVerdict("unverified", "legacy-inequivalent", fp, length,
+                                None, None)
+    with _rc.open_decoded(selected) as fh:
+        chain, reached = _rc.anchor_over(
+            fh, start_offset=0, start_anchor=_rc.anchor_seed(),
+            end_offset=int(snap.last_byte_offset))
+    if reached != snap.last_byte_offset:
+        return ContainerVerdict("unverified", "legacy-boundary", fp, length,
+                                None, None)
+    unchanged = (length == snap.size_bytes and int(snap.ingest_complete) == 1)
+    return ContainerVerdict("adopt" if unchanged else "adopt-ingest", None, fp,
+                            length, chain, reached, validation.complete_line_end)
+
+
+#: Private test seam: called before an adoption commit with (table, path).
+_CODEX_VERIFY_PRECOMMIT_HOOK: "Callable[[str, str], None] | None" = None
+
+
+def _adopt_codex_container(conn, table: str, snap: _CursorSnapshot,
+                           verdict: ContainerVerdict) -> bool:
+    """Adopt a verified container: container columns only (I4).
+
+    Nothing else changes — no row is deleted or inserted, no incarnation,
+    ledger, physical-mutation sequence or ``last_ingested_at``. The WHERE
+    clause revalidates the cursor generation being adopted; the caller has
+    already revalidated the container fingerprint.
+    """
+    if _load_cursor_snapshot(conn, table, snap.path) != snap:
+        return False
+    fp = verdict.fingerprint
+    is_zstd = fp.kind == _rc.ZSTD
+    strikes = (", container_resume_strikes=0"
+               if table == "codex_session_files" else "")
+    # A verified prefix can lose only the never-consumed torn suffix. Until
+    # the executor reconciles the old scan target, keep that read debt pending:
+    # an ordinary caller must not interpret the smaller decoded target as a
+    # replacement in the gap between adoption and its second admission. Only
+    # container columns change here; the cursor/seeds stay wholly untouched.
+    reconcile_target = verdict.decoded_length < snap.size_bytes
+    state = "pending" if reconcile_target else "accepted"
+    reason = "verified-prefix" if reconcile_target else None
+    pending = fp.to_json() if reconcile_target else None
+    cur = conn.execute(
+        f"UPDATE {table} SET container_kind=?, container_path=?, "
+        "container_size_bytes=?, decoded_size_bytes=?, mtime_ns=?, device_id=?, "
+        "inode=?, content_anchor_version=?, content_anchor=?, "
+        "content_anchor_offset=?, container_state=?, "
+        "container_state_reason=?, pending_container_fingerprint=?"
+        f"{strikes} WHERE path=? AND last_byte_offset=? AND size_bytes=? "
+        "AND last_total_tokens IS ? AND source_root_key IS ? "
+        "AND container_state='pending'",
+        (fp.kind, fp.path if is_zstd else None, fp.size if is_zstd else None,
+         verdict.decoded_length if is_zstd else None, fp.mtime_ns, fp.device,
+         fp.inode, _rc.ANCHOR_VERSION, verdict.anchor, verdict.anchor_offset,
+         state, reason, pending, snap.path, snap.last_byte_offset, snap.size_bytes,
+         snap.last_total_tokens, snap.root_key))
+    return cur.rowcount == 1
+
+
+CODEX_VERIFY_DRAIN_LOCK_NAME = "codex-verify-drain.lock"
+
+
+class VerificationDrainResult(NamedTuple):
+    outcome: str
+    adopted: int
+    ingested: int
+    reset: int
+    unverified: int
+    pending: int
+    yielded: int
+    retried: int
+
+
+def _conversation_store_locks():
+    maintenance = _conversation_drain_maintenance_lock()
+    if maintenance is None:
+        return None
+    _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
+    fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        maintenance.close()
+        return None
+    return maintenance, fh
+
+
+def _release_conversation_store_locks(token) -> None:
+    for fh in reversed(token):
+        fh.close()
+
+
+def _conversation_drain_maintenance_lock():
+    """Nonblocking maintenance -> provider order, including recovery refusal.
+
+    The full opener runs before admission (it can perform recovery). Hold a
+    shared maintenance lease from admission through commit so recovery cannot
+    replace the family in the gap between that open and the provider lock.
+    """
+    path = pathlib.Path(_cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        db = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+        if (_conversation_recovery_state_path().exists()
+                or _cctally_db_sib._repair_marker_path(db).exists()
+                or _cctally_db_sib._quarantine_pending_path(db).exists()):
+            fh.close()
+            return None
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+def run_codex_container_verification_drain(
+        *, wait_for_requests: bool = True,
+        max_identities: "int | None" = None) -> VerificationDrainResult:
+    """Drain container-verification debt in both stores (#968 spec 5.5).
+
+    Shared by the detached ``_codex-replay-drain`` worker and explicit
+    ``cache-sync --source codex``. Never sets ``CODEX_REPLAY_FROM_ZERO_KEY``.
+    Per identity: prepare without locks; admit through the global gate; take
+    the store's lock domain without blocking; revalidate the container
+    fingerprint and the cursor generation; adopt, or hand ingest/reset to a
+    per-identity targeted sync that takes the same admission.
+    """
+    import _lib_codex_drain_admission as adm
+    worker = _worker_lock(CODEX_VERIFY_DRAIN_LOCK_NAME)
+    if worker is None:
+        return VerificationDrainResult("busy", 0, 0, 0, 0, 0, 0, 0)
+    counts = dict(adopted=0, ingested=0, reset=0, unverified=0, pending=0,
+                  yielded=0, retried=0)
+    # Distinct identities processed (review P3-6): a retry of the same
+    # identity after a refused admission is counted in `retried`, never here,
+    # so `max_identities` bounds identities, not attempts.
+    processed: "set[tuple[str, str]]" = set()
+    prune_discovery = _CodexPruneDiscoveryCache()
+    try:
+        for table in _VERIFY_TABLES:
+            after = ""
+            retry_path = None
+            while True:
+                opener = (open_cache_db if table == "codex_session_files"
+                          else open_conversations_db)
+                conn = opener()
+                try:
+                    row = ((retry_path,) if retry_path is not None else conn.execute(
+                        f"SELECT path FROM {table} WHERE container_state='pending' "
+                        "AND path > ? ORDER BY path LIMIT 1", (after,)).fetchone())
+                    if row is None:
+                        break
+                    path = row[0]
+                    if (max_identities is not None
+                            and (table, path) not in processed
+                            and len(processed) >= max_identities):
+                        break
+                    after = path
+                    snap = _load_cursor_snapshot(conn, table, path)
+                    if snap is None:
+                        retry_path = None
+                        continue
+                    selected = _rc.select_container(path)
+                    qualified = _qualify_codex_targets({path})
+                    if (not qualified
+                            or qualified[0].source_root_key != snap.root_key):
+                        verdict = ContainerVerdict(
+                            "pending", "read-error", None, None, None, None)
+                    else:
+                        verdict = _verify_codex_container(conn, table, snap, selected)
+                finally:
+                    conn.close()
+                if (table, path) in processed:
+                    counts["retried"] += 1
+                processed.add((table, path))
+                outcome = _apply_codex_verdict(
+                    table, path, snap, verdict, adm, counts,
+                    wait_for_requests=wait_for_requests,
+                    prune_discovery=prune_discovery)
+                if outcome == "yield-stop":
+                    return VerificationDrainResult("yielded", **counts)
+                retry_path = path if outcome == "retry" else None
+        outcome = "yielded" if counts["yielded"] else "drained"
+        return VerificationDrainResult(outcome, **counts)
+    finally:
+        _release_worker_lock(worker)
+
+
+def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
+                         wait_for_requests: bool, prune_discovery=None) -> str:
+    """Admit and apply one verdict; returns "done", "retry" or "yield-stop"."""
+    cache_side = table == "codex_session_files"
+    if verdict.outcome == "pending":
+        counts["pending"] += 1
+        hold = {"decoder-unavailable": "decoder-unavailable",
+                "decode-error": "decode-error",
+                "read-error": "decode-error"}.get(verdict.reason)
+        if cache_side and hold is not None and snap is not None:
+            # 5.11 U6: an undecodable candidate is suspended, not pending
+            # forever. Recorded when admission allows; never waited for.
+            selected = _rc.select_container(pathlib.Path(path))
+            if selected is not None:
+                _codex_admitted_cache_write(
+                    lambda conn: _codex_barrier_apply_holds(
+                        conn, [(path, snap.root_key, hold, selected.fingerprint)]),
+                    wait_for_requests=False)
+        return "done"
+    resets = frozenset({path}) if verdict.outcome == "reset" else frozenset()
+    take = _cache_store_locks if cache_side else _conversation_store_locks
+    give = (_release_cache_store_locks if cache_side
+            else _release_conversation_store_locks)
+    opener = open_cache_db if cache_side else open_conversations_db
+    if verdict.outcome in ("adopt", "adopt-ingest", "unverified"):
+        # Open BEFORE admission takes the store's lock domain (review S-P2b).
+        # `_conversations_open_guarded` may take the maintenance lock
+        # exclusively and then block on BOTH conversation provider locks
+        # (`bin/_cctally_cache.py:11412-11426`); opened after admission, that
+        # self-deadlocks on the Codex provider lock admission already holds and
+        # inverts the maintenance -> provider order. This is the HEAD writer's
+        # order: callers open the store, `sync_codex_conversations` then takes
+        # its provider lock (`bin/_cctally_cache.py:14113-14119`).
+        conn = opener()
+        try:
+            admission = adm.admit(_cctally_core.APP_DIR, take, give)
+            if not admission.admitted:
+                counts["yielded"] += 1
+                if not wait_for_requests:
+                    return "yield-stop"
+                _drain_backoff(adm)
+                return "retry"
+            try:
+                again = _rc.select_container(path)
+                qualified = _qualify_codex_targets({path})
+                if (again is None or again.fingerprint != verdict.fingerprint
+                        or _load_cursor_snapshot(conn, table, path) != snap
+                        or not qualified
+                        or qualified[0].source_root_key != snap.root_key):
+                    counts["pending"] += 1   # changed under us: verify again later
+                    return "done"
+                if verdict.outcome == "unverified":
+                    conn.execute(
+                        f"UPDATE {table} SET container_state='unverified', "
+                        "container_state_reason=?, pending_container_fingerprint=? "
+                        "WHERE path=? AND container_state='pending'",
+                        (verdict.reason, verdict.fingerprint.to_json(), path))
+                    counts["unverified"] += 1
+                    if cache_side:
+                        _codex_barrier_apply_holds(conn, [(path, snap.root_key,
+                            "verification-unverified", verdict.fingerprint)])
+                elif snap.state != "accepted":
+                    if not _adopt_codex_container(conn, table, snap, verdict):
+                        counts["pending"] += 1
+                        conn.rollback()
+                        return "done"
+                    counts["adopted"] += 1
+                    if cache_side:
+                        _codex_barrier_adopt(
+                            conn, path=path, root_key=snap.root_key,
+                            fingerprint=verdict.fingerprint,
+                            decoded_length=verdict.decoded_length,
+                            accepted_end=int(snap.last_byte_offset),
+                            complete=verdict.outcome == "adopt")
+                if _CODEX_VERIFY_PRECOMMIT_HOOK is not None:
+                    _CODEX_VERIFY_PRECOMMIT_HOOK(table, path)
+                conn.commit()
+                # The tail admission revalidates the newly adopted cursor,
+                # rather than the pending generation used for preparation.
+                snap = _load_cursor_snapshot(conn, table, path)
+            except BaseException:
+                conn.rollback()
+                raise
+            finally:
+                adm.finish(admission, give)
+        finally:
+            conn.close()
+        if verdict.outcome != "adopt-ingest":
+            return "done"
+    # adopt-ingest (after adoption) and reset: one per-identity targeted sync,
+    # admitted through the gate; the sync takes its own locks without blocking
+    # and rechecks for requests right after them (check 3).
+    prune_discovery = ((prune_discovery or _CodexPruneDiscoveryCache())
+                       if resets else None)
+    if prune_discovery is not None:
+        _roots, scope = prune_discovery.prepare()
+        if scope.refusal_reason(path, snap.root_key) is not None:
+            counts["pending"] += 1
+            return "done"
+    # If validation found no unread complete line, target reconciliation is
+    # metadata-only, even when part of the old torn suffix remains. The normal
+    # writer would advance the sequence and timestamps with no new facts (I4).
+    reconcile_only = (verdict.outcome == "adopt-ingest"
+                      and verdict.complete_line_end == snap.last_byte_offset
+                      and verdict.decoded_length < snap.size_bytes)
+    conn = opener()                       # before admission (S-P2b)
+    try:
+        # The sync takes its own provider locks. For conversations, retain
+        # the maintenance lease BEFORE that acquisition, in the same order
+        # as recovery; the post-lock callback completes admission check 3.
+        take_sync = ((lambda: "sync-owns-locks") if cache_side else
+                     _conversation_drain_maintenance_lock)
+        give_sync = ((lambda token: None) if cache_side else
+                     (lambda token: token.close()))
+        if reconcile_only:
+            take_sync, give_sync = take, give
+        admission = adm.admit(_cctally_core.APP_DIR, take_sync, give_sync)
+        if not admission.admitted:
+            counts["yielded"] += 1
+            if not wait_for_requests:
+                return "yield-stop"
+            _drain_backoff(adm)
+            return "retry"
+        try:
+            stale = [False]
+
+            def recheck():
+                if adm.fresh_requests(_cctally_core.APP_DIR):
+                    return True
+                again = _rc.select_container(path)
+                qualified = _qualify_codex_targets({path})
+                stale[0] = (
+                    again is None or again.fingerprint != verdict.fingerprint
+                    or _load_cursor_snapshot(conn, table, path) != snap
+                    or not qualified or qualified[0].source_root_key != snap.root_key)
+                if not stale[0] and prune_discovery is not None:
+                    _roots, scope = prune_discovery.prepare()
+                    stale[0] = scope.refusal_reason(path, snap.root_key) is not None
+                return stale[0]
+            if reconcile_only:
+                stats = CodexIngestStats()
+                if recheck():
+                    stats.lock_contended = True
+                else:
+                    # Full validation scanned the new target to frame EOF;
+                    # its complete-line frontier is already committed. A torn
+                    # suffix is not an unread budget continuation. Keep the
+                    # target at decoded EOF and the cursor at the last newline.
+                    complete = ", ingest_complete=1" if cache_side else ""
+                    conn.execute(
+                        f"UPDATE {table} SET size_bytes=?, "
+                        "container_state='accepted', container_state_reason=NULL, "
+                        f"pending_container_fingerprint=NULL{complete} WHERE path=?",
+                        (verdict.decoded_length, path))
+                    conn.commit()
+                    counts["ingested"] += 1
+                    return "done"
+            elif cache_side:
+                stats = sync_codex_cache(
+                    conn, maintenance="caller", lock_timeout=0,
+                    only_paths={path}, executor_paths=frozenset({path}),
+                    executor_resets=resets,
+                    executor_verified_prefixes=(frozenset({path})
+                        if verdict.outcome == "adopt-ingest" else frozenset()),
+                    _after_locks=recheck)
+            else:
+                stats = sync_codex_conversations(
+                    conn, maintenance="caller", lock_timeout=0, only_paths={path},
+                    executor_paths=frozenset({path}), executor_resets=resets,
+                    _after_locks=recheck)
+        finally:
+            adm.finish(admission, give_sync)
+    finally:
+        conn.close()
+    if getattr(stats, "lock_contended", False):
+        if stale[0]:
+            counts["pending"] += 1
+            return "done"
+        counts["yielded"] += 1
+        if not wait_for_requests:
+            return "yield-stop"
+        _drain_backoff(adm)
+        return "retry"
+    if not stats.targeted_clean or stats.files_processed == 0:
+        counts["pending"] += 1
+        return "done"
+    counts["reset" if resets else "ingested"] += 1
+    return "done"
+
+
+# ── #968 spec 5.11: the conversation publication barrier (cache side) ─────────
+CODEX_BARRIER_CENSUS_KEY = "codex_barrier_census"
+CODEX_BARRIER_TARGETS_INIT_KEY = "codex_barrier_targets_initialized"
+CODEX_BARRIER_INLINE_SEAL_MAX_KEYS = 32
+CODEX_BARRIER_DRAIN_SEAL_CHUNK = 200
+CODEX_BARRIER_SEAL_RESERVE_SECONDS = 0.5
+CODEX_BARRIER_SCAN_LOCK_NAME = "codex-barrier-scan.lock"
+_CODEX_BARRIER_CHUNK = 400
+#: The fourteen `codex_conversation_threads` columns, in table order: the
+#: byte-preserving thread snapshots are INSERT ... SELECT over this list.
+_CODEX_THREAD_SNAPSHOT_COLUMNS = (
+    "conversation_key, source_root_key, native_thread_id, root_thread_id, "
+    "parent_thread_id, source_path, cwd, git_json, source_kind, "
+    "thread_source_json, model_provider, context_window, first_seen_utc, "
+    "last_seen_utc")
+_CODEX_BARRIER_CURSOR_SQL = (
+    "SELECT container_kind, inode, container_size_bytes, mtime_ns, "
+    "decoded_size_bytes, last_byte_offset, ingest_complete, size_bytes, "
+    "container_state, device_id FROM codex_session_files WHERE path=?")
+
+
+class CodexBarrierRead(NamedTuple):
+    """One file read's barrier facts, applied inside its file batch."""
+    identity: str
+    source_path: str
+    source_root_key: "str | None"
+    kind: str
+    generation: str
+    scan_target: int
+    start_offset: int
+    final_offset: int
+    reached_target: bool
+    #: conversation key -> (metadata JSON, metadata offset) of its latest
+    #: `session_meta` in the bytes read; (None, None) when the key was met
+    #: only through events (resumed state).
+    keys: "dict[str, tuple[str | None, int | None]]"
+    #: The walk's set of population keys it admitted or re-armed (a priority
+    #: hint for the inline sealer).
+    touched: "set[str]"
+
+
+def _codex_barrier_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def _codex_barrier_revision_floor() -> int:
+    """Revisions are floored at the wall clock (ms), so a deleted and rebuilt
+    cache.db still issues revisions newer than every published one."""
+    return int(time.time() * 1000)
+
+
+def _codex_barrier_chunks(items):
+    items = sorted(items)
+    for start in range(0, len(items), _CODEX_BARRIER_CHUNK):
+        yield items[start:start + _CODEX_BARRIER_CHUNK]
+
+
+def _codex_barrier_collect(keys: dict, emission) -> None:
+    """Record every key the parser met in one physical record (5.11)."""
+    event = emission.event
+    if event is not None and event.conversation_key:
+        keys.setdefault(event.conversation_key, (None, None))
+    thread = emission.thread
+    if (thread is not None and thread.conversation_key is not None
+            and thread.native_thread_id is not None
+            and thread.root_thread_id is not None):
+        # The same condition the walk applies before writing a thread row.
+        keys[thread.conversation_key] = (
+            _barrier.metadata_from_thread(thread), int(emission.line_offset))
+
+
+def _codex_barrier_population_subset(conn, keys) -> "set[str]":
+    found: set[str] = set()
+    for chunk in _codex_barrier_chunks({k for k in keys if k}):
+        marks = ",".join("?" * len(chunk))
+        found.update(r[0] for r in conn.execute(
+            "SELECT conversation_key FROM codex_barrier_population "
+            f"WHERE conversation_key IN ({marks})", chunk))
+    return found
+
+
+def _codex_barrier_identity_keys(conn, identity: str) -> "set[str]":
+    return {r[0] for r in conn.execute(
+        "SELECT conversation_key FROM codex_barrier_membership "
+        "WHERE file_identity=?", (identity,))}
+
+
+def _codex_barrier_retained_keys(conn, path: str) -> "set[str]":
+    """Keys a file is known to have fed from its retained rows (positive only)."""
+    keys = {r[0] for r in conn.execute(
+        "SELECT conversation_key FROM codex_session_entries WHERE source_path=?",
+        (path,)) if r[0]}
+    keys |= {r[0] for r in conn.execute(
+        "SELECT conversation_key FROM codex_conversation_threads "
+        "WHERE source_path=?", (path,)) if r[0]}
+    row = conn.execute("SELECT last_conversation_key FROM codex_session_files "
+                       "WHERE path=?", (path,)).fetchone()
+    if row is not None and row[0]:
+        keys.add(row[0])
+    return keys
+
+
+def _codex_cursor_generation(kind, inode, container_size, mtime_ns,
+                             decoded_size, device=None) -> str:
+    """The generation token of a stored cursor, through the leaf's one rule.
+
+    The stored device takes part for a compressed cursor only, exactly as the
+    leaf's token does (review P3-2).
+    """
+    fingerprint = _rc.ContainerFingerprint(
+        kind or _rc.PLAIN, "", container_size, mtime_ns,
+        None if device is None else int(device), inode)
+    return _rc.generation_token(
+        fingerprint, decoded_size if (kind or _rc.PLAIN) == _rc.ZSTD else None)
+
+
+def _codex_barrier_load_target(conn, identity: str) -> "_barrier.Target | None":
+    row = conn.execute(
+        "SELECT source_path, generation_token, complete_line_end, state, reason, "
+        "accepted_generation_token, accepted_complete_line_end "
+        "FROM codex_barrier_targets WHERE file_identity=?", (identity,)).fetchone()
+    if row is None:
+        return None
+    # A held target stores its HOLD as the reason (see the writer), whatever
+    # its state: a suspension is SUSPENDED with or without a watermark
+    # (review N2), and the pending hold is REQUIRED.
+    held = (row[4] in _barrier.SUSPENSION_HOLDS
+            or row[4] == _barrier.PENDING_HOLD)
+    return _barrier.Target(identity, row[0], row[1], row[2],
+                           row[4] if held else None, row[5], row[6])
+
+
+def _codex_barrier_write_target(conn, *, identity, path, root_key, generation,
+                                scan_target, complete_line_end, hold, wm_gen,
+                                wm_off) -> "_barrier.TargetVerdict":
+    verdict = _barrier.classify_target(_barrier.Target(
+        identity, path, generation, complete_line_end, hold, wm_gen, wm_off))
+    conn.execute(
+        "INSERT INTO codex_barrier_targets (file_identity, source_path, "
+        "source_root_key, generation_token, scan_target, complete_line_end, "
+        "state, reason, accepted_generation_token, accepted_complete_line_end) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file_identity) DO UPDATE SET "
+        "source_path=excluded.source_path, "
+        "source_root_key=excluded.source_root_key, "
+        "generation_token=excluded.generation_token, "
+        "scan_target=excluded.scan_target, "
+        "complete_line_end=excluded.complete_line_end, state=excluded.state, "
+        "reason=excluded.reason, "
+        "accepted_generation_token=excluded.accepted_generation_token, "
+        "accepted_complete_line_end=excluded.accepted_complete_line_end",
+        (identity, path, root_key, generation, int(scan_target or 0),
+         complete_line_end, verdict.state,
+         hold if hold is not None else verdict.reason, wm_gen, wm_off))
+    if wm_gen is not None:
+        # Membership is proven now: the retained-evidence sentinels written
+        # for a held contributor of unknown membership have served (N2).
+        conn.execute("DELETE FROM codex_barrier_membership WHERE "
+                     "file_identity=? AND generation_token=?",
+                     (identity, _barrier.RETAINED_GENERATION))
+    return verdict
+
+
+def _codex_barrier_upsert_members(conn, identity: str, generation: str,
+                                  path: str, keys: dict) -> None:
+    """Positive membership at one generation; the latest metadata wins."""
+    newer = ("excluded.metadata_offset IS NOT NULL AND "
+             "(codex_barrier_membership.metadata_offset IS NULL OR "
+             "excluded.metadata_offset >= codex_barrier_membership.metadata_offset)")
+    conn.executemany(
+        "INSERT INTO codex_barrier_membership (file_identity, generation_token, "
+        "conversation_key, source_path, metadata_json, metadata_offset) "
+        "VALUES (?,?,?,?,?,?) ON CONFLICT(file_identity, generation_token, "
+        "conversation_key) DO UPDATE SET source_path=excluded.source_path, "
+        f"metadata_json=CASE WHEN {newer} THEN excluded.metadata_json "
+        "ELSE codex_barrier_membership.metadata_json END, "
+        f"metadata_offset=CASE WHEN {newer} THEN excluded.metadata_offset "
+        "ELSE codex_barrier_membership.metadata_offset END",
+        [(identity, generation, key, path, meta, offset)
+         for key, (meta, offset) in sorted(keys.items())])
+
+
+def _codex_barrier_admit(conn, keys, *, reason: str) -> "set[str]":
+    """Admit conversations to the population (5.11 "Population and lifetime").
+
+    Called BEFORE the caller's reset delete and thread upsert in the same
+    transaction, so the entry snapshot is the thread row as it stood before
+    this change: the thread Task 11 registers for a legacy publication.
+    """
+    admitted: set[str] = set()
+    now, revision = _codex_barrier_now(), _codex_barrier_revision_floor()
+    for key in sorted(k for k in keys if k):
+        if conn.execute(
+                "INSERT OR IGNORE INTO codex_barrier_population "
+                "(conversation_key, required_revision, entered_at_utc) "
+                "VALUES (?,?,?)", (key, revision, now)).rowcount != 1:
+            continue
+        admitted.add(key)
+        conn.execute(
+            f"INSERT OR IGNORE INTO codex_barrier_entry_threads "
+            f"({_CODEX_THREAD_SNAPSHOT_COLUMNS}) SELECT "
+            f"{_CODEX_THREAD_SNAPSHOT_COLUMNS} FROM codex_conversation_threads "
+            "WHERE conversation_key=?", (key,))
+        conn.execute(
+            "INSERT INTO codex_barrier_repairs (conversation_key, revision, "
+            "reason) VALUES (?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET "
+            "revision=MAX(revision, excluded.revision), reason=excluded.reason",
+            (key, revision, f"entry:{reason}"))
+    return admitted
+
+
+def _codex_barrier_enqueue_repair(conn, keys, *, reason: str) -> "set[str]":
+    """Queue certification of population keys at their current revision."""
+    queued = _codex_barrier_population_subset(conn, keys)
+    for key in sorted(queued):
+        conn.execute(
+            "INSERT INTO codex_barrier_repairs (conversation_key, revision, "
+            "reason) SELECT conversation_key, required_revision, ? "
+            "FROM codex_barrier_population WHERE conversation_key=? "
+            "ON CONFLICT(conversation_key) DO UPDATE SET "
+            "revision=excluded.revision, reason=excluded.reason",
+            (reason, key))
+    return queued
+
+
+def _codex_barrier_rearm(conn, keys, *, reason: str) -> "set[str]":
+    """A new required revision for every population key in ``keys`` (5.11
+    "Re-arming"). Never touches a certificate or a publication: a newer
+    requirement never withdraws what was published."""
+    armed = _codex_barrier_population_subset(conn, keys)
+    floor = _codex_barrier_revision_floor()
+    for key in sorted(armed):
+        conn.execute(
+            "UPDATE codex_barrier_population SET required_revision = "
+            "MAX(required_revision + 1, ?) WHERE conversation_key=?",
+            (floor, key))
+    _codex_barrier_enqueue_repair(conn, armed, reason=reason)
+    return armed
+
+
+def _codex_barrier_apply_read(conn, read: CodexBarrierRead) -> None:
+    """Membership, readiness target and population effects of one file read.
+
+    Runs at the top of ``_write_codex_file_batch`` (before its reset delete
+    and its thread upsert), inside the file's transaction or savepoint, so it
+    commits or rolls back with the rows it describes.
+    """
+    prior = _codex_barrier_load_target(conn, read.identity)
+    wm_gen = prior.watermark_generation if prior else None
+    wm_off = prior.watermark_offset if prior else None
+    old_generation = prior.generation if prior else None
+    dropped: set[str] = set()
+    if read.start_offset == 0:
+        # A read from zero re-derives this generation's membership: an
+        # in-place rewrite keeps a plain file's generation, so the old rows of
+        # THIS generation go (older generations' rows are never erased).
+        dropped = {r[0] for r in conn.execute(
+            "SELECT conversation_key FROM codex_barrier_membership "
+            "WHERE file_identity=? AND generation_token=?",
+            (read.identity, read.generation))}
+        conn.execute("DELETE FROM codex_barrier_membership WHERE "
+                     "file_identity=? AND generation_token=?",
+                     (read.identity, read.generation))
+        wm_gen, wm_off = read.generation, read.final_offset
+    elif wm_gen == read.generation and wm_off == read.start_offset:
+        wm_off = read.final_offset
+    # Otherwise the read is not contiguous with proven membership (a legacy
+    # prefix): its keys are positive evidence and the watermark stays.
+    _codex_barrier_upsert_members(conn, read.identity, read.generation,
+                                  read.source_path, read.keys)
+    _codex_barrier_write_target(
+        conn, identity=read.identity, path=read.source_path,
+        root_key=read.source_root_key, generation=read.generation,
+        scan_target=read.scan_target,
+        complete_line_end=read.final_offset if read.reached_target else None,
+        hold=None, wm_gen=wm_gen, wm_off=wm_off)
+    generation_changed = (old_generation is not None
+                          and old_generation != read.generation)
+    affected = set(read.keys) | dropped
+    if generation_changed or (prior is not None and prior.hold is not None):
+        # A new generation, or recovery from a hold: every key this
+        # contributor was ever known to feed gets a new revision.
+        affected |= _codex_barrier_identity_keys(conn, read.identity)
+    admitted: set[str] = set()
+    if read.kind == _rc.ZSTD:
+        admitted = _codex_barrier_admit(conn, read.keys, reason="compressed-read")
+    read.touched.update(admitted)
+    read.touched.update(_codex_barrier_rearm(
+        conn, affected - admitted,
+        reason="transition" if generation_changed else "append"))
+
+
+def _codex_walk_hold(selected, reason: "str | None") -> str:
+    """The barrier hold a walk records for a container it may not read now."""
+    if reason == "verification-unverified":
+        return reason
+    if selected is not None and selected.kind == _rc.ZSTD and (
+            _rc.decoder_capability() == "unavailable"):
+        return "decoder-unavailable"
+    if reason in (None, "verification-pending", "container-transition",
+                  "resume-budget"):
+        return _barrier.PENDING_HOLD
+    return reason                       # decoder-unavailable, decode-error
+
+
+def _codex_barrier_apply_holds(conn, holds) -> "set[str]":
+    """Record pending and suspended contributors (5.11 "Unresolved
+    generations"). A hold never deletes membership or retained rows.
+
+    Entering a hold admits the keys the file is known to have fed (membership,
+    else its retained rows) — container-transition handling is the
+    population's second entry point. A pending hold re-arms them (the
+    candidate is a dependency of the next revision); a suspension only queues
+    them, because an unreadable contributor never changes a publication on its
+    own: it becomes an exclusion whose retained accepted facts keep supplying
+    what they supplied (U6; review N2), and the readable contributors keep
+    advancing the key. A walk's PENDING view never overrides the verification
+    executor's decode-error or unverified verdict on the same container.
+    """
+    touched: set[str] = set()
+    for path, root_key, hold, fingerprint in holds:
+        if root_key is None:
+            row = conn.execute("SELECT source_root_key FROM codex_session_files "
+                               "WHERE path=?", (path,)).fetchone()
+            root_key = row[0] if row is not None else None
+        identity = codex_file_key_for_entry_path(root_key or "", path)
+        prior = _codex_barrier_load_target(conn, identity)
+        if fingerprint is not None:
+            generation = _rc.generation_token(fingerprint, None)
+        else:
+            generation = prior.generation if prior is not None else "unknown"
+        if prior is not None and prior.generation == generation:
+            if prior.hold == hold:
+                continue                    # already recorded: a quiet tick writes nothing
+            if hold == _barrier.PENDING_HOLD and prior.hold in (
+                    "decode-error", "verification-unverified"):
+                continue
+        keys = (_codex_barrier_identity_keys(conn, identity)
+                | _codex_barrier_retained_keys(conn, path))
+        admitted = _codex_barrier_admit(conn, keys, reason=hold)
+        wm_gen = prior.watermark_generation if prior is not None else None
+        wm_off = prior.watermark_offset if prior is not None else None
+        _codex_barrier_write_target(
+            conn, identity=identity, path=path, root_key=root_key,
+            generation=generation, scan_target=0, complete_line_end=None,
+            hold=hold, wm_gen=wm_gen, wm_off=wm_off)
+        if wm_gen is None and keys:
+            # Review N2: this contributor's accepted membership was never
+            # proven. Record the keys its retained rows prove it feeds, at the
+            # sentinel generation, so each of those keys' seals sees it as an
+            # exclusion. Where the key's retained thread row (latest
+            # certificate, else entry snapshot, else accounting row) names
+            # this file, the row carries that thread as the contributor's
+            # retained accepted metadata, so the seal keeps it rather than
+            # retracting it. A key this contributor cannot be shown to feed
+            # gets no row and is never blocked by it; the contributor is
+            # counted in the status record's unknown-membership buckets.
+            rows = []
+            for key in sorted(keys):
+                retained = _codex_barrier_retained_thread(conn, key)
+                meta = (_barrier.metadata_from_row(retained)
+                        if retained is not None
+                        and retained.get("source_path") == path else None)
+                rows.append((identity, _barrier.RETAINED_GENERATION, key, path,
+                             meta, 0 if meta is not None else None))
+            conn.executemany(
+                "INSERT OR REPLACE INTO codex_barrier_membership (file_identity, "
+                "generation_token, conversation_key, source_path, "
+                "metadata_json, metadata_offset) VALUES (?,?,?,?,?,?)", rows)
+        touched |= admitted
+        if hold == _barrier.PENDING_HOLD:
+            touched |= _codex_barrier_rearm(conn, keys - admitted,
+                                            reason="transition")
+        else:
+            touched |= _codex_barrier_enqueue_repair(conn, keys - admitted,
+                                                     reason=hold)
+    return touched
+
+
+def _codex_barrier_adopt(conn, *, path, root_key, fingerprint, decoded_length,
+                         accepted_end: int, complete: bool) -> None:
+    """A verified, content-equivalent transition (5.5 adopt / adopt-ingest).
+
+    The accepted prefix is proven identical, so its parser-proven membership
+    is the new generation's membership for that prefix: copy it rather than
+    re-scan, move the watermark, and re-arm (a new revision whose
+    certification is content-equal, which Task 11 records without a derived
+    write).
+    """
+    identity = codex_file_key_for_entry_path(root_key or "", path)
+    prior = _codex_barrier_load_target(conn, identity)
+    generation = _rc.generation_token(fingerprint, decoded_length)
+    wm_gen = wm_off = None
+    if (prior is not None and prior.watermark_generation is not None
+            and prior.watermark_offset is not None):
+        conn.execute(
+            "INSERT OR IGNORE INTO codex_barrier_membership (file_identity, "
+            "generation_token, conversation_key, source_path, metadata_json, "
+            "metadata_offset) SELECT file_identity, ?, conversation_key, "
+            "source_path, metadata_json, metadata_offset "
+            "FROM codex_barrier_membership WHERE file_identity=? "
+            "AND generation_token=?",
+            (generation, identity, prior.watermark_generation))
+        wm_gen, wm_off = generation, min(int(prior.watermark_offset),
+                                         int(accepted_end))
+    keys = (_codex_barrier_identity_keys(conn, identity)
+            | _codex_barrier_retained_keys(conn, path))
+    admitted = _codex_barrier_admit(conn, keys, reason="transition")
+    _codex_barrier_write_target(
+        conn, identity=identity, path=path, root_key=root_key,
+        generation=generation, scan_target=int(decoded_length or 0),
+        complete_line_end=int(accepted_end) if complete else None, hold=None,
+        wm_gen=wm_gen, wm_off=wm_off)
+    _codex_barrier_rearm(conn, keys - admitted, reason="transition")
+
+
+def _codex_barrier_forget_identity(conn, identity: str) -> "set[str]":
+    """The prune executor removed a contributor: its membership and target go,
+    and every population key it fed gets a new revision."""
+    keys = _codex_barrier_identity_keys(conn, identity)
+    conn.execute("DELETE FROM codex_barrier_membership WHERE file_identity=?",
+                 (identity,))
+    conn.execute("DELETE FROM codex_barrier_targets WHERE file_identity=?",
+                 (identity,))
+    return _codex_barrier_rearm(conn, keys, reason="contributor-removed")
+
+
+def _codex_barrier_init_targets(conn) -> int:
+    """One-time targets for identities accounted before #968 (marker-gated).
+
+    Their accepted prefixes were parsed by a binary that recorded no
+    membership, so each starts `membership-unproven`, and nothing seals until
+    the off-hook membership scan proves them: retained evidence never proves
+    that a file has no further memberships (5.11).
+    """
+    if conn.execute("SELECT 1 FROM cache_meta WHERE key=?",
+                    (CODEX_BARRIER_TARGETS_INIT_KEY,)).fetchone():
+        return 0
+    created = 0
+    rows = conn.execute(
+        "SELECT path, source_root_key, container_kind, inode, "
+        "container_size_bytes, mtime_ns, decoded_size_bytes, last_byte_offset, "
+        "size_bytes, device_id FROM codex_session_files").fetchall()
+    for (path, root_key, kind, inode, csize, mtime_ns, dsize, offset,
+         size, device) in rows:
+        identity = codex_file_key_for_entry_path(root_key or "", path)
+        if _codex_barrier_load_target(conn, identity) is not None:
+            continue                     # a #968 walk already wrote it
+        generation = _codex_cursor_generation(kind, inode, csize, mtime_ns,
+                                              dsize, device)
+        empty = int(offset or 0) == 0
+        _codex_barrier_write_target(
+            conn, identity=identity, path=path, root_key=root_key,
+            generation=generation, scan_target=int(size or 0),
+            complete_line_end=0 if empty else None, hold=None,
+            wm_gen=generation if empty else None, wm_off=0 if empty else None)
+        created += 1
+    _set_cache_meta(conn, CODEX_BARRIER_TARGETS_INIT_KEY, _codex_barrier_now())
+    return created
+
+
+def _codex_barrier_census_proven(conn) -> bool:
+    """Every readable candidate has a parser-proven membership census.
+
+    A pending generation can introduce keys absent from its accepted prefix.
+    That old watermark proves positive membership only, so it cannot complete
+    the current census. U6 suspensions remain legitimate exclusions.
+    """
+    if conn.execute("SELECT 1 FROM cache_meta WHERE key=?",
+                    (CODEX_BARRIER_TARGETS_INIT_KEY,)).fetchone() is None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM codex_barrier_targets WHERE reason='membership-unproven' "
+        "OR reason=? LIMIT 1",
+        (_barrier.PENDING_HOLD,)).fetchone() is None
+
+
+def _codex_barrier_census_flag(conn) -> bool:
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       (CODEX_BARRIER_CENSUS_KEY,)).fetchone()
+    return row is not None and row[0] == "1"
+
+
+class BarrierSealResult(NamedTuple):
+    sealed: int
+    blocked: int
+    remaining: int
+    census: str
+    scan_needed: bool
+    last_key: str
+
+
+def _codex_barrier_retained_thread(conn, key: str) -> "dict | None":
+    """The thread a seal must not lose or needlessly change (P1-1, P2-2).
+
+    The latest certificate's thread when the key was certified before; else
+    the entry snapshot taken when it entered the population (the legacy
+    publication's thread); else the current accounting row.
+    """
+    row = conn.execute(
+        "SELECT certificate_json FROM codex_barrier_certificates "
+        "WHERE conversation_key=? ORDER BY revision DESC LIMIT 1",
+        (key,)).fetchone()
+    cert = _barrier.parse_certificate(row[0]) if row is not None else None
+    if cert is not None and cert.get("thread"):
+        return {name: cert["thread"].get(name) for name in _barrier.THREAD_FIELDS}
+    columns = ", ".join(_barrier.THREAD_FIELDS)
+    for table in ("codex_barrier_entry_threads", "codex_conversation_threads"):
+        found = conn.execute(f"SELECT {columns} FROM {table} "
+                             "WHERE conversation_key=?", (key,)).fetchone()
+        if found is not None:
+            return dict(zip(_barrier.THREAD_FIELDS, found))
+    return None
+
+
+def _codex_barrier_seal_one(conn, key: str) -> bool:
+    row = conn.execute("SELECT required_revision FROM codex_barrier_population "
+                       "WHERE conversation_key=?", (key,)).fetchone()
+    if row is None:
+        conn.execute("DELETE FROM codex_barrier_repairs WHERE conversation_key=?",
+                     (key,))
+        return False
+    revision = int(row[0])
+    members = [_barrier.MemberFact(*r) for r in conn.execute(
+        "SELECT file_identity, generation_token, source_path, metadata_json, "
+        "metadata_offset FROM codex_barrier_membership WHERE conversation_key=?",
+        (key,))]
+    targets = []
+    for identity in sorted({m.identity for m in members}):
+        target = _codex_barrier_load_target(conn, identity)
+        targets.append(target if target is not None else _barrier.Target(
+            identity, "", "", None, None, None, None))
+    stamps = conn.execute(
+        "SELECT first_seen_utc, last_seen_utc FROM codex_conversation_threads "
+        "WHERE conversation_key=?", (key,)).fetchone()
+    retained = _codex_barrier_retained_thread(conn, key)
+    if all(_barrier.classify_target(t).state == _barrier.READY for t in targets):
+        # #968 spec-favour resolution: new fully-accounted metadata must not
+        # be frozen by an older contributor that still supplies the entry
+        # snapshot. The current row is ONLY an equality preference: the pure
+        # kernel selects metadata from eligible generation-qualified members,
+        # never copies this mutable row into the certificate. With any U6
+        # exclusion, the accepted certificate/entry fallback keeps priority.
+        columns = ", ".join(_barrier.THREAD_FIELDS)
+        current = conn.execute(
+            f"SELECT {columns} FROM codex_conversation_threads "
+            "WHERE conversation_key=?", (key,)).fetchone()
+        if current is not None:
+            retained = dict(zip(_barrier.THREAD_FIELDS, current))
+    decision = _barrier.decide_seal(
+        key, revision, targets, members,
+        timestamps=tuple(stamps) if stamps else None,
+        retained_thread=retained)
+    if not decision.sealable:
+        return False
+    conn.execute(
+        "INSERT OR REPLACE INTO codex_barrier_certificates (conversation_key, "
+        "revision, certificate_json, sealed_at_utc) VALUES (?,?,?,?)",
+        (key, revision, _barrier.certificate_json(decision.certificate),
+         _codex_barrier_now()))
+    conn.execute("DELETE FROM codex_barrier_certificates WHERE "
+                 "conversation_key=? AND revision<?", (key, revision))
+    conn.execute("DELETE FROM codex_barrier_repairs WHERE conversation_key=? "
+                 "AND revision<=?", (key, revision))
+    return True
+
+
+def _codex_barrier_seal_pending(conn, *, priority=(), max_keys=None,
+                                deadline=None, allow_init: bool = True,
+                                start_after: str = "") -> BarrierSealResult:
+    """Seal certificates for queued conversations whose census is ready.
+
+    The caller holds the cache writer locks and has committed its own work.
+    Reads only cache.db (no stat, no decode) and commits once.
+    """
+    if allow_init:
+        _codex_barrier_init_targets(conn)
+
+    def remaining() -> int:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM codex_barrier_repairs").fetchone()[0])
+
+    if not _codex_barrier_census_proven(conn):
+        if conn.in_transaction:
+            conn.commit()
+        return BarrierSealResult(0, 0, remaining(), "membership-unproven", True,
+                                 start_after)
+    if not _codex_barrier_census_flag(conn):
+        if conn.in_transaction:
+            conn.commit()
+        return BarrierSealResult(0, 0, remaining(), "walk-incomplete", False,
+                                 start_after)
+    queued = [r[0] for r in conn.execute(
+        "SELECT conversation_key FROM codex_barrier_repairs "
+        "WHERE conversation_key > ? ORDER BY conversation_key", (start_after,))]
+    queued_set = set(queued)
+    order = [k for k in sorted(set(priority)) if k in queued_set]
+    first = set(order)
+    order += [k for k in queued if k not in first]
+    sealed = blocked = 0
+    last_key = start_after
+    for key in order:
+        if max_keys is not None and sealed + blocked >= max_keys:
+            break
+        if deadline is not None and _walk_clock() >= deadline:
+            break
+        if _codex_barrier_seal_one(conn, key):
+            sealed += 1
+        else:
+            blocked += 1
+        last_key = max(last_key, key)
+    if sealed:
+        # Tells the conversation frontier that certificates newer than their
+        # publications may exist (Task 11).
+        _set_cache_meta(conn, _barrier.SEAL_SEQ_KEY, str(time.time_ns()))
+    if conn.in_transaction:
+        conn.commit()
+    return BarrierSealResult(sealed, blocked, remaining(), "complete", False,
+                             last_key)
+
+
+def _codex_barrier_after_walk(conn, stats, *, targeted: bool, deadline,
+                              touched) -> None:
+    """Seal what the walk made sealable, inside the walk's lock hold.
+
+    A quiet tick with nothing queued costs one probe. Budgeted and targeted
+    calls seal at most ``CODEX_BARRIER_INLINE_SEAL_MAX_KEYS`` keys (the ones
+    this walk touched first) and never run the one-time target init; work they
+    leave is handed to the `_codex-replay-drain` worker, never run past the
+    budget.
+    """
+    if conn.execute("SELECT 1 FROM codex_barrier_repairs LIMIT 1").fetchone() is None:
+        return
+    if deadline is not None and (
+            _walk_clock() >= deadline - CODEX_BARRIER_SEAL_RESERVE_SECONDS):
+        return
+    inline = targeted or deadline is not None
+    result = _codex_barrier_seal_pending(
+        conn, priority=touched,
+        max_keys=CODEX_BARRIER_INLINE_SEAL_MAX_KEYS if inline else None,
+        deadline=deadline, allow_init=deadline is None)
+    stats.barrier_sealed += result.sealed
+    stats.barrier_pending = result.remaining
+    unattempted = result.remaining - result.blocked
+    if result.scan_needed or (inline and result.census == "complete"
+                              and unattempted > 0):
+        stats.drain_requested = tuple(sorted(
+            set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
+
+
+def _codex_admitted_cache_write(fn, *, wait_for_requests: bool):
+    """Run ``fn(conn)`` through the drain gate under the cache lock domain.
+
+    The store is opened BEFORE admission takes the cache flocks (review N5;
+    the order every executor keeps, review S-P2b). ``open_cache_db`` on a
+    store that is not at its steady state (schema not current after an
+    upgrade, or not in WAL mode) takes the maintenance and cache flocks
+    itself with a 15 s bound (``bin/_cctally_cache.py:11124-11140``): opened
+    after admission it would wait for the cache flock admission already
+    holds (flock is per open file description) and then raise "cache writer
+    is busy". A connection opened for a refused admission is closed before
+    the backoff, and the next attempt opens a fresh one.
+
+    Returns ``(True, result)``, or ``(False, None)`` when a fresh hook request
+    made the caller yield and it may not wait.
+    """
+    import _lib_codex_drain_admission as adm
+    while True:
+        conn = open_cache_db()
+        try:
+            admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                                  _release_cache_store_locks)
+        except BaseException:
+            conn.close()
+            raise
+        if admission.admitted:
+            break
+        conn.close()
+        if not wait_for_requests:
+            return False, None
+        _drain_backoff(adm)
+    try:
+        try:
+            result = fn(conn)
+            if conn.in_transaction:
+                conn.commit()
+            return True, result
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    finally:
+        adm.finish(admission, _release_cache_store_locks)
+
+
+def run_codex_barrier_seal_drain(*, wait_for_requests: bool = True) -> BarrierSealResult:
+    """Seal the whole repair queue in admitted chunks (worker, cache-sync)."""
+    sealed, after = 0, ""
+    while True:
+        ok, result = _codex_admitted_cache_write(
+            lambda conn: _codex_barrier_seal_pending(
+                conn, max_keys=CODEX_BARRIER_DRAIN_SEAL_CHUNK, start_after=after),
+            wait_for_requests=wait_for_requests)
+        if not ok:
+            return BarrierSealResult(sealed, 0, -1, "yielded", False, after)
+        sealed += result.sealed
+        if result.census != "complete" or result.last_key == after:
+            return result._replace(sealed=sealed)
+        after = result.last_key
+
+
+class MembershipScanResult(NamedTuple):
+    outcome: str
+    proven: int
+    suspended: int
+    skipped: int
+    yielded: int
+
+
+class _BarrierScanPrep(NamedTuple):
+    outcome: str                   # "proven", "hold" or "changed"
+    keys: "dict | None"
+    hold: "str | None"
+    fingerprint: "_rc.ContainerFingerprint | None"
+    generation: "str | None"
+
+
+def _codex_barrier_prepare_scan(path: str, root_key, cursor) -> _BarrierScanPrep:
+    """Read-only parse of one accepted prefix [0, end): no lock, no write."""
+    (kind, inode, csize, mtime_ns, dsize, end, _complete, _size,
+     state, device) = cursor
+    if state != "accepted":
+        return _BarrierScanPrep("changed", None, None, None, None)
+    selected = _rc.select_container(pathlib.Path(path))
+    if selected is None:
+        return _BarrierScanPrep("hold", None, "container-absent", None, None)
+    generation = _codex_cursor_generation(kind, inode, csize, mtime_ns, dsize,
+                                          device)
+    live = _rc.generation_token(
+        selected.fingerprint, dsize if selected.kind == _rc.ZSTD else None)
+    if live != generation:
+        if inode is None and (kind or _rc.PLAIN) == _rc.PLAIN == selected.kind:
+            generation = live          # a pre-#769 row never recorded its inode
+        else:
+            return _BarrierScanPrep("changed", None, None, None, None)
+    end = int(end or 0)
+    keys: dict = {}
+    state_ = _CodexIterState(session_id=None, model=None, total_tokens=0)
+    try:
+        with _rc.open_decoded(selected) as fh:
+            for emission in _iter_codex_fused_records_with_offsets(
+                    fh, path, initial_session_id=None, initial_model=None,
+                    initial_total_tokens=0, source_root_key=root_key,
+                    state=state_, stop_before=lambda off: off >= end):
+                _codex_barrier_collect(keys, emission)
+            reached = fh.tell()
+    except _rc.ContainerError as exc:
+        return _BarrierScanPrep("hold", None, _container_skip_reason(exc.category),
+                                selected.fingerprint, None)
+    except OSError:
+        return _BarrierScanPrep("changed", None, None, None, None)
+    if reached != end:
+        return _BarrierScanPrep("changed", None, None, None, None)
+    return _BarrierScanPrep("proven", keys, None, None, generation)
+
+
+def run_codex_barrier_membership_scan(
+        *, wait_for_requests: bool = True,
+        max_identities: "int | None" = None) -> MembershipScanResult:
+    """Prove the membership of every unproven accepted prefix (5.11).
+
+    Off-hook only (the `_codex-replay-drain` worker and explicit cache-sync).
+    Per identity: parse without locks, then admit through the global gate,
+    revalidate the cursor unchanged, and write membership, target and re-arm
+    in one short transaction.
+    """
+    worker = _worker_lock(CODEX_BARRIER_SCAN_LOCK_NAME)
+    if worker is None:
+        return MembershipScanResult("busy", 0, 0, 0, 0)
+    counts = dict(proven=0, suspended=0, skipped=0, yielded=0)
+    try:
+        ok, _ = _codex_admitted_cache_write(_codex_barrier_init_targets,
+                                            wait_for_requests=wait_for_requests)
+        if not ok:
+            return MembershipScanResult("yielded", 0, 0, 0, 1)
+        after, processed = "", 0
+        while max_identities is None or processed < max_identities:
+            conn = open_cache_db()
+            try:
+                row = conn.execute(
+                    "SELECT file_identity, source_path, source_root_key "
+                    "FROM codex_barrier_targets WHERE reason='membership-unproven' "
+                    "AND file_identity > ? ORDER BY file_identity LIMIT 1",
+                    (after,)).fetchone()
+                cursor = None if row is None else conn.execute(
+                    _CODEX_BARRIER_CURSOR_SQL, (row[1],)).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                break
+            identity, path, root_key = row
+            after = identity
+            processed += 1
+            if cursor is None:
+                counts["skipped"] += 1   # the prune executor forgets it
+                continue
+            prep = _codex_barrier_prepare_scan(path, root_key, cursor)
+            if prep.outcome == "changed":
+                counts["skipped"] += 1   # a walk or a verification owns it now
+                continue
+
+            def apply(conn, prep=prep, path=path, root_key=root_key,
+                      identity=identity, cursor=cursor):
+                if conn.execute(_CODEX_BARRIER_CURSOR_SQL,
+                                (path,)).fetchone() != tuple(cursor):
+                    return "skipped"     # accounting moved: scan again later
+                if prep.outcome == "hold":
+                    _codex_barrier_apply_holds(
+                        conn, [(path, root_key, prep.hold, prep.fingerprint)])
+                    return "suspended"
+                end = int(cursor[5] or 0)
+                _codex_barrier_upsert_members(conn, identity, prep.generation,
+                                              path, prep.keys)
+                _codex_barrier_write_target(
+                    conn, identity=identity, path=path, root_key=root_key,
+                    generation=prep.generation, scan_target=int(cursor[7] or 0),
+                    complete_line_end=end if int(cursor[6] or 0) == 1 else None,
+                    hold=None, wm_gen=prep.generation, wm_off=end)
+                _codex_barrier_rearm(conn, set(prep.keys),
+                                     reason="membership-proven")
+                return "proven"
+
+            ok, outcome = _codex_admitted_cache_write(
+                apply, wait_for_requests=wait_for_requests)
+            if not ok:
+                counts["yielded"] += 1
+                break
+            counts[outcome] += 1
+        return MembershipScanResult(
+            "yielded" if counts["yielded"] else "drained", **counts)
+    finally:
+        _release_worker_lock(worker)
+
+
+_BARRIER_UNRESOLVED_REASONS = (
+    "verification-pending", "decoder-unavailable", "decode-error",
+    "verification-unverified", "container-absent", "membership-unproven",
+    "accounting-incomplete")
+
+
+def _codex_barrier_status(conn) -> dict:
+    """The status record's `barrier` object (spec 5.6; review P2-4).
+
+    Bounded counts only, from single aggregate scans (SUM(CASE ...), never a
+    GROUP BY or DISTINCT, so no statement builds a temp B-tree): non-ready
+    targets by unresolved reason, by known/unknown membership (a watermark
+    or none) and by retained accepted fallback (an accounted cursor with
+    ingested bytes, which U6's retained facts can stand on); population keys
+    with a non-ready contributor of unknown membership (an exclusion, or a
+    pending hold; review N2); and queued work split
+    into first certification (no certificate yet) and repair (re-certifying
+    a certified key).
+    """
+    reason_sums = ", ".join(
+        f"COALESCE(SUM(t.reason='{r}'),0)" for r in _BARRIER_UNRESOLVED_REASONS)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(t.state='suspended'),0), "
+        "COALESCE(SUM(t.accepted_generation_token IS NOT NULL),0), "
+        "COALESCE(SUM(t.accepted_generation_token IS NULL),0), "
+        "COALESCE(SUM(COALESCE(f.last_byte_offset,0) > 0),0), "
+        "COALESCE(SUM(COALESCE(f.last_byte_offset,0) = 0),0), "
+        f"{reason_sums} "
+        "FROM codex_barrier_targets t "
+        "LEFT JOIN codex_session_files f ON f.path = t.source_path "
+        "WHERE t.state <> 'ready'").fetchone()
+    suspended, known, unknown, with_fallback, without_fallback = (
+        int(v) for v in row[:5])
+    unresolved = {r: int(v) for r, v in zip(_BARRIER_UNRESOLVED_REASONS, row[5:])}
+    first, repair = conn.execute(
+        "SELECT COALESCE(SUM(c.conversation_key IS NULL),0), "
+        "COALESCE(SUM(c.conversation_key IS NOT NULL),0) "
+        "FROM codex_barrier_repairs r LEFT JOIN codex_barrier_certificates c "
+        "ON c.conversation_key = r.conversation_key").fetchone()
+    keys_unknown = conn.execute(
+        "SELECT COUNT(*) FROM codex_barrier_population p WHERE EXISTS ("
+        "SELECT 1 FROM codex_barrier_membership m "
+        "JOIN codex_barrier_targets t ON t.file_identity = m.file_identity "
+        "WHERE m.conversation_key = p.conversation_key "
+        "AND t.state <> 'ready' AND t.accepted_generation_token IS NULL)"
+    ).fetchone()[0]
+    return {
+        "population": int(conn.execute(
+            "SELECT COUNT(*) FROM codex_barrier_population").fetchone()[0]),
+        "repairsPending": int(first) + int(repair),
+        "certificationPending": int(first),
+        "repairPending": int(repair),
+        "suspended": suspended,
+        "membershipUnproven": unresolved["membership-unproven"],
+        "unresolved": unresolved,
+        "membershipKnown": known,
+        "membershipUnknown": unknown,
+        "withRetainedFallback": with_fallback,
+        "withoutRetainedFallback": without_fallback,
+        "keysMembershipUnknown": int(keys_unknown),
+        "walkCensus": _codex_barrier_census_flag(conn),
+    }
 
 
 def _delete_codex_file_derived_rows(
@@ -3378,6 +5181,33 @@ class _OrdinaryCodexPrunePlan:
     refused_root_keys: set[str]
 
 
+def _stamp_codex_debt_only_walk(conn, key: str, debt_only: bool) -> None:
+    """Review N3: a fresh token when a full walk was clean except for pending
+    prune debt, else none. A frontier holds only on a token it has not seen
+    since its own last full plan (`_lib_ingest_frontier._debt_hold_plan`).
+    Deleting an absent row writes nothing (#901 W8)."""
+    if debt_only:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key, value) VALUES(?, ?)",
+            (key, os.urandom(8).hex()))
+    else:
+        conn.execute("DELETE FROM cache_meta WHERE key=?", (key,))
+
+
+def _record_codex_prune_debt(
+    conn: sqlite3.Connection, sources: "list[tuple[str, str | None]]",
+) -> int:
+    """Persist planned orphan identities as prune debt (#968 spec 5.7)."""
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    changed = 0
+    for path, root_key in sources:
+        changed += conn.execute(
+            "INSERT OR IGNORE INTO codex_prune_debt "
+            "(source_path, source_root_key, recorded_at_utc) VALUES (?,?,?)",
+            (path, root_key or "", now_iso)).rowcount
+    return changed
+
+
 def _plan_ordinary_codex_prune(
     conn: sqlite3.Connection,
     current_file_identities: set[tuple[str, str]],
@@ -3475,6 +5305,428 @@ def _prune_inactive_codex_source_roots(
               """,
         tuple(params),
     )
+
+
+class PruneDrainResult(NamedTuple):
+    outcome: str            # "drained" | "yielded" | "busy" | "partial"
+    identities_deleted: int
+    identities_dropped: int
+    yielded: int
+    remaining: int
+
+
+#: Private test seam: called inside each identity transaction, before commit.
+_CODEX_PRUNE_PRECOMMIT_HOOK: "Callable[[str, str], None] | None" = None
+
+
+def _worker_lock(name: str):
+    path = _cctally_core.APP_DIR / name
+    _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _release_worker_lock(fd) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _cache_store_locks():
+    from _lib_cache_writer_lock import acquire_cache_writer_flocks
+    return acquire_cache_writer_flocks(
+        _cctally_core.CACHE_LOCK_PATH, _cctally_core.CACHE_LOCK_CODEX_PATH,
+        timeout=None)
+
+
+def _release_cache_store_locks(token) -> None:
+    from _lib_cache_writer_lock import release_cache_writer_flocks
+    release_cache_writer_flocks(token)
+
+
+def _drain_backoff(adm) -> None:
+    """After a refused admission: wait out every fresh request; when none was
+    fresh (the gate or a store lock was busy), sleep one poll step so a
+    waiting worker never spins on the gate."""
+    if adm.fresh_requests(_cctally_core.APP_DIR):
+        adm.wait_until_no_fresh_requests(_cctally_core.APP_DIR)
+    else:
+        adm._sleep(adm.POLL_SECONDS)
+
+
+def _codex_identity_present(path: str, root_key: "str | None",
+                            roots: "list[CodexProviderRoot]") -> bool:
+    """Logical presence under the identity's own configured root (I2)."""
+    candidate = pathlib.Path(path)
+    for root in roots:
+        if root_key is not None and root.source_root_key != root_key:
+            continue
+        try:
+            inside = candidate.is_relative_to(root.walk_root)
+        except (ValueError, TypeError):
+            inside = False
+        if inside and _rc.select_container(candidate) is not None:
+            return True
+    return False
+
+
+class _CodexPruneDiscoveryCache:
+    """One discovery per drain pass (#968 spec 5.7; review N10).
+
+    Discovery globs every configured root, which on a production corpus costs
+    seconds; running it once per identity made a drain of P identities cost P
+    walks. The list is reused while the configured root keys are unchanged and
+    rediscovered when they change. Every fact that authorizes a deletion is
+    still read for the identity's own transaction: ``prepare`` recomputes the
+    #485 scope from the list, and its recognition probe reads the listed files
+    live (a vanished or rewritten file fails it), ``refusal_reason`` checks
+    the identity's parent directory live, and presence is checked live under
+    the identity's own root after admission. Only the choice of which files
+    (at most 32 per root) the probe reads comes from the pass's discovery.
+    """
+
+    def __init__(self) -> None:
+        self._key: "tuple[str, ...] | None" = None
+        self._files: "list[CodexDiscoveredFile]" = []
+
+    def prepare(self) -> "tuple[list[CodexProviderRoot], _CodexPruneScope]":
+        roots = _codex_provider_roots()
+        key = tuple(r.source_root_key for r in roots)
+        if key != self._key:
+            self._files = _discover_codex_files_with_roots()
+            self._key = key
+        return roots, _codex_prune_scope(self._files)
+
+
+def run_codex_prune_drain(*, wait_for_requests: bool = True,
+                          max_identities: "int | None" = None) -> PruneDrainResult:
+    """Drain cache.db prune debt one logical identity per transaction (#968 5.7).
+
+    Single-flight through ``codex-prune-drain.lock``. Every identity is admitted
+    through the global drain gate (``_lib_codex_drain_admission``) and
+    revalidated before deletion: current roots, logical presence in any
+    container, and #485 eligibility computed for THIS transaction (review
+    S-P3 item 4: never a scope computed once per worker run). Debt is not
+    permission.
+    """
+    import _lib_codex_drain_admission as adm
+    worker = _worker_lock(CODEX_PRUNE_DRAIN_LOCK_NAME)
+    if worker is None:
+        return PruneDrainResult("busy", 0, 0, 0, -1)
+    deleted = dropped = yielded = 0
+    discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
+    try:
+        while max_identities is None or deleted + dropped < max_identities:
+            # Prepare without locks: the identity and its #485 scope, computed
+            # for THIS identity from the pass's discovery. Opening the store
+            # happens BEFORE admission takes the store locks (the HEAD writer
+            # order; review S-P2b), and the connection is kept for the
+            # identity.
+            conn = open_cache_db()
+            try:
+                row = conn.execute(
+                    "SELECT source_path, source_root_key FROM codex_prune_debt "
+                    "ORDER BY source_path, source_root_key LIMIT 1").fetchone()
+                if row is None:
+                    break
+                roots, scope = discovery.prepare()
+                admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                                      _release_cache_store_locks)
+                if not admission.admitted:
+                    yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                    continue
+                try:
+                    if ([r.source_root_key for r in _codex_provider_roots()]
+                            != [r.source_root_key for r in roots]):
+                        continue          # roots changed while admitting: re-prepare
+                    path, stored_root = row[0], (row[1] or None)
+                    eligible, _refused, _ok_roots, _refused_roots = (
+                        _partition_codex_prune_candidates(
+                            scope, [(path, stored_root)], set()))
+                    present = _codex_identity_present(path, stored_root, roots)
+                    if present or not eligible:
+                        conn.execute(
+                            "DELETE FROM codex_prune_debt WHERE source_path=? "
+                            "AND source_root_key=?", (path, row[1]))
+                        conn.commit()
+                        dropped += 1
+                        continue
+                    keys = {r[0] for r in conn.execute(
+                        "SELECT DISTINCT conversation_key FROM "
+                        "codex_conversation_messages WHERE source_path=?",
+                        (path,)) if r[0]}
+                    _codex_barrier_forget_identity(
+                        conn, codex_file_key_for_entry_path(stored_root or "", path))
+                    _delete_codex_file_derived_rows(
+                        conn, path, source_root_key=stored_root,
+                        match_source_root=True)
+                    _recompute_codex_rollups(conn, keys)
+                    _bump_codex_physical_mutation_seq(conn)
+                    conn.execute(
+                        "DELETE FROM codex_prune_debt WHERE source_path=? "
+                        "AND source_root_key=?", (path, row[1]))
+                    _set_cache_meta(conn, CODEX_PRUNE_ROOT_CLEANUP_KEY, "1")
+                    if _CODEX_PRUNE_PRECOMMIT_HOOK is not None:
+                        _CODEX_PRUNE_PRECOMMIT_HOOK(path, row[1])
+                    conn.commit()
+                    deleted += 1
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    adm.finish(admission, _release_cache_store_locks)
+            finally:
+                conn.close()
+        conn = open_cache_db()
+        try:
+            remaining = int(conn.execute(
+                "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0])
+            cleanup_due = conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=?",
+                (CODEX_PRUNE_ROOT_CLEANUP_KEY,)).fetchone() is not None
+            if remaining == 0 and cleanup_due:
+                _codex_prune_root_cleanup(conn, adm)
+        finally:
+            conn.close()
+        outcome = "drained" if remaining == 0 else (
+            "yielded" if yielded else "partial")
+        return PruneDrainResult(outcome, deleted, dropped, yielded, remaining)
+    finally:
+        _release_worker_lock(worker)
+
+
+CODEX_CONVERSATION_PRUNE_DRAIN_LOCK_NAME = "codex-conversation-prune-drain.lock"
+
+#: Private test seam: called inside each identity transaction, before commit.
+_CODEX_CONVERSATION_PRUNE_PRECOMMIT_HOOK: "Callable[[str, str], None] | None" = None
+
+
+def _record_codex_conversation_prune_debt(
+    conn: sqlite3.Connection, sources: "list[tuple[str, str | None]]",
+) -> int:
+    """Persist planned conversations-store orphans as debt (#968 spec 5.8)."""
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    changed = 0
+    for path, root_key in sources:
+        changed += conn.execute(
+            "INSERT OR IGNORE INTO codex_conversation_prune_debt "
+            "(source_path, source_root_key, recorded_at_utc) VALUES (?,?,?)",
+            (path, root_key or "", now_iso)).rowcount
+    return changed
+
+
+def run_codex_conversation_prune_drain(
+        *, wait_for_requests: bool = True,
+        max_identities: "int | None" = None) -> PruneDrainResult:
+    """Drain conversations.db prune debt one identity per transaction.
+
+    The twin of ``run_codex_prune_drain``: admitted through the same global
+    gate, under the Codex conversations provider lock (so it can never commit
+    while an ordinary conversation writer holds that lock). Each transaction
+    deletes touches, messages and events, the source-file cursor LAST,
+    recomputes rollups and materializes the find projection for the captured
+    keys, and deletes the debt row. The cache and conversations transactions
+    are separately atomic (spec 5.8).
+
+    Two orders matter (spec 5.7, 5.11, 5.12):
+    * The store is opened BEFORE admission takes the provider lock (review
+      S-P2b). ``_conversations_open_guarded`` may take the maintenance lock
+      exclusively and then wait for both provider locks
+      (``bin/_cctally_cache.py:11412-11426``); opened after admission, that
+      self-deadlocks on the lock admission holds (flock is per open file
+      description) and inverts HEAD's maintenance -> provider order. HEAD's
+      ordinary writer opens first and locks second (14113-14121).
+    * Roots, logical presence and #485 eligibility are recomputed for EACH
+      identity's transaction, never from a scope computed once per worker run
+      (review S-P3 item 4). Debt is not permission. Only the file discovery
+      the scope is computed from is shared by the pass (review N10), and it
+      is redone whenever the root keys change; see
+      ``_CodexPruneDiscoveryCache`` for which facts stay live.
+    """
+    import _lib_codex_drain_admission as adm
+    import _lib_codex_conversation_query as query
+    worker = _worker_lock(CODEX_CONVERSATION_PRUNE_DRAIN_LOCK_NAME)
+    if worker is None:
+        return PruneDrainResult("busy", 0, 0, 0, -1)
+    deleted = dropped = yielded = 0
+    repair_retried = False
+    discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
+    try:
+        while max_identities is None or deleted + dropped < max_identities:
+            conn = open_conversations_db()          # before admission (S-P2b)
+            try:
+                row = conn.execute(
+                    "SELECT source_path, source_root_key "
+                    "FROM codex_conversation_prune_debt "
+                    "ORDER BY source_path, source_root_key LIMIT 1").fetchone()
+                if row is None:
+                    break
+                # Prepared without locks: this identity's scope, from the
+                # pass's one discovery (Task 4's _CodexPruneDiscoveryCache).
+                roots, scope = discovery.prepare()
+                admission = adm.admit(_cctally_core.APP_DIR,
+                                      _conversation_store_locks,
+                                      _release_conversation_store_locks)
+                if not admission.admitted:
+                    db = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+                    marker = _cctally_db_sib._repair_marker_path(db)
+                    if (not repair_retried and marker.exists()
+                            and not _cctally_db_sib._repair_marker_is_live(marker)[0]):
+                        # Reopen outside admission so the guarded opener can
+                        # reclaim a crashed repair without provider re-entry.
+                        repair_retried = True
+                        continue
+                    yielded += 1
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                    continue
+                try:
+                    if ([r.source_root_key for r in _codex_provider_roots()]
+                            != [r.source_root_key for r in roots]):
+                        continue      # roots changed while admitting: re-prepare
+                    path, stored_root = row[0], (row[1] or None)
+                    cursor = conn.execute(
+                        "SELECT source_root_key FROM codex_conversation_source_files "
+                        "WHERE path=?", (path,)).fetchone()
+                    requalified = (cursor is not None
+                                   and (cursor[0] or None) != stored_root)
+                    eligible, _refused, _ok_roots, _refused_roots = (
+                        _partition_codex_prune_candidates(
+                            scope, [(path, stored_root)], set()))
+                    if (requalified
+                            or _codex_identity_present(path, stored_root, roots)
+                            or not eligible):
+                        conn.execute(
+                            "DELETE FROM codex_conversation_prune_debt "
+                            "WHERE source_path=? AND source_root_key=?",
+                            (path, row[1]))
+                        conn.commit()
+                        dropped += 1
+                        continue
+                    affected = {r[0] for r in conn.execute(
+                        "SELECT DISTINCT conversation_key "
+                        "FROM codex_conversation_messages WHERE source_path=?",
+                        (path,)) if r[0]}
+                    conn.execute(
+                        "DELETE FROM codex_conversation_file_touches "
+                        "WHERE source_path=?", (path,))
+                    deleted_messages = max(0, conn.execute(
+                        "DELETE FROM codex_conversation_messages "
+                        "WHERE source_path=?", (path,)).rowcount)
+                    conn.execute(
+                        "DELETE FROM codex_conversation_events WHERE source_path=?",
+                        (path,))
+                    conn.execute(
+                        "DELETE FROM codex_conversation_source_files WHERE path=?",
+                        (path,))
+                    if affected:
+                        _recompute_codex_rollups(conn, affected)
+                        query.materialize_codex_find_projection(
+                            conn, affected, cascaded=deleted_messages > 0)
+                    conn.execute(
+                        "DELETE FROM codex_conversation_prune_debt "
+                        "WHERE source_path=? AND source_root_key=?", (path, row[1]))
+                    if _CODEX_CONVERSATION_PRUNE_PRECOMMIT_HOOK is not None:
+                        _CODEX_CONVERSATION_PRUNE_PRECOMMIT_HOOK(path, row[1])
+                    conn.commit()
+                    deleted += 1
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    adm.finish(admission, _release_conversation_store_locks)
+            finally:
+                conn.close()
+        conn = open_conversations_db()
+        try:
+            remaining = int(conn.execute(
+                "SELECT COUNT(*) FROM codex_conversation_prune_debt").fetchone()[0])
+        finally:
+            conn.close()
+        outcome = "drained" if remaining == 0 else (
+            "yielded" if yielded else "partial")
+        return PruneDrainResult(outcome, deleted, dropped, yielded, remaining)
+    finally:
+        _release_worker_lock(worker)
+
+def _codex_prune_root_cleanup(conn, adm) -> bool:
+    """Root cleanup after child cleanup (#968 spec 5.7; review P3-1).
+
+    Recomputes the ordinary plan under admission and passes the #485 SAFE
+    root partition as ``candidate_root_keys`` — never ``None``, which would
+    remove every inactive root, including roots the partition refused. The
+    pending key is cleared in the same transaction.
+    """
+    files = _discover_codex_files_with_roots()
+    scope = _codex_prune_scope(files)
+    admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                          _release_cache_store_locks)
+    if not admission.admitted:
+        return False
+    try:
+        active_root_keys = {item.source_root_key for item in files}
+        plan = _plan_ordinary_codex_prune(
+            conn, {(str(item.source_path), item.source_root_key)
+                   for item in files}, active_root_keys, scope)
+        if plan.safe_root_keys:
+            _prune_inactive_codex_source_roots(
+                conn, active_root_keys,
+                candidate_root_keys=set(plan.safe_root_keys))
+        conn.execute("DELETE FROM cache_meta WHERE key=?",
+                     (CODEX_PRUNE_ROOT_CLEANUP_KEY,))
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        adm.finish(admission, _release_cache_store_locks)
+
+
+def cmd_codex_prune_drain_internal(args) -> int:
+    """Hidden ``_codex-prune-drain`` handler (#968 spec 5.7). Always returns 0."""
+    from _cctally_record import (
+        _hook_log_error_detail, _hook_log_safe_free_text, _hook_tick_log_line,
+        _hook_tick_log_rotate_if_needed,
+    )
+    started = time.monotonic()
+
+    def _log(outcome: str, detail: str = "", *, error: str = "") -> None:
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        safe = _hook_log_safe_free_text(error) if error else ""
+        _hook_tick_log_line(
+            f"{stamp} provider=codex op=prune-drain result={outcome} "
+            f"dur_ms={max(0, int((time.monotonic() - started) * 1000))}"
+            + (f" {detail}" if detail else "")
+            + (f" error={safe}" if safe else ""))
+        _hook_tick_log_rotate_if_needed()
+
+    try:
+        result = run_codex_prune_drain(wait_for_requests=True)
+        conv_result = run_codex_conversation_prune_drain(wait_for_requests=True)
+    except Exception as exc:
+        _log("error", error=_hook_log_error_detail(exc))
+        return 0
+    _log(result.outcome,
+         f"deleted={result.identities_deleted} dropped={result.identities_dropped} "
+         f"yielded={result.yielded} remaining={result.remaining} "
+         f"conv_deleted={conv_result.identities_deleted} "
+         f"conv_dropped={conv_result.identities_dropped} "
+         f"conv_remaining={conv_result.remaining}")
+    return 0
 
 
 def _append_codex_quota_obs(quota_rows: list) -> None:
@@ -3654,6 +5906,85 @@ def _codex_batch_precommit() -> None:
         hook()
 
 
+class CodexContainerAcceptance(NamedTuple):
+    """The container whose content a cursor commit accepts (#968 spec 5.3).
+
+    For a plain container ``path``, ``container_size_bytes`` and
+    ``decoded_size_bytes`` are NULL: the spec defines NULL ``container_path``
+    as "the logical path" and a plain file's physical and decoded sizes as
+    ``size_bytes`` itself.
+    """
+
+    kind: str
+    path: "str | None"
+    container_size_bytes: "int | None"
+    decoded_size_bytes: "int | None"
+    content_anchor: "bytes | None"
+    content_anchor_offset: "int | None"
+
+
+_CODEX_CURSOR_UPSERT_SQL = """INSERT INTO codex_session_files
+           (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
+            last_session_id, last_model, last_total_tokens, source_root_key,
+            last_native_thread_id, last_root_thread_id, last_parent_thread_id,
+            last_conversation_key, last_turn_id, account_key, ingest_complete,
+            device_id, inode)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(path) DO UPDATE SET
+            size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,
+            last_byte_offset=excluded.last_byte_offset,
+            last_ingested_at=excluded.last_ingested_at,
+            last_session_id=excluded.last_session_id,
+            last_model=excluded.last_model,
+            last_total_tokens=excluded.last_total_tokens,
+            source_root_key=excluded.source_root_key,
+            last_native_thread_id=excluded.last_native_thread_id,
+            last_root_thread_id=excluded.last_root_thread_id,
+            last_parent_thread_id=excluded.last_parent_thread_id,
+            last_conversation_key=excluded.last_conversation_key,
+            last_turn_id=excluded.last_turn_id,
+            account_key=excluded.account_key,
+            ingest_complete=excluded.ingest_complete,
+            device_id=excluded.device_id, inode=excluded.inode"""
+
+_CODEX_CURSOR_UPSERT_WITH_CONTAINER_SQL = """INSERT INTO codex_session_files
+   (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
+    last_session_id, last_model, last_total_tokens, source_root_key,
+    last_native_thread_id, last_root_thread_id, last_parent_thread_id,
+    last_conversation_key, last_turn_id, account_key, ingest_complete,
+    device_id, inode, container_kind, container_path, container_size_bytes,
+    decoded_size_bytes, content_anchor_version, content_anchor,
+    content_anchor_offset, container_state, container_state_reason,
+    pending_container_fingerprint, container_resume_strikes)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+           'accepted',NULL,NULL,0)
+   ON CONFLICT(path) DO UPDATE SET
+    size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,
+    last_byte_offset=excluded.last_byte_offset,
+    last_ingested_at=excluded.last_ingested_at,
+    last_session_id=excluded.last_session_id,
+    last_model=excluded.last_model,
+    last_total_tokens=excluded.last_total_tokens,
+    source_root_key=excluded.source_root_key,
+    last_native_thread_id=excluded.last_native_thread_id,
+    last_root_thread_id=excluded.last_root_thread_id,
+    last_parent_thread_id=excluded.last_parent_thread_id,
+    last_conversation_key=excluded.last_conversation_key,
+    last_turn_id=excluded.last_turn_id,
+    account_key=excluded.account_key,
+    ingest_complete=excluded.ingest_complete,
+    device_id=excluded.device_id, inode=excluded.inode,
+    container_kind=excluded.container_kind,
+    container_path=excluded.container_path,
+    container_size_bytes=excluded.container_size_bytes,
+    decoded_size_bytes=excluded.decoded_size_bytes,
+    content_anchor_version=excluded.content_anchor_version,
+    content_anchor=excluded.content_anchor,
+    content_anchor_offset=excluded.content_anchor_offset,
+    container_state='accepted', container_state_reason=NULL,
+    pending_container_fingerprint=NULL, container_resume_strikes=0"""
+
+
 def _write_codex_file_batch(
     conn: sqlite3.Connection,
     *,
@@ -3680,10 +6011,13 @@ def _write_codex_file_batch(
     file_identity: "str | None" = None,
     incarnation: "int | None" = None,
     file_account_decision: "tuple[int, str | None] | None" = None,
+    file_account_decided_at: "str | None" = None,
     anchor_resolver: "CodexResetAnchorResolver | None" = None,
     ingest_complete: bool = True,
     device_id: "int | None" = None,
     inode: "int | None" = None,
+    container: "CodexContainerAcceptance | None" = None,
+    barrier: "CodexBarrierRead | None" = None,
     commit: bool = True,
 ) -> int:
     """Write one fully-buffered Codex file atomically and return entry changes.
@@ -3692,10 +6026,10 @@ def _write_codex_file_batch(
     unbudgeted sync applies each file inside its own savepoint and commits the
     batch once.
 
-    ``prune_roots`` gates the whole-tree ``_prune_inactive_codex_source_roots``
-    call: a targeted (only_paths) ingest passes ``False`` so it never deletes a
-    ``codex_source_roots`` row for a root it wasn't asked about (spec §5.1
-    whole-tree bypass — ``active_root_keys`` then covers only the targets).
+    ``prune_roots`` and ``active_root_keys`` remain accepted for existing
+    callers. Root deletion belongs exclusively to the admitted prune drain:
+    the whole-tree walk records its safe root plan before file batches, and
+    targeted ingestion never creates a whole-tree cleanup request (#968 §5.7).
 
     ``file_identity``/``incarnation``/``file_account_decision`` (#416) carry the
     durable attribution decision into THIS transaction, so the decision, the
@@ -3711,6 +6045,9 @@ def _write_codex_file_batch(
     erased by its own commit, the unread suffix would be skipped as unchanged
     forever, and nothing would raise."""
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    if barrier is not None:
+        # Before the reset delete and thread upsert: snapshot the old thread.
+        _codex_barrier_apply_read(conn, barrier)
     if reset_file:
         _delete_codex_file_derived_rows(conn, path_str)
     if file_identity is not None and incarnation is not None:
@@ -3720,6 +6057,8 @@ def _write_codex_file_batch(
             conn, file_identity, incarnation, at_utc=now_iso)
         if file_account_decision is not None:
             decision_offset, decision_key = file_account_decision
+            if file_account_decided_at is None:
+                raise ValueError("a materialized file decision requires its journal timestamp")
             record_codex_file_account(
                 conn,
                 file_identity=file_identity,
@@ -3727,7 +6066,7 @@ def _write_codex_file_batch(
                 from_offset=decision_offset,
                 root_scope=discovered.source_root_key,
                 account_key=decision_key,
-                decided_at_utc=now_iso,
+                decided_at_utc=file_account_decided_at,
             )
     conn.execute(
         """INSERT INTO codex_source_roots
@@ -3799,42 +6138,34 @@ def _write_codex_file_batch(
     # identity-relevant field changes; the replace fired the INSERT trigger and
     # logged an accounting change on every advance. A new file still fires the
     # INSERT trigger, and an identity change still logs through the UPDATE one.
-    conn.execute(
-        """INSERT INTO codex_session_files
-           (path, size_bytes, mtime_ns, last_byte_offset, last_ingested_at,
-            last_session_id, last_model, last_total_tokens, source_root_key,
-            last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id, account_key, ingest_complete,
-            device_id, inode)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(path) DO UPDATE SET
-            size_bytes=excluded.size_bytes, mtime_ns=excluded.mtime_ns,
-            last_byte_offset=excluded.last_byte_offset,
-            last_ingested_at=excluded.last_ingested_at,
-            last_session_id=excluded.last_session_id,
-            last_model=excluded.last_model,
-            last_total_tokens=excluded.last_total_tokens,
-            source_root_key=excluded.source_root_key,
-            last_native_thread_id=excluded.last_native_thread_id,
-            last_root_thread_id=excluded.last_root_thread_id,
-            last_parent_thread_id=excluded.last_parent_thread_id,
-            last_conversation_key=excluded.last_conversation_key,
-            last_turn_id=excluded.last_turn_id,
-            account_key=excluded.account_key,
-            ingest_complete=excluded.ingest_complete,
-            device_id=excluded.device_id, inode=excluded.inode""",
-        (
-            path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
-            last_model, last_total_tokens, discovered.source_root_key,
-            last_native_thread_id, last_root_thread_id, last_parent_thread_id,
-            last_conversation_key, last_turn_id, account_key,
-            1 if ingest_complete else 0,
-            None if device_id is None else int(device_id),
-            None if inode is None else int(inode),
-        ),
+    cursor_values = (
+        path_str, size, mtime_ns, final_offset, now_iso, last_session_id,
+        last_model, last_total_tokens, discovered.source_root_key,
+        last_native_thread_id, last_root_thread_id, last_parent_thread_id,
+        last_conversation_key, last_turn_id, account_key,
+        1 if ingest_complete else 0,
+        None if device_id is None else int(device_id),
+        None if inode is None else int(inode),
     )
-    if prune_roots:
-        _prune_inactive_codex_source_roots(conn, active_root_keys)
+    if container is None:
+        # Callers outside the walks (historical migrations, tests) keep the
+        # exact pre-#968 statement: container columns keep their stored value
+        # or, on insert, the plain/accepted defaults.
+        conn.execute(_CODEX_CURSOR_UPSERT_SQL, cursor_values)
+    else:
+        conn.execute(
+            _CODEX_CURSOR_UPSERT_WITH_CONTAINER_SQL,
+            cursor_values + (
+                container.kind, container.path,
+                container.container_size_bytes,
+                container.decoded_size_bytes,
+                None if container.content_anchor is None else _rc.ANCHOR_VERSION,
+                container.content_anchor,
+                container.content_anchor_offset,
+            ),
+        )
+    # Root cleanup is requested by the whole-tree prune plan and executed by
+    # _codex_prune_root_cleanup under drain admission, never by a file batch.
     # A file batch owns accounting, quota, thread, event, root, and cursor
     # facts as one physical unit. Keep the version bump in that same commit so
     # a rolled-back batch never appears newer to the dashboard signature.
@@ -3845,61 +6176,58 @@ def _write_codex_file_batch(
     return rows_changed
 
 
-def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]:
-    """Yield each existing *.jsonl under the given roots, de-duped by RESOLVED
-    path (first occurrence wins — collapses overlapping/prefix roots and
-    symlink/`..` aliases of the same physical file).
+def _iter_codex_logical_containers(
+    roots: list[pathlib.Path],
+) -> Iterator["_rc.SelectedContainer"]:
+    """Yield each logical rollout's selected container under the given roots,
+    de-duped by resolved logical identity (first occurrence wins).
 
-    Pure read: globs + is_file() only, no DB access. Shared by both Codex
-    walkers (_discover_codex_session_files and sync_codex_cache) so they stay
-    in lock-step on dedup + is_file() ordering.
+    Shares full discovery's grouping (#968 spec 5.2), so the direct fallback
+    and the cursor walks see the same population. Pure read: globs and stats.
     """
     seen: set[pathlib.Path] = set()
     for root in roots:
-        for jp in sorted(root.glob("**/*.jsonl"), key=lambda path: str(path)):
-            # Dedup on the RESOLVED path, not the raw spelling. A symlinked
-            # $CODEX_HOME root or an alias entry (`.../.codex`,
-            # `.../sub/../.codex`) can glob the same physical file under
-            # different spellings; UNIQUE(source_path, line_offset) keys on the
-            # string, so distinct spellings would double-ingest (2-3x tokens /
-            # cost) on a fresh walk. resolve() collapses the aliases (issue
-            # #108). First spelling still wins for the yielded source_path.
-            try:
-                key = jp.resolve()
-            except OSError:
-                key = jp  # unresolvable (broken symlink, perms) — key on raw
+        logicals = {
+            _rc.logical_path(candidate)
+            for pattern in ("**/*.jsonl", "**/*.jsonl.zst")
+            for candidate in root.glob(pattern)
+        }
+        for logical in sorted(logicals, key=lambda path: str(path)):
+            selected = _rc.select_container(logical)
+            if selected is None:
+                continue
+            physical = _canonical_codex_path(selected.path)
+            key = _rc.logical_path(physical)
             if key in seen:
                 continue
             seen.add(key)
-            if jp.is_file():
-                yield jp
+            yield selected
 
 
-def _discover_codex_session_files(
-    range_start: dt.datetime,
-) -> list[pathlib.Path]:
-    """Glob each $CODEX_HOME session root's **/*.jsonl, mtime >= range_start.
+def _iter_codex_jsonl_paths(roots: list[pathlib.Path]) -> Iterator[pathlib.Path]:
+    """Logical paths of ``_iter_codex_logical_containers`` (callers keyed on paths)."""
+    for selected in _iter_codex_logical_containers(roots):
+        yield selected.logical
 
-    Iterates _cctally()._codex_session_roots() (multi-root). The "none found"
-    notice fires ONLY when there are zero session-root directories at all (the
-    multi-root analogue of the old single-dir-missing check) — NOT when roots
-    exist but the mtime filter leaves the set empty (that stays silent, as
-    today, so narrow-range queries gain no new stderr).
+def _discover_codex_session_files(range_start: dt.datetime) -> list:
+    """Selected containers under every $CODEX_HOME session root (#968 5.6).
+
+    The mtime filter applies to PLAIN containers only: a compressed
+    container's mtime is a compression time, not an event time, and using it
+    as a proxy would silently exclude history. Every compressed container is
+    therefore a candidate, and its entries are range-filtered after decoding.
     """
     roots = _cctally()._codex_session_roots()
     if not roots:
         eprint("[codex] no Codex session directory found")
         return []
     start_ts = range_start.timestamp()
-    result: list[pathlib.Path] = []
-    for jp in _iter_codex_jsonl_paths(roots):
-        try:
-            mtime = jp.stat().st_mtime
-        except OSError:
+    result = []
+    for selected in _iter_codex_logical_containers(roots):
+        if (selected.kind == _rc.PLAIN
+                and selected.fingerprint.mtime_ns / 1e9 < start_ts):
             continue
-        if mtime < start_ts:
-            continue
-        result.append(jp)
+        result.append(selected)
     return result
 
 
@@ -4386,8 +6714,8 @@ def _force_retention_prune_after_replay(
     is disabled (``conversation.retention_days`` 0)."""
     try:
         import _lib_conversation_retention as retention
-        from _cctally_config import resolve_retention_days
-        retention_days = resolve_retention_days(_cctally().load_config())
+        from _cctally_config import resolve_prune_retention_days
+        retention_days = resolve_prune_retention_days(_cctally().load_config())
         if retention_days <= 0:
             return
         owned = conn is None
@@ -6785,6 +9113,196 @@ def iter_entries_with_id(
     return out
 
 
+# #968 section 8: operator-approved wording, verbatim.
+CODEX_COMPRESSED_DECODER_WARNING = (
+    "Some compressed Codex rollouts could not be read. Cached history was "
+    "kept. Use Python 3.14+ or install `backports.zstd` in the Python "
+    "environment running cctally (`pip install backports.zstd`).")
+CODEX_REBUILD_REFUSED_MESSAGE = (
+    "Codex rebuild refused: compressed rollouts could not be decoded. "
+    "Existing Codex data was kept.")
+CODEX_DIRECT_FALLBACK_UNAVAILABLE_MESSAGE = (
+    "Codex totals are unavailable because compressed history could not be "
+    "decoded.")
+CODEX_MAINTENANCE_DEFERRED_MESSAGE = (
+    "Codex history maintenance is continuing in the background.")
+CODEX_CONTAINER_STATUS_KEY = "codex_container_status"
+
+
+class CodexHistoryUnavailable(RuntimeError):
+    """The direct fallback met compressed history it cannot read (#968 5.6).
+
+    A RuntimeError so callers that already translate OSError/sqlite3.Error
+    into a generic failure let it through unchanged; ``main`` maps it to
+    exit 3 with ``CODEX_DIRECT_FALLBACK_UNAVAILABLE_MESSAGE``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(CODEX_DIRECT_FALLBACK_UNAVAILABLE_MESSAGE)
+
+
+def _codex_compressed_rebuild_refusal(files) -> "str | None":
+    """Shared rebuild preflight: may a destructive Codex clear proceed?
+
+    Every compressed container a rebuild would have to re-read must be
+    decodable and pass full-stream integrity validation; otherwise the clear
+    would destroy history it cannot restore (I5). Runs before either store is
+    cleared, for every entry point that consumes a rebuild or replay marker.
+    """
+    compressed = [f for f in files if f.container_kind == _rc.ZSTD]
+    if not compressed:
+        return None
+    if _rc.decoder_capability() == "unavailable":
+        return "decoder-unavailable"
+    for item in compressed:
+        selected = _rc.select_container(item.source_path)
+        if selected is None:
+            return "decode-error"
+        if selected.kind != _rc.ZSTD:
+            continue
+        try:
+            result = _rc.validate_full_stream(selected)
+        except _rc.ContainerReadInterrupted:
+            return "decode-error"
+        if not result.ok:
+            return ("decoder-unavailable" if result.error == "decoder-unavailable"
+                    else "decode-error")
+    return None
+
+
+_CONTAINER_SKIP_KEYS = ("decoder-unavailable", "decode-error",
+                        "verification-pending", "verification-unverified")
+
+
+def _record_codex_container_status(conn, stats, *, census_complete: bool,
+                                   cursor_table="codex_session_files") -> None:
+    """Write the versioned, privacy-bounded container status (#968 5.6).
+
+    A complete census replaces the skipped counts; a partial (targeted,
+    budget-stopped or refused) observation merges by maximum, so it can never
+    clear an estate-wide failure. Counts only: no paths, no identifiers.
+    """
+    if cursor_table not in ("codex_session_files", "codex_conversation_source_files"):
+        raise ValueError("unknown Codex cursor table")
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(
+        timespec="seconds").replace("+00:00", "Z")
+    prior = {}
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       (CODEX_CONTAINER_STATUS_KEY,)).fetchone()
+    if row and row[0]:
+        try:
+            decoded = json.loads(row[0])
+            prior = decoded if isinstance(decoded, dict) else {}
+        except (TypeError, ValueError):
+            prior = {}
+    observed = {k: int(stats.container_skipped.get(k, 0))
+                for k in _CONTAINER_SKIP_KEYS}
+    # D3: verification debt is pending work only. A terminal `unverified`
+    # container is reported (and warned about) on its own and never feeds V
+    # or the 24-hour rule.
+    debt = int(conn.execute(
+        f"SELECT COUNT(*) FROM {cursor_table} "
+        "WHERE container_state = 'pending'").fetchone()[0])
+    observed["verification-pending"] = max(
+        observed["verification-pending"], debt)
+    observed["verification-unverified"] = int(conn.execute(
+        f"SELECT COUNT(*) FROM {cursor_table} "
+        "WHERE container_state = 'unverified'").fetchone()[0])
+    if census_complete:
+        skipped = observed
+    else:
+        old = prior.get("skipped") if isinstance(prior.get("skipped"), dict) else {}
+        skipped = {k: max(int(old.get(k, 0) or 0), observed[k])
+                   for k in _CONTAINER_SKIP_KEYS}
+    since = prior.get("verificationPendingSince") if debt else None
+    # D6: pending READ work is maintenance too. The store-wide part is an
+    # accepted compressed cursor that has not reached its decoded end; the
+    # walk-local part is a never-ingested compressed rollout this walk held
+    # (Task 10's provenance hold increments `container_reads_held`). Its
+    # start is kept while reads stay pending and cleared only by a complete
+    # census that finds none.
+    complete = ("ingest_complete = 1 AND size_bytes IS decoded_size_bytes"
+                if cursor_table == "codex_session_files"
+                else "last_byte_offset IS decoded_size_bytes")
+    reads = int(conn.execute(
+        f"SELECT COUNT(*) FROM {cursor_table} "
+        "WHERE container_kind = 'zstd' AND container_state = 'accepted' "
+        f"AND NOT ({complete})").fetchone()[0])
+    reads += int(stats.container_reads_held)
+    if not census_complete:
+        reads = max(reads, int(prior.get("readsPending", 0) or 0))
+    if reads:
+        reads_since = prior.get("readsPendingSince") or now_iso
+    elif census_complete:
+        reads_since = None
+    else:
+        reads_since = prior.get("readsPendingSince")
+    # An unchanged accepted generation must not resolve a decoder (T1/I4).
+    # Keep the last capability observation WITH its own timestamp: the latest
+    # ingestion observation does not pretend that an idle walk probed Python.
+    new_capability_observation = bool(
+        stats.files_processed or stats.container_pending
+        or any(stats.container_skipped.values()) or stats.rebuild_refused)
+    decoder = prior.get("decoder")
+    decoder_observed_at = prior.get("decoderObservedAt", prior.get("observedAt"))
+    if new_capability_observation or decoder not in (
+            "stdlib", "backports.zstd", "unavailable"):
+        decoder = _rc.decoder_capability()
+        decoder_observed_at = now_iso
+    # Share this observation with explicit callers without resolving again.
+    stats.container_decoder = decoder
+    record = {
+        "version": 1,
+        "observedAt": now_iso,
+        "census": "complete" if census_complete else "partial",
+        "skipped": skipped,
+        "decoder": decoder,
+        "decoderObservedAt": decoder_observed_at,
+        "verificationDebt": debt,
+        "verificationPendingSince": since or (now_iso if debt else None),
+        "readsPending": reads,
+        "readsPendingSince": reads_since,
+        "rebuildRefused": (stats.rebuild_refused if census_complete
+                           else stats.rebuild_refused or prior.get("rebuildRefused")),
+        "barrier": (_codex_barrier_status(conn)
+                    if cursor_table == "codex_session_files"
+                    else prior.get("barrier", {})),
+    }
+    _set_cache_meta(conn, CODEX_CONTAINER_STATUS_KEY,
+                    json.dumps(record, sort_keys=True))
+
+
+_DECODER_WARNING_EMITTED = False
+_MAINTENANCE_NOTE_EMITTED = False
+
+
+def _warn_compressed_unreadable_once(stats) -> bool:
+    """The one-shot section 8 warning; explicit commands only, never the hook."""
+    global _DECODER_WARNING_EMITTED
+    if _DECODER_WARNING_EMITTED or stats is None:
+        return False
+    unread_without_decoder = (
+        stats.container_decoder == "unavailable"
+        and (stats.container_pending
+             or stats.container_skipped.get("verification-pending")
+             or stats.container_skipped.get("verification-unverified")))
+    if not (stats.container_skipped.get("decoder-unavailable")
+            or unread_without_decoder):
+        return False
+    _DECODER_WARNING_EMITTED = True
+    eprint(CODEX_COMPRESSED_DECODER_WARNING)
+    return True
+
+
+def _note_maintenance_deferred_once() -> bool:
+    global _MAINTENANCE_NOTE_EMITTED
+    if _MAINTENANCE_NOTE_EMITTED:
+        return False
+    _MAINTENANCE_NOTE_EMITTED = True
+    eprint(CODEX_MAINTENANCE_DEFERRED_MESSAGE)
+    return True
+
+
 class AccountAttributionUnavailable(Exception):
     """A ``--account``-scoped entry read cannot be satisfied from the account-
     stamped cache and would otherwise degrade to a direct-JSONL parse (#341,
@@ -7163,6 +9681,8 @@ class CodexIngestStats:
     files_processed: int = 0
     files_skipped_unchanged: int = 0
     files_reset_truncated: int = 0
+    # #968 spec 5.8: genuine resets deferred before any durable file effect.
+    files_deferred_reset: int = 0
     # Count of codex_session_entries rows written by this sync. Codex
     # ingest uses INSERT OR IGNORE — ignored conflicts do NOT bump
     # SQLite's `total_changes`, so this number is effectively "rows
@@ -7180,6 +9700,7 @@ class CodexIngestStats:
     prune_refused: bool = False
     prune_refused_files: int = 0
     lock_contended: bool = False
+    drain_yielded: bool = False
     # #279 S2 F1 parse-health counters — folded from each file's
     # _CodexIterState after its drain. Same vocabulary as the iterator
     # (info-non-dict / no-last-token-usage / bad-timestamp / no-session-id).
@@ -7209,6 +9730,23 @@ class CodexIngestStats:
     budget_exhausted: bool = False
     full_walk_complete: bool = False
     maintenance_failed: bool = False
+    container_pending: int = 0
+    container_skipped: dict = field(default_factory=dict)
+    drain_requested: tuple = ()
+    prune_debt_pending: int = 0
+    full_walk_debt_only: bool = False
+    rebuild_refused: "str | None" = None
+    container_reads_held: int = 0
+    barrier_sealed: int = 0
+    barrier_pending: int = 0
+    barrier_files_deferred: int = 0
+    barrier_keys_deferred: int = 0
+    barrier_keys_published: int = 0
+    barrier_files_published: int = 0
+    barrier_retry: bool = False
+    # The status writer already observes capability for unresolved work.
+    # Explicit adapters reuse it; unchanged accepted generations never probe.
+    container_decoder: "str | None" = None
 
     @property
     def targeted_clean(self) -> bool:
@@ -7217,7 +9755,10 @@ class CodexIngestStats:
         only when this is True — byte-for-byte the Claude ``IngestStats`` rule."""
         return (not self.lock_contended
                 and self.deferred_reason is None
-                and self.files_failed == 0)
+                and self.files_failed == 0
+                and not self.container_pending
+                and not self.barrier_retry
+                and not any(self.container_skipped.values()))
 
 
 def _progress_codex_stderr(stats: CodexIngestStats, *, force: bool = False) -> None:
@@ -7456,14 +9997,156 @@ def _defer_codex_replay_drain() -> str:
     return "spawned" if _spawn_detached(CODEX_REPLAY_DRAIN_COMMAND) else "failed"
 
 
-def cmd_codex_replay_drain_internal(args) -> int:
-    """Hidden ``_codex-replay-drain`` handler: the unbudgeted byte-zero replay.
+class ResetDrainResult(NamedTuple):
+    outcome: str
+    reset: int
+    unchanged: int
+    yielded: int
 
-    An ordinary UNBUDGETED ``sync_codex_cache`` — the same call
-    ``cache-sync --source codex`` makes — which is exactly what performs the
-    replay: the pending marker is OR'd into the sync's own ``rebuild``, so the
-    walk captures ``rebuild_known_identities`` before clearing and re-reads
-    every rollout from byte zero.
+
+def _codex_reset_candidates() -> "list[str]":
+    """Read-only: logical paths a budgeted walk may have deferred (#968 5.8).
+
+    Deliberately over-approximate — requalified roots, a replaced plain
+    identity, a shorter plain container. The executor's targeted sync decides
+    under the locks, so a stale candidate costs one ordinary targeted ingest,
+    never a spurious reset. A container-kind transition is verification work
+    (Task 5) and is never a candidate here.
+    """
+    files = _discover_codex_files_with_roots()
+    conn = open_cache_db()
+    try:
+        rows = {r[0]: r[1:] for r in conn.execute(
+            "SELECT path, size_bytes, device_id, inode, source_root_key, "
+            "container_kind FROM codex_session_files")}
+    finally:
+        conn.close()
+    out: list[str] = []
+    for item in files:
+        key = str(item.source_path)
+        prev = rows.get(key)
+        if prev is None:
+            continue
+        prev_size, prev_dev, prev_ino, prev_root, prev_kind = prev
+        if prev_root != item.source_root_key:
+            out.append(key)
+            continue
+        selected = _rc.select_container(item.source_path)
+        if (selected is None or selected.kind != _rc.PLAIN
+                or prev_kind not in (None, _rc.PLAIN)):
+            continue
+        fp = selected.fingerprint
+        if (_ingest_frontier.source_identity_replaced(
+                prev_dev, prev_ino, fp.device, fp.inode)
+                or fp.size < int(prev_size or 0)):
+            out.append(key)
+    return sorted(out)
+
+
+def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult:
+    """Perform resets a budgeted walk deferred, off the hook (#968 spec 5.8).
+
+    One admitted, unbudgeted targeted sync per candidate; the sync's own
+    decision chain runs the existing reset (journal, incarnation, account
+    ranges and derived rows atomic) because the path is an executor path.
+    """
+    import _lib_codex_drain_admission as adm
+    worker = _worker_lock(CODEX_VERIFY_DRAIN_LOCK_NAME)
+    if worker is None:
+        return ResetDrainResult("busy", 0, 0, 0)
+    reset = unchanged = yielded = 0
+    discovery = _CodexPruneDiscoveryCache()
+    try:
+        for path in _codex_reset_candidates():
+            while True:
+                conn = open_cache_db()
+                snap = _load_cursor_snapshot(conn, "codex_session_files", path)
+                current = _load_codex_session_files_rows(conn, [path]).get(path)
+                selected = _rc.select_container(path)
+                qualified = _qualify_codex_targets({path})
+                _roots, scope = discovery.prepare()
+                # A scan is not permission: retain #485 protection and leave
+                # new container transitions to the verification executor. The
+                # post-lock callback revalidates this complete cursor/generation
+                # snapshot and the live scope before any durable effect.
+                if (snap is None or current is None or selected is None
+                        or not qualified
+                        or _codex_container_decision(
+                            selected, _accepted_container(
+                                current, ext=15, mtime=1, device=13, inode=14),
+                            executor_path=False, should_stop=None).action != "read"
+                        or scope.refusal_reason(path, snap.root_key) is not None
+                        or scope.refusal_reason(
+                            path, qualified[0].source_root_key) is not None):
+                    conn.close()
+                    unchanged += 1
+                    break
+                stale = [False]
+
+                def recheck():
+                    if adm.fresh_requests(_cctally_core.APP_DIR):
+                        return True
+                    again = _rc.select_container(path)
+                    qualified_now = _qualify_codex_targets({path})
+                    _roots, current_scope = discovery.prepare()
+                    stale[0] = (
+                        again is None or again.fingerprint != selected.fingerprint
+                        or _load_cursor_snapshot(
+                            conn, "codex_session_files", path) != snap
+                        or not qualified_now
+                        or qualified_now[0].source_root_key
+                        != qualified[0].source_root_key
+                        or current_scope.refusal_reason(path, snap.root_key)
+                        is not None
+                        or current_scope.refusal_reason(
+                            path, qualified[0].source_root_key) is not None)
+                    return stale[0]
+
+                admission = adm.admit(_cctally_core.APP_DIR,
+                                      lambda: "sync-owns-locks",
+                                      lambda token: None)
+                if not admission.admitted:
+                    conn.close()
+                    yielded += 1
+                    if not wait_for_requests:
+                        return ResetDrainResult("yielded", reset, unchanged, yielded)
+                    _drain_backoff(adm)
+                    continue
+                try:
+                    try:
+                        stats = sync_codex_cache(
+                            conn, maintenance="caller", lock_timeout=0,
+                            only_paths={path}, executor_paths=frozenset({path}),
+                            _after_locks=recheck)
+                    finally:
+                        conn.close()
+                finally:
+                    adm.finish(admission, lambda token: None)
+                if stats.lock_contended:
+                    if stale[0]:
+                        unchanged += 1
+                        break
+                    yielded += 1
+                    if not wait_for_requests:
+                        return ResetDrainResult("yielded", reset, unchanged, yielded)
+                    _drain_backoff(adm)
+                    continue
+                if stats.files_reset_truncated:
+                    reset += 1
+                else:
+                    unchanged += 1
+                break
+        return ResetDrainResult("yielded" if yielded else "drained",
+                                reset, unchanged, yielded)
+    finally:
+        _release_worker_lock(worker)
+
+def cmd_codex_replay_drain_internal(args) -> int:
+    """Hidden worker for an armed byte-zero replay and container verification.
+
+    An existing replay marker or newly settled history provenance permits an
+    unbudgeted cache walk. Verification, membership scans and seals never arm
+    that destructive marker; explicit cache-sync shares these executors.
 
     Always returns 0: a detached worker's exit code is observed by nobody. A
     failure is written to ``hook-tick.log`` rather than swallowed, because the
@@ -7496,12 +10179,25 @@ def cmd_codex_replay_drain_internal(args) -> int:
         _hook_tick_log_rotate_if_needed()
 
     try:
+        history = run_codex_history_provenance_drain(wait_for_requests=True)
         conn = open_cache_db()
         try:
-            stats = sync_codex_cache(
-                conn, lock_timeout=CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS)
+            stats = CodexIngestStats()
+            if ((history.outcome == "settled" and history.candidates)
+                    or conn.execute("SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+                                    (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone()):
+                stats = sync_codex_cache(
+                    conn, maintenance="caller",
+                    lock_timeout=CODEX_REPLAY_DRAIN_LOCK_TIMEOUT_SECONDS)
         finally:
             conn.close()
+        if stats.rebuild_refused:
+            _log("refused", f"rebuild_refused={stats.rebuild_refused}")
+            return 0
+        verification = run_codex_container_verification_drain(wait_for_requests=True)
+        reset_result = run_codex_reset_drain(wait_for_requests=True)
+        scan = run_codex_barrier_membership_scan(wait_for_requests=True)
+        seal = run_codex_barrier_seal_drain(wait_for_requests=True)
     except Exception as exc:
         # This walk touches every rollout, so its `OSError`s carry the most
         # identifying paths of any worker on this path. `_hook_log_error_detail`
@@ -7521,7 +10217,14 @@ def cmd_codex_replay_drain_internal(args) -> int:
         "success",
         f"files={int(getattr(stats, 'files_processed', 0) or 0)} "
         f"torn={int(getattr(stats, 'files_deferred_torn', 0) or 0)} "
-        f"failed={int(getattr(stats, 'files_failed', 0) or 0)}")
+        f"failed={int(getattr(stats, 'files_failed', 0) or 0)} "
+        f"verify_adopted={verification.adopted} verify_ingested={verification.ingested} "
+        f"verify_reset={verification.reset} verify_unverified={verification.unverified} "
+        f"verify_pending={verification.pending} "
+        f"reset_done={reset_result.reset} reset_unchanged={reset_result.unchanged} "
+        f"barrier_proven={scan.proven} barrier_sealed={seal.sealed} "
+        f"barrier_remaining={seal.remaining} history={history.outcome} "
+        f"history_candidates={history.candidates} history_traced={history.traced}")
     return 0
 
 
@@ -7559,7 +10262,9 @@ def _codex_backlog_after(
 
     Stat'ed here rather than tracked incrementally: it runs once per budgeted
     tick over at most the discovered file count, and a running total would
-    drift the moment a file changed size mid-walk.
+    drift the moment a file changed size mid-walk. Compressed files use the
+    retained decoded target; a never-validated target counts as one file with
+    an unknown byte debt (zero known bytes), never as compressed bytes.
 
     ``existing`` is the PRE-walk cursor snapshot, so a file this tick already
     advanced would be measured from the offset it had before the tick started —
@@ -7581,10 +10286,18 @@ def _codex_backlog_after(
                     int(prev[0] or 0), int(prev[2] or 0),
                     True if complete is None else bool(int(complete)),
                 )
-        try:
-            size = item.source_path.stat().st_size
-        except OSError:
+        selected = _rc.select_container(item.source_path)
+        if selected is None:
             continue
+        if selected.kind == _rc.ZSTD:
+            if record is None:
+                # No validation has established a decoded target yet. Count
+                # the unread file without inventing bytes from frame size.
+                pending_files += 1
+                continue
+            size = record[0]
+        else:
+            size = selected.fingerprint.size
         if record is None:
             offset = 0
         else:
@@ -7598,7 +10311,7 @@ def _codex_backlog_after(
     return pending_files, pending_bytes
 
 
-def sync_codex_cache(
+def _sync_codex_cache_locked(
     conn: sqlite3.Connection,
     *,
     progress: Callable[[CodexIngestStats], None] | None = None,
@@ -7608,6 +10321,10 @@ def sync_codex_cache(
     budget_seconds: "float | None" = None,
     active_transcript_path: "str | None" = None,
     quota_reconcile: str = "auto",
+    executor_paths: "frozenset[str]" = frozenset(),
+    executor_resets: "frozenset[str]" = frozenset(),
+    executor_verified_prefixes: "frozenset[str]" = frozenset(),
+    _after_locks: "Callable[[], bool] | None" = None,
     _on_first_file_rollback: Callable[[], None] | None = None,
     _on_file_committed: Callable[[str], None] | None = None,
     _on_file_prepared: Callable[[str], None] | None = None,
@@ -7702,6 +10419,9 @@ def sync_codex_cache(
         if acquired is None:
             eprint("[codex-cache] sync already in progress; using existing cache")
             stats.lock_contended = True
+            return stats
+        if _after_locks is not None and _after_locks():
+            stats.lock_contended = stats.drain_yielded = True
             return stats
         # #901 §5.3c (W9): a sync writer owns its checkpoints.
         _wal_checkpoint.arm(conn)
@@ -7821,11 +10541,11 @@ def sync_codex_cache(
                 if not _path or not _root_key:
                     continue
                 try:
-                    rebuild_known_identities.add(codex_file_key(
-                        str(_root_key),
-                        str(_canonical_codex_path(pathlib.Path(str(_path))))))
+                    rebuild_known_identities.add(
+                        codex_file_key_for_entry_path(_root_key, _path))
                 except (ValueError, TypeError, OSError):
                     continue
+            rebuild_known_identities |= _codex_history_identities(conn)
         if rebuild and not targeted:
             # #485: rebuild used to clear first and discover second. With an
             # empty/missing/misconfigured root that made the explicit repair
@@ -7865,6 +10585,18 @@ def sync_codex_cache(
                 stats.prune_refused_files = len({
                     path for path, _root in refused_sources
                 })
+                return stats
+            refusal = _codex_compressed_rebuild_refusal(preflight_files)
+            if refusal is not None:
+                stats.rebuild_refused = refusal
+                stats.files_total = len(preflight_files)
+                stats.container_skipped[refusal] = sum(
+                    f.container_kind == _rc.ZSTD for f in preflight_files)
+                _record_codex_container_status(conn, stats, census_complete=False)
+                conn.commit()
+                # Refusal did no walk or destructive work. Its retained
+                # coverage evidence and every pending replay marker survive.
+                walk_marker_owed = False
                 return stats
         if rebuild:
             # Clear INSIDE the lock — see sync_cache() for the full
@@ -8045,32 +10777,20 @@ def sync_codex_cache(
             refused_root_keys = prune_plan.refused_root_keys
             protected_paths = {path for path, _root in refused_sources}
             if safe_sources or safe_root_keys:
-                before_prune = conn.total_changes
-                # #294 S6: capture the conversation keys the orphan rows belong to
-                # BEFORE deleting, so the rollups can be repaired/deleted after.
-                orphan_keys: set = set()
-                for orphan_path, orphan_root_key in safe_sources:
-                    orphan_keys.update(
-                        row[0] for row in conn.execute(
-                            "SELECT DISTINCT conversation_key FROM codex_conversation_messages "
-                            "WHERE source_path = ?", (orphan_path,)) if row[0])
-                    _delete_codex_file_derived_rows(
-                        conn,
-                        orphan_path,
-                        source_root_key=orphan_root_key,
-                        match_source_root=True,
-                    )
-                _prune_inactive_codex_source_roots(
-                    conn, active_root_keys,
-                    candidate_root_keys=safe_root_keys,
-                )
-                # Recompute-affected-or-delete the rollups the prune touched (§3.2):
-                # a conversation with no surviving rows loses its rollup, one that
-                # survives in another file is recomputed from the survivors.
-                _recompute_codex_rollups(conn, orphan_keys)
-                if conn.total_changes != before_prune:
-                    _bump_codex_physical_mutation_seq(conn)
-                stats.files_pruned = len({path for path, _root in safe_sources})
+                # #968 spec 5.7, I6: the walk NEVER deletes orphans. It records
+                # each planned logical identity as durable debt and requests
+                # the single-flight `_codex-prune-drain` worker after its locks
+                # are released. A root-only plan (no orphan child, an inactive
+                # root the #485 partition proved safe) also hands its cleanup
+                # to the executor, which recomputes that partition under its
+                # own admission and runs root cleanup after child cleanup
+                # (review P3-1: the root-only case is kept, never dropped).
+                if safe_sources:
+                    _record_codex_prune_debt(conn, safe_sources)
+                if safe_root_keys:
+                    _set_cache_meta(conn, CODEX_PRUNE_ROOT_CLEANUP_KEY, "1")
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
             if refused_sources or refused_root_keys:
                 _codex_prune_refusal_record(
                     conn,
@@ -8115,7 +10835,7 @@ def sync_codex_cache(
                     "last_session_id, last_model, last_total_tokens, source_root_key, "
                     "last_native_thread_id, last_root_thread_id, last_parent_thread_id, "
                     "last_conversation_key, last_turn_id, ingest_complete, "
-                    "device_id, inode "
+                    "device_id, inode," + _CODEX_CONTAINER_SELECT + ",container_resume_strikes "
                     "FROM codex_session_files"
                 )
             }
@@ -8131,6 +10851,9 @@ def sync_codex_cache(
         # here is skipped, not declined — the per-file loop clean-drops it.
         if targeted:
             for discovered in files:
+                if str(discovered.source_path) in executor_paths:
+                    # Off-hook executors decide their resets under these locks.
+                    continue
                 prev = existing.get(str(discovered.source_path))
                 if prev is None:
                     continue  # brand-new file: nothing to shrink/requalify
@@ -8139,11 +10862,14 @@ def sync_codex_cache(
                 if prev_root_key != discovered.source_root_key:
                     stats.deferred_reason = "requalification"
                     return stats
-                try:
-                    cur_size = discovered.source_path.stat().st_size
-                except OSError:
-                    continue  # vanished post-qualify → clean-drop in the loop
-                if cur_size < prev_size:
+                selected = _rc.select_container(discovered.source_path)
+                if (selected is None or selected.kind != _rc.PLAIN
+                        or prev[15] != _rc.PLAIN):
+                    # Container transitions are held by the per-file decision;
+                    # physical sizes never establish decoded truncation.
+                    continue
+                cur_size = selected.fingerprint.size
+                if cur_size < prev_size and str(discovered.source_path) not in executor_paths:
                     stats.deferred_reason = "truncation"
                     return stats
 
@@ -8249,7 +10975,7 @@ def sync_codex_cache(
         w11_deferred: "list[_CodexPreparedFile]" = []
         # Attribution decisions this call journaled for a file it had to
         # prepare again: the durable decision is reused, never re-decided.
-        w11_journaled: "dict[tuple[str, int], tuple[int, str | None]]" = {}
+        w11_journaled: "dict[tuple[str, int], tuple[tuple[int, str | None], str]]" = {}
         # Whole-transaction losses per file, so a persistent one ends.
         w11_losses: "dict[str, int]" = {}
         walk_queue = collections.deque(enumerate(walk))
@@ -8509,6 +11235,11 @@ def sync_codex_cache(
         # the loop stays flat, mirroring sync_cache's walk seam.
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
+        pending_marks: list[tuple[str, str, str]] = []
+        strike_marks: list[tuple[str, int]] = []
+        barrier_holds: list = []
+        barrier_touched: set[str] = set()
+        history = _CodexHistoryContext(conn)
         for _walk_index, discovered in _walk_items():
             # The budget is checked BEFORE a file is opened, so a tick either
             # commits a file whole (or to a recorded partial offset) or does not
@@ -8525,16 +11256,58 @@ def sync_codex_cache(
                 # filesystem state: neither truncation/requalification reset
                 # nor append ingestion may replace the retained generation.
                 continue
-            try:
-                st = jp.stat()
-            except OSError as exc:
-                eprint(f"[codex-cache] stat failed for {jp}: {exc}")
+            selected = _rc.select_container(jp)
+            if selected is None:
+                eprint(f"[codex-cache] stat failed for {jp}: no container")
                 stats.files_failed += 1
                 continue
-
-            size = st.st_size
-            mtime_ns = st.st_mtime_ns
+            _fp = selected.fingerprint
+            st = _CodexContainerStat(_fp.size, _fp.mtime_ns, _fp.device, _fp.inode)
             prev = existing.get(path_str)
+            accepted = (None if prev is None else _accepted_container(
+                prev, ext=15, mtime=1, device=13, inode=14))
+            history_rollout = False
+            if prev is None and selected.kind != _rc.PLAIN:
+                verdict = history.classify(
+                    conn, codex_file_identity(discovered), path_str,
+                    known=rebuild_known_identities if rebuild else ())
+                if verdict == "unknown":
+                    # Untraced compressed history waits for the off-hook
+                    # journal census before decoding or first-ingest decisions.
+                    stats.container_reads_held += 1
+                    stats.container_skipped["verification-pending"] = (
+                        stats.container_skipped.get("verification-pending", 0) + 1)
+                    stats.drain_requested = tuple(sorted(
+                        set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
+                    continue
+                history_rollout = verdict == "history"
+            try:
+                container_decision = _codex_container_decision(
+                    selected, accepted, executor_path=path_str in executor_paths,
+                    should_stop=(lambda: deadline is not None and _walk_clock() >= deadline))
+            except _rc.ContainerReadInterrupted:
+                stats.budget_exhausted = True
+                unwalked = list(walk[_walk_index:])
+                break
+            if container_decision.action == "pending":
+                if prev is not None:
+                    barrier_holds.append((path_str, discovered.source_root_key,
+                                          _codex_walk_hold(selected, None), _fp))
+                pending_marks.append((path_str, _fp.to_json(), container_decision.reason))
+                stats.container_pending += 1
+                continue
+            if container_decision.action == "skip":
+                reason = container_decision.reason
+                hold = _codex_walk_hold(selected, reason)
+                if prev is not None or hold in _barrier.SUSPENSION_HOLDS:
+                    barrier_holds.append((path_str, discovered.source_root_key,
+                                          hold, _fp))
+                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                if selected.kind == _rc.ZSTD and prev is None:
+                    stats.container_reads_held += 1
+                continue
+            size = int(container_decision.size)
+            mtime_ns = st.st_mtime_ns
             start_offset = 0
             # public #5: the byte length this pass COMMITS to scanning, which
             # `codex_session_files.size_bytes` records and `ingest_complete`
@@ -8566,7 +11339,7 @@ def sync_codex_cache(
                     prev_root_key, prev_native_thread_id, prev_root_thread_id,
                     prev_parent_thread_id, prev_conversation_key, prev_turn_id,
                     prev_complete, prev_device, prev_inode,
-                ) = prev
+                ) = prev[:15]
                 prev_total_tokens = (
                     int(prev_ttot) if prev_ttot is not None else None
                 )
@@ -8597,7 +11370,27 @@ def sync_codex_cache(
                 # skipped on equality, which made the unread suffix permanently
                 # invisible on any rollout that never grows again.
                 incomplete = prev_complete is not None and not int(prev_complete)
-                if targeted and (requalified or replaced or size < prev_size):
+                if path_str in executor_resets:
+                    truncated = True
+                    start_offset = 0
+                    initial_session_id = initial_model = None
+                    initial_total_tokens = 0
+                    prev_total_tokens = None
+                    prev_native_thread_id = prev_root_thread_id = None
+                    prev_parent_thread_id = prev_conversation_key = prev_turn_id = None
+                elif (path_str in executor_verified_prefixes
+                      and not requalified and not replaced
+                      and prev_offset <= size < prev_size):
+                    # Only the verification verdict proves prefix equivalence;
+                    # a reset-drain candidate is not evidence of that proof.
+                    # Losing only an unconsumed torn suffix is not a reset:
+                    # finish at the new decoded target with the retained seeds.
+                    start_offset = prev_offset
+                    scan_target = size
+                    initial_session_id, initial_model = prev_sid, prev_model
+                    initial_total_tokens = prev_total_tokens or 0
+                elif targeted and path_str not in executor_paths and (
+                        requalified or replaced or size < prev_size):
                     # §5.1 preflight-snapshot scoped: a shrink, a requalification
                     # or a replacement landing AFTER the preflight is declined
                     # HERE, per file — the whole-call preflight above compares
@@ -8612,7 +11405,7 @@ def sync_codex_cache(
                     # — that whole-cache-affecting escalation is the full sync's.
                     stats.files_failed += 1
                     continue
-                if (
+                elif (
                     not requalified and not replaced and incomplete
                     and size >= prev_offset
                 ):
@@ -8634,6 +11427,13 @@ def sync_codex_cache(
                     # deferred.
                     start_offset = prev_offset
                     scan_target = min(size, prev_size)
+                    # The committed cursor is itself retained provenance for
+                    # this captured backlog, even when no durable attribution
+                    # decision ever covered it. A partial historical first
+                    # read must not become a live first-ingest decision on its
+                    # next slice. This ends with the stored target: subsequent
+                    # growth takes the ordinary delta-append branch below.
+                    history_rollout = True
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
@@ -8652,6 +11452,13 @@ def sync_codex_cache(
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
+                elif deadline is not None:
+                    # #968 5.8: decide before journal appends, incarnations,
+                    # attribution ranges, quota facts, or destructive writes.
+                    stats.files_deferred_reset += 1
+                    stats.drain_requested = tuple(sorted(
+                        set(stats.drain_requested) | {CODEX_REPLAY_DRAIN_COMMAND}))
+                    continue
                 else:
                     truncated = True
                     start_offset = 0
@@ -8700,9 +11507,8 @@ def sync_codex_cache(
             # W11: a decision this call already journaled for a file it is
             # preparing again (its batch had to be redone) is durable truth
             # that cache.db does not hold yet: replay it, never re-decide.
-            memo_decision = (
-                w11_journaled.get((file_identity, incarnation)) if w11
-                else None)
+            memo = (w11_journaled.get((file_identity, incarnation)) if w11 else None)
+            memo_decision = memo[0] if memo is not None else None
             if memo_decision is not None and memo_decision in account_ranges:
                 memo_decision = None
             if memo_decision is not None:
@@ -8711,6 +11517,7 @@ def sync_codex_cache(
             covered, decided_key = codex_account_for_offset(
                 account_ranges, start_offset)
             pending_decision: "tuple[int, str | None] | None" = None
+            pending_decided_at: "str | None" = None
 
             def _live_root_account():
                 """This root's active account, resolved at most once per sync."""
@@ -8793,6 +11600,10 @@ def sync_codex_cache(
                 # this is scoped by the pre-clear identity snapshot, so a rollout
                 # first SEEN during a rebuild still takes a normal decision.
                 file_account_key = None
+            elif history_rollout:
+                # Known history with no covering durable decision remains
+                # unattributed. Live authentication cannot reconstruct it.
+                file_account_key = None
             else:
                 # #341: resolve this root's active account (per-root auth.json
                 # stable-read, cached per sync). A torn read (auth.json
@@ -8851,6 +11662,7 @@ def sync_codex_cache(
                 model=initial_model,
                 total_tokens=initial_total_tokens,
             )
+            generation_gap_offset = None
             if start_offset > 0 and not truncated and not requalified:
                 prior_accounting = conn.execute(
                     "SELECT MAX(timestamp_utc),MAX(line_offset) "
@@ -8862,9 +11674,7 @@ def sync_codex_cache(
                     iter_state.last_accounting_timestamp = _parse_anchor_iso(
                         prior_accounting[0])
                 if prior_accounting is not None and prior_accounting[1] is not None:
-                    iter_state.generation_transition_pending = (
-                        _lib_jsonl._codex_generation_transition_between(
-                            path_str, int(prior_accounting[1]), start_offset))
+                    generation_gap_offset = int(prior_accounting[1])
             if (
                 prev is not None and not truncated and not requalified
                 and prev_native_thread_id is not None
@@ -8915,8 +11725,34 @@ def sync_codex_cache(
                     return True
                 return False
 
+            barrier_keys: dict = {}
             try:
-                with open(jp, "rb") as fh:
+                # The cache writer flocks keep this file's retained quota keys
+                # stable while it is buffered. Load the indexed path range once
+                # instead of repeating a natural-key seek for every raw row.
+                # Do not add buffered keys: the old probe saw committed rows
+                # only, including earlier file batches, never this file's buffer.
+                retained_quota_keys = (set(conn.execute(
+                    "SELECT line_offset, logical_limit_key "
+                    "FROM quota_window_snapshots "
+                    "WHERE source='codex' AND source_path=?", (path_str,)))
+                    if history_rollout else set())
+                if generation_gap_offset is not None:
+                    iter_state.generation_transition_pending = (
+                        _lib_jsonl._codex_generation_transition_between(
+                            path_str, generation_gap_offset, start_offset,
+                            open_stream=lambda: _rc.open_decoded(
+                                selected, should_stop=(lambda: file_deadline is not None
+                                                       and _walk_clock() >= file_deadline))))
+                start_anchor = (_rc.anchor_seed() if start_offset == 0 else
+                                accepted.anchor if accepted is not None
+                                and accepted.anchor_offset == start_offset else None)
+                with _rc.open_decoded(
+                    selected, should_stop=(lambda: file_deadline is not None
+                                           and _walk_clock() >= file_deadline),
+                ) as raw_fh:
+                    fh = _rc.LineAnchorRecorder(raw_fh, start_offset=start_offset,
+                                               start_anchor=start_anchor)
                     fh.seek(start_offset)
                     for emission in _iter_codex_fused_records_with_offsets(
                         fh,
@@ -8929,7 +11765,16 @@ def sync_codex_cache(
                         stop_before=_stop_before,
                     ):
                         event = emission.event
+                        _codex_barrier_collect(barrier_keys, emission)
                         for quota in emission.quotas:
+                            if history_rollout and (
+                                    quota.line_offset, quota.logical_limit_key
+                            ) in retained_quota_keys:
+                                # Journal-first INSERT OR IGNORE would reject
+                                # this raw fact. Do not let its conflicting
+                                # reset affect canonical anchors (including
+                                # another identity's retained rows) beforehand.
+                                continue
                             quota_rows.append((
                                 quota.source, quota.source_root_key,
                                 quota.source_path, quota.line_offset,
@@ -8994,6 +11839,17 @@ def sync_codex_cache(
                         ))
                         yielded_count += 1
                     final_offset = fh.tell()
+                    if (selected.kind == _rc.ZSTD
+                            and _rc.fingerprint_of(selected.path, selected.kind) != _fp):
+                        raise _rc.ContainerError("unstable-stat")
+                    # A prefix seek can finish its final chunk after the
+                    # deadline without raising. Count that ordinary budget
+                    # stop through the same no-progress handoff as an
+                    # interrupted decode, preserving the retained cursor.
+                    if (selected.kind == _rc.ZSTD and prev is not None
+                            and incomplete and stopped_short["value"]
+                            and final_offset == start_offset):
+                        raise _rc.ContainerReadInterrupted()
                     # #279 S2 F1: fold this file's iterator counters into the
                     # sync-level stats. iter_state is per-file, so += is
                     # exact. Folded inside the try: an OSError mid-read drops
@@ -9004,6 +11860,32 @@ def sync_codex_cache(
                     stats.token_events_skipped += iter_state.token_events_skipped
                     for _r, _n in iter_state.skip_reasons.items():
                         stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
+            except _rc.ContainerReadInterrupted:
+                if w11:
+                    _codex_w11_trace("prepare_drop", path_str)
+                    if w11_batch:
+                        walk_queue.extendleft(reversed(_w11_flush(final=False)))
+                anchor_resolver.discard_uncommitted_file()
+                strikes = int(prev[22] or 0) + 1 if prev is not None else 1
+                strike_marks.append((path_str, strikes))
+                stats.budget_exhausted = True
+                unwalked = list(walk[_walk_index:])
+                break
+            except _rc.ContainerError as exc:
+                if w11:
+                    _codex_w11_trace("prepare_drop", path_str)
+                    if w11_batch:
+                        walk_queue.extendleft(reversed(_w11_flush(final=False)))
+                anchor_resolver.discard_uncommitted_file()
+                reason = _container_skip_reason(exc.category)
+                hold = _codex_walk_hold(selected, reason)
+                if prev is not None or hold in _barrier.SUSPENSION_HOLDS:
+                    barrier_holds.append((path_str, discovered.source_root_key,
+                                          hold, _fp))
+                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                if selected.kind == _rc.ZSTD and prev is None:
+                    stats.container_reads_held += 1
+                continue
             except OSError as exc:
                 eprint(f"[codex-cache] could not read {jp}: {exc}")
                 if w11:
@@ -9016,6 +11898,28 @@ def sync_codex_cache(
                 anchor_resolver.discard_uncommitted_file()
                 stats.files_failed += 1
                 continue
+
+            _is_zstd = selected.kind == _rc.ZSTD
+            _anchor = fh.result(final_offset)
+            container_acceptance = CodexContainerAcceptance(
+                kind=selected.kind,
+                path=str(selected.path) if _is_zstd else None,
+                container_size_bytes=_fp.size if _is_zstd else None,
+                decoded_size_bytes=size if _is_zstd else None,
+                content_anchor=_anchor,
+                content_anchor_offset=final_offset if _anchor is not None else None,
+            )
+
+            barrier_read = CodexBarrierRead(
+                identity=file_identity, source_path=path_str,
+                source_root_key=discovered.source_root_key,
+                kind=selected.kind,
+                generation=_rc.generation_token(
+                    _fp, size if selected.kind == _rc.ZSTD else None),
+                scan_target=scan_target, start_offset=start_offset,
+                final_offset=final_offset,
+                reached_target=not stopped_short["value"],
+                keys=barrier_keys, touched=barrier_touched)
 
             # Pull terminal session_id/model from the iterator's tracker.
             # This picks up updates from session_meta / turn_context events
@@ -9073,13 +11977,18 @@ def sync_codex_cache(
             decision_journaled = False
             if pending_decision is None and memo_decision is not None:
                 pending_decision = memo_decision
+                pending_decided_at = memo[1]
                 decision_journaled = True
             if pending_decision is not None and not decision_journaled:
                 decision_offset, decision_key = pending_decision
+                # The durable decision has ONE timestamp. Buffer and reuse it
+                # through both savepoint retry and whole-batch re-preparation;
+                # materialization must be byte-equal to subsequent replay.
+                pending_decided_at = dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="seconds").replace("+00:00", "Z")
                 try:
                     _append_codex_file_account_decision(
-                        at=dt.datetime.now(dt.timezone.utc)
-                          .isoformat(timespec="seconds").replace("+00:00", "Z"),
+                        at=pending_decided_at,
                         root_scope=discovered.source_root_key,
                         file_identity=file_identity,
                         incarnation=incarnation,
@@ -9100,7 +12009,7 @@ def sync_codex_cache(
                     continue
                 if w11:
                     w11_journaled[(file_identity, incarnation)] = (
-                        pending_decision)
+                        pending_decision, pending_decided_at)
 
             # Task 7 Item 1: journal the Codex quota observations BEFORE the cache
             # write (and before the offset advances), under the codex flock this
@@ -9145,9 +12054,12 @@ def sync_codex_cache(
                         file_identity=file_identity,
                         incarnation=incarnation,
                         file_account_decision=pending_decision,
+                        file_account_decided_at=pending_decided_at,
                         ingest_complete=not stopped_short["value"],
                         device_id=st.st_dev,
                         inode=st.st_ino,
+                        container=container_acceptance,
+                        barrier=barrier_read,
                     ),
                     merges=anchor_resolver.take_pending_merges(),
                     reset_counted=bool(truncated or requalified),
@@ -9210,6 +12122,7 @@ def sync_codex_cache(
                         file_identity=file_identity,
                         incarnation=incarnation,
                         file_account_decision=pending_decision,
+                        file_account_decided_at=pending_decided_at,
                         anchor_resolver=anchor_resolver,
                         ingest_complete=not stopped_short["value"],
                         # The SAME pre-read stat that defined `scan_target`.
@@ -9217,6 +12130,8 @@ def sync_codex_cache(
                         # never have read (#769 S6).
                         device_id=st.st_dev,
                         inode=st.st_ino,
+                        container=container_acceptance,
+                        barrier=barrier_read,
                     )
                 except sqlite3.DatabaseError as exc:
                     conn.rollback()
@@ -9286,6 +12201,25 @@ def sync_codex_cache(
 
         if progress is not None and not w11:
             progress(stats)
+        if pending_marks:
+            _mark_codex_containers_pending(
+                conn, "codex_session_files", pending_marks, commit=not w11)
+        if strike_marks:
+            for path, strikes in strike_marks:
+                if strikes >= 2:
+                    _mark_codex_containers_pending(
+                        conn, "codex_session_files", [(path, "", "resume-budget")])
+                    stats.container_pending += 1
+                    barrier_holds.append((path, None, _barrier.PENDING_HOLD, None))
+                else:
+                    conn.execute("UPDATE codex_session_files SET container_resume_strikes=? WHERE path=?",
+                                 (strikes, path))
+            conn.commit()
+        if barrier_holds:
+            barrier_touched |= _codex_barrier_apply_holds(conn, barrier_holds)
+        if (stats.container_pending
+                or stats.container_skipped.get("verification-pending", 0)):
+            stats.drain_requested = tuple(sorted(set(stats.drain_requested) | {"_codex-replay-drain"}))
         _p_walk.__exit__(None, None, None)
         # public #5: did this walk actually reach every discovered file? The
         # end-of-walk markers below describe the WHOLE TREE, and a budget stop
@@ -9452,6 +12386,7 @@ def sync_codex_cache(
                         and not stats.prune_refused
                         and (
                             stats.files_processed + stats.files_skipped_unchanged
+                + sum(stats.container_skipped.values())
                             == stats.files_total
                         )
                     ):
@@ -9644,7 +12579,18 @@ def sync_codex_cache(
                         deferred_cert_sigs = dict(certificate[1])
                     else:
                         project_after_unlock = True
-        stats.full_walk_complete = bool(
+        if not targeted:
+            # #968 spec 5.7: debt recorded by this walk or an earlier one
+            # withholds the certificate. One indexed COUNT(*), taken here for
+            # every non-targeted walk (the prune block commits only a
+            # non-empty plan); an earlier walk's leftover debt re-requests the
+            # worker too.
+            stats.prune_debt_pending = int(conn.execute(
+                "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0])
+            if stats.prune_debt_pending:
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
+        walk_clean = bool(
             not targeted
             and walk_complete
             and stats.files_failed == 0
@@ -9652,11 +12598,18 @@ def sync_codex_cache(
             and not stats.prune_refused
             and not stats.maintenance_failed
             and not w11_lost
+            and not stats.files_deferred_reset
+            and not stats.container_pending
+            and not stats.container_reads_held
             and (
                 stats.files_processed + stats.files_skipped_unchanged
+                + sum(stats.container_skipped.values())
                 == stats.files_total
             )
         )
+        stats.full_walk_complete = walk_clean and not stats.prune_debt_pending
+        # Review N3: clean except for pending prune debt.
+        stats.full_walk_debt_only = walk_clean and bool(stats.prune_debt_pending)
         if not targeted:
             with _codex_finalization_stage(conn):
                 if stats.full_walk_complete:
@@ -9670,6 +12623,30 @@ def sync_codex_cache(
                         "DELETE FROM cache_meta WHERE key=?",
                         (_ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY,),
                     )
+                barrier_census = bool(
+                    walk_complete and stats.files_failed == 0
+                    and stats.files_deferred_torn == 0 and not w11_lost
+                    and stats.files_processed + stats.files_skipped_unchanged
+                    + sum(stats.container_skipped.values())
+                    + stats.container_pending == stats.files_total)
+                _set_cache_meta_if_changed(conn, CODEX_BARRIER_CENSUS_KEY,
+                                           "1" if barrier_census else "0")
+                history.finish(conn)
+                if deadline is None or stats.full_walk_complete:
+                    # Review N3: only an unbudgeted walk, or one that
+                    # certifies, moves the debt-only token, so a hook's
+                    # budget-stopped walk never cancels a frontier's hold.
+                    _stamp_codex_debt_only_walk(
+                        conn, _ingest_frontier.CODEX_FULL_WALK_DEBT_ONLY_KEY,
+                        _ingest_frontier.debt_only_refusal(
+                            _ingest_frontier.provider_sync_certifiable,
+                            "full", stats))
+        with _codex_finalization_stage(conn):
+            _record_codex_container_status(
+                conn, stats, census_complete=(not targeted and walk_complete
+                                              and not stats.files_failed
+                                              and not stats.prune_refused
+                                              and not stats.files_deferred_torn))
         # #901 §5.3c (W8): the one commit of the finalization transaction:
         # resume and backlog state, parse health, the walk's markers, the
         # ordered maintenance stages and the completion marker — and, under
@@ -9688,6 +12665,8 @@ def sync_codex_cache(
         walk_marker_owed = False
         for note in finalization_notes:
             eprint(note)
+        _codex_barrier_after_walk(conn, stats, targeted=targeted,
+                                  deadline=deadline, touched=barrier_touched)
         # Codex creates/extends cache.db sidecars independently of Claude's
         # sync path. Harden them while both cache flocks are still held and
         # after all Codex writes, before the optional checkpoint can rotate a
@@ -9746,6 +12725,50 @@ def sync_codex_cache(
         with _perf.phase("projector"):
             reconcile_codex_quota_projection()
     return stats
+
+
+def sync_codex_cache(conn: sqlite3.Connection, *, maintenance: str = "defer",
+                     **kwargs) -> CodexIngestStats:
+    """Codex accounting ingest; see ``_sync_codex_cache_locked``.
+
+    #968 spec 5.7/5.5: maintenance the walk planned (prune debt, container
+    verification, deferred resets) is requested AFTER every lock is released.
+    ``maintenance="defer"`` (hooks, implicit reporting syncs) requests the
+    detached workers; ``maintenance="caller"`` (explicit ``cache-sync``) leaves
+    them to the caller, which drains synchronously through the same executors.
+    """
+    if maintenance not in ("defer", "caller"):
+        raise ValueError(f"unknown maintenance mode {maintenance!r}")
+    stats = _sync_codex_cache_locked(conn, **kwargs)
+    if maintenance == "defer":
+        for command in stats.drain_requested:
+            _request_codex_drain_worker(command)
+    return stats
+
+
+def _request_codex_drain_worker(command: str) -> str:
+    """Attempt-throttled detached spawn of one drain worker (no inline fallback)."""
+    if command == CODEX_PRUNE_DRAIN_COMMAND:
+        marker_name = CODEX_PRUNE_DRAIN_MARKER_NAME
+        throttle = CODEX_PRUNE_DRAIN_SPAWN_THROTTLE_SECONDS
+    elif command == CODEX_REPLAY_DRAIN_COMMAND:
+        return _defer_codex_replay_drain()
+    else:
+        raise ValueError(command)
+    marker = _cctally_core.APP_DIR / marker_name
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        age = None
+    if age is not None and 0 <= age < throttle:
+        return "throttled"
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        return "failed"
+    from _cctally_update import _spawn_detached
+    return "spawned" if _spawn_detached(command) else "failed"
 
 
 _CODEX_ACCOUNT_WEEK = dt.timedelta(
@@ -9981,6 +13004,17 @@ def apply_codex_window_spend_adoption(
 # already at its correct owner is not rewritten.
 
 
+def _codex_stored_identity_path(source_path) -> pathlib.Path:
+    """The canonical logical path discovery derives for a stored path: the
+    selected container, canonicalized, then normalized to its logical form
+    (Task 3), so a compressed or symlinked container keeps its identity."""
+    logical = pathlib.Path(str(source_path))
+    selected = _rc.select_container(logical)
+    target = selected.path if selected is not None else logical
+    return _rc.logical_path(_canonical_codex_path(target))
+
+
+
 def codex_file_key_for_entry_path(
     source_root_key: str, source_path: str,
 ) -> str:
@@ -9995,8 +13029,260 @@ def codex_file_key_for_entry_path(
 
     return codex_file_key(
         str(source_root_key),
-        str(_canonical_codex_path(pathlib.Path(str(source_path)))),
+        str(_codex_stored_identity_path(source_path)),
     )
+
+
+#: #968 spec 5.11 (Attribution), review P1-3: the one-time reconciliation of
+#: compressed history with journal-retained provenance. Absent: unsettled
+#: (every store an unfixed binary wrote). Present: JSON
+#: {"journalHighWater": [segment, offset] | null, "traced": [paths]}, where
+#: ``traced`` lists the logical paths a journal-retained quota observation
+#: named that no cursor holds yet.
+CODEX_HISTORY_PROVENANCE_KEY = "codex_history_provenance"
+
+
+def _codex_history_marker(conn) -> "dict | None":
+    """The marker's payload, or None when unsettled. Unreadable reads as
+    unsettled: the walk then holds, never guesses."""
+    row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                       (CODEX_HISTORY_PROVENANCE_KEY,)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(
+            payload.get("traced"), list):
+        return None
+    return payload
+
+
+def _store_codex_history_marker(conn, payload: dict, *, replace: bool) -> None:
+    verb = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
+    conn.execute(
+        f"{verb} INTO cache_meta(key, value) VALUES (?, ?)",
+        (CODEX_HISTORY_PROVENANCE_KEY,
+         json.dumps(payload, separators=(",", ":"), sort_keys=True)))
+
+
+def _codex_ledger_paths(conn) -> "frozenset[str]":
+    """Every path the bounded accounting ledger still names: a positive signal
+    only, read at most once per walk (the ledger has no path index, so a
+    per-file lookup would scan it once per rollout)."""
+    return frozenset(r[0] for r in conn.execute(
+        "SELECT source_path FROM codex_accounting_change_log "
+        "WHERE change_kind='path'") if r[0])
+
+
+def _codex_has_history_provenance(conn, identity: str, path: str, *,
+                                  ledger_paths) -> bool:
+    """Does cache.db still hold a trace of this rollout's history?
+
+    No prune deletes an incarnation or a file-account decision. Decisions
+    are journaled and replay recreates them; incarnations are cache-resident,
+    and replay recreates one only for an identity with a journaled decision
+    (review N7), so after ``rm cache.db`` an identity whose only trace was its
+    incarnation has none here and is history only if the journal pass traced
+    it. A quota row survives where no prune ran, or where a stats rebuild
+    re-materialized it from the journal; the ledger is the bounded extra
+    signal. Each lookup is a primary-key or unique-index seek.
+    """
+    for sql, arg in (
+            ("SELECT 1 FROM codex_file_incarnations WHERE file_identity=?",
+             identity),
+            ("SELECT 1 FROM codex_file_accounts WHERE file_identity=? LIMIT 1",
+             identity),
+            ("SELECT 1 FROM quota_window_snapshots WHERE source='codex' "
+             "AND source_path=? LIMIT 1", path)):
+        if conn.execute(sql, (arg,)).fetchone() is not None:
+            return True
+    return path in ledger_paths
+
+
+def _codex_history_identities(conn) -> "set[str]":
+    """Rebuild only: every identity an incarnation row or the ledger names."""
+    known = {r[0] for r in conn.execute(
+        "SELECT file_identity FROM codex_file_incarnations")}
+    seen: set = set()
+    for root_key, path in conn.execute(
+            "SELECT source_root_key, source_path FROM codex_accounting_change_log "
+            "WHERE change_kind='path'"):
+        if not path or (root_key, path) in seen:
+            continue
+        seen.add((root_key, path))
+        try:
+            known.add(codex_file_key_for_entry_path(root_key or "", path))
+        except (ValueError, TypeError, OSError):
+            continue
+    return known
+
+
+class _CodexHistoryContext:
+    """One walk's provenance state, read once before the walk loop."""
+
+    __slots__ = ("payload", "traced", "settle_on_finish", "ledger_paths",
+                 "consulted")
+
+    def __init__(self, conn):
+        import _cctally_journal as _jr
+        self.payload = _codex_history_marker(conn)
+        self.traced = (None if self.payload is None
+                       else frozenset(str(p) for p in self.payload["traced"]))
+        # Read BEFORE this walk appends anything: with no journal at all there
+        # is no journal-retained provenance to find, so the store is settled.
+        self.settle_on_finish = (self.payload is None
+                                 and _jr.journal_high_water() is None)
+        self.ledger_paths = None
+        self.consulted = False
+
+    def classify(self, conn, identity: str, path: str, *, known=()) -> str:
+        """``"history"``, ``"new"`` or ``"unknown"`` for a compressed rollout
+        with no cursor."""
+        if self.payload is None and not self.settle_on_finish:
+            # Before raw INSERT OR IGNORE can win, restore any independently
+            # journal-retained quota stamp. A prefix attribution decision does
+            # not certify quota recovery: rebuilding rehydrates that decision
+            # before this walk, whereas a detached drain can arrive before it.
+            # Both entrypoints must recover the same journal-first population.
+            return "unknown"
+        if identity in known:
+            return "history"
+        if self.traced is not None and path in self.traced:
+            self.consulted = True
+            return "history"
+        if self.ledger_paths is None:
+            self.ledger_paths = _codex_ledger_paths(conn)
+        if _codex_has_history_provenance(conn, identity, path,
+                                         ledger_paths=self.ledger_paths):
+            return "history"
+        if self.traced is not None or self.settle_on_finish:
+            return "new"
+        return "unknown"
+
+    def finish(self, conn) -> None:
+        """Inside the non-targeted walk's finalization stage: settle a store
+        that had no journal, or drop traced paths that now have a cursor."""
+        if self.settle_on_finish:
+            _store_codex_history_marker(
+                conn, {"journalHighWater": None, "traced": []}, replace=False)
+            return
+        if not (self.consulted and self.traced):
+            return
+        remaining = sorted(
+            p for p in self.traced if conn.execute(
+                "SELECT 1 FROM codex_session_files WHERE path=? LIMIT 1",
+                (p,)).fetchone() is None)
+        if len(remaining) != len(self.traced):
+            _store_codex_history_marker(
+                conn, dict(self.payload, traced=remaining), replace=True)
+
+class ProvenanceDrainResult(NamedTuple):
+    outcome: str     # "settled", "already-settled", "busy" or "yielded"
+    candidates: int  # held rollouts: compressed, no cursor, no cache trace
+    traced: int      # of them, the ones a journal-retained observation names
+
+
+def _codex_history_candidates() -> "list[str]":
+    """Read-only: the logical paths an unsettled walk holds."""
+    files = _discover_codex_files_with_roots()
+    conn = open_cache_db()
+    try:
+        cursors = {r[0] for r in conn.execute(
+            "SELECT path FROM codex_session_files")}
+        out: list[str] = []
+        for item in files:
+            key = str(item.source_path)
+            if key in cursors:
+                continue
+            selected = _rc.select_container(item.source_path)
+            if selected is None or selected.kind == _rc.PLAIN:
+                continue
+            # File-account coverage cannot witness quota coverage. Include
+            # every cursorless compressed identity until this census settles,
+            # even if an earlier sync already replayed its prefix decision.
+            out.append(key)
+        return sorted(out)
+    finally:
+        conn.close()
+
+
+def run_codex_history_provenance_drain(
+        *, wait_for_requests: bool = True) -> ProvenanceDrainResult:
+    """Settle provenance and retained quota before historical raw ingestion.
+
+    One journal scan outside all cache locks, then one existing drain-gated
+    transaction per logical identity. Canonical file decisions apply first;
+    the existing quota applier owns attribution precedence, normalization and
+    reset anchors. Yield/refusal never settles a partially applied population.
+    """
+    import _cctally_journal as _jr
+    worker = _worker_lock(CODEX_VERIFY_DRAIN_LOCK_NAME)
+    if worker is None:
+        return ProvenanceDrainResult("busy", 0, 0)
+    try:
+        probe = open_cache_db()
+        try:
+            if _codex_history_marker(probe) is not None:
+                return ProvenanceDrainResult("already-settled", 0, 0)
+        finally:
+            probe.close()
+        candidates = _codex_history_candidates()
+        prepared = {str(item.source_path): item
+                    for item in _qualify_codex_targets(set(candidates))}
+        if set(prepared) != set(candidates):
+            return ProvenanceDrainResult("yielded", len(candidates), 0)
+        identities = {path: codex_file_identity(item)
+                      for path, item in prepared.items()}
+        traced, high_water, quotas, decisions = _jr._codex_journal_history_evidence(
+            candidates, identities=identities.values(), capture=True)
+        for path in candidates:
+            item, identity = prepared[path], identities[path]
+            # Codex legacy normalization is independent of Claude's cutover
+            # account (_decoded_quota_stream's contract). Decode per identity
+            # outside writer locks; no journal traversal occurs in the apply.
+            records = list(_jr._decoded_quota_stream(quotas.get(path, ()), None))
+            file_ops = decisions.get(identity, ())
+
+            def apply(conn, path=path, item=item, identity=identity,
+                      records=records, file_ops=file_ops):
+                live = _qualify_codex_targets({path})
+                if (len(live) != 1
+                        or live[0].source_root_key != item.source_root_key
+                        or codex_file_identity(live[0]) != identity
+                        or live[0].container_fingerprint != item.container_fingerprint):
+                    return False
+                if conn.execute("SELECT 1 FROM codex_session_files WHERE path=?",
+                                (path,)).fetchone() is not None:
+                    return False  # another writer moved the captured population
+                before = conn.total_changes
+                _jr._apply_file_account_records(conn, file_ops)
+                _jr._apply_quota_records(conn, records, quiet=True)
+                if conn.total_changes != before:
+                    # Preserve triggers/change ledgers; no partial recovery
+                    # mints journal coverage or leaves old coverage standing.
+                    _invalidate_codex_journal_coverage_certificate(conn)
+                    _bump_codex_physical_mutation_seq(conn)
+                return True
+
+            admitted, applied = _codex_admitted_cache_write(
+                apply, wait_for_requests=wait_for_requests)
+            if not admitted or not applied:
+                return ProvenanceDrainResult("yielded", len(candidates), len(traced))
+        # A changed inventory is retried from one new captured census; never
+        # certify a subset because identities arrived or moved during the scan.
+        if set(_codex_history_candidates()) != set(candidates):
+            return ProvenanceDrainResult("yielded", len(candidates), len(traced))
+        payload = {"journalHighWater": list(high_water) if high_water else None,
+                   "traced": sorted(traced)}
+        written, _ = _codex_admitted_cache_write(
+            lambda conn: _store_codex_history_marker(conn, payload, replace=False),
+            wait_for_requests=wait_for_requests)
+        return ProvenanceDrainResult("settled" if written else "yielded",
+                                     len(candidates), len(traced))
+    finally:
+        _release_worker_lock(worker)
 
 
 class _CodexFileBaselineResolver:
@@ -10273,6 +13559,7 @@ def iter_codex_entries(
     range_end: dt.datetime,
     *,
     account_key: "str | None" = None,
+    current_roots_only: bool = False,
 ) -> list[CodexEntry]:
     """Return cached CodexEntry rows with timestamp in [range_start, range_end].
 
@@ -10280,13 +13567,27 @@ def iter_codex_entries(
     stamped entries for the per-account budget ladder; ``None`` (default) reads
     all accounts (merged / byte-identical). The ``unattributed`` sentinel matches
     the literal stamp OR a NULL ``account_key`` (read rule ``NULL ≡ unattributed``).
+
+    Administrative/rederive callers keep the default all-history view.
+    ``current_roots_only`` opts reporting into the currently configured roots,
+    independently of the registry that retains old roots until the drain.
+    As with cleanup, positive recognizable-root evidence is required before
+    withholding a retired root; unknown identities and relative fixtures stay.
     """
+    root_scope = (
+        _codex_prune_scope(_discover_codex_files_with_roots())
+        if current_roots_only else None
+    )
     start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
+    root_column = (
+        ", source_root_key"
+        if root_scope is not None and root_scope.recognized_root_keys else ""
+    )
     sql = (
         "SELECT timestamp_utc, session_id, model, "
         "input_tokens, cached_input_tokens, output_tokens, "
-        "reasoning_output_tokens, total_tokens, source_path "
+        "reasoning_output_tokens, total_tokens, source_path" + root_column + " "
         "FROM codex_session_entries "
         "WHERE timestamp_utc >= ? AND timestamp_utc <= ? "
     )
@@ -10302,6 +13603,14 @@ def iter_codex_entries(
     sql += "ORDER BY timestamp_utc ASC"
     entries: list[CodexEntry] = []
     for row in conn.execute(sql, params):
+        if (
+            root_scope is not None
+            and root_scope.recognized_root_keys
+            and row[9] is not None
+            and row[9] not in root_scope.configured_root_keys
+            and os.path.isabs(row[8])
+        ):
+            continue
         entries.append(CodexEntry(
             timestamp=dt.datetime.fromisoformat(row[0]),
             session_id=row[1],
@@ -10316,24 +13625,32 @@ def iter_codex_entries(
     return entries
 
 
-def _collect_codex_entries_direct(
-    range_start: dt.datetime,
-    range_end: dt.datetime,
-) -> list[CodexEntry]:
-    """Legacy direct-parse fallback when cache.db is unavailable."""
-    files = _discover_codex_session_files(range_start)
+def _collect_codex_entries_direct(range_start: dt.datetime,
+                                  range_end: dt.datetime) -> list[CodexEntry]:
+    """Direct-parse fallback when cache.db is unavailable or contended.
+
+    Parses both container forms with identical offset semantics and
+    deduplication. Compressed history it cannot read is a typed failure,
+    never a smaller successful total (I5).
+    """
     entries: list[CodexEntry] = []
-    for fp in files:
+    for selected in _discover_codex_session_files(range_start):
         try:
-            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
-                for _offset, entry in _iter_codex_jsonl_entries_with_offsets(fh, str(fp)):
+            with _rc.open_decoded(selected) as fh:
+                for _offset, entry in _iter_codex_jsonl_entries_with_offsets(
+                        fh, str(selected.logical)):
                     if entry.timestamp < range_start or entry.timestamp > range_end:
                         continue
                     entries.append(entry)
+        except _rc.ContainerError as exc:
+            if selected.kind == _rc.ZSTD:
+                raise CodexHistoryUnavailable() from exc
+            eprint(f"[codex] could not read {selected.logical}: {exc}")
         except OSError as exc:
-            eprint(f"[codex] could not read {fp}: {exc}")
+            if selected.kind == _rc.ZSTD:
+                raise CodexHistoryUnavailable() from exc
+            eprint(f"[codex] could not read {selected.logical}: {exc}")
     return entries
-
 
 def get_codex_entries(
     range_start: dt.datetime,
@@ -10366,7 +13683,8 @@ def get_codex_entries(
     try:
         if skip_sync:
             return iter_codex_entries(
-                conn, range_start, range_end, account_key=account_key)
+                conn, range_start, range_end, account_key=account_key,
+                current_roots_only=True)
         # #344: route the ingest through the guarded recovery boundary so a
         # classified corruption closes the handle, quarantines once, and
         # restarts on a fresh family (reassigning `conn`, closed in finally).
@@ -10393,8 +13711,12 @@ def get_codex_entries(
                 "falling back to direct JSONL parse for correctness"
             )
             return _collect_codex_entries_direct(range_start, range_end)
+        _warn_compressed_unreadable_once(stats)
+        if stats.drain_requested:
+            _note_maintenance_deferred_once()
         return iter_codex_entries(
-            conn, range_start, range_end, account_key=account_key)
+            conn, range_start, range_end, account_key=account_key,
+            current_roots_only=True)
     finally:
         conn.close()
 
@@ -11618,6 +14940,7 @@ def _open_conversations_db_unlocked(
         cache.close()
         cache_uri = _cctally_core.CACHE_DB_PATH.resolve().as_uri() + "?mode=ro"
         conn.execute("ATTACH DATABASE ? AS cache_db", (cache_uri,))
+        _install_codex_last_good_views(conn)
         if _conversation_derivations_enabled(run_derivations):
             _import_legacy_conversation_rows(conn)
             _ensure_codex_conversation_contract(conn)
@@ -11631,6 +14954,54 @@ def open_conversations_db(
     return _conversations_open_guarded(
         attach_cache=attach_cache, run_derivations=run_derivations,
     )
+
+
+def _install_codex_last_good_views(conn: sqlite3.Connection) -> bool:
+    """Shadow the thread table with its last-good form (#968 spec 5.11).
+
+    A conversation outside the barrier population reads the accounting row as
+    before. A population conversation reads its published thread (the sealed
+    certificate's metadata), or, before its first publication, the snapshot
+    taken when it entered the population. Every unqualified reader (detail,
+    list, children, parent, spawn links, source paths, the rollup writer)
+    inherits this without being rewritten. False when either store lacks the
+    barrier tables: the conversation pass then fails closed.
+    """
+    import _lib_codex_metadata
+    try:
+        conn.execute("SELECT 1 FROM cache_db.codex_barrier_population LIMIT 0")
+        conn.execute("SELECT 1 FROM cache_db.codex_barrier_entry_threads LIMIT 0")
+        conn.execute("SELECT 1 FROM main.codex_conversation_publications LIMIT 0")
+        conn.execute(
+            "SELECT 1 FROM main.codex_conversation_published_threads LIMIT 0")
+    except sqlite3.OperationalError:
+        return False
+    cols = _CODEX_THREAD_SNAPSHOT_COLUMNS
+    view = _barrier.LAST_GOOD_THREADS_VIEW
+    conn.execute("DROP VIEW IF EXISTS temp.codex_conversation_threads")
+    conn.execute(f"DROP VIEW IF EXISTS temp.{view}")
+    conn.execute(
+        f"CREATE TEMP VIEW {view} AS "
+        f"SELECT {cols} FROM cache_db.codex_conversation_threads t "
+        "WHERE NOT EXISTS (SELECT 1 FROM cache_db.codex_barrier_population p "
+        "WHERE p.conversation_key = t.conversation_key) "
+        f"UNION ALL SELECT {cols} FROM main.codex_conversation_published_threads w "
+        "WHERE EXISTS (SELECT 1 FROM cache_db.codex_barrier_population p "
+        "WHERE p.conversation_key = w.conversation_key) "
+        f"UNION ALL SELECT {cols} FROM cache_db.codex_barrier_entry_threads e "
+        "WHERE NOT EXISTS (SELECT 1 FROM main.codex_conversation_publications q "
+        "WHERE q.conversation_key = e.conversation_key)")
+    conn.execute("CREATE TEMP VIEW codex_conversation_threads AS "
+                 f"SELECT * FROM temp.{view}")
+    _lib_codex_metadata.invalidate_codex_threads_table_resolution(conn)
+    return True
+
+
+def _ensure_codex_last_good_views(conn: sqlite3.Connection) -> bool:
+    if conn.execute("SELECT 1 FROM sqlite_temp_master WHERE type='view' "
+                    "AND name=?", (_barrier.LAST_GOOD_THREADS_VIEW,)).fetchone():
+        return True
+    return _install_codex_last_good_views(conn)
 
 
 # --------------------------------------------------------------------------
@@ -11836,6 +15207,8 @@ def open_conversations_db_readonly(
             except OSError:
                 pass
         _gate_reader_schema(conn, attach_cache=attach_cache)
+        if attach_cache:
+            _install_codex_last_good_views(conn)
         return conn
     except BaseException:
         if conn is not None:
@@ -11936,6 +15309,7 @@ def scope_conversations_db_to_account(
         "INSERT INTO _conversation_account_scope(account_key) VALUES(?)", (key,)
     )
 
+    conn.execute("DROP VIEW IF EXISTS temp.codex_conversation_threads")
     conn.executescript(
         f"""
         CREATE TEMP VIEW conversation_messages AS
@@ -12020,6 +15394,7 @@ def scope_conversations_db_to_account(
         if row[0]
     }
     safe_project_attribution: dict[str, tuple[str | None, str | None]] = {}
+    threads = _lib_codex_metadata.resolve_codex_threads_table(conn)
     for conversation_key in codex_keys:
         # #845 §4.7. The thread is re-tested EVEN WHEN a rollup is persisted:
         # a rollup materialized before the thread was corrupted carries a
@@ -12029,7 +15404,7 @@ def scope_conversations_db_to_account(
         thread = conn.execute(
             "SELECT source_root_key, CAST(cwd AS BLOB) AS cwd_blob, "
             "CAST(git_json AS BLOB) AS git_json_blob "
-            "FROM cache_db.codex_conversation_threads WHERE conversation_key=?",
+            f"FROM {threads} WHERE conversation_key=?",
             (conversation_key,),
         ).fetchone()
         decoded = None
@@ -12694,6 +16069,51 @@ def _import_legacy_conversation_rows(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _codex_retained_contract_replay_ready(conn: sqlite3.Connection) -> bool:
+    """Admit open-time retained replay only over accepted compressed generations.
+
+    Reuse the walk's generation decision with existing cursor evidence; this
+    opener never validates or opens a stream. Unresolved generations and known
+    refusals wait for the shared guarded sync, which can prove a safe rebuild.
+    Plain-only stores retain their existing retained-event upgrade behavior.
+    """
+    try:
+        compressed = [selected for selected in _iter_codex_logical_containers(
+            _cctally()._codex_session_roots()) if selected.kind == _rc.ZSTD]
+        if not compressed:
+            return True
+        status_row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                                  (CODEX_CONTAINER_STATUS_KEY,)).fetchone()
+        if status_row:
+            status = json.loads(status_row[0])
+            if not isinstance(status, dict) or status.get("rebuildRefused"):
+                return False
+        if _rc.decoder_capability() == "unavailable":
+            return False
+        for selected in compressed:
+            row = conn.execute(
+                "SELECT mtime_ns,device_id,inode,last_byte_offset,content_anchor_version,"
+                + _CODEX_CONTAINER_SELECT + " FROM codex_conversation_source_files WHERE path=?",
+                (str(selected.logical),)).fetchone()
+            # Never pass a missing cursor to the decision: that branch would
+            # validate the whole compressed stream on the foreground open.
+            if row is None:
+                return False
+            accepted = _accepted_container(row, ext=5, mtime=0, device=1, inode=2)
+            if (accepted.kind != _rc.ZSTD or accepted.state != "accepted"
+                    or accepted.anchor is None
+                    or row[4] != _rc.ANCHOR_VERSION
+                    or accepted.anchor_offset != row[3]):
+                return False
+            decision = _codex_container_decision(
+                selected, accepted, executor_path=False, should_stop=None)
+            if decision.action != "read":
+                return False
+        return True
+    except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
+        return False
+
+
 def _ensure_codex_conversation_contract(conn: sqlite3.Connection) -> bool:
     """Converge retained Codex events on first read after a contract bump.
 
@@ -12736,6 +16156,10 @@ def _ensure_codex_conversation_contract(conn: sqlite3.Connection) -> bool:
         if not _acquire_cache_flock(lock_fh, timeout=15.0):
             return False
         if not needs_replay():
+            return False
+        if not _codex_retained_contract_replay_ready(conn):
+            # #968 5.6: the normal opener must not consume a refused rebuild
+            # or stale contract behind the sync's preservation boundary.
             return False
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -13957,6 +17381,9 @@ def _clear_codex_conversation_store(conn: sqlite3.Connection) -> None:
     _codex_conversation_fts_full_clear(conn)
     conn.execute("DELETE FROM codex_conversation_source_files")
 
+    conn.execute("DELETE FROM codex_conversation_publications")
+    conn.execute("DELETE FROM codex_conversation_published_threads")
+
 
 # #901 §5.3c (W7, Q13): the bounds of one batch inside a Codex
 # conversation-sync pass. Consecutive changed files share one transaction, up to
@@ -13986,6 +17413,468 @@ class _CodexConversationBatch:
     affected_keys: set = field(default_factory=set)
     inputs_changed: set = field(default_factory=set)
     paths: list = field(default_factory=list)
+    unit: "_CodexPublicationUnit | None" = None
+
+
+# ── #968 spec 5.11: the conversation publication barrier (conversations) ─────
+#: The cursor columns of one conversations-store row, in the order the walk's
+#: ``existing`` map reads them (``row[1:]`` indexes are the walk's ``prev``).
+_CODEX_CONVERSATION_CURSOR_COLUMNS = (
+    "path,size_bytes,mtime_ns,last_byte_offset,source_root_key,"
+    "last_session_id,last_model,last_total_tokens,"
+    "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
+    "last_conversation_key,last_turn_id,device_id,inode,"
+    + _CODEX_CONTAINER_SELECT)
+_CODEX_THREAD_COLUMN_NAMES = tuple(
+    name.strip() for name in _CODEX_THREAD_SNAPSHOT_COLUMNS.split(","))
+_LEGACY_PUBLICATION_SQL = (
+    "SELECT p.conversation_key, p.required_revision "
+    "FROM cache_db.codex_barrier_population p "
+    "WHERE NOT EXISTS (SELECT 1 FROM main.codex_conversation_publications q "
+    "WHERE q.conversation_key = p.conversation_key) "
+    "AND EXISTS (SELECT 1 FROM main.codex_conversation_rollups r "
+    "WHERE r.conversation_key = p.conversation_key)")
+
+#: Test seam (T5 case 10): called inside a unit's transaction, after its
+#: files and before its publication records. Production leaves it None.
+_CODEX_PUBLICATION_PRECOMMIT_HOOK = None
+
+
+class _SupersededPublication(Exception):
+    """A newer publication committed after this unit was planned."""
+
+
+def _codex_conversation_cursor_row(conn, path: str):
+    row = conn.execute(
+        f"SELECT {_CODEX_CONVERSATION_CURSOR_COLUMNS} "
+        "FROM codex_conversation_source_files WHERE path=?", (path,)).fetchone()
+    return None if row is None else tuple(row[1:])
+
+
+def _codex_conversation_population_subset(conn, keys) -> "set[str]":
+    found: set[str] = set()
+    for chunk in _codex_barrier_chunks({k for k in keys if k}):
+        marks = ",".join("?" * len(chunk))
+        found.update(row[0] for row in conn.execute(
+            "SELECT conversation_key FROM cache_db.codex_barrier_population "
+            f"WHERE conversation_key IN ({marks})", chunk))
+    return found
+
+
+def _codex_conversation_membership_keys(conn, identity: str) -> "set[str]":
+    return {row[0] for row in conn.execute(
+        "SELECT conversation_key FROM cache_db.codex_barrier_membership "
+        "WHERE file_identity=?", (identity,))}
+
+
+def _codex_conversation_source_keys(conn, path: str) -> "set[str]":
+    # The same statement the reset branch already runs.
+    return {row[0] for row in conn.execute(
+        "SELECT DISTINCT conversation_key "
+        "FROM codex_conversation_messages WHERE source_path=?", (path,)) if row[0]}
+
+
+class _CodexKeyFacts(NamedTuple):
+    required: "int | None"
+    certificate: "dict | None"
+    published: int
+
+    @property
+    def settled(self) -> bool:
+        """Sealed at its current requirement: no accounted byte is missing."""
+        return (self.certificate is not None and self.required is not None
+                and int(self.certificate["revision"]) == self.required)
+
+    @property
+    def neutral(self) -> bool:
+        return self.settled and self.published >= int(self.certificate["revision"])
+
+    @property
+    def publishable(self) -> bool:
+        return self.settled and _barrier.publication_advances(
+            self.published, self.certificate["revision"])
+
+
+def _codex_publication_facts(conn, key: str) -> _CodexKeyFacts:
+    row = conn.execute(
+        "SELECT required_revision FROM cache_db.codex_barrier_population "
+        "WHERE conversation_key=?", (key,)).fetchone()
+    cert_row = conn.execute(
+        "SELECT certificate_json FROM cache_db.codex_barrier_certificates "
+        "WHERE conversation_key=? ORDER BY revision DESC LIMIT 1", (key,)).fetchone()
+    published = conn.execute(
+        "SELECT published_revision FROM main.codex_conversation_publications "
+        "WHERE conversation_key=?", (key,)).fetchone()
+    return _CodexKeyFacts(
+        None if row is None else int(row[0]),
+        None if cert_row is None else _barrier.parse_certificate(cert_row[0]),
+        0 if published is None else int(published[0] or 0))
+
+
+@dataclass
+class _CodexPublicationUnit:
+    """Conversations that publish together (5.11 "The conversation pass").
+
+    Every population key fed by one of ``files`` is either published here at
+    its settled certificate or already published at a settled one, so
+    consuming ``files`` to ``caps`` changes no other conversation.
+    """
+    keys: tuple
+    certificates: dict
+    required: dict
+    caps: dict                       # path -> (generation, consumption target)
+    files: tuple
+    failed: bool = False
+
+    def cap_for(self, path: str, generation: str) -> "int | None":
+        entry = self.caps.get(path)
+        if entry is None or entry[0] != generation:
+            return None
+        return int(entry[1])
+
+
+class _CodexPublicationWork:
+    """The conversation pass's two phases.
+
+    Iterating yields ``(discovered, None)`` for every phase-1 file, then
+    ``(None, None)`` (the loop commits its open batch), then, per unit, its
+    files as ``(discovered, unit)`` and ``(None, unit)`` (the loop commits the
+    unit). Planning captures one read snapshot between the two phases and
+    releases it before any publication transaction begins.
+    """
+
+    def __init__(self, conn, files, *, only_paths, stats):
+        self.conn = conn
+        self.files = list(files)
+        self.files_by_path = {str(d.source_path): d for d in self.files}
+        self.only_paths = (None if only_paths is None
+                           else {str(path) for path in only_paths})
+        self.stats = stats
+        self.population_present = conn.execute(
+            "SELECT 1 FROM cache_db.codex_barrier_population LIMIT 1"
+        ).fetchone() is not None
+        self.deferred: dict = {}
+        self.units: list = []
+        self.seal_seq = None
+        self.backlog_complete = True
+
+    def __iter__(self):
+        for discovered in self.files:
+            yield discovered, None
+        yield None, None
+        self.units = _plan_codex_publication_units(self.conn, self)
+        for unit in self.units:
+            for discovered in unit.files:
+                yield discovered, unit
+            yield None, unit
+
+    def _defer(self, discovered, keys, *, generation, size) -> bool:
+        path = str(discovered.source_path)
+        prior = self.deferred.get(path)
+        self.deferred[path] = (discovered,
+                               set(keys) | (prior[1] if prior else set()))
+        self.stats.barrier_files_deferred += 1
+        # A deferral is a completed census item only when the cache has
+        # durably admitted this observed target to its publication work. A
+        # conversation-first pass cannot rely on a future seal for an identity
+        # accounting has not seen (968-T11-STOP-01). An accepted empty census
+        # is also conclusive even though it has no conversation to publish.
+        target = self.conn.execute(
+            "SELECT generation_token,scan_target,state,accepted_generation_token,"
+            "accepted_complete_line_end,complete_line_end "
+            "FROM cache_db.codex_barrier_targets WHERE file_identity=?",
+            (codex_file_identity(discovered),)).fetchone()
+        covered = (target is not None and target[0] == generation
+                   and int(target[1]) >= size
+                   and (bool(keys) or (
+                       target[2] == _barrier.READY and target[3] == generation
+                       and target[4] is not None and target[4] == target[5])))
+        if not covered:
+            self.stats.barrier_retry = True
+        return True
+
+    def defer_before_read(self, discovered, *, selected, prev,
+                          reset_file: bool, generation: str, size: int) -> bool:
+        """Before any byte is read: may this file change a population
+        conversation? A compressed container always defers: the cache admits
+        whatever it feeds when it reads it (5.11 "Population and lifetime")."""
+        zstd = selected.kind == _rc.ZSTD
+        if not zstd and not self.population_present:
+            return False
+        keys = _codex_conversation_membership_keys(
+            self.conn, codex_file_identity(discovered))
+        if prev is not None and prev[10]:
+            keys.add(prev[10])
+        if reset_file:
+            keys |= _codex_conversation_source_keys(
+                self.conn, str(discovered.source_path))
+        hit = _codex_conversation_population_subset(self.conn, keys)
+        if zstd or hit:
+            return self._defer(discovered, hit, generation=generation, size=size)
+        return False
+
+    def defer_after_read(self, discovered, events, *, generation: str,
+                         size: int) -> bool:
+        """The freshly parsed records name a population conversation."""
+        if not self.population_present:
+            return False
+        hit = _codex_conversation_population_subset(
+            self.conn, {e.conversation_key for e in events if e.conversation_key})
+        return (self._defer(discovered, hit, generation=generation, size=size)
+                if hit else False)
+
+
+def _register_legacy_publications(conn, keys: "set[str] | None") -> int:
+    """Register population materializations as legacy, uncertified
+    publications (5.11 "Legacy materializations at initialization").
+
+    The published thread is the entry snapshot, which is exactly what the
+    last-good view showed before registration, so registering changes no
+    reader. ``keys=None`` registers the whole population.
+    """
+    if keys is None:
+        rows = conn.execute(_LEGACY_PUBLICATION_SQL).fetchall()
+    else:
+        rows = []
+        for key in sorted(keys):
+            rows.extend(conn.execute(
+                _LEGACY_PUBLICATION_SQL + " AND p.conversation_key=?",
+                (key,)).fetchall())
+    now = _codex_barrier_now()
+    cols = _CODEX_THREAD_SNAPSHOT_COLUMNS
+    for key, required in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO main.codex_conversation_publications "
+            "(conversation_key, required_revision, ready_certificate_revision, "
+            "published_revision, legacy_uncertified, updated_at_utc) "
+            "VALUES (?,?,NULL,0,1,?)", (key, int(required), now))
+        conn.execute(
+            f"INSERT OR IGNORE INTO main.codex_conversation_published_threads "
+            f"({cols}) SELECT {cols} FROM cache_db.codex_barrier_entry_threads "
+            "WHERE conversation_key=?", (key,))
+    if conn.in_transaction:
+        conn.commit()
+    return len(rows)
+
+
+def _codex_publication_unit(conn, work, group: set, fact):
+    """The unit for one closed group of keys, or None when it must wait."""
+    if any(not fact(key).settled for key in group):
+        return None
+    caps: dict = {}
+    for key in sorted(group):
+        for contributor in fact(key).certificate["contributors"]:
+            path = contributor["path"]
+            generation = contributor["generation"]
+            end = int(contributor["completeLineEnd"])
+            prior = caps.get(path)
+            if prior is not None and prior[0] != generation:
+                return None              # the cache re-arms and re-seals it
+            caps[path] = (generation, end if prior is None else max(end, prior[1]))
+    publish = tuple(sorted(key for key in group if fact(key).publishable))
+    if not publish:
+        return None
+    files = []
+    for path in sorted(caps):
+        discovered = work.files_by_path.get(path)
+        if discovered is None:
+            qualified = _qualify_codex_targets({path})
+            discovered = qualified[0] if qualified else None
+        if discovered is None:
+            # Qualification can recover without a new accounting mutation or
+            # seal. Keep the existing seal outstanding and refuse a completed
+            # walk until a later conversation pass can consume this unit.
+            work.stats.barrier_retry = True
+            work.backlog_complete = False
+            return None
+        files.append(discovered)
+    return _CodexPublicationUnit(
+        keys=publish,
+        certificates={key: fact(key).certificate for key in publish},
+        required={key: fact(key).required for key in publish},
+        caps=caps, files=tuple(files))
+
+
+def _codex_publication_candidates(conn, work) -> set:
+    """Deferred keys plus the eligible certificate backlog for this pass."""
+    candidates: set = set()
+    for _discovered, keys in work.deferred.values():
+        candidates |= keys
+    for key, _revision, text in conn.execute(
+            _barrier.BACKLOG_CERTIFICATES_SQL).fetchall():
+        if work.only_paths is not None:
+            cert = _barrier.parse_certificate(text)
+            paths = ({c["path"] for c in cert["contributors"]}
+                     if cert is not None else set())
+            if paths and not paths & work.only_paths:
+                work.backlog_complete = False
+                continue
+        candidates.add(key)
+    return candidates
+
+
+def _plan_codex_publication_units(conn, work) -> list:
+    """Capture one coherent cache snapshot, after legacy registration writes.
+
+    The read transaction ends before the caller writes conversations.db. No
+    cache writer lock or cross-store write transaction is acquired here.
+    """
+    candidates = _codex_publication_candidates(conn, work)
+    _register_legacy_publications(
+        conn, None if work.only_paths is None else candidates)
+    conn.execute("BEGIN")
+    try:
+        return _capture_codex_publication_units(conn, work)
+    finally:
+        conn.rollback()                 # release the read snapshot, even on error
+
+
+def _capture_codex_publication_units(conn, work) -> list:
+    """Requirements, certificates and membership all use the same snapshot."""
+    stats = work.stats
+    row = conn.execute("SELECT value FROM cache_db.cache_meta WHERE key=?",
+                       (_barrier.SEAL_SEQ_KEY,)).fetchone()
+    work.seal_seq = None if row is None else str(row[0])
+    candidates = _codex_publication_candidates(conn, work)
+    facts: dict = {}
+
+    def fact(key):
+        if key not in facts:
+            facts[key] = _codex_publication_facts(conn, key)
+        return facts[key]
+
+    fed: dict = {}
+
+    def fed_by(identity):
+        if identity not in fed:
+            fed[identity] = _codex_conversation_population_subset(
+                conn, _codex_conversation_membership_keys(conn, identity))
+        return fed[identity]
+
+    units, seen = [], set()
+    for seed in sorted(candidates):
+        if seed in seen or fact(seed).neutral:
+            continue
+        group, queue = set(), [seed]
+        while queue:
+            key = queue.pop()
+            if key in group:
+                continue
+            group.add(key)
+            cert = fact(key).certificate
+            for contributor in (cert or {}).get("contributors", ()):
+                for other in fed_by(contributor["identity"]):
+                    if other not in group and not fact(other).neutral:
+                        queue.append(other)
+        seen |= group
+        unit = _codex_publication_unit(conn, work, group, fact)
+        if unit is None:
+            stats.barrier_keys_deferred += len(group)
+        else:
+            units.append(unit)
+    return units
+
+
+def _write_codex_publications(conn, unit) -> None:
+    """Publication records and certified threads, monotonically (5.11)."""
+    now = _codex_barrier_now()
+    cols = _CODEX_THREAD_SNAPSHOT_COLUMNS
+    names = _CODEX_THREAD_COLUMN_NAMES
+    update = ", ".join(f"{name}=excluded.{name}" for name in names[1:])
+    differs = " OR ".join(
+        f"codex_conversation_published_threads.{name} IS NOT excluded.{name}"
+        for name in names[1:])
+    for key in unit.keys:
+        cert = unit.certificates[key]
+        revision = int(cert["revision"])
+        changed = conn.execute(
+            "INSERT INTO codex_conversation_publications (conversation_key, "
+            "required_revision, ready_certificate_revision, published_revision, "
+            "legacy_uncertified, updated_at_utc) VALUES (?,?,?,?,0,?) "
+            "ON CONFLICT(conversation_key) DO UPDATE SET "
+            "required_revision=MAX(required_revision, excluded.required_revision), "
+            "ready_certificate_revision=excluded.ready_certificate_revision, "
+            "published_revision=excluded.published_revision, "
+            "legacy_uncertified=0, updated_at_utc=excluded.updated_at_utc "
+            "WHERE excluded.published_revision > "
+            "codex_conversation_publications.published_revision",
+            (key, int(unit.required[key]), revision, revision, now)).rowcount
+        if changed != 1:
+            raise _SupersededPublication(key)
+        thread = cert.get("thread")
+        if thread is None:
+            if cert.get("exclusions"):
+                # Review r3 F4: this side's own guard (U6). The seal keeps a
+                # retained thread only while cache.db still holds one
+                # (`_codex_barrier_retained_thread`); after `rm cache.db`, or
+                # for an unreadable contributor with no membership row, it can
+                # seal None over contributors that supply no metadata. An
+                # excluded contributor never retracts the published thread,
+                # so the published row stays exactly as it is.
+                continue
+            conn.execute("DELETE FROM codex_conversation_published_threads "
+                         "WHERE conversation_key=?", (key,))
+            continue
+        values = [thread[name] for name in _barrier.THREAD_FIELDS]
+        values += [thread.get("firstSeenUtc"), thread.get("lastSeenUtc")]
+        conn.execute(
+            f"INSERT INTO codex_conversation_published_threads ({cols}) "
+            f"VALUES ({','.join('?' * len(names))}) "
+            f"ON CONFLICT(conversation_key) DO UPDATE SET {update} "
+            f"WHERE {differs}", values)
+
+
+def _fail_codex_publication_unit(conn, batch, stats, *, retry: bool):
+    """Abandon a unit: nothing it consumed survives (deferred, 5.11)."""
+    unit = batch.unit
+    if conn.in_transaction:
+        conn.rollback()
+    if not unit.failed:
+        unit.failed = True
+        stats.barrier_keys_deferred += len(unit.keys)
+    if retry:
+        stats.barrier_retry = True
+    return _CodexConversationBatch(unit=unit)
+
+
+def _commit_codex_publication_unit(conn, batch, stats, progress) -> None:
+    """One publication: the unit's ingestion, publication records, rollups and
+    find projection commit together or not at all (5.11 "The conversation
+    pass"). Runs even when no file had bytes to consume (a repair-only or
+    legacy certification), and the value-sensitive rollup upsert writes
+    nothing for a content-equal one."""
+    unit = batch.unit
+    if unit is None or unit.failed:
+        if conn.in_transaction:
+            conn.rollback()
+        return
+    keys = set(batch.affected_keys) | set(unit.keys)
+    try:
+        if not conn.in_transaction:
+            conn.execute("BEGIN")
+        if _CODEX_PUBLICATION_PRECOMMIT_HOOK is not None:
+            _CODEX_PUBLICATION_PRECOMMIT_HOOK(conn, unit.keys)
+        _write_codex_publications(conn, unit)
+        _recompute_codex_rollups(conn, keys, inputs_changed=batch.inputs_changed)
+        import _lib_codex_conversation_query as query
+        query.materialize_codex_find_projection(conn, keys, cascaded=batch.cascaded)
+        conn.commit()
+        _wal_checkpoint.after_commit(conn)
+    except _SupersededPublication:
+        conn.rollback()
+        stats.barrier_keys_deferred += len(unit.keys)
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
+        eprint(f"[codex-conversations] publication of {len(unit.keys)} "
+               f"conversation(s) deferred: {exc}")
+        stats.barrier_keys_deferred += len(unit.keys)
+        stats.barrier_retry = True
+    else:
+        stats.barrier_keys_published += len(unit.keys)
+        stats.barrier_files_published += batch.files
+        stats.files_reset_truncated += batch.reset_truncated
+    _report_conversation_progress(progress, "ingest", stats)
+
 
 
 def _codex_conversation_batch_admits(
@@ -14078,10 +17967,13 @@ def _rollback_codex_file_savepoint(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def sync_codex_conversations(
+def _sync_codex_conversations_locked(
     conn: sqlite3.Connection,
     *,
     rebuild: bool = False,
+    executor_paths: "frozenset[str]" = frozenset(),
+    executor_resets: "frozenset[str]" = frozenset(),
+    _after_locks: "Callable[[], bool] | None" = None,
     lock_timeout: "float | None" = None,
     only_paths: "set[str] | None" = None,
     progress: "Callable[[str, CodexIngestStats], None] | None" = None,
@@ -14119,6 +18011,9 @@ def sync_codex_conversations(
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
             stats.lock_contended = True
             return stats
+        if _after_locks is not None and _after_locks():
+            stats.lock_contended = stats.drain_yielded = True
+            return stats
         # #901 §5.3c (W9): a sync writer owns its checkpoints.
         _wal_checkpoint.arm(conn)
         targeted = only_paths is not None
@@ -14154,6 +18049,12 @@ def sync_codex_conversations(
         # sync in its own worker), so nothing else orders them.
         if _cache_side_replay_pending(conn):
             stats.deferred_reason = "cache_replay_pending"
+            return stats
+        # #968 spec 5.11: the barrier extends this admission point. Its state
+        # or attachment missing fails closed rather than reading as "no
+        # population".
+        if not _ensure_codex_last_good_views(conn):
+            stats.deferred_reason = "barrier_unavailable"
             return stats
         if (pending_rebuild or contract_rebuild or codex_replay_pending) and targeted:
             stats.deferred_reason = "rebuild_pending"
@@ -14205,6 +18106,17 @@ def sync_codex_conversations(
                     path for path, _root in refused_sources
                 })
                 return stats
+            refusal = _codex_compressed_rebuild_refusal(preflight_files)
+            if refusal is not None:
+                stats.rebuild_refused = refusal
+                stats.files_total = len(preflight_files)
+                stats.container_skipped[refusal] = sum(
+                    f.container_kind == _rc.ZSTD for f in preflight_files)
+                _record_codex_container_status(
+                    conn, stats, census_complete=False,
+                    cursor_table="codex_conversation_source_files")
+                conn.commit()
+                return stats
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?,?)",
                 ("conversation_rebuild_codex_pending", "1"),
@@ -14221,7 +18133,8 @@ def sync_codex_conversations(
         )
         stats.files_total = len(files)
         _report_conversation_progress(progress, "ingest", stats)
-        # The last two members are `device_id`/`inode` (#769 S6). They are read
+        # The original projection ends in `device_id`/`inode` (#769 S6),
+        # followed by the shared container evidence. These identity fields are read
         # by the per-file decision below, not merely retained: a replacement
         # that lands at the same size moves neither the size nor the cursor, so
         # identity is the only evidence that the retained offset describes a
@@ -14229,26 +18142,27 @@ def sync_codex_conversations(
         existing = {
             row[0]: tuple(row[1:])
             for row in conn.execute(
-                "SELECT path,size_bytes,mtime_ns,last_byte_offset,source_root_key,"
-                "last_session_id,last_model,last_total_tokens,"
-                "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
-                "last_conversation_key,last_turn_id,device_id,inode "
+                f"SELECT {_CODEX_CONVERSATION_CURSOR_COLUMNS} "
                 "FROM codex_conversation_source_files"
             )
         }
         if targeted:
             for discovered in files:
+                if str(discovered.source_path) in executor_paths:
+                    # Off-hook executors decide their resets under these locks.
+                    continue
                 prev = existing.get(str(discovered.source_path))
                 if prev is None:
                     continue
                 if prev[3] != discovered.source_root_key:
                     stats.deferred_reason = "requalification"
                     return stats
-                try:
-                    current_size = discovered.source_path.stat().st_size
-                except OSError:
-                    continue
-                if current_size < prev[0]:
+                selected = _rc.select_container(discovered.source_path)
+                if (selected is None or selected.kind != _rc.PLAIN
+                        or prev[14] != _rc.PLAIN):
+                    continue  # hold container transitions in the per-file walk
+                current_size = selected.fingerprint.size
+                if current_size < prev[0] and str(discovered.source_path) not in executor_paths:
                     stats.deferred_reason = "truncation"
                     return stats
         protected_paths: set[str] = set()
@@ -14280,45 +18194,9 @@ def sync_codex_conversations(
                 prune_scope, retained_sources, set()
             )
             protected_paths = {path for path, _root in refused_sources}
-            # #901 §5.3b: the whole prune is one transaction, so its rollups
-            # and projection are repaired once, over every conversation it
-            # touched, after all of its deletes. Each is a pure function of the
-            # surviving rows, so the result equals the old per-path repair; the
-            # projection generation advances once for the transaction, and the
-            # cascade signal covers a surviving conversation whose rebuilt rows
-            # come out equal (the deleted file held only its final messages).
-            prune_affected: set[str] = set()
-            prune_deleted_messages = 0
-            for stale_path, _stale_root_key in safe_sources:
-                prune_affected.update(
-                    row[0] for row in conn.execute(
-                        "SELECT DISTINCT conversation_key "
-                        "FROM codex_conversation_messages WHERE source_path=?",
-                        (stale_path,),
-                    ) if row[0]
-                )
-                conn.execute(
-                    "DELETE FROM codex_conversation_file_touches WHERE source_path=?",
-                    (stale_path,),
-                )
-                prune_deleted_messages += max(0, conn.execute(
-                    "DELETE FROM codex_conversation_messages WHERE source_path=?",
-                    (stale_path,),
-                ).rowcount)
-                conn.execute(
-                    "DELETE FROM codex_conversation_events WHERE source_path=?",
-                    (stale_path,),
-                )
-                conn.execute(
-                    "DELETE FROM codex_conversation_source_files WHERE path=?",
-                    (stale_path,),
-                )
-            if prune_affected:
-                _recompute_codex_rollups(conn, prune_affected)
-                import _lib_codex_conversation_query as query
-                query.materialize_codex_find_projection(
-                    conn, prune_affected, cascaded=prune_deleted_messages > 0)
-            stats.files_pruned = len({path for path, _root in safe_sources})
+            if safe_sources:
+                # #968 5.8: planning records debt; only the worker deletes.
+                _record_codex_conversation_prune_debt(conn, safe_sources)
             if refused_sources:
                 _codex_prune_refusal_record(
                     conn,
@@ -14332,6 +18210,11 @@ def sync_codex_conversations(
                     path for path, _root in refused_sources
                 })
             conn.commit()
+            stats.prune_debt_pending = int(conn.execute(
+                "SELECT COUNT(*) FROM codex_conversation_prune_debt").fetchone()[0])
+            if stats.prune_debt_pending:
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
             # #901 §5.3c (W9): the end of the stale-source prune is a boundary.
             _wal_checkpoint.at_boundary(conn)
 
@@ -14339,22 +18222,74 @@ def sync_codex_conversations(
         # bounded by CODEX_CONVERSATION_BATCH_FILES and _BYTES. Unchanged,
         # unreadable and declined files write nothing, so they neither join nor
         # break a batch.
+        pending_marks: list[tuple[str, str, str]] = []
         batch = _CodexConversationBatch()
-        for discovered in files:
+        work = _CodexPublicationWork(
+            conn, files, only_paths=only_paths, stats=stats)
+        for discovered, unit in work:
+            if discovered is None:
+                if unit is None:          # the phase boundary
+                    _commit_codex_conversation_batch(conn, batch, stats, progress)
+                else:                     # one unit's end
+                    if batch.unit is not unit:
+                        batch = _CodexConversationBatch(unit=unit)
+                    _commit_codex_publication_unit(conn, batch, stats, progress)
+                batch = _CodexConversationBatch()
+                continue
+            if unit is not None:
+                if batch.unit is not unit:
+                    batch = _CodexConversationBatch(unit=unit)
+                if unit.failed:
+                    continue
             jp = discovered.source_path
             path_str = str(jp)
             if path_str in protected_paths:
                 # Visible but unrecognizable input is not evidence that the
                 # retained transcript generation should be reset or replaced.
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
                 continue
-            try:
-                st = jp.stat()
-            except OSError:
+            selected = _rc.select_container(jp)
+            if selected is None:
+                if unit is not None:
+                    stats.files_failed += 1
+                    batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
+                    continue
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
-            size, mtime_ns = st.st_size, st.st_mtime_ns
-            prev = existing.get(path_str)
+            _fp = selected.fingerprint
+            st = _CodexContainerStat(_fp.size, _fp.mtime_ns, _fp.device, _fp.inode)
+            prev = (existing.get(path_str) if unit is None
+                    else _codex_conversation_cursor_row(conn, path_str))
+            accepted = (None if prev is None else _accepted_container(
+                prev, ext=14, mtime=1, device=12, inode=13))
+            container_decision = _codex_container_decision(
+                selected, accepted, executor_path=path_str in executor_paths, should_stop=None)
+            if container_decision.action == "pending":
+                pending_marks.append((path_str, _fp.to_json(), container_decision.reason))
+                stats.container_pending += 1
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
+                _report_conversation_progress(progress, "ingest", stats)
+                continue
+            if container_decision.action == "skip":
+                reason = container_decision.reason
+                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                if selected.kind == _rc.ZSTD and prev is None:
+                    stats.container_reads_held += 1
+                if unit is not None:
+                    # A failed publication is still due, even when its failure
+                    # was an unreadable skip rather than pending verification.
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
+                _report_conversation_progress(progress, "ingest", stats)
+                continue
+            size, mtime_ns = int(container_decision.size), st.st_mtime_ns
+            generation = _rc.generation_token(
+                _fp, size if selected.kind == _rc.ZSTD else None)
             # A stored identity that differs from the one just statted means the
             # retained offset points into a file that no longer occupies this
             # pathname. THE INODE DECIDES and the device only corroborates:
@@ -14368,29 +18303,48 @@ def sync_codex_conversations(
                     prev[12], prev[13], st.st_dev, st.st_ino)
             )
             if (
-                prev is not None and not replaced and size == prev[0]
+                unit is None and path_str not in executor_resets
+                and prev is not None and not replaced and size == prev[0]
                 and prev[3] == discovered.source_root_key
             ):
                 stats.files_skipped_unchanged += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
-            reset_file = (
+            reset_file = path_str in executor_resets or (
                 prev is not None
                 and (
-                    size < prev[0] or replaced
+                    (size < prev[0] and path_str not in executor_paths) or replaced
                     or prev[3] != discovered.source_root_key
                 )
             )
-            if targeted and reset_file:
-                stats.deferred_reason = (
+            if targeted and reset_file and path_str not in executor_resets:
+                reason = (
                     "requalification"
                     if prev is not None and prev[3] != discovered.source_root_key
                     else "source_replaced" if replaced
                     else "truncation"
                 )
+                if unit is not None:
+                    stats.deferred_reason = stats.deferred_reason or reason
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
+                    continue
+                stats.deferred_reason = reason
                 # The files already ingested keep today's committed result.
                 _commit_codex_conversation_batch(conn, batch, stats, progress)
                 return stats
+            cap = None
+            if unit is not None:
+                cap = unit.cap_for(path_str, generation)
+                if cap is None:
+                    # The certificate names another generation of this file;
+                    # the cache re-arms and re-seals it (5.11 "Re-arming").
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
+                    continue
+                if (not reset_file and prev is not None
+                        and int(prev[2]) >= cap):
+                    continue              # its certified bytes are consumed
             start_offset = 0 if prev is None or reset_file else int(prev[2])
             initial_session_id = prev[4] if prev else None
             initial_model = prev[5] if prev else None
@@ -14402,6 +18356,11 @@ def sync_codex_conversations(
             initial_parent = prev[9] if prev else None
             initial_conversation = prev[10] if prev else None
             initial_turn = prev[11] if prev else None
+            if path_str in executor_resets:
+                initial_session_id = initial_model = None
+                initial_total_tokens = 0
+                initial_native = initial_root = initial_parent = None
+                initial_conversation = initial_turn = None
 
             # #347 uses the accounting cache's journal-backed file-range map as
             # the Codex transcript oracle.  It is already attached read-only,
@@ -14428,6 +18387,12 @@ def sync_codex_conversations(
             except sqlite3.OperationalError:
                 account_ranges = []
 
+            if unit is None and work.defer_before_read(
+                    discovered, selected=selected, prev=prev,
+                    reset_file=reset_file, generation=generation, size=size):
+                _report_conversation_progress(progress, "ingest", stats)
+                continue
+
             state = _CodexIterState(
                 session_id=initial_session_id,
                 model=initial_model,
@@ -14449,7 +18414,8 @@ def sync_codex_conversations(
                 if prior_accounting is not None and prior_accounting[1] is not None:
                     state.generation_transition_pending = (
                         _lib_jsonl._codex_generation_transition_between(
-                            path_str, int(prior_accounting[1]), start_offset))
+                            path_str, int(prior_accounting[1]), start_offset,
+                            open_stream=lambda: _rc.open_decoded(selected)))
             if initial_native and initial_root:
                 state.thread = _lib_jsonl.CodexThreadMetadata(
                     source_root_key=discovered.source_root_key,
@@ -14470,7 +18436,12 @@ def sync_codex_conversations(
             account_by_physical: dict[tuple[str, int], str | None] = {}
             yielded = 0
             try:
-                with open(jp, "rb") as fh:
+                start_anchor = (_rc.anchor_seed() if start_offset == 0 else
+                                accepted.anchor if accepted is not None
+                                and accepted.anchor_offset == start_offset else None)
+                with _rc.open_decoded(selected) as raw_fh:
+                    fh = _rc.LineAnchorRecorder(raw_fh, start_offset=start_offset,
+                                               start_anchor=start_anchor)
                     fh.seek(start_offset)
                     for emission in _iter_codex_fused_records_with_offsets(
                         fh,
@@ -14480,6 +18451,7 @@ def sync_codex_conversations(
                         initial_total_tokens=initial_total_tokens,
                         source_root_key=discovered.source_root_key,
                         state=state,
+                        stop_before=None if cap is None else (lambda off, _cap=cap: off >= _cap),
                     ):
                         event = emission.event
                         events.append(event)
@@ -14512,9 +18484,24 @@ def sync_codex_conversations(
                         if emission.accounting is not None:
                             yielded += 1
                     final_offset = fh.tell()
+                    if (selected.kind == _rc.ZSTD
+                            and _rc.fingerprint_of(selected.path, selected.kind) != _fp):
+                        raise _rc.ContainerError("unstable-stat")
+            except _rc.ContainerError as exc:
+                reason = _container_skip_reason(exc.category)
+                stats.container_skipped[reason] = stats.container_skipped.get(reason, 0) + 1
+                if selected.kind == _rc.ZSTD and prev is None:
+                    stats.container_reads_held += 1
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
+                _report_conversation_progress(progress, "ingest", stats)
+                continue
             except OSError as exc:
                 eprint(f"[codex-conversations] could not read {jp}: {exc}")
                 stats.files_failed += 1
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
+                    continue
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
 
@@ -14527,6 +18514,12 @@ def sync_codex_conversations(
                     ),
                 )
             except Exception as exc:  # noqa: BLE001
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
+                    if not targeted:
+                        raise
+                    eprint(f"[codex-conversations] normalization failed for {jp}: {exc}")
+                    continue
                 if not targeted:
                     # The batch's earlier files keep today's committed result.
                     _commit_codex_conversation_batch(
@@ -14538,8 +18531,13 @@ def sync_codex_conversations(
                 stats.files_failed += 1
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
+            if unit is None and work.defer_after_read(
+                    discovered, events, generation=generation, size=size):
+                _report_conversation_progress(progress, "ingest", stats)
+                continue
+
             consumed = max(0, int(final_offset) - int(start_offset))
-            if not _codex_conversation_batch_admits(batch, consumed):
+            if unit is None and not _codex_conversation_batch_admits(batch, consumed):
                 _commit_codex_conversation_batch(conn, batch, stats, progress)
                 batch = _CodexConversationBatch()
             affected_keys = {
@@ -14614,8 +18612,11 @@ def sync_codex_conversations(
                     "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
                     "source_root_key,last_session_id,last_model,last_total_tokens,"
                     "last_native_thread_id,last_root_thread_id,last_parent_thread_id,"
-                    "last_conversation_key,last_turn_id,device_id,inode) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "last_conversation_key,last_turn_id,device_id,inode,"
+                    "container_kind,container_path,container_size_bytes,decoded_size_bytes,"
+                    "content_anchor_version,content_anchor,content_anchor_offset,"
+                    "container_state,container_state_reason,pending_container_fingerprint) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',NULL,NULL) "
                     "ON CONFLICT(path) DO UPDATE SET "
                     "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
                     "last_byte_offset=excluded.last_byte_offset,"
@@ -14629,7 +18630,12 @@ def sync_codex_conversations(
                     "last_parent_thread_id=excluded.last_parent_thread_id,"
                     "last_conversation_key=excluded.last_conversation_key,"
                     "last_turn_id=excluded.last_turn_id,"
-                    "device_id=excluded.device_id,inode=excluded.inode",
+                    "device_id=excluded.device_id,inode=excluded.inode,"
+                    "container_kind=excluded.container_kind,container_path=excluded.container_path,"
+                    "container_size_bytes=excluded.container_size_bytes,decoded_size_bytes=excluded.decoded_size_bytes,"
+                    "content_anchor_version=excluded.content_anchor_version,content_anchor=excluded.content_anchor,"
+                    "content_anchor_offset=excluded.content_anchor_offset,container_state='accepted',"
+                    "container_state_reason=NULL,pending_container_fingerprint=NULL",
                     (
                         path_str,
                         size,
@@ -14650,10 +18656,21 @@ def sync_codex_conversations(
                         # offset it describes (#769 S6).
                         int(st.st_dev),
                         int(st.st_ino),
+                        selected.kind,
+                        str(selected.path) if selected.kind == _rc.ZSTD else None,
+                        _fp.size if selected.kind == _rc.ZSTD else None,
+                        size if selected.kind == _rc.ZSTD else None,
+                        _rc.ANCHOR_VERSION if fh.result(final_offset) is not None else None,
+                        fh.result(final_offset),
+                        final_offset if fh.result(final_offset) is not None else None,
                     ),
                 )
                 conn.execute(_CODEX_FILE_RELEASE)
             except sqlite3.DatabaseError as exc:
+                if unit is not None:
+                    eprint(f"[codex-conversations] db error on {jp}: {exc}")
+                    batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
+                    continue
                 # This file alone rolls back: its rows, cursor and bookkeeping
                 # never reached the batch, whose other files still commit.
                 eprint(f"[codex-conversations] db error on {jp}: {exc}")
@@ -14672,11 +18689,24 @@ def sync_codex_conversations(
             batch.affected_keys.update(affected_keys)
             batch.inputs_changed.update(inputs_changed)
             batch.paths.append(jp)
-            if _codex_conversation_batch_full(batch):
+            if unit is None and _codex_conversation_batch_full(batch):
                 _commit_codex_conversation_batch(conn, batch, stats, progress)
                 batch = _CodexConversationBatch()
         _commit_codex_conversation_batch(conn, batch, stats, progress)
+        if (work.seal_seq is not None and work.backlog_complete
+                and not stats.barrier_retry):
+            # Every certificate sealed up to this token was considered. Units
+            # still waiting on the cache are re-triggered by its next seal.
+            _set_cache_meta_if_changed(conn, _barrier.PUBLISHED_SEQ_KEY,
+                                       work.seal_seq)
+            if conn.in_transaction:
+                conn.commit()
 
+        if pending_marks:
+            _mark_codex_containers_pending(conn, "codex_conversation_source_files", pending_marks)
+        if (stats.container_pending
+                or stats.container_skipped.get("verification-pending", 0)):
+            stats.drain_requested = ("_codex-replay-drain",)
         run_codex_find_projection_backfill(conn)
         _report_conversation_progress(progress, "finalize", stats)
         if only_paths is None and stats.files_failed == 0:
@@ -14714,6 +18744,24 @@ def sync_codex_conversations(
                     (CODEX_CONVERSATION_REPLAY_FROM_ZERO_KEY,),
                 )
             conn.commit()
+        _record_codex_container_status(
+            conn, stats,
+            census_complete=(only_paths is None and not stats.files_failed
+                             and not stats.prune_refused
+                             and not stats.files_deferred_torn
+                             and not stats.container_pending
+                             and not any(stats.container_skipped.values())
+                             and stats.files_processed + stats.files_skipped_unchanged
+                             == stats.files_total),
+            cursor_table="codex_conversation_source_files")
+        conn.commit()
+        if only_paths is None:
+            _stamp_codex_debt_only_walk(
+                conn, _ingest_frontier.CODEX_CONVERSATION_WALK_DEBT_ONLY_KEY,
+                _ingest_frontier.debt_only_refusal(
+                    _ingest_frontier.conversation_sync_certifiable, "full", stats))
+            if conn.in_transaction:
+                conn.commit()
         _report_conversation_progress(progress, "checkpoint", stats)
         _harden_conversation_sidecars()
         _maybe_truncate_wal(conn, _cctally_core.CONVERSATIONS_DB_PATH)
@@ -14742,6 +18790,22 @@ def sync_codex_conversations(
     _report_conversation_progress(progress, "complete", stats)
     return stats
 
+
+def sync_codex_conversations(conn: sqlite3.Connection, *,
+                             maintenance: str = "defer",
+                             **kwargs) -> CodexIngestStats:
+    """Codex conversations ingest; see ``_sync_codex_conversations_locked``.
+
+    #968 spec 5.8: requested maintenance is spawned only after the provider
+    lock is released; ``maintenance="caller"`` leaves it to the caller.
+    """
+    if maintenance not in ("defer", "caller"):
+        raise ValueError(f"unknown maintenance mode {maintenance!r}")
+    stats = _sync_codex_conversations_locked(conn, **kwargs)
+    if maintenance == "defer":
+        for command in stats.drain_requested:
+            _request_codex_drain_worker(command)
+    return stats
 
 class _TranscriptRebuildOutcome(NamedTuple):
     stats: "IngestStats | CodexIngestStats | None"
@@ -15038,13 +19102,15 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     # full rebuild. Claude-only surface; runs the three-gate safe helper.
     if getattr(args, "prune_orphans", False):
         if source == "codex":
-            # The prune surface is Claude-only; Codex orphans are pruned
-            # automatically during codex sync (see sync_codex_cache). Respect
-            # the explicit --source codex rather than silently pruning Claude.
+            # The prune surface is Claude-only. Codex orphans are recorded as
+            # prune debt by the Codex sync and drained per identity after it,
+            # by cache-sync itself or by the `_codex-prune-drain` worker (#968
+            # spec 5.7). Respect the explicit --source codex rather than
+            # silently pruning Claude.
             eprint(
                 "[cache-sync] --prune-orphans applies to the Claude cache only "
-                "(Codex orphans are pruned automatically during codex sync); "
-                "nothing to do for --source codex."
+                "(Codex orphans are pruned after each codex sync, by cache-sync "
+                "itself or a background worker); nothing to do for --source codex."
             )
             conn.close()
             return 0
@@ -15099,9 +19165,9 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
     # (#313 P3). Removes >retention-day conversation transcripts (re-derivable
     # from JSONL). Reclaim the freed disk space with `cctally db vacuum`.
     if getattr(args, "prune_conversations", False):
-        from _cctally_config import resolve_retention_days
+        from _cctally_config import resolve_prune_retention_days
         import _lib_conversation_retention as retention
-        retention_days = resolve_retention_days(_cctally().load_config())
+        retention_days = resolve_prune_retention_days(_cctally().load_config())
         if retention_days <= 0:
             eprint(
                 "[cache-sync] transcript retention is disabled "
@@ -15188,6 +19254,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                     progress=_progress_codex_stderr,
                     rebuild=args.rebuild,
                     lock_timeout=lt,
+                    maintenance="caller",
                 )
 
         plan.append(_sync_codex_leg)
@@ -15204,6 +19271,7 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             _perf.flush_stderr(_perf.current_root())
         return 1
     result_index = 0
+    codex_stats = None
 
     if source in ("claude", "all"):
         stats = plan_results[result_index]
@@ -15233,6 +19301,12 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
 
     if source in ("codex", "all"):
         stats = plan_results[result_index]
+        if stats.rebuild_refused:
+            conn.close()
+            eprint(CODEX_REBUILD_REFUSED_MESSAGE)
+            _p_root.__exit__(None, None, None)
+            return 3
+        _warn_compressed_unreadable_once(stats)
         _progress_codex_stderr(stats, force=True)
         if stats.lock_contended and args.rebuild:
             eprint(
@@ -15267,6 +19341,20 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "half-written); no usage was attributed from them. Re-run "
                 "`codex login` if it stays this way; `cctally doctor` reports it."
             )
+        codex_stats = stats
+        if not stats.lock_contended:
+            history = run_codex_history_provenance_drain(wait_for_requests=True)
+            if history.outcome == "settled" and history.candidates:
+                # Same accounting path and lock policy, without repeating the
+                # rebuild clear: the now-settled historical inputs can be read.
+                codex_stats = sync_codex_cache(
+                    conn, progress=_progress_codex_stderr, lock_timeout=lt,
+                    maintenance="caller")
+                if codex_stats.lock_contended:
+                    contended = True
+            if not codex_stats.lock_contended:
+                run_codex_barrier_membership_scan(wait_for_requests=True)
+                run_codex_barrier_seal_drain(wait_for_requests=True)
 
     conn.close()
 
@@ -15331,6 +19419,10 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                     _perf.flush_stderr(_perf.current_root())
                 return 1
             conv_stats = outcome.stats
+            if getattr(conv_stats, "rebuild_refused", None):
+                eprint(CODEX_REBUILD_REFUSED_MESSAGE)
+                _p_root.__exit__(None, None, None)
+                return 3
             if conv_stats.lock_contended:
                 eprint(
                     "[cache-sync] transcript rebuild incomplete: "
@@ -15428,8 +19520,13 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                     )
             if source in ("codex", "all"):
                 conv_stats = sync_codex_conversations(
-                    conversation_conn, rebuild=False, lock_timeout=lt
+                    conversation_conn, rebuild=False, lock_timeout=lt,
+                    maintenance="caller",
                 )
+                if conv_stats.rebuild_refused:
+                    eprint(CODEX_REBUILD_REFUSED_MESSAGE)
+                    _p_root.__exit__(None, None, None)
+                    return 3
                 if conv_stats.lock_contended:
                     eprint(
                         "[cache-sync] transcript sync skipped (codex): "
@@ -15443,6 +19540,24 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                     )
         finally:
             conversation_conn.close()
+
+    if codex_stats is not None and not codex_stats.lock_contended:
+        prune_result = run_codex_prune_drain(wait_for_requests=True)
+        verify_result = run_codex_container_verification_drain(wait_for_requests=True)
+        run_codex_reset_drain(wait_for_requests=True)
+        conv_result = run_codex_conversation_prune_drain(wait_for_requests=True)
+        run_codex_barrier_membership_scan(wait_for_requests=True)
+        sealed = run_codex_barrier_seal_drain(wait_for_requests=True)
+        if sealed.sealed:
+            conversation_conn = open_conversations_db()
+            try:
+                sync_codex_conversations(conversation_conn, maintenance="caller")
+            finally:
+                conversation_conn.close()
+        if (prune_result.outcome == "busy" or verify_result.outcome == "busy"
+                or conv_result.outcome == "busy"):
+            # Both executors share this single operator-facing notice.
+            _note_maintenance_deferred_once()
 
     _p_root.__exit__(None, None, None)
     # #276 perf: when tracing is enabled, flush the completed "cache-sync"

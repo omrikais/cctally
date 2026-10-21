@@ -64,7 +64,7 @@ FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "mirror-public"
 # parent-repo hook ever leaks through. Mixed-commit scenarios in
 # particular need the bypass to land the seed commit at all.
 # ---------------------------------------------------------------------------
-_SCAFFOLD = '''#!/bin/bash
+_SCAFFOLD = '''#!/usr/bin/env bash
 set -euo pipefail
 work="$(pwd)"
 REPO_ROOT="$1"
@@ -109,6 +109,11 @@ cp "$REPO_ROOT/.public-tag-patterns" .
 git add -A
 git commit --no-verify -q -m "chore: infra bootstrap"
 git -c tag.gpgsign=false tag mirror-cursor HEAD
+# A local bare private origin: the mirror tool publishes mirror-cursor there
+# itself (bootstrap included), leased on origin's value, and a push it cannot
+# complete is an error, never a warning.
+git init -q --bare "$work/private-origin.git"
+git remote add origin "$work/private-origin.git"
 
 # cwd remains $work/private/ for scenario-specific bash that follows.
 '''
@@ -440,6 +445,9 @@ SCENARIOS.append((
     None,
     # run.sh: configure faux origin → reconcile twice → assert second
     # run produced no new commit and stdout contains the no-op string.
+    # The second run's output goes to the case's own work directory (the
+    # harness runs this from `<work>/private`), never a fixed /tmp name that
+    # every run on the host shares and the confined runner kills (#940 D4).
     'pushd ../public >/dev/null\n'
     'git remote remove origin 2>/dev/null || true\n'
     'git remote add origin https://github.com/omrikais/cctally.git\n'
@@ -449,16 +457,16 @@ SCENARIOS.append((
     'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: reconcile1 exit=$rc"; exit "$rc"; fi\n'
     'HEAD_AFTER_RUN1=$(git -C ../public rev-parse HEAD)\n'
     'python3 bin/cctally-mirror-public --public-clone ../public --reconcile --yes \\\n'
-    '  > /tmp/cctally-reconcile-idempotent-run2.txt 2>&1\n'
+    '  > ../_reconcile-run2.txt 2>&1\n'
     'rc=$?\n'
-    'cat /tmp/cctally-reconcile-idempotent-run2.txt\n'
+    'cat ../_reconcile-run2.txt\n'
     'if [ "$rc" -ne 0 ]; then echo "ASSERT_FAIL: reconcile2 exit=$rc"; exit "$rc"; fi\n'
     'HEAD_AFTER_RUN2=$(git -C ../public rev-parse HEAD)\n'
     'if [ "$HEAD_AFTER_RUN1" != "$HEAD_AFTER_RUN2" ]; then\n'
     '  echo "ASSERT_FAIL: idempotent reconcile produced a second commit"\n'
     '  exit 2\n'
     'fi\n'
-    'grep -q "no drift to reconcile" /tmp/cctally-reconcile-idempotent-run2.txt || { echo "ASSERT_FAIL: expected no-drift message on second run"; exit 2; }\n'
+    'grep -q "no drift to reconcile" ../_reconcile-run2.txt || { echo "ASSERT_FAIL: expected no-drift message on second run"; exit 2; }\n'
     'echo "ASSERT_OK"\n',
 ))
 
@@ -600,7 +608,7 @@ def build(out_root: Path) -> None:
             if run_path.exists():
                 run_path.unlink()
         else:
-            run_path.write_text("#!/bin/bash\nset -uo pipefail\n" + run,
+            run_path.write_text("#!/usr/bin/env bash\nset -uo pipefail\n" + run,
                                 encoding="utf-8")
             run_path.chmod(0o755)
         # Optional public-tree golden: sorted `git -C public ls-tree -r

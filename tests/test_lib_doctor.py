@@ -40,6 +40,8 @@ def test_doctor_state_has_required_fields():
         "codex_project_metadata_health", "codex_project_metadata_error",
         # public #5: the hook's budgeted-ingest backlog record.
         "codex_ingest_backlog",
+        "codex_compressed_census", "codex_decoder_capability",
+        "codex_container_status", "codex_maintenance_debt",
         "dashboard_bind_stored", "runtime_bind",
         "config_json_error",
         "update_state", "update_state_error",
@@ -107,7 +109,8 @@ def test_doctor_state_has_required_fields():
         "journal_has_bytes",
         "journal_malformed_count", "journal_torn_tail_count",
         "journal_cursor_lag_bytes", "journal_hw_segment",
-        "journal_cursor_segment", "journal_heal_incidents",
+        "journal_cursor_segment", "journal_cursor_invalid",
+        "journal_heal_incidents",
         # #386: the stats sole-writer guard log leg (journal.writer_guard).
         "journal_writer_guard",
         # #374/#402: event conflicts, whole-batch taint, selector failure.
@@ -161,6 +164,15 @@ def test_doctor_state_has_required_fields():
         # recorded nothing.
         "conversation_rollup_pricing_observation",
         "cache_rollup_pricing_observation",
+        # #825/#832 spec 8: the account-bound legacy-writer evidence.
+        "legacy_writer",
+        # #825/#832 spec 8 / 5.6: the per-account outcome quarantine.
+        "outcome_quarantine",
+        # #825/#832 fix round K11 (K9K10-R6): why a deep journal scan or the
+        # segment listing could not complete, so the journal checks report
+        # "unavailable (cause)" instead of a zero or a stale summary.
+        "journal_scan_error",
+        "journal_listing_error",
     }
     assert fields == expected, fields ^ expected
 
@@ -219,6 +231,9 @@ def _state(**overrides) -> L.DoctorState:
                           "by_event": {"PostToolBatch": 2, "Stop": 1, "SubagentStop": 1},
                           "last_fire_ago_s": 4, "oauth_ok": 4, "throttled": 0},
         oauth_token_present=True,
+        # #825/#832: a validated index with no quarantined account.
+        outcome_quarantine={"available": True, "triggered": False,
+                            "accounts": []},
         stats_db_status={"path": "/tmp/x.db", "user_version": 7, "registry_size": 7,
                          "migrations": [{"seq": 1, "name": "001_x", "status": "applied"}]},
         cache_db_status={"path": "/tmp/c.db", "user_version": 3, "registry_size": 3,
@@ -234,6 +249,13 @@ def _state(**overrides) -> L.DoctorState:
         codex_entries_count=0,
         codex_last_entry_at=None,
         codex_jsonl_present=False,
+        codex_compressed_census={"compressedOnly": 0, "retainedComplete": 0,
+                                 "retainedIncomplete": 0, "neverIngested": 0,
+                                 "unverified": 0},
+        codex_decoder_capability="backports.zstd",
+        codex_container_status={"version": 1, "census": "complete"},
+        codex_maintenance_debt={"verifications": 0, "reads": 0,
+                                "deletions": 0, "olderThan24h": False},
         dashboard_bind_stored="loopback",
         runtime_bind=None,
         config_json_error=None,
@@ -1418,7 +1440,7 @@ def test_run_checks_returns_all_categories():
     rep = L.run_checks(_state())
     assert {c.id for c in rep.categories} == {
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry", "performance",
+        "accounting", "pricing", "quota", "safety", "telemetry", "performance",
     }
 
 
@@ -1518,7 +1540,7 @@ def test_serialize_json_top_level_shape():
     cat_ids = [c["id"] for c in payload["categories"]]
     assert cat_ids == [
         "install", "hooks", "auth", "db", "journal", "data", "accounts",
-        "pricing", "quota", "safety", "telemetry", "performance",
+        "accounting", "pricing", "quota", "safety", "telemetry", "performance",
     ]
 
 

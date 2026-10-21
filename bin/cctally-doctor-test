@@ -24,6 +24,10 @@
 #     scratch-HOME-relative PATH to make the check deterministic.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -32,7 +36,7 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CCTALLY="$REPO_ROOT/bin/cctally"
 # Generated fixture inputs are staged out of tree (#529 S3). The committed
 # tree is the read-only template; nothing under it is written during a run.
-FIXTURE_STAGE=$(mktemp -d -t cctally-doctor-fixstage.XXXXXX)
+FIXTURE_STAGE=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixstage.XXXXXX") || exit 1
 FIXTURES="$FIXTURE_STAGE/doctor"
 # Goldens address the COMMITTED root, never the staging copy above: this
 # harness's EXIT trap removes that copy, so a regenerate run writing there
@@ -54,7 +58,7 @@ fail_count=0
 
 # Per-run scratch root for ALL scenarios. Each scenario gets its own
 # subdir under here so concurrent harnesses don't collide.
-SCRATCH_ROOT=$(mktemp -d -t cctally-doctor-fixtures-XXXXXX)
+SCRATCH_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cctally-doctor-fixtures-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_ROOT" "$FIXTURE_STAGE"' EXIT
 
 # Clean python-only bin for the scrubbed PATH (issue #114).
@@ -277,6 +281,15 @@ fi
 
 echo "cctally-doctor-test: running scenarios under $FIXTURES"
 
+# Test regime reset, session 2: CCTALLY_DOCTOR_TEST_SCENARIOS=a,b runs only the
+# named scenario directories (the quick gate's named subset,
+# bin/_lib_quick_gate.py HARNESS_SUBSETS, whose names the quick gate checks
+# against the tree before it runs this harness). Unset, every scenario.
+scenario_filter="${CCTALLY_DOCTOR_TEST_SCENARIOS:-}"
+if [ -n "$scenario_filter" ]; then
+    echo "cctally-doctor-test: scenario filter: $scenario_filter"
+fi
+
 # Each run_mode call re-runs setup.sh against a fresh per-mode scratch
 # so the post-command update hook's mutations (config.json auto-create,
 # fire-and-forget update-check subprocess writing update-state.json) do
@@ -284,6 +297,12 @@ echo "cctally-doctor-test: running scenarios under $FIXTURES"
 for d in "$FIXTURES"/*/; do
     name=$(basename "${d%/}")
     [ -f "$d/setup.sh" ] || continue
+    if [ -n "$scenario_filter" ]; then
+        case ",$scenario_filter," in
+            *",$name,"*) ;;
+            *) continue ;;
+        esac
+    fi
     run_mode "$name" "default" ""          "txt"
     run_mode "$name" "quiet"   "--quiet"   "quiet.txt"
     run_mode "$name" "verbose" "--verbose" "verbose.txt"

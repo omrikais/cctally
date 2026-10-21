@@ -5,8 +5,9 @@
 # (the outer harness-pool budget — backward-compatible meaning):
 #   OUTER  — xargs -P width of the shell-harness pool.
 #   INNER  — per-harness inner fan-out cap, passed into each harness's env
-#            (config/dashboard/update read CCTALLY_TEST_JOBS; release reads
-#            CCTALLY_RELEASE_TEST_JOBS). Prevents the B^2 nesting where B
+#            (config/dashboard/update/preflight/test-remote read
+#            CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS).
+#            Prevents the B^2 nesting where B
 #            outer harnesses each spawn B (or, for release, nproc) inner
 #            workers.
 #   PYTEST — pytest-xdist worker count for the bulk post-pool pytest phase.
@@ -347,15 +348,14 @@ if [ "$TIER_MODE" = 1 ]; then
     # ---- 1-4: the basis, bound to the materialized tree ------------------
     # Read-only git, and `python3 -B` because plan mode is contractually
     # side-effect-free (preserve-item 25) and this block runs before it.
-    _tier_basis=$(python3 -B - "$REPO_ROOT" "$TIER_BASE_REV" <<'TIERPY'
-import subprocess
+    _tier_basis=$(printf '%s\n' 'import subprocess
 import sys
 
 root, base_rev = sys.argv[1], sys.argv[2]
 
 
 # `--no-optional-locks` on EVERY call, not only the diffs. `git diff` refreshes
-# the index's stat cache and rewrites .git/index when it does, and this program
+# the index'\''s stat cache and rewrites .git/index when it does, and this program
 # runs before plan mode, which preserve-item 25 requires to be literally
 # side-effect-free. The flag makes git skip taking the index lock, so the read
 # stays a read.
@@ -408,7 +408,7 @@ while index < len(tokens):
 # materializes: tracked paths that differ from HEAD (modified, added and deleted
 # alike), plus untracked-not-ignored paths.
 #
-# Only the first of the two is exactly "the changed subset" of the wrapper's
+# Only the first of the two is exactly "the changed subset" of the wrapper'\''s
 # `git ls-files --cached --others --exclude-standard` selection. The second
 # returns EVERY untracked-not-ignored path, changed or not, because an untracked
 # path has no committed state to differ from. That over-includes rather than
@@ -435,8 +435,7 @@ print(head)
 print(len(committed_set))
 print(len(worktree_set))
 for rel in sorted(union):
-    print(rel)
-TIERPY
+    print(rel)' | python3 -B - "$REPO_ROOT" "$TIER_BASE_REV"
     # The message names the revision as CONTEXT and attributes nothing to it.
     # The first wording said the revision was what the change set could not be
     # derived from, which blamed the caller's argument for `git` being absent, a
@@ -464,9 +463,7 @@ TIERPY
                 seconds) MERGE_MAX_SECONDS=$_value ;;
                 record) MERGE_RECORD=$_value ;;
             esac
-        done <<EOF
-$_merge_plan
-EOF
+        done < <(printf '%s\n' "$_merge_plan")
         [ -n "$MERGE_RECORD" ] || contract_usage_abort "merge selection missing" --merge-gate
         printf 'cctally-test-all: merge gate selected %s coverage\n' "$COVERAGE_MODE" >&2
     else
@@ -535,17 +532,13 @@ EOF
                 *) _tier_want="$_tier_want$_forced " ;;
             esac
             break
-        done <<EOF
-$_manifest_names
-EOF
+        done < <(printf '%s\n' "$_manifest_names")
     done
     for _n in $_tier_safe; do
         _found=0
         while IFS= read -r _m; do
             [ "$_m" = "$_n" ] && { _found=1; break; }
-        done <<EOF
-$_manifest_names
-EOF
+        done < <(printf '%s\n' "$_manifest_names")
         if [ "$_found" != 1 ]; then
             # Fail closed rather than dropping the name silently: attribution
             # named a harness this profile's manifest does not declare, so the
@@ -574,9 +567,7 @@ EOF
             *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
             *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
         esac
-    done <<EOF
-$_manifest_names
-EOF
+    done < <(printf '%s\n' "$_manifest_names")
     set +f
     COVERAGE_SELECTED=${COVERAGE_SELECTED% }
     COVERAGE_OMITTED=${COVERAGE_OMITTED% }
@@ -627,9 +618,7 @@ if [ "$SUBSET_MODE" = 1 ]; then
         _found=0
         while IFS= read -r _n; do
             [ "$_n" = "$_want" ] && { _found=1; break; }
-        done <<EOF
-$_manifest_names
-EOF
+        done < <(printf '%s\n' "$_manifest_names")
         if [ "$_found" != 1 ]; then
             contract_usage_abort "unknown harness '$_want'; it has no row in tests/authoritative-test-manifest.json for the $CONTRACT_PROFILE profile" "$_want"
         fi
@@ -643,9 +632,7 @@ EOF
             *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
             *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
         esac
-    done <<EOF
-$_manifest_names
-EOF
+    done < <(printf '%s\n' "$_manifest_names")
     COVERAGE_SELECTED=${COVERAGE_SELECTED% }
     COVERAGE_OMITTED=${COVERAGE_OMITTED% }
     COVERAGE_MODE=subset
@@ -669,6 +656,10 @@ fi
 # tests/test_harness_dev_autodetect_coverage.py note: NOT a substitute for
 # per-harness sourcing).
 export CCTALLY_DISABLE_DEV_AUTODETECT=1
+# #965: the suite's own copy of the test retention switch (docs/fixtures-gotchas.md,
+# "Conversation retention is off in test environments (#965)"); every child
+# harness and the pytest leg also assign it themselves.
+export CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF=1
 
 # ---- harness discovery (read-only; safe in plan mode) ------------------
 # reconcile is kept in final_harnesses ONLY as a summary-ordering device so it
@@ -814,9 +805,7 @@ SCHEDULER_TABLE=unknown
 SCHEDULER_TABLE_DIGEST=unknown
 dispatch_harnesses=(${report_harnesses[@]+"${report_harnesses[@]}"})
 _scheduler_out=$(
-    REPORT_ORDER="${report_harnesses[*]+"${report_harnesses[*]}"}" \
-    python3 -B - "$REPO_ROOT" "$CONTRACT_PROFILE" <<'SCHEDPY'
-import hashlib
+    printf '%s\n' 'import hashlib
 import os
 import sys
 
@@ -832,7 +821,7 @@ except ImportError as exc:
     )
     raise SystemExit(1)
 
-# Raw bytes rather than durations.read_table's text, because the record is
+# Raw bytes rather than durations.read_table'\''s text, because the record is
 # compared against the file on disk and text mode translates newlines.
 try:
     with open(os.path.join(repo_root, durations.TABLE_REL), "rb") as handle:
@@ -863,8 +852,9 @@ order, error = durations.dispatch_order(
 )
 if error:
     bail(error)
-print(" ".join(order))
-SCHEDPY
+print(" ".join(order))' |
+    REPORT_ORDER="${report_harnesses[*]+"${report_harnesses[*]}"}" \
+    python3 -B - "$REPO_ROOT" "$CONTRACT_PROFILE"
 )
 _scheduler_rc=$?
 # Split the provenance line off the front. Command substitution strips trailing
@@ -893,7 +883,7 @@ elif [ -n "$_scheduler_order" ]; then
     # the mechanism, but the assignment form also invites pathname expansion,
     # and SC2206 is not on the gate's permitted-suppression list. A manifest
     # harness name carries no whitespace, so one IFS split is exact.
-    read -r -a dispatch_harnesses <<< "$_scheduler_order"
+    read -r -a dispatch_harnesses < <(printf '%s\n' "$_scheduler_order")
     SCHEDULER_MODE=lpt
 else
     # Exit 0 with no names at all. This is REACHED, not defence: the subset
@@ -986,9 +976,12 @@ fi
 EVIDENCE_KERNEL="$REPO_ROOT/bin/_lib_test_evidence.py"
 EVIDENCE_PRIVATE="$REPO_ROOT/bin/_lib_test_remote_observability.py"
 
-_ev() {   # _ev <mode> [args...]
-    python3 - "$EVIDENCE_KERNEL" "$EVIDENCE_PRIVATE" "$@" <<'EVPY'
-import fcntl
+# The bridge program, printed rather than fed as a here-document: bash 3.2
+# and /bin/sh write here-document bodies under /private/var/tmp whatever
+# TMPDIR says (#940 C11).
+_ev_bridge() {
+    printf '%s\n' 'import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -1025,7 +1018,7 @@ def _load(path, name):
 # that imports but is not this kernel — a truncated copy, a rename that left
 # the entry point behind — is diagnosed here rather than raising an
 # AttributeError inside whichever mode happened to touch the missing name
-# first, whose non-zero status the caller then attributes to that mode's own
+# first, whose non-zero status the caller then attributes to that mode'\''s own
 # arguments.
 REQUIRED = (
     "DEFAULT_MAX_AGE_DAYS", "DEFAULT_MAX_BYTES", "RUN_STATES", "ScrubContext",
@@ -1033,6 +1026,9 @@ REQUIRED = (
     "allocate_budget", "apply_validation_redactions",
     "bound_extract_lines", "build_scrubbed_extract",
     "_coverage_gaps",
+    "LEGACY_STORE", "retention_store", "carried_seeded_loss", "retention_coverage",
+    "read_evidence_index", "update_evidence_index", "record_store_loss",
+    "forget_indexed_runs", "verify_indexed_runs",
     "merge_duration_legs", "plan_evidence_evictions",
     "render_retention_notice",
     "resolve_evidence_layout", "resolve_run_id", "select_failure_windows",
@@ -1049,7 +1045,7 @@ if EV is not None:
         EV = None
         LOAD_ERROR = "the module defines none of: %s" % ", ".join(missing)
 # Exit 9 is reserved for "this bridge has no usable kernel" and is the ONLY
-# status the caller reads as that. It must not collide with a mode's own
+# status the caller reads as that. It must not collide with a mode'\''s own
 # argument errors, which use 2.
 if EV is None:
     sys.stderr.write(
@@ -1072,7 +1068,7 @@ def _int(name, default=0):
 
 
 def _process_start(pid):
-    """The estate's existing locale-pinned process-identity idiom.
+    """The estate'\''s existing locale-pinned process-identity idiom.
 
     A pid alone is not an identity, because the kernel recycles pids and a
     recycled pid would keep a dead run marked `active`, and therefore
@@ -1232,7 +1228,7 @@ def _harness_table(logdir):
 
 
 def _read_log(path):
-    """One subject's log as text lines, or None when it is not text.
+    """One subject'\''s log as text lines, or None when it is not text.
 
     STRICT decoding. `errors="replace"` turned undecodable bytes into U+FFFD
     and let an export be published over content nothing had decoded, which
@@ -1248,17 +1244,17 @@ def _read_log(path):
         return None
 
 
-# The block's own header, and the `[OMITTED: …]` notice it writes when it
+# The block'\''s own header, and the `[OMITTED: …]` notice it writes when it
 # truncates, are LINES IN THE EMITTED FILE and the kernel charges them to the
-# subject's budget. A caller that requested only the cluster lines therefore
+# subject'\''s budget. A caller that requested only the cluster lines therefore
 # lost two lines of real content off the end of every block, including on a
 # nine-line log with a six-hundred-line cap. The overhead is requested here so
-# the accounting is the caller's rather than a surprise in the kernel.
+# the accounting is the caller'\''s rather than a surprise in the kernel.
 BLOCK_OVERHEAD_LINES = 2
 
 
 def _subject_windows(lines):
-    """`(clusters, hard_lines, supplemental_lines)` for one subject's log."""
+    """`(clusters, hard_lines, supplemental_lines)` for one subject'\''s log."""
     windows = EV.select_failure_windows(lines, failing=True)
     hard = sum(
         win["end"] - win["start"] + 1 for win in windows if win["kind"] == "hard"
@@ -1274,7 +1270,7 @@ if MODE == "pid-start":
     raise SystemExit(0)
 
 if MODE == "scrub-log":
-    # One subject's sanitized block, for the CONSOLE. Same transformer and
+    # One subject'\''s sanitized block, for the CONSOLE. Same transformer and
     # same validator as the export, so the two cannot drift; the budget is
     # per-subject here and run-wide there, which is the only difference.
     subject, logfile = ARGS[0], ARGS[1]
@@ -1300,7 +1296,7 @@ if MODE == "scrub-log":
         log_names={subject: "logs/%s.log" % subject},
         clusters={subject: clusters},
     )
-    # The parent already printed `---- <subject> … ----`, so the kernel's own
+    # The parent already printed `---- <subject> … ----`, so the kernel'\''s own
     # subject header would nest a block inside a block.
     if body and body[0] == "---- %s ----" % subject:
         body = body[1:]
@@ -1308,14 +1304,14 @@ if MODE == "scrub-log":
     violations = EV.validate_export(body, _roots())
     # Per LINE for a structural leg, whole-block only when a CONTENT leg
     # fired, exactly as the export path below degrades. The two used to differ
-    # — the console dropped one subject's block and the export dropped the
+    # — the console dropped one subject'\''s block and the export dropped the
     # file — and both were the same mistake at different scales.
     body, redaction = EV.apply_validation_redactions(body, violations, _roots())
     if redaction["refused"]:
-        # BRANCH ON THE CAUSE. The canary refusal is not a leg's verdict and
+        # BRANCH ON THE CAUSE. The canary refusal is not a leg'\''s verdict and
         # carries no violation, so the generic wording below reported "0
         # violations" and named the validator for a refusal the validator did
-        # not reach. Compared against the kernel's own constant, because a
+        # not reach. Compared against the kernel'\''s own constant, because a
         # retyped literal would drift silently from the reason the sidecar
         # records.
         if redaction.get("refusal") == EV.TRANSFORMER_HEALTH_REFUSAL:
@@ -1342,7 +1338,7 @@ if MODE == "scrub-log":
 
 if MODE == "export":
     # The whole-run extract: ONE allocation across every failed subject, so a
-    # noisy harness cannot consume the run budget before another subject's
+    # noisy harness cannot consume the run budget before another subject'\''s
     # decisive failure is reached.
     evidence_dir = ARGS[0]
     subject_lines = {}
@@ -1367,7 +1363,7 @@ if MODE == "export":
             # silent half-answer the validator exists to prevent. Nothing is
             # lost — the raw logs are retained and the caller prints where.
             sys.stderr.write(
-                "cctally-test-all: %s's log could not be read as text, so no "
+                "cctally-test-all: %s'\''s log could not be read as text, so no "
                 "export file was written; the complete unsanitized logs are "
                 "retained under logs/\n" % name
             )
@@ -1414,12 +1410,12 @@ if MODE == "export":
     # evidence enough that the design cannot depend on every future leg being
     # perfect. A content violation still refuses everything, because that is
     # the transformer leaking rather than a leg over-firing. The offending
-    # line's bytes never reach the file either way.
+    # line'\''s bytes never reach the file either way.
     out, redaction = EV.apply_validation_redactions(out, violations, _roots())
     _write_validator_sidecar(evidence_dir, redaction)
     if redaction["refused"]:
         # Same branch as the console path above, and for the same reason: this
-        # line plus the non-deciding `contract_note` are the operator's entire
+        # line plus the non-deciding `contract_note` are the operator'\''s entire
         # signal in the one case where every byte of failure evidence is
         # withheld, so it must not report zero violations or blame the
         # validator for a refusal the validator did not reach.
@@ -1442,8 +1438,8 @@ if MODE == "export":
             )
         raise SystemExit(1)
     if redaction["redacted"]:
-        # Never silent, on the operator's surface and in the machine-readable
-        # record alike: this file's own rule for eviction, applied to the
+        # Never silent, on the operator'\''s surface and in the machine-readable
+        # record alike: this file'\''s own rule for eviction, applied to the
         # other thing it removes without being asked.
         sys.stderr.write(
             "cctally-test-all: the validator refused %d of %d extract lines; "
@@ -1493,7 +1489,7 @@ if MODE == "manifest":
     # A verdict exists only for a run that REACHED one, which is `completed`
     # and nothing else. `active`, `aborted` and `abandoned` all describe a run
     # whose estate never finished, and claiming an outcome for any of them
-    # would let the next run's eviction pass rank an unfinished run as a pass —
+    # would let the next run'\''s eviction pass rank an unfinished run as a pass —
     # `plan_evidence_evictions` orders `outcome == "pass"` first for cap
     # eviction, so the false pass is discarded ahead of a genuine failure. An
     # interrupted run reported `outcome: "pass"` and `failureClass: "none"`
@@ -1501,10 +1497,10 @@ if MODE == "manifest":
     # while its justification covered every unfinished state.
     settled = state == "completed"
     # The same metric the outcome record carries, so a reader holding either
-    # artifact alone can normalize this run's cost. Numerator and denominator
+    # artifact alone can normalize this run'\''s cost. Numerator and denominator
     # are both present beside it rather than only their quotient.
     # An EMPTY EV_PASSED_CASES means the denominator could not be assembled —
-    # pytest's passed-item count was not readable — which is a different answer
+    # pytest'\''s passed-item count was not readable — which is a different answer
     # from a denominator of zero and is recorded as null rather than as the
     # shell half alone.
     passed_cases = _int("EV_PASSED_CASES") if _env("EV_PASSED_CASES") else None
@@ -1619,7 +1615,7 @@ def _load_runs(root):
 # `manifest.json active`. That gap is sub-second even on a loaded runner, so
 # 120 seconds is two orders of magnitude of headroom. It exists because a
 # concurrent run caught inside that gap was counted as an ORPHAN, which
-# flipped the whole pass's coverage to `degraded` — a false alarm on a signal
+# flipped the whole pass'\''s coverage to `degraded` — a false alarm on a signal
 # whose only value is that an operator believes it. The window costs nothing
 # but reporting a genuinely orphaned directory one pass late, and a partial
 # `rmtree` leaves a recent mtime anyway because removing a child updates the
@@ -1645,7 +1641,7 @@ def _orphan_dirs(root, now=None):
     are on disk, and under-stating `bytesAfter` is exactly the class the
     rescan exists to close.
 
-    `now` is the retention pass's ONE clock sample, supplied by the caller so
+    `now` is the retention pass'\''s ONE clock sample, supplied by the caller so
     the grace window and the age horizon are measured against the same
     instant. It defaults to the current time for a direct caller.
     """
@@ -1693,8 +1689,8 @@ def _merge_intervals(gaps):
     """The UNION of every coverage hole ever recorded.
 
     `plan_evidence_evictions` reports the gaps of ONE pass, and coverage is
-    cumulative over the store's whole life. A surface that rendered a single
-    pass's intervals would report a store full of holes as complete after any
+    cumulative over the store'\''s whole life. A surface that rendered a single
+    pass'\''s intervals would report a store full of holes as complete after any
     pass that evicted nothing.
     """
     OPEN = float("inf")
@@ -1730,7 +1726,7 @@ RETENTION_LOCK_SECONDS = 60
 def _acquire_retention_lock(path):
     """An exclusive flock on `path`, or None if it could not be taken.
 
-    Bounded rather than blocking. Retention is non-deciding by the spec's
+    Bounded rather than blocking. Retention is non-deciding by the spec'\''s
     freeze point, so skipping this pass is a legitimate outcome the next run
     reclaims; hanging the aggregator behind a wedged holder is not.
     """
@@ -1753,12 +1749,146 @@ def _acquire_retention_lock(path):
             time.sleep(0.05)
 
 
+def _iso(epoch):
+    if epoch is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch)))
+
+
+class _IndexLock(object):
+    """The evidence index'\''s writer lock (#940, C8). The public kernel names
+    no lock layout, so every writer supplies one; this is the exclusive flock
+    on `<index>.lock` that the runner'\''s enrollment also takes (the private
+    runner-storage tests observe that the two exclude each other)."""
+
+    def __init__(self, index):
+        self.path = index + ".lock"
+        self.fd = None
+
+    def __enter__(self):
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return self
+
+    def __exit__(self, *exc):
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            os.close(fd)
+        return False
+
+
+def _index_forget(index, store, run_ids):
+    """Drop runs from the evidence index (#940, C8): runs retention evicted on
+    purpose, and runs whose loss was just recorded. The kernel'\''s own reader
+    and atomic writer, under this aggregator'\''s lock, so the index has one
+    shape."""
+    EV.forget_indexed_runs(index, store_id=store, run_ids=run_ids, lock=_IndexLock(index))
+
+
+def _index_listed(index, store, run_ids):
+    """The members of `run_ids` the evidence index still lists for `store`
+    (#940 D0b), each mapped to the finish epoch the index records for it (or
+    None): a pending forget the index no longer lists has nothing left to
+    forget. An index that cannot be read keeps every one, never deciding."""
+    try:
+        runs = ((EV.read_evidence_index(index).get("stores") or {}).get(store) or {}) \
+            .get("runs") or []
+    except (OSError, ValueError):
+        return dict((r, None) for r in run_ids)
+    by_id = dict((r.get("runId"), r) for r in runs)
+    return dict((r, _indexed_finish(by_id[r])) for r in run_ids if r in by_id)
+
+
+def _indexed_finish(run):
+    """The epoch an indexed run finished (its `endedAt`, else `startedAt`):
+    the quantity retention evicts by (`finished_epoch`, else
+    `started_epoch`), never the stamp of the run id (#940 D0c). An `endedAt`
+    that does not parse falls through to `startedAt` (#940 D-2 F14). None when
+    the index records neither readably."""
+    for key in ("endedAt", "startedAt"):
+        value = run.get(key)
+        if value:
+            try:
+                return int(EV._iso_epoch(value))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _detect_index_loss(index, store, root, current_run, seeded, evicted=(), horizon=None):
+    """R7-F7: an indexed run whose evidence is missing, truncated or changed
+    is LOST, discovered here from the index alone (no pre-seeded flag). Each
+    is recorded in the index'\''s loss list and carried in the record'\''s
+    `seededLoss`, so the store stays `coverage: degraded` until the interval
+    ages out. A run retention itself evicted (`evicted`: this pass'\''s, and any
+    earlier pass'\''s whose index forget has not yet succeeded) is planned,
+    never lost. So is a run that finished before the retention `horizon`
+    (#940 D0c: by the finish the index records, the quantity retention evicts
+    by, never by its id stamp): retention evicts it by age, so it is forgotten
+    from the index here instead of being read as loss or listed for ever.
+    Never deciding: an index that cannot be read is a note."""
+    try:
+        problems = [p for p in EV.verify_indexed_runs(index, store_id=store, root=root)
+                    if p["runId"] != current_run and p["runId"] not in evicted]
+        if not problems:
+            return
+        runs = dict((r.get("runId"), r) for r in
+                    ((EV.read_evidence_index(index).get("stores") or {}).get(store) or {})
+                    .get("runs") or [])
+        aged = set()
+        if horizon is not None:
+            for problem in problems:
+                finish = _indexed_finish(runs.get(problem["runId"]) or {})
+                if finish is not None and finish < horizon:
+                    aged.add(problem["runId"])
+        problems = [p for p in problems if p["runId"] not in aged]
+        keys = set((e.get("start"), e.get("end"), e.get("reason")) for e in seeded)
+        items = []
+        for problem in problems:
+            run = runs.get(problem["runId"]) or {}
+            items.append({"start": run.get("startedAt"), "end": run.get("endedAt"),
+                          "reason": "detected %s evidence of run %s" % (
+                              problem["kind"], problem["runId"])})
+        # #940 D0b: every loss joins the seeded loss BEFORE any index write, so
+        # an index that cannot be written does not drop a loss this pass found:
+        # the record still degrades coverage. D-1 F4: all of them first, so one
+        # failed write cannot drop the losses after it.
+        for item in items:
+            if (item["start"], item["end"], item["reason"]) not in keys:
+                seeded.append(item)
+                keys.add((item["start"], item["end"], item["reason"]))
+            sys.stderr.write("cctally-test-all: evidence loss: %s\n" % item["reason"])
+        for item in items:
+            EV.record_store_loss(index, store_id=store, start=item["start"],
+                                 end=item["end"], reason=item["reason"],
+                                 lock=_IndexLock(index))
+        _index_forget(index, store, set(p["runId"] for p in problems) | aged)
+    except (OSError, ValueError, KeyError) as exc:
+        sys.stderr.write("cctally-test-all: the evidence index %s could not be verified "
+                         "(%s: %s)\n" % (index, exc.__class__.__name__, exc))
+
+
 def _retention_pass(root, current_run, record_path):
     try:
         with open(record_path, encoding="utf-8") as handle:
             previous = json.load(handle)
     except (OSError, ValueError):
         previous = {}
+    # #940 (C8, F20): the store this pass runs on. A record written for another
+    # store never lends this one its pass count, gaps or seeded loss.
+    store = os.environ.get("CCTALLY_RUNNER_STORE_ID") or EV.retention_store(previous)
+    if previous and EV.retention_store(previous) != store:
+        sys.stderr.write(
+            "cctally-test-all: the retention record %s belongs to store %s, not %s; "
+            "starting this store'\''s record afresh\n"
+            % (record_path, EV.retention_store(previous), store))
+        previous = {}
+    index = os.environ.get("CCTALLY_RUNNER_EVIDENCE_INDEX") or ""
 
     runs = _load_runs(root)
     live = {}
@@ -1809,6 +1939,72 @@ def _retention_pass(root, current_run, record_path):
     # eviction. `bytesAfter` is therefore the post-pass state as observed, and
     # no consumer may read it as exact.
     removed_ids = {run["run_id"] for run in removed}
+    # Seeded loss is preserved until it ages out of the retention horizon (C8).
+    seeded = EV.carried_seeded_loss(
+        previous, now, max_age_days=_int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS))
+    # Evicted runs the index still lists: this pass'\''s, plus an earlier pass'\''s
+    # whose forget failed after its eviction succeeded. They are retried here
+    # and, until a forget succeeds, carried in the record, so no later pass
+    # reads a planned eviction as loss.
+    #
+    # #940 D0b: the carried list is accepted only as a list of run ids (a string
+    # is not a list of its characters, and an unsafe id is dropped). It is
+    # carried whenever it is non-empty, and while forgets keep failing it is
+    # reconciled against the index, so it keeps only the runs the index still
+    # lists. Each entry carries the epoch its run finished
+    # (`indexForgetPendingEnded`), the quantity retention evicts by.
+    #
+    # #940 D0c: a pass that names no index adds none of its own evictions
+    # (there is nothing to forget them from, and the CI lane'\''s unstamped ids
+    # would stay pending for ever), and it alone age-bounds what it carries:
+    # an entry whose recorded finish is older than the retention window is
+    # dropped, and one with no recorded finish is kept. A pass that names an
+    # index carries an entry while its forget fails, and loss detection forgets
+    # the runs past the window it finds listed. #940 D-2 F19: not for ever,
+    # though. An index that stays unreadable, or whose forget keeps failing,
+    # would grow the list on every pass, so a named-index pass drops an entry
+    # whose recorded finish is more than one further window past the horizon:
+    # by then loss detection forgets it as aged once the index recovers. No
+    # entry whose run finished inside the horizon is dropped.
+    window = _int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS) * 86400
+    horizon = now - window
+    carried = previous.get("indexForgetPending")
+    carried = [r for r in carried if EV.validate_run_id(r)] if isinstance(carried, list) else []
+    carried_ended = previous.get("indexForgetPendingEnded")
+    if not isinstance(carried_ended, dict):
+        carried_ended = {}
+
+    def _epoch(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    pending_ended = dict((r, _epoch(carried_ended.get(r))) for r in carried)
+    if index:
+        for run in removed:
+            finish = run.get("finished_epoch") or run.get("started_epoch")
+            pending_ended[run["run_id"]] = _epoch(finish)
+        pending_forget = set(pending_ended)
+        try:
+            _index_forget(index, store, pending_forget)
+            forgotten = True
+        except (OSError, ValueError) as exc:
+            forgotten = False
+            sys.stderr.write("cctally-test-all: the evidence index %s could not be updated "
+                             "(%s: %s)\n" % (index, exc.__class__.__name__, exc))
+        _detect_index_loss(index, store, root, current_run, seeded, evicted=pending_forget,
+                           horizon=horizon)
+        if forgotten:
+            pending_ended = {}
+        else:
+            listed = _index_listed(index, store, pending_forget)
+            pending_ended = dict(
+                (r, pending_ended[r] if pending_ended.get(r) is not None else listed[r])
+                for r in listed)
+            pending_ended = dict((r, e) for r, e in pending_ended.items()
+                                 if e is None or e >= horizon - window)
+    else:
+        pending_ended = dict((r, e) for r, e in pending_ended.items()
+                             if e is None or e >= horizon)
+    pending_forget = set(pending_ended)
     after_runs = _load_runs(root)
     orphans, unclassified_bytes = _orphan_dirs(root, now)
     bytes_after = (
@@ -1837,10 +2033,17 @@ def _retention_pass(root, current_run, record_path):
         "schemaVersion": 1,
         "updatedAt": int(time.time()),
         "passes": int(previous.get("passes") or 0) + 1,
+        # The store this record describes (#940, F20): the observability reader
+        # de-duplicates passes on (host, store, passes).
+        "store": store,
         # An orphan is not healthy retained evidence. Its interval cannot be
         # recovered — the manifest that carried it is what went missing — so
         # the coverage state is degraded and no interval is invented for it.
-        "coverage": "degraded" if (gaps or orphans) else "complete",
+        # Seeded loss (a lost predecessor store, detected index loss) degrades
+        # it too, until it ages out.
+        "coverage": EV.retention_coverage(gaps=gaps, orphans=len(orphans),
+                                          seeded_loss=seeded),
+        "seededLoss": seeded,
         "gaps": gaps,
         "overCap": bytes_after > max_bytes,
         "bytesAfter": bytes_after,
@@ -1858,6 +2061,11 @@ def _retention_pass(root, current_run, record_path):
             {run.get("reason") for run in removed if run.get("reason")}
         ),
     }
+    if pending_forget:
+        record["indexForgetPending"] = sorted(pending_forget)
+        ended = dict((r, e) for r, e in pending_ended.items() if e is not None)
+        if ended:
+            record["indexForgetPendingEnded"] = ended
     _write_atomic(record_path, json.dumps(record) + "\n")
 
     notice = EV.render_retention_notice(plan)
@@ -1866,11 +2074,14 @@ def _retention_pass(root, current_run, record_path):
     # Fired for an orphan too, not for gaps alone. The record above already
     # degrades on `gaps or orphans`, so a pass that degraded ONLY because of an
     # orphan wrote the degraded record and printed nothing — silent
-    # degradation, beside this file's own rule that eviction is never silent.
-    if gaps or orphans:
+    # degradation, beside this file'\''s own rule that eviction is never silent.
+    if gaps or orphans or seeded:
         detail = []
         if gaps:
             detail.append("%d gaps" % len(gaps))
+        if seeded:
+            detail.append("%d recorded loss interval%s" % (len(seeded),
+                                                           "" if len(seeded) == 1 else "s"))
         if orphans:
             detail.append(
                 "%d orphan %s with no readable manifest"
@@ -1890,7 +2101,7 @@ def _retention_pass(root, current_run, record_path):
 if MODE == "merge-durations":
     # ARGS[0] is the published artifact; the rest are the legs that RAN.
     # Non-deciding, like every other evidence step: the caller reports a
-    # failure through a note and the artifact's own absence.
+    # failure through a note and the artifact'\''s own absence.
     # A leg left by a killed process is a truncated gzip member, which raises
     # `EOFError` or `zlib.error` — NEITHER of which is an `OSError`. Catching
     # `OSError` alone let the bridge die with a traceback on exactly the
@@ -1922,7 +2133,7 @@ if MODE == "retention":
     if lock_fd is None:
         sys.stderr.write(
             "cctally-test-all: the evidence retention lock could not be taken "
-            "within %ds, so this run's retention pass was skipped; the next "
+            "within %ds, so this run'\''s retention pass was skipped; the next "
             "run reclaims it\n" % RETENTION_LOCK_SECONDS
         )
         raise SystemExit(0)
@@ -1934,9 +2145,36 @@ if MODE == "retention":
         os.close(lock_fd)
     raise SystemExit(0)
 
+if MODE == "index":
+    # #940 (C8, R7-F7): a FINISHED run'\''s manifest, with its expected length and
+    # digest, under the store it ran on, so a later retention pass can discover
+    # its deletion or truncation. Non-deciding: a failure is a note.
+    root, run_dir, run_id = ARGS[0], ARGS[1], ARGS[2]
+    index = os.environ.get("CCTALLY_RUNNER_EVIDENCE_INDEX") or ""
+    if not index:
+        raise SystemExit(0)
+    store = os.environ.get("CCTALLY_RUNNER_STORE_ID") or EV.LEGACY_STORE
+    manifest = os.path.join(run_dir, "manifest.json")
+    try:
+        with open(manifest, "rb") as handle:
+            data = handle.read()
+        doc = json.loads(data.decode("utf-8"))
+        EV.update_evidence_index(
+            index, store_id=store, run_id=run_id,
+            started_at=_iso(doc.get("startedEpoch")), ended_at=_iso(doc.get("finishedEpoch")),
+            length=len(data), digest="sha256:" + hashlib.sha256(data).hexdigest(),
+            relpath=os.path.relpath(manifest, root), lock=_IndexLock(index))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("cctally-test-all: run %s was not added to the evidence index %s "
+                         "(%s: %s)\n" % (run_id, index, exc.__class__.__name__, exc))
+    raise SystemExit(0)
+
 sys.stderr.write("cctally-test-all: unknown evidence mode %r\n" % MODE)
-raise SystemExit(9)
-EVPY
+raise SystemExit(9)'
+}
+
+_ev() {   # _ev <mode> [args...]
+    _ev_bridge | python3 - "$EVIDENCE_KERNEL" "$EVIDENCE_PRIVATE" "$@"
 }
 
 # ---- run identity and the opening banner (#529 S2) ----------------------
@@ -1982,16 +2220,110 @@ if [ "$COVERAGE_MODE" = merge-focused ] && [ "$MERGE_DEADLINE_WORKER" = 0 ]; the
     _merge_rc=$?
     if [ "$_merge_rc" = 124 ]; then
         contract_note "merge gate reached its ${MERGE_MAX_SECONDS}-second execution deadline"
-        contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" completion
+        contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" budget
         contract_finish
     fi
     exit "$_merge_rc"
 fi
 
+# ---- the suite generation (#963, spec 5.4) ------------------------------
+# Claimed HERE: after plan mode and the merge-focused dispatch, which both
+# exit before any side effect, and BEFORE admission, whose estate discovery is
+# the first subprocess that can allocate pytest temp. Every pytest allocation
+# of this run lives beneath it: the main leg's --basetemp m, the benchmark
+# leg's --basetemp b, the PYTEST_DEBUG_TEMPROOT t of implicit nested sessions,
+# and the temporary log directory. TMPDIR itself is never changed (spec 4.1).
+GEN_LIB="$REPO_ROOT/bin/_lib_test_generation.py"
+GEN_DIR=""
+GEN_TOKEN=""
+GEN_STATE=none
+_gen() { python3 -B "$GEN_LIB" "$@"; }
+
+# The terminal half of the lifecycle, called from the EXIT trap with the exit
+# status. A generation the success path already removed is left alone (R2-F1:
+# a post-cleanup budget failure never recreates it). Whatever the status, the
+# run reaps its recorded groups and, once every one is established gone and no
+# other process carries its descendant token, removes the generation (test
+# regime reset, session 1: a failed or interrupted run no longer keeps its
+# scratch for 24 hours). Only when a descendant may still run, or the removal
+# is refused, is it kept: 128 and above records `interrupted`, anything else
+# `failed`, and both release obstructive metadata for the unchanged 24-hour
+# retention (U5).
+_gen_settle() {   # $1 exit status
+    [ "$GEN_STATE" = claimed ] || return 0
+    # Removal only once every recorded group is established gone (spec 5.4)
+    # and the sweep's own descendant-token scan sees no other holder (Review
+    # Focus 4): a detached descendant outside the recorded groups, or an
+    # environment scan that cannot see, keeps the generation. The scan never
+    # counts this run's own process or its ancestors.
+    local reaped=0
+    _gen reap --dir "$GEN_DIR" && _gen descendants --dir "$GEN_DIR" && reaped=1
+    if [ "$reaped" = 1 ] && _gen remove --dir "$GEN_DIR"; then
+        GEN_STATE=removed
+        return 0
+    fi
+    if [ "$1" -ge 128 ]; then
+        _gen finish --dir "$GEN_DIR" --state interrupted || true
+    else
+        _gen finish --dir "$GEN_DIR" --state failed || true
+    fi
+    GEN_STATE=retained
+    return 0
+}
+
+# Every process group this run starts is recorded, so a later sweep can tell
+# survivors of a killed run from a reused number.
+_gen_record_group() {   # $1 group leader pid
+    [ "$GEN_STATE" = claimed ] && [ -n "$1" ] || return 0
+    _gen add-group --dir "$GEN_DIR" --pgid "$1" \
+        || contract_note "suite generation: could not record process group $1"
+    return 0
+}
+
+# Success, for the generation: nothing failed, or the only reason recorded is
+# the deliberate subset (the same test as the verdict block's
+# `_subset_other_reasons`).
+_gen_run_succeeded() {
+    [ "$CONTRACT_CLASS" = none ] && return 0
+    [ "$CONTRACT_CLASS" = incomplete ] || return 1
+    [ "$(printf '%s' "$CONTRACT_REASONS" \
+        | awk -F'\t' 'NF && $1 != "deliberate-subset"' | wc -l | tr -d ' ')" = 0 ]
+}
+
+if ! GEN_CLAIM=$(_gen claim --tmpdir "${TMPDIR:-/tmp}" --owner-pid "$$"); then
+    contract_note "suite generation: could not claim a generation beneath ${TMPDIR:-/tmp} (check TMPDIR)"
+    contract_fail infrastructure admission-scratch-failed "generation" admission
+    contract_abort
+fi
+# The claim prints the directory, then the generation's descendant token.
+GEN_DIR=${GEN_CLAIM%%$'\n'*}
+GEN_DESCENDANT_TOKEN=${GEN_CLAIM#*$'\n'}
+GEN_STATE=claimed
+GEN_TOKEN=${GEN_DIR##*/ctg-}
+# 963-CD-G3 (esc-db01a377fca6): every leg, harness and test-launched process
+# inherits this run's token after every enclosing run's, so a detached
+# descendant that escaped the recorded groups and the reservation's sampling
+# still keeps the generation while the sweep can see its environment. It is
+# deliberately inherited (spec 4.3), never owner-only.
+export CCTALLY_SUITE_GENERATIONS="${CCTALLY_SUITE_GENERATIONS:+$CCTALLY_SUITE_GENERATIONS }$GEN_DESCENDANT_TOKEN"
+# Ownership is installed immediately; _cleanup_run takes it over below.
+trap '_gen_settle $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+export PYTEST_DEBUG_TEMPROOT="$GEN_DIR/t"
+# Inspection only: it records when a killed run's ownership was first seen to
+# have ended. Reclamation waits for the exit sweep in _cleanup_run, after this
+# run's wall is frozen, so an old generation never costs this run's budget.
+_gen sweep --tmpdir "${TMPDIR:-/tmp}" --keep "$GEN_DIR" || true
+
 # AFTER plan mode by design: the block above exits "before ANY side effect" and
 # tests/test_test_all_scheduler.py depends on that, while these checks parse a
 # manifest, import the allowlist classifier and (from Task 3) launch capability
-# probes. Admission runs before LOGDIR so a refusal creates nothing. The library
+# probes. Admission runs before LOGDIR, so a refusal launches no harness and creates
+# no log directory. It does leave the suite generation claimed above (its
+# marker, its empty t/ and anything estate discovery allocated beneath it): the
+# EXIT trap marks it failed and keeps it for 24 hours like any failed run (U5,
+# no exception), and a later run's exit sweep reclaims it (#963). The library
 # itself is sourced near the top of this file, because the worker-budget checks
 # need contract_usage_abort; only the calls below have side effects.
 # CONTRACT_PROFILE is resolved with the subset block near the top of this file,
@@ -2018,9 +2350,7 @@ if [ "$COVERAGE_RESOLVED" != 1 ]; then
             else
                 COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
             fi
-        done <<EOF
-$(contract_manifest_harness_names "$CONTRACT_PROFILE")
-EOF
+        done < <(printf '%s\n' "$(contract_manifest_harness_names "$CONTRACT_PROFILE")")
         COVERAGE_SELECTED=${COVERAGE_SELECTED% }
         COVERAGE_OMITTED=${COVERAGE_OMITTED% }
     else
@@ -2052,8 +2382,9 @@ fi
 # The structural check: this tree's live pytest, frontend and suppression sets
 # against the committed estate artifact, and every artifact transition against
 # committed history for authorization. It runs HERE — after capability
-# admission and before LOGDIR exists — so a refusal creates nothing and no
-# harness has launched.
+# admission and before LOGDIR exists — so a refusal launches no harness and
+# creates no log directory; its only residue is the suite generation claimed
+# before admission, kept as failed for 24 hours (#963).
 #
 # D12 says "every otherwise-admitted non-plan invocation", and these are the
 # exits that come first, named rather than assumed away:
@@ -2091,23 +2422,72 @@ if [ "$COVERAGE_PYTEST" != "skipped" ]; then
     contract_admit_estate_plan "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
 fi
 
-# ---- the committed runtime budget (#630 S7) ----------------------------
-# Parsed and validated HERE, at admission, so a malformed or missing budget
-# refuses the run in seconds rather than after twenty minutes of work whose
-# cost it then cannot judge. The completion check re-reads nothing; it compares
-# the computed metric against the value validated here.
+# The quarantine applier (spec 4.3), run with `python3 -c` rather than a
+# here-document for the reason _CONTRACT_BUDGET_PY records (bash 3.2 writes
+# here-document bodies outside TMPDIR). It parses the list through the one
+# shared parser, bin/_lib_quarantine.py (both id forms), and applies only the
+# pytest node ids: harness cases are the harness's own business. With a legs
+# directory it prints one node id per line after rewriting <legs>/pytest.txt
+# and <legs>/benchmark.txt without the listed nodes; without one it only
+# validates the list (the admission check below). It must never contain a
+# single quote.
+_QUARANTINE_PY='import os, sys
+
+path = sys.argv[1]
+legs = sys.argv[2] if len(sys.argv) > 2 else None
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(path))), "bin"))
+import _lib_quarantine
+try:
+    ids = _lib_quarantine.pytest_ids(_lib_quarantine.load_path(path))
+except _lib_quarantine.QuarantineError as exc:
+    print(exc)
+    sys.exit(1)
+if legs is None:
+    sys.exit(0)
+prefixes = tuple(ids)
+for name in ("pytest", "benchmark"):
+    leg = os.path.join(legs, name + ".txt")
+    if not os.path.isfile(leg) or not prefixes:
+        continue
+    with open(leg, encoding="utf-8") as handle:
+        nodes = handle.read().splitlines()
+    kept = [n for n in nodes if not n.startswith(prefixes)]
+    if kept != nodes:
+        with open(leg, "w", encoding="utf-8") as handle:
+            handle.write("".join(n + "\n" for n in kept))
+print("\n".join(ids))
+'
+
+# ---- the quarantine list (test regime reset, session 1; spec 4.3) ------
+# Validated HERE, at admission, whenever the pytest phase will run, so an
+# unreadable tests/quarantine.json refuses the run in seconds, before the
+# harness pool starts, rather than after it has run. The pytest phase applies
+# the validated list to both legs. An absent list (the public mirror may carry
+# none) is not checked and deselects nothing.
+if [ "$COVERAGE_PYTEST" != "skipped" ] && [ -f "$REPO_ROOT/tests/quarantine.json" ]; then
+    quarantine_out=$(python3 -c "$_QUARANTINE_PY" "$REPO_ROOT/tests/quarantine.json") || {
+        contract_note "pytest: tests/quarantine.json could not be applied: $quarantine_out"
+        contract_fail infrastructure estate-artifact-unreadable "tests/quarantine.json" admission
+        contract_abort
+    }
+fi
+
+# ---- the committed runtime budget (#630 S7; report-only since the reset) --
+# Parsed and validated HERE, at admission. The budget is report-only (test
+# regime reset, session 1): a malformed or missing file is a note and the run
+# proceeds with the budget unevaluated; it never aborts admission. The
+# completion check re-reads nothing; it compares the computed metric against
+# the value validated here and records the result in the outcome.
 #
 # Loaded only when the run is ELIGIBLE, through the same predicate the check
-# reads. An ineligible run never compares itself against the budget, so
-# refusing it for a budget it will never read would be a refusal nobody asked
-# for — and `--harness`, the tier and linux-matrix are all ineligible.
+# reads — `--harness`, the tier and linux-matrix are all ineligible.
 if contract_budget_is_eligible; then
-    contract_budget_load "$REPO_ROOT/tests/authoritative-runtime-budget.json" \
-        || contract_abort
+    contract_budget_load "$REPO_ROOT/tests/authoritative-runtime-budget.json"
 fi
 
 # ---- evidence resolution (#529 S2) -------------------------------------
-# AFTER admission, so a refused run creates nothing at all.
+# AFTER admission, so a refused run creates no evidence directory; its only
+# residue is the suite generation, kept as failed for 24 hours (#963).
 #
 # The root is machine-wide and lives OUTSIDE every synced worktree, keyed by
 # {remoteDir, runId}: the remote wrapper keys its locks and handles by
@@ -2211,7 +2591,12 @@ if [ -n "$EVIDENCE_ROOT" ]; then
     export CCTALLY_TEST_ALL_OUTCOME_FILE
     _write_manifest active ""
 else
-    LOGDIR=$(mktemp -d -t cctally-test-all.XXXXXX)
+    # #963 (note R13): a temporary log directory lives inside the suite
+    # generation, so a run killed with SIGKILL leaves nothing outside its
+    # generation; the success path removes it with the generation before the
+    # budget freeze, and a failed run keeps it for 24 hours. The evidence-root
+    # branch above is unchanged: evidence is never deleted with scratch.
+    LOGDIR=$(mktemp -d "$GEN_DIR/logs.XXXXXX")
     if [ -z "$LOGDIR" ] || [ ! -d "$LOGDIR" ]; then
         contract_note "evidence: could not allocate a temporary log directory (mktemp failed; check TMPDIR)"
         contract_fail infrastructure evidence-init-failed "" admission
@@ -2249,6 +2634,10 @@ POOL_PID=""
 PHASE_PID=""
 
 _phase_set() {   # atomic replacement: the reporter may read at any instant
+    # #963 R30: after a successful removal on a run with no evidence root the
+    # temporary PROGRESS_DIR is gone with the generation; bash 3.2 applies the
+    # `>` redirect before `2>/dev/null`, so writing into it would print an error.
+    [ -d "$PROGRESS_DIR" ] || return 0
     printf '%s' "$1" > "$PROGRESS_DIR/phase.tmp" 2>/dev/null \
         && mv -f "$PROGRESS_DIR/phase.tmp" "$PROGRESS_DIR/phase" 2>/dev/null
     return 0
@@ -2419,10 +2808,25 @@ _cleanup_run() {
         _collect_timings
         _write_manifest "$state" "$rc"
         _harden_evidence_modes
+        # #940 (C8, R7-F7): the finished manifest goes into the runner's
+        # evidence index, so its loss is discoverable later. Non-deciding.
+        if [ -n "${CCTALLY_RUNNER_EVIDENCE_INDEX:-}" ]; then
+            _ev index "$EVIDENCE_ROOT" "$EVIDENCE_DIR" "$RUN_ID" >/dev/null || true
+        fi
     fi
     rm -rf "$PROGRESS_DIR" 2>/dev/null || true
     if [ "$LOGDIR_IS_TEMPORARY" = 1 ]; then
         rm -rf "$LOGDIR"
+    fi
+    # #963: a failed or interrupted run removes its generation here once its
+    # groups are reaped, or keeps it (released, marked) for 24 hours while one
+    # may still run; a successful one already removed it before the freeze.
+    _gen_settle "$rc"
+    # Reclaim generations whose ownership ended and whose 24 hours ran out:
+    # after this run's wall is frozen, and never on an interrupted exit, which
+    # must leave promptly.
+    if [ "$GEN_STATE" != none ] && [ "$rc" -lt 128 ]; then
+        _gen sweep --tmpdir "${TMPDIR:-/tmp}" --keep "$GEN_DIR" --reclaim || true
     fi
     return $rc
 }
@@ -2482,6 +2886,9 @@ _collect_timings() {
         printf 'total\t%s\n' "$SECONDS"
         printf 'shell-pool\t%s\n' "${pool_wall:-0}"
         printf 'pytest\t%s\n' "${pytest_wall:-0}"
+        printf 'pytest-main\t%s\n' "${pytest_main_wall:-0}"
+        printf 'pytest-benchmark\t%s\n' "${pytest_bench_wall:-0}"
+        printf 'cleanup\t%s\n' "${cleanup_wall:-0}"
     } > "$EVIDENCE_DIR/timings/phases.tsv" 2>/dev/null || true
     return 0
 }
@@ -2524,18 +2931,38 @@ _emit_failure_context() {   # $1 subject, $2 logfile
     return 0
 }
 
+# ---- the owner-only environment (#966(c), spec 4.3) ---------------------
+# The variables that describe THIS invocation (its outcome record, run id,
+# evidence store and flags) never reach a harness or a pytest leg, where a
+# nested aggregator would otherwise write this run's outcome. The list is
+# computed once, after every export above; arrays cannot cross into the
+# `bash -c` workers, so run_one reads the exported space-separated form.
+if ! _owner_names=$(_gen owner-env-names); then
+    contract_note "owner environment: the owner-only classification could not be read"
+    contract_fail infrastructure admission-scratch-failed "owner-environment" admission
+    contract_abort
+fi
+OWNER_SCRUB=()
+for _n in $_owner_names; do OWNER_SCRUB+=(-u "$_n"); done
+_CCTALLY_HARNESS_SCRUB=$_owner_names
+export _CCTALLY_HARNESS_SCRUB
+
 run_one() {
-    local h=$1 start=$SECONDS rc
+    local h=$1 start=$SECONDS rc scrub=() _n
+    for _n in ${_CCTALLY_HARNESS_SCRUB:-}; do scrub+=(-u "$_n"); done
     # `started` before execution and `done` last. Three states follow — no
     # `started` means queued, `started` without `done` means running, `done`
     # means complete — and distinguishing queued from running is what lets the
     # heartbeat NAME a hung harness rather than leave it as a line that never
     # arrives.
     : > "$LOGDIR/${h}.started"
-    # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update
-    # read CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS. INNER
+    # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update/
+    # preflight/test-remote read CCTALLY_TEST_JOBS; release reads
+    # CCTALLY_RELEASE_TEST_JOBS. INNER
     # is exported below so it is non-empty in this xargs-spawned subshell.
-    env CCTALLY_TEST_JOBS="$INNER" CCTALLY_RELEASE_TEST_JOBS="$INNER" \
+    # `scrub` removes the owner-only variables (spec 4.3) before the harness's
+    # own overrides, so no harness can reach this run's outcome or evidence.
+    env ${scrub[@]+"${scrub[@]}"} CCTALLY_TEST_JOBS="$INNER" CCTALLY_RELEASE_TEST_JOBS="$INNER" \
         "$REPO_ROOT/bin/cctally-${h}-test" > "$LOGDIR/${h}.log" 2>&1
     rc=$?
     echo "$rc" > "$LOGDIR/${h}.exit"                   # one file per harness
@@ -2569,6 +2996,7 @@ set -m
     | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {} ; } &
 POOL_PID=$!
 set +m
+_gen_record_group "$POOL_PID"
 wait "$POOL_PID"
 POOL_PID=""
 pool_wall=$((SECONDS - pool_start))
@@ -2628,6 +3056,9 @@ printf '[cctally-test-all] shell pool complete — %s passed, %s failed, %ss\n' 
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
 pytest_wall=0
+pytest_main_wall=0
+pytest_bench_wall=0
+cleanup_wall=0
 
 # pytest's own passed-ITEM count, read from its summary line — or the EMPTY
 # STRING when no count could be read at all.
@@ -2646,8 +3077,7 @@ pytest_wall=0
 # `cut` then flattened to a wrong 0 — for a log carrying a NUL byte, a shape
 # this estate already has a `binary-log` reason code for.
 _parse_pytest_passed() {   # <logfile>
-    python3 - "$1" <<'PY'
-import re
+    printf '%s\n' 'import re
 import sys
 
 try:
@@ -2658,7 +3088,7 @@ except OSError:
     print("")
     raise SystemExit(0)
 
-# The LAST such line wins: a test's own output can carry the same shape, and
+# The LAST such line wins: a test'\''s own output can carry the same shape, and
 # the summary is always last.
 summary = None
 for line in data.splitlines():
@@ -2670,8 +3100,7 @@ if summary is None:
     print("")
     raise SystemExit(0)
 match = re.search(rb"(\d+) passed", summary)
-print(match.group(1).decode() if match else "0")
-PY
+print(match.group(1).decode() if match else "0")' | python3 - "$1"
 }
 
 # Parse only node IDs the authoritative estate can actually own. Both pytest
@@ -2773,9 +3202,7 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
             file) pytest_args+=(--ignore="$_sel_value") ;;
             node) pytest_args+=(--deselect="$_sel_value") ;;
         esac
-    done <<EOF
-$CONTRACT_ESTATE_SELECTORS
-EOF
+    done < <(printf '%s\n' "$CONTRACT_ESTATE_SELECTORS")
     # The per-leg node lists, for the collected-identifier proof below. This is
     # the second expansion: admission ran `--validate-legs`, which writes
     # nothing because it precedes LOGDIR. A failure here cannot be silent —
@@ -2785,6 +3212,29 @@ EOF
     python3 "$REPO_ROOT/bin/_lib_test_estate.py" --repo "$REPO_ROOT" \
         --profile "$CONTRACT_PROFILE" --plan-legs "$estate_leg_dir" \
         > "$estate_plan_log" 2>&1 || true
+    # ---- the quarantine list (test regime reset, session 1; spec 4.3) ----
+    # tests/quarantine.json names flaky nodes. Each is deselected from both
+    # legs below and dropped here from both expected leg lists, with pytest's
+    # own --deselect semantics (a node-id prefix), because a node deselected
+    # but still expected would fail the observed-collection check as
+    # manifest-missing-pytest-node. An absent list (the public mirror may
+    # carry none) deselects nothing; admission already refused an unreadable
+    # one, and this refusal stays only for a list that changed since. The
+    # scheduled CI run executes the listed nodes in a separate report-only leg.
+    quarantine_ids=()
+    if [ -f "$REPO_ROOT/tests/quarantine.json" ]; then
+        quarantine_out=$(python3 -c "$_QUARANTINE_PY" \
+            "$REPO_ROOT/tests/quarantine.json" "$estate_leg_dir") || {
+            contract_note "pytest: tests/quarantine.json could not be applied: $quarantine_out"
+            contract_fail infrastructure estate-artifact-unreadable "tests/quarantine.json" pytest
+            contract_abort
+        }
+        while IFS= read -r _qid; do
+            [ -z "$_qid" ] || quarantine_ids+=("$_qid")
+        done < <(printf '%s\n' "$quarantine_out")
+        [ "${#quarantine_ids[@]}" -eq 0 ] || printf '[cctally-test-all] quarantine: %s node id(s) deselected from both pytest legs (tests/quarantine.json)\n' \
+            "${#quarantine_ids[@]}" >&2
+    fi
     if [ "$COVERAGE_MODE" = merge-focused ]; then
         python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" --repo "$REPO_ROOT" \
             --base "$TIER_BASE_REV" --filter-legs "$estate_leg_dir" \
@@ -2806,6 +3256,9 @@ EOF
         done < "$estate_leg_dir/benchmark.txt"
         [ -s "$estate_leg_dir/pytest.txt" ] || { contract_fail infrastructure manifest-missing-pytest-node "empty merge smoke" pytest; contract_abort; }
     fi
+    for _qid in ${quarantine_ids[@]+"${quarantine_ids[@]}"}; do
+        pytest_args+=("--deselect=$_qid")
+    done
     if python3 -c 'import xdist' >/dev/null 2>&1; then
         pytest_args+=(-n "$PYTEST")
     fi
@@ -2847,7 +3300,9 @@ EOF
     # Neither is added to the removal list, because removing a variable that
     # cannot narrow the run would break the deliberate uses a caller has for it
     # while buying nothing.
-    pytest_env_sanitize=(env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS -u PYTEST_CURRENT_TEST)
+    # The owner-only variables (spec 4.3, #966(c)) are removed here as well, so
+    # no test in either leg can write this run's outcome or evidence.
+    pytest_env_sanitize=(env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS -u PYTEST_CURRENT_TEST ${OWNER_SCRUB[@]+"${OWNER_SCRUB[@]}"})
     if [ -n "${PYTEST_ADDOPTS:-}" ] || [ -n "${PYTEST_PLUGINS:-}" ]; then
         printf '[cctally-test-all] pytest: PYTEST_ADDOPTS/PYTEST_PLUGINS were present and are REMOVED from both execution legs — they can narrow a run that admission observed in full (#648 M13); use CCTALLY_PYTEST_DURATIONS=1 for per-test timings\n' >&2
     fi
@@ -2859,6 +3314,10 @@ EOF
     if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
         pytest_args+=(--durations=0)
     fi
+    # #963 spec 5.4: an explicit basetemp inside the suite generation, outside
+    # the numbered pytest-N namespace that implicit nested sessions rotate, so
+    # no nested session can delete this leg's temp.
+    pytest_args+=(--basetemp "$GEN_DIR/m")
     pytest_start=$SECONDS
     # Each leg runs as its own process group for the reasons given at the pool:
     # `wait` is interruptible by a trapped signal and the group is reapable.
@@ -2873,9 +3332,11 @@ EOF
         > "$pytest_log" 2>&1 &
     PHASE_PID=$!
     set +m
+    _gen_record_group "$PHASE_PID"
     wait "$PHASE_PID"
     pytest_rc=$?
     PHASE_PID=""
+    pytest_main_wall=$((SECONDS - pytest_start))
     pytest_dump_main=0
     pytest_dump_benchmark=0
     # Called UNCONDITIONALLY, including on a clean run: the classification is
@@ -2917,6 +3378,9 @@ EOF
         pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
         pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE
                                -p tests._estate_leg_plugin)
+        for _qid in ${quarantine_ids[@]+"${quarantine_ids[@]}"}; do
+            pytest_benchmark_args+=("--deselect=$_qid")
+        done
         pytest_benchmark_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
         if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
             pytest_benchmark_args+=(--durations=0)
@@ -2925,6 +3389,10 @@ EOF
             pytest_benchmark_args+=(-p tests._pytest_durations_plugin)
             pytest_durations_legs+=("$pytest_durations_bench")
         fi
+        # #963 spec 5.4: the benchmark leg's own explicit basetemp, distinct
+        # from the main leg's, inside the suite generation.
+        pytest_benchmark_args+=(--basetemp "$GEN_DIR/b")
+        bench_start=$SECONDS
         set -m
         { cd "$REPO_ROOT" \
           && CCTALLY_DURATIONS_PATH="$pytest_durations_bench" \
@@ -2935,9 +3403,11 @@ EOF
             > "$pytest_benchmark_log" 2>&1 &
         PHASE_PID=$!
         set +m
+        _gen_record_group "$PHASE_PID"
         wait "$PHASE_PID"
         pytest_benchmark_rc=$?
         PHASE_PID=""
+        pytest_bench_wall=$((SECONDS - bench_start))
         if [ "$pytest_benchmark_rc" -ne 0 ]; then
             pytest_status="FAIL"
             pytest_dump_benchmark=1
@@ -3010,6 +3480,46 @@ else
     contract_fail incomplete pytest-unavailable "" pytest
 fi
 
+# ---- the suite generation's removal (#963 spec 5.4, J9) ----------------
+# The console's "Slowest harnesses" lines read $LOGDIR/<harness>.time. Without
+# an evidence root LOGDIR is temporary and lives inside the generation removed
+# below, so the lines are computed HERE, before the removal, and printed
+# unchanged at the same place in the timing section.
+slowest_lines=$(
+    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
+        t=$(cat "$LOGDIR/${h}.time" 2>/dev/null || echo 0)
+        printf '%s %s\n' "$t" "$h"
+    done | sort -rn | head -10 | while read -r t h; do
+        printf '  %4ss  %s\n' "$t" "$h"
+    done
+)
+# BEFORE contract_check_runtime_budget, which freezes the wall that both the
+# normalized budget and the outcome's wallSeconds use: removal is part of the
+# run's cost, and removing after the freeze would hide it (B1). Children are
+# reaped first, and removal waits on the reaper establishing that every
+# recorded group is gone: one that survives SIGKILL, or whose state is unknown,
+# keeps the generation exactly as a refused removal does. Either way the
+# generation stays, marked failed, for 24 hours (the reaper or the remover
+# printed why) and the run fails as infrastructure. The reason's phase is
+# `pytest`, one the outcome carrier's closed phase set admits (U7: no new
+# phase); the generation is the pytest legs' temp.
+if [ "$GEN_STATE" = claimed ] && _gen_run_succeeded; then
+    cleanup_start=$SECONDS
+    if ! _gen reap --dir "$GEN_DIR"; then
+        _gen finish --dir "$GEN_DIR" --state failed || true
+        GEN_STATE=retained
+        contract_note "suite generation $GEN_TOKEN was not removed: a recorded process group was not established as terminated; it is kept for 24 hours beneath ${TMPDIR:-/tmp}"
+        contract_fail infrastructure temp-generation-cleanup-failed "$GEN_TOKEN" pytest
+    elif _gen remove --dir "$GEN_DIR"; then
+        GEN_STATE=removed
+    else
+        GEN_STATE=retained
+        contract_note "suite generation $GEN_TOKEN could not be removed; it is kept for 24 hours beneath ${TMPDIR:-/tmp}"
+        contract_fail infrastructure temp-generation-cleanup-failed "$GEN_TOKEN" pytest
+    fi
+    cleanup_wall=$((SECONDS - cleanup_start))
+fi
+
 # ---- the normalized runtime budget (#630 S7) ---------------------------
 # AFTER every ordinary classification, so a secondary budget failure can never
 # mask the decisive test result, and BEFORE the verdict block below rather than
@@ -3020,7 +3530,7 @@ fi
 contract_check_runtime_budget
 if [ "$COVERAGE_MODE" = merge-focused ] && [ "$SECONDS" -gt "$MERGE_MAX_SECONDS" ]; then
     contract_note "merge gate exceeded its ${MERGE_MAX_SECONDS}-second execution budget ($SECONDS seconds)"
-    contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" completion
+    contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" budget
 fi
 
 echo "----"
@@ -3029,7 +3539,7 @@ printf '%5s   %s\n' "$pytest_status" "pytest"
 if [ "$pytest_status" = "FAIL" ]; then
     if [ -n "$pytest_failed_nodes" ]; then
         echo "pytest failing node ids:"
-        while IFS= read -r node; do echo "  $node"; done <<< "$pytest_failed_nodes"
+        while IFS= read -r node; do echo "  $node"; done < <(printf '%s\n' "$pytest_failed_nodes")
     else
         echo "pytest failing node ids: (none parsed — see the Verdict below for its infrastructure or incomplete classification; likely a pytest INTERNALERROR, worker crash, empty collection, or truncated/missing log; see '---- pytest FAIL details ----' on stderr)"
     fi
@@ -3040,14 +3550,9 @@ echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (
 echo "----"
 echo "Timing: total=${SECONDS}s  shell-pool=${pool_wall}s  pytest=${pytest_wall}s  (outer=$OUTER inner=$INNER pytest=$PYTEST)"
 echo "Slowest harnesses:"
-{
-    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
-        t=$(cat "$LOGDIR/${h}.time" 2>/dev/null || echo 0)
-        printf '%s %s\n' "$t" "$h"
-    done
-} | sort -rn | head -10 | while read -r t h; do
-    printf '  %4ss  %s\n' "$t" "$h"
-done
+# Computed before the suite generation's removal (above): without an evidence
+# root the temporary LOGDIR was inside it (#963 R30).
+[ -z "$slowest_lines" ] || printf '%s\n' "$slowest_lines"
 
 # One verdict line, because `Total:` counts only summary-line failures and a
 # run refused for `case-floor-unmet` has none — the scrollback would otherwise

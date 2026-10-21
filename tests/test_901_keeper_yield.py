@@ -37,7 +37,7 @@ import uuid
 
 import pytest
 
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 from test_901_sync_transactions import _wal_salt
 from test_901_wal_keeper import (  # noqa: F401 — `w9` is a fixture
     PassiveSpy,
@@ -864,7 +864,7 @@ class Stores:
         self.wal = wal
         self.tmp = tmp_path
         self.ns = load_script()
-        redirect_paths_without_conversation_retention(
+        redirect_paths(
             self.ns, monkeypatch, tmp_path)
         self.share = tmp_path / ".local" / "share" / "cctally"
         self.cache = sys.modules["_cctally_cache"]
@@ -1255,7 +1255,7 @@ def test_m_db_vacuum_of_stats_db_is_unchanged(tmp_path, monkeypatch, capsys):
     import argparse
 
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     db_mod = sys.modules["_cctally_db"]
     claims: list = []
     monkeypatch.setattr(

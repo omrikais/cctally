@@ -11,6 +11,7 @@ import argparse
 import datetime
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -240,7 +241,32 @@ def observe(stream, run_id, phase, sample, **extra):
     stream.flush()
 
 
+def write_refusal_record(args, status, waited):
+    """Publish sanitized proof only at confirmed pre-workload wait exhaustion.
+
+    Exclusive creation preserves earlier evidence. An invocation nonce binds
+    the proof to this call even when the same Actions attempt is replayed.
+    Neither raw process identities nor the command enter this document.
+    """
+    doc = {"schemaVersion": 1, "runId": args.run_id,
+           "invocationId": args.invocation_id, "cause": "reservation-wait-exhausted",
+           "reservationState": status, "workloadStarted": False,
+           "waitSeconds": args.wait, "waitedSeconds": waited,
+           "observedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    args.refusal_record.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(args.refusal_record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(doc, stream, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def run(args):
+    if args.refusal_record is not None and os.path.lexists(args.refusal_record):
+        # Do not run over an old proof, overwrite it, or let its mere presence
+        # turn a new infrastructure failure into a new reservation refusal.
+        raise FileExistsError("refusal evidence already exists")
     inherited = inherited_fd(args.root)
     if inherited is not None:
         # No LOCK_UN and no owner rewrite: only the outer supervisor releases.
@@ -263,11 +289,14 @@ def run(args):
             if status == "idle" and not expired:
                 break
             fcntl.flock(fd, fcntl.LOCK_UN)
-            if expired or time.monotonic() - started >= args.wait:
+            waited = time.monotonic() - started
+            if expired or waited >= args.wait:
                 print("runner reservation: acquisition deadline reached" if expired else
                       "runner reservation: host occupied or ownership unknown; no workload started",
                       file=sys.stderr)
                 os.close(fd)
+                if not expired and status in {"busy", "unknown"} and args.refusal_record is not None:
+                    write_refusal_record(args, status, waited)
                 return 75 if expired else args.busy_exit
             pause = min(args.sample_seconds, max(0, args.wait - (time.monotonic() - started)))
             if args.deadline is not None:
@@ -388,6 +417,9 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--run-id", default="unknown")
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--refusal-record", type=Path,
+                        help="optional sanitized record of pre-workload wait exhaustion")
+    parser.add_argument("--invocation-id", help="fresh 32-character hexadecimal refusal-proof nonce")
     parser.add_argument("--wait", type=float, default=1800)
     parser.add_argument("--busy-exit", type=int, default=3)
     parser.add_argument("--deadline", type=float)
@@ -414,6 +446,11 @@ def main(argv=None):
         return 0
     if not args.command or args.evidence is None or args.wait < 0 or args.sample_seconds <= 0:
         parser.error("run requires a command, evidence file and nonnegative wait")
+    if args.refusal_record is not None and (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id)
+            or not re.fullmatch(r"[0-9a-f]{32}", args.invocation_id or "")
+            or not math.isfinite(args.wait)):
+        parser.error("refusal proof requires a sanitized run ID, fresh invocation ID and finite wait")
     args.evidence.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         return run(args)

@@ -16,6 +16,44 @@ KiB = 1024
 MiB = 1024 * KiB
 
 
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
+
+
 def _live_inputs(run):
     """The input-mode receipt every revision-15 verdict requires (a live run;
     a catch-up receipt beside it carries its finite-frontier evidence)."""
@@ -1392,7 +1430,8 @@ def test_the_residual_exception_refuses_anything_but_the_stable_residual(
 
 _DIRTY = {"lock_contended": True, "files_failed": 1, "files_deferred_torn": 1,
           "deferred_reason": "identity_torn", "prune_refused": True,
-          "budget_exhausted": True, "maintenance_failed": True}
+          "budget_exhausted": True, "maintenance_failed": True,
+          "barrier_retry": True, "files_deferred_reset": 1, "container_pending": 1}
 
 
 @pytest.mark.parametrize("phase", ["catchUp", "verify"])
@@ -3749,6 +3788,7 @@ def _drop_before_seal(monkeypatch, fr, names):
     monkeypatch.setattr(fr, "_seal", seal)
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_seal_removes_finder_metadata_created_during_capture(tmp_path, monkeypatch):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3761,6 +3801,7 @@ def test_seal_removes_finder_metadata_created_during_capture(tmp_path, monkeypat
     assert fr.verify(freeze, full=True)["problems"] == []
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_seal_refuses_an_unmanifested_file_in_the_freeze(tmp_path, monkeypatch):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3803,6 +3844,7 @@ def _entry(manifest, path):
     return next(e for e in manifest["entries"] if e["logical"] == str(path))
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_copies_a_record_boundary_prefix_without_a_torn_line(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3818,6 +3860,7 @@ def test_capture_copies_a_record_boundary_prefix_without_a_torn_line(tmp_path):
     assert entry["sha256"] == __import__("hashlib").sha256(frozen).hexdigest()
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_admits_suffix_growth_during_the_copy(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3832,6 +3875,7 @@ def test_capture_admits_suffix_growth_during_the_copy(tmp_path):
     assert entry["admittedLength"] == len(b'{"a":1}\n{"b":2}\n')
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_refuses_a_retained_cursor_beyond_the_last_record(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3846,6 +3890,7 @@ def test_capture_refuses_a_retained_cursor_beyond_the_last_record(tmp_path):
     ("shrink", "shrank during the copy"),
     ("rewrite", "in-place rewrite"),
 ])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_retries_then_refuses_a_transcript_that_never_settles(
         tmp_path, change, reason):
     fr = _load("frozen_roots")
@@ -3881,6 +3926,7 @@ def test_capture_retries_then_refuses_a_transcript_that_never_settles(
                  clock=Restoring())
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_retries_a_replacement_once_and_records_the_new_identity(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3897,6 +3943,7 @@ def test_capture_retries_a_replacement_once_and_records_the_new_identity(tmp_pat
     assert entry["admittedLength"] == 24
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_copies_multiline_json_metadata_whole(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3909,6 +3956,7 @@ def test_capture_copies_multiline_json_metadata_whole(tmp_path):
         assert entry["admittedLength"] == path.stat().st_size
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_retries_an_in_place_metadata_rewrite_then_refuses(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3931,6 +3979,7 @@ def test_capture_retries_an_in_place_metadata_rewrite_then_refuses(tmp_path):
                    retry_deadline_s=4)
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_covers_a_file_symlink_inside_a_root(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -3976,6 +4025,7 @@ def _tsv(freeze):
     return (freeze / "rootmap.tsv").read_text().splitlines()
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_covers_an_absolute_link_to_a_file_outside_every_root(tmp_path):
     fr = _load("frozen_roots")
     tree = _link_tree(tmp_path)
@@ -4026,6 +4076,7 @@ def test_capture_covers_an_absolute_link_to_a_file_outside_every_root(tmp_path):
     ("fifo", "not a regular file"),
     ("dangling", "not a regular file"),
 ])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_refuses_an_outside_link_it_cannot_cover(tmp_path, shape, reason):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4054,6 +4105,7 @@ def test_capture_refuses_an_outside_link_it_cannot_cover(tmp_path, shape, reason
         _capture(fr, tmp_path, tree)
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_covers_a_directory_link_the_walk_does_not_traverse(tmp_path):
     fr = _load("frozen_roots")
     tree = _link_tree(tmp_path)
@@ -4089,6 +4141,7 @@ def _tsv_fields(tsv, kind, path):
     return next(l.split("\t") for l in tsv if l.split("\t")[:2] == [kind, str(path)])
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_records_a_directory_links_target_metadata_never_its_contents(
         tmp_path):
     """Amendment 13 O1: `os.walk` (DirEntry.is_dir) and `os.stat` FOLLOW the
@@ -4121,6 +4174,7 @@ def test_capture_records_a_directory_links_target_metadata_never_its_contents(
     assert fr.verify(freeze, full=True)["valid"] is True
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_refuses_a_directory_link_whose_target_vanished(tmp_path, monkeypatch):
     fr = _load("frozen_roots")
     tree = _link_tree(tmp_path)
@@ -4135,6 +4189,7 @@ def test_capture_refuses_a_directory_link_whose_target_vanished(tmp_path, monkey
         _capture(fr, tmp_path, tree)
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_covers_an_in_root_directory_link_and_refuses_one_used_as_a_file(
         tmp_path):
     fr = _load("frozen_roots")
@@ -4152,6 +4207,7 @@ def test_capture_covers_an_in_root_directory_link_and_refuses_one_used_as_a_file
                    home=str(tree["home"]), clock=_Ticks())
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_checks_a_retained_file_reached_through_a_link(tmp_path):
     fr = _load("frozen_roots")
     tree = _link_tree(tmp_path)
@@ -4223,6 +4279,7 @@ def _probe_tree(tmp_path):
     return tree
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_derives_probe_entries_from_the_frozen_transcripts_cwds(tmp_path):
     fr = _load("frozen_roots")
     tree = _probe_tree(tmp_path)
@@ -4259,6 +4316,7 @@ def test_capture_derives_probe_entries_from_the_frozen_transcripts_cwds(tmp_path
     assert fr.verify(freeze, full=True)["valid"] is True
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_probe_presents_a_links_lstat_stat_and_target(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4286,6 +4344,7 @@ def test_capture_probe_presents_a_links_lstat_stat_and_target(tmp_path):
     assert len(s) == 18 and int(s[3]) == os.stat(outside).st_ino
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_takes_explicit_probes_and_refuses_one_outside_every_root(
         tmp_path, capsys):
     fr = _load("frozen_roots")
@@ -4337,6 +4396,7 @@ def _target_tree(tmp_path):
     return tree
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_probes_cwds_at_and_below_a_denied_directory_link_target(tmp_path):
     fr = _load("frozen_roots")
     tree = _target_tree(tmp_path)
@@ -4378,6 +4438,7 @@ def test_capture_probes_cwds_at_and_below_a_denied_directory_link_target(tmp_pat
     assert fr.verify(freeze, full=True)["valid"] is True
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_takes_an_explicit_probe_below_a_denied_target_and_stops_at_a_link(
         tmp_path, capsys):
     fr = _load("frozen_roots")
@@ -4417,6 +4478,7 @@ def test_capture_takes_an_explicit_probe_below_a_denied_target_and_stops_at_a_li
     assert len(s) == 18 and int(s[3]) == os.stat(elsewhere).st_ino
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_records_nothing_else_below_a_denied_target_and_refuses_an_unreadable_probe(
         tmp_path, monkeypatch):
     """Below a denied target the namespace answers only a probe entry or a
@@ -4449,6 +4511,7 @@ def test_capture_records_nothing_else_below_a_denied_target_and_refuses_an_unrea
         _capture(fr, tmp_path / "x", tree, store=_frozen_store(tmp_path / "x" / "store"))
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_records_absences_and_refuses_an_open_or_newer_store(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4472,6 +4535,7 @@ def test_capture_records_absences_and_refuses_an_open_or_newer_store(tmp_path):
                    home=str(tree["home"]), clock=_Ticks(), now=lambda: 1.0)
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_the_manifest_feeds_the_namespace_and_the_sandbox_profile(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4494,7 +4558,36 @@ def test_the_manifest_feeds_the_namespace_and_the_sandbox_profile(tmp_path):
     assert f'(deny file-write* (subpath "{os.path.realpath(tmp_path / "freeze")}")' \
         in profile
 
+    # Metadata denials must return an error rather than SIGKILL: libproc's
+    # read-only cwd/fd inspection reaches these rules too. Keep every content
+    # and write denial fatal, including file roots and denied link targets.
+    synthetic = fr.sandbox_profile(tmp_path / "freeze", {
+        "roots": [{"kind": "directory", "logical": '/fake/live "directory"'},
+                  {"kind": "file", "logical": "/fake/file-root"}],
+        "deniedTargets": [{"logical": "/fake/link-target"}],
+    })
+    lines = synthetic.splitlines()
+    for filt, logical in (("subpath", r'/fake/live \"directory\"'),
+                          ("literal", "/fake/file-root"),
+                          ("subpath", "/fake/link-target")):
+        selector = f'({filt} "{logical}")'
+        fatal = f'(deny file-read* file-write* {selector} (with send-signal SIGKILL))'
+        metadata = f'(deny file-read-metadata {selector} (with no-report))'
+        assert fatal in lines
+        assert metadata in lines
+        assert lines.index(fatal) < lines.index(metadata)
+        # chdir tests existence rather than reading data. Deny it as well;
+        # a signal here would also kill lsof's process inspection.
+        existence = f'(deny file-test-existence {selector} (with no-report))'
+        assert existence in lines
+    assert sum(line.startswith("(allow ") for line in lines) == 1
+    assert lines[1] == "(allow default)"
+    assert lines[-1] == (
+        f'(deny file-write* (subpath "{os.path.realpath(tmp_path / "freeze")}")'
+        ' (with send-signal SIGKILL))')
 
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_verify_detects_a_seal_mutation(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4521,6 +4614,7 @@ def test_verify_detects_a_seal_mutation(tmp_path):
     assert any("rootmap.tsv changed" in p for p in fr.verify(freeze)["problems"])
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_refuses_a_cursor_beyond_a_replacement_and_a_missing_file(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4564,6 +4658,7 @@ def test_qualify_refuses_a_cursor_beyond_a_replacement_and_a_missing_file(tmp_pa
     assert any("size_bytes 50 is beyond" in p for p in result["problems"])
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_admits_an_absent_row_that_retains_no_bytes(tmp_path):
     """A tracked row with zero size and a zero cursor (a transcript recorded
     while empty, its file later deleted) retains nothing the freeze could
@@ -4592,6 +4687,7 @@ def test_qualify_admits_an_absent_row_that_retains_no_bytes(tmp_path):
                for p in result["problems"]), result["problems"]
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_refuses_a_store_copy_the_freeze_was_not_captured_against(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -4648,6 +4744,7 @@ def _capture_copies(fr, tmp_path, tree, stores, name="freeze"):
                       codex_home=None, claude_config_dir=None, clock=_Ticks())
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_one_freeze_bound_to_two_store_copies_qualifies_each_copy(tmp_path):
     fr = _load("frozen_roots")
     tree = _session_home(tmp_path)
@@ -4676,6 +4773,7 @@ def test_one_freeze_bound_to_two_store_copies_qualifies_each_copy(tmp_path):
     assert absences[str(gone)] == absences[str(empty)] == "retained-missing"
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_takes_the_largest_cursor_of_any_bound_copy(tmp_path):
     """The union rule: B retains a cursor beyond the live rollout's last
     complete record, so a freeze bound to A alone captures, and one bound to
@@ -4688,6 +4786,7 @@ def test_capture_takes_the_largest_cursor_of_any_bound_copy(tmp_path):
         _capture_copies(fr, tmp_path, tree, [a, b], name="freeze-ab")
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_capture_cli_binds_every_store_flag(tmp_path, capsys):
     fr = _load("frozen_roots")
     tree = _session_home(tmp_path)
@@ -4703,6 +4802,7 @@ def test_capture_cli_binds_every_store_flag(tmp_path, capsys):
     assert "2 store copies" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_refuses_a_store_copy_the_freeze_is_not_bound_to(tmp_path):
     fr = _load("frozen_roots")
     tree = _session_home(tmp_path)
@@ -4727,6 +4827,7 @@ def test_qualify_refuses_a_store_copy_the_freeze_is_not_bound_to(tmp_path):
                         name="freeze-twice")
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_a_copy_drained_after_the_capture_is_refused_for_that_copy_only(tmp_path):
     """A freeze captured before one copy's later drain: that copy's cursor is
     beyond the frozen file, so its qualification is refused; the other copy
@@ -4750,6 +4851,7 @@ def test_a_copy_drained_after_the_capture_is_refused_for_that_copy_only(tmp_path
                in p for p in qb["problems"]), qb["problems"]
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_b_pair_accepts_runs_on_two_copies_of_one_freeze_and_refuses_two_freezes(
         tmp_path, capsys):
     """The candidate's run uses copy A and the baseline's copy B: one freeze
@@ -4783,6 +4885,383 @@ def test_b_pair_accepts_runs_on_two_copies_of_one_freeze_and_refuses_two_freezes
                              seal=seal2)
     assert workload.b_pair(str(cand), str(other)) == 2
     assert "mixed input evidence" in capsys.readouterr().out
+
+
+# ── #968: compressed Codex rollouts in the frozen input set ─────────────────
+
+
+def _zst(path, data):
+    from _codex_zstd_fixtures import zstd_bytes
+    path.write_bytes(zstd_bytes(data))
+    return path
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_capture_records_a_compressed_rollout_as_a_container(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    data = b'{"z":1}\n{"z":2}\n'
+    zst = _zst(tree["rollout"].parent / "rollout-z.jsonl.zst", data)
+    manifest = _capture(fr, tmp_path, tree)
+    entry = _entry(manifest, zst)
+    assert (entry["kind"], entry["class"]) == ("file", "container")
+    assert entry["admittedLength"] == zst.stat().st_size
+    assert entry["ino"] == os.stat(zst).st_ino
+    assert entry["decoded"] == {"ok": True, "length": len(data),
+                                "completeLineEnd": len(data), "error": None}
+    assert (tmp_path / "freeze" / entry["physical"]).read_bytes() == zst.read_bytes()
+    assert all(x["logical"] != str(zst) for x in manifest["exclusions"])
+    codex_root = str(tree["home"] / ".codex")
+    assert manifest["discoveryBoundary"]["roots"][codex_root]["containers"] == 1
+    rootmap = (tmp_path / "freeze" / "rootmap.tsv").read_text().splitlines()
+    assert any(line.startswith(f"E\tF\t{zst}\t") for line in rootmap)
+    assert fr.verify(tmp_path / "freeze", full=True)["problems"] == []
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_capture_probes_the_cwd_a_compressed_rollout_records(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    worktree = tree["home"] / ".codex" / "worktrees" / "w1" / "proj"
+    worktree.mkdir(parents=True)
+    meta = {"type": "session_meta", "payload": {"id": "s", "cwd": str(worktree)}}
+    _zst(tree["rollout"].parent / "rollout-m.jsonl.zst",
+         json.dumps(meta).encode() + b"\n")
+    manifest = _capture(fr, tmp_path, tree)
+    assert _entry(manifest, worktree)["class"] == "probe"
+    assert manifest["probes"]["scan"]["containers"] == 1
+    assert manifest["probes"]["scan"]["undecodableContainers"] == 0
+
+
+def _compressed_tracked(tmp_path, tree, data, *, offset):
+    """A rollout the store tracks as plain, now present only compressed."""
+    from _codex_zstd_fixtures import compress_in_place
+    logical = tree["rollout"].parent / "rollout-z.jsonl"
+    logical.write_bytes(data)
+    inode = os.stat(logical).st_ino
+    compress_in_place(logical)
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", logical, offset, offset, inode)])
+    return logical, store
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_qualify_covers_a_retained_plain_row_with_its_compressed_container(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    data = b'{"z":1}\n{"z":2}\n'
+    logical, store = _compressed_tracked(tmp_path, tree, data, offset=len(data))
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    assert {"logical": str(logical), "reason": "compressed-only"} in manifest["absences"]
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["problems"] == []
+    assert result["retainedContainerCovered"] == 1
+    assert result["retainedContainerShorter"] == 0
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_qualify_counts_a_container_shorter_than_the_retained_cursor(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    data = b'{"z":1}\n{"z":2}\n'
+    _logical, store = _compressed_tracked(tmp_path, tree, data, offset=len(data) + 7)
+    _capture(fr, tmp_path, tree, store=store)
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["problems"] == []
+    assert (result["retainedContainerShorter"], result["retainedContainerCovered"]) == (1, 0)
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_decoded_twins_present_decoded_bytes_with_the_retained_identity(tmp_path):
+    from _codex_zstd_fixtures import compress_in_place
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    data = b'{"z":1}\n{"z":2}\n'
+    tracked = tree["rollout"].parent / "rollout-t.jsonl"
+    tracked.write_bytes(data + b'{"torn":')
+    tracked_zst = compress_in_place(tracked)
+    fresh = tree["rollout"].parent / "rollout-u.jsonl"
+    fresh.write_bytes(data)
+    fresh_zst = compress_in_place(fresh)
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", tracked, len(data), len(data), 4242)])
+    manifest = _capture(fr, tmp_path, tree, store=store, decoded_twins=True)
+    twin = _entry(manifest, tracked)
+    assert (twin["kind"], twin["class"], twin["identitySource"]) == (
+        "file", "decoded-twin", "store")
+    assert (twin["dev"], twin["ino"]) == (1, 4242)
+    assert twin["admittedLength"] == len(data)
+    assert (tmp_path / "freeze" / twin["physical"]).read_bytes() == data
+    other = _entry(manifest, fresh)
+    assert other["identitySource"] == "container"
+    assert other["ino"] == os.stat(fresh_zst).st_ino
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences[str(tracked_zst)] == "container-presented-as-twin"
+    assert absences[str(fresh_zst)] == "container-presented-as-twin"
+    assert manifest["decodedTwins"] is True
+    rootmap = (tmp_path / "freeze" / "rootmap.tsv").read_text().splitlines()
+    assert f"A\t{tracked_zst}" in rootmap
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["problems"] == []
+    assert result["retainedTwinCovered"] == 1
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_decoded_twins_keep_a_plain_rollout_beside_its_container(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    zst = _zst(tree["rollout"].parent / (tree["rollout"].name + ".zst"),
+               b'{"other":1}\n')
+    manifest = _capture(fr, tmp_path, tree, decoded_twins=True)
+    assert _entry(manifest, tree["rollout"])["class"] == "transcript"
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences[str(zst)] == "container-beside-plain"
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_capture_presents_an_omitted_rollout_as_absent_in_both_forms(tmp_path):
+    from _codex_zstd_fixtures import compress_in_place
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    data = b'{"z":1}\n'
+    gone = tree["rollout"].parent / "rollout-g.jsonl"
+    gone.write_bytes(data)
+    inode = os.stat(gone).st_ino
+    gone_zst = compress_in_place(gone)
+    both = tree["rollout"].parent / "rollout-both.jsonl"
+    both.write_bytes(data)
+    both_zst = _zst(pathlib.Path(str(both) + ".zst"), data)
+    kept = _zst(tree["rollout"].parent / "rollout-kept.jsonl.zst", data)
+    sources = [tree["rollout"], gone_zst, both, both_zst, kept]
+    before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+              for p in sources}
+    plain_inode = os.stat(tree["rollout"]).st_ino
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", gone, len(data), len(data), inode),
+        ("codex_session_files", both, len(data), len(data), both.stat().st_ino),
+        ("codex_session_files", tree["rollout"], 16, 16, plain_inode)])
+    omitted = sorted([str(gone), str(both), str(tree["rollout"])])
+    manifest = _capture(fr, tmp_path, tree, store=store, omit=omitted)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    for logical in omitted:
+        for spelling in (logical, logical + ".zst"):
+            assert absences.get(spelling) == "omitted", spelling
+            assert all(e["logical"] != spelling for e in manifest["entries"])
+            assert f"A\t{spelling}\n" in (tmp_path / "freeze/rootmap.tsv").read_text()
+    assert manifest["omitted"] == omitted
+    assert {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+            for p in sources} == before
+    archive = _entry(manifest, kept)
+    assert archive["class"] == "container"
+    assert archive["ino"] == kept.stat().st_ino
+    assert (tmp_path / "freeze" / archive["physical"]).read_bytes() == before[kept][0]
+    assert manifest["discoveryBoundary"]["roots"][str(tree["home"] / ".codex")]["containers"] == 1
+    assert fr.verify(tmp_path / "freeze", full=True)["problems"] == []
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["problems"] == []
+    assert result["retainedOmitted"] == 3
+
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_compressed_only_capture_records_every_missing_plain_counterpart(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    logical = tree["rollout"].parent / "fresh.jsonl"
+    _zst(logical.with_name(logical.name + ".zst"), b'{"fresh":1}\n')
+    manifest = _capture(fr, tmp_path, tree)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences.get(str(logical)) == "compressed-only"
+    assert str(tree["rollout"]) not in absences
+    assert f"A\t{logical}" in (tmp_path / "freeze" / "rootmap.tsv").read_text().splitlines()
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_decoded_twins_preserve_the_canonical_compressed_alias(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    real = tree["rollout"].parent / "z-real.jsonl"
+    container = _zst(real.with_name(real.name + ".zst"), b'{"real":1}\n')
+    alias = real.with_name("a-alias.jsonl")
+    alias.with_name(alias.name + ".zst").symlink_to(container.name)
+    st = container.stat()
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", real, 11, 11, st.st_ino)])
+    manifest = _capture(fr, tmp_path, tree, store=store, decoded_twins=True)
+    link = _entry(manifest, alias)
+    assert link["kind"] == "symlink"
+    assert link["resolved"] == str(real)
+    assert (tmp_path / "freeze" / link["physical"]).resolve() == (
+        tmp_path / "freeze" / _entry(manifest, real)["physical"])
+    qualified = fr.qualify(store, tmp_path / "freeze")
+    assert qualified["qualified"] is True, qualified["problems"]
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_qualification_refuses_a_silently_flattened_decoded_alias(tmp_path, monkeypatch):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    real = tree["rollout"].parent / "z-real.jsonl"
+    container = _zst(real.with_name(real.name + ".zst"), b'{"real":1}\n')
+    alias = real.with_name("a-alias.jsonl")
+    alias_container = alias.with_name(alias.name + ".zst")
+    alias_container.symlink_to(container.name)
+    original = fr._write_controls
+
+    def flatten_before_sealing(freeze, manifest):
+        target = _entry(manifest, real)
+        held = _entry(manifest, alias)
+        physical = held["physical"]
+        alias_copy = freeze / physical
+        data = (freeze / target["physical"]).read_bytes()
+        if alias_copy.is_symlink():
+            alias_copy.unlink()
+            alias_copy.write_bytes(data)
+        held.clear()
+        held.update(target, logical=str(alias), physical=physical,
+                    container={"logical": str(alias_container),
+                               "canonicalLogical": str(real)})
+        original(freeze, manifest)
+
+    monkeypatch.setattr(fr, "_write_controls", flatten_before_sealing)
+    store = _frozen_store(tmp_path / "store")
+    _capture(fr, tmp_path, tree, store=store, decoded_twins=True)
+    assert fr.verify(tmp_path / "freeze", full=True)["problems"] == []
+    qualified = fr.qualify(store, tmp_path / "freeze")
+    assert qualified["qualified"] is False
+    assert any("canonical" in p and str(alias) in p for p in qualified["problems"])
+
+
+@pytest.mark.parametrize("shape", ["outside-root", "plain-target", "omitted-target"])
+def test_decoded_twins_refuse_an_unrepresentable_alias(tmp_path, shape):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    logical = tree["rollout"].parent / "real.jsonl"
+    container = _zst(logical.with_name(logical.name + ".zst"), b'{"real":1}\n')
+    if shape == "outside-root":
+        container = _zst(tmp_path / "outside.jsonl.zst", b'{"real":1}\n')
+    elif shape == "plain-target":
+        logical.write_bytes(b'{"different":1}\n')
+    (logical.parent / "alias.jsonl.zst").symlink_to(container)
+    omit = [str(logical)] if shape == "omitted-target" else []
+    with pytest.raises(fr.Refused, match="decoded twin alias"):
+        _capture(fr, tmp_path, tree, decoded_twins=True, omit=omit)
+
+
+
+def _late_compressed_alias(tmp_path, monkeypatch, fr):
+    tree = _frozen_home(tmp_path)
+    sessions = tree["home"] / ".codex" / "sessions"
+    for name in ("a", "z"):
+        (sessions / name).mkdir()
+    real = sessions / "z" / "real.jsonl"
+    data = b'{"real":1}\n{"real":2}\n'
+    container = _zst(real.with_name(real.name + ".zst"), data)
+    alias = sessions / "a" / "alias.jsonl"
+    alias.with_name(alias.name + ".zst").symlink_to(container)
+    original = fr.os.walk
+    visited = []
+
+    def canonical_first(*args, **kwargs):
+        for folder, dirs, files in original(*args, **kwargs):
+            dirs.sort(reverse=True)
+            visited.append(pathlib.Path(folder))
+            yield folder, dirs, files
+
+    monkeypatch.setattr(fr.os, "walk", canonical_first)
+    return tree, real, alias, data, visited
+
+
+@pytest.mark.parametrize("table", ["codex_session_files", "codex_conversation_source_files"])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_late_decoded_alias_applies_retained_identity_before_sealing(
+        tmp_path, monkeypatch, table):
+    fr = _load("frozen_roots")
+    tree, real, alias, data, visited = _late_compressed_alias(tmp_path, monkeypatch, fr)
+    store = _frozen_store(tmp_path / "store", rows=[
+        (table, alias, len(data), len(data), 4242)])
+    manifest = _capture(fr, tmp_path, tree, store=store, decoded_twins=True)
+    assert visited.index(real.parent) < visited.index(alias.parent)
+    held = _entry(manifest, real)
+    assert (held["dev"], held["ino"], held["identitySource"]) == (1, 4242, "store")
+    assert held["admittedLength"] >= len(data)
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["qualified"] is True, result["problems"]
+
+
+def test_late_decoded_alias_enforces_the_largest_retained_cursor(tmp_path, monkeypatch):
+    fr = _load("frozen_roots")
+    tree, real, alias, data, visited = _late_compressed_alias(tmp_path, monkeypatch, fr)
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", alias, len(data) + 7, len(data) + 7, 4242)])
+    with pytest.raises(fr.Refused, match="retained cursor/scan target"):
+        _capture(fr, tmp_path, tree, store=store, decoded_twins=True)
+    assert visited.index(real.parent) < visited.index(alias.parent)
+
+
+@pytest.mark.parametrize("shape", ["canonical-row", "bound-copies", "conversation-row"])
+def test_decoded_alias_refuses_conflicting_retained_identities(
+        tmp_path, monkeypatch, shape):
+    fr = _load("frozen_roots")
+    tree, real, alias, data, _ = _late_compressed_alias(tmp_path, monkeypatch, fr)
+    rows = [("codex_session_files", alias, len(data), len(data), 4242)]
+    stores = []
+    if shape == "canonical-row":
+        rows.append(("codex_session_files", real, len(data), len(data), 9999))
+    elif shape == "conversation-row":
+        rows.append(("codex_conversation_source_files", alias, len(data), len(data), 9999))
+    stores.append(_frozen_store(tmp_path / "store", rows=rows))
+    if shape == "bound-copies":
+        stores.append(_frozen_store(tmp_path / "other-store", rows=[
+            ("codex_session_files", alias, len(data), len(data), 9999)]))
+    with pytest.raises(fr.Refused, match="conflicting retained identities"):
+        _capture(fr, tmp_path, tree, store=stores, decoded_twins=True)
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_compressed_selftest_uses_candidate_api_with_a_minimal_control_tree(tmp_path):
+    import subprocess
+    import sys
+
+    control = tmp_path / "old-control"
+    (control / "bin").mkdir(parents=True)
+    (control / "bin" / "cctally").write_text('print("measured plain control")\n')
+    code = r'''
+import importlib.util, json, os, pathlib, sys
+harness, control, scratch = map(pathlib.Path, sys.argv[1:])
+assert not (control / "bin" / "_lib_codex_rollout_container.py").exists()
+assert "_lib_codex_rollout_container" not in sys.modules
+spec = importlib.util.spec_from_file_location("fresh_selftest", harness / "frozen_selftest.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.PY = sys.executable
+s = m.SelfTest.__new__(m.SelfTest)
+s.base = scratch; s.base.mkdir()
+s.tree_dir = control; s.cctally = str(control / "bin" / "cctally")
+s.wtrace = ""; s.checks = []; s.facts = {}
+seen = []
+def portable_dispatch(argv, env, receipts, **kwargs):
+    seen.append(argv[3])
+    return m.run(argv, env=env, timeout=60)
+s.launch = portable_dispatch
+s.compressed_rollouts()
+candidate = str(harness.parents[1] / "bin")
+assert seen == [candidate, candidate], seen
+assert all(c["ok"] for c in s.checks if c["check"].endswith(".native")), s.checks
+assert s.tree_dir == control
+plain = s.ingest(scratch / "data", dict(os.environ), prefix=scratch / "trace", frozen=False)
+assert plain.returncode == 0 and plain.stdout.strip() == "measured plain control", plain
+print(json.dumps({"candidate": candidate, "measured": str(s.tree_dir), "dispatches": seen}))
+'''
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-c", code, str(TOOLS), str(control),
+                             str(tmp_path / "selftest")], cwd=control, env=env,
+                            text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    evidence = json.loads(result.stdout)
+    assert evidence["candidate"] != str(control / "bin")
+    assert evidence["measured"] == str(control)
 
 
 def test_frozen_admission_needs_the_qualification_of_its_own_copy():
@@ -5498,6 +5977,7 @@ def _sha(data):
     return __import__("hashlib").sha256(data).hexdigest()
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_a_codex_state_title_committed_only_in_the_wal_enters_the_freeze(tmp_path):
     """dc14 N1's RED: a title committed only in the WAL (a reader pins it, so
     a PASSIVE checkpoint stays incomplete) must survive the capture; a later
@@ -5570,6 +6050,7 @@ def test_a_codex_state_title_committed_only_in_the_wal_enters_the_freeze(tmp_pat
         assert f"A\t{state}{side}" in (tmp_path / "freeze" / "rootmap.tsv").read_text()
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_a_partially_backfilled_state_database_keeps_its_latest_commit(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -5631,6 +6112,7 @@ def _wal_reused_at_constant_length(db):
 
 @pytest.mark.parametrize("scenario", [_checkpointed_between_reads,
                                       _wal_reused_at_constant_length])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_independent_file_captures_cannot_certify_the_state_pair(tmp_path, scenario):
     """dc14 N1's mutation seams: each file is stable during its own read, so a
     per-file capture certifies both, yet the pair it took loses a committed
@@ -5670,6 +6152,7 @@ def test_independent_file_captures_cannot_certify_the_state_pair(tmp_path, scena
     assert ("kept",) in rows and len(rows) == 7
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_the_state_pair_retries_a_replaced_main_file(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -5691,6 +6174,7 @@ def test_the_state_pair_retries_a_replaced_main_file(tmp_path):
     assert "replaced" in " ".join(entry["source"]["retries"])
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_the_state_pair_retries_a_wal_that_appears_or_disappears(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path / "a")
@@ -5728,6 +6212,7 @@ def test_the_state_pair_retries_a_wal_that_appears_or_disappears(tmp_path):
                                       "stableAbsence": True}
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_the_state_pair_refuses_when_it_never_holds_still(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -5749,6 +6234,7 @@ def test_the_state_pair_refuses_when_it_never_holds_still(tmp_path):
     assert not (tmp_path / "freeze" / ".sqlite-derive").exists()
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_the_state_pair_refuses_a_failed_recovery_and_a_nonempty_journal(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path / "a")
@@ -5773,6 +6259,7 @@ def test_the_state_pair_refuses_a_failed_recovery_and_a_nonempty_journal(tmp_pat
                    clock=_Ticks())
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_a_derived_state_database_may_differ_in_size_from_its_source(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
@@ -6427,6 +6914,7 @@ def test_the_d_verdict_labels_its_evidence(tmp_path, capsys):
     assert out["inputs"] == {"mode": "live", "freeze": None}
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_qualify_verifies_every_committed_prefix_against_the_freeze(tmp_path):
     """A frozen catch-up trusts the qualification for the committed-prefix
     digests (#777 continuity), so qualify recomputes each one from the
@@ -6795,6 +7283,7 @@ def test_the_latency_pair_applies_the_ingest_factor_to_matched_sync_passes(
                              for p in result["problems"]), result
 
 
+@pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_a_frozen_latency_run_needs_its_copys_qualification(tmp_path):
     """README "Frozen inputs" step 2: a frozen catch-up refuses a copy whose
     qualification is missing or names another freeze or copy. latency.py's
@@ -7468,6 +7957,13 @@ def test_an_interrupted_runner_leaves_nothing_running_and_judges_its_family(
 @pytest.mark.parametrize("sig, status", [("SIGINT", 130), ("SIGHUP", 129)])
 def test_every_trapped_signal_ends_the_run_the_same_way(tmp_path, sig, status):
     import signal as _signal
+    # bash cannot trap a signal that was ignored when it started, and the
+    # runner inherits this process's disposition: a signal some earlier
+    # in-process test left at SIG_IGN would make the trap a no-op and the wait
+    # below a 40 s timeout that names nothing. Say so instead.
+    assert _signal.getsignal(getattr(_signal, sig)) is not _signal.SIG_IGN, (
+        f"{sig} is ignored in this test process (leaked by an earlier test), "
+        "so run-clone.sh could not trap it")
     box = _lifecycle_box(tmp_path)
     proc = _start_runner(box, "run-clone.sh", _lifecycle_args(box)["run-clone.sh"])
     try:
@@ -8601,3 +9097,533 @@ def test_the_analyzer_self_test_passes_with_the_family_termination_rule(tmp_path
     assert out.returncode == 0, out.stdout + out.stderr
     assert "analyze-selftest: PASS" in out.stdout
     assert "frozen-unterminated" in (TOOLS / "analyze_selftest.py").read_text()
+
+
+# #968 T14B-PREP-03: journal replay canonicalizes sources with no cursor row.
+def _quota_journal(store, records, *, name="observations-2026-10.jsonl", tail=b""):
+    journal = store / "data" / "journal"
+    journal.mkdir(parents=True, exist_ok=True)
+    path = journal / name
+    path.write_bytes(b"".join(json.dumps(r, ensure_ascii=True).encode() + b"\n"
+                              for r in records) + tail)
+    return path
+
+
+def _journal_quota(path, **payload):
+    return {"t": "obs", "provider": "codex", "payload": {
+        "kind": "quota_window_snapshot", "source_root_key": "root",
+        "source_path": str(path), "line_offset": 0, **payload}}
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_only_sources_capture_metadata_union_aliases_and_explicit_absence(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    base = tree["home"] / ".codex" / "retired"
+    base.mkdir()
+    present = base / "historical-\u00e9.bin"
+    present.write_bytes(b"journal reference does not grant a content read")
+    alias = base / "alias.bin"
+    alias.symlink_to(present.name)
+    directory_alias = base / "dir-alias"
+    directory_alias.symlink_to(base, target_is_directory=True)
+    missing = base / "never-there.bin"
+    below_link = directory_alias / present.name
+    a, b = (_frozen_store(tmp_path / name) for name in ("store-a", "store-b"))
+    _quota_journal(a, [_journal_quota(present), _journal_quota(alias)])
+    _quota_journal(b, [_journal_quota(missing), _journal_quota(below_link)],
+                   name="bootstrap-2026-10.jsonl")
+    assert fr.retained_rows(a) == fr.retained_rows(b) == []
+    manifest = _capture(fr, tmp_path, tree, store=[a, b])
+    entries = {e["logical"]: e for e in manifest["entries"]}
+    assert str(present) in entries, "cursor-free journal source metadata was omitted"
+    assert entries[str(present)]["kind"] == "probe"
+    assert "physical" not in entries[str(present)]
+    assert entries[str(alias)]["target"] == present.name
+    assert entries[str(directory_alias)]["kind"] == "probe"
+    assert {"logical": str(missing), "reason": "probe-absent"} in manifest["absences"]
+    coverage = manifest["journalCoverage"]
+    assert set(coverage["sources"]) == {str(p) for p in (present, alias, missing, below_link)}
+    assert len(coverage["stores"]) == 2
+    assert str(present) in coverage["sources"][str(below_link)]
+    rootmap = (tmp_path / "freeze" / "rootmap.tsv").read_text()
+    assert f"E\tP\t{present}\t" in rootmap
+    assert f"A\t{missing}\n" in rootmap
+    assert str(base / "unrelated.bin") not in rootmap
+    assert not any(e.get("physical") and (tmp_path / "freeze" / e["physical"]).is_file()
+                   and (tmp_path / "freeze" / e["physical"]).read_bytes()
+                   == present.read_bytes() for e in entries.values())
+    for store in (a, b):
+        result = fr.qualify(store, tmp_path / "freeze")
+        assert result["qualified"], result["problems"]
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_source_eligibility_matches_replay_decoding_and_complete_lines(tmp_path):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    base = tree["home"] / ".codex"
+    included = base / "zero-offset"
+    excluded = [base / f"excluded-{n}" for n in range(8)]
+    records = [_journal_quota(included, line_offset=False),
+               _journal_quota(excluded[0], source_root_key=""),
+               _journal_quota(excluded[1], line_offset=None),
+               {**_journal_quota(excluded[2]), "t": "op"},
+               {**_journal_quota(excluded[3]), "provider": "claude"},
+               _journal_quota(excluded[4], kind="other"),
+               {"provider": "codex", "payload": _journal_quota(excluded[5])["payload"]},
+               _journal_quota(excluded[6], source_path="")]
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, records, tail=b'not json\n[]\n' +
+                   json.dumps(_journal_quota(excluded[7])).encode())
+    _quota_journal(store, [_journal_quota(excluded[0])], name="ignored.jsonl")
+    _quota_journal(store, [_journal_quota(excluded[0])], name="observations-x.jsonl.partial")
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    absences = {a["logical"] for a in manifest["absences"]}
+    assert str(included) in absences, "eligible zero-offset journal source was omitted"
+    assert not any(str(p) in absences for p in excluded)
+    assert set(manifest["journalCoverage"]["sources"]) == {str(included)}
+
+
+@pytest.mark.parametrize("decoded_twins", [False, True])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_probes_preserve_omissions_and_container_presentations(tmp_path, decoded_twins):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    compressed = tree["rollout"].parent / "compressed.jsonl"
+    _zst(pathlib.Path(str(compressed) + ".zst"), b'{"x":1}\n')
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(tree["rollout"]), _journal_quota(compressed)])
+    manifest = _capture(fr, tmp_path, tree, store=store, omit=[tree["rollout"]],
+                        decoded_twins=decoded_twins)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences[str(tree["rollout"])] == "omitted"
+    assert absences[str(tree["rollout"]) + ".zst"] == "omitted"
+    assert all(e["logical"] != str(tree["rollout"]) for e in manifest["entries"])
+    if decoded_twins:
+        assert _entry(manifest, compressed)["class"] == "decoded-twin"
+        assert absences[str(compressed) + ".zst"] == "container-presented-as-twin"
+    else:
+        assert absences[str(compressed)] == "compressed-only"
+        assert _entry(manifest, str(compressed) + ".zst")["class"] == "container"
+    assert set(manifest["journalCoverage"]["sources"]) == {
+        str(tree["rollout"]), str(compressed)}
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["qualified"], result["problems"]
+
+
+@pytest.mark.parametrize("damage", ["missing-coverage", "missing-metadata", "changed-journal"])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_qualification_rejects_missing_or_changed_journal_probe_coverage(
+        tmp_path, monkeypatch, damage):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    source = tree["home"] / ".codex" / "historical.bin"
+    source.write_bytes(b"metadata only")
+    store = _frozen_store(tmp_path / "store")
+    journal = _quota_journal(store, [_journal_quota(source)])
+    original = fr._write_controls
+
+    def damage_before_seal(freeze, manifest):
+        if damage == "missing-coverage":
+            manifest.pop("journalCoverage", None)
+        elif damage == "missing-metadata":
+            manifest["entries"] = [e for e in manifest["entries"]
+                                   if e["logical"] != str(source)]
+        original(freeze, manifest)
+
+    monkeypatch.setattr(fr, "_write_controls", damage_before_seal)
+    _capture(fr, tmp_path, tree, store=store)
+    if damage == "changed-journal":
+        journal.write_bytes(journal.read_bytes().replace(b'"root"', b'"else"'))
+    assert fr.verify(tmp_path / "freeze")["valid"] is True
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert not result["qualified"], "unproved journal coverage must fail closed"
+    assert any("journal" in p.lower() for p in result["problems"])
+
+
+# #968 T14B-PREP-04: selection must not mistake unknown twins for absence.
+@pytest.mark.parametrize("shape", ["absent", "compressed", "directory-alias", "file-alias"])
+@pytest.mark.parametrize("decoded_twins", [False, True])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_selection_captures_both_forms_and_canonical_alias_targets(
+        tmp_path, monkeypatch, shape, decoded_twins):
+    import types
+    import _lib_codex_rollout_container as rc
+
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    retired = tree["home"] / ".codex" / "retired"
+    retired.mkdir()
+    logical = retired / "gone.jsonl"
+    compressed = pathlib.Path(str(logical) + ".zst")
+    if shape != "absent":
+        _zst(compressed, b'{"historical":1}\n')
+    source = logical
+    if shape == "directory-alias":
+        alias = retired / "alias"
+        alias.symlink_to(retired, target_is_directory=True)
+        source = alias / logical.name
+    elif shape == "file-alias":
+        source = retired / "alias.jsonl"
+        source.symlink_to(logical.name)
+    before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+              for p in (compressed,) if p.exists()}
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(source)])
+    assert fr.retained_rows(store) == []
+    manifest = _capture(fr, tmp_path, tree, store=store, decoded_twins=decoded_twins)
+    entries = {e["logical"]: e for e in manifest["entries"]}
+    absent = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert str(compressed) in entries or str(compressed) in absent, (
+        "journal-only selection's compressed counterpart has no attested metadata")
+    coverage = manifest["journalCoverage"]["sources"][str(source)]
+    assert str(logical) in coverage and str(compressed) in coverage
+    assert manifest["omitted"] == [] and manifest["decodedTwins"] == decoded_twins
+    assert all("physical" not in e for p, e in entries.items()
+               if p.startswith(str(retired) + "/")), "journal metadata grants no content"
+    if compressed.exists():
+        assert entries[str(compressed)]["kind"] == "probe"
+        assert entries[str(compressed)]["ino"] == before[compressed][1]
+    else:
+        assert absent[str(compressed)] == "probe-absent"
+    assert {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+            for p in before} == before
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"]
+    qualified = fr.qualify(store, tmp_path / "freeze")
+    assert qualified["qualified"], qualified["problems"]
+
+    # The real selector at a sealed-metadata stat boundary. Synthetic source
+    # bytes are stable; unknown paths are EACCES, never inferred ENOENT.
+    unmapped = []
+    real_stat = os.stat
+
+    def sealed_stat(path):
+        p = os.fspath(path)
+        if p in absent:
+            raise FileNotFoundError(p)
+        if p not in entries:
+            unmapped.append(p)
+            raise PermissionError(p)
+        return real_stat(p)
+
+    monkeypatch.setattr(rc, "os", types.SimpleNamespace(stat=sealed_stat, fspath=os.fspath))
+    selected = rc.select_container(logical)
+    assert (selected.kind if selected else None) == (None if shape == "absent" else rc.ZSTD)
+    assert unmapped == []
+    unrelated = retired / "unrelated.jsonl"
+    assert rc.select_container(unrelated) is None
+    assert unmapped == [str(unrelated), str(unrelated) + ".zst"]
+    receipts = _receipts(tmp_path, {"100.1.2.jsonl": [
+        _receipt_line(), *[json.dumps({"event": "unmapped", "pid": 100,
+                                     "call": "stat", "path": p}) for p in unmapped]]}, [100])
+    verdict = fr.family_verdict(receipts, "abc")
+    assert not verdict["valid"] and any("unmapped stat" in p for p in verdict["problems"])
+
+
+@pytest.mark.parametrize("damage", ["plain", "compressed", "component", "coverage"])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_selection_qualification_rejects_resealed_incomplete_metadata(
+        tmp_path, monkeypatch, damage):
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    retired = tree["home"] / ".codex" / "retired"
+    retired.mkdir()
+    source = retired / "gone.jsonl"
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(source)])
+    original = fr._write_controls
+
+    def damage_before_seal(freeze, manifest):
+        missing = {"plain": str(source), "compressed": str(source) + ".zst",
+                   "component": str(retired)}.get(damage)
+        if damage == "coverage":
+            manifest["journalCoverage"]["sources"][str(source)] = [
+                p for p in manifest["journalCoverage"]["sources"][str(source)]
+                if p != str(source) + ".zst"]
+        else:
+            manifest["entries"] = [e for e in manifest["entries"] if e["logical"] != missing]
+            manifest["absences"] = [a for a in manifest["absences"] if a["logical"] != missing]
+        original(freeze, manifest)
+
+    monkeypatch.setattr(fr, "_write_controls", damage_before_seal)
+    _capture(fr, tmp_path, tree, store=store)
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"]
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert not result["qualified"], "valid reseal must not admit missing selection metadata"
+    assert any("journal" in p.lower() for p in result["problems"])
+
+
+@pytest.mark.parametrize("target_form", ["plain", "compressed"])
+@pytest.mark.parametrize("counterpart_present", [False, True])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_external_file_alias_attests_selection_metadata_only(
+        tmp_path, monkeypatch, target_form, counterpart_present):
+    import types
+    import _lib_codex_rollout_container as rc
+
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    outside = pathlib.Path(os.path.realpath(tmp_path)) / "external"
+    outside.mkdir()
+    plain = outside / "history.jsonl"
+    compressed = outside / "history.jsonl.zst"
+    target, counterpart = ((plain, compressed) if target_form == "plain"
+                           else (compressed, plain))
+    if target_form == "plain":
+        target.write_bytes(b'{"historical":1}\n')
+    else:
+        _zst(target, b'{"historical":1}\n')
+    if counterpart_present:
+        if counterpart == compressed:
+            _zst(counterpart, b'{"other":2}\n')
+        else:
+            counterpart.write_bytes(b'{"other":2}\n')
+    alias = tree["rollout"].parent / target.name
+    alias.symlink_to(target)
+    sources = [alias, plain, compressed]
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(p) for p in sources])
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    entries = {e["logical"]: e for e in manifest["entries"]}
+    absent = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert _entry(manifest, target)["class"] in ("transcript", "container")
+    if target_form == "compressed":
+        entry = entries[str(target)]
+        assert entry["decoded"] == {"ok": True, "length": len(b'{"historical":1}\n'),
+                                    "completeLineEnd": len(b'{"historical":1}\n'),
+                                    "error": None}
+        physical = tmp_path / "freeze" / entry["physical"]
+        assert physical.read_bytes() == target.read_bytes()
+        selected = fr._frozen_container(rc, physical)
+        assert selected.path == physical and selected.kind == rc.ZSTD
+        assert selected.fingerprint == rc.fingerprint_of(physical, rc.ZSTD)
+    assert all(r["kind"] == "file" for r in manifest["roots"]
+               if r["logical"].startswith(str(outside)))
+    assert str(outside) not in {r["logical"] for r in manifest["roots"]}
+    if counterpart_present:
+        assert entries[str(counterpart)]["kind"] == "probe"
+        assert "physical" not in entries[str(counterpart)]
+        assert entries[str(counterpart)]["ino"] == counterpart.stat().st_ino
+    else:
+        assert absent[str(counterpart)] == "probe-absent"
+    for source in sources:
+        coverage = manifest["journalCoverage"]["sources"][str(source)]
+        assert str(plain) in coverage and str(compressed) in coverage
+    tsv = (tmp_path / "freeze" / "rootmap.tsv").read_text()
+    assert (f"E\tP\t{counterpart}\t" if counterpart_present
+            else f"A\t{counterpart}\n") in tsv
+    assert f'(literal "{counterpart}")' in (tmp_path / "freeze" / "frozen.sb").read_text()
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"]
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["qualified"], result["problems"]
+
+    # Real selector, with exactly the sealed lstat/stat boundary. The external
+    # counterpart is metadata only; unknown paths must fail rather than leak.
+    real_stat = os.stat
+    unmapped = []
+
+    def sealed_stat(path):
+        p = os.fspath(path)
+        if p in absent:
+            raise FileNotFoundError(p)
+        if p not in entries:
+            unmapped.append(p)
+            raise PermissionError(p)
+        return real_stat(p)
+
+    monkeypatch.setattr(rc, "os", types.SimpleNamespace(stat=sealed_stat, fspath=os.fspath))
+    for spelling in (plain, compressed):
+        selected = rc.select_container(spelling)
+        assert selected.logical == plain
+        assert selected.kind == (rc.PLAIN if plain.exists() else rc.ZSTD)
+    assert rc.select_container(alias) is not None
+    assert unmapped == []
+    unrelated = outside / "unrelated.jsonl"
+    assert rc.select_container(unrelated) is None
+    assert unmapped == [str(unrelated), str(unrelated) + ".zst"]
+    roots = [fr.Root(r["kind"], r["logical"], r["walk"], index=r["index"])
+             for r in manifest["roots"]]
+    with pytest.raises(fr.Refused, match="outside captured probe namespace"):
+        fr.journal_selection_components(str(unrelated), roots, entries, absent, {})
+
+
+@pytest.mark.parametrize("damage", ["plain", "compressed", "root", "coverage", "all-coverage"])
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_journal_external_alias_rejects_resealed_incomplete_selection(
+        tmp_path, monkeypatch, damage):
+    fr = _load("frozen_roots")
+    tree = _link_tree(tmp_path)
+    source = tree["target"]
+    counterpart = str(source) + ".zst"
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(source)])
+    original = fr._write_controls
+
+    def damage_before_seal(freeze, manifest):
+        missing = {"plain": str(source), "compressed": counterpart}.get(damage)
+        if missing:
+            # Remove only this fixture's copied content, so the intact seal
+            # guard can admit the damaged metadata to qualification.
+            for entry in manifest["entries"]:
+                if entry["logical"] == missing and "physical" in entry:
+                    (freeze / entry["physical"]).unlink()
+            manifest["entries"] = [e for e in manifest["entries"] if e["logical"] != missing]
+            manifest["absences"] = [a for a in manifest["absences"] if a["logical"] != missing]
+        elif damage == "root":
+            manifest["roots"] = [r for r in manifest["roots"] if r["logical"] != counterpart]
+        elif damage == "coverage":
+            manifest["journalCoverage"]["sources"][str(source)].remove(counterpart)
+        else:
+            manifest.pop("journalCoverage")
+        original(freeze, manifest)
+
+    monkeypatch.setattr(fr, "_write_controls", damage_before_seal)
+    _capture(fr, tmp_path, tree, store=store)
+    assert fr.verify(tmp_path / "freeze", full=True)["valid"]
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert not result["qualified"], "resealing must not certify unattested external selection"
+    assert any("journal" in p.lower() for p in result["problems"])
+
+
+# SBX-ORACLE-R01: execute the real named oracle expressions with retained
+# response shapes; the native sandbox itself remains a separate mandatory gate.
+def _selftest_predicate(name, **values):
+    import ast
+    module = _load("frozen_selftest")
+    tree = ast.parse((TOOLS / "frozen_selftest.py").read_text())
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr == "check"
+             and node.args and isinstance(node.args[0], ast.Constant)
+             and node.args[0].value == name]
+    assert calls
+    return all(bool(eval(compile(ast.Expression(call.args[1]),
+                                 str(TOOLS / "frozen_selftest.py"), "eval"),
+                         vars(module), values)) for call in calls)
+
+
+@pytest.mark.parametrize("name, field", [
+    ("bypass.unloadedLibraryKilled", "stat"),
+    ("bypass.rawSyscallDenied", "rawOpen"),
+    ("bypass.rawThroughDirLinkKilled", "rawOpen"),
+    ("bypass.rawLinkTargetKilled", "rawOpen"),
+])
+def test_selftest_bypass_oracles_require_operation_denial(name, field):
+    import errno
+    import subprocess
+
+    def accepted(code, stdout, stderr=""):
+        result = subprocess.CompletedProcess([], code, stdout, stderr)
+        return _selftest_predicate(name, raw=result, killed=result)
+
+    for denied in (errno.EPERM, errno.EACCES):
+        assert accepted(0, json.dumps({field: -1, "errno": denied}))
+    assert accepted(-9, "")
+    for code, stdout in [
+        (0, json.dumps({field: 0, "errno": 0})),
+        (0, json.dumps({field: 7, "errno": errno.EPERM})),
+        (0, json.dumps({field: -1, "errno": errno.ENOENT})),
+        (0, json.dumps({field: -1, "errno": 0})),
+        (0, json.dumps({field: -1, "errno": True})),
+        (0, json.dumps({field: -1, "errno": errno.EPERM, "content": "live"})),
+        (0, json.dumps({field: -1, "errno": errno.EPERM}) + "\nread\n"),
+        (0, f'{{"{field}": 0, "{field}": -1, "errno": 1}}'),
+        (0, json.dumps({field: -1.0, "errno": errno.EPERM})),
+        (1, json.dumps({field: -1, "errno": errno.EPERM})),
+        (0, ""), (0, "not-json"), (0, "[]"), (0, "{}"),
+        (1, ""), (2, ""), (137, ""), (-15, ""),
+        (-9, "read\n"), (-9, '{"content":"live"}'),
+    ]:
+        assert not accepted(code, stdout), (name, code, stdout)
+    assert not accepted(1, "", "PermissionError: [Errno 1] denied")
+    assert not accepted(-9, "", "read live content")
+    assert not accepted(0, json.dumps({field: -1, "errno": errno.EPERM}),
+                        "read live content")
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+def test_selftest_fatal_stimulus_is_owner_allowed_raw_metadata_write(tmp_path):
+    """Exercise the actual C helper on fake sealed permissions, unsandboxed
+    on the remote runner: a failed permission check cannot impersonate SIGKILL."""
+    import subprocess
+    st = _load("frozen_selftest")
+    src, binary = tmp_path / "bypass.c", tmp_path / "bypass"
+    src.write_text(st.BYPASS_C)
+    built = subprocess.run(["clang", "-O1", "-o", str(binary), str(src)],
+                           text=True, capture_output=True, timeout=60)
+    assert built.returncode == 0, built.stderr
+    freeze = tmp_path / "freeze"
+    freeze.mkdir()
+    target = freeze / "rootmap.tsv"
+    target.write_text("unchanged control\n")
+    target.chmod(0o444)
+    freeze.chmod(0o555)
+    test = st.SelfTest.__new__(st.SelfTest)
+    test.bypass, test.freeze = str(binary), freeze
+    argv = test.sandbox_kill_argv()
+    assert argv == [str(binary), "raw-chmod", str(target)]
+    before = target.stat()
+    result = subprocess.run(argv, text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"rawChmod": 0, "errno": 0}
+    assert target.read_text() == "unchanged control\n"
+    assert before.st_mode & 0o777 == 0o444
+    assert target.stat().st_mode & 0o777 == 0o644
+    # Both kill fixtures must select this same primitive; the top-level one
+    # is shell-rendered, while the swallowed child receives the argv intact.
+    source = (TOOLS / "frozen_selftest.py").read_text()
+    import ast
+    methods = {n.name: n for n in ast.walk(ast.parse(source))
+               if isinstance(n, ast.FunctionDef)}
+    for method in ("invalidity", "toplevel_ends"):
+        assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == "sandbox_kill_argv"
+                   for n in ast.walk(methods[method]))
+
+
+def test_selftest_signal_oracles_keep_genuine_kill_and_invalid_family():
+    import subprocess
+    killed = subprocess.CompletedProcess([], 0, "-9\n", "")
+    invalid = {"valid": False, "problems": ["child terminated by signal 9"]}
+    assert _selftest_predicate("invalid.swallowedSandboxKill", out=killed, fam=invalid)
+    for out, fam in [
+        (subprocess.CompletedProcess([], 0, "0\n", ""), invalid),
+        (subprocess.CompletedProcess([], 0, "1\n", ""), invalid),
+        (killed, {"valid": True, "problems": []}),
+        (killed, {"valid": False, "problems": ["unrelated failure"]}),
+    ]:
+        assert not _selftest_predicate("invalid.swallowedSandboxKill", out=out, fam=fam)
+    assert _selftest_predicate("toplevel.runnerStatuses", out=subprocess.CompletedProcess(
+        [], 0, "killed=137\nteardown=137\nnormal=0\n", ""))
+    assert not _selftest_predicate("toplevel.runnerStatuses", out=subprocess.CompletedProcess(
+        [], 0, "killed=0\nteardown=137\nnormal=0\n", ""))
+    assert _selftest_predicate("invalid.killedTopLevel", fam={
+        "valid": False, "problems": ["top-level pid 123 terminated by signal 9"]})
+    for fam in ({"valid": True, "problems": []},
+                {"valid": False, "problems": ["child terminated by signal 9"]},
+                {"valid": False, "problems": ["top-level pid 123 exited 1"]}):
+        assert not _selftest_predicate("invalid.killedTopLevel", fam=fam)
+
+
+def test_selftest_unloaded_stat_reports_structured_operation_outcome(tmp_path):
+    import errno
+    import subprocess
+    import sys
+
+    st = _load("frozen_selftest")
+    target = tmp_path / "present"
+    target.write_text("live content must never be emitted\n")
+    scripts = [(st.UNLOADED_STAT, {"stat": 0, "errno": 0}, False)]
+    for error in (errno.EPERM, errno.EACCES, errno.ENOENT):
+        script = ("from unittest.mock import patch\n"
+                  f"with patch('os.stat', side_effect=OSError({error}, 'denied')):\n"
+                  f"    exec({st.UNLOADED_STAT!r})\n")
+        scripts.append((script, {"stat": -1, "errno": error},
+                        error in (errno.EPERM, errno.EACCES)))
+    for script, expected, denied in scripts:
+        result = subprocess.run([sys.executable, "-c", script, str(target)],
+                                text=True, capture_output=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == expected
+        assert "live content" not in result.stdout
+        assert _selftest_predicate("bypass.unloadedLibraryKilled", killed=result) is denied

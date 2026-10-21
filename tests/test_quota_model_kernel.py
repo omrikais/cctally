@@ -21,6 +21,11 @@ import pytest
 # conftest puts bin/ on sys.path.
 import _lib_quota_model as qm
 
+#: Every pre-#978 test below is an Opus 5 era population (August 2026), so
+#: the population-level functions it calls are given that era explicitly.
+OPUS5 = qm.era_by_id("opus-5")
+OPUS55 = qm.era_by_id("opus-5-5")
+
 
 # --------------------------------------------------------------------------
 # Task 1 — constants payload, fingerprint, t-quantile table
@@ -46,11 +51,15 @@ def test_payload_carries_no_operator_budget():
 
 
 def test_the_supported_composition_floor_and_fast_mode_policy_are_fingerprinted():
-    policy = qm.constants_payload()["coefficientSupport"]
-    assert policy == {
-        "supportedCompositionFrom": "2026-07-25",
-        "fastModeParticipation": "usage-credits-only-excluded",
-    }
+    # #978: the floor and the fast-mode policy now live on each era of the
+    # fingerprinted table rather than in one `coefficientSupport` member.
+    eras = qm.constants_payload()["coefficientEras"]
+    assert [(e["id"], e["from"], e["until"]) for e in eras] == [
+        ("opus-5", "2026-07-25", "2026-09-22"),
+        ("opus-5-5", "2026-09-22", None),
+    ]
+    for era in eras:
+        assert era["fastModeParticipation"] == "usage-credits-only-excluded"
 
 
 def test_counts_stay_ints_and_thresholds_stay_floats_in_the_payload():
@@ -83,9 +92,16 @@ def test_counts_stay_ints_and_thresholds_stay_floats_in_the_payload():
 
 
 def test_token_class_weights_are_the_spec_values():
-    # Mutation: any coefficient edited.
-    assert qm.TOKEN_CLASS_WEIGHTS == {
+    # Mutation: any coefficient edited, in either era. The Opus 5 set is
+    # pinned through an `opus-5`-era instant so the selector is exercised too.
+    assert qm.era_for_instant(DAY).weight_map() == {
         "fresh": 1.0, "output": 4.73, "cache_1h": 1.03, "cache_read": 0.0031,
+    }
+    assert OPUS5.weight_map() == {
+        "fresh": 1.0, "output": 4.73, "cache_1h": 1.03, "cache_read": 0.0031,
+    }
+    assert OPUS55.weight_map() == {
+        "fresh": 1.0, "output": 0.64, "cache_1h": 1.0, "cache_read": 0.0148,
     }
 
 
@@ -99,8 +115,9 @@ def test_every_token_class_coefficient_is_strictly_positive():
     # on follows from the coefficients: that every entry's quantities are
     # non-negative, and that no class accumulator overflows. Section 39 pins
     # each of those with its own test in Part V below.
-    assert all(w > 0.0 and math.isfinite(w)
-               for w in qm.TOKEN_CLASS_WEIGHTS.values())
+    for era in qm.COEFFICIENT_ERAS:
+        assert all(w > 0.0 and math.isfinite(w)
+                   for w in era.weight_map().values()), era.id
 
 
 def test_no_per_family_multiplier_ships():
@@ -305,7 +322,7 @@ def test_a_day_of_only_fable_point_one_usage_is_not_withheld():
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                newest_entry_at=DAY + dt.timedelta(days=2))
+                                newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in obs] == [None]
     assert obs[0].family_shares == {"claude-fable-5-1": pytest.approx(1.0)}
 
@@ -327,7 +344,7 @@ def test_a_day_of_only_mythos_usage_is_not_withheld():
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                newest_entry_at=DAY + dt.timedelta(days=2))
+                                newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in obs] == [None]
     assert obs[0].family_shares == {"claude-mythos-5": pytest.approx(1.0)}
 
@@ -558,7 +575,7 @@ def test_a_date_crossing_a_segment_boundary_is_a_transition_day():
     cr = [qm.CreditRecord(DAY.replace(hour=4), "reset")]
     segs = qm.build_segments(snaps, cr)
     series = qm.build_daily_series(segs, [], now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     same_date = [o for o in series if o.date == DAY.date()]
     # Mutation: emitting one row per (segment, date), which lets the
     # consecutive-run counter count one calendar day twice.
@@ -580,7 +597,7 @@ def test_an_incomplete_tail_day_is_local_history_incomplete():
                             cache_1h=0, cache_read=0)
     series = qm.build_daily_series(segs, [inside],
                                    now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY.replace(hour=12))
+                                   newest_entry_at=DAY.replace(hour=12), era=OPUS5)
     today = [o for o in series if o.date == DAY.date()]
     assert [o.cause for o in today] == [qm.WithholdingCause.NO_LOCAL_HISTORY]
     assert today[0].units == pytest.approx(1_000_000.0)
@@ -604,7 +621,7 @@ def test_tokens_at_the_closing_instant_belong_to_the_next_observation():
                               cache_read=0)
     series = qm.build_daily_series(segs, [at_close],
                                    now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o for o in series if o.date == DAY.date()][0].units == 0.0
 
 
@@ -616,7 +633,7 @@ def test_an_entry_inside_the_interval_is_counted_with_its_shares():
                        output=0, cache_create_total=0, cache_1h=0, cache_read=0)
     obs = [o for o in qm.build_daily_series(
         segs, [e], now=DAY + dt.timedelta(days=2),
-        newest_entry_at=DAY + dt.timedelta(days=2)) if o.date == DAY.date()][0]
+        newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5) if o.date == DAY.date()][0]
     assert obs.cause is None
     assert obs.units == pytest.approx(1_000_000.0)
     assert obs.family_shares == {"claude-opus-5": pytest.approx(1.0)}
@@ -630,7 +647,7 @@ def test_a_capped_reading_makes_the_day_right_censored():
     snaps = [_snap(1, 90.0), _snap(5, 100.0)]
     segs = qm.build_segments(snaps, [])
     series = qm.build_daily_series(segs, [], now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in series] == [qm.WithholdingCause.RIGHT_CENSORED]
 
 
@@ -641,7 +658,7 @@ def test_an_unknown_token_split_inside_the_interval_withholds_the_day():
                        fresh=1_000_000, output=0, cache_create_total=10,
                        cache_1h=None, cache_read=0)
     series = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in series] == [qm.WithholdingCause.TOKEN_SPLIT_UNKNOWN]
 
 
@@ -652,7 +669,7 @@ def test_an_unclassified_family_makes_the_composition_unsupported():
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     series = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in series] == \
         [qm.WithholdingCause.UNSUPPORTED_COMPOSITION]
 
@@ -665,7 +682,7 @@ def test_a_non_finite_entry_withholds_its_day_with_a_typed_cause():
                        fresh=float("nan"), output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     series = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                   newest_entry_at=DAY + dt.timedelta(days=2))
+                                   newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.cause for o in series] == \
         [qm.WithholdingCause.TOKEN_SPLIT_UNKNOWN]
 
@@ -686,14 +703,14 @@ def test_a_meter_gain_of_exactly_two_true_points_is_retained():
     # value rather than near it. A `<` to `<=` mutation drops the day.
     segs = qm.build_segments([_snap(1, 10.0), _snap(5, 12.0)], [])
     kept = qm.build_daily_series(segs, [], now=DAY + dt.timedelta(days=2),
-                                 newest_entry_at=DAY + dt.timedelta(days=2))
+                                 newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert [o.date for o in kept] == [DAY.date()]
     assert kept[0].meter_delta == 2.0
     # One reading lower is 1.0 and is absent from the series entirely.
     below = qm.build_segments([_snap(1, 10.0), _snap(5, 11.0)], [])
     assert qm.build_daily_series(
         below, [], now=DAY + dt.timedelta(days=2),
-        newest_entry_at=DAY + dt.timedelta(days=2)) == []
+        newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5) == []
 
 
 def test_a_day_the_meter_barely_moved_is_absent_from_the_series():
@@ -702,7 +719,7 @@ def test_a_day_the_meter_barely_moved_is_absent_from_the_series():
     snaps = [_snap(1, 10.0), _snap(5, 11.0)]
     segs = qm.build_segments(snaps, [])
     assert qm.build_daily_series(segs, [], now=DAY + dt.timedelta(days=2),
-                                 newest_entry_at=DAY + dt.timedelta(days=2)) == []
+                                 newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5) == []
 
 
 # --------------------------------------------------------------------------
@@ -808,7 +825,10 @@ def test_an_undefined_centre_or_radius_makes_a_day_unsupported():
 # Task 6 — the fit, the exact rank-sum detector, Holm, classification
 # --------------------------------------------------------------------------
 NOW = dt.datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
-OBS_EPOCH = dt.date(2026, 7, 1)
+#: The first `opus-5` day (#978). The synthetic forecast entries below are
+#: dated from it, and `analyse` refuses a forecast entry outside the era it
+#: is given, so the epoch sits inside the era the helpers pass.
+OBS_EPOCH = dt.date(2026, 7, 25)
 
 
 def _obs(meter_delta, units, index=0, *, segment_id=0, cause=None,
@@ -1242,7 +1262,7 @@ WEEK_END = WEEK_START + dt.timedelta(days=7)
 
 
 def _analyse(series, **kw):
-    args = dict(now=NOW, newest_at=NOW - dt.timedelta(hours=1),
+    args = dict(now=NOW, newest_at=NOW - dt.timedelta(hours=1), era=OPUS5,
                 observed_percent=40, current_week_units=40e6,
                 current_week_start=WEEK_START, current_week_end=WEEK_END,
                 forecast_population=())
@@ -1438,14 +1458,14 @@ def test_entries_outside_every_observation_interval_are_reported():
 
     got = qm.unattributed_units(segs, [entry(0), entry(3), entry(5),
                                        entry(7)],
-                                now=DAY + dt.timedelta(days=2))
+                                now=DAY + dt.timedelta(days=2), era=OPUS5)
     assert got["entries"] == 3
     assert got["units"] == pytest.approx(3_000_000.0)
     # And the one inside is the one the series actually counted.
     obs = qm.build_daily_series(segs, [entry(0), entry(3), entry(5),
                                        entry(7)],
                                 now=DAY + dt.timedelta(days=2),
-                                newest_entry_at=DAY + dt.timedelta(days=2))
+                                newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)
     assert obs[0].units == pytest.approx(1_000_000.0)
 
 
@@ -1457,10 +1477,10 @@ def test_a_day_below_the_minimum_gain_attributes_none_of_its_tokens():
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
     assert qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                 newest_entry_at=DAY + dt.timedelta(days=2)) \
+                                 newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5) \
         == []
     assert qm.unattributed_units(
-        segs, [e], now=DAY + dt.timedelta(days=2))["entries"] == 1
+        segs, [e], now=DAY + dt.timedelta(days=2), era=OPUS5)["entries"] == 1
 
 
 def test_no_family_is_classified_as_draining_only_a_dedicated_pool():
@@ -1478,7 +1498,7 @@ def test_an_unclassified_entry_is_counted_but_contributes_no_units():
     e = qm.EntryRecord(at=DAY.replace(hour=9), model="some-other-vendor-model",
                        fresh=1_000_000, output=0, cache_create_total=0,
                        cache_1h=0, cache_read=0)
-    got = qm.unattributed_units(segs, [e], now=DAY + dt.timedelta(days=2))
+    got = qm.unattributed_units(segs, [e], now=DAY + dt.timedelta(days=2), era=OPUS5)
     assert got["entries"] == 1 and got["units"] == 0.0
 
 
@@ -1489,8 +1509,8 @@ def test_the_diagnostics_block_is_json_serializable_and_camel_case():
     series = _spread(10e6, 20) + [_obs(10, 30e6, 20 + i) for i in range(3)]
     a = _analyse(series, unattributed={"units": 5.0, "entries": 2})
     decoded = json.loads(json.dumps(a.diagnostics))
-    assert decoded["detector"]["splitDate"] == "2026-07-21"
-    assert decoded["detector"]["scanStartDate"] == "2026-07-01"
+    assert decoded["detector"]["splitDate"] == "2026-08-14"
+    assert decoded["detector"]["scanStartDate"] == "2026-07-25"
     assert decoded["unattributedUnits"] == 5.0
     assert decoded["unattributedEntries"] == 2
     for key in decoded:
@@ -1561,12 +1581,12 @@ def test_a_naive_datetime_is_rejected_rather_than_read_as_host_local():
         qm.build_segments([_snap(1, 10.0)],
                           [qm.CreditRecord(naive, "reset")])
     with pytest.raises(ValueError):
-        qm.build_daily_series(segs, [], now=naive, newest_entry_at=later)
+        qm.build_daily_series(segs, [], now=naive, newest_entry_at=later, era=OPUS5)
     with pytest.raises(ValueError):
-        qm.build_daily_series(segs, [], now=later, newest_entry_at=naive)
+        qm.build_daily_series(segs, [], now=later, newest_entry_at=naive, era=OPUS5)
     with pytest.raises(ValueError):
         qm.build_daily_series(segs, [entry], now=later,
-                              newest_entry_at=later)
+                              newest_entry_at=later, era=OPUS5)
     with pytest.raises(ValueError):
         _analyse(_spread(10e6, 12), now=naive)
     with pytest.raises(ValueError):
@@ -1661,7 +1681,7 @@ def test_a_confirmed_change_publishes_both_regimes_as_evidence():
     assert a.baseline_fit.value == pytest.approx(1.02e6)
     assert a.baseline_fit.support.days == 20
     assert "superseded" in a.baseline_fit.qualifications
-    assert "split-at:2026-07-21" in a.baseline_fit.qualifications
+    assert "split-at:2026-08-14" in a.baseline_fit.qualifications
     assert "detection-only" in a.watch_fit.qualifications
 
 
@@ -1787,12 +1807,12 @@ _TODAY_NEWEST = (DAY + dt.timedelta(days=23)).replace(hour=3)
 def _analyse_store(n_days):
     segs, entries = _meter_store(n_days, _step_units)
     series = qm.build_daily_series(segs, entries, now=_TODAY_NOW,
-                                   newest_entry_at=_TODAY_NEWEST)
+                                   newest_entry_at=_TODAY_NEWEST, era=OPUS5)
     return series, qm.analyse(
         series, now=_TODAY_NOW, newest_at=_TODAY_NEWEST,
         forecast_population=(), current_week_units=40e6,
         current_week_start=DAY,
-        current_week_end=DAY + dt.timedelta(days=28))
+        current_week_end=DAY + dt.timedelta(days=28), era=OPUS5)
 
 
 def test_an_in_progress_day_is_excluded_from_the_series_entirely():
@@ -1814,7 +1834,7 @@ def test_an_ingest_incomplete_day_still_carries_no_local_history():
     ended = DAY + dt.timedelta(days=3)
     series = qm.build_daily_series(
         segs, entries, now=ended,
-        newest_entry_at=(DAY + dt.timedelta(days=1)).replace(hour=12))
+        newest_entry_at=(DAY + dt.timedelta(days=1)).replace(hour=12), era=OPUS5)
     causes = {o.date: o.cause for o in series}
     assert causes[DAY.date()] is None
     assert causes[(DAY + dt.timedelta(days=1)).date()] is \
@@ -2135,7 +2155,7 @@ def test_token_class_shares_are_raw_quantities_not_weighted_units():
                        fresh=1_000_000, output=1_000_000,
                        cache_create_total=0, cache_1h=0, cache_read=0)
     obs = qm.build_daily_series(segs, [e], now=DAY + dt.timedelta(days=2),
-                                newest_entry_at=DAY + dt.timedelta(days=2))[0]
+                                newest_entry_at=DAY + dt.timedelta(days=2), era=OPUS5)[0]
     assert obs.class_shares["fresh"] == pytest.approx(0.5)
     assert obs.class_shares["output"] == pytest.approx(0.5)
     # The FAMILY vector stays a share of weighted units and still sums to one.
@@ -2148,24 +2168,32 @@ def test_token_class_shares_are_raw_quantities_not_weighted_units():
 
 def test_the_token_class_floor_is_derived_from_the_coefficients():
     # `0.05 * mu / 4.7269`, where mu is the centre's own weighted value and
-    # 4.7269 = 4.73 - 0.0031 is the coefficient spread. Mutation: asserting a
+    # 4.7269 = 4.73 - 0.0031 is the `opus-5` coefficient spread (the
+    # `opus-5-5` spread is 1.0 - 0.0148 = 0.9852). Mutation: asserting a
     # constant instead, which would not move with the centre.
-    spread = max(qm.TOKEN_CLASS_WEIGHTS.values()) - \
-        min(qm.TOKEN_CLASS_WEIGHTS.values())
+    weights = OPUS5.weight_map()
+    spread = max(weights.values()) - min(weights.values())
     assert spread == pytest.approx(4.7269)
-    fresh_only = qm.token_class_floor({"fresh": 1.0})
+    new_weights = OPUS55.weight_map()
+    new_spread = max(new_weights.values()) - min(new_weights.values())
+    assert new_spread == pytest.approx(0.9852)
+    assert qm.token_class_floor({"fresh": 1.0}, era=OPUS55) == \
+        pytest.approx(0.05 * 1.0 / new_spread)
+    assert qm.token_class_floor({"fresh": 0.5, "output": 0.5}, era=OPUS55) \
+        == pytest.approx(0.05 * (0.5 + 0.5 * 0.64) / new_spread)
+    fresh_only = qm.token_class_floor({"fresh": 1.0}, era=OPUS5)
     assert fresh_only == pytest.approx(0.05 * 1.0 / spread)
     assert fresh_only == pytest.approx(0.01058, abs=5e-5)
     # A centre carrying output is worth more per unit share, so its floor is
     # larger — the floor is centre-specific and not a single number.
     mixed = {"fresh": 0.5, "output": 0.5}
-    assert qm.token_class_floor(mixed) == \
+    assert qm.token_class_floor(mixed, era=OPUS5) == \
         pytest.approx(0.05 * (0.5 + 0.5 * 4.73) / spread)
-    assert qm.token_class_floor(mixed) > fresh_only
-    assert qm.token_class_floor(None) is None
+    assert qm.token_class_floor(mixed, era=OPUS5) > fresh_only
+    assert qm.token_class_floor(None, era=OPUS5) is None
     # A centre with no weighted value at all defines no floor.
-    assert qm.token_class_floor({"fresh": 0.0}) is None
-    assert qm.token_class_floor({}) is None
+    assert qm.token_class_floor({"fresh": 0.0}, era=OPUS5) is None
+    assert qm.token_class_floor({}, era=OPUS5) is None
 
 
 def test_the_effective_radius_is_the_larger_of_the_two():
@@ -2186,7 +2214,7 @@ def test_the_mix_support_policy_is_fingerprinted():
     assert payload["token_class_max_relative_effect"] == 0.05
     assert payload["vector"] == "raw-quantity-share"
     assert payload["effective_radius"] == "max(empirical, floor)"
-    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 3
+    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 4
 
 
 def test_the_published_radii_are_the_effective_ones():
@@ -2194,7 +2222,7 @@ def test_the_published_radii_are_the_effective_ones():
     # was floored from is a diagnostic rather than lost.
     a = _analyse(_spread(10e6, 12))
     assert a.family_radius == pytest.approx(0.03)
-    assert a.class_radius == pytest.approx(qm.token_class_floor({"fresh": 1.0}))
+    assert a.class_radius == pytest.approx(qm.token_class_floor({"fresh": 1.0}, era=OPUS5))
     assert a.diagnostics["familyRadiusEmpirical"] == pytest.approx(0.0)
     assert a.diagnostics["classRadiusEmpirical"] == pytest.approx(0.0)
 
@@ -2239,7 +2267,7 @@ def test_the_forecast_population_is_probed_against_the_fit_population():
     assert probed.verdict is qm.Verdict.WITHHELD
     assert probed.exit_code == 3
     # The reference it was measured against is the fit population's centre.
-    assert qm.tv_distance(qm.aggregate_composition([_output_heavy(11)])[1],
+    assert qm.tv_distance(qm.aggregate_composition([_output_heavy(11)], era=OPUS5)[1],
                           probed.class_shares) > probed.class_radius
 
 
@@ -2289,17 +2317,17 @@ def test_the_forecast_aggregate_uses_raw_class_and_weighted_family_shares():
     entries = [_forecast_entry(1, fresh=1_000_000, output=1_000_000),
                _forecast_entry(2, fresh=1_000_000, output=0,
                                model="claude-sonnet-5")]
-    families, classes = qm.aggregate_composition(entries)
+    families, classes = qm.aggregate_composition(entries, era=OPUS5)
     assert classes["fresh"] == pytest.approx(2 / 3)
     assert classes["output"] == pytest.approx(1 / 3)
     weighted_opus = 1_000_000 + 4.73 * 1_000_000
     total = weighted_opus + 1_000_000
     assert families["claude-opus-5"] == pytest.approx(weighted_opus / total)
-    assert qm.aggregate_composition([]) is None
+    assert qm.aggregate_composition([], era=OPUS5) is None
     # An unclassified family contributes nothing, so a population made only of
     # them supports no comparison.
     assert qm.aggregate_composition(
-        [_forecast_entry(1, fresh=10, output=0, model="mystery-model")]) is None
+        [_forecast_entry(1, fresh=10, output=0, model="mystery-model")], era=OPUS5) is None
 
 
 # --- section 36: the remaining measured gaps ------------------------------
@@ -2338,9 +2366,9 @@ def test_the_new_boundaries_reject_a_naive_datetime():
                                  fresh=1, output=0, cache_create_total=0,
                                  cache_1h=0, cache_read=0)
     with pytest.raises(ValueError):
-        qm.unattributed_units(segs, [entry], now=later)
+        qm.unattributed_units(segs, [entry], now=later, era=OPUS5)
     with pytest.raises(ValueError):
-        qm.unattributed_units(segs, [aware_entry], now=naive)
+        qm.unattributed_units(segs, [aware_entry], now=naive, era=OPUS5)
     with pytest.raises(ValueError):
         qm.day_is_complete(DAY.date(), now=naive, newest_entry_at=later)
     with pytest.raises(ValueError):
@@ -2571,7 +2599,7 @@ def _one_day_series(entries):
                     _MALFORMED_DAY.day, hour, tzinfo=UTC),
         DAY, percent, "api") for hour, percent in ((1, 10.0), (23, 20.0))]
     return qm.build_daily_series(qm.build_segments(snaps, []), entries,
-                                 now=NOW, newest_entry_at=NOW)
+                                 now=NOW, newest_entry_at=NOW, era=OPUS5)
 
 
 def _at_noon(**kw):
@@ -2648,7 +2676,7 @@ def test_the_forecast_aggregate_asserts_the_same_two_premises():
     # dropping the `raw_total <= 0.0` limb divides by zero here exactly as it
     # does there.
     negative = [_entry(fresh=1, cache_read=-1)]
-    assert qm.aggregate_composition(negative) is None
+    assert qm.aggregate_composition(negative, era=OPUS5) is None
     # A probed population the kernel cannot aggregate fails CLOSED, so this
     # pins the guard's reachable consequence rather than a fail-open that a
     # renderer would report as a healthy run.
@@ -2661,7 +2689,7 @@ def test_the_forecast_aggregate_asserts_the_same_two_premises():
     # component compares false, so `is_supported` returns True against any
     # centre and the support test is defeated rather than tripped.
     overflowing = [_entry(cache_read=int(1e308)) for _ in range(2)]
-    assert qm.aggregate_composition(overflowing) is None
+    assert qm.aggregate_composition(overflowing, era=OPUS5) is None
 
 
 # --- section 40: the interface change and the remaining pins --------------
@@ -2672,12 +2700,12 @@ def test_the_forecast_population_is_a_required_keyword():
     # check must fail loudly.
     with pytest.raises(TypeError):
         qm.analyse(_spread(10e6, 12), now=NOW,
-                   newest_at=NOW - dt.timedelta(hours=1))
+                   newest_at=NOW - dt.timedelta(hours=1), era=OPUS5)
     # The two diagnostics keep their `None` defaults, because publishing a
     # null is the stated design and is visible on the wire.
     a = qm.analyse(_spread(10e6, 12), now=NOW,
                    newest_at=NOW - dt.timedelta(hours=1),
-                   forecast_population=())
+                   forecast_population=(), era=OPUS5)
     assert a.diagnostics["unattributedUnits"] is None
     assert a.diagnostics["inProgressDayExcluded"] is None
 
@@ -2903,7 +2931,7 @@ def test_a_forecast_population_the_kernel_cannot_aggregate_is_unsupported():
     # This is the week a new Claude family ships, which is the scenario
     # section 26 already had to be patched for once.
     unknown = [_entry(model="claude-vega-9", fresh=1_000_000)] * 50
-    assert qm.aggregate_composition(unknown) is None
+    assert qm.aggregate_composition(unknown, era=OPUS5) is None
     a = _analyse(_spread(10e6, 12), forecast_population=unknown)
     assert a.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
     assert a.verdict is qm.Verdict.WITHHELD
@@ -2950,7 +2978,7 @@ FR = qm.effective_radius(
     float(qm.MIX_SUPPORT["family_tv_floor"]))
 CR = qm.effective_radius(
     qm.support_radius([o.class_shares for o in REF_DAYS], CC),
-    qm.token_class_floor(CC))
+    qm.token_class_floor(CC, era=OPUS5))
 
 #: A day inside BOTH radii, and a day outside the class radius only — the
 #: shape section 2.1 measured on the live store, where every decisive watch
@@ -3271,3 +3299,278 @@ def test_a_non_withheld_verdict_refuses():
     for verdict in (qm.Verdict.RATE_CHANGE_DETECTED, qm.Verdict.NO_RATE_CHANGE):
         assert qm.transition_persistence_permitted(dataclasses.replace(
             _permitted_analysis(), verdict=verdict)) is False
+
+
+# ==========================================================================
+# #978 — the Claude 5.5 families and the date-keyed coefficient era
+#
+# Spec: docs/superpowers/specs/2026-10-20-978-opus55-quota-kernel.md. Every
+# expected number below is a literal worked by hand from the spec's weights,
+# never recomputed through the kernel, so a path that weights with the wrong
+# era cannot agree with itself and pass.
+# ==========================================================================
+_FAMILIES_55 = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+
+#: A complete day inside the open `opus-5-5` era.
+_NEW_ERA_DAY = dt.datetime(2026, 9, 24, tzinfo=UTC)
+
+
+def _era(era_id):
+    return qm.era_by_id(era_id)
+
+
+def _new_era_entries(day):
+    """The three hand-worked 5.5 entries of RED test 2b, at hours 3-5.
+
+    Under the `opus-5-5` weights (fresh 1.0, output 0.64, cache_1h 1.0,
+    cache_read 0.0148):
+
+    * opus-5-5:   1000 + 200*0.64 + 50000*0.0148            = 1868.0
+    * sonnet-5-5: (4000 + 1500) + 1000*0.64 + 500*1.0       = 6640.0
+    * haiku-5-5:  3000*0.64 + 100000*0.0148                 = 3400.0
+    """
+    return [
+        qm.EntryRecord(at=day.replace(hour=3), model="claude-opus-5-5",
+                       fresh=1000, output=200, cache_create_total=0,
+                       cache_1h=0, cache_read=50000),
+        qm.EntryRecord(at=day.replace(hour=4), model="claude-sonnet-5-5",
+                       fresh=4000, output=1000, cache_create_total=2000,
+                       cache_1h=500, cache_read=0),
+        qm.EntryRecord(at=day.replace(hour=5), model="claude-haiku-5-5",
+                       fresh=0, output=3000, cache_create_total=0,
+                       cache_1h=None, cache_read=100000),
+    ]
+
+
+def _one_day_segments(day, first_hour=1, last_hour=23):
+    return qm.build_segments(
+        [qm.SnapshotRecord(day.replace(hour=first_hour), day, 10.0, "api"),
+         qm.SnapshotRecord(day.replace(hour=last_hour), day, 30.0, "api")],
+        [])
+
+
+def test_55_families_normalise_to_themselves_with_general_participation():
+    # RED test 1. Mutation: dropping a 5.5 family from the catalogue, which
+    # withholds every day carrying it as `unsupported-composition`.
+    for name in _FAMILIES_55:
+        spelled = "Anthropic/" + name.upper() + "-20260922"
+        assert qm.normalize_family(spelled) == name
+        assert qm.normalize_family(name) == name
+        assert qm.family_participation(name) == "general"
+        assert "operator-supplied in #978" in qm.FAMILY_PROVENANCE[name]
+
+
+def test_completed_55_only_day_is_not_unsupported_composition():
+    obs = qm.build_daily_series(
+        _one_day_segments(_NEW_ERA_DAY), _new_era_entries(_NEW_ERA_DAY),
+        now=_NEW_ERA_DAY + dt.timedelta(days=2),
+        newest_entry_at=_NEW_ERA_DAY + dt.timedelta(days=2),
+        era=_era("opus-5-5"))
+    assert [o.cause for o in obs] == [None]
+    assert qm.WithholdingCause.UNSUPPORTED_COMPOSITION not in {
+        o.cause for o in obs}
+
+
+def test_era_boundary_is_half_open_and_requires_aware():
+    # Mutations: the boundary made inclusive on the wrong side, or shifted.
+    assert qm.era_for_instant(
+        dt.datetime(2026, 9, 21, 23, 59, 59, 999999, tzinfo=UTC)).id == "opus-5"
+    assert qm.era_for_instant(
+        dt.datetime(2026, 9, 22, 0, 0, 0, tzinfo=UTC)).id == "opus-5-5"
+    assert qm.era_for_instant(
+        dt.datetime(2026, 7, 24, 23, 59, 59, tzinfo=UTC)) is None
+    assert qm.era_for_instant(
+        dt.datetime(2026, 7, 25, 0, 0, 0, tzinfo=UTC)).id == "opus-5"
+    with pytest.raises(ValueError):
+        qm.era_for_instant(dt.datetime(2026, 9, 22, 0, 0, 0))
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-5", "claude-opus-5-5"])
+def test_entry_weight_changes_at_the_boundary(model):
+    # RED test 2. A non-fresh vector of 1,000 tokens per class:
+    #   opus-5:   1000 + 4730 + 1030 + 3.1  = 6763.1
+    #   opus-5-5: 1000 +  640 + 1000 + 14.8 = 2654.8
+    # Mutation: selecting the era by model name rather than by instant.
+    def at(instant):
+        return qm.EntryRecord(at=instant, model=model, fresh=1000,
+                              output=1000, cache_create_total=1000,
+                              cache_1h=1000, cache_read=1000)
+    before = at(dt.datetime(2026, 9, 21, 23, 59, 59, tzinfo=UTC))
+    after = at(dt.datetime(2026, 9, 22, 0, 0, 0, tzinfo=UTC))
+    assert qm.weighted_units(before) == pytest.approx(6763.1, abs=1e-9)
+    assert qm.weighted_units(after) == pytest.approx(2654.8, abs=1e-9)
+
+
+def test_era_unavailable_is_distinct_from_split_unknown():
+    uncovered = _entry(at=dt.datetime(2026, 7, 1, tzinfo=UTC), fresh=10)
+    assert qm.weigh_entry(uncovered).cause == "unvalidated-coefficient-era"
+    assert qm.weigh_entry(uncovered).units is None
+    split = _entry(cache_1h=None, cache_create_total=5)
+    assert qm.weigh_entry(split).cause == "token-split-unknown"
+    assert qm.weigh_entry(split).units is None
+    in_new = _entry(at=dt.datetime(2026, 9, 23, tzinfo=UTC), fresh=10)
+    assert qm.weigh_entry(in_new, _era("opus-5")).cause == \
+        "unvalidated-coefficient-era"
+    assert qm.weigh_entry(in_new).cause is None
+
+
+def test_new_era_aggregates_match_hand_arithmetic():
+    # RED test 2b. Every path that turns raw class quantities into units must
+    # weight with the selected era, so a correct `weighted_units` alone
+    # proves nothing about the fitted days or the family shares.
+    era = _era("opus-5-5")
+    entries = _new_era_entries(_NEW_ERA_DAY)
+    [obs] = qm.build_daily_series(
+        _one_day_segments(_NEW_ERA_DAY), entries,
+        now=_NEW_ERA_DAY + dt.timedelta(days=2),
+        newest_entry_at=_NEW_ERA_DAY + dt.timedelta(days=2), era=era)
+    assert obs.cause is None
+    assert obs.units == pytest.approx(11908.0, abs=1e-9)
+    raw_classes = {"fresh": 6500 / 161200, "output": 4200 / 161200,
+                   "cache_1h": 500 / 161200, "cache_read": 150000 / 161200}
+    family = {"claude-opus-5-5": 1868 / 11908,
+              "claude-sonnet-5-5": 6640 / 11908,
+              "claude-haiku-5-5": 3400 / 11908}
+    assert obs.class_shares == pytest.approx(raw_classes, abs=1e-12)
+    assert obs.family_shares == pytest.approx(family, abs=1e-12)
+
+    family_shares, class_shares = qm.aggregate_composition(entries, era=era)
+    assert family_shares == pytest.approx(family, abs=1e-12)
+    assert class_shares == pytest.approx(raw_classes, abs=1e-12)
+
+    # The same entries, before the day's first reading, are attributed to no
+    # observation and are reported at the same weighted total.
+    outside = qm.unattributed_units(
+        _one_day_segments(_NEW_ERA_DAY, first_hour=10), entries,
+        now=_NEW_ERA_DAY + dt.timedelta(days=2), era=era)
+    assert outside["units"] == pytest.approx(11908.0, abs=1e-9)
+    assert outside["entries"] == 3
+
+
+#: Twelve day mixes as (opus-5-5, sonnet-5-5, haiku-5-5) entry counts. Their
+#: units are 5268, 3400, 6640, 3736, 6800, 8508, 3400, 7136, 10040, 10200,
+#: 7472 and 3400, which total exactly 76,000: 76 points at 1,000 units each.
+_KNOWN_BUDGET_MIXES = ((1, 0, 1), (0, 0, 1), (0, 1, 0), (2, 0, 0), (0, 0, 2),
+                       (1, 1, 0), (0, 0, 1), (2, 0, 1), (0, 1, 1), (0, 0, 3),
+                       (4, 0, 0), (0, 0, 1))
+_KNOWN_DAY_UNITS = (5268.0, 3400.0, 6640.0, 3736.0, 6800.0, 8508.0, 3400.0,
+                    7136.0, 10040.0, 10200.0, 7472.0, 3400.0)
+_KNOWN_BUDGET = 1000.0
+
+
+def _known_budget_store(start):
+    """Twelve complete days from `start`, built the way `_meter_store` builds
+    its steady fixture: one week anchor, readings at 01:00 and 23:00.
+
+    The meter starts at 5.0 and rises by each day's literal units divided by
+    `_KNOWN_BUDGET`, so the readings themselves do not depend on the era the
+    entries are later weighted with.
+    """
+    shapes = _new_era_entries(start)
+    snaps, entries = [], []
+    cumulative = 0.0
+    for k, counts in enumerate(_KNOWN_BUDGET_MIXES):
+        day = start + dt.timedelta(days=k)
+        snaps.append(qm.SnapshotRecord(
+            day.replace(hour=1), start, 5.0 + cumulative / _KNOWN_BUDGET,
+            "api"))
+        cumulative += _KNOWN_DAY_UNITS[k]
+        snaps.append(qm.SnapshotRecord(
+            day.replace(hour=23), start, 5.0 + cumulative / _KNOWN_BUDGET,
+            "api"))
+        hour = 3
+        for shape, count in zip(shapes, counts):
+            for _ in range(count):
+                entries.append(dataclasses.replace(
+                    shape, at=day.replace(hour=hour)))
+                hour += 1
+    return qm.build_segments(snaps, []), entries
+
+
+def _known_budget_analysis(start, era):
+    segs, entries = _known_budget_store(start)
+    end = start + dt.timedelta(days=len(_KNOWN_BUDGET_MIXES) + 1)
+    series = qm.build_daily_series(segs, entries, now=end,
+                                   newest_entry_at=end, era=era)
+    return series, qm.analyse(series, now=end, newest_at=end,
+                              forecast_population=(), era=era)
+
+
+def test_new_era_fit_recovers_known_budget():
+    # The day units are the literals above, not a kernel recomputation.
+    series, analysis = _known_budget_analysis(
+        dt.datetime(2026, 9, 23, tzinfo=UTC), _era("opus-5-5"))
+    assert [o.units for o in series] == pytest.approx(
+        list(_KNOWN_DAY_UNITS), abs=1e-9)
+    assert analysis.status is qm.CalibrationStatus.OK
+    assert analysis.fitted.value == pytest.approx(_KNOWN_BUDGET, rel=0.01)
+
+    # Non-vacuity: the same readings with the entries weighted under the
+    # Opus 5 coefficients move the estimate far outside the tolerance.
+    old_series, old = _known_budget_analysis(
+        dt.datetime(2026, 8, 1, tzinfo=UTC), _era("opus-5"))
+    eligible = [o for o in old_series if o.cause is None]
+    old_point = (sum(o.units for o in eligible)
+                 / sum(o.meter_delta for o in eligible))
+    assert abs(old_point - _KNOWN_BUDGET) / _KNOWN_BUDGET > 0.10
+    assert old.fitted.value is None or \
+        abs(old.fitted.value - _KNOWN_BUDGET) / _KNOWN_BUDGET > 0.10
+
+
+def test_population_functions_refuse_out_of_era_entries():
+    era = _era("opus-5-5")
+    stray = qm.EntryRecord(at=dt.datetime(2026, 9, 21, 12, tzinfo=UTC),
+                           model="claude-opus-5", fresh=10, output=0,
+                           cache_create_total=0, cache_1h=0, cache_read=0)
+    segs = _one_day_segments(_NEW_ERA_DAY)
+    later = _NEW_ERA_DAY + dt.timedelta(days=2)
+    with pytest.raises(qm.CoefficientEraMismatch):
+        qm.build_daily_series(segs, [stray], now=later,
+                              newest_entry_at=later, era=era)
+    with pytest.raises(qm.CoefficientEraMismatch):
+        qm.unattributed_units(segs, [stray], now=later, era=era)
+    with pytest.raises(qm.CoefficientEraMismatch):
+        qm.aggregate_composition([stray], era=era)
+
+
+def test_token_class_floor_per_era():
+    # Spec section 4.4: 0.05 / (4.73 - 0.0031) and 0.05 / (1.0 - 0.0148).
+    centre = {"fresh": 1.0, "output": 0.0, "cache_1h": 0.0, "cache_read": 0.0}
+    assert qm.token_class_floor(centre, era=_era("opus-5")) == \
+        0.01057775709238613
+    assert qm.token_class_floor(centre, era=_era("opus-5-5")) == \
+        pytest.approx(0.050751116524563544, rel=1e-12)
+
+
+def test_constants_payload_carries_the_era_table():
+    payload = qm.constants_payload()
+    assert payload["coefficientEras"] == [
+        {
+            "id": "opus-5",
+            "from": "2026-07-25",
+            "until": "2026-09-22",
+            "tokenClassWeights": {"fresh": 1.0, "output": 4.73,
+                                  "cache_1h": 1.03, "cache_read": 0.0031},
+            "fastModeParticipation": "usage-credits-only-excluded",
+            "provenance": ('The Opus 5 calibration, docs/quota-model.md '
+                           '"The finding"'),
+        },
+        {
+            "id": "opus-5-5",
+            "from": "2026-09-22",
+            "until": None,
+            "tokenClassWeights": {"fresh": 1.0, "output": 0.64,
+                                  "cache_1h": 1.0, "cache_read": 0.0148},
+            "fastModeParticipation": "usage-credits-only-excluded",
+            "provenance": ("The 2026-10-18 Opus 5.5 refit; output weakly "
+                           "identified (95% CI 0.23–1.13), cache read "
+                           "sharp (0.0128–0.0168)"),
+        },
+    ]
+    # No mutable current weight set survives anywhere.
+    assert "tokenClassWeights" not in payload
+    assert "coefficientSupport" not in payload
+    assert not hasattr(qm, "TOKEN_CLASS_WEIGHTS")
+    assert not hasattr(qm, "COEFFICIENT_SUPPORT")
+    assert payload["algorithmRevision"] == 4
+    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 4

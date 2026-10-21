@@ -1,0 +1,13 @@
+diff --git a/bin/_lib_conversation_retention.py b/bin/_lib_conversation_retention.py
+index a5308ba..3ebec31 100644
+--- a/bin/_lib_conversation_retention.py
++++ b/bin/_lib_conversation_retention.py
+@@ -107,7 +107,7 @@ RESERVATION_VERSION = 2
+ DELETION_FIXED_BYTES = 512 * KiB
+ #: A: per deleted row, and above `DELETION_FALLBACK_ROW_THRESHOLD` (Q5).
+ DELETION_PER_ROW_BYTES = 15 * KiB
+-DELETION_PER_ROW_FALLBACK_BYTES = 50 * KiB
++DELETION_PER_ROW_FALLBACK_BYTES = 1 * KiB  # A5s non-vacuity: under-charged
+ #: B = ceil(5/4 x (2P + 24) / 1 KiB) KiB per pointer-map page of M_cap, from
+ #: the store's own page size (11 KiB at 4 KiB pages).
+ POINTER_MAP_FACTOR_NUMERATOR = 5

@@ -28,6 +28,10 @@
 #                               Suppressed when NO_PYTHON=1.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 # Dev-instance isolation: force prod data-dir layout under fake HOME.
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_lib-harness-env.sh"
@@ -47,7 +51,7 @@ if [ -z "$NODE_BIN" ]; then
     exit 1
 fi
 
-SCRATCH_DIR=$(mktemp -d -t cctally-npm-shim-XXXXXX)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-npm-shim-XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 
 pass_count=0
@@ -141,6 +145,7 @@ EOF
     else
         child_path="$work/PATH:/usr/bin:/bin"
     fi
+    # retention-control: production-behavior -- runs the copied npm package's shim, deliberately packaged code (spec I8); env -i only makes its python3 lookup hermetic, and the #965 switch is deliberately absent.
     env -i \
         HOME="$HOME" \
         PATH="$child_path" \

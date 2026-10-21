@@ -21,7 +21,7 @@ import threading
 
 import pytest
 from _fts5_gate import require_fts5  # the ONE FTS5 capability gate (#630 S6)
-from conftest import load_script, redirect_paths_without_conversation_retention
+from conftest import load_script, redirect_paths
 
 
 def _asst_line(uuid, msg_id, req_id, text, *, sid="s1",
@@ -48,7 +48,7 @@ def _ai_title_line(sid, title):
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     conn = ns["open_conversations_db"]()

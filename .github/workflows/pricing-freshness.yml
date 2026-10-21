@@ -64,13 +64,14 @@ jobs:
             exit "$rc"
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "$OUT" > /tmp/pricing.json
+          # The job's own temp directory, never a host-wide /tmp (#940).
+          printf '%s\n' "$OUT" > "${RUNNER_TEMP:?}/pricing.json"
 
       - name: Manage the pricing-drift issue
         id: manage
         run: |
           export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
-          python3 .github/scripts/pricing_issue.py /tmp/pricing.json
+          python3 .github/scripts/pricing_issue.py "${RUNNER_TEMP:?}/pricing.json"
 
       # A run whose check failed before the issue manager ran created no
       # issue, and records exactly that, so no finished run lacks a result.

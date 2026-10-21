@@ -510,17 +510,32 @@ def _count_scoped(conn, table: str, account_key: str) -> int:
         return 0
 
 
+def _stats_index_not_current():
+    import _cctally_store
+    return _cctally_store.StatsIndexNotCurrent
+
+
 def _cmd_account_label(args: argparse.Namespace) -> int:
     ref = getattr(args, "ref", None)
     label = getattr(args, "label", None)
     conn = _cctally_core.open_db()
     try:
-        key = _resolve_ref_or_exit(conn, ref)
-        if key is None:
+        # #825/#832 spec 6: the reference and provider serialized into the op
+        # come from one snapshot proven to be the current interpretation.
+        try:
+            import _cctally_store
+            with _cctally_store.current_stats_snapshot(conn):
+                key = _resolve_ref_or_exit(conn, ref)
+                if key is None:
+                    return 2
+                provider_row = conn.execute(
+                    "SELECT provider FROM accounts WHERE account_key = ?",
+                    (key,)
+                ).fetchone()
+        except _stats_index_not_current() as exc:
+            eprint(f"account label: {exc}; another cctally process is "
+                   "republishing the stats index — restart it and retry")
             return 2
-        provider_row = conn.execute(
-            "SELECT provider FROM accounts WHERE account_key = ?", (key,)
-        ).fetchone()
         provider = provider_row[0] if provider_row is not None else None
     finally:
         conn.close()
@@ -1390,9 +1405,18 @@ def _cmd_account_attribute(args: argparse.Namespace) -> int:
                 "the range is half-open [since, until)")
         conn = _cctally_core.open_db()
         try:
-            account_key = _attribute_resolve_account(
-                conn, getattr(args, "ref", None))
-            label = display_account_label(conn, account_key)
+            # #825/#832 spec 6: resolved on one validated current snapshot.
+            try:
+                import _cctally_store
+                with _cctally_store.current_stats_snapshot(conn):
+                    account_key = _attribute_resolve_account(
+                        conn, getattr(args, "ref", None))
+                    label = display_account_label(conn, account_key)
+            except _stats_index_not_current() as exc:
+                raise _AttributeUsage(
+                    f"account attribute: {exc}; another cctally process is "
+                    "republishing the stats index — restart it and retry"
+                ) from exc
         finally:
             conn.close()
     except _AttributeUsage as exc:

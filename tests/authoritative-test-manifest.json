@@ -248,7 +248,7 @@
     {
       "name": "quota",
       "visibility": "public",
-      "minCases": 17,
+      "minCases": 21,
       "countPolicy": "fixed"
     },
     {

@@ -115,6 +115,16 @@ SCENARIOS = {
     "38-codex-hooks-config-unparseable":       "codex_hooks_config_unparseable",
     "39-codex-hooks-liveness-stale-multi-account":
         "codex_hooks_liveness_stale_multi_account",
+    # #825/#832 (spec section 8, F9, F16): every other scenario carries no
+    # current account-bound index, so `accounting.outcome_quarantine` reads
+    # "unavailable" and `journal.legacy_writer` "unavailable" everywhere. These
+    # two build a current, validated epoch-1018 store through the real bound
+    # recording kernel: one with no legacy write (both legs OK) and one where
+    # an older process wrote a reading after the cutover (both legs WARN, the
+    # quarantine row in the approved accounting wording plus the control
+    # sentence).
+    "40-account-bound-clear":       "account_bound_clear",
+    "41-account-bound-legacy-write": "account_bound_legacy_write",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -226,6 +236,19 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
+    if slug in ("account_bound_clear", "account_bound_legacy_write"):
+        variant = slug[len("account_bound_"):]
+        return textwrap.dedent("""\
+            for name in {USER_FACING_WRAPPERS}; do
+                ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
+            done
+            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
+            write_oauth_credentials
+            # A current account-bound store, built by the real bound recording
+            # kernel under pinned clocks (see `_emit_account_bound`).
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-account-bound VARIANT \\
+                "$HARNESS_FAKE_HOME"
+            """).replace("VARIANT", variant)
     if slug == "hooks_missing":
         return textwrap.dedent("""\
             echo '{"hooks":{}}' > "$HARNESS_FAKE_HOME/.claude/settings.json"
@@ -338,9 +361,13 @@ def _scenario_body(slug: str) -> str:
         # A valid inflight 7d tombstone is an intentional crash-recovery
         # signal.  Keep the clean all_ok baseline so the generated golden
         # proves the new statusline pipeline check is the only added WARN.
+        # #825/#832 section 7: the current fence is per exact account and
+        # window under the account-bound root; a far-future week keeps the
+        # window live whatever CCTALLY_AS_OF the harness pins.
         return _scenario_body("all_ok") + textwrap.dedent("""\
-            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-authoritative-7d.json" <<'JSON'
-            {"schemaVersion":1,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
+            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones"
+            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones/sevenDay-4102444800.json" <<'JSON'
+            {"schemaVersion":1,"protocolGeneration":"account-bound-v1","accountKey":"unattributed","canonicalWindowKey":4102444800,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
             JSON
         """)
     if slug in (
@@ -666,6 +693,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
     p.add_argument("--emit-codex-cache", action="store_true")
+    p.add_argument("--emit-account-bound", choices=["clear", "legacy_write"])
     p.add_argument("--emit-codex-null-anchor", action="store_true")
     p.add_argument("--emit-pricing-cache", action="store_true")
     p.add_argument("--emit-empty-codex-project-metadata", action="store_true")
@@ -693,6 +721,9 @@ def main():
 
     if args.emit_snapshot and args.path:
         _emit_snapshot(args.emit_snapshot, pathlib.Path(args.path))
+        return
+    if args.emit_account_bound and args.path:
+        _emit_account_bound(args.emit_account_bound, pathlib.Path(args.path))
         return
     if args.emit_codex_cache and args.path:
         _emit_codex_cache(pathlib.Path(args.path))
@@ -840,6 +871,119 @@ def _emit_retention(slug: str, app_dir) -> None:
         "max_age_days": 1, "max_total_mib": 1, "min_free_mib": None,
     }
     config.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
+
+#: #825/#832: the pinned instants of the account-bound scenarios. The harness
+#: runs doctor at 2026-05-13T14:22:31Z; the last current reading is two
+#: seconds before it, so `freshness.latest_snapshot` stays fresh.
+_AB_FIRST_READING = "2026-05-13T14:00:00Z"
+_AB_LEGACY_WRITE = "2026-05-13T14:10:00Z"
+_AB_EVIDENCE_SEEN = "2026-05-13T14:20:00Z"
+_AB_LAST_READING = "2026-05-13T14:22:29Z"
+_AB_WEEK_RESET = "2026-05-16T00:00:00Z"
+
+
+def _emit_account_bound(variant: str, home: pathlib.Path) -> None:
+    """Build a current, validated epoch-1018 store under ``home`` through the
+    REAL bound recording kernel, deterministically.
+
+    Every clock the store records is pinned: `CCTALLY_AS_OF` with
+    `CCTALLY_TEST_PIN_CAPTURE` for the readings, and the journal's append,
+    op-time and legacy-writer-evidence clocks for the segment name, the
+    cutover op and `firstObservedAt`. ``legacy_write`` then appends the
+    previous release's unstamped reading after the cutover (paused before its
+    own ingest), and the next current reading's ingest excludes it — the
+    quarantine trigger and the excluded population the two legs report."""
+    import datetime as dt
+    import importlib.machinery
+    import importlib.util
+    import json
+    import os
+    import sys
+
+    def epoch(text):
+        return int(dt.datetime.fromisoformat(
+            text.replace("Z", "+00:00")).timestamp())
+
+    def pinned(text):
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+    os.environ["HOME"] = str(home)
+    os.environ.pop("CCTALLY_DATA_DIR", None)
+    os.environ["CCTALLY_DISABLE_DEV_AUTODETECT"] = "1"
+    os.environ["CCTALLY_DISABLE_TELEMETRY"] = "1"
+    os.environ["CCTALLY_TEST_PIN_CAPTURE"] = "1"
+    bin_dir = str(ENTRY_POINT.parent)
+    if bin_dir not in sys.path:
+        sys.path.insert(0, bin_dir)
+    loader = importlib.machinery.SourceFileLoader("cctally", str(ENTRY_POINT))
+    spec = importlib.util.spec_from_loader("cctally", loader)
+    cctally = importlib.util.module_from_spec(spec)
+    sys.modules["cctally"] = cctally
+    loader.exec_module(cctally)
+    import _cctally_core as core
+    core._init_paths_from_env()
+    import _cctally_journal as jr
+    import _cctally_statusline as sl
+    import _lib_journal as J
+    import argparse
+
+    clock = {"now": _AB_FIRST_READING}
+    jr._utc_now = lambda: pinned(clock["now"])
+    jr._now_iso = lambda: clock["now"]
+    jr._evidence_now = lambda: pinned(_AB_EVIDENCE_SEEN)
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "accountUuid": "doctor-fixture-account",
+        "emailAddress": "fixture@example.test"}}))
+
+    def record(at, weekly, five):
+        clock["now"] = at
+        os.environ["CCTALLY_AS_OF"] = at
+        args = argparse.Namespace(
+            percent=weekly, resets_at=str(epoch(_AB_WEEK_RESET)),
+            five_hour_percent=five,
+            five_hour_resets_at=str(epoch("2026-05-13T18:00:00Z")),
+            # Not `api`: a bound two-axis `api` reading is a control witness
+            # (spec 5.6 item 7), which would restore the control certificate
+            # and leave only the accounting half paused.
+            source="statusline")
+        rc = cctally.record_usage_bound(
+            args, binding=sl._capture_binding(), nudge_dashboard=False)
+        if rc != 0:
+            raise SystemExit(f"record_usage_bound exited {rc}")
+
+    record(_AB_FIRST_READING, 1.0, 2.0)
+    if variant == "legacy_write":
+        clock["now"] = _AB_LEGACY_WRITE
+        legacy = J.unstamped_record(J.make_obs(
+            at=_AB_LEGACY_WRITE, src="record-usage", provider="claude",
+            payload={"weekly_percent": 1.5,
+                     "resets_at": epoch(_AB_WEEK_RESET),
+                     "source": "record-usage",
+                     "captured_at": _AB_LEGACY_WRITE}))
+        segment = jr.list_segments()[-1]
+        with open(core.JOURNAL_DIR / segment, "ab") as fh:
+            fh.write(J.encode_line(legacy))
+    record(_AB_LAST_READING, 2.0, 3.0)
+    # The recordings' Claude cache sync stamps its parse-health record with the
+    # real wall clock (`_update_parse_health_meta`); doctor's verbose and JSON
+    # output show it, so pin it like every other recorded instant.
+    import sqlite3
+    cache = sqlite3.connect(core.APP_DIR / "cache.db")
+    try:
+        for key, value in cache.execute(
+                "SELECT key, value FROM cache_meta").fetchall():
+            try:
+                doc = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(doc, dict) and "last_write_at" in doc:
+                doc["last_write_at"] = doc["since"] = _AB_LAST_READING
+                cache.execute("UPDATE cache_meta SET value = ? WHERE key = ?",
+                              (json.dumps(doc, sort_keys=True), key))
+        cache.commit()
+    finally:
+        cache.close()
+
 
 def _emit_snapshot(slug: str, db_path: pathlib.Path) -> None:
     """Seed weekly_usage_snapshots with a single row at the expected age."""

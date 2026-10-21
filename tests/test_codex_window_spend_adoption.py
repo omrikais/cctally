@@ -324,110 +324,131 @@ def _apply(ns, cache, **kwargs):
 
 def test_the_glue_adopts_unattributed_entries_inside_a_named_window(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/quota.jsonl")
-    _seed_entry(cache, timestamp=CROSSING - dt.timedelta(minutes=10),
-                account_key=None, source_path="/s/a.jsonl", line_offset=10)
-    _seed_entry(cache, timestamp=CROSSING, account_key="",
-                source_path="/s/a.jsonl", line_offset=20)
-    # Outside the nominal window entirely.
-    _seed_entry(cache, timestamp=NOMINAL_START - dt.timedelta(hours=1),
-                account_key=None, source_path="/s/a.jsonl", line_offset=5)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/quota.jsonl")
+        _seed_entry(cache, timestamp=CROSSING - dt.timedelta(minutes=10),
+                    account_key=None, source_path="/s/a.jsonl", line_offset=10)
+        _seed_entry(cache, timestamp=CROSSING, account_key="",
+                    source_path="/s/a.jsonl", line_offset=20)
+        # Outside the nominal window entirely.
+        _seed_entry(cache, timestamp=NOMINAL_START - dt.timedelta(hours=1),
+                    account_key=None, source_path="/s/a.jsonl", line_offset=5)
+        cache.commit()
 
-    assert _apply(ns, cache) == 2
-    assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A, 3: None}
+        assert _apply(ns, cache) == 2
+        assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A, 3: None}
+    finally:
+        cache.close()
 
 
 def test_the_glue_is_idempotent(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/quota.jsonl")
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/quota.jsonl")
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache) == 1
-    before = _accounts(cache)
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == before
+        assert _apply(ns, cache) == 1
+        before = _accounts(cache)
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == before
+    finally:
+        cache.close()
 
 
 def test_the_glue_leaves_an_ambiguous_window_alone(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/a.jsonl")
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_B,
-                   source_path="/s/b.jsonl", line_offset=2)
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/a.jsonl")
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_B,
+                       source_path="/s/b.jsonl", line_offset=2)
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == {1: None}
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == {1: None}
+    finally:
+        cache.close()
 
 
 def test_the_glue_ignores_a_spark_pool_window(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, key=SPARK_KEY, captured=BLOCK_START,
-                   account_key=ACCT_A, source_path="/s/spark.jsonl",
-                   limit_name="gpt-5.3-codex-spark weekly",
-                   observed_model="gpt-5.3-codex-spark")
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, key=SPARK_KEY, captured=BLOCK_START,
+                       account_key=ACCT_A, source_path="/s/spark.jsonl",
+                       limit_name="gpt-5.3-codex-spark weekly",
+                       observed_model="gpt-5.3-codex-spark")
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == {1: None}
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == {1: None}
+    finally:
+        cache.close()
 
 
 def test_the_glue_ignores_a_five_hour_window(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, key=FIVE_HOUR_KEY, window=FIVE_HOUR,
-                   captured=BLOCK_START, reset=CROSSING + dt.timedelta(hours=1),
-                   account_key=ACCT_A, source_path="/s/5h.jsonl")
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, key=FIVE_HOUR_KEY, window=FIVE_HOUR,
+                       captured=BLOCK_START, reset=CROSSING + dt.timedelta(hours=1),
+                       account_key=ACCT_A, source_path="/s/5h.jsonl")
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == {1: None}
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == {1: None}
+    finally:
+        cache.close()
 
 
 def test_a_bounded_pass_only_visits_windows_touching_the_synced_entries(ns):
     """An ordinary hook-tick sync must not scan all history. The bound is the
     span of the entries (and window resets) this sync wrote."""
     cache = ns["open_cache_db"]()
-    old_reset = RESET - dt.timedelta(days=21)
-    _seed_snapshot(cache, captured=old_reset - dt.timedelta(days=6),
-                   reset=old_reset, account_key=ACCT_A,
-                   source_path="/s/old.jsonl")
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/new.jsonl")
-    _seed_entry(cache, timestamp=old_reset - dt.timedelta(days=1),
-                account_key=None, source_path="/s/old.jsonl", line_offset=10)
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/new.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        old_reset = RESET - dt.timedelta(days=21)
+        _seed_snapshot(cache, captured=old_reset - dt.timedelta(days=6),
+                       reset=old_reset, account_key=ACCT_A,
+                       source_path="/s/old.jsonl")
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/new.jsonl")
+        _seed_entry(cache, timestamp=old_reset - dt.timedelta(days=1),
+                    account_key=None, source_path="/s/old.jsonl", line_offset=10)
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/new.jsonl", line_offset=10)
+        cache.commit()
 
-    touched = {ROOT: (CROSSING, CROSSING)}
-    assert _apply(ns, cache, touched=touched) == 1
-    assert _accounts(cache) == {1: None, 2: ACCT_A}
-    # The unbounded pass then repairs the rest.
-    assert _apply(ns, cache) == 1
-    assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A}
+        touched = {ROOT: (CROSSING, CROSSING)}
+        assert _apply(ns, cache, touched=touched) == 1
+        assert _accounts(cache) == {1: None, 2: ACCT_A}
+        # The unbounded pass then repairs the rest.
+        assert _apply(ns, cache) == 1
+        assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A}
+    finally:
+        cache.close()
 
 
 def test_an_empty_touched_map_is_a_no_op(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/quota.jsonl")
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/quota.jsonl")
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache, touched={}) == 0
-    assert _accounts(cache) == {1: None}
+        assert _apply(ns, cache, touched={}) == 0
+        assert _accounts(cache) == {1: None}
+    finally:
+        cache.close()
 
 
 class _RefusesSQL:
@@ -449,37 +470,43 @@ def test_an_empty_touched_map_issues_no_sql_at_all(ns):
 
 def test_the_glue_adopts_a_row_carrying_the_literal_unattributed_sentinel(ns):
     cache = ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/quota.jsonl")
-    _seed_entry(cache, timestamp=CROSSING, account_key=UNATTRIBUTED,
-                source_path="/s/a.jsonl", line_offset=10)
-    cache.commit()
+    try:
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/quota.jsonl")
+        _seed_entry(cache, timestamp=CROSSING, account_key=UNATTRIBUTED,
+                    source_path="/s/a.jsonl", line_offset=10)
+        cache.commit()
 
-    assert _apply(ns, cache) == 1
-    assert _accounts(cache) == {1: ACCT_A}
+        assert _apply(ns, cache) == 1
+        assert _accounts(cache) == {1: ACCT_A}
+    finally:
+        cache.close()
 
 
 def test_the_glue_adopts_under_realistic_window_density(ns):
     """One identified window overlapped by several unidentified ones — the shape
     every real root is in, and the one a one- or two-window fixture hides."""
     cache = ns["open_cache_db"]()
-    for index, delta in enumerate((dt.timedelta(hours=25), dt.timedelta(days=2),
-                                   dt.timedelta(days=3))):
-        _seed_snapshot(cache, captured=BLOCK_START - delta, reset=RESET - delta,
-                       account_key=None, source_path=f"/s/old{index}.jsonl")
-    _seed_snapshot(cache, captured=BLOCK_START + dt.timedelta(minutes=84),
-                   reset=RESET + dt.timedelta(minutes=84), account_key=None,
-                   source_path="/s/drift.jsonl")
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/named.jsonl")
-    _seed_entry(cache, timestamp=CROSSING, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    _seed_entry(cache, timestamp=NOMINAL_START + dt.timedelta(days=4),
-                account_key=None, source_path="/s/a.jsonl", line_offset=20)
-    cache.commit()
+    try:
+        for index, delta in enumerate((dt.timedelta(hours=25), dt.timedelta(days=2),
+                                       dt.timedelta(days=3))):
+            _seed_snapshot(cache, captured=BLOCK_START - delta, reset=RESET - delta,
+                           account_key=None, source_path=f"/s/old{index}.jsonl")
+        _seed_snapshot(cache, captured=BLOCK_START + dt.timedelta(minutes=84),
+                       reset=RESET + dt.timedelta(minutes=84), account_key=None,
+                       source_path="/s/drift.jsonl")
+        _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                       source_path="/s/named.jsonl")
+        _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        _seed_entry(cache, timestamp=NOMINAL_START + dt.timedelta(days=4),
+                    account_key=None, source_path="/s/a.jsonl", line_offset=20)
+        cache.commit()
 
-    assert _apply(ns, cache) == 2
-    assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A}
+        assert _apply(ns, cache) == 2
+        assert _accounts(cache) == {1: ACCT_A, 2: ACCT_A}
+    finally:
+        cache.close()
 
 
 def test_a_bounded_pass_never_stamps_what_the_full_pass_would_refuse(ns):
@@ -492,27 +519,30 @@ def test_a_bounded_pass_never_stamps_what_the_full_pass_would_refuse(ns):
     claiming the row and stamps a conflict away.
     """
     cache = ns["open_cache_db"]()
-    touched_at = CROSSING
-    near, far = (touched_at + dt.timedelta(hours=1),
-                 touched_at - dt.timedelta(hours=1))
-    _seed_snapshot(cache, captured=touched_at, reset=near, account_key=ACCT_A,
-                   source_path="/s/near.jsonl")
-    _seed_snapshot(cache, captured=touched_at, reset=far, account_key=ACCT_B,
-                   source_path="/s/far.jsonl")
-    # Claimed by `near` only: one identified account, so it is adopted.
-    _seed_entry(cache, timestamp=touched_at, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    # Claimed by BOTH, which name different accounts: genuinely ambiguous.
-    _seed_entry(cache, timestamp=touched_at - dt.timedelta(hours=2),
-                account_key=None, source_path="/s/a.jsonl", line_offset=20)
-    cache.commit()
+    try:
+        touched_at = CROSSING
+        near, far = (touched_at + dt.timedelta(hours=1),
+                     touched_at - dt.timedelta(hours=1))
+        _seed_snapshot(cache, captured=touched_at, reset=near, account_key=ACCT_A,
+                       source_path="/s/near.jsonl")
+        _seed_snapshot(cache, captured=touched_at, reset=far, account_key=ACCT_B,
+                       source_path="/s/far.jsonl")
+        # Claimed by `near` only: one identified account, so it is adopted.
+        _seed_entry(cache, timestamp=touched_at, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        # Claimed by BOTH, which name different accounts: genuinely ambiguous.
+        _seed_entry(cache, timestamp=touched_at - dt.timedelta(hours=2),
+                    account_key=None, source_path="/s/a.jsonl", line_offset=20)
+        cache.commit()
 
-    assert _apply(ns, cache, touched={ROOT: (touched_at, touched_at)}) == 1
-    bounded = _accounts(cache)
-    assert bounded == {1: ACCT_A, 2: None}
-    # The full pass reaches exactly the same verdict, and adds nothing.
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == bounded
+        assert _apply(ns, cache, touched={ROOT: (touched_at, touched_at)}) == 1
+        bounded = _accounts(cache)
+        assert bounded == {1: ACCT_A, 2: None}
+        # The full pass reaches exactly the same verdict, and adds nothing.
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == bounded
+    finally:
+        cache.close()
 
 
 def test_a_bounded_pass_never_scans_past_the_windows_it_loaded(ns):
@@ -523,25 +553,28 @@ def test_a_bounded_pass_never_scans_past_the_windows_it_loaded(ns):
     water mark rather than at the union of the loaded window ranges.
     """
     cache = ns["open_cache_db"]()
-    touched_at = CROSSING
-    _seed_snapshot(cache, captured=touched_at,
-                   reset=touched_at + dt.timedelta(days=5), account_key=ACCT_A,
-                   source_path="/s/top.jsonl")
-    _seed_snapshot(cache, captured=touched_at,
-                   reset=touched_at + dt.timedelta(days=8), account_key=ACCT_B,
-                   source_path="/s/hidden.jsonl")
-    _seed_entry(cache, timestamp=touched_at, account_key=None,
-                source_path="/s/a.jsonl", line_offset=10)
-    _seed_entry(cache, timestamp=touched_at + dt.timedelta(days=4),
-                account_key=None, source_path="/s/a.jsonl", line_offset=20)
-    cache.commit()
+    try:
+        touched_at = CROSSING
+        _seed_snapshot(cache, captured=touched_at,
+                       reset=touched_at + dt.timedelta(days=5), account_key=ACCT_A,
+                       source_path="/s/top.jsonl")
+        _seed_snapshot(cache, captured=touched_at,
+                       reset=touched_at + dt.timedelta(days=8), account_key=ACCT_B,
+                       source_path="/s/hidden.jsonl")
+        _seed_entry(cache, timestamp=touched_at, account_key=None,
+                    source_path="/s/a.jsonl", line_offset=10)
+        _seed_entry(cache, timestamp=touched_at + dt.timedelta(days=4),
+                    account_key=None, source_path="/s/a.jsonl", line_offset=20)
+        cache.commit()
 
-    assert _apply(ns, cache, touched={ROOT: (touched_at, touched_at)}) == 1
-    assert _accounts(cache) == {1: ACCT_A, 2: None}
-    # And the full pass agrees: the second row is claimed by two windows naming
-    # different accounts, so it stays nobody's.
-    assert _apply(ns, cache) == 0
-    assert _accounts(cache) == {1: ACCT_A, 2: None}
+        assert _apply(ns, cache, touched={ROOT: (touched_at, touched_at)}) == 1
+        assert _accounts(cache) == {1: ACCT_A, 2: None}
+        # And the full pass agrees: the second row is claimed by two windows naming
+        # different accounts, so it stays nobody's.
+        assert _apply(ns, cache) == 0
+        assert _accounts(cache) == {1: ACCT_A, 2: None}
+    finally:
+        cache.close()
 
 
 # --------------------------------------------------------------------------
@@ -572,46 +605,53 @@ def test_the_ladder_segment_reports_the_spend_behind_its_own_crossing(ns):
     from _lib_quota import QuotaWindowIdentity
     import _cctally_quota as quota_mod
 
-    stats, cache = ns["open_db"](), ns["open_cache_db"]()
-    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
-                   source_path="/s/quota.jsonl")
-    for index in range(3):
-        _seed_entry(
-            cache,
-            timestamp=BLOCK_START + dt.timedelta(minutes=10 * (index + 1)),
-            account_key=None, source_path="/s/rollout.jsonl",
-            line_offset=100 + index, total_tokens=250_000)
-    cache.commit()
-    _seed_milestone(stats, percent=1, captured=CROSSING, account_key=ACCT_A,
-                    source_path="/s/rollout.jsonl", line_offset=900)
+    stats = ns["open_db"]()
+    try:
+        cache = ns["open_cache_db"]()
+        try:
+            _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                           source_path="/s/quota.jsonl")
+            for index in range(3):
+                _seed_entry(
+                    cache,
+                    timestamp=BLOCK_START + dt.timedelta(minutes=10 * (index + 1)),
+                    account_key=None, source_path="/s/rollout.jsonl",
+                    line_offset=100 + index, total_tokens=250_000)
+            cache.commit()
+            _seed_milestone(stats, percent=1, captured=CROSSING, account_key=ACCT_A,
+                            source_path="/s/rollout.jsonl", line_offset=900)
 
-    identity = QuotaWindowIdentity(
-        source="codex", source_root_key=ROOT, logical_limit_key=WEEK_KEY,
-        observed_slot="primary", window_minutes=WEEK, account_key=ACCT_A,
-    )
+            identity = QuotaWindowIdentity(
+                source="codex", source_root_key=ROOT, logical_limit_key=WEEK_KEY,
+                observed_slot="primary", window_minutes=WEEK, account_key=ACCT_A,
+            )
 
-    before = quota_mod.codex_quota_breakdown(
-        identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
-        account_key=ACCT_A)
-    assert len(before) == 1, "precondition: the durable ladder has one crossing"
-    assert before[0].cost_usd == 0.0, (
-        "precondition: the segment's spend is invisible to its own account")
+            before = quota_mod.codex_quota_breakdown(
+                identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
+                account_key=ACCT_A)
+            assert len(before) == 1, "precondition: the durable ladder has one crossing"
+            assert before[0].cost_usd == 0.0, (
+                "precondition: the segment's spend is invisible to its own account")
 
-    assert _apply(ns, cache) == 3
+            assert _apply(ns, cache) == 3
 
-    after = quota_mod.codex_quota_breakdown(
-        identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
-        account_key=ACCT_A)
-    assert len(after) == 1
-    assert after[0].total_tokens == 750_000
-    assert after[0].cost_usd > 0.0
-    assert after[0].marginal_cost_usd == pytest.approx(after[0].cost_usd)
+            after = quota_mod.codex_quota_breakdown(
+                identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
+                account_key=ACCT_A)
+            assert len(after) == 1
+            assert after[0].total_tokens == 750_000
+            assert after[0].cost_usd > 0.0
+            assert after[0].marginal_cost_usd == pytest.approx(after[0].cost_usd)
 
-    # The dollars left the unattributed bucket rather than being duplicated.
-    unattributed = quota_mod.codex_quota_breakdown(
-        identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
-        account_key=UNATTRIBUTED)
-    assert unattributed == ()
+            # The dollars left the unattributed bucket rather than being duplicated.
+            unattributed = quota_mod.codex_quota_breakdown(
+                identity, RESET, speed="standard", cache_conn=cache, stats_conn=stats,
+                account_key=UNATTRIBUTED)
+            assert unattributed == ()
+        finally:
+            cache.close()
+    finally:
+        stats.close()
 
 
 # --------------------------------------------------------------------------

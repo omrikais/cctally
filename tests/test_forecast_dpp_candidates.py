@@ -173,6 +173,7 @@ def _regime(ns, *, effective_from, effective_until=None):
         class_shares={"output": 1.0},
         family_radius=0.2,
         class_radius=0.2,
+        coefficient_era="opus-5",
     )
 
 
@@ -189,7 +190,7 @@ def _pin_calibration(ns, monkeypatch, regime, *, unsupported_weeks=()):
     unsupported = {start for start in unsupported_weeks}
     monkeypatch.setattr(
         qcg, "apply_regime",
-        lambda _regime, entries: (
+        lambda _regime, entries, **_kw: (
             qcg.ApplyRejection.UNSUPPORTED_COMPOSITION
             if entries and entries[0] in unsupported
             else qcg.AppliedQuota(10.0, 9.0, 11.0, 1.0)))

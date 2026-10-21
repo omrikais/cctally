@@ -17,6 +17,7 @@ import _cctally_journal as _journal
 import _lib_accounts
 import _lib_journal
 import _lib_journal_router
+import _cctally_store
 from _lib_json_envelope import stamp_schema_version
 
 
@@ -68,11 +69,20 @@ def _read_prefix(high_water):
         )
     records = []
     evidence = []
+    evidence_owners: list = []
     audit_ends: dict = {}
+    audit_candidates: list = []
     malformed = 0
     prior_high_water = None
     cutover_captured = _journal._CUTOVER_UNSEEN
     hasher = _lib_journal_router.PrefixHashAccumulator()
+    # #825/#832 (spec 5.3): admission is resolved within this one pass and
+    # applied after it, before selection or normalization. An excluded record
+    # — an old process's repair acknowledgement or correction batch included —
+    # keeps its positional slot and is never selection or audit input (F7).
+    pass_boundary = _journal._PassBoundary()
+    coordinates: list = []
+    cutover_candidates: list = []
     for segment, offset, raw in _journal._iter_range_with_segments(
         None,
         high_water,
@@ -86,6 +96,7 @@ def _read_prefix(high_water):
             prior_high_water = (segment, offset + len(raw) + 1)
             continue
         record_end = (segment, offset + len(raw) + 1)
+        pass_boundary.observe(record)
         if record.get("t") == "op":
             _journal._capture_protocol_prefix_evidence(
                 record,
@@ -93,20 +104,22 @@ def _read_prefix(high_water):
                 evidence,
                 hasher=hasher,
             )
+            if len(evidence) > len(evidence_owners):
+                evidence_owners.append(len(records))
             payload = record.get("payload")
             if (
                 isinstance(payload, dict)
                 and payload.get("kind")
-                == _lib_journal._PROTOCOL_RESOLUTION_KIND
+                in _lib_journal.PROTOCOL_RESOLUTION_KINDS
             ):
-                audit_ends[record.get("id")] = record_end
-        # First cutover op wins, exactly as `find_accounts_cutover_op` scans.
-        if (
-            cutover_captured is _journal._CUTOVER_UNSEEN
-            and record.get("id") == _journal.CUTOVER_OP_ID
-        ):
-            cutover_captured = _journal._cutover_value_of(record)
+                audit_candidates.append(
+                    (len(records), record.get("id"), record_end))
+        # First ADMITTED cutover op wins, exactly as `find_accounts_cutover_op`
+        # scans; admission is known only after the pass.
+        if record.get("id") == _journal.CUTOVER_OP_ID:
+            cutover_candidates.append((record, (segment, offset)))
         records.append(_lib_journal_router.selector_slot(record))
+        coordinates.append((segment, offset))
         prior_high_water = record_end
     prefix_hash = hasher.digest_at(high_water)
     # The accumulator buffers the segment it is reading — 410 MB on the
@@ -119,6 +132,19 @@ def _read_prefix(high_water):
         raise _lib_journal.JournalProtocolError(
             f"journal prefix contains {malformed} malformed line(s)"
         )
+    boundary = pass_boundary.resolve(high_water)
+    _journal._apply_pass_admission(records, coordinates, boundary)
+    # #825/#832 fix round C (CD2-005): an excluded acknowledgement is absent
+    # for every purpose — its evidence and its audit end go with it.
+    evidence = _journal._admitted_prefix_evidence(
+        evidence, evidence_owners, records)
+    for index, audit_id, record_end in audit_candidates:
+        if records[index] is not None:
+            audit_ends[audit_id] = record_end
+    for candidate, (segment, offset) in cutover_candidates:
+        if _journal._is_admitted(candidate, segment, offset, boundary):
+            cutover_captured = _journal._cutover_value_of(candidate)
+            break
     # No suffix fallback, deliberately. `_read_only_high_water` pins the
     # canonically-last segment at its full size, so this prefix IS the whole
     # journal and an op the prefix does not contain is not in the journal at
@@ -255,6 +281,13 @@ def _repair_locks(timeout: float = 5.0):
     finally:
         _cctally_core.note_stats_maintenance_released()
         release_cache_writer_flocks(held)
+    # #825/#832 spec 4.3 revision 2: the repair's live index publication (or
+    # its no-op) posts a wake once its locks are released.
+    try:
+        import _cctally_statusline
+        _cctally_statusline.post_wake("holder:journal-repair")
+    except Exception:
+        pass
 
 
 def _iso_now() -> str:
@@ -322,6 +355,25 @@ def _post_audit_failure(requested, audit_ids, exc):
     return payload, 3
 
 
+def _post_audit_obligation_lost(requested, audit_ids, exc):
+    """Fix round K12 (K11R-3): the rebuilt index IS published (and the
+    holder wake is posted once the repair locks are released); only its
+    residual-derivation obligation was lost. The status stays `failed`,
+    with the additive `indexPublished`, and the command exits 3."""
+    payload, returncode = _post_audit_failure(requested, audit_ids, exc)
+    payload["indexPublished"] = True
+    return payload, returncode
+
+
+def _obligation_lost_message(error) -> str:
+    return (
+        "cctally: the corrected stats.db was published, but the record that "
+        "the inputs written during the rebuild still need deriving could not "
+        f"be saved ({error}). Those inputs stay in the journal and the next "
+        "ingest derives them; check that the data directory is writable."
+    )
+
+
 def _stats_has_acknowledgements(fingerprints) -> bool:
     if not _cctally_core.DB_PATH.exists():
         return False
@@ -330,9 +382,12 @@ def _stats_has_acknowledgements(fingerprints) -> bool:
             f"file:{_cctally_core.DB_PATH}?mode=ro", uri=True
         )
         try:
-            rows = conn.execute(
-                "SELECT violation_json FROM journal_protocol_violations"
-            )
+            # #825/#832 spec 6: completion evidence only from a validated
+            # current index; anything else fails closed.
+            with _cctally_store.current_stats_snapshot(conn):
+                rows = conn.execute(
+                    "SELECT violation_json FROM journal_protocol_violations"
+                ).fetchall()
             stored = {
                 item.get("fingerprint")
                 for item in (json.loads(str(row[0])) for row in rows)
@@ -341,7 +396,8 @@ def _stats_has_acknowledgements(fingerprints) -> bool:
             return set(fingerprints) <= stored
         finally:
             conn.close()
-    except (OSError, sqlite3.Error, ValueError, TypeError):
+    except (OSError, sqlite3.Error, ValueError, TypeError,
+            _cctally_store.StatsIndexNotCurrent):
         return False
 
 
@@ -368,6 +424,8 @@ def _recovery_high_water(audit_ids, audit_ends):
 
 
 def _apply(requested, initial_preview):
+    import _cctally_completion
+
     _call_pause_hook("before-lock")
     with _repair_locks():
         preview, snapshot = _preview_payload(requested)
@@ -429,9 +487,16 @@ def _apply(requested, initial_preview):
                     ),
                     high_water=audit_high_water,
                     update_quota_cache=False,
+                    complete_derivation=True,
                     before_swap=lambda: _call_crash_hook(
                         "before-rebuild-swap"
                     ),
+                )
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                return _post_audit_obligation_lost(
+                    requested,
+                    {audit["id"]},
+                    exc,
                 )
             except Exception as exc:
                 return _post_audit_failure(
@@ -477,9 +542,16 @@ def _apply(requested, initial_preview):
                     ),
                     high_water=recovery_high_water,
                     update_quota_cache=False,
+                    complete_derivation=True,
                     before_swap=lambda: _call_crash_hook(
                         "before-rebuild-swap"
                     ),
+                )
+            except _cctally_completion.ResidualObligationNotDurable as exc:
+                return _post_audit_obligation_lost(
+                    requested,
+                    audit_ids,
+                    exc,
                 )
             except Exception as exc:
                 return _post_audit_failure(
@@ -498,6 +570,18 @@ def _apply(requested, initial_preview):
 
 def cmd_db_journal_repair(args) -> int:
     """Preview structural violations without mutating the journal or indexes."""
+    if (bool(getattr(args, "yes", False))
+            and list(getattr(args, "violation", ()) or ())
+            and _journal.account_bound_cutover_enforced()):
+        # #825/#832 spec 5.5: establish the account-bound cutover before the
+        # apply's prefix-bound planning (the preview below is that plan), so
+        # the plan never races the boundary's own append.
+        try:
+            _journal.ensure_account_bound_cutover()
+        except _journal.AccountBoundCutoverDeferred:
+            pass
+        except OSError:
+            pass
     try:
         requested = list(getattr(args, "violation", ()) or ())
         payload, _snapshot = _preview_payload(requested)
@@ -585,6 +669,11 @@ def cmd_db_journal_repair(args) -> int:
         if returncode != 0:
             if bool(getattr(args, "json", False)):
                 print(json.dumps(payload, separators=(",", ":")))
+            elif payload.get("indexPublished"):
+                print(
+                    _obligation_lost_message(payload["errors"][0]),
+                    file=sys.stderr,
+                )
             else:
                 for error in payload["errors"]:
                     print(

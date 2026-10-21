@@ -42,6 +42,44 @@ if str(BIN) not in sys.path:
     sys.path.insert(0, str(BIN))
 
 
+@pytest.fixture(autouse=True)
+def _no_detached_drains(monkeypatch):
+    """Patch each fresh sibling, including loads through imported aliases."""
+    import conftest
+    import subprocess
+    import sys
+
+    real_load = conftest.load_script_module
+    real_popen = subprocess.Popen
+    escaped = []
+
+    def patch_current():
+        update = sys.modules.get("_cctally_update")
+        if update is not None:
+            monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+
+    def load_without_detaching(*args, **kwargs):
+        module = real_load(*args, **kwargs)
+        patch_current()
+        return module
+
+    def guard_detached(*popenargs, **kwargs):
+        argv = popenargs[0] if popenargs else kwargs.get("args")
+        if (kwargs.get("start_new_session") and isinstance(argv, (list, tuple))
+                and argv and str(argv[-1]).startswith("_codex-")):
+            escaped.append(tuple(argv))
+            raise AssertionError("a Codex detached worker escaped test isolation")
+        return real_popen(*popenargs, **kwargs)
+
+    # Every conftest.load_script alias resolves this primitive at call time;
+    # wrapping only this module's load_script name would miss helper-owned loads.
+    monkeypatch.setattr(conftest, "load_script_module", load_without_detaching)
+    monkeypatch.setattr(subprocess, "Popen", guard_detached)
+    patch_current()
+    yield
+    assert not escaped, f"detached Codex worker attempts: {escaped!r}"
+
+
 def _load_build_bench():
     """Path-load the hyphenated generator; a plain import cannot find it."""
     path = BIN / "build-bench-fixtures.py"
@@ -49,6 +87,14 @@ def _load_build_bench():
     spec = importlib.util.spec_from_loader("build_bench_fixtures", loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
+    real_load = mod.load_cctally
+
+    def load_without_detaching():
+        cctally = real_load()
+        sys.modules["_cctally_update"]._spawn_detached = lambda command: True
+        return cctally
+
+    mod.load_cctally = load_without_detaching
     return mod
 
 

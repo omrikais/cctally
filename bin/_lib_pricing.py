@@ -92,7 +92,12 @@ def _chip_for_model(name: str) -> str:
 # fingerprint a store recorded and refuses a write from an older process. That
 # comparison is day-granular by construction, so two revisions sharing a date
 # compare equal and the older process is authorized to write.
-PRICING_SNAPSHOT_DATE = "2026-10-07"
+#
+# A sync of this date or of either table also changes the dynamic-SQL shape
+# pinned in `bin/_lib_detector_access_registry.py`, so its registry test fails
+# until the affected pins are re-pinned through the reviewed procedure in that
+# module's docstring. Bulk regeneration of the pins alone is not acceptance.
+PRICING_SNAPSHOT_DATE = "2026-10-14"
 PRICING_STALENESS_DAYS = 60  # release pre-flight WARNs past this age
 
 
@@ -700,7 +705,7 @@ CLAUDE_MODEL_PRICING: dict[str, dict[str, Any]] = {
         "input_cost_per_token": 2e-06,
         "output_cost_per_token": 1e-05,
         "cache_creation_input_token_cost": 2.5e-06,
-        "cache_read_input_token_cost": 2e-07,
+        "cache_read_input_token_cost": 1e-07,
     },
 }
 

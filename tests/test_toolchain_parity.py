@@ -51,7 +51,7 @@ WORKFLOW_DIR = REPO / ".github" / "workflows"
 PIN_FILE = REPO / "tests" / "requirements-dev.txt"
 PIN_FILE_REL = "tests/requirements-dev.txt"
 
-EXPECTED_PIN_COUNT = 14
+EXPECTED_PIN_COUNT = 15
 EXPECTED_AUTHORITATIVE_JOBS = {
     "ci.yml:test-macos",
     "ci.yml:test-pr",
@@ -127,6 +127,8 @@ def test_pin_file_carries_the_packages_every_gate_needs():
         "pyyaml",
         "rich",
         "shellcheck-py",
+        # #968: the compressed-rollout suite never skips, so the decoder is a gate dependency.
+        "backports.zstd",
     ):
         assert required in names, f"{required} missing from {PIN_FILE_REL}"
 

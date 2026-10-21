@@ -22,6 +22,15 @@ import _cctally_core
 import _lib_journal as J
 import _cctally_journal as journal
 
+@pytest.fixture(autouse=True)
+def _without_account_bound_cutover_chokepoint(monkeypatch):
+    """This suite pins the exact bytes, offsets, line counts or prefix
+    traversals of its own journal records, so the #825/#832 append-path
+    cutover establishment (covered by tests/test_statusline_cutover_f1.py)
+    is switched off through its test-harness opt-out."""
+    monkeypatch.setenv("CCTALLY_TEST_NO_ACCOUNT_BOUND_CUTOVER", "1")
+
+
 FIXED_JULY = dt.datetime(2026, 7, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
 FIXED_AUG = dt.datetime(2026, 8, 3, 12, 0, 0, tzinfo=dt.timezone.utc)
 
@@ -210,3 +219,77 @@ def test_list_segments_canonical_order_excludes_partial(journal_env):
         "observations-2026-06.jsonl",
         "observations-2026-07.jsonl",
     ]
+
+
+# --------------------------------------------------------------------------
+# (g) #825/#832 writer-generation stamp at both append APIs (spec 5.1, F5)
+# --------------------------------------------------------------------------
+
+def _legacy_obs(payload):
+    """An obs exactly as the previous release builds it: no `wpg`, content id
+    over {t, at, src, provider, payload}."""
+    core = {"t": "obs", "at": "t-legacy", "src": "statusline",
+            "provider": "claude", "payload": payload}
+    return {"v": J.LINE_VERSION, **core, "id": J.content_id(core)}
+
+
+def test_every_appended_record_carries_the_writer_generation(journal_env):
+    data_dir = journal_env
+    legacy = _legacy_obs({"i": 1})
+    evt = {"v": 1, "t": "evt", "id": "x:1", "rev": 0, "at": "t",
+           "src": "ingest", "payload": {"kind": "budget", "vendor": "codex"}}
+    journal.append_record(legacy, now_utc=FIXED_JULY)
+    journal.append_records([_legacy_obs({"i": 2}), evt], now_utc=FIXED_JULY)
+    journal.append_record(J.make_op(at="t", src="x", payload={"kind": "k"}),
+                          now_utc=FIXED_JULY)
+    lines = _decoded_lines(data_dir / "journal" / "observations-2026-07.jsonl")
+    assert len(lines) == 4
+    assert all(line["wpg"] == "account-bound-v1" for line in lines)
+    # A content-id record is re-identified over its stamped core; a semantic
+    # event id is preserved.
+    assert lines[0]["id"] != legacy["id"]
+    core = {k: v for k, v in lines[0].items() if k not in ("v", "id")}
+    assert lines[0]["id"] == J.content_id(core)
+    assert lines[2]["id"] == "x:1"
+    assert lines[2]["payload"] == evt["payload"]
+
+
+def test_prepare_record_is_idempotent_and_matches_the_builders():
+    built = J.make_obs(at="t", src="statusline", provider="claude",
+                       payload={"i": 1})
+    assert built["wpg"] == "account-bound-v1"
+    assert J.prepare_record(built) == built
+    assert J.prepare_record(J.prepare_record(_legacy_obs({"i": 1}))) == (
+        J.prepare_record(_legacy_obs({"i": 1})))
+
+
+def test_make_obs_content_id_covers_the_writer_generation():
+    stamped = J.make_obs(at="t-legacy", src="statusline", provider="claude",
+                         payload={"i": 1})
+    legacy = _legacy_obs({"i": 1})
+    assert stamped["payload"] == legacy["payload"]
+    assert stamped["id"] != legacy["id"]
+    core = {k: v for k, v in stamped.items() if k not in ("v", "id")}
+    assert stamped["id"] == J.content_id(core)
+    for builder_record in (
+        J.make_op(at="t", src="s", payload={"kind": "sync_week"}),
+        J.make_evt(kind="budget", id="bm:1", at="t", payload={}),
+        J.make_account_observe(at="t", account_key="k" * 16, provider="claude"),
+        J.make_account_label(at="t", account_key="k" * 16, label="x"),
+    ):
+        assert builder_record["wpg"] == "account-bound-v1"
+    for record in J.make_correction_batch(
+            batch_id="b1", family="claude-usage", at="t", actions=[]):
+        assert record["wpg"] == "account-bound-v1"
+
+
+def test_event_content_hash_ignores_the_writer_generation():
+    evt = J.make_evt(kind="budget", id="bm:1", at="t",
+                     payload={"vendor": "codex"})
+    assert evt["wpg"] == "account-bound-v1"
+    legacy = {k: v for k, v in evt.items() if k != "wpg"}
+    selection = J.resolve_effective_events([legacy, evt])
+    assert selection.conflicts == ()
+    assert len(selection.active) == 1
+    selection = J.resolve_effective_events([evt, legacy])
+    assert selection.conflicts == ()

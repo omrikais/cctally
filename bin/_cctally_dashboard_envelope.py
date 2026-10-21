@@ -96,6 +96,7 @@ from _cctally_dashboard_cache_report import _cache_report_snapshot_to_dict
 # copy was already exactly this — collapse to the single definition).
 _ensure_sibling_loaded("_lib_json_envelope")
 from _lib_json_envelope import _iso_z
+from _lib_five_hour import latest_five_hour_reading
 
 
 def _model_breakdowns_to_models(model_breakdowns: list[dict[str, Any]],
@@ -235,9 +236,17 @@ def _select_current_block_for_envelope(
     # statement of that key. Its `week_start_at` is a byte copy of the
     # non-held row it was derived from, so scoping the post-reset lookup
     # below by it is unaffected.
+    #
+    # #825/#832 spec 4.7 revision 7: the current window is the newest five-hour
+    # READING's, through the one shared selection under the same as-of and
+    # account restrictions. A retired replica (its five-hour fields cleared in
+    # place by a five-hour credit) or a weekly-only reading can be the newest
+    # row and names no window. The newest row still supplies `week_start_at`
+    # for the post-reset lookup below: that is weekly evidence, selected
+    # independently.
     snap = conn.execute(
         """
-        SELECT five_hour_window_key, week_start_at
+        SELECT week_start_at
           FROM weekly_usage_snapshots
          WHERE captured_at_utc <= ?
            AND (? IS NULL OR account_key = ?)
@@ -246,7 +255,11 @@ def _select_current_block_for_envelope(
         """,
         (_iso_z(now_utc), account_key, account_key),
     ).fetchone()
-    if snap is None or snap["five_hour_window_key"] is None:
+    if snap is None:
+        return None
+    reading = latest_five_hour_reading(
+        conn, account_key=account_key, as_of_utc=_iso_z(now_utc))
+    if reading is None:
         return None
 
     # The account supplied by `_tui_build_current_week` is the owner of the
@@ -298,7 +311,7 @@ def _select_current_block_for_envelope(
          ORDER BY id ASC
          LIMIT 1
         """,
-        (snap["five_hour_window_key"], account_key, account_key,
+        (reading.window_key, account_key, account_key,
          _iso_z(now_utc)),
     ).fetchone()
     if block is None:

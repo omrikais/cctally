@@ -149,7 +149,7 @@ def _accepted(app, percent):
 
 def _pending_drop(app, clock, axis="sevenDay"):
     """The persisted pending drop for one axis, as the next tick will read it."""
-    control = app._read_control_state(now_epoch=clock.value)
+    control = app._read_control_state(now_epoch=clock.value, account_key="unattributed")
     return None if control is None else control.pending_drops[axis]
 
 
@@ -338,23 +338,17 @@ def test_a_reset_after_a_spent_attempt_still_reaches_the_database(app, monkeypat
     )
 
 
-def test_a_previous_binary_control_state_is_read_and_reconciled(app, monkeypatch):
-    """Task 4.7 — the control document version moved; the spool version did not.
+def test_a_previous_binary_control_state_is_never_read(app, monkeypatch):
+    """#825/#832 section 7 (replaces the #755 Task 4.7 compatibility read).
 
-    A schema-version-1 control document carries neither `deadlineAt` nor
-    `retained`. It must still parse, so a session running the previous binary
-    does not make this one discard the whole document and restart from nothing.
-
-    Its pending drops do not survive the read, and that is the compatibility
-    path rather than a gap in it. Neither missing field can be recovered — the
-    evidence is not invented, and `firstSeenAt` was stamped under the pre-#755
-    arming rule, so it does not mean "when this low was first seen" here. The
-    projection is what the document is read for; the drop re-arms from live
-    evidence with its own deadline.
+    The previous binary's control document lives at the legacy
+    `statusline-selected.json`. After the account-bound protocol it is never
+    authority: the current reducer neither reads nor rewrites it, and the
+    account partition arms its drop from live evidence with its own deadline.
     """
     clock = _Clock(app, monkeypatch, int(time.time()))
     reset_epoch = _seed_database(app, clock, percent=63)
-    projection = app._read_db_projection_stable()
+    projection = app._read_db_projection_stable(account_key="unattributed")
     document = app._cctally_statusline._control_document(
         app._cctally_statusline._candidates.ControlState(
             projection, {"fiveHour": None, "sevenDay": None}
@@ -370,20 +364,12 @@ def test_a_previous_binary_control_state_is_read_and_reconciled(app, monkeypatch
         "contributors": {},
         "retrySignature": None,
     }
-    app.STATUSLINE_SELECTED_PATH.write_text(json.dumps(document))
+    legacy = json.dumps(document)
+    app.STATUSLINE_SELECTED_PATH.write_text(legacy)
 
-    control = app._read_control_state(now_epoch=clock.value)
-    assert control is not None, "a previous-binary control document failed to parse"
-    assert control.db_projection.seven_day is not None, (
-        "the projection the document is read for did not survive the read"
-    )
-    assert control.pending_drops["sevenDay"] is None, (
-        "a version-1 pending drop was carried under the version-2 contract"
-    )
+    assert app._read_control_state(
+        now_epoch=clock.value, account_key="unattributed") is None
 
-    # The consequence: the next evaluation arms from live evidence, with a
-    # deadline measured from now rather than one reconstructed from a
-    # first-seen instant that meant something else.
     _spool(app, session_id="reset", percent=0, reset_epoch=reset_epoch)
     app._statusline_reduce_and_publish()
     armed = _pending_drop(app, clock)
@@ -391,10 +377,8 @@ def test_a_previous_binary_control_state_is_read_and_reconciled(app, monkeypatch
     assert armed.first_seen_at == clock.value
     assert armed.deadline_at == clock.value + DEADLINE_SECONDS
     assert armed.retained is not None and armed.retained.percent == 0
-
-    # The candidate document version is unchanged, so a spool document written
-    # by the previous binary is still read by this one.
-    assert app._cctally_statusline._candidates.SCHEMA_VERSION == 1
+    assert app.STATUSLINE_SELECTED_PATH.read_text() == legacy, (
+        "the legacy control document must never be rewritten")
 
 
 def test_a_peer_reporting_above_the_baseline_does_not_delay_the_reset(app, monkeypatch):

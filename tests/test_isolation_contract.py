@@ -13,6 +13,7 @@ import time
 
 import pytest
 
+import _temp_hygiene as _hyg
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -21,6 +22,7 @@ _ASSIGNED = {
     "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
     "CCTALLY_DISABLE_UPDATE_CHECK": "1",
     "CCTALLY_DISABLE_RETENTION_SWEEP": "1",
+    "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
 }
 _REMOVED = ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY")
 
@@ -45,10 +47,13 @@ print(json.dumps({"inherited": inherited, "core_preloaded": core_preloaded,
 
 
 def test_conftest_normalizes_all_six_preamble_variables(tmp_path):
+    # #965: the retention switch is the seventh pin; the name is kept so the
+    # node's estate identity does not change.
     hostile = {
         "CCTALLY_DISABLE_DEV_AUTODETECT": "0",
         "CCTALLY_DISABLE_UPDATE_CHECK": "0",
         "CCTALLY_DISABLE_RETENTION_SWEEP": "0",
+        "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "0",
         "CODEX_HOME": str(tmp_path / "hostile-codex"),
         "DO_NOT_TRACK": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
@@ -497,6 +502,186 @@ def test_the_child_keeps_the_layout_its_caller_asked_for(guarded, tmp_path):
         "HOME": env["HOME"], "PATH": env["PATH"], "TZ": env["TZ"],
         "CCTALLY_DATA_DIR": env["CCTALLY_DATA_DIR"],
     }
+
+
+_TEMP_VARIABLES = ("TMPDIR", "TMP", "TEMP", "SQLITE_TMPDIR")
+
+
+def _parent_temp_dirs(tmp_path, monkeypatch):
+    """Give this process a distinct, existing directory for each variable."""
+    parent = {}
+    for name in _TEMP_VARIABLES:
+        d = tmp_path / ("parent-" + name.lower())
+        d.mkdir()
+        monkeypatch.setenv(name, str(d))
+        parent[name] = str(d)
+    return parent
+
+
+def test_a_fresh_env_child_gets_the_parents_temporary_variables(tmp_path, monkeypatch):
+    """#940 D4 (spec 6.5). A fresh env dict that omits the temporary variables
+    sent its child's `tempfile` to `/tmp` and SQLite to `/var/tmp`, which the
+    confined runner kills. The chokepoint restores them from this process."""
+    parent = _parent_temp_dirs(tmp_path, monkeypatch)
+    code = (
+        "import json, os, tempfile; print(json.dumps(dict("
+        "{k: os.environ.get(k) for k in %r}, gettempdir=tempfile.gettempdir())))"
+        % (_TEMP_VARIABLES,)
+    )
+    proc = subprocess.run([sys.executable, "-c", code], env=_fresh_env(tmp_path),
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    seen = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert {k: seen[k] for k in _TEMP_VARIABLES} == parent
+    assert seen["gettempdir"] == os.path.abspath(parent["TMPDIR"])
+
+
+def test_a_present_temporary_variable_is_never_replaced(tmp_path, monkeypatch):
+    """A caller's own value is a deliberate override and is kept as given,
+    even one naming a directory that does not exist: tests drive exactly that."""
+    import _lib_test_isolation as iso
+
+    _parent_temp_dirs(tmp_path, monkeypatch)
+    given = {
+        "TMPDIR": str(tmp_path / "declared"),
+        "TMP": "/private/var/folders/internal/",
+        "TEMP": "relative/temp",
+        "SQLITE_TMPDIR": str(tmp_path / "sqlite-declared"),
+    }
+    child = iso._child_environment(dict(_fresh_env(tmp_path), **given))
+    assert {k: child[k] for k in _TEMP_VARIABLES} == given
+
+
+def test_an_empty_temporary_variable_is_restored(tmp_path, monkeypatch):
+    import _lib_test_isolation as iso
+
+    parent = _parent_temp_dirs(tmp_path, monkeypatch)
+    child = iso._child_environment(
+        dict(_fresh_env(tmp_path), **{k: "" for k in _TEMP_VARIABLES}))
+    assert {k: child[k] for k in _TEMP_VARIABLES} == parent
+
+
+@pytest.mark.parametrize("value", ["relative/tmp", "missing", ""])
+def test_an_invalid_parent_temporary_variable_is_not_copied(tmp_path, monkeypatch, value):
+    """Only an absolute, existing parent directory is restored; anything else
+    leaves the child to its own platform default rather than inventing one."""
+    import _lib_test_isolation as iso
+
+    if value == "missing":
+        value = str(tmp_path / "does-not-exist")
+    for name in _TEMP_VARIABLES:
+        monkeypatch.setenv(name, value)
+    child = iso._child_environment(_fresh_env(tmp_path))
+    assert not any(name in child for name in _TEMP_VARIABLES), child
+
+
+@pytest.mark.parametrize("name", [
+    pytest.param("TMP", id="TMP"),
+    pytest.param("TEMP", id="TEMP"),
+])
+def test_a_parent_temporary_root_too_long_for_multiprocessing_is_not_copied(tmp_path, name):
+    """#940 D-2 F9: a copied TMP or TEMP is the root `tempfile` reads when the
+    child has no TMPDIR, so a value Darwin multiprocessing cannot use (over 63
+    bytes) is not copied where the child keeps a bounded root to read without
+    it: here the other of the two, copied short (fix round 2, V10: dropping
+    TEMP leaves the child reading TMP). A short one is still copied, and off
+    Darwin the bound does not apply."""
+    import _lib_test_isolation as iso
+
+    long_dir = tmp_path / ("x" * 80)
+    long_dir.mkdir()
+    short_dir = "/"  # absolute, existing, and well within the bound
+    other = "TMP" if name == "TEMP" else "TEMP"
+    assert iso.multiprocessing_temp_root_problem({name: str(long_dir)}, "darwin")
+    assert iso.multiprocessing_temp_root_problem({name: short_dir}, "darwin") is None
+    child = {}
+    iso._restore_temp_variables(child, {name: str(long_dir), other: short_dir},
+                                platform="darwin")
+    assert name not in child, child
+    assert child.get(other) == short_dir, child
+    child = {}
+    iso._restore_temp_variables(child, {name: short_dir}, platform="darwin")
+    assert child.get(name) == short_dir, child
+    child = {}
+    iso._restore_temp_variables(child, {name: str(long_dir)}, platform="linux")
+    assert child.get(name) == str(long_dir), child
+
+
+@pytest.mark.parametrize("name", [
+    pytest.param("TMP", id="TMP"),
+    pytest.param("TEMP", id="TEMP"),
+])
+def test_a_long_temporary_root_is_kept_when_the_child_has_no_other(tmp_path, name):
+    """#940 D-2 fix round 2 (V2): dropping the only temporary root a child
+    would have leaves its `tempfile` to fall back to /tmp, the very failure the
+    chokepoint exists to stop. With no bounded root to read instead, the long
+    copy is kept: the child's `tempfile` keeps the long root, and only
+    multiprocessing, which cannot use it, falls back to /tmp, where
+    confinement kills the write."""
+    import _lib_test_isolation as iso
+
+    long_dir = tmp_path / ("x" * 80)
+    long_dir.mkdir()
+    child = {}
+    iso._restore_temp_variables(child, {name: str(long_dir)}, platform="darwin")
+    assert child == {name: str(long_dir)}, child
+    # Both long: dropping the first would only reach the second, as long.
+    child = {}
+    iso._restore_temp_variables(child, {"TEMP": str(long_dir), "TMP": str(long_dir)},
+                                platform="darwin")
+    assert child == {"TEMP": str(long_dir), "TMP": str(long_dir)}, child
+
+
+def test_long_temporary_copies_are_dropped_under_a_bounded_tmpdir(tmp_path):
+    """V2: with a bounded TMPDIR the child keeps a usable root, so long copied
+    TEMP and TMP values are dropped rather than handed on."""
+    import _lib_test_isolation as iso
+
+    long_dir = tmp_path / ("x" * 80)
+    long_dir.mkdir()
+    child = {}
+    iso._restore_temp_variables(
+        child, {"TMPDIR": "/", "TEMP": str(long_dir), "TMP": str(long_dir)},
+        platform="darwin")
+    assert child == {"TMPDIR": "/"}, child
+
+
+def test_a_long_copy_beside_a_callers_own_long_root_is_dropped(tmp_path):
+    """V10: a caller's own value is never dropped, long or not. A long copied
+    TEMP in front of the caller's own long TMP is dropped, so the child reads
+    the caller's choice; a copy behind a caller's own TEMP is unread and
+    dropped the same way."""
+    import _lib_test_isolation as iso
+
+    long_dir = tmp_path / ("x" * 80)
+    long_dir.mkdir()
+    own = str(tmp_path / ("y" * 80))
+    os.mkdir(own)
+    child = {"TMP": own}
+    iso._restore_temp_variables(child, {"TEMP": str(long_dir)}, platform="darwin")
+    assert child == {"TMP": own}, child
+    child = {"TEMP": own}
+    iso._restore_temp_variables(child, {"TMP": str(long_dir)}, platform="darwin")
+    assert child == {"TEMP": own}, child
+
+
+def test_a_callers_own_unusable_value_is_not_a_root_to_read(tmp_path):
+    """#940 D-2 P3 #5: `tempfile` skips a variable that names no existing
+    directory, so a caller's own unusable TMPDIR is not a root the child
+    reads: a long copied TEMP behind it is what the child would read and is
+    kept (dropping it would send the child's `tempfile` to /tmp). A bounded
+    copied TMP behind both is a usable root, so the long TEMP is dropped."""
+    import _lib_test_isolation as iso
+
+    long_dir = tmp_path / ("x" * 80)
+    long_dir.mkdir()
+    child = {"TMPDIR": "/nonexistent-940-tmpdir"}
+    iso._restore_temp_variables(child, {"TEMP": str(long_dir)}, platform="darwin")
+    assert child == {"TMPDIR": "/nonexistent-940-tmpdir", "TEMP": str(long_dir)}, child
+    child = {"TMPDIR": "/nonexistent-940-tmpdir"}
+    iso._restore_temp_variables(child, {"TEMP": str(long_dir), "TMP": "/"},
+                                platform="darwin")
+    assert child == {"TMPDIR": "/nonexistent-940-tmpdir", "TMP": "/"}, child
 
 
 def test_an_inheriting_child_is_covered(guarded):
@@ -1044,7 +1229,7 @@ def test_the_conftest_teardown_really_fails_a_swallowed_violation(tmp_path):
     )
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "conftest", "-q", "-p",
-         "no:cacheprovider", str(module)],
+         "no:cacheprovider", *_hyg.nested_basetemp_args(tmp_path), str(module)],
         env=env, capture_output=True, text=True, timeout=110,
     )
     assert proc.returncode != 0, (
@@ -1081,7 +1266,8 @@ def _nested_pytest(module_path, tmp_path, synthetic, extra_args=()):
     )
     return subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "conftest", "-q",
-         "-p", "no:cacheprovider", *extra_args, str(module_path)],
+         "-p", "no:cacheprovider", *_hyg.nested_basetemp_args(tmp_path),
+         *extra_args, str(module_path)],
         env=env, capture_output=True, text=True, timeout=110,
     )
 
@@ -1459,9 +1645,15 @@ def test_an_inherited_data_dir_override_is_captured_at_conftest_import(tmp_path)
     # directly receives the bootstrap envelope from the interceptor and installs
     # the roots its PARENT classified, so it could never show whether a fresh
     # process reads the override for itself.
+    #
+    # The temporary root alone is carried across (#940 D4): without it the
+    # child's `tempfile` falls back to `/tmp`, and the confined runner kills
+    # that write with SIGKILL before the probe can answer.
+    tmpdir = os.environ.get("TMPDIR")
     command = (
         f"env -i HOME={shlex.quote(str(tmp_path / 'fake-home'))} "
-        f"PATH=/usr/bin:/bin TZ=Etc/UTC "
+        + (f"TMPDIR={shlex.quote(tmpdir)} " if tmpdir else "")
+        + f"PATH=/usr/bin:/bin TZ=Etc/UTC "
         f"CCTALLY_DATA_DIR={shlex.quote(str(custom))} "
         f"{shlex.quote(sys.executable)} -c {shlex.quote(probe)}"
     )
@@ -1470,3 +1662,498 @@ def test_an_inherited_data_dir_override_is_captured_at_conftest_import(tmp_path)
     assert proc.returncode == 0, proc.stderr
     roots = json.loads(proc.stdout.strip().splitlines()[-1])
     assert os.path.realpath(str(custom)) in roots, roots
+
+
+# --- the Darwin multiprocessing temporary root (#940 D4, spec 6.5) ----------
+
+
+def test_a_temporary_root_within_63_bytes_is_accepted():
+    import _lib_test_isolation as iso
+
+    root = "/" + "t" * 62
+    assert len(root) == 63
+    assert iso.multiprocessing_temp_root_problem({"TMPDIR": root}, "darwin") is None
+
+
+@pytest.mark.parametrize("root", ["/" + "t" * 63, "/" + "t" * 62 + "/"])
+def test_a_temporary_root_over_63_bytes_is_refused_on_darwin(root):
+    """Python's multiprocessing ignores a TMPDIR too long for its AF_UNIX
+    socket path and falls back to `/tmp`, which the confined runner kills.
+    The exact exported spelling is measured, trailing separator included."""
+    import _lib_test_isolation as iso
+
+    problem = iso.multiprocessing_temp_root_problem({"TMPDIR": root}, "darwin")
+    assert problem is not None
+    assert "TMPDIR" in problem and "64 bytes" in problem and "63" in problem
+
+
+def test_the_variable_tempfile_would_read_is_the_one_measured():
+    """`tempfile` reads TMPDIR, then TEMP, then TMP; an empty one is skipped."""
+    import _lib_test_isolation as iso
+
+    long_root = "/" + "t" * 70
+    assert iso.multiprocessing_temp_root_problem(
+        {"TMPDIR": "", "TEMP": long_root, "TMP": "/tmp"}, "darwin").startswith("TEMP")
+    assert iso.multiprocessing_temp_root_problem(
+        {"TMPDIR": "/tmp", "TEMP": long_root}, "darwin") is None
+    assert iso.multiprocessing_temp_root_problem({}, "darwin") is None
+
+
+def test_a_long_temporary_root_is_not_a_problem_off_darwin():
+    import _lib_test_isolation as iso
+
+    assert iso.multiprocessing_temp_root_problem(
+        {"TMPDIR": "/" + "t" * 200}, "linux") is None
+
+
+def test_a_session_on_a_long_darwin_temporary_root_stops_before_collection(
+        monkeypatch):
+    """The check runs at session start, before any test can initialise
+    multiprocessing and cache its temporary directory."""
+    import conftest
+
+    monkeypatch.setenv("TMPDIR", "/" + "t" * 70)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(pytest.UsageError, match="multiprocessing"):
+        conftest.pytest_sessionstart(None)
+    monkeypatch.setenv("TMPDIR", "/" + "t" * 40)
+    conftest.pytest_sessionstart(None)
+
+
+# ---------------------------------------------------------------------------
+# The #965 test retention launch guard (spec 5.7, T6 runtime)
+# ---------------------------------------------------------------------------
+
+from _retention_fixtures import LAUNCH_TIMEOUT_S, QUICK_TIMEOUT_S  # noqa: E402
+
+_RET_SWITCH = "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF"
+_RET_CLI = REPO_ROOT / "bin" / "cctally"
+
+
+def _retention_env(tmp_path, value):
+    env = dict(os.environ)
+    env.update({"HOME": str(tmp_path / "home"), "TZ": "Etc/UTC",
+                "CCTALLY_DATA_DIR": str(tmp_path / "data")})
+    env.pop("CODEX_HOME", None)
+    if value is None:
+        env.pop(_RET_SWITCH, None)
+    else:
+        env[_RET_SWITCH] = value
+    return env
+
+
+def _retention_records(node_id):
+    import _lib_test_isolation as iso
+    return [v for v in iso.read_ledger()
+            if v.node_id == node_id and v.kind == iso.RETENTION_POLICY_KIND]
+
+
+#: The guard's two rejection reasons (bin/_lib_test_isolation.py,
+#: _retention_launch_failure), stated separately so each case asserts its own.
+_RET_INELIGIBLE = "which has no .git entry at its root"
+
+
+def _ret_switch_reason(value):
+    return (f"{_RET_SWITCH} is absent" if value is None
+            else f"{_RET_SWITCH} is {value!r}, not '1'")
+
+
+def _expect_retention_rejection(request, launch, *, switch, ineligible=False):
+    """``switch``: the switch value the rejection must name (None = absent), or
+    the string "carried" when the child carries it at "1" and the switch reason
+    must be missing. ``ineligible``: whether the .git reason must be present;
+    either reason's presence or absence is asserted, never "one of them"."""
+    import _lib_test_isolation as iso
+    try:
+        with pytest.raises(iso.RetentionPolicyBlocked) as caught:
+            launch()
+        message = str(caught.value)
+        assert "retention-policy violation" in message, message
+        if switch == "carried":
+            assert f"{_RET_SWITCH} is" not in message, message
+        else:
+            assert _ret_switch_reason(switch) in message, message
+        assert (_RET_INELIGIBLE in message) == ineligible, message
+        assert _retention_records(request.node.nodeid), (
+            "the rejection was not recorded before the raise")
+    finally:
+        iso.drop_node_from_ledger(request.node.nodeid)
+
+
+@pytest.mark.parametrize("value", [None, "", "0"], ids=["absent", "empty", "zero"])
+def test_965_a_covered_launch_without_the_policy_is_rejected(value, tmp_path, request):
+    env = _retention_env(tmp_path, value)
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        [sys.executable, str(_RET_CLI), "--version"], env=env,
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=value)
+
+
+def test_965_the_same_launch_with_the_switch_runs(tmp_path):
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run([sys.executable, str(_RET_CLI), "--version"],
+                          env=_retention_env(tmp_path, "1"),
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_965_a_fresh_environment_launch_is_rejected(tmp_path, request):
+    env = _fresh_env(tmp_path, CCTALLY_DATA_DIR=str(tmp_path / "data"))
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        [sys.executable, str(_RET_CLI), "--version"], env=env,
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+def test_965_an_env_i_shell_launch_is_rejected(tmp_path, request):
+    import shlex
+    command = (f"env -i HOME={shlex.quote(str(tmp_path / 'home'))} PATH=/usr/bin:/bin "
+               f"{shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} --version")
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["/bin/sh", "-c", command], capture_output=True, text=True,
+        timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+@pytest.mark.parametrize("value", [None, "1"], ids=["absent", "carried"])
+def test_965_a_launch_the_guard_cannot_resolve_fails_closed(value, tmp_path, request):
+    """A relative program resolves against the launch's cwd, which a `cd` inside
+    the shell string does not move: the guard names a path that holds no file.
+    That is unresolvable, not a stub, so it is judged and fails closed (the
+    switch alone does not admit it: the code it would execute is unknown)."""
+    import shlex
+    command = f"cd {shlex.quote(str(REPO_ROOT))} && bin/cctally --version"
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["/bin/sh", "-c", command], cwd=tmp_path, env=_retention_env(tmp_path, value),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S),
+        switch="carried" if value == "1" else value, ineligible=True)
+
+
+def test_965_a_missing_cctally_path_is_not_a_stub(tmp_path, request):
+    missing = tmp_path / "gone" / "cctally"
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        [str(missing), "--version"], env=_retention_env(tmp_path, None),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S),
+        switch=None, ineligible=True)
+
+
+def test_965_a_line_continuation_does_not_split_an_env_i_launch(tmp_path, request):
+    """`env -i ... \\<newline> python bin/cctally` is ONE command: the cleared
+    environment applies to the cctally launch on the continued line."""
+    import shlex
+    command = (f"env -i HOME={shlex.quote(str(tmp_path / 'home'))} PATH=/usr/bin:/bin \\\n"
+               f"  {shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} --version")
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["/bin/sh", "-c", command], capture_output=True, text=True,
+        timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+@pytest.mark.parametrize("options", [
+    ["bash", "-o", "pipefail", "-c"],
+    ["bash", "-eo", "pipefail", "-c"],
+    ["bash", "+o", "posix", "-c"],
+    ["bash", "-O", "extglob", "-c"],
+    ["bash", "--rcfile", "/dev/null", "-c"],
+    ["bash", "-c", "-e"],
+    ["bash", "-c", "--"],
+    ["sh", "-o", "errexit", "-c"],
+], ids=["o", "eo", "plus-o", "shopt", "rcfile", "c-then-e", "c-then-dashdash", "sh-o"])
+def test_965_shell_options_before_the_command_string_are_parsed(options, tmp_path, request):
+    """A shell option that takes an argument, or an option after -c, is not the
+    command string: the scan reaches the real `-c` string and judges it."""
+    import shlex
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} --version"
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        [*options, command], env=_retention_env(tmp_path, None),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+def test_965_a_shell_option_launch_with_the_switch_runs(tmp_path):
+    import shlex
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} --version"
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run(["bash", "-o", "pipefail", "-c", command],
+                          env=_retention_env(tmp_path, "1"),
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+#: Shell words before the program the guard must read past: every command
+#: prefix with its options (`{L}` is the covered launch), a prefix after a
+#: leading assignment, and the reserved words that may open a command.
+_RET_PREFIXED = {
+    "command-dashdash": "command -- {L}",
+    "command-p": "command -p {L}",
+    "command-p-dashdash": "command -p -- {L}",
+    "exec-a": "exec -a renamed {L}",
+    "exec-l": "exec -l {L}",
+    "exec-cluster-a": "exec -la renamed {L}",
+    "exec-dashdash": "exec -- {L}",
+    "time-p": "time -p {L}",
+    "time-dashdash": "time -- {L}",
+    "nohup-dashdash": "nohup -- {L}",
+    "builtin-exec": "builtin exec -- {L}",
+    "builtin-command": "builtin command -p {L}",
+    "assignment-then-exec": "FOO=1 exec {L}",
+    "assignment-then-command": "FOO=1 command -- {L}",
+    "bang": "! {L}",
+    "if": "if {L}; then :; fi",
+    "brace-group": "{{ {L}; }}",
+    "while": "while {L}; do break; done",
+    "for-do": "for x in 1; do {L}; done",
+    "env-split-string": "env -S '{L}'",
+    "env-split-string-long": "env --split-string='{L}'",
+    "env-verbose": "env -v {L}",
+}
+
+
+def _ret_launch():
+    import shlex
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} --version"
+
+
+@pytest.mark.parametrize("form", sorted(_RET_PREFIXED))
+def test_965_a_prefixed_shell_launch_without_the_switch_is_rejected(form, tmp_path, request):
+    """965-DIFF-002: a prefix's options (`command --`, `exec -a NAME`, `time
+    -p`, ...) are parsed, never taken for the program, so the covered launch
+    behind them is judged and rejected for the absent switch."""
+    command = _RET_PREFIXED[form].format(L=_ret_launch())
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["bash", "-c", command], env=_retention_env(tmp_path, None),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+def test_965_the_reviewers_command_dashdash_launch_is_rejected(tmp_path, request):
+    """The review's own probe: `command --` left `--` as the apparent program."""
+    import shlex
+    command = (f"command -- {shlex.quote(sys.executable)} {shlex.quote(str(_RET_CLI))} "
+               "cache-sync --rebuild")
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["bash", "-c", command], env=_retention_env(tmp_path, None),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+@pytest.mark.parametrize("command", [
+    "exec -c {L}",
+    f"{_RET_SWITCH}=1 exec -c {{L}}",
+], ids=["exec-c", "assigned-then-exec-c"])
+def test_965_exec_c_clears_the_switch(command, tmp_path, request):
+    """`exec -c` runs the program with an empty environment: a switch the
+    caller carries, or assigns in front of `exec`, never reaches it."""
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        ["bash", "-c", command.format(L=_ret_launch())], env=_retention_env(tmp_path, "1"),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+#: Prefix options the guard cannot interpret: the launch fails closed.
+_RET_UNPARSED_REASON = "names a covered program but cannot be parsed"
+
+
+@pytest.mark.parametrize("command", [
+    "command -x {L}", "exec -z {L}", "time -l {L}", "nohup --weird {L}",
+    "builtin -x exec {L}", "env -C / {L}", "env --chdir=/ {L}", "env -P /usr/bin {L}",
+    "env --frobnicate {L}",
+], ids=["command-x", "exec-z", "time-l", "nohup-long", "builtin-x", "env-C",
+        "env-chdir", "env-P", "env-unknown-long"])
+def test_965_an_uninterpretable_prefix_option_fails_closed(command, tmp_path, request):
+    """An option the guard cannot interpret, or one that moves where the
+    program resolves (`env -C`, `env -P`), rejects the launch even when the
+    switch is carried: the segment is never skipped."""
+    import _lib_test_isolation as iso
+    try:
+        with pytest.raises(iso.RetentionPolicyBlocked) as caught:
+            # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+            subprocess.run(["bash", "-c", command.format(L=_ret_launch())],
+                           env=_retention_env(tmp_path, "1"), capture_output=True,
+                           text=True, timeout=QUICK_TIMEOUT_S)
+        assert _RET_UNPARSED_REASON in str(caught.value), str(caught.value)
+        assert f"{_RET_SWITCH} is" not in str(caught.value), str(caught.value)
+    finally:
+        iso.drop_node_from_ledger(request.node.nodeid)
+
+
+@pytest.mark.parametrize("argv", [
+    ["env", "-u", "FOO", "-S", "{py} {cli} --version"],
+    ["env", "-iS", "PATH=/usr/bin:/bin {py} {cli} --version"],
+    ["env", "--", "{py}", "{cli}", "--version"],
+    ["{py}", "-bW", "error", "{cli}", "--version"],
+    ["{py}", "--check-hash-based-pycs", "never", "{cli}", "--version"],
+], ids=["env-u-then-S", "env-iS", "env-dashdash", "python-bW", "python-check-hash"])
+def test_965_option_arguments_in_an_argv_launch_are_parsed(argv, tmp_path, request):
+    """The same rule for a direct argv: an `env` or `python` option's argument
+    is never taken for the program or the script."""
+    argv = [a.format(py=sys.executable, cli=_RET_CLI) for a in argv]
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        argv, env=_retention_env(tmp_path, None),
+        capture_output=True, text=True, timeout=QUICK_TIMEOUT_S), switch=None)
+
+
+def test_965_command_v_runs_nothing_and_is_not_judged(tmp_path):
+    """`command -v` only describes the program; nothing is launched."""
+    import shlex
+    # timing-budget: #965 hang bound for one quick shell launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run(["bash", "-c", f"command -v {shlex.quote(str(_RET_CLI))}"],
+                          env=_retention_env(tmp_path, None),
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize("form", ["command-dashdash", "exec-a", "env-split-string"])
+def test_965_a_prefixed_launch_with_the_switch_runs(form, tmp_path):
+    """Parsing the prefix does not over-reject: the switch admits it."""
+    command = _RET_PREFIXED[form].format(L=_ret_launch())
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run(["bash", "-c", command], env=_retention_env(tmp_path, "1"),
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_965_a_path_only_scrub_passes(tmp_path):
+    env = _retention_env(tmp_path, "1")
+    env["PATH"] = "/usr/bin:/bin"
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run([sys.executable, str(_RET_CLI), "--version"], env=env,
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_965_a_stub_named_cctally_is_not_a_covered_launch(tmp_path):
+    """A file named `cctally` with no `_cctally_core.py` beside it is a stub (the
+    fake installs of setup, update and doctor tests), not cctally code: the guard
+    does not judge it, so it needs neither the switch nor a declaration."""
+    stub = tmp_path / "stub-bin" / "cctally"
+    stub.parent.mkdir()
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    # timing-budget: #965 hang bound for one quick cctally launch, QUICK_TIMEOUT_S (30 s) from tests/_retention_fixtures.py, under the 120 s cap
+    proc = subprocess.run([str(stub)], env=_retention_env(tmp_path, None),
+                          capture_output=True, text=True, timeout=QUICK_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_965_packaged_code_is_rejected_undeclared_and_runs_declared(tmp_path, request):
+    import _lib_test_isolation as iso
+    from _retention_fixtures import copy_layout, counts, seed, stage, write_retention
+    packaged = copy_layout("packaged", tmp_path / "packaged")
+    staged = stage(tmp_path / "store")
+    assert staged.env.get(_RET_SWITCH) == "1"
+
+    def checkout_cache_sync(*args):
+        # timing-budget: #965 hang bound for one cctally launch, LAUNCH_TIMEOUT_S (45 s) from tests/_retention_fixtures.py; a node makes at most two in sequence, under the 120 s cap
+        proc = subprocess.run([sys.executable, str(_RET_CLI), "cache-sync", *args],
+                              env=staged.env, capture_output=True, text=True,
+                              timeout=LAUNCH_TIMEOUT_S)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    # Non-vacuity: the store holds expired Claude and Codex transcripts before
+    # the packaged launch is observed pruning them.
+    seed(staged.data, checkout_cache_sync)
+    write_retention(staged.data, None)
+    argv = [sys.executable, str(packaged), "cache-sync", "--source", "all", "--rebuild"]
+    # timing-budget: #965 hang bound for one cctally launch, LAUNCH_TIMEOUT_S (45 s) from tests/_retention_fixtures.py; a node makes at most two in sequence, under the 120 s cap
+    _expect_retention_rejection(request, lambda: subprocess.run(
+        argv, env=staged.env, cwd=REPO_ROOT, capture_output=True, text=True,
+        timeout=LAUNCH_TIMEOUT_S), switch="carried", ineligible=True)
+    with iso.retention_launch_control("production-behavior",
+                                      reason="#965 T6: packaged code is the subject"):
+        # timing-budget: #965 hang bound for one cctally launch, LAUNCH_TIMEOUT_S (45 s) from tests/_retention_fixtures.py; a node makes at most two in sequence, under the 120 s cap
+        proc = subprocess.run(argv, env=staged.env, cwd=REPO_ROOT,
+                              capture_output=True, text=True, timeout=LAUNCH_TIMEOUT_S)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    got = counts(staged.data)
+    assert got["recent_claude"] > 0, got
+    assert got["expired_claude"] == 0 and got["expired_codex"] == 0, (
+        f"the declared packaged launch did not run with production retention: {got}")
+
+
+_RETENTION_SWALLOW_MODULE = """\
+import os
+import subprocess
+import sys
+
+import _lib_test_isolation as iso
+
+
+def test_it_swallows_a_retention_rejection(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != iso.RETENTION_SWITCH}
+    env["HOME"] = str(tmp_path)
+    try:
+        subprocess.run([sys.executable, %(cli)r, "--version"], env=env,
+                       capture_output=True, timeout=30)
+    except iso.RetentionPolicyBlocked:
+        pass
+"""
+
+
+def test_965_a_caught_retention_rejection_still_fails_the_test(tmp_path):
+    module = tmp_path / "test_nested_retention_swallow.py"
+    module.write_text(_RETENTION_SWALLOW_MODULE % {"cli": str(_RET_CLI)})
+    synthetic = tmp_path / "nested-data"
+    synthetic.mkdir()
+    proc = _nested_pytest(module, tmp_path, synthetic)
+    assert proc.returncode != 0, (
+        "the nested run passed; a swallowed retention rejection did not fail it\n"
+        + proc.stdout)
+    assert "retention-policy violation" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_the_session_directory_follows_the_suite_temp_root(tmp_path):
+    """#963 (note R11): the isolation session directory lives in the suite
+    generation's private temp root, so it is removed with it, instead of
+    accumulating under TMPDIR for every session and every --collect-only."""
+    import tempfile
+
+    import _lib_test_isolation as iso
+
+    root = tmp_path / "t"
+    root.mkdir()
+    env = {"PYTEST_DEBUG_TEMPROOT": str(root), iso.ENV_SESSION: "s963"}
+    # session_id() returns the identifier this process already minted (it
+    # ignores env once one exists), so the leaf is named through it.
+    leaf = iso.session_id(env)
+    assert iso.session_dir(env) == root / "cctally-isolation" / leaf, (
+        "the isolation session directory is outside the suite generation")
+    fallback = pathlib.Path(tempfile.gettempdir()) / "cctally-isolation" / leaf
+    for value in (str(tmp_path / "missing"), "relative/t", ""):
+        env["PYTEST_DEBUG_TEMPROOT"] = value
+        assert iso.session_dir(env) == fallback, value
+
+
+def test_a_fresh_child_environment_keeps_the_suite_temp_root(tmp_path):
+    import _lib_test_isolation as iso
+
+    root = tmp_path / "t"
+    root.mkdir()
+    parent = {"PYTEST_DEBUG_TEMPROOT": str(root), "TMPDIR": "/tmp/x"}
+    child = {"PATH": "/usr/bin", "TMPDIR": "/tmp/x"}
+    iso._restore_suite_temp_root(child, parent)
+    assert child.get("PYTEST_DEBUG_TEMPROOT") == str(root), (
+        "a fresh child environment lost the suite's PYTEST_DEBUG_TEMPROOT")
+    moved = {"PATH": "/usr/bin", "TMPDIR": str(tmp_path / "elsewhere")}
+    iso._restore_suite_temp_root(moved, parent)
+    assert "PYTEST_DEBUG_TEMPROOT" not in moved, "a child that chose its own TMPDIR was overridden"
+    own = {"PYTEST_DEBUG_TEMPROOT": "/own", "TMPDIR": "/tmp/x"}
+    iso._restore_suite_temp_root(own, parent)
+    assert own["PYTEST_DEBUG_TEMPROOT"] == "/own"
+    for bad in (str(tmp_path / "missing"), "relative"):
+        c = {"TMPDIR": "/tmp/x"}
+        iso._restore_suite_temp_root(c, dict(parent, PYTEST_DEBUG_TEMPROOT=bad))
+        assert "PYTEST_DEBUG_TEMPROOT" not in c, bad
+
+
+def test_the_child_environment_applies_the_suite_temp_root(monkeypatch):
+    import _lib_test_isolation as iso
+
+    seen = []
+    monkeypatch.setattr(iso, "_restore_suite_temp_root",
+                        lambda child, parent: seen.append(dict(child)))
+    iso._child_environment({"PATH": "/usr/bin"})
+    assert seen, "_child_environment does not restore the suite temp root"

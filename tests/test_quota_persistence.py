@@ -95,11 +95,12 @@ def _analysis(glue, *, status=None, verdict=None, exit_code=0, fitted=None,
                                 else composition_provenance))
 
 
-def _mode(glue, kind="automatic", account_key=None):
+def _mode(glue, kind="automatic", account_key=None, coefficient_era="opus-5",
+          now=NOW, regime_start=REGIME_START):
     return glue.PersistMode(
-        kind=kind, account_key=account_key, now=NOW,
+        kind=kind, account_key=account_key, now=now,
         fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
-        regime_start=REGIME_START)
+        regime_start=regime_start, coefficient_era=coefficient_era)
 
 
 def _regimes(state, glue, account_key=None):
@@ -654,3 +655,189 @@ def test_691_the_helper_is_the_conjunction_it_claims_to_be(glue):
     assert glue._transition_persistence_admitted(object()) is False, (
         "the helper must stay total over any input, as the predicate it "
         "wraps is")
+
+
+# --------------------------------------------------------------------------
+# #978 spec 4.5 — an era change rolls the calibration over; it is never a
+# metering-rate transition.
+# --------------------------------------------------------------------------
+LEGACY_FINGERPRINT = (
+    "0cd932a7f8caa5d9bec7010ed5d800935e5c78332ae060c1142650943512a24a")
+NEW_ERA_NOW = dt.datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+NEW_ERA_START = dt.datetime(2026, 9, 22, tzinfo=UTC)
+
+
+def _open_prior(*, fingerprint, era=None, value=2_400_000.0):
+    regime = {
+        "effectiveFrom": "2026-07-25T00:00:00+00:00",
+        "effectiveUntil": None, "fingerprint": fingerprint,
+        "algorithmRevision": 3, "unitsPerPoint": value,
+        "interval": {"lo": value * 0.95, "hi": value * 1.05},
+        "support": {"days": 30, "segments": 4}, "status": "ok",
+        "asOf": "2026-09-01T00:00:00+00:00", "qualifications": []}
+    if era is not None:
+        regime["coefficientEra"] = era
+    return regime
+
+
+def _state(*regimes, key="*"):
+    return {"schemaVersion": 1,
+            "accounts": {key: {"regimes": [dict(r) for r in regimes]}}}
+
+
+def _new_era_mode(glue, account_key=None):
+    return _mode(glue, account_key=account_key, coefficient_era="opus-5-5",
+                 now=NEW_ERA_NOW, regime_start=NEW_ERA_START)
+
+
+def _assert_rolled_over(glue, regimes, prior_value):
+    mrc = glue._cctally()._load_sibling("_lib_meter_rate_change")
+    assert len(regimes) == 2, regimes
+    assert regimes[0]["unitsPerPoint"] == prior_value
+    assert regimes[0]["status"] == "stale"
+    assert regimes[0]["effectiveUntil"] == NEW_ERA_NOW.isoformat()
+    assert regimes[1]["coefficientEra"] == "opus-5-5"
+    assert regimes[1]["effectiveUntil"] is None
+    assert regimes[1]["unitsPerPoint"] == 1_000_000.0
+    assert mrc.enumerate_transitions(
+        regimes, provider="claude", account_key="unattributed",
+        detected_at=NEW_ERA_NOW.isoformat()) == ()
+    assert mrc.active_rate_change(regimes) is None
+
+
+@pytest.mark.parametrize("prior", [
+    _open_prior(fingerprint=LEGACY_FINGERPRINT),
+    None,  # the current fingerprint, under the other era (set below)
+], ids=["legacy-fingerprint", "same-fingerprint-other-era"])
+def test_legacy_fingerprint_prior_rolls_over_without_transition(glue, prior):
+    """RED test 4. Both an old-build prior (no `coefficientEra`) and a
+    current-build `opus-5` prior roll over on a trustworthy new-era fit: the
+    old regime is closed as stale at the clock and one `opus-5-5` regime is
+    appended, with no rate transition, no recovery candidate and no marker."""
+    if prior is None:
+        prior = _open_prior(
+            fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+            era="opus-5")
+    state = _state(prior)
+    _assert_rolled_over(
+        glue, _regimes(glue.reduce_state(
+            state, _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+            _new_era_mode(glue)), glue), 2_400_000.0)
+    assert state["accounts"]["*"]["regimes"][0]["status"] == "ok", \
+        "the reducer is pure"
+
+    glue.save_calibrations(state)
+    _quarantined, fresh, candidates = glue.persist_and_detect(
+        _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+        _new_era_mode(glue))
+    assert fresh == ()
+    assert candidates == ()
+    stored = glue.load_calibrations(now=NEW_ERA_NOW).state
+    _assert_rolled_over(glue, _regimes(stored, glue), 2_400_000.0)
+
+
+def test_same_fingerprint_other_era_prior_rolls_over(glue):
+    """The fingerprint matches, so before #978 this regime would have been
+    updated IN PLACE with an Opus 5.5 budget under its Opus 5 history."""
+    prior = _open_prior(fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+                        era="opus-5")
+    state = glue.reduce_state(
+        _state(prior), _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+        _new_era_mode(glue))
+    _assert_rolled_over(glue, _regimes(state, glue), 2_400_000.0)
+
+
+def test_a_same_era_prior_still_updates_in_place(glue):
+    """The control: under a matching fingerprint AND era nothing rolls over."""
+    prior = _open_prior(fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+                        era="opus-5-5")
+    regimes = _regimes(glue.reduce_state(
+        _state(prior), _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+        _new_era_mode(glue)), glue)
+    assert len(regimes) == 1
+    assert regimes[0]["unitsPerPoint"] == 1_000_000.0
+    assert regimes[0]["coefficientEra"] == "opus-5-5"
+
+
+def test_every_written_regime_names_its_era(glue):
+    regimes = _regimes(glue.reduce_state(
+        glue.empty_calibration_state(), _analysis(glue), _mode(glue)), glue)
+    assert [r["coefficientEra"] for r in regimes] == ["opus-5"]
+
+
+def test_two_accounts_rollover_is_order_independent(glue):
+    a = _open_prior(fingerprint=LEGACY_FINGERPRINT, value=2_400_000.0)
+    b = _open_prior(fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+                    era="opus-5", value=2_200_000.0)
+    fit = _analysis(glue, fitted=_evidence(glue, 1_000_000.0))
+
+    def run(order):
+        state = {"schemaVersion": 1, "accounts": {}}
+        for key, regime in order:
+            state["accounts"][key] = {"regimes": [dict(regime)]}
+        for key in ("a", "b"):
+            state = glue.reduce_state(state, fit,
+                                      _new_era_mode(glue, account_key=key))
+        return {key: json.dumps(_regimes(state, glue, key), sort_keys=True)
+                for key in ("a", "b")}
+
+    forward = run([("a", a), ("b", b)])
+    reverse = run([("b", b), ("a", a)])
+    assert forward == reverse
+    for key, prior_value in (("a", 2_400_000.0), ("b", 2_200_000.0)):
+        regimes = json.loads(forward[key])
+        assert [r["status"] for r in regimes] == ["stale", "ok"]
+        assert regimes[0]["unitsPerPoint"] == prior_value
+
+
+def test_recovery_and_active_marker_ignore_era_rollover(glue):
+    prior = _open_prior(fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+                        era="opus-5")
+    glue.save_calibrations(_state(prior))
+    glue.persist_and_detect(
+        _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+        _new_era_mode(glue))
+    stored = glue.load_calibrations(now=NEW_ERA_NOW).state
+    assert glue.recovery_candidates(
+        stored, None, detected_at=NEW_ERA_NOW.isoformat()) == ()
+    delivery = glue.seed_delivery_state()
+    assert glue._owed_rate_change_transitions(
+        ["unattributed"], delivery, now=NEW_ERA_NOW) == ()
+    mrc = glue._cctally()._load_sibling("_lib_meter_rate_change")
+    assert mrc.active_rate_change(_regimes(stored, glue)) is None
+
+
+def test_historical_clock_never_overwrites_later_era(glue):
+    """A `CCTALLY_AS_OF` inside the Opus 5 era against a stored `opus-5-5`
+    calibration persists nothing, however trustworthy its own fit."""
+    stored = _state(_open_prior(
+        fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT, era="opus-5-5",
+        value=1_000_000.0))
+    assert glue.reduce_state(
+        stored, _analysis(glue, fitted=_evidence(glue, 2_400_000.0)),
+        _mode(glue, coefficient_era="opus-5")) is stored
+
+
+def test_a_run_with_no_selected_era_persists_nothing(glue):
+    stored = glue.empty_calibration_state()
+    assert glue.reduce_state(stored, _analysis(glue),
+                             _mode(glue, coefficient_era=None)) is stored
+
+
+@pytest.mark.parametrize("recorded, era_id, stale", [
+    ({"fingerprint": "current", "coefficientEra": "opus-5-5"}, "opus-5-5",
+     False),
+    ({"fingerprint": "current", "coefficientEra": "opus-5"}, "opus-5-5",
+     True),
+    ({"fingerprint": "old"}, "opus-5-5", True),
+    (None, "opus-5-5", False),
+])
+def test_a_prior_from_another_era_is_reported_stale(glue, recorded, era_id,
+                                                    stale):
+    """Spec 4.3's status table: a stored prior under other constants or
+    another era is the `stale` overlay, as today."""
+    if recorded is not None and recorded["fingerprint"] == "current":
+        recorded = dict(recorded,
+                        fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT)
+    era = glue.qm.era_by_id(era_id)
+    assert glue.recorded_prior_is_stale(recorded, era) is stale

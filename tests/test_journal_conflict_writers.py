@@ -446,7 +446,7 @@ def test_real_record_usage_retry_preserves_durable_frozen_block(
         for candidate in candidates
     }
     content_hashes = {
-        jr._lib_journal._sha256_canonical(candidate) for candidate in candidates
+        jr._lib_journal.event_content_hash(candidate) for candidate in candidates
     }
     assert len(canonical) == 1, "every retry candidate must be byte-identical"
     assert len(content_hashes) == 1

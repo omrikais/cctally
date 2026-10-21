@@ -264,6 +264,16 @@ BLOCKING_CALLEES = {
         "`session_queue.TaskAdmission.prepare_isolated` runs the isolated "
         "checkout's Git steps, each bounded by what its `timeout_s` callable "
         "reports is left"),
+    "AccessSupervisor": (
+        "the runner storage access supervisor: its `deadline=` is the budget "
+        "every later `run` on it spends waiting for its worker (#940)"),
+    "bounded_run": (
+        "the runner sampler's `bounded_run` waits for its reader up to its "
+        "`timeout`, then kills and reaps it (#940)"),
+    "_recover_completed_correction": (
+        "`_cctally_journal._recover_completed_correction` waits up to its "
+        "`timeout_s` for the maintenance and journal-ingest locks before the "
+        "in-band correction rebuild"),
 }
 
 #: The other half of the same decision, closed for the same reason. Each names a
@@ -285,6 +295,10 @@ NON_BLOCKING_CALLEES = {
         "`frozen_roots.copy_whole(…, deadline=…)` bounds the RETRIES of a stable "
         "whole-file read of a file the test controls; it waits on no other party, "
         "and a stable file returns on its first attempt"),
+    "_calibrate_root": (
+        "the root-calibration test helper runs calibration on a simulated clock "
+        "that its own `sleep` advances, so its `deadline=` settle bound spends "
+        "no wall time (#940)"),
 }
 
 #: Clocks a deadline is computed from.
@@ -1783,8 +1797,7 @@ def python_findings() -> list:
     """
     global _PYTHON_FINDINGS_CACHE
     if _PYTHON_FINDINGS_CACHE is None:
-        _PYTHON_FINDINGS_CACHE = _scan_python_findings(
-            [path for path in _tracked("tests/*.py") if path.exists()])
+        _PYTHON_FINDINGS_CACHE = _scan_python_findings(_python_estate())
     return list(_PYTHON_FINDINGS_CACHE)
 
 
@@ -2084,8 +2097,73 @@ def shell_findings() -> list:
 PYTHON_SCAN_SHARDS = 16
 
 
+#: A tracked file with this name marks its directory as the home of a vendored
+#: historical source tree: the sibling `tree/` directory holds another
+#: revision's code, kept byte for byte as a test fixture and pinned to that
+#: revision's identity, so it is not part of this revision's Python estate and
+#: the scan leaves it out (only that directory). A checkout that tracks no
+#: marker excludes nothing.
+FROZEN_SOURCE_MARKER = "FROZEN_SOURCE_TREE"
+
+
+def _frozen_tree_prefixes(tracked) -> tuple:
+    """The `<d>/tree/` prefix of every directory `<d>` that holds the marker,
+    from repo-relative POSIX paths."""
+    prefixes = set()
+    for rel in tracked:
+        parent, _, name = rel.rpartition("/")
+        if name == FROZEN_SOURCE_MARKER:
+            prefixes.add(f"{parent}/tree/" if parent else "tree/")
+    return tuple(sorted(prefixes))
+
+
+def _frozen_source_trees() -> tuple:
+    """The frozen source trees this checkout marks."""
+    return _frozen_tree_prefixes(
+        path.relative_to(REPO).as_posix() for path in _tracked("*" + FROZEN_SOURCE_MARKER))
+
+
+def _in_frozen_tree(path, trees) -> bool:
+    """Whether a repo path lies under one of `trees`. The path is taken
+    relative to the repository as written, never resolved, so a symlink that
+    points outside the repository cannot make it raise."""
+    return pathlib.Path(path).relative_to(REPO).as_posix().startswith(trees)
+
+
 def _python_estate() -> list:
-    return sorted(path for path in _tracked("tests/*.py") if path.exists())
+    trees = _frozen_source_trees()
+    return sorted(path for path in _tracked("tests/*.py") if path.exists() and not _in_frozen_tree(path, trees))
+
+
+def test_a_frozen_source_tree_is_outside_the_python_estate():
+    """A tracked marker file makes its sibling `tree/` directory a frozen
+    source tree: a module under that directory leaves the Python estate, while
+    a module beside the marker, under a similarly named directory or under an
+    unmarked `tree/` stays. The estate is every tracked pytest-tree module
+    minus the marked trees, and each marked tree really holds modules."""
+    synthetic = [
+        "a/b/" + FROZEN_SOURCE_MARKER, "a/b/tree/lib/module.py", "a/b/module.py",
+        "a/b/treehouse/module.py", "c/tree/module.py", "d/NOT_" + FROZEN_SOURCE_MARKER,
+        "d/tree/module.py",
+    ]
+    trees = _frozen_tree_prefixes(synthetic)
+    assert trees == ("a/b/tree/",)
+    assert _in_frozen_tree(REPO / "a" / "b" / "tree" / "lib" / "module.py", trees)
+    for beside in ("a/b/module.py", "a/b/treehouse/module.py", "c/tree/module.py", "d/tree/module.py"):
+        assert not _in_frozen_tree(REPO / beside, trees), beside
+    assert _frozen_tree_prefixes([]) == ()
+
+    markers = [path for path in _tracked("*" + FROZEN_SOURCE_MARKER) if path.name == FROZEN_SOURCE_MARKER]
+    real = _frozen_source_trees()
+    assert real == _frozen_tree_prefixes(path.relative_to(REPO).as_posix() for path in markers)
+    tracked = {path for path in _tracked("tests/*.py") if path.exists()}
+    frozen = {path for path in tracked if _in_frozen_tree(path, real)}
+    for prefix in real:
+        assert any(path.relative_to(REPO).as_posix().startswith(prefix) for path in frozen), prefix
+    estate = set(_python_estate())
+    ordinary = REPO / "tests" / "test_timing_budget_guard.py"
+    assert ordinary in estate and not _in_frozen_tree(ordinary, real)
+    assert estate == tracked - frozen
 
 
 def _python_shard_index(path) -> int:
@@ -3410,6 +3488,42 @@ def test_a_tolerance_on_stored_data_is_not_an_elapsed_ceiling():
 # ------------------------------------------------------- python fixed waits
 
 
+def _is_prune_deletion_workload(relative, node, tree, text):
+    """One declared cost injection, installed on the real deletion seam.
+
+    This exception belongs to that workload, not to timing-budget comments.
+    Changing its duration, owner, installation or wrapper keeps the finding.
+    """
+    if relative != "tests/test_codex_prune_drain.py" or node.args[0].value != 3.0:
+        return False
+    parents = {id(child): parent for parent in ast.walk(tree)
+               for child in ast.iter_child_nodes(parent)}
+    statement = parents.get(id(node))
+    wrapper = parents.get(id(statement))
+    owner = parents.get(id(wrapper))
+    if not (isinstance(statement, ast.Expr)
+            and isinstance(wrapper, ast.FunctionDef) and wrapper.name == "slow_delete"
+            and isinstance(owner, ast.FunctionDef)
+            and owner.name == "test_hook_wall_time_stays_within_u4_overlapping_a_worker_and_alone"):
+        return False
+    annotation = "# injected-workload: codex-prune-deletion, exactly 3s; hook and nested-sync assertions must prove no inline deletion."
+    if text.splitlines()[node.lineno - 2].strip() != annotation:
+        return False
+    returns = [n for n in ast.walk(wrapper) if isinstance(n, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.Call) or _callee_of(returns[0].value) != "original":
+        return False
+    for call in ast.walk(owner):
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            continue
+        if (ast.unparse(call.func) == "monkeypatch.setattr" and len(call.args) == 3
+                and ast.unparse(call.args[0]) == "cache_mod"
+                and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == "_delete_codex_file_derived_rows"
+                and ast.unparse(call.args[2]) == "slow_delete"):
+            return True
+    return False
+
+
 def collect_fixed_waits(path, source=None, tree=None, *, _cache=None) -> list:
     """`time.sleep(N)` with N at or above a second, outside any loop.
 
@@ -3454,6 +3568,8 @@ def collect_fixed_waits(path, source=None, tree=None, *, _cache=None) -> list:
             continue
         seconds = float(value.value)
         if seconds < POLL_CADENCE_SECONDS or node.lineno in in_loop:
+            continue
+        if _is_prune_deletion_workload(relative, node, tree, text):
             continue
         findings.append(Finding(
             relative, node.lineno, "fixed-wait", seconds,
@@ -3700,3 +3816,18 @@ def test_it_flags_the_wait_that_polled_the_wrong_condition():
         "sleep 5  # let SIG_IGN install\n"
     )
     assert [f.kind for f in findings] == ["fixed-wait"], findings
+
+
+def test_only_the_declared_prune_deletion_workload_is_not_a_readiness_wait():
+    path = REPO / "tests/test_codex_prune_drain.py"
+    source = path.read_text()
+    assert not [f for f in collect_fixed_waits(path, source=source)
+                if f.function == "slow_delete"]
+    for changed in (
+        source.replace('time.sleep(3.0)', 'time.sleep(4.0)'),
+        source.replace('"_delete_codex_file_derived_rows", slow_delete', '"_other", slow_delete'),
+        source.replace('def slow_delete(', 'def readiness_wait('),
+    ):
+        assert any(f.kind == "fixed-wait" for f in collect_fixed_waits(path, source=changed))
+    annotated = "import time\ndef test_ready():\n    # timing-budget: wait for readiness\n    time.sleep(3.0)\n"
+    assert [f.kind for f in collect_fixed_waits("tests/probe.py", source=annotated)] == ["fixed-wait"]

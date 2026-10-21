@@ -20,6 +20,10 @@
 # stay byte-stable across runs.
 
 set -uo pipefail
+# #940 C11: drop one trailing slash (the macOS default TMPDIR carries one), so
+# the "${TMPDIR:-/tmp}/..." templates below never yield a doubled separator
+# that a golden path substitution or a prefix comparison would then miss.
+case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HARNESS_FIXTURES_DIR="$REPO_ROOT/tests/fixtures/quota"
@@ -30,7 +34,7 @@ HARNESS_BIN="$REPO_ROOT/bin/cctally"
 # shellcheck source=bin/_lib-golden-diff.sh
 . "$REPO_ROOT/bin/_lib-golden-diff.sh"
 
-SCRATCH_DIR=$(mktemp -d -t cctally-quota-fixtures-XXXXXX) || {
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-quota-fixtures-XXXXXX") || {
     echo "FAIL: could not create a scratch directory" >&2
     exit 1
 }
@@ -125,7 +129,7 @@ done
 # A skip predicate that matched everything would leave this harness reporting
 # a clean pass over nothing, which is the failure the manifest's minCases
 # floor also guards. Both are cheap; neither alone is a mechanism.
-if [ "$scenario_count" -lt 10 ]; then
+if [ "$scenario_count" -lt 12 ]; then
     echo "FAIL: only $scenario_count scenario(s) carried an input.env"
     fail_count=$((fail_count + 1))
 fi

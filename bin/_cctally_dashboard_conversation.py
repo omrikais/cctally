@@ -65,6 +65,7 @@ from _lib_dashboard_json import (
     encode_dashboard_json_bytes_capped,
 )
 from _lib_retained_size import retained_size_bytes
+import _lib_codex_rollout_container as _rc
 
 
 def _advance_live_tail_accounting(handler, changed, sync, label):
@@ -443,40 +444,280 @@ def _cached_file_sigs(conn, paths):
     return out
 
 
+#: The cursor columns a Codex live-tail signature is computed from (#968 5.9).
+_CODEX_WATCH_SIG_COLUMNS = (
+    "path, size_bytes, container_kind, container_size_bytes, mtime_ns, "
+    "device_id, inode, pending_container_fingerprint")
+
+
+def _codex_watch_kernel():
+    return sys.modules["cctally"]._load_sibling("_lib_codex_conversation_watch")
+
+
+def _codex_acknowledged_sig(row):
+    """The live-tail signature one ``codex_conversation_source_files`` row
+    acknowledges (#968 spec 5.9).
+
+    A container already recorded as pending (or unverified) work is
+    acknowledged at its recorded fingerprint: the verification executor owns
+    it, and rescheduling it on every poll is the non-convergence I9 forbids.
+    Otherwise the accepted container's signature: ``("plain", size)`` for
+    plain, which is today's committed size, or the container identity for a
+    zstd container.
+    """
+    _path, size, kind, csize, mtime_ns, device, inode, pending = row
+    if pending:
+        fingerprint = _rc.ContainerFingerprint.from_json(pending)
+        if fingerprint is not None:
+            return fingerprint.watch_sig()
+    return _codex_watch_kernel().committed_watch_sig(
+        kind, size, csize, mtime_ns, device, inode)
+
+
 def _codex_cached_file_sigs(conn, paths):
-    """{path: size_bytes} from ``codex_conversation_source_files`` for the given paths — the
-    Codex analogue of ``_cached_file_sigs`` (spec §5.2). Size-only, matching the
-    watch kernel's size-only signature and ``sync_codex_cache``'s size-only
-    delta. Paths with no row are absent → treated as changed. Baselines the
-    Codex live-tail watch against the cache's own committed cursor so growth
-    during an ingest is re-detected next cycle (the per-path committed-cursor
-    invariant — the S6 physical mutation sequence is at most an extra
-    certificate, never this cursor's replacement)."""
+    """{path: acknowledged signature} from ``codex_conversation_source_files``
+    for the given paths — the Codex analogue of ``_cached_file_sigs`` (spec
+    §5.2), in the container-aware shape the Codex observation seam returns
+    (#968 spec 5.9). Paths with no row are absent → treated as changed.
+    Baselines the Codex live-tail watch against the cache's own committed
+    cursor so growth during an ingest is re-detected next cycle (the per-path
+    committed-cursor invariant — the S6 physical mutation sequence is at most
+    an extra certificate, never this cursor's replacement)."""
     out = {}
     if not paths:
         return out
     placeholders = ",".join("?" for _ in paths)
     try:
         rows = conn.execute(
-            f"SELECT path, size_bytes FROM codex_conversation_source_files "
+            f"SELECT {_CODEX_WATCH_SIG_COLUMNS} "
+            f"FROM codex_conversation_source_files "
             f"WHERE path IN ({placeholders})", list(paths)).fetchall()
     except sqlite3.OperationalError:
         return out
-    for p, size in rows:
-        out[p] = size
+    for row in rows:
+        out[row[0]] = _codex_acknowledged_sig(row)
     return out
 
 
 def _codex_all_committed_sizes(conn):
-    """{path: size_bytes} for EVERY tracked Codex file — fed to the frontier as
-    both the ``known_paths`` diff set and the ``committed_sizes`` growth
-    baseline. A plain SELECT (no lock), so it never widens the SSE lock scope."""
+    """{path: acknowledged signature} for EVERY tracked Codex file — fed to the
+    frontier as both the ``known_paths`` diff set and the ``committed_sizes``
+    growth baseline, which the kernel compares with ``codex_sig_advanced``
+    (#968 spec 5.9). A plain SELECT (no lock), so it never widens the SSE lock
+    scope."""
     try:
         rows = conn.execute(
-            "SELECT path, size_bytes FROM codex_conversation_source_files").fetchall()
+            f"SELECT {_CODEX_WATCH_SIG_COLUMNS} "
+            "FROM codex_conversation_source_files").fetchall()
     except sqlite3.OperationalError:
         return {}
-    return {p: size for (p, size) in rows}
+    return {row[0]: _codex_acknowledged_sig(row) for row in rows}
+
+
+def _codex_seal_token(conn):
+    """The publication barrier's seal token (Task 11's ``SEAL_SEQ_KEY``), read
+    through the attached cache; ``None`` when unreadable, which never re-arms
+    anything."""
+    barrier = sys.modules["cctally"]._load_sibling(
+        "_lib_codex_publication_barrier")
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_db.cache_meta WHERE key=?",
+            (barrier.SEAL_SEQ_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None else row[0]
+
+
+@dataclasses.dataclass
+class _CodexWatchIngest:
+    """Stream-local observations, separate from the durable ingest result.
+
+    ``stats.targeted_clean`` remains authoritative for ingest completion. A
+    held container can acknowledge its observed signature without certifying
+    any accounting or transcript work as complete (T12-INTEG01).
+    """
+
+    stats: object
+    accounting_blocked: bool = False
+    acknowledged: dict = dataclasses.field(default_factory=dict)
+    observation_visible: bool = False
+
+    def __getattr__(self, name):
+        return getattr(self.stats, name)
+
+
+def _codex_observation_hold_only(stats, *, executor_owned=False):
+    """Recognize container holds without overlooking an actual ingest loss.
+
+    This is only admission to a stream-local observation acknowledgment,
+    never a replacement for ``targeted_clean`` or a frontier certificate.
+    Unknown skipped reasons and every failed/contended ingest stay dirty.
+    """
+    if any(getattr(stats, name, False) for name in (
+            "lock_contended", "deferred_reason", "files_failed",
+            "files_deferred_torn", "files_deferred_reset", "maintenance_failed",
+            "budget_exhausted", "drain_yielded", "rebuild_refused")):
+        return False
+    if getattr(stats, "barrier_retry", False) and not executor_owned:
+        return False
+    skipped = getattr(stats, "container_skipped", {})
+    return (bool(getattr(stats, "container_pending", 0) or any(skipped.values()))
+            and set(skipped) <= {
+                "decoder-unavailable", "decode-error", "read-error",
+                "unstable-stat", "verification-pending", "verification-unverified"})
+
+
+def _codex_watch_probes(conn):
+    """Container observations and committed cursors for both Codex polls.
+
+    Pending fingerprints acknowledge executor-owned work. A container held
+    without a recorded fingerprint acknowledges the pre-ingest observation,
+    so replacement during ingest is still detected. These are observation
+    acknowledgments only: durable pending work remains dirty.
+
+    A scoped accounting hold cannot run transcript ingest. It acknowledges
+    the observation quietly and retries once accounting accepts that exact
+    container. Failed or contended accounting remains unacknowledged. Plain
+    barrier-deferred files wait at their pre-ingest observation until a real
+    file change or a readable new seal token re-arms them once.
+    """
+    observed: dict = {}
+    deferred: dict = {}     # path -> (pre-ingest signature, seal token)
+    accounting_wait: dict = {}  # path -> observed container awaiting accounting
+    rearmed: set = set()
+
+    def accounting_accepted(path, sig):
+        try:
+            row = conn.execute(
+                f"SELECT {_CODEX_WATCH_SIG_COLUMNS} "
+                "FROM cache_db.codex_session_files "
+                "WHERE path=? AND container_state='accepted'", (path,)).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None and _codex_acknowledged_sig(row) == sig
+
+    def executor_owns_observations(paths):
+        # Publication-unit planning can encounter the same pending container
+        # as phase one and set barrier_retry. Acknowledge only when EVERY
+        # changed path has durable executor ownership of the exact observation;
+        # a failed plain/accepted contributor must keep the whole poll retrying.
+        if not paths:
+            return False
+        marks = ",".join("?" for _ in paths)
+        try:
+            rows = conn.execute(
+                "SELECT path,pending_container_fingerprint "
+                "FROM codex_conversation_source_files "
+                f"WHERE path IN ({marks}) AND container_state='pending'",
+                list(paths)).fetchall()
+        except sqlite3.Error:
+            return False
+        if len(rows) != len(paths):
+            return False
+        for path, pending in rows:
+            fingerprint = _rc.ContainerFingerprint.from_json(pending)
+            before = observed.get(path)
+            if (fingerprint is None or before is None
+                    or before[0] != _rc.ZSTD
+                    or fingerprint.watch_sig() != before):
+                return False
+        return True
+
+    def stat_fn(path):
+        sig = _rc.observe_watch_sig(path)
+        observed[path] = sig
+        waiting = accounting_wait.get(path)
+        if waiting is not None:
+            if sig != waiting:
+                del accounting_wait[path]
+            elif accounting_accepted(path, sig):
+                del accounting_wait[path]
+                rearmed.add(path)
+        held = deferred.get(path)
+        if held is not None:
+            token = _codex_seal_token(conn)
+            if sig != held[0] or (token is not None and token != held[1]):
+                del deferred[path]
+                if sig == held[0]:
+                    rearmed.add(path)
+        if path in rearmed and sig is not None:
+            return ("rearm",) + tuple(sig)
+        return sig
+
+    def committed_sig(path):
+        rearmed.discard(path)       # reached only after a clean ingest
+        held = deferred.get(path)
+        if held is not None:
+            return held[0]
+        acknowledged = _codex_cached_file_sigs(conn, [path]).get(path)
+        before = observed.get(path)
+        if (before is not None and before[0] == _rc.ZSTD
+                and acknowledged != before):
+            return before
+        return acknowledged
+
+    def settle_ingest(ingest):
+        def settled(changed):
+            token = _codex_seal_token(conn)
+            result = ingest(changed)
+            if isinstance(result, _CodexWatchIngest):
+                stats = result.stats
+            else:
+                stats = result
+                result = _CodexWatchIngest(stats)
+            clean = getattr(stats, "targeted_clean", False)
+            executor_owned = (
+                getattr(stats, "barrier_retry", False)
+                and not result.accounting_blocked
+                and not getattr(stats, "barrier_files_deferred", 0)
+                and executor_owns_observations(changed))
+            held_only = _codex_observation_hold_only(
+                stats, executor_owned=executor_owned)
+            if not clean and not held_only:
+                return result
+            acknowledged = _codex_cached_file_sigs(conn, list(changed))
+            plain_deferred = 0
+            for path in changed:
+                before = observed.get(path)
+                if before is None:
+                    continue
+                if before[0] == _rc.ZSTD and held_only:
+                    # The pass actually observed this container, even if the
+                    # verification executor still owes its durable work.
+                    result.acknowledged[path] = before
+                    rearmed.discard(path)
+                    if result.accounting_blocked:
+                        accounting_wait[path] = before
+                elif (not result.accounting_blocked
+                      and getattr(stats, "barrier_files_deferred", 0)
+                      and before[0] != _rc.ZSTD
+                      and _codex_watch_kernel().codex_sig_advanced(
+                          before, acknowledged.get(path))):
+                    # Phase-one deferrals can publish in phase two. Only a
+                    # committed cursor behind the probe still owes this work;
+                    # ingestion may already have consumed a later append.
+                    deferred[path] = (before, token)
+                    result.acknowledged[path] = before
+                    plain_deferred += 1
+                elif not result.accounting_blocked and not clean:
+                    # A mixed pass may have committed a plain contributor
+                    # while holding a container. Keep its committed cursor.
+                    sig = acknowledged.get(path)
+                    if sig is not None:
+                        result.acknowledged[path] = sig
+            if (plain_deferred == len(changed)
+                    and not getattr(stats, "targeted_visible", False)):
+                stats.targeted_visible = False
+            result.observation_visible = (
+                not clean and bool(result.acknowledged)
+                and not result.accounting_blocked
+                and not getattr(stats, "barrier_retry", False)
+                and bool(getattr(stats, "targeted_visible", True)))
+            return result
+        return settled
+
+    return stat_fn, committed_sig, settle_ingest
 
 
 def _codex_classified_paths(conn, paths):
@@ -1220,7 +1461,7 @@ def _send_sse_headers(handler) -> None:
 
 def _run_conversation_events_stream(
     handler, conn, *, passive, tail_data, resolve, ingest, cached_sigs,
-    discovery_step=None,
+    discovery_step=None, stat_fn=None, committed_sig=None,
 ) -> None:
     """Shared per-conversation live-tail SSE loop (spec §5.2), driving both the
     bare (``sessionId``) and qualified (``conversationKey``) streams from ONE
@@ -1236,9 +1477,18 @@ def _run_conversation_events_stream(
     ~10-cycle Codex child-discovery frontier (``None`` for Claude — a bare or
     qualified-Claude stream never runs it). The cache lock is held ONLY inside
     ``ingest`` / ``discovery_step``, never across a sleep (the #297 WAL
-    discipline)."""
+    discipline).
+
+    ``stat_fn`` / ``committed_sig`` are the provider's observation seam
+    (#968 spec 5.9): Codex passes ``_codex_watch_probes`` so both poll sites
+    compare one container-aware signature shape; ``None`` keeps the kernel's
+    literal-path size probe and the committed-cursor lookup through
+    ``cached_sigs`` (Claude, unchanged).
+    """
     import time as _time
     watch = sys.modules["cctally"]._load_sibling("_lib_conversation_watch")
+    probe = stat_fn or watch.file_sig
+    committed = committed_sig or (lambda p: cached_sigs([p]).get(p))
     tail_frame = (
         "event: tail\ndata: " + encode_dashboard_json(tail_data) + "\n\n"
     ).encode("utf-8")
@@ -1286,12 +1536,26 @@ def _run_conversation_events_stream(
         if _request_peer_gone(handler, timeout=_LIVE_TAIL_POLL_INTERVAL):
             return
         cycles += 1
-        changed = watch.changed_paths(files, seen)
+        changed = watch.changed_paths(files, seen, probe)
         if changed:
             _time.sleep(_LIVE_TAIL_DEBOUNCE)
+            observation = None
+
+            def poll_ingest(changed):
+                nonlocal observation
+                observation = ingest(changed)
+                return observation
+
             new_seen, emitted = watch.watch_step(
-                files, seen, ingest_fn=ingest,
-                committed_sig_fn=lambda p: cached_sigs([p]).get(p))
+                files, seen, stat_fn=probe, ingest_fn=poll_ingest,
+                committed_sig_fn=committed)
+            if isinstance(observation, _CodexWatchIngest):
+                # A held container was observed, not successfully ingested.
+                # Keep that distinction out of the generic watch kernel and
+                # out of every durable cursor/certification decision.
+                new_seen = dict(new_seen)
+                new_seen.update(observation.acknowledged)
+                emitted = emitted or observation.observation_visible
             seen = new_seen
             if emitted:
                 handler.wfile.write(tail_frame)
@@ -1643,7 +1907,8 @@ def _qualified_conversation_events(
             finally:
                 accounting.close()
             if not accounting_stats.targeted_clean:
-                return accounting_stats
+                return _CodexWatchIngest(
+                    accounting_stats, accounting_blocked=True)
             writer = sys.modules["_cctally_dashboard"].open_conversations_db()
             try:
                 stats = sync_codex_conversations(writer, only_paths=set(changed))
@@ -1658,6 +1923,8 @@ def _qualified_conversation_events(
             return stats
 
         cached = lambda paths: _codex_cached_file_sigs(conn, paths)
+        stat_fn, committed_sig, settle_ingest = _codex_watch_probes(conn)
+        _ingest = settle_ingest(_ingest)
         discovery = (
             None if account_key is not None
             else _make_codex_discovery_step(handler, conn, key, cq_codex)
@@ -1694,6 +1961,7 @@ def _qualified_conversation_events(
             return stats
 
         cached = lambda paths: _cached_file_sigs(conn, paths)
+        stat_fn = committed_sig = None
         discovery = None
 
     try:
@@ -1701,7 +1969,8 @@ def _qualified_conversation_events(
             handler, conn, passive=passive,
             tail_data={"conversationKey": key},
             resolve=_resolve, ingest=_ingest, cached_sigs=cached,
-            discovery_step=discovery)
+            discovery_step=discovery, stat_fn=stat_fn,
+            committed_sig=committed_sig)
     except (BrokenPipeError, ConnectionResetError,
             ConnectionAbortedError, socket.timeout):
         pass

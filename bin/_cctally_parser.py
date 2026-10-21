@@ -3787,6 +3787,28 @@ def _build_stats_corruption_heal_parser(subparsers, name, *, help_text, xref=Non
     )
     worker.set_defaults(func=c.cmd_stats_corruption_heal_internal)
 
+def _build_statusline_continue_parser(subparsers, name, *, help_text, xref=None):
+    """Build the #825/#832 detached statusline continuation worker parser."""
+    c = _cctally()
+    worker = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: continue deferred statusline work
+                    under the one reducer reservation it inherits, or (with
+                    --wait) observe one blocking lock's release and post one
+                    wake. Spawned by the event-driven continuation; never
+                    polls. Always returns 0.
+                    """
+                ),
+    )
+    worker.add_argument("--reservation-fd", type=int, required=True,
+                        help=argparse.SUPPRESS)
+    worker.add_argument("--wait", default=None, help=argparse.SUPPRESS)
+    worker.set_defaults(func=c.cmd_statusline_continue_internal)
+
 def _build_artifact_retention_parser(subparsers, name, *, help_text, xref=None):
     """Build the #496 S6 detached retained-artifact reclamation worker parser."""
     c = _cctally()
@@ -3826,6 +3848,24 @@ def _build_codex_replay_drain_parser(subparsers, name, *, help_text, xref=None):
                 ),
     )
     rd.set_defaults(func=c.cmd_codex_replay_drain_internal)
+
+def _build_codex_prune_drain_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_codex-prune-drain` parser (#968 spec 5.7)."""
+    c = _cctally()
+    pd = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: detached worker that drains recorded
+                    Codex prune debt one source identity per transaction, off
+                    the hook. Always returns 0; failures are written to
+                    hook-tick.log.
+                    """
+                ),
+    )
+    pd.set_defaults(func=c.cmd_codex_prune_drain_internal)
 
 def _build_repair_symlinks_parser(subparsers, name, *, help_text, xref=None):
     """Build the `repair-symlinks` parser (registered via _REGISTRATION; #279 S6 W3).
@@ -3913,8 +3953,10 @@ _REGISTRATION = (
     _Reg('_codex-quota-verify', _build_codex_quota_verify_parser, argparse.SUPPRESS, None, None),
     _Reg('_stats-epoch-rebuild', _build_stats_epoch_rebuild_parser, argparse.SUPPRESS, None, None),
     _Reg('_stats-corruption-heal', _build_stats_corruption_heal_parser, argparse.SUPPRESS, None, None),
+    _Reg('_statusline-continue', _build_statusline_continue_parser, argparse.SUPPRESS, None, None),
     _Reg('_artifact-retention', _build_artifact_retention_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-replay-drain', _build_codex_replay_drain_parser, argparse.SUPPRESS, None, None),
+    _Reg('_codex-prune-drain', _build_codex_prune_drain_parser, argparse.SUPPRESS, None, None),
     _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
 )
 

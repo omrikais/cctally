@@ -25,7 +25,9 @@ FIXED = dt.datetime(2026, 9, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
 NOW = dt.datetime(2026, 7, 20, 12, tzinfo=dt.timezone.utc)
 LEGACY_NOW = dt.datetime(2026, 6, 3, 12, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1016
-NEW_EPOCH = 1017
+# The current head: the indexes were introduced at 1017 and #825/#832 moved
+# the head to 1018, so an upgraded install reaches them at the current epoch.
+NEW_EPOCH = 1018
 READ_INDEXES = (
     "idx_quota_projection_state_digest", "idx_quota_blocks_digest",
     "idx_quota_milestones_digest", "idx_quota_threshold_events_digest",

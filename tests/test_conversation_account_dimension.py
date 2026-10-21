@@ -599,8 +599,9 @@ def test_scoped_codex_cli_export_refuses_ambiguous_path(
         tmp_path, monkeypatch, capsysbinary):
     """The CLI must not emit an anonymized copy over unproven CWD ownership."""
     ns = load_script()
-    # The export refusal needs a retained transcript, independent of age.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path)
     provider = tmp_path / "provider"
     rollout = provider / "sessions" / "2026" / "08" / "04" / "modern-full.jsonl"
     rollout.parent.mkdir(parents=True)
@@ -749,8 +750,9 @@ def _claude_user_line(uuid: str, text: str, timestamp: str) -> str:
 def test_claude_delta_ingest_stamps_once_and_rebuild_preserves_accounts(
         tmp_path, monkeypatch):
     ns = load_script()
-    # Account attribution must survive replay regardless of fixture age.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
     import _cctally_core as core
 
     project = tmp_path / "data" / ".claude" / "projects" / "-switching"
@@ -809,8 +811,9 @@ def test_claude_delta_ingest_stamps_once_and_rebuild_preserves_accounts(
 def test_codex_conversation_replay_uses_durable_file_account_map(
         tmp_path, monkeypatch):
     ns = load_script()
-    # Durable account attribution is tested independently of transcript age.
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path / "data-codex")
+    # Transcripts are kept regardless of age: docs/fixtures-gotchas.md,
+    # "Conversation retention is off in test environments (#965)".
+    redirect_paths(ns, monkeypatch, tmp_path / "data-codex")
     import _cctally_cache as cache_mod
 
     provider = tmp_path / "provider"
@@ -902,15 +905,12 @@ def test_codex_conversation_replay_uses_durable_file_account_map(
 # section above owns names of its own.
 
 import os  # noqa: E402 — section-local, kept beside the cases that use it
-from conftest import (  # noqa: E402
-    redirect_paths_without_conversation_retention,
-)
 
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     ns = load_script()
-    redirect_paths_without_conversation_retention(ns, monkeypatch, tmp_path)
+    redirect_paths(ns, monkeypatch, tmp_path)
     projects = tmp_path / ".claude" / "projects" / "-Users-u-proj"
     projects.mkdir(parents=True, exist_ok=True)
     conn = ns["open_conversations_db"]()
