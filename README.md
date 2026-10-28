@@ -30,13 +30,11 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.113.0** (2026-09-29)
+**Latest stable: v1.116.1** (2026-10-28)
 
-Highlights from the `v1.112.0` to `v1.113.0` stable upgrade:
+Highlights from the `v1.113.0` to `v1.116.1` stable upgrade:
 
-- Codex cost reports price `gpt-6.1-sol` at its published input, cached-input and output rates, including long-context and Fast pricing, instead of using fallback rates.
-
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.113.0)
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.116.1)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
