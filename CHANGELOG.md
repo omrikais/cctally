@@ -5,6 +5,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.116.1] - 2026-10-28
+
+### Maintenance
+- Internal improvements only; no user-facing changes.
+
 ## [1.116.0] - 2026-10-28
 
 ### Added

@@ -14,9 +14,10 @@ capture instant (or any post-fetch clock) as ``q`` fails
 `test_q_precedes_fetch_on_*`, and one that remembered an earlier attempt's
 ``q`` fails `test_no_key_for_failed_fetch`.
 
-`test_previous_release_reads_keyed_observation_unchanged` runs the frozen
-account-bound revision-1 release (80f5e1409, `tests/_frozen_release.py`) over
-a store holding keyed observations (maintainer-only, like the T6 oracle).
+The previous-release check, the frozen account-bound revision-1 release
+(80f5e1409) reading a store that holds keyed observations, runs the frozen
+archive and is maintainer-only, so it lives with the T6 oracle in
+`tests/test_mixed_schedule_revision2_797.py` (see .mirror-allowlist).
 """
 from __future__ import annotations
 
@@ -24,7 +25,6 @@ import argparse
 import datetime as dt
 import json
 import re
-import sqlite3
 import sys
 import time
 
@@ -233,54 +233,3 @@ def test_no_key_for_hook_discarded_response(app, monkeypatch):
     _direct_record(app, weekly=40, source="api")
     assert len(_usage_obs()) == 1
     assert _keyed() == []
-
-
-# --------------------------------------------------------------------------
-# the previous release reads a keyed observation unchanged
-# --------------------------------------------------------------------------
-
-@pytest.fixture(scope="module")
-def frozen1(tmp_path_factory):
-    import _frozen_release as FR
-    return FR.unpack_revision1(tmp_path_factory.mktemp("revision1-release"))
-
-
-def _rows(path, sql):
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        return [tuple(r) for r in conn.execute(sql)]
-    finally:
-        conn.close()
-
-
-def _tables(path):
-    return {r[0] for r in _rows(
-        path, "SELECT name FROM sqlite_schema WHERE type = 'table'")}
-
-
-def test_previous_release_reads_keyed_observation_unchanged(
-        monkeypatch, tmp_path, frozen1):
-    import test_mixed_schedule_revision2_797 as R2
-    import _cctally_core as core
-    mixed = R2.Mixed2(monkeypatch, tmp_path, frozen1)
-    for i, (weekly, five) in enumerate(((30, 70), (30, 70), (31, 20))):
-        mixed.step(("cur_refresh", dict(at=R2.BASE + 600 * i, weekly=weekly,
-                                        five=five, account="A")))
-    keyed = [r for r in mixed._journal()
-             if r.get("t") == "obs" and KEY in (r.get("payload") or {})]
-    assert len(keyed) == 3, "every current refresh carries the key"
-    snapshot_sql = ("SELECT captured_at_utc, weekly_percent, five_hour_percent,"
-                    " source FROM weekly_usage_snapshots ORDER BY id")
-    current_rows = _rows(core.DB_PATH, snapshot_sql)
-    assert current_rows
-    proc = mixed._old(["db", "rebuild", "--db", "stats", "--json"],
-                      R2.BASE + 2000)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert R2.M20._epoch(mixed.app_dir) == 1018
-    # The old binary folds the keyed observations' journaled decisions as it
-    # always did, and has no samples table: it ignores the key.
-    assert _rows(core.DB_PATH, snapshot_sql) == current_rows
-    assert "claude_oauth_samples" not in _tables(core.DB_PATH)
-    view = mixed._old(["weekly", "--json"], R2.BASE + 2100)
-    assert view.returncode == 0, view.stdout + view.stderr
-    json.loads(view.stdout)

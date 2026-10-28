@@ -37,9 +37,21 @@ print(json.dumps({"peak": progress.peak_resident_bytes(),
 """
 
 
+# Linux keeps a process's `ru_maxrss` across `execve`, and a child forked or
+# vforked from this test process starts from this process's resident peak (a
+# pytest worker reported 0.8 GB as the peak of a 100 MB driver on the public
+# matrix). A small intermediate interpreter launches the driver, so the
+# driver's peak starts from that interpreter's, not from the test runner's.
+_LAUNCHER = r"""
+import subprocess, sys
+sys.exit(subprocess.run(sys.argv[1:]).returncode)
+"""
+
+
 def _drive(megabytes: int) -> dict:
     out = subprocess.run(
-        [sys.executable, "-c", _DRIVER, str(BIN), str(megabytes)],
+        [sys.executable, "-c", _LAUNCHER,
+         sys.executable, "-c", _DRIVER, str(BIN), str(megabytes)],
         check=True, capture_output=True, text=True, timeout=120)
     return json.loads(out.stdout)
 

@@ -76,6 +76,19 @@ def _force_darwin(monkeypatch):
     monkeypatch.setattr(_clone(), "_PLATFORM", "darwin")
 
 
+def _replace_clone_fd(monkeypatch, replacement):
+    """Replace the clone call itself with `replacement`.
+
+    `try_clone` returns False before `_clone_fd` when `_fclonefileat` finds
+    no ``fclonefileat`` in libc, which is every glibc host (the public Linux
+    matrix), so the lookup is stubbed as well: these tests then exercise the
+    errno handling on any host instead of only on macOS.
+    """
+    clone = _clone()
+    monkeypatch.setattr(clone, "_fclonefileat", lambda: replacement)
+    monkeypatch.setattr(clone, "_clone_fd", replacement)
+
+
 def _clone_supported(directory: pathlib.Path) -> bool:
     probe = directory / "clone-probe.src"
     probe.write_bytes(b"probe")
@@ -110,14 +123,14 @@ def test_try_clone_refusal_is_false_and_other_errors_raise(
     def refused(fd, destination):
         raise OSError(errno.ENOTSUP, "no", destination)
 
-    monkeypatch.setattr(clone, "_clone_fd", refused)
+    _replace_clone_fd(monkeypatch, refused)
     assert clone.try_clone(str(src), str(tmp_path / "b")) is False
     assert not (tmp_path / "b").exists()
 
     def broken(fd, destination):
         raise OSError(errno.EIO, "io", destination)
 
-    monkeypatch.setattr(clone, "_clone_fd", broken)
+    _replace_clone_fd(monkeypatch, broken)
     with pytest.raises(OSError) as raised:
         clone.try_clone(str(src), str(tmp_path / "b"))
     assert raised.value.errno == errno.EIO
@@ -146,7 +159,6 @@ def test_snapshot_is_clone_on_apfs(layout):
 
 def test_snapshot_refused_clone_copies_under_tmpdir(layout, monkeypatch):
     rederive = layout["rederive"]
-    clone = _clone()
     _force_darwin(monkeypatch)
     _devices_differ(monkeypatch, layout)
     attempts = []
@@ -155,7 +167,7 @@ def test_snapshot_refused_clone_copies_under_tmpdir(layout, monkeypatch):
         attempts.append(destination)
         raise OSError(errno.ENOTSUP, "no", destination)
 
-    monkeypatch.setattr(clone, "_clone_fd", refused)
+    _replace_clone_fd(monkeypatch, refused)
     before = sorted(os.listdir(layout["data"]))
     with rederive._open_sqlite_snapshot(
             layout["source"], prefix="cctally-rederive-cache-") as conn:
