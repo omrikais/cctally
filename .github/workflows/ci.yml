@@ -1,21 +1,13 @@
 name: CI
 
 on:
-  schedule:
-    - cron: '17 */12 * * *'
-  workflow_dispatch:
   push:
     branches: [main]
-    # Skip docs-only pushes — every job here is code/test focused, and
-    # CHANGELOG / README / CLAUDE.md / docs/**/*.md churn doesn't change
-    # any test outcome. `paths-ignore` evaluates per push: if EVERY
-    # changed file matches, the workflow is skipped; a mixed code+docs
-    # push still runs. The shared memory publication set (#899 S2) is never
-    # read by any job here either: a memory-only publication runs only the
-    # fast main-push observer, and its exact tree is certified before the push.
+    # A memory-only publication changes nothing changed-checks reads; its exact
+    # tree is certified by bin/cctally-memory-publish before the push.
     # `.agentmem/config.json` is configuration, not memory, and still runs CI.
+    # Markdown is NOT ignored: changed-checks lints the docs a push changes.
     paths-ignore:
-      - '**/*.md'
       - '.claude-memory/**'
       - '.agentmem/codex-memory/**'
       - '.agentmem/topics.json'
@@ -27,676 +19,157 @@ on:
       - '.agentmem/codex-memory/**'
       - '.agentmem/topics.json'
 
-# #630 S4 (F25). One superseded push no longer occupies the single primary
-# cctally runner while a newer commit waits behind it. Measured over 100 pushes, 15 were
-# still running when a later push arrived, and the self-hosted occupancy lying
-# after the superseding push totalled 155 minutes over 10.4 days once the three
-# runner-stall runs are excluded — about 15 minutes a day.
-#
-# Pushes to `main` collapse into one group; pull requests group by number.
-# `test-pr` keeps its own job-level group under a DIFFERENT name, so the two
-# scopes cannot cancel each other or deadlock.
-#
-# The tradeoff, stated rather than buried: cancelling on `main` means a
-# superseded commit ends with no verdict of its own, and a red on the newer run
-# cannot be attributed to one of two commits without a bisect. That is
-# acceptable because the authoritative gate run BEFORE the push is the primary
-# evidence and CI is corroboration.
+# Every push checks its own range, so no push run is cancelled by a later one;
+# a pull request's run is superseded by the next push to it.
+# Every job reads only; test-pr's uploads use the runtime token, not this one.
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'background' || github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # #529 S7 (E1). A release stamp is a mechanical two-or-three-file version
-  # bump over a tree release Gate 0 has already certified with an
-  # authoritative receipt, and it used to occupy the single self-hosted
-  # runner for ~17 minutes across three sequential jobs. `paths-ignore`
-  # cannot express the exclusion: 76 of the last 200 commits touching
-  # package.json are NOT stamps — they add published modules to the npm
-  # `files` list, which changes the shipped artifact.
-  #
-  # This job DEFAULTS TO RUNNING THE FULL PIPELINE. Every dependent job's
-  # `if:` is written so a failure here still admits the job (see below) —
-  # `needs:` alone would skip dependents on failure, which is the exact
-  # inversion of this gate's purpose.
-  release-stamp-gate:
-    # Keep the public-mirror classifier on GitHub's hosted sandbox. A private
-    # fork PR cannot reach this job (nor any other private executing job), so
-    # fork-authored merge code never runs on the maintainer's Mac.
-    if: >-
-      github.repository == 'omrikais/cctally' ||
-      (github.repository == 'omrikais/cctally-dev' &&
-       (github.event_name != 'pull_request' ||
-        github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: ${{ fromJSON(github.repository == 'omrikais/cctally-dev' && '["self-hosted","macOS","cctally"]' || '["ubuntu-latest"]') }}
-    timeout-minutes: 5
-    # Read-only, matching test-pr and doc-lint.yml. This job reads history and
-    # writes one output; it needs no token scope beyond the checkout.
-    permissions:
-      contents: read
+  # Test regime reset (Codex Q11). A private push to main runs only the static
+  # checks of what it changed: the merge command's quick gate ran before the
+  # push, and a release verifies its exact commit in release-candidate.yml. The
+  # check runs under the runner supervisor's local mode at exactly the pushed
+  # commit, waiting at most 300 s for the host lock; a busy host (exit 75)
+  # fails the step and is reported as not run, never as a pass. Fork code never reaches
+  # a Mac: this job runs only on a push to this repository.
+  changed-checks:
+    if: github.repository == 'omrikais/cctally-dev' && github.event_name == 'push'
+    runs-on: [self-hosted, macOS, ARM64, cctally]
+    timeout-minutes: 10
     outputs:
-      skipHeavy: ${{ steps.classify.outputs.skipHeavy }}
+      dashboard: ${{ steps.classify.outputs.dashboard }}
     steps:
       - uses: actions/checkout@v5
         with:
-          # The predicate proves the pushed range is one commit by comparing
-          # HEAD^ against the event's `before`, so the parent must be present.
-          fetch-depth: 2
-          persist-credentials: false
-      - id: classify
-        run: |
-          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
-          python3 .github/scripts/classify_release_stamp.py \
-            --repo . \
-            --before "${{ github.event.before }}" \
-            --after "${{ github.event.after }}" \
-            --event-name "${{ github.event_name }}"
-
-  # #630 S4 (F22). A push whose tree an authoritative receipt already covers
-  # does not need the estate run again. Every passing authoritative
-  # `bin/cctally-test-remote` run publishes a small JSON receipt as a git blob
-  # at `refs/cctally/receipts/<tree-oid>/<run-id>` on this repository, and this
-  # job decides whether one of them verifies completely against the pushed tree.
-  #
-  # SEPARATE from `release-stamp-gate` rather than merged into it: the two
-  # answer independent questions, and coupling their failure domains buys
-  # nothing.
-  #
-  # Guarded to the private repository. Without the guard it would run on every
-  # mirror push, which changes the
-  # operator-selected public-push outcome — a public push must continue to run
-  # the release classifier and nothing else.
-  #
-  # The lookup key is the TREE OID, not the commit sha: a `--no-ff` merge of a
-  # fast-forwardable branch produces a new commit over an unchanged tree, and
-  # keying on the commit discards evidence the tree retains (measured: 35
-  # discharges of 100 pushes by tree, 16 by commit). Certification is still the
-  # digest, so a receipt minted over selected untracked input simply fails to
-  # reproduce and the estate runs.
-  receipt-gate:
-    # This step puts `secrets.GITHUB_TOKEN` in the environment of code that
-    # comes from the checkout, and on a `pull_request` event the checkout is
-    # the MERGE ref — so without an event guard, fork-authored code would see
-    # the token. The guard therefore deliberately MIRRORS the one on
-    # `test-macos`, this job's only consumer, which already refuses fork PRs:
-    # a context that could never act on the discharge cannot reach the token
-    # either, and same-repository PR discharge is preserved. Since the test
-    # regime reset (session 1) a push to main runs no full suite, so neither
-    # this job nor `test-macos` admits a push.
-    if: >-
-      github.repository == 'omrikais/cctally-dev' &&
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: [self-hosted, macOS, cctally]
-    timeout-minutes: 5
-    # Read-only repository receipts.
-    permissions:
-      contents: read
-    outputs:
-      admitted: ${{ steps.classify.outputs.admitted }}
-      discharged: ${{ steps.classify.outputs.discharged }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # Merge selection also needs the actual incoming base/history.
+          # The range is diffed locally, so both ends must be in the clone.
           fetch-depth: 0
           persist-credentials: false
-      - id: classify
+
+      # Whether the range can change the committed dashboard bundle or its
+      # source. A range that cannot be read or diffed (a new branch, an
+      # all-zero before) counts as yes.
+      - name: Classify the pushed paths
+        id: classify
         env:
-          RECEIPT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This job admits only pull requests, whose incoming base is the base
-          # commit; `github.event.before` is the previous PR head on synchronize.
-          MERGE_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
         run: |
-          # No `set -x`: a trace would echo the authorization header.
-          #
-          # Errexit is NOT cleared, and deliberately so. GitHub's default shell
-          # for a `run:` without `shell:` is `bash -e {0}`, and `set -uo
-          # pipefail` adds flags without removing `-e`, so an unhandled failure
-          # here aborts the step. That is itself a fail-safe outcome: the job
-          # then ends `result != 'success'`, which leaves the `test-macos`
-          # conjunct true and runs the estate. The explicit `exit 0` paths and
-          # the `|| true` guards below exist so that a failed fetch, an absent
-          # namespace and a malformed candidate end as an ordinary
-          # `discharged=false` decision rather than as a job failure.
-          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
-          set -uo pipefail
-          receipts="${RUNNER_TEMP:-/tmp}/receipts"
-          mkdir -p "$receipts"
-          tree=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || true)
-          if ! printf '%s' "$tree" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "receipt-gate: HEAD names no tree object; the estate runs" >&2
-            echo "admitted=false" >> "$GITHUB_OUTPUT"
-            echo "discharged=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          dashboard=true
+          if [ -n "${BEFORE//0/}" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+              && changed=$(git diff --name-only --no-renames "$BEFORE" "$AFTER"); then
+            if ! printf '%s\n' "$changed" \
+                | grep -Eq '^(dashboard/(web|static)/|package[^/]*\.json$|\.nvmrc$)'; then
+              dashboard=false
+            fi
           fi
-          # ONE non-persisted authenticated fetch, supplied through `-c` so the
-          # credential is scoped to this single command and never written to
-          # the repository's config. The checkout above persisted none.
-          basic=$(printf 'x-access-token:%s' "$RECEIPT_TOKEN" | base64 | tr -d '\n')
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic" \
-              fetch --no-tags origin \
-              "+refs/cctally/receipts/$tree/*:refs/receipts/$tree/*" 2>/dev/null \
-            || echo "receipt-gate: no receipt namespace for tree $tree" >&2
-          for ref in $(git for-each-ref --format='%(refname)' "refs/receipts/$tree/"); do
-            git cat-file blob "$ref" > "$receipts/${ref##*/}.json" 2>/dev/null || true
-          done
-          # The incoming base is always passed; an empty one (no base known)
-          # means full coverage only, inside the classifier.
-          python3 .github/scripts/classify_receipt.py --merge-base "$MERGE_BASE" \
-            --sha "${{ github.sha }}" \
-            --repo . \
-            --receipts-dir "$receipts" \
-            --ref-namespace "$tree" \
-            --topology-profile private \
-            --summary-file "$GITHUB_STEP_SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "dashboard=$dashboard" >> "$GITHUB_OUTPUT"
 
-  # test-linux (hosted ubuntu) was disabled to save GH Actions minutes.
-  # The self-hosted macOS runner covers the scheduled and dispatched full runs
-  # plus trusted private same-repository PRs; a push to main runs no full
-  # suite (test regime reset, session 1). Public-mirror/fork PRs use the
-  # hosted `test-pr` sandbox below. `dashboard-build-stability` stays
-  # push-only and `e2e-reader` is schedule-only.
-
-  test-macos:
-    # Self-hosted runners must NEVER execute fork-PR code on the maintainer's
-    # machine. Private same-repository PRs are maintainer-owned branches, so
-    # they use this authority instead of the two-worker hosted lane that took
-    # ~30 minutes for the same suite. The exact head-repository equality is the
-    # safety boundary; public-mirror/fork PRs stay on `test-pr` below.
-    #
-    # The two `release-stamp-gate` clauses are an ADDITIONAL conjunct (#529
-    # S7, E1), and the two `receipt-gate` clauses are a second one (#630 S4);
-    # the repository and head-repository equalities above are untouched, so a
-    # broken, widened or deleted classifier still cannot put fork code on the
-    # maintainer's machine.
-    #
-    # The guarantee, stated exactly: while this workflow remains active, a
-    # `receipt-gate` that FAILS, is SKIPPED, or emits a MISSING or MALFORMED
-    # output leaves `result != 'success'` or `discharged != 'true'` true, so the
-    # estate RUNS. Only an explicit successful `discharged == 'true'` skips it.
-    # Two cases that guarantee deliberately does not cover: a CANCELLED run
-    # makes the leading `!cancelled()` false, so the job does not run — correct
-    # for a cancelled run, but not the estate running; and DELETING a job still
-    # named in `needs` makes the workflow graph invalid rather than producing a
-    # non-success result.
-    #
-    # Only `test-macos` carries this conjunct. The receipt certifies
-    # `bin/cctally-test-all`; it does not build the dashboard bundle and it does
-    # not run Playwright, so `dashboard-build-stability` and `e2e-reader` keep
-    # exactly their current guards.
-    needs: [release-stamp-gate, receipt-gate]
-    if: >-
-      !cancelled() &&
-      (needs.release-stamp-gate.result != 'success' ||
-       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
-      (needs.receipt-gate.result != 'success' ||
-       needs.receipt-gate.outputs.admitted != 'true' ||
-       needs.receipt-gate.outputs.discharged != 'true') &&
-      github.repository == 'omrikais/cctally-dev' &&
-      (github.event_name == 'schedule' ||
-       github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' &&
-        github.event.pull_request.head.repo.full_name == github.repository))
-    runs-on: [self-hosted, macOS, cctally]
-    # #922: 300s admission plus the observed max historical job (3,359s)
-    # totals 3,659s within 4,200s, leaving 541s. These six observations do
-    # not establish a population p95. Suite deadlines/budgets stay unchanged.
-    timeout-minutes: 70
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          # tests/test_schema_delivery_parity.py reconstructs the previous
-          # installable shape from the newest release tag that is a strict
-          # ancestor of HEAD, so this lane needs the tags AND the history that
-          # decides ancestry. A shallow checkout makes that node fail loudly
-          # rather than skip, which is deliberate: a lane that skipped there
-          # would report success over a comparison it never made. The public
-          # mirror runs this same file without carrying that module, and pays a
-          # full-history checkout of the much smaller public repository for it.
-          fetch-depth: 0
-          fetch-tags: true
-
-      # #940. This runner keeps its heavy writes on its external store, and its
-      # listener exports that store's evidence directory. The suite's evidence
-      # root is that directory, exported once here for every later step, so
-      # retained evidence and the sanitized extract live on the store rather
-      # than in the job temp. A runner without the variable has no enrolled
-      # store, and the job fails here, before anything writes.
-      - name: Resolve the runner's evidence store
-        run: |
-          printf 'CCTALLY_TEST_EVIDENCE_ROOT=%s\n' "${CCTALLY_RUNNER_EVIDENCE_ROOT:?}" >> "$GITHUB_ENV"
-
-      # `bin/cctally-share-v2-test` runs a Vitest-based GUI smoke
-      # (`dashboard/web/src/share/ShareManualSmoke.test.tsx`) via
-      # `npm test` from `dashboard/web/`, which needs the workspace's
-      # `node_modules/.bin/vitest` on disk. Without these two steps the
-      # smoke fails with `sh: vitest: command not found` on a fresh
-      # runner checkout (the share-v2 harness counts that as a hard
-      # failure). Mirrors the setup-node + `npm ci` pair the
-      # `dashboard-build-stability` job already uses.
-      - name: Setup Node (per .nvmrc)
-        uses: actions/setup-node@v5
-        with:
-          node-version-file: dashboard/web/.nvmrc
-          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
-          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
-          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
-          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
-          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
-
-      - name: Install dashboard deps (vitest for share-v2 smoke)
-        working-directory: dashboard/web
-        run: npm ci
-
-      # FTS5 is the one hard capability no step above installs, because it is a
-      # compile-time SQLite option rather than a package (#529 S6, M2). Asked
-      # here, of the same brew python@3.13 the suite's venv is built from, so a
-      # runner whose SQLite lacks it refuses BEFORE the suite starts instead of
-      # after the aggregator's admission probe. One shared assertion:
-      # bin/_lib-test-contract.sh calls the same helper in probe mode.
-      - name: Assert FTS5 before the suite
+      # `local` is the step's own process (exec), its final command, so the
+      # runner's cancellation signals reach it (Codex Q6 item 1); it writes
+      # its exit status to GITHUB_OUTPUT, which the next step reports.
+      - name: Check the pushed range
+        id: execute
         env:
-          PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-        run: bash bin/_lib-fts5-probe.sh require python3
-
-      - name: Run cctally test suite
-        env:
-          # This lane is the authoritative gate for the private tree, so a
-          # missing hard capability is a refusal to start rather than an
-          # `incomplete` classification the run continues past (#529 S1). All
-          # seven are provisioned below or by the steps above: pytest,
-          # pytest-timeout, PyYAML, rich and ShellCheck by the venv pip install; node/npm from
-          # /opt/homebrew/bin on the pinned PATH (bin/cctally-frontend-test and
-          # the npm-shim harnesses already hard-fail without them); fts5 from
-          # brew python@3.13's SQLite. agentmem is asserted here too, because
-          # this lane declares CCTALLY_AGENTMEM_TEST_POLICY=required and
-          # provisions it onto the runner's external store below.
-          CCTALLY_AUTHORITATIVE_RUN: "1"
-          # Pin Python to brew's 3.13 by prepending its libexec/bin (where
-          # python3 -> python3.13 symlinks live) so the runner's PATH —
-          # which may include pyenv shims pointing at older system Python —
-          # doesn't shadow it. Also drop the runner's tool-cache entries
-          # that some Actions toolchains inject ahead of brew.
-          PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-          # Pin the suite's base timezone to UTC. In-process tests that parse
-          # naive date-only --since/--until resolve them in display-tz, which
-          # defaults to the host tz; without this the self-hosted runner's
-          # local tz (Asia/Jerusalem, UTC+3) shifts those bounds by its offset
-          # and TZ-assuming tests fail (e.g. cache-report bound == ...T00:00:00Z).
-          # The PR lane (test-pr), the Linux matrix, and bin/cctally-test-remote
-          # already pin this — test-macos was the lone unpinned suite lane.
-          # Etc/UTC, not UTC (repo gotcha).
-          TZ: "Etc/UTC"
-          # This self-hosted lane is the CI authority for cctally's private
-          # agentmem integration. tests/conftest.py fails before collection if
-          # the pinned dependency is absent.
-          CCTALLY_AGENTMEM_TEST_POLICY: "required"
-          # Cap the OUTER parallel-harness fan-out below the Mac Studio's core
-          # count. cctally-test-all keeps CCTALLY_TEST_JOBS as the outer pool
-          # budget; the derived inner cap (min(4,outer)=4 here) is pinned lower
-          # so dashboard fixture servers keep port-print headroom and `release`
-          # no longer fans out to full nproc (#292). pytest still runs solo.
-          CCTALLY_TEST_JOBS: "4"
-          CCTALLY_INNER_JOBS: "2"
-          # pytest runs SOLO after the shell pool, so it gets the whole box.
-          # cctally-test-all only auto-sizes pytest to the core count when
-          # CCTALLY_TEST_JOBS is unset; pinning the outer budget above collapsed
-          # PYTEST to 4 as a side effect. State it explicitly (runner is a
-          # 10-core M1 Max: 8 performance + 2 efficiency).
-          CCTALLY_PYTEST_JOBS: "10"
-          # #529 S2. Setting the root is what turns retained evidence AND
-          # console sanitization on; the upload step below is what makes the
-          # sanitized extract survive the job. The two go together on purpose:
-          # a run that sanitizes its console while retaining nothing destroys
-          # the only copy of what it redacted. The root itself,
-          # CCTALLY_TEST_EVIDENCE_ROOT, is the runner's evidence store, which
-          # the resolver step above exported (#940).
-          # GITHUB_RUN_ID plus the attempt and job name do not distinguish a
-          # matrix leg, so every lane states its own identity explicitly.
-          CCTALLY_TEST_RUN_ID: macos-${{ github.run_id }}-${{ github.run_attempt }}
-          # #899 S2. The suite's structured outcome record, at a per-run,
-          # per-attempt path. This is the path the evidence root already
-          # defaults it to, so the failure extract upload below still carries
-          # it; naming it here lets the classifier step read it.
-          CCTALLY_TEST_ALL_OUTCOME_FILE: ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
-          # Separate from the suite's exclusively claimed evidence directory.
-          # This file exists only after confirmed pre-workload wait exhaustion.
-          CCTALLY_RESERVATION_REFUSAL_FILE: ${{ runner.temp }}/cctally-reservation-refusals/macos-${{ github.run_id }}-${{ github.run_attempt }}.json
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          CCTALLY_FETCH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          # A fresh nonce prevents old proof from this same run/attempt from
-          # certifying a replay or an unrelated exit 3. Persist only the nonce
-          # so a classifier after this failed step can check this invocation.
-          CCTALLY_RESERVATION_INVOCATION="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-          export CCTALLY_RESERVATION_INVOCATION
-          echo "CCTALLY_RESERVATION_INVOCATION=$CCTALLY_RESERVATION_INVOCATION" >> "$GITHUB_ENV"
-          python3 --version
-          # Brew's Python is PEP 668 "externally managed" — `pip install`
-          # against the system interpreter is refused. Build a per-job venv
-          # so test deps stay isolated from the runner's host Python. The
-          # venv is activated for the whole step so bin/cctally's
-          # `#!/usr/bin/env python3` shebang resolves to the venv interpreter
-          # too (rich + pytest then importable).
-          python3 -m venv .venv
-          source .venv/bin/activate
-          # #940: agentmem's pinned checkout and its link live on the runner's
-          # external store, not in the runner home.
-          agentmem_root="${CCTALLY_RUNNER_ROOT:?}/cache/agentmem"
-          export PATH="$agentmem_root/bin:$PATH"
-          python3 bin/cctally-agentmem-dependency provision \
-            --checkout-root "$agentmem_root" --link "$agentmem_root/bin/agentmem"
-          python3 bin/cctally-agentmem-dependency check \
-            --checkout-root "$agentmem_root" --link "$agentmem_root/bin/agentmem"
-          # tests/requirements-dev.txt IS the toolchain, for this lane and for
-          # bin/cctally-test-remote alike (#529 S6, F20). This lane used to
-          # install an unpinned list here while the wrapper installed twelve
-          # exact pins, so a suite result could depend on which gate ran it.
-          # --no-deps is what makes the pin a pin, and `pip check` is the
-          # offline closure validator that --no-deps otherwise leaves unrun.
-          # tests/test_toolchain_parity.py enforces both, structurally, across
-          # every lane that sets CCTALLY_AUTHORITATIVE_RUN.
-          python3 -m pip install --no-deps -r tests/requirements-dev.txt
-          python3 -m pip check
-          # The same physical-host reservation used by manual wrapper runs.
-          # CI admission is explicitly bounded at 300s inside its 70-minute
-          # job; it changes no suite deadline, fan-out or normalized budget.
-          # The reservation root is the runner's internal one, named
-          # explicitly; raw host observations persist on its external store,
-          # outside runner.temp (which Actions clears) and uploaded export/
-          # (#940).
-          python3 bin/_lib_runner_reservation.py run \
-            --root "${CCTALLY_RUNNER_RESERVATION_ROOT:?}" \
-            --run-id "$CCTALLY_TEST_RUN_ID" \
-            --wait 300 \
-            --evidence "${CCTALLY_RUNNER_OBSERVATIONS_ROOT:?}/ci/$CCTALLY_TEST_RUN_ID.jsonl" \
-            --refusal-record "$CCTALLY_RESERVATION_REFUSAL_FILE" \
-            --invocation-id "$CCTALLY_RESERVATION_INVOCATION" \
-            -- bin/cctally-test-all
+          deadline=$(( $(date +%s) + 540 ))
+          exec "${CCTALLY_RUNNER_PYTHON:?is not set by the runner listener environment}" -I -B \
+            "${CCTALLY_RUNNER_TOOL:?is not set by the runner listener environment}" local --sha "$GITHUB_SHA" \
+            --fetch-url "https://github.com/$GITHUB_REPOSITORY.git" \
+            --deadline-epoch "$deadline" --wait 300 --busy-exit 75 \
+            -- python3 bin/cctally-preflight --changed "$BEFORE..$AFTER"
 
-      # #922: classify only authentic pre-workload wait exhaustion. This never
-      # creates a suite outcome/receipt and the job remains visibly failed.
-      - name: Classify the reservation outcome
-        id: reservation_outcome
-        if: failure() && github.event_name == 'schedule'
-        continue-on-error: true
+      - name: Report a host that was busy
+        if: always()
         env:
-          CCTALLY_TEST_RUN_ID: macos-${{ github.run_id }}-${{ github.run_attempt }}
-          CCTALLY_RESERVATION_REFUSAL_FILE: ${{ runner.temp }}/cctally-reservation-refusals/macos-${{ github.run_id }}-${{ github.run_attempt }}.json
-          CCTALLY_TEST_ALL_OUTCOME_FILE: ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          SUPERVISOR_EXIT: ${{ steps.execute.outputs.exit }}
         run: |
-          python3 .github/scripts/classify_reservation_outcome.py \
-            --record "$CCTALLY_RESERVATION_REFUSAL_FILE" \
-            --event-name "${{ github.event_name }}" \
-            --run-id "$CCTALLY_TEST_RUN_ID" \
-            --invocation-id "$CCTALLY_RESERVATION_INVOCATION" \
-            --suite-outcome "$CCTALLY_TEST_ALL_OUTCOME_FILE"
-
-      - name: 'Full verification unavailable: reservation wait exhausted'
-        if: failure() && github.event_name == 'schedule' && steps.reservation_outcome.outcome == 'success'
-        run: echo "full verification unavailable; no suite workload started"
-
-      - name: Upload the sanitized reservation refusal
-        if: failure() && github.event_name == 'schedule' && steps.reservation_outcome.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: reservation-refusal-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
-          retention-days: 14
-          path: ${{ runner.temp }}/cctally-reservation-refusals/macos-${{ github.run_id }}-${{ github.run_attempt }}.json
-
-      # Failure-only, and BOUNDED: only the two export files, never logs/.
-      # `export/` is a sibling of `logs/` and never a parent, so this path
-      # cannot capture a raw log even by accident. The independent validator
-      # runs again here and REFUSES the artifact rather than transforming it a
-      # second time — a single grammar used twice would give a classifier bug
-      # two chances at the same text. It is the PUBLIC kernel that runs, because
-      # these workflows are mirrored and the public tree carries no private
-      # module.
-      - name: Validate the sanitized failure extract
-        if: failure() || cancelled()
-        env:
-          CCTALLY_EXTRACT: ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
-        run: |
-          python3 - "$CCTALLY_EXTRACT" <<'VALIDATE_PY'
-          import importlib.util, pathlib, sys
-
-          path = pathlib.Path(sys.argv[1])
-          if not path.is_file() or path.stat().st_size == 0:
-              print("::warning::no sanitized failure extract was produced for this run")
-              raise SystemExit(0)
-          spec = importlib.util.spec_from_file_location(
-              "_lib_test_evidence", "bin/_lib_test_evidence.py")
-          kernel = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(kernel)
-          lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-          violations = kernel.validate_export(lines)
-          if violations:
-              for violation in violations[:5]:
-                  print("::error::failure-context.txt line %s: %s"
-                        % (violation["index"], violation["reason"]))
-              # Refuse by REMOVING it: the upload step below is set to ignore a
-              # missing file, so nothing unvalidated can reach an artifact. The
-              # complete unsanitized logs stay on the runner either way.
-              path.unlink()
-              print("::error::refusing to upload the failure extract; "
-                    "the complete unsanitized logs stay on the runner")
-          VALIDATE_PY
-
-      - name: Upload the sanitized failure extract
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failure-context-macos-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: ignore
-          retention-days: 14
-          path: |
-            ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
-            ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
-
-      # Test regime reset, spec 4.3: bin/cctally-test-all deselects every node
-      # tests/quarantine.json lists, so the scheduled run executes them here, in
-      # a leg of their own whose result is reported in the step summary and
-      # never decides the job. Pull requests and merges do not run it. The list
-      # is read through bin/_lib_quarantine.py: pytest ids run in one pytest
-      # call and each harness's listed cases through its own `--cases`, and
-      # each is reported on its own line.
-      #
-      # The leg holds the same physical-host reservation as the suite (machine
-      # safety C1), taken after the suite released its own, with a short
-      # admission wait: a busy host is reported, never waited out. It never
-      # runs after an authentic pre-workload reservation refusal (the
-      # classifier step's success) or when the suite's workload never started
-      # (no suite outcome record), and its own step timeout bounds it well
-      # inside the job's.
-      - name: Run the quarantined tests (report only)
-        if: ${{ !cancelled() && github.event_name == 'schedule' && steps.reservation_outcome.outcome != 'success' }}
-        continue-on-error: true
-        timeout-minutes: 10
-        env:
-          PATH: /opt/homebrew/opt/python@3.13/libexec/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-          TZ: "Etc/UTC"
-          CCTALLY_AGENTMEM_TEST_POLICY: "required"
-          CCTALLY_TEST_RUN_ID: macos-${{ github.run_id }}-${{ github.run_attempt }}
-          CCTALLY_TEST_ALL_OUTCOME_FILE: ${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/local/macos-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
-        run: |
-          set -e
-          summary() {
-            printf '### Quarantined tests (report only)\n\n%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
-          }
-          if [ ! -e "$CCTALLY_TEST_ALL_OUTCOME_FILE" ] || [ ! -f .venv/bin/activate ]; then
-            summary "not run: the suite's workload never started"
-            exit 0
-          fi
-          source .venv/bin/activate
-          export PATH="${CCTALLY_RUNNER_ROOT:?}/cache/agentmem/bin:$PATH"
-          started="$RUNNER_TEMP/cctally-quarantine-started"
-          rm -f "$started"
-          export CCTALLY_QUARANTINE_STARTED="$started"
-          rc=0
-          python3 bin/_lib_runner_reservation.py run \
-            --root "${CCTALLY_RUNNER_RESERVATION_ROOT:?}" \
-            --run-id "$CCTALLY_TEST_RUN_ID-quarantine" \
-            --wait 120 \
-            --evidence "${CCTALLY_RUNNER_OBSERVATIONS_ROOT:?}/ci/$CCTALLY_TEST_RUN_ID-quarantine.jsonl" \
-            -- python3 -c 'import os, subprocess, sys
-          sys.path.insert(0, "bin")
-          import _lib_quarantine
-          open(os.environ["CCTALLY_QUARANTINE_STARTED"], "w").close()
-          entries = _lib_quarantine.load(".")
-          ids = _lib_quarantine.pytest_ids(entries)
-          harnesses = sorted({e.harness for e in entries if e.kind == "harness"})
-          lines, rcs = [], []
-          def verdict(rc):
-              return "passed" if rc == 0 else "failed (exit %d)" % rc
-          if ids:
-              rc = subprocess.call([sys.executable, "-m", "pytest", "-q", "-rfE",
-                                    "-p", "no:cacheprovider", "--timeout=120",
-                                    "--basetemp", os.path.join(os.environ["RUNNER_TEMP"], "cctally-quarantine-pytest"),
-                                    *ids])
-              rcs.append(rc)
-              lines.append("- %d listed pytest node id(s): %s" % (len(ids), verdict(rc)))
-          for name in harnesses:
-              cases = _lib_quarantine.harness_cases(entries, name)
-              rc = subprocess.call([os.path.join("bin", "cctally-%s-test" % name), "--cases", ",".join(cases)])
-              rcs.append(rc)
-              lines.append("- harness %s, %d listed case(s): %s" % (name, len(cases), verdict(rc)))
-          if not lines:
-              lines.append("no listed nodes")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("### Quarantined tests (report only)\n\n%s\n" % "\n".join(lines))
-          sys.exit(next((rc for rc in rcs if rc), 0))' || rc=$?
-          if [ ! -e "$started" ]; then
-            summary "not run: the runner reservation was not obtained (exit $rc)"
-          fi
-          exit "$rc"
+          # A skipped or cancelled execute step left no status to report; one
+          # that ran and left none is incomplete (Codex Q6 item 6).
+          case "${EXECUTE_OUTCOME:-}" in
+            success|failure) ;;
+            *)
+              echo "the execute step did not complete (${EXECUTE_OUTCOME:-unknown}); the runner supervisor was not consulted" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0 ;;
+          esac
+          case "${SUPERVISOR_EXIT:-}" in
+            75)
+              echo "not run: the runner supervisor's host lock was not obtained within 300 s" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "::error title=changed-checks not run::the host was busy; rerun with: gh run rerun $GITHUB_RUN_ID --failed" ;;
+            '')
+              echo "::error title=changed-checks incomplete::incomplete: no exit status from the runner supervisor (the execute step's outcome was $EXECUTE_OUTCOME)"
+              exit 1 ;;
+          esac
 
   dashboard-build-stability:
-    # Same self-hosted-on-public-PR exposure as test-macos above. Push-only
-    # gating keeps fork PRs off the maintainer's machine; the byte-stable
-    # rebuild check still runs on every push to main.
-    needs: [release-stamp-gate]
+    # The committed dashboard/static bundle must be what the source builds to.
+    # Only a push whose range can change it (dashboard/web/**,
+    # dashboard/static/**, package*.json, .nvmrc) runs this; changed-checks
+    # classifies the range. It runs even when changed-checks failed.
+    needs: [changed-checks]
     if: >-
       !cancelled() &&
-      (needs.release-stamp-gate.result != 'success' ||
-       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
-      github.event_name == 'push' && github.repository == 'omrikais/cctally-dev'
-    runs-on: [self-hosted, macOS, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
-    timeout-minutes: 20  # npm ci + vite build; headroom over the observed few-min run (#279 S7 W4)
+      github.event_name == 'push' && github.repository == 'omrikais/cctally-dev' &&
+      needs.changed-checks.outputs.dashboard == 'true'
+    runs-on: [self-hosted, macOS, ARM64, cctally]  # committed bytes were generated on macOS; native bindings vary by OS
+    timeout-minutes: 20  # provisioning + vite build; headroom over the observed few-min run (#279 S7 W4)
     steps:
       - uses: actions/checkout@v5
-
-      - name: Setup Node (per .nvmrc)
-        uses: actions/setup-node@v5
         with:
-          node-version-file: dashboard/web/.nvmrc
-          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
-          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
-          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
-          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
-          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
+          persist-credentials: false
 
-      - name: Install dashboard deps
-        working-directory: dashboard/web
-        run: npm ci
-
-      # #529 S7 (E2). This job used to run the full vitest estate as its own
-      # step. It no longer does: the estate has exactly one declared execution
-      # per push, inside the bundle, and tests/test_frontend_estate_topology.py
-      # asserts that across the whole workflow tree rather than arguing it per
-      # job — which is the reasoning that let the duplication survive.
-      - name: Build dashboard
-        working-directory: dashboard/web
-        run: npm run build
-
-      - name: Verify dashboard/static/ is byte-stable
-        run: git diff --exit-code dashboard/static/
-
-  e2e-reader:
-    # The conversation-reader real-browser smoke net (#281 S3): a small,
-    # deterministic Playwright suite over the scroll / pager / anchor / focus /
-    # live-tail seams that JSDOM unit tests are structurally blind to. Same
-    # self-hosted-on-public-PR exposure rule as test-macos / dashboard-build-
-    # stability above — schedule-only + this-repo gating keeps fork-PR code off
-    # the maintainer's machine. Since the test regime reset (session 1) it runs
-    # on the scheduled run only, never on a push to main. This lane serves the
-    # COMMITTED dashboard/static bundle; its byte-stability against source is
-    # dashboard-build-stability's job on every push, so this lane deliberately
-    # does NOT rebuild (the PR lane, which has no build-stability check, builds
-    # first instead).
-    needs: [release-stamp-gate]
-    if: >-
-      !cancelled() &&
-      (needs.release-stamp-gate.result != 'success' ||
-       needs.release-stamp-gate.outputs.skipHeavy != 'true') &&
-      github.event_name == 'schedule' && github.repository == 'omrikais/cctally-dev'
-    runs-on: [self-hosted, macOS, cctally]
-    timeout-minutes: 30  # generous headroom over the ~2-5 min suite so a hung test can't wedge the job
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Node (per .nvmrc)
-        uses: actions/setup-node@v5
-        with:
-          node-version-file: dashboard/web/.nvmrc
-          # Deliberately NO `cache: npm` on the self-hosted lanes. This runner is
-          # persistent, so `~/.npm` survives between jobs and `npm ci` finishes in
-          # ~1s from it; the hosted-cache round-trip only added a ~1.3 GB download
-          # + untar on top (~68s per job, x3 jobs — measured on run 30407806707).
-          # The ephemeral ubuntu `test-pr` lane below starts cold and KEEPS it.
-
-      - name: Install dashboard deps
-        working-directory: dashboard/web
-        run: npm ci
-
-      - name: Install Playwright chromium (cached no-op after the first run)
-        working-directory: dashboard/web
-        run: npx playwright install chromium
-
-      - name: Run reader e2e suite
-        working-directory: dashboard/web
-        # The launcher (e2e/serve.sh) shells `python3` for the stdlib-only fixture
-        # builder and the `cctally dashboard` server, so brew's Python 3.13 must
-        # win over any pyenv shim — the same pin test-macos uses. PREPEND it to
-        # PATH rather than replacing PATH the way test-macos does for its
-        # pure-Python step: a full override would drop setup-node's node from PATH
-        # and break `npx playwright`. No venv is needed — the builder and the
-        # dashboard server are stdlib-only.
+      # The build and the byte check run under the runner supervisor, as
+      # changed-checks does, which provisions node and node_modules from the
+      # lockfile; a busy host (exit 75) is reported as not run, never as a pass.
+      # As changed-checks: `local` is exec'd, and the next step reports.
+      - name: Build the dashboard and verify dashboard/static/ is byte-stable
+        id: execute
+        env:
+          CCTALLY_FETCH_TOKEN: ${{ github.token }}
         run: |
-          export PATH="/opt/homebrew/opt/python@3.13/libexec/bin:$PATH"
-          python3 --version
-          # Retain each run outside the checkout that Actions cleans, on the
-          # runner's external evidence store (#940). An existing run directory
-          # or occupied port refuses without cleanup.
-          evidence_parent="${CCTALLY_RUNNER_EVIDENCE_ROOT:?}/ui-qa"
-          mkdir -p "$evidence_parent"
-          export CCTALLY_E2E_EVIDENCE_DIR="$evidence_parent/e2e-reader-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          mkdir "$CCTALLY_E2E_EVIDENCE_DIR"
-          export CCTALLY_E2E_SAFE_EVIDENCE=1
-          export CCTALLY_E2E_RUNTIME_DIR="$CCTALLY_E2E_EVIDENCE_DIR/runtime"
-          export PLAYWRIGHT_JSON_OUTPUT_NAME="$CCTALLY_E2E_EVIDENCE_DIR/playwright.json"
-          export PLAYWRIGHT_HTML_OUTPUT_DIR="$CCTALLY_E2E_EVIDENCE_DIR/playwright-report"
-          export PLAYWRIGHT_HTML_OPEN=never
-          unset TEST_WORKER_INDEX TEST_PARALLEL_INDEX
-          echo "CCTALLY_E2E_EVIDENCE_DIR=$CCTALLY_E2E_EVIDENCE_DIR" >> "$GITHUB_ENV"
-          npx playwright test --reporter=list,html,json
+          deadline=$(( $(date +%s) + 1080 ))
+          exec "${CCTALLY_RUNNER_PYTHON:?is not set by the runner listener environment}" -I -B \
+            "${CCTALLY_RUNNER_TOOL:?is not set by the runner listener environment}" local --sha "$GITHUB_SHA" \
+            --fetch-url "https://github.com/$GITHUB_REPOSITORY.git" \
+            --deadline-epoch "$deadline" --wait 300 --busy-exit 75 \
+            -- bash -c 'set -eu; (cd dashboard/web && npm run build); git diff --exit-code dashboard/static/'
 
-      - name: Upload Playwright artifacts
-        if: failure() && env.CCTALLY_E2E_EVIDENCE_DIR != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-reader-artifacts
-          path: |
-            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/playwright-report/
-            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/test-results/
-            ${{ env.CCTALLY_E2E_EVIDENCE_DIR }}/playwright.json
-          retention-days: 7
+      - name: Report a host that was busy
+        if: always()
+        env:
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+          SUPERVISOR_EXIT: ${{ steps.execute.outputs.exit }}
+        run: |
+          # A skipped or cancelled execute step left no status to report; one
+          # that ran and left none is incomplete (Codex Q6 item 6).
+          case "${EXECUTE_OUTCOME:-}" in
+            success|failure) ;;
+            *)
+              echo "the execute step did not complete (${EXECUTE_OUTCOME:-unknown}); the runner supervisor was not consulted" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0 ;;
+          esac
+          case "${SUPERVISOR_EXIT:-}" in
+            75)
+              echo "not run: the runner supervisor's host lock was not obtained within 300 s" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "::error title=dashboard-build-stability not run::the host was busy; rerun with: gh run rerun $GITHUB_RUN_ID --failed" ;;
+            '')
+              echo "::error title=dashboard-build-stability incomplete::incomplete: no exit status from the runner supervisor (the execute step's outcome was $EXECUTE_OUTCOME)"
+              exit 1 ;;
+          esac
 
   test-pr:
     # Hosted PR signal lane (#281 S2 / #280 R2): public-mirror PRs (including
     # forks) run in GitHub's sandbox with a read-only token and no secrets.
-    # Private same-repository PRs use the faster self-hosted macOS authority
-    # above; private fork PRs never run. This lane is a SIGNAL, not merge
+    # Private pull requests run nothing: private work lands through
+    # bin/cctally-merge, never a PR. This lane is a SIGNAL, not merge
     # enforcement: no branch-protection required checks (they'd reject the
     # direct-push merge-back flow and strand md-only PRs on path filters).
     if: >-
@@ -734,8 +207,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false                    # PR lane never needs a persisted token
-          # See the test-macos lane: tests/test_schema_delivery_parity.py needs
-          # release tags and the history that decides ancestry.
+          # tests/test_schema_delivery_parity.py needs release tags and the
+          # history that decides ancestry.
           fetch-depth: 0
           fetch-tags: true
       - uses: actions/setup-python@v6
@@ -772,8 +245,7 @@ jobs:
       # tests/requirements-dev.txt IS the toolchain, the same file and the same
       # install bin/cctally-test-remote and the two other authoritative lanes
       # use (#529 S6, F20). --no-deps makes the pin a pin; `pip check` is the
-      # closure validator --no-deps otherwise leaves unrun. Enforced
-      # structurally by tests/test_toolchain_parity.py.
+      # closure validator --no-deps otherwise leaves unrun.
       - name: Install Python test deps
         run: |
           python -m pip install --no-deps -r tests/requirements-dev.txt
@@ -809,10 +281,7 @@ jobs:
         #
         # #529 S7 (E2). The dashboard-build-stability job used to run the
         # estate again as its own step. It no longer does: the estate has
-        # exactly one declared execution per push, inside the bundle, and
-        # tests/test_frontend_estate_topology.py asserts that rather than
-        # arguing it per job — which is the reasoning that let the
-        # duplication survive.
+        # exactly one declared execution per push, inside the bundle.
         #
         # #529 S2. Setting the root turns retained evidence AND console
         # sanitization on. Keep it step-scoped because the runner context is
@@ -871,10 +340,9 @@ jobs:
             ${{ runner.temp }}/cctally-test-evidence/local/pr-${{ github.run_id }}-${{ github.run_attempt }}/export/failure-context.txt
             ${{ runner.temp }}/cctally-test-evidence/local/pr-${{ github.run_id }}-${{ github.run_attempt }}/export/outcome.json
 
-      # Reader real-browser smoke net (#281 S3) on the PR lane. The self-hosted
-      # e2e-reader job above is push-only for fork-PR safety, so external PRs pick
-      # up this e2e signal on the public mirror (omrikais/cctally), where hosted
-      # sandboxing makes fork code safe and minutes are free.
+      # Reader real-browser smoke net (#281 S3) on the PR lane. External PRs
+      # pick up this e2e signal on the public mirror (omrikais/cctally), where
+      # hosted sandboxing makes fork code safe and minutes are free.
       - name: Resolve Playwright version (for the browser cache key)
         id: playwright
         working-directory: dashboard/web

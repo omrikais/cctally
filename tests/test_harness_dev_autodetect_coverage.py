@@ -3,7 +3,6 @@ suppressor preamble (directly, or transitively via _lib-fixture-harness.sh).
 A new harness added without it relocates its data dir to cctally-dev on a
 dev machine and its goldens break on direct runs — this test makes that a
 hard, drift-proof failure rather than something to remember."""
-import json
 import os
 import pathlib
 import re
@@ -69,24 +68,9 @@ import _retention_entry_points as rep  # noqa: E402
 from _retention_fixtures import (  # noqa: E402
     LAUNCH_TIMEOUT_S, SWITCH, counts, seed, stage, write_retention)
 
-#: The private profile, by bin/cctally-test-all's own discriminator
-#: (CONTRACT_PROFILE, :143-146): .mirror-allowlist excludes itself, so it is
-#: present exactly in the private tree and absent from every public projection.
-_PRIVATE_PROFILE = (rep.REPO_ROOT / ".mirror-allowlist").is_file()
-
 
 def _rel(path):
     return str(path.relative_to(rep.REPO_ROOT))
-
-
-def _declared_harnesses():
-    """The harnesses tests/authoritative-test-manifest.json requires in THIS
-    profile: every public row, and the private rows only in the private tree
-    (the same visibility rule the suite's admission applies)."""
-    manifest = json.loads((rep.REPO_ROOT / "tests" / "authoritative-test-manifest.json")
-                          .read_text(encoding="utf-8"))
-    return {BIN / f"cctally-{row['name']}-test" for row in manifest["harnesses"]
-            if _PRIVATE_PROFILE or row.get("visibility", "public") == "public"}
 
 
 def test_965_preamble_exports_the_retention_switch():
@@ -106,13 +90,8 @@ def test_965_every_shell_entry_point_keeps_the_switch():
     extras = {rep.FIXTURE_LIB, rep.AGGREGATOR, rep.SERVE, _PREAMBLE}
     assert all(path.is_file() for path in extras), sorted(map(_rel, extras))
     present = {path for path in BIN.glob("cctally-*-test") if path.is_file()}
+    assert present, "the harness glob found nothing, so the scan proves nothing"
     assert scanned == present | extras, "the scan does not cover exactly the files present"
-    declared = _declared_harnesses()
-    # The floor: 62 private, 54 public today, derived from the manifest rather
-    # than written down, so the public projection passes and a shrinking glob
-    # still fails.
-    assert declared and declared <= present, (
-        "declared harnesses the scan cannot see: " + ", ".join(sorted(map(_rel, declared - present))))
     problems = []
     for path, kind in points:
         problems += rep.shell_violations(path.read_text(errors="replace"),
@@ -138,13 +117,10 @@ def test_965_the_builder_population_is_derived_not_listed():
 
 
 def test_965_the_cleared_environment_scan_sees_the_known_launches():
-    """Non-vacuity and quote awareness, measured at HEAD (population (e)). The
-    private bin/cctally-test-remote-test is required only in the private tree."""
+    """Non-vacuity and quote awareness, measured at HEAD (population (e))."""
     seen = {path.name for path, _ in rep.shell_entry_points()
             if rep.cleared_env_launches(path.read_text(errors="replace"))}
     required = {"cctally-npm-shim-test", "cctally-npm-postinstall-test"}
-    if _PRIVATE_PROFILE:
-        required.add("cctally-test-remote-test")
     assert required <= seen, seen
     assert "cctally-preflight-test" not in seen, "quoted test data read as a launch"
 

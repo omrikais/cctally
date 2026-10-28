@@ -990,45 +990,54 @@ print("ok")
         ok=0
     fi
 
-    # POST /api/sync (v2): valid Origin → 200, bogus → 403, missing → 403.
-    #
-    # #583 S2 §4: this server runs with --no-sync, and a manual refresh=1
-    # there now STATES the skip instead of performing no refresh silently, so
-    # the success answer is 200 with a `refresh_skipped_no_sync` warning
-    # rather than the pre-#583 bare 204. The body is checked too, because a
-    # 200 whose warnings array said something else would pass a status-only
-    # assertion while reporting the wrong thing to the user.
-    local sync_code sync_body
-    sync_body=$(curl -s -w '\n%{http_code}' --max-time 5 \
-        -X POST -H "Origin: http://127.0.0.1:$port" "$base/api/sync")
-    sync_code=$(tail -n1 <<<"$sync_body")
-    if [ "$sync_code" != "200" ]; then
-        echo "FAIL $name: POST /api/sync (valid Origin) returned $sync_code (expected 200)"
-        ok=0
-    elif ! grep -q 'refresh_skipped_no_sync' <<<"$sync_body"; then
-        echo "FAIL $name: POST /api/sync under --no-sync did not warn refresh_skipped_no_sync: $sync_body"
-        ok=0
-    fi
-    # A MACHINE NUDGE under --no-sync is refused with 204 and enqueues
-    # nothing: the documented contract freezes data to the startup snapshot.
-    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
-        -X POST -H "Origin: http://127.0.0.1:$port" \
-        "$base/api/sync?refresh=0&queue=1")
-    if [ "$sync_code" != "204" ]; then
-        echo "FAIL $name: POST /api/sync?queue=1 under --no-sync returned $sync_code (expected 204)"
-        ok=0
-    fi
-    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
-        -X POST -H "Origin: http://evil.example" "$base/api/sync")
-    if [ "$sync_code" != "403" ]; then
-        echo "FAIL $name: POST /api/sync (bogus Origin) returned $sync_code (expected 403)"
-        ok=0
-    fi
-    sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
-        -X POST "$base/api/sync")
-    if [ "$sync_code" != "403" ]; then
-        echo "FAIL $name: POST /api/sync (missing Origin) returned $sync_code (expected 403)"
-        ok=0
+    # POST /api/sync's transport contract (#985): checked once, in the `ok`
+    # scenario. It answers the same for every fixture, and the full endpoint
+    # contract runs on the merge path in tests/test_dashboard_api_sync_refresh.py
+    # (refresh, --no-sync skip warning, queue=1 nudge) and
+    # tests/test_dashboard_csrf.py (Origin), both in the dashboard-server row.
+    # Repeating it per scenario ran a full snapshot rebuild under a 5 s curl
+    # limit in every fixture, which is what timed out under a loaded pool.
+    if [ "$name" = "ok" ]; then
+        # POST /api/sync (v2): valid Origin → 200, bogus → 403, missing → 403.
+        #
+        # #583 S2 §4: this server runs with --no-sync, and a manual refresh=1
+        # there now STATES the skip instead of performing no refresh silently, so
+        # the success answer is 200 with a `refresh_skipped_no_sync` warning
+        # rather than the pre-#583 bare 204. The body is checked too, because a
+        # 200 whose warnings array said something else would pass a status-only
+        # assertion while reporting the wrong thing to the user.
+        local sync_code sync_body
+        sync_body=$(curl -s -w '\n%{http_code}' --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" "$base/api/sync")
+        sync_code=$(tail -n1 <<<"$sync_body")
+        if [ "$sync_code" != "200" ]; then
+            echo "FAIL $name: POST /api/sync (valid Origin) returned $sync_code (expected 200)"
+            ok=0
+        elif ! grep -q 'refresh_skipped_no_sync' <<<"$sync_body"; then
+            echo "FAIL $name: POST /api/sync under --no-sync did not warn refresh_skipped_no_sync: $sync_body"
+            ok=0
+        fi
+        # A MACHINE NUDGE under --no-sync is refused with 204 and enqueues
+        # nothing: the documented contract freezes data to the startup snapshot.
+        sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://127.0.0.1:$port" \
+            "$base/api/sync?refresh=0&queue=1")
+        if [ "$sync_code" != "204" ]; then
+            echo "FAIL $name: POST /api/sync?queue=1 under --no-sync returned $sync_code (expected 204)"
+            ok=0
+        fi
+        sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST -H "Origin: http://evil.example" "$base/api/sync")
+        if [ "$sync_code" != "403" ]; then
+            echo "FAIL $name: POST /api/sync (bogus Origin) returned $sync_code (expected 403)"
+            ok=0
+        fi
+        sync_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -X POST "$base/api/sync")
+        if [ "$sync_code" != "403" ]; then
+            echo "FAIL $name: POST /api/sync (missing Origin) returned $sync_code (expected 403)"
+            ok=0
+        fi
     fi
 
     # F3: when --tz is pinned at startup, POST /api/settings must refuse

@@ -332,14 +332,15 @@ def _defer_without_spawning(call):
     import _cctally_db
     import _cctally_update
 
-    prior = _cctally_update._spawn_detached
-    _cctally_update._spawn_detached = lambda _command: True
+    prior = _cctally_update._spawn_detached_with_pid
+    _cctally_update._spawn_detached_with_pid = (
+        lambda _command, **_kw: os.getpid())
     try:
         call()
     except _cctally_db.StatsHealDeferred:
         return
     finally:
-        _cctally_update._spawn_detached = prior
+        _cctally_update._spawn_detached_with_pid = prior
     raise AssertionError("the corruption heal did not defer")
 
 
@@ -1061,7 +1062,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1018
+    assert _cctally_core.STATS_INDEX_EPOCH == 1019
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -1081,7 +1082,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1018
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1019
     finally:
         conn.close()
 

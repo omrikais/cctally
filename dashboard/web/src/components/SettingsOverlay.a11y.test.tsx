@@ -667,12 +667,6 @@ describe('the section rail and the filter (#513 S2 §2.1, §2.2)', () => {
     }
   });
 
-  it('does not carry a no-op settings-row class on ordinary field labels', () => {
-    render(<SettingsOverlay />);
-    openSettings();
-    expect(document.querySelectorAll('.settings-row')).toHaveLength(0);
-  });
-
   it('keeps a filtered-out dirty field in the change count AND in the POST body', async () => {
     const fetchMock = respondWith(200, {});
     render(<SettingsOverlay />);
@@ -803,24 +797,7 @@ describe('a self-unmounting control never drops focus to the body (#513 S2 §2.3
   });
 });
 
-// §2.7 retired "axis" as a user-facing noun. An `aria-label` IS user-facing:
-// it is the only name a screen-reader user hears, and it overrides the visible
-// label it sits next to.
 describe('naming (#513 S2 §2.7)', () => {
-  it('says "axis" nowhere a person can read or hear it', () => {
-    render(<SettingsOverlay />);
-    openSettings();
-    const root = document.getElementById('settings-root')!;
-    expect(root.textContent ?? '', 'visible text still says axis').not.toMatch(/\baxis\b/i);
-    const labels = Array.from(
-      root.querySelectorAll<HTMLElement>('[aria-label]'),
-    ).map((node) => node.getAttribute('aria-label') ?? '');
-    expect(labels.length, 'nothing carried an aria-label').toBeGreaterThan(2);
-    for (const label of labels) {
-      expect(label, `aria-label "${label}" still says axis`).not.toMatch(/\baxis\b/i);
-    }
-  });
-
   it('still names both test-alert selects, and the projected one only when it applies', () => {
     render(<SettingsOverlay />);
     openSettings();

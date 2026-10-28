@@ -2,6 +2,7 @@
 from __future__ import annotations
 import types
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -680,6 +681,226 @@ def test_probe_snapshot_uses_bounded_cow_clone_and_cleans_stale_dirs(
     assert commands[0][1]["timeout"] == (
         cache_mod._CONVERSATION_PROBE_CLONE_TIMEOUT_SECONDS
     )
+
+
+def _fake_cp(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+    stderr: str,
+    *,
+    status: int = 1,
+) -> pathlib.Path:
+    """Put a `cp` on PATH that writes ``stderr`` and exits ``status``.
+
+    The pytest copy seam is dropped so the real clone helper runs it. Returns
+    the marker the fake touches, so a test can prove the clone was attempted.
+    """
+    fake_bin = tmp_path / "fake-cp-bin"
+    fake_bin.mkdir()
+    message = fake_bin / "stderr.txt"
+    message.write_text(stderr + "\n", encoding="utf-8")
+    invoked = fake_bin / "invoked"
+    fake = fake_bin / "cp"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f": > '{invoked}'\n"
+        f"cat '{message}' >&2\n"
+        f"exit {status}\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY", raising=False)
+    return invoked
+
+
+def _gnu_clone_failure(error: int) -> str:
+    """GNU coreutils' `cp --reflink=always` message for a failed FICLONE."""
+    return (
+        "cp: failed to clone '/d/.conversations-probe-x/conversations.db' "
+        f"from '/d/conversations.db': {os.strerror(error)}"
+    )
+
+
+_CLONE_REFUSALS = {
+    **{
+        f"gnu-{name}": _gnu_clone_failure(getattr(errno, name))
+        for name in ("ENOTSUP", "EOPNOTSUPP", "EXDEV", "ENOTTY", "EINVAL")
+    },
+    "macos-ENOTSUP": (
+        "cp: /d/.conversations-probe-x/conversations.db: clonefile failed: "
+        f"{os.strerror(errno.ENOTSUP)}"
+    ),
+}
+
+_CLONE_FAILURES = {
+    **{
+        f"gnu-clone-{name}": _gnu_clone_failure(getattr(errno, name))
+        for name in ("ENOSPC", "EDQUOT", "EIO", "EPERM", "EACCES")
+    },
+    "gnu-open-EACCES": (
+        "cp: cannot open '/d/conversations.db' for reading: "
+        f"{os.strerror(errno.EACCES)}"
+    ),
+    "gnu-stat-ENOENT": (
+        f"cp: cannot stat '/d/conversations.db': {os.strerror(errno.ENOENT)}"
+    ),
+    "gnu-create-ENOSPC": (
+        "cp: cannot create regular file "
+        "'/d/.conversations-probe-x/conversations.db': "
+        f"{os.strerror(errno.ENOSPC)}"
+    ),
+    "macos-copyfile-EIO": (
+        f"cp: /d/conversations.db: {os.strerror(errno.EIO)}"
+    ),
+    "macos-clonefile-EIO": (
+        "cp: /d/.conversations-probe-x/conversations.db: clonefile failed: "
+        f"{os.strerror(errno.EIO)}"
+    ),
+    "no-stderr": "",
+}
+
+
+@pytest.mark.parametrize(
+    "stderr", list(_CLONE_REFUSALS.values()), ids=list(_CLONE_REFUSALS),
+)
+def test_a_filesystem_that_cannot_clone_is_reported_as_unavailable(
+    tmp_path, monkeypatch, stderr,
+):
+    """Only a refusal meaning "this filesystem cannot clone" is unavailability.
+
+    The pre-rebuild quick-check skips on that error and the rebuild continues,
+    so it must be reserved for a permanent property of the filesystem.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = ns["_cctally_cache"]
+    invoked = _fake_cp(tmp_path, monkeypatch, stderr)
+    source = tmp_path / "source.db"
+    source.write_bytes(b"probe source")
+
+    with pytest.raises(cache_mod.ConversationProbeCloneUnavailable):
+        cache_mod._clone_conversation_probe_member(
+            source, tmp_path / "snapshot.db",
+        )
+    assert invoked.exists()
+
+
+@pytest.mark.parametrize(
+    "stderr", list(_CLONE_FAILURES.values()), ids=list(_CLONE_FAILURES),
+)
+def test_a_clone_that_fails_for_another_reason_is_not_unavailability(
+    tmp_path, monkeypatch, stderr,
+):
+    """Out of space, permission, a vanished source or an I/O error must fail.
+
+    An I/O error reading a damaged store is the very signal the probe exists to
+    catch, so none of these may be mistaken for a filesystem without clones.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = ns["_cctally_cache"]
+    invoked = _fake_cp(tmp_path, monkeypatch, stderr)
+    source = tmp_path / "source.db"
+    source.write_bytes(b"probe source")
+
+    with pytest.raises(OSError) as raised:
+        cache_mod._clone_conversation_probe_member(
+            source, tmp_path / "snapshot.db",
+        )
+    assert invoked.exists()
+    assert not isinstance(
+        raised.value, cache_mod.ConversationProbeCloneUnavailable,
+    )
+    if stderr:
+        assert stderr in str(raised.value)
+
+
+def test_a_clone_failure_that_is_not_a_refusal_still_fails_the_rebuild(
+    tmp_path, monkeypatch,
+):
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = ns["_cctally_cache"]
+    core = ns["_cctally_core"]
+    conn = ns["open_conversations_db"](attach_cache=False)
+    conn.close()
+    path = pathlib.Path(core.CONVERSATIONS_DB_PATH)
+    before = _family_snapshot(path)
+    invoked = _fake_cp(
+        tmp_path, monkeypatch, _gnu_clone_failure(errno.ENOSPC),
+    )
+
+    with pytest.raises(OSError, match="No space left on device") as raised:
+        cache_mod._prepare_conversation_rebuild(
+            ("claude", "codex"), lock_timeout=0.05,
+        )
+
+    assert invoked.exists()
+    assert not isinstance(
+        raised.value, cache_mod.ConversationProbeCloneUnavailable,
+    )
+    assert _family_snapshot(path) == before
+    assert not list(path.parent.glob(".conversations-probe-*"))
+    assert not list((path.parent / "quarantine").glob("conversations.db-*"))
+
+
+def _corrupt_header(path: pathlib.Path) -> None:
+    path.write_bytes(b"not a sqlite transcript database")
+
+
+def _corrupt_second_page(path: pathlib.Path) -> None:
+    """Damage a page that opening never reads; only quick_check finds it."""
+    raw = bytearray(path.read_bytes())
+    page_size = int.from_bytes(raw[16:18], "big")
+    if page_size == 1:
+        page_size = 65_536
+    assert len(raw) >= page_size * 3
+    raw[page_size:page_size * 2] = b"\xa5" * page_size
+    path.write_bytes(raw)
+
+
+@pytest.mark.parametrize(
+    "corrupt", [_corrupt_header, _corrupt_second_page],
+    ids=["header", "interior-page"],
+)
+def test_a_corrupt_store_without_clones_is_never_quarantined(
+    tmp_path, monkeypatch, corrupt,
+):
+    """Without a clone there is no snapshot, so nothing may be quarantined.
+
+    The pre-rebuild quick-check is skipped on a filesystem that cannot clone.
+    A damaged header then fails the open and the rebuild; damage only
+    quick_check finds may go unnoticed. Either way the family must stay where
+    it is: recovery needs the same snapshot for its forensics.
+    """
+    env, data = _stage_sources(tmp_path)
+    initial = _run(env, "cache-sync", "--source", "all", "--rebuild")
+    assert initial.returncode == 0, initial.stderr
+    path = data / "conversations.db"
+    for suffix in ("-wal", "-shm"):
+        pathlib.Path(f"{path}{suffix}").unlink(missing_ok=True)
+    corrupt(path)
+    inode = path.stat().st_ino
+    invoked = _fake_cp(
+        tmp_path, monkeypatch, _gnu_clone_failure(errno.ENOTSUP),
+    )
+    no_clone_env = dict(env)
+    no_clone_env.pop("CCTALLY_TEST_CONVERSATION_PROBE_COPY")
+    no_clone_env["PATH"] = os.environ["PATH"]
+
+    declined = _run(no_clone_env, "cache-sync", "--source", "all", "--rebuild")
+
+    assert invoked.exists(), "the rebuild never attempted a clone"
+    assert "integrity check skipped" in declined.stderr, declined.stderr
+    if corrupt is _corrupt_header:
+        assert declined.returncode == 1, declined.stderr
+        assert "file is not a database" in declined.stderr
+    assert path.stat().st_ino == inode
+    assert not list(data.glob(".conversations-probe-*"))
+    assert not list((data / "quarantine").glob("conversations.db-*"))
+    assert not (data / "conversations.db.recovery.json").exists()
+    assert not (data / "conversations.db.repairing").exists()
 
 
 def test_confirmed_forensics_uses_durable_json_publication(

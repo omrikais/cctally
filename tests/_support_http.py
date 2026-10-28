@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import socket as _socket
 import socketserver
 import threading
@@ -30,23 +29,6 @@ import weakref
 # Derived, not chosen: the slowest pytest node observed under real three-lane
 # contention was 23.1 s, and the pytest cap is 120 s.
 PRESENCE_BACKSTOP_SECONDS = 30.0
-
-# #630 S2 calibration seam, and nothing else reads it. `bin/cctally-test-load-
-# invariance --calibrate slow-transport` arms it so the contended lane can be
-# SHOWN to fail: a lane that has never failed is no evidence that it would. It
-# is off in every ordinary run, the five contention rounds included.
-#
-# The fault is deliberately two-sided. A delay alone would prove nothing now
-# that every budget in the estate is the 30-second presence backstop, and a
-# delay large enough to blow that would make calibration take longer than the
-# thing it calibrates. Delaying the transport AND shrinking the budget it is
-# measured against reproduces the same condition — a transport slower than its
-# backstop — in a fraction of a second, and it fails through the helpers' own
-# diagnostic rather than through a bare timeout.
-_FAULT = os.environ.get("CCTALLY_LOAD_INVARIANCE_FAULT", "")
-_FAULT_SLOW_TRANSPORT = "slow-transport"
-_FAULT_DELAY_SECONDS = 0.5
-_FAULT_BACKSTOP_SECONDS = 0.1
 
 
 #: The smallest budget `remaining` will hand back once a shared deadline has
@@ -72,14 +54,6 @@ def remaining(deadline, *, floor=EXHAUSTED_DEADLINE_FLOOR_SECONDS):
     operation from a short one.
     """
     return max(floor, deadline - time.monotonic())
-
-
-def _transport_backstop(backstop):
-    """The backstop a transport really gets, and the delay it really pays."""
-    if _FAULT != _FAULT_SLOW_TRANSPORT:
-        return backstop
-    time.sleep(_FAULT_DELAY_SECONDS)
-    return _FAULT_BACKSTOP_SECONDS
 
 
 class _TrackedHandlerThreads(list):
@@ -363,7 +337,6 @@ def post_json(port, path, payload, *, backstop=PRESENCE_BACKSTOP_SECONDS,
     `None`, because a helper that answers `None` for both an empty body and an
     HTML error page hides the error page.
     """
-    backstop = _transport_backstop(backstop)
     body = json.dumps(payload).encode("utf-8")
     host_header = f"{host}:{port}"
     sent = {
@@ -433,7 +406,7 @@ def _server_state(server):
 #: after matching the first frame dropped the second permanently. The next call
 #: then spent its whole thirty-second backstop watching keep-alives go by.
 #:
-#: `bin/cctally-test-load-invariance` found it: two of three contended rounds
+#: The #630 S2 contended lane (since retired) found it: two of three contended rounds
 #: failed in `tests/test_codex_dashboard_conversation_events.py`, in tests the
 #: ordinary suite passes every time. Load makes it MORE likely rather than
 #: less, because a reader descheduled under contention drains more slowly and
@@ -562,7 +535,6 @@ def _ended(outcome, detail):
 
 def read_event(sock, *, marker, backstop=PRESENCE_BACKSTOP_SECONDS):
     """Wait for an SSE frame containing `marker`. Returns as soon as it lands."""
-    backstop = _transport_backstop(backstop)
     frame, tail, elapsed, outcome, detail = _drain_for(sock, marker, backstop)
     if frame is None:
         raise AssertionError(
@@ -577,8 +549,7 @@ def read_no_event(sock, *, marker, window):
     """Assert no frame containing `marker` arrives within `window` seconds.
 
     `window` is the assertion's observation period and is spent in full. It is
-    deliberately a separate parameter from the presence backstop, and the
-    timing-budget guard treats a named absence window as annotated.
+    deliberately a separate parameter from the presence backstop.
 
     A transport that goes away before the window elapses does NOT satisfy this
     assertion. Nothing arriving on a socket the peer closed says nothing about

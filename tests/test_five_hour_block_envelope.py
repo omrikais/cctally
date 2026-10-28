@@ -906,41 +906,31 @@ def _r8_credited_envelope_store(ns, conn, *, stored_start, floor_pct=63.0):
     return key
 
 
-def test_835_r8_the_envelope_withholds_a_credit_retired_block_start(ctx):
-    """THE THIRD CONSUMER. On a credited store the envelope published the retired
-    weekly value and a delta derived from it, while
-    `_credit_aware_block_weekly_axes` answered `(None, None)` for the same row.
-
-    The block's stored start is 63.0, the credit at 09:00 retired 63.0, the block's
-    observations are at 10:30, and `current_used_pct` is the post-credit 20.0. So
-    the published start was the retired number and the published delta was
-    `20.0 - 63.0 = -43.0`pp of burn that never happened."""
+def test_840_the_envelope_publishes_a_credited_blocks_stored_start(ctx):
+    """#840 (spec section 4.8). The shared helper
+    `_credit_aware_block_weekly_axes` returns a block's STORED axes now that
+    the retirement band is removed, so the envelope publishes the stored start
+    (63.0) and the delta derived from it (`20.0 - 63.0 = -43.0`pp). A stale
+    replica already in a store is corrected by `retract` (residual R8)."""
     ns, conn = ctx
     _r8_credited_envelope_store(ns, conn, stored_start=63.0)
 
-    # Non-vacuity: the shared helper must really be withholding on this row, or
-    # the assertion below would be about a store with no credit in it.
     block = dict(conn.execute(
         "SELECT * FROM five_hour_blocks LIMIT 1").fetchone())
     assert ns["_credit_aware_block_weekly_axes"](
-        conn, block, now_utc=_PINNED_NOW) == (None, None)
+        conn, block, now_utc=_PINNED_NOW) == (63.0, 63.0)
 
     fhb = ns["_select_current_block_for_envelope"](
         conn, current_used_pct=20.0, now_utc=_PINNED_NOW)
     assert fhb is not None
-    assert fhb["seven_day_pct_at_block_start"] is None, (
-        "the dashboard envelope published the weekly value the credit retired")
-    assert fhb["seven_day_pct_delta_pp"] is None, (
-        "the dashboard envelope published a burn nobody observed")
+    assert fhb["seven_day_pct_at_block_start"] == pytest.approx(63.0)
+    assert fhb["seven_day_pct_delta_pp"] == pytest.approx(-43.0, abs=1e-9)
 
 
-def test_835_r8_the_envelope_delta_yields_none_from_a_withheld_anchor(ctx):
-    """`p_anchor` needs no new handling, and that is verified rather than assumed.
-
-    `p_anchor` is initialized to `p_start` and the delta is already guarded by
-    `p_anchor is None`, so a withheld start reaches the guard on the non-crossed
-    path. The crossed path overwrites `p_anchor` from a capture-time snapshot read
-    that is its own population, so withholding the start does not disturb it."""
+def test_840_the_envelopes_crossed_delta_uses_its_post_reset_anchor(ctx):
+    """On the crossed path `p_anchor` is overwritten from a capture-time
+    snapshot read, so the published start is the stored 63.0 while the delta
+    is measured from the 11:00 snapshot's own 20.0."""
     ns, conn = ctx
     key = _r8_credited_envelope_store(ns, conn, stored_start=63.0)
     conn.execute("UPDATE five_hour_blocks SET crossed_seven_day_reset = 1")
@@ -949,18 +939,15 @@ def test_835_r8_the_envelope_delta_yields_none_from_a_withheld_anchor(ctx):
     fhb = ns["_select_current_block_for_envelope"](
         conn, current_used_pct=20.0, now_utc=_PINNED_NOW)
     assert fhb is not None
-    assert fhb["seven_day_pct_at_block_start"] is None
+    assert fhb["seven_day_pct_at_block_start"] == pytest.approx(63.0)
     assert fhb["crossed_seven_day_reset"] is True
-    # The post-reset anchor is the 11:00 snapshot's own 20.0, which no band
-    # retires, so the crossed delta survives a withheld start axis.
     assert fhb["seven_day_pct_delta_pp"] == pytest.approx(0.0, abs=1e-9)
     assert key == fhb["five_hour_window_key"]
 
 
 def test_835_r8_an_uncredited_envelope_store_is_byte_stable(ctx):
-    """The byte-stability contract for this surface. A week with no credits
-    resolves no bands, so the envelope publishes exactly what it published
-    before — the stored value and the delta derived from it."""
+    """The uncredited control for this surface: the envelope publishes the
+    stored value and the delta derived from it."""
     ns, conn = ctx
     _seed_block(conn, key=1777595400, start_iso="2026-04-30T10:30:00+00:00",
                 p_start=60.0, p_end=64.0)

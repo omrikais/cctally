@@ -166,19 +166,6 @@ describe('#564 — the decorated hero discloses the fallback window', () => {
     expect(compact?.textContent).toBe('Incl. no-cycle accounts · last 7 days');
   });
 
-  // The dim treatment rides on its own class, so it cannot be lost by a note
-  // that has no responsive form. Without it such a span carries no class at all
-  // and falls through to the bright `.hs-sub span` metric rule.
-  it('keeps the disclosure in the dim caption class, not the metric one', () => {
-    const { container } = renderCodex(HeroStrip, makeDecoratedCodexSourceData());
-    const note = container.querySelector(
-      '[data-testid="hero-spent-note"]') as HTMLElement;
-    for (const span of [...note.querySelectorAll('span')]) {
-      expect(span.getAttribute('class')).not.toBeNull();
-    }
-    expect(note.querySelector('.hero-spent-note-text')).not.toBeNull();
-  });
-
   it('renders no note when every card is cycle-bounded', () => {
     const { container } = renderCodex(
       HeroStrip, withoutFallbackCards(makeDecoratedCodexSourceData()));

@@ -1887,9 +1887,51 @@ def doctor_payload_memo(
 
 
 def reset_doctor_memo() -> None:
-    """Drop the memoized doctor payload (test hook + M5 invalidation entry)."""
+    """Drop the memoized doctor payload and the deferred frames' memoized
+    ``rebuild_worker`` value (test hook + M5 invalidation entry)."""
     with _DOCTOR_MEMO_LOCK:
         _DOCTOR_MEMO.clear()
+        _REBUILD_WORKER_MEMO.clear()
+
+
+# #997 D10: while an epoch rebuild is pending or running every stats open
+# defers, so the dashboard serves only the deferred startup frame and deferred
+# ticks, neither of which runs the doctor gather. Their doctor block still
+# carries the `db.rebuild_worker` aggregate, from the worker snapshots alone
+# (file reads and a `ps` probe per pid; no stats open, no cctally lock). This
+# memo keeps a deferred tick from forking `ps` every tick, on the doctor
+# payload's TTL and freshness rule. Same injected-`compute` decoupling.
+REBUILD_WORKER_MEMO_TTL_S = DOCTOR_MEMO_TTL_S
+
+_REBUILD_WORKER_MEMO: "dict" = {}
+
+
+def rebuild_worker_memo(
+    now_utc: dt.datetime,
+    *,
+    ttl_s: float,
+    compute: "Callable[[dt.datetime], dict | None]",
+) -> "dict | None":
+    """Return the deferred frames' ``rebuild_worker`` value, recomputing via
+    ``compute(now_utc)`` only when the memo is cold: never computed, older
+    than ``ttl_s``, or a clock regression. ``compute`` runs outside the
+    lock, exactly as in `doctor_payload_memo`."""
+    with _DOCTOR_MEMO_LOCK:
+        cached = _REBUILD_WORKER_MEMO
+        computed_at = cached.get("computed_at")
+        fresh = (
+            computed_at is not None
+            and now_utc >= computed_at
+            and (now_utc - computed_at).total_seconds() < ttl_s
+        )
+        if fresh:
+            return cached["value"]
+    value = compute(now_utc)
+    with _DOCTOR_MEMO_LOCK:
+        _REBUILD_WORKER_MEMO.clear()
+        _REBUILD_WORKER_MEMO["value"] = value
+        _REBUILD_WORKER_MEMO["computed_at"] = now_utc
+    return value
 
 
 # === Task 5.1 — idle-path dispatch state (last signature + snapshot) ========

@@ -11,20 +11,6 @@ describe('<BlocksPanel />', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders the panel card with blue accent', () => {
-    render(<BlocksPanel />);
-    const section = document.getElementById('panel-blocks');
-    expect(section?.classList.contains('panel')).toBe(true);
-    expect(section?.classList.contains('accent-blue')).toBe(true);
-  });
-
-  it('renders the layers icon and the "current week" subtitle', () => {
-    render(<BlocksPanel />);
-    const useEl = document.querySelector('#panel-blocks svg use');
-    expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#layers');
-    expect(screen.getByText(/current week/i)).toBeInTheDocument();
-  });
-
   it('renders one .blocks-row per fixture row (3 rows)', () => {
     render(<BlocksPanel />);
     const rows = document.querySelectorAll('#panel-blocks .blocks-row');

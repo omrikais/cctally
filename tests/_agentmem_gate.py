@@ -27,8 +27,7 @@ import pytest
 # Verification lanes declare CCTALLY_AGENTMEM_TEST_POLICY: the LAN/self-hosted
 # authorities require the pinned dependency, hosted CI records its explicit
 # private-repository boundary, and an ordinary developer machine remains
-# optional. Since #529 S6 the local escape hatch declares it too, so
-# `CCTALLY_TEST_LOCAL=1` runs the same contract the path it escapes runs.
+# optional.
 _agentmem_policy = os.environ.get("CCTALLY_AGENTMEM_TEST_POLICY", "optional-local")
 
 AGENTMEM_PRESENT = shutil.which("agentmem") is not None

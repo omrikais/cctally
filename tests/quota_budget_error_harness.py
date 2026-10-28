@@ -170,12 +170,11 @@ def validate_artifact(payload) -> list:
 def _load_cctally(store: pathlib.Path):
     """The shipped module, with its data directory pinned to `store`.
 
-    Through `tests/_script_loader.load_script_module`, which is the estate's
+    Through `tests/_script_loader.load_script_module`, which is the suite's
     ONE loader for `bin/cctally`; a hand-rolled compile-and-exec here would
-    be a second implementation, and `tests/test_script_loader.py` refuses
-    those as a rule rather than as a list. The environment is pinned FIRST,
-    because the loader re-derives every path constant from it during the
-    load and a later assignment would not be seen.
+    be a second implementation of its eviction and path re-derivation. The
+    environment is pinned FIRST, because the loader re-derives every path
+    constant from it during the load and a later assignment would not be seen.
     """
     tests_dir = str(REPO / "tests")
     if tests_dir not in sys.path:

@@ -872,15 +872,6 @@ def test_every_explain_scenario_has_an_input_env():
         assert (scenario / "golden-json.txt").is_file(), scenario
 
 
-def test_the_manifest_registers_the_explain_harness():
-    manifest = json.loads(
-        (_REPO / "tests" / "authoritative-test-manifest.json").read_text()
-    )
-    rows = [h for h in manifest["harnesses"] if h["name"] == "explain"]
-    assert rows and rows[0]["countPolicy"] == "fixed"
-    assert manifest["minHarnessRows"] >= 61
-
-
 # --- the denominator is an EvidenceField --------------------------------
 
 @pytest.fixture

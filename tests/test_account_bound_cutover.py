@@ -186,8 +186,17 @@ def test_crash_at_each_durability_step_recovers_one_boundary(
         assert baseline.digest() == boundary.legacy_spool_baseline_digest
     else:
         # The install was lost with the crashed producer; the retry found the
-        # op and installed nothing. The reducer reports baseline-unavailable.
-        assert baseline is None
+        # op and installed nothing for it. #797/#823/#840 (spec 4.6 B2): the
+        # revision-2 establishment that follows reconciles that lost baseline
+        # before installing the expanded one, so the trigger the reducer
+        # would have raised is journalled ahead of the revision op.
+        reasons = [rec["payload"]["reason"] for _seg, rec in _records()
+                   if rec and (rec.get("payload") or {}).get("kind")
+                   == P.LEGACY_SPOOL_ACTIVITY_KIND]
+        assert reasons == ["baseline-unavailable"]
+        assert baseline is not None
+        assert baseline.digest() == (
+            boundary.revision.legacy_spool_baseline_digest)
 
 
 def test_corrupt_coordinate_cache_never_yields_a_second_boundary(env):

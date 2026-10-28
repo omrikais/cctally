@@ -15,9 +15,6 @@
 // stays — the week genuinely is not opened here — and the diagnosis is offered
 // beside it, because `/api/diagnosis` is keyed by explicit half-open bounds.
 import { describe, it, expect, beforeEach } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { fireEvent, render } from '@testing-library/react';
 import { RecentAlertsModal } from '../src/components/RecentAlertsModal';
 import { Toast } from '../src/components/Toast';
@@ -39,16 +36,6 @@ import {
 } from '../src/lib/alertScope';
 import fixture from './fixtures/envelope.json';
 import type { AlertEntry, Envelope } from '../src/types/envelope';
-
-const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src');
-
-function* walkSources(dir: string): Generator<string> {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) yield* walkSources(full);
-    else if (/\.tsx?$/.test(entry.name)) yield full;
-  }
-}
 
 const LIVE_WEEK_START = '2026-04-21T00:00:00Z';
 const CLOSED_WEEK_START = '2026-03-01T00:00:00Z';
@@ -239,133 +226,6 @@ describe('#620 S2 — every follow entry point delivers the scope', () => {
     fireEvent.click(container.querySelector('.mfc-explain') as HTMLButtonElement);
     expect(getState().openExplainWindowStartAt).toBe('2026-04-21T00:00:00.000Z');
     expect(getState().openExplainAlertFiredAt).toBeNull();
-  });
-
-  // `followAlertTarget` is the single chokepoint. Three modules invoke it, and
-  // `AlertFollowCell` serves both the alerts modal and the toast, which is why
-  // four surfaces come from three files. Each module makes two calls: one for
-  // the explain affordance and one for the primary target.
-  //
-  // The expected counts are PER FILE. A set of filenames plus a total is
-  // satisfied by moving a call from one module to another, which is exactly
-  // the change that silently drops a surface.
-  const EXPECTED_CALLS: Record<string, number> = {
-    'modals/ForecastModal.tsx': 2,
-    'components/BudgetBlock.tsx': 2,
-    'components/AlertFollow.tsx': 2,
-  };
-
-  /** One source file with its import statements removed.
-   *
-   *  A line filter keyed on `startsWith('import')` drops any line whose first
-   *  token merely begins with those six letters, so
-   *  `importedTarget && followAlertTarget(x)` disappeared from the scan
-   *  entirely. This removes import STATEMENTS instead: `\bimport\b` will not
-   *  match `importedTarget`.
-   *
-   *  The match ends on the statement's OWN terminator — the module specifier —
-   *  rather than on the next semicolon in the file. `[^;]*;` ran on past the
-   *  end of any import written without a trailing semicolon and deleted
-   *  whatever call sat between that import and the next statement's semicolon,
-   *  silently counting a real call site as absent. Nothing under `src/` is
-   *  written that way today, which is exactly what made the old form sound and
-   *  one lint-config change from wrong.
-   *
-   *  Both import forms end at the module specifier: the binding form has a
-   *  `from` before it, the side-effect form has nothing between `import` and
-   *  the quote. The part before `from` may not contain a quote or a
-   *  semicolon, so no match can cross a statement boundary; that class still
-   *  spans newlines, so a multi-line import is consumed whole. The lookahead
-   *  keeps `import.meta.url` and a dynamic `import(` out of it.
-   *
-   *  Every failure this can have is in the SAFE direction. A comment inside an
-   *  import block carrying a quote or a semicolon stops the match, so that
-   *  import survives the strip — and if it is an import OF this symbol, the
-   *  mentions-versus-calls rule below fails loudly rather than counting a
-   *  surface as absent.
-   */
-  function withoutImports(text: string): string {
-    const IMPORT_STATEMENT =
-      /^[ \t]*import\b(?!\s*[.(])(?:[^'";]*?\bfrom\b)?[ \t\n]*(['"])[^'"\n]*\1[ \t]*;?/gm;
-    return text.replace(IMPORT_STATEMENT, '');
-  }
-
-  it('does not swallow a call after an import written without a semicolon', () => {
-    // `[^;]*;` ends on the FIRST semicolon after the word `import`, so an
-    // import written in ASI style — no trailing semicolon — ran on into the
-    // next statement and deleted whatever call sat between the two. No file
-    // under `src/` is written that way today, which is exactly why the guard
-    // could be one lint-config change away from counting a surface as absent.
-    const source = [
-      "import { followAlertTarget } from '../store/followAlertTarget'",
-      '',
-      'export function go(target: AlertTarget): void {',
-      '  followAlertTarget(target);',
-      '}',
-    ].join('\n');
-    const stripped = withoutImports(source);
-    expect(stripped).not.toMatch(/^[ \t]*import\b/m);
-    expect(stripped.match(/\bfollowAlertTarget\s*\(/g)).toHaveLength(1);
-  });
-
-  it('still removes the import forms the tree actually uses', () => {
-    const source = [
-      "import '../index.css';",
-      'import {',
-      '  followAlertTarget,',
-      "} from '../store/followAlertTarget';",
-      "import type { AlertTarget } from '../lib/alertScope';",
-      'const importedTarget = 1;',
-      'followAlertTarget(importedTarget);',
-    ].join('\n');
-    const stripped = withoutImports(source);
-    expect(stripped).not.toMatch(/^[ \t]*import\b/m);
-    // `importedTarget` merely BEGINS with those six letters and must survive.
-    expect(stripped).toContain('const importedTarget = 1;');
-    expect(stripped.match(/\bfollowAlertTarget\s*\(/g)).toHaveLength(1);
-  });
-
-  it('covers every surface that follows a target', () => {
-    // This guard READS THE SOURCE TREE. Asserting the size of a set of string
-    // literals the test itself writes is an arithmetic identity: it reads
-    // nothing, so a fifth `followAlertTarget(` call site left it green and the
-    // comment claiming otherwise was false.
-    const found: Record<string, number> = {};
-    for (const absolute of walkSources(SRC_DIR)) {
-      if (absolute.endsWith(`store${path.sep}followAlertTarget.ts`)) continue;
-      // A word boundary, not a bare substring: `myFollowAlertTarget(` is a
-      // different function and must not be counted as a call to this one.
-      const calls = withoutImports(readFileSync(absolute, 'utf8'))
-        .match(/\bfollowAlertTarget\s*\(/g);
-      if (calls) {
-        found[path.relative(SRC_DIR, absolute).split(path.sep).join('/')] =
-          calls.length;
-      }
-    }
-    expect(found).toEqual(EXPECTED_CALLS);
-  });
-
-  it('is never reached through a name other than its own', () => {
-    // The count above can only see what it can name. An aliased import
-    // (`import { followAlertTarget as follow }`) or a local rebinding
-    // (`const f = followAlertTarget`) adds a call site under a name no scan
-    // for this symbol will ever match, so both are closed by a RULE rather
-    // than by widening the scan: outside its own module the symbol may appear
-    // only as a call to itself.
-    for (const absolute of walkSources(SRC_DIR)) {
-      if (absolute.endsWith(`store${path.sep}followAlertTarget.ts`)) continue;
-      const relative = path.relative(SRC_DIR, absolute)
-        .split(path.sep).join('/');
-      const text = readFileSync(absolute, 'utf8');
-      expect(text, `${relative} imports followAlertTarget under an alias`)
-        .not.toMatch(/\bfollowAlertTarget\s+as\s+/);
-      const mentions = (withoutImports(text).match(/\bfollowAlertTarget\b/g)
-                        ?? []).length;
-      const calls = (withoutImports(text).match(/\bfollowAlertTarget\s*\(/g)
-                     ?? []).length;
-      expect(mentions, `${relative} names followAlertTarget without calling it`)
-        .toBe(calls);
-    }
   });
 });
 

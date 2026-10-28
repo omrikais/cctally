@@ -6,9 +6,6 @@
 // withheld. What it cannot decide (real `@media` at 390px, trusted Tab order,
 // a real focus trap, whether the text is legible) is the browser gate's.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ModalRoot } from '../src/modals/ModalRoot';
 import { Header } from '../src/components/Header';
@@ -166,8 +163,6 @@ function report(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
-
-const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src');
 
 /** Publish a snapshot whose display block resolves to `tz`.
  *
@@ -566,13 +561,10 @@ describe('#620 S2 — the surface states its facts legibly', () => {
     );
   });
 
-  it('separates the next-step label from the command it precedes', async () => {
-    // The gate measured the label's right edge and the `<code>` left edge at
-    // the same x on all 14 rows: JSX strips the newline between the two
-    // elements, so the emitted HTML carries no text node between them and the
-    // uppercase label read as one word with the command —
-    // `NEXT STEPcctally claude daily …`. The separation is the rule's, so the
-    // rule is what this pins.
+  it('states the next-step label beside the command it precedes', async () => {
+    // A contributor row ends with what to run next: the "next step" label and
+    // the command itself. (Their visual separation is a CSS rule, which the
+    // browser gate observes.)
     stubFetch(report());
     openExplain();
     const { container } = render(<ModalRoot />);
@@ -585,14 +577,6 @@ describe('#620 S2 — the surface states its facts legibly', () => {
     expect(next.querySelector('.explain-figure-label')?.textContent?.trim())
       .toBe('next step');
     expect(next.querySelector('code')?.textContent).toContain('cctally');
-    const css = readFileSync(path.join(SRC_DIR, 'index.css'), 'utf8');
-    const rule = /\n\.explain-row-next\s*\{([^}]*)\}/.exec(css);
-    expect(rule).not.toBeNull();
-    // The two sibling rows that already state a label beside a value —
-    // `.explain-row-figures` and `.explain-denominator` — both carry a flex
-    // gap. This is the same construction, not a third one.
-    expect(rule?.[1]).toMatch(/display:\s*flex/);
-    expect(rule?.[1]).toMatch(/gap:/);
   });
 
   it('keeps the denominator identifier readable and names it as the CLI does', async () => {

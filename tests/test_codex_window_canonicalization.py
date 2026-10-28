@@ -1099,10 +1099,10 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     source-local five-hour credit confirmation state, and #769 S11 advances to
     1015 for `weekly_usage_snapshots.weekly_observation_held`, and #869 advances
     to 1016 for `five_hour_blocks.pricing_provenance_json`, and #901 advances
-    to 1017 for read indexes, and #825/#832 to 1018 for the account-bound
-    journal fence."""
+    to 1017 for read indexes, #825/#832 to 1018 for the account-bound
+    journal fence, and #797/#823/#840 to 1019 for its revision 2."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1018
+    assert _cctally_core.STATS_INDEX_EPOCH == 1019
 
 
 # --------------------------------------------------------------------------

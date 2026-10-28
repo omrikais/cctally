@@ -25,6 +25,8 @@ the status-line render.
 Both paths (status-line snippet and the default hook integration) can run
 simultaneously; the `record-usage` funnel dedupes correctly.
 
+**Limitation after a credit.** The direct recipe passes only the `rate_limits` numbers, and Claude Code keeps showing an idle session the reading from its last response. After a credit lowers your usage, an idle session's cached reading looks exactly like a fresh one, so the direct recipe can record a value the credit already retired. [`cctally statusline`](statusline.md) can tell the two apart: it checks each reading against the session's own transcript activity and the provider's readings, and refuses a reading proven stale. Prefer `cctally statusline` as your status-line command. The `record-usage` flags are unchanged. A value recorded this way that later proves stale can be corrected with `cctally db rederive`'s reviewed `retract` (see [db.md](db.md)).
+
 ---
 
 # `record-usage`

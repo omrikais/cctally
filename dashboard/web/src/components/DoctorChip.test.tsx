@@ -67,3 +67,53 @@ describe('#293 S4 — DoctorChip label/status split', () => {
     expect(getState().doctorModalOpen).toBe(true);
   });
 });
+
+// #997 T-B3 (spec D10) — when the stats.db rebuild worker check warns, the
+// envelope's doctor block carries `rebuild_worker: {severity, summary}`; the
+// chip's tooltip and accessible name then read
+// `<summary> · Doctor · <SEV> · checked <T> (click for report)`. The visible
+// label and severity class are unchanged.
+describe('#997 — DoctorChip rebuild-worker sentence', () => {
+  const DIED = 'the last stats.db upgrade rebuild died without finishing';
+  const when = new Date('2026-07-14T10:00:00Z').toLocaleTimeString();
+
+  it('present: tooltip and aria-label lead with the sentence', () => {
+    const { container } = renderWith({
+      ...doctor('warn', { ok: 64, warn: 1, fail: 0 }),
+      rebuild_worker: { severity: 'warn', summary: DIED },
+    });
+    const btn = container.querySelector('button.doctor-chip') as HTMLButtonElement;
+    const expected = `${DIED} · Doctor · WARN · checked ${when} (click for report)`;
+    expect(btn.getAttribute('title')).toBe(expected);
+    expect(btn.getAttribute('aria-label')).toBe(expected);
+    // Visible label and colors unchanged.
+    expect(container.querySelector('.doctor-chip-label')?.textContent).toBe('Doctor');
+    expect(container.querySelector('.doctor-chip-status')?.textContent).toBe('1 warn');
+    expect(btn.className).toBe('doctor-chip doctor-chip--warn');
+    expect(btn.textContent).not.toContain(DIED);
+  });
+
+  it('absent (null): tooltip and aria-label are the generic text', () => {
+    const { container } = renderWith({
+      ...doctor('ok', { ok: 65, warn: 0, fail: 0 }),
+      rebuild_worker: null,
+    });
+    const btn = container.querySelector('button.doctor-chip') as HTMLButtonElement;
+    expect(btn.getAttribute('title')).toBe(`Doctor · OK · checked ${when} (click for report)`);
+    expect(btn.getAttribute('aria-label')).toBe(
+      'Doctor diagnostic: OK — 65 OK, 0 warn, 0 fail',
+    );
+  });
+
+  it('fallback block (key missing, synthetic FAIL): generic text', () => {
+    const { container } = renderWith({
+      ...doctor('fail', { ok: 0, warn: 0, fail: 1 }),
+      _error: 'RuntimeError: boom',
+    });
+    const btn = container.querySelector('button.doctor-chip') as HTMLButtonElement;
+    expect(btn.getAttribute('title')).toBe(`Doctor · FAIL · checked ${when} (click for report)`);
+    expect(btn.getAttribute('aria-label')).toBe(
+      'Doctor diagnostic: FAIL — 0 OK, 0 warn, 1 fail',
+    );
+  });
+});

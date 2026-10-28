@@ -64,10 +64,36 @@ def _eligible(monkeypatch, retention):
         and geometry.freelist_count > 0)
 
 
-def _visit(retention, conn, now, ops):
+def _visit(retention, conn, now, ops, *, clock=None):
+    """One visit. ``clock`` (a `_stops_after_chunks` clock) decides when
+    its reclaim attempt ends; without it the visit runs on the real clock."""
+    def record(kind, payload):
+        ops.append((kind, payload))
+        if clock is not None and kind == "reclaim":
+            clock.reported()
+
     return retention._maybe_prune_conversation_retention(
-        conn, now_utc=now, retention_days=180,
-        record_phase=lambda kind, payload: ops.append((kind, payload)))
+        conn, now_utc=now, retention_days=180, record_phase=record,
+        **({} if clock is None else {"clock": clock}))
+
+
+class _stops_after_chunks:
+    """A visit clock that stands still, so every chunk plans with the whole
+    reclaim deadline in real time, and passes the deadline once ``chunks``
+    reclaim chunks have reported."""
+
+    def __init__(self, retention, chunks):
+        self._jump = retention.RECLAIM_DEADLINE_SECONDS + 0.5
+        self._left = chunks
+        self._now = 0.0
+
+    def __call__(self):
+        return self._now
+
+    def reported(self):
+        self._left -= 1
+        if self._left == 0:
+            self._now += self._jump
 
 
 def _seed_claude(conn, session_id, rows):
@@ -227,13 +253,19 @@ def test_a_legacy_record_is_normalized_once_before_the_first_chunk(
     monkeypatch.setattr(retention, "normalize_reclaim_record", normalize)
     monkeypatch.setattr(retention, "reclaim_chunk", chunk)
     ops = []
-    _visit(retention, conn, NOW, ops)
-    _visit(retention, conn, NOW + dt.timedelta(minutes=1), ops)
+    for minute in (0, 1):
+        # #990: each visit ends after exactly two chunks, decided here rather
+        # than by the wall clock. With the real clock a loaded runner left
+        # the visit's last chunk a sliver of the 2 s deadline, its planner
+        # helper refused it, and the "every chunk is ok" check failed on a
+        # deadline skip instead of on normalization.
+        _visit(retention, conn, NOW + dt.timedelta(minutes=minute), ops,
+               clock=_stops_after_chunks(retention, 2))
     normalizations = [e for e in events if e[0] == "normalize"]
     chunks = [e for e in events if e[0] == "chunk"]
     assert events[0] == ("normalize", True, retention.RECLAIM_RECORD_LENGTH)
     assert [e[1] for e in normalizations] == [True, False], events
-    assert chunks and all(e[1] == "ok" for e in chunks), events
+    assert [e[1] for e in chunks] == ["ok"] * 4, events
     record = retention.read_reclaim_pending(conn)
     assert record["freelist_count"] is not None
     ledger = sum(b["charged"] for b in record["ledger"])

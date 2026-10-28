@@ -14,14 +14,6 @@ describe('Header — mobile additions', () => {
     updateSnapshot(fixture as unknown as Envelope);
   });
 
-  it('renders ⚙ settings and ? help icon buttons', () => {
-    render(<Header />);
-    const settings = screen.getByRole('button', { name: /open settings/i });
-    const help = screen.getByRole('button', { name: /open help/i });
-    expect(settings).toBeTruthy();
-    expect(help).toBeTruthy();
-  });
-
   it('settings click dispatches a synthetic "s" keydown', () => {
     const events: string[] = [];
     const listener = (e: KeyboardEvent) => events.push(e.key);

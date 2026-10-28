@@ -32,7 +32,7 @@ from conftest import load_script, redirect_paths
 
 FIXED = dt.datetime(2026, 9, 12, 12, 0, 0, tzinfo=dt.timezone.utc)
 PREVIOUS_EPOCH = 1014
-NEW_EPOCH = 1018  # current head; the column was introduced at 1015
+NEW_EPOCH = 1019  # current head (#797/#823/#840); the column was introduced at 1015
 TABLE = "weekly_usage_snapshots"
 COLUMN = "weekly_observation_held"
 

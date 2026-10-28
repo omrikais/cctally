@@ -1792,15 +1792,19 @@ def test_one_selection_snapshot_opens_each_segment_exactly_once(s5_repair):
     """Before the conversion this snapshot opened the three segments ten times:
     once each for the materialized read, twice more for each of the two
     resolution ops' `journal_prefix_hash` re-reads, and three more for the
-    separate `_prefix_hash` pass."""
+    separate `_prefix_hash` pass.
+
+    #997 D12: the streamed prefix hash retains no segment bytes, so the one
+    mid-segment evidence point re-reads that segment's prefix once through
+    the seam; nothing else is reopened."""
     repair, opened = s5_repair["repair"], s5_repair["opened"]
     opened.clear()
     snapshot = repair._selection_snapshot()
     selection = snapshot.selection
 
-    assert opened == list(S5.SEGMENTS), (
+    assert opened == list(S5.TAINTED_EVIDENCE_PASS_OPENS), (
         "a selection snapshot must open each segment through the seam exactly "
-        "once, in canonical order"
+        "once, in canonical order, plus the one mid-segment evidence re-read"
     )
     assert snapshot.high_water == s5_repair["built"]["high_water"]
     assert snapshot.prefix_hash == S5_BASELINE_PREVIEW["journalPrefixHash"]
@@ -1826,10 +1830,12 @@ def test_one_selection_snapshot_opens_each_segment_exactly_once(s5_repair):
 def test_the_prefix_hasher_is_released_before_the_normalization_loop(
     tmp_path, monkeypatch
 ):
-    """`PrefixHashAccumulator` buffers the segment it is reading — 410 MB on the
-    maintainer's journal — and `rebuild_stats_index` drops it the moment its pass
-    ends, before it walks the decoded records. This pass must do the same, or
-    that buffer stays resident across the whole normalization loop.
+    """`PrefixHashAccumulator` streams the prefix hash and retains no segment
+    bytes (#997 D12; it used to buffer the segment it was reading, 410 MB on the
+    maintainer's journal), but it still holds hash states, registered
+    boundaries and the segment opener. `rebuild_stats_index` drops it the
+    moment its pass ends, before it walks the decoded records, and this pass
+    must do the same, so none of that stays live across the normalization loop.
 
     Residency is not visible in any output, so this asserts it structurally: by
     the time the first record is normalized, the accumulator must already be
@@ -1990,5 +1996,6 @@ def test_the_whole_recovery_command_takes_no_extra_prefix_traversal(
     assert payload["auditId"] == audit_id
     assert rebuilt == [S5_RECOVERY_HIGH_WATER_BY_AUDIT[audit_id]]
     # Three legitimate selection snapshots: the unlocked preview, the revalidated
-    # preview under the repair lock, and the final preview after the rebuild.
-    assert opened == list(S5.SEGMENTS) * 3, opened
+    # preview under the repair lock, and the final preview after the rebuild,
+    # each with its one mid-segment evidence re-read (#997 D12).
+    assert opened == list(S5.TAINTED_EVIDENCE_PASS_OPENS) * 3, opened

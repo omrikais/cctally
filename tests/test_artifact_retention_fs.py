@@ -533,11 +533,12 @@ def test_the_heal_marker_is_durable_before_the_worker_is_spawned(
     from _cctally_update import _spawn_detached  # noqa: F401
     import _cctally_update
 
-    def spawn(_cmd):
+    def spawn(_cmd, env=None):
         obs.note("worker-spawned")
-        return True
+        return os.getpid()
 
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", spawn)
+    # #997 D8: the heal worker spawns through the pid-returning seam.
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid", spawn)
 
     _drive_heal_hook(store, core, monkeypatch)
 
@@ -583,7 +584,8 @@ def test_an_unconfirmed_worker_enriches_then_clears_the_request(
 
     monkeypatch.setattr(db_mod, "write_corruption_forensics", unconfirmed)
     import _cctally_update
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: True)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda _cmd, env=None: os.getpid())
     _drive_heal_hook(store, core, monkeypatch)
     assert marker.exists(), "admission precedes worker-side classification"
     assert json.loads(marker.read_text())["forensicsPath"] is None
@@ -604,7 +606,8 @@ def test_a_coalesced_detection_counts_on_the_one_admitted_occurrence(
     _ns, core, store = _load(tmp_path, monkeypatch)
     import _cctally_update
 
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: True)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda _cmd, env=None: os.getpid())
 
     _drive_heal_hook(store, core, monkeypatch)
     first = json.loads(store._stats_heal_marker_path().read_text())
@@ -631,7 +634,8 @@ def test_admission_policy_is_unchanged_by_the_split(tmp_path, monkeypatch):
 
     spawned: list[int] = []
     monkeypatch.setattr(
-        _cctally_update, "_spawn_detached", lambda _cmd: spawned.append(1) or True
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda _cmd, env=None: spawned.append(1) or os.getpid()
     )
     core.APP_DIR.mkdir(parents=True, exist_ok=True)
     request = {"healId": "h1", "forensicsPath": None, "triggerError": ""}
@@ -696,7 +700,8 @@ def test_only_a_reserved_reservation_spawns(tmp_path, monkeypatch):
     core.APP_DIR.mkdir(parents=True, exist_ok=True)
     spawned: list[str] = []
     monkeypatch.setattr(
-        _cctally_update, "_spawn_detached", lambda cmd: spawned.append(cmd) or True
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda cmd, env=None: spawned.append(cmd) or os.getpid()
     )
 
     assert store.complete_stats_corruption_heal("pending") == "pending"
@@ -731,7 +736,8 @@ def test_a_failed_spawn_drops_the_marker_so_the_next_open_is_admitted(
     # A concurrent detector coalesces onto the marker and takes no action.
     assert store.reserve_stats_corruption_heal(_request("h2")) == "pending"
 
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: False)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda _cmd, env=None: None)
     assert store.complete_stats_corruption_heal("reserved") == "failed"
     assert not marker.exists()
 

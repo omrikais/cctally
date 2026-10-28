@@ -168,7 +168,14 @@ def pytest_configure(config):
     A global plugin, not hooks in this file: pytest calls the fixture hooks for
     a session-scoped fixture through the Session's hook proxy, which leaves out
     this conftest because it sits below the rootdir (see _temp_hygiene.Plugin).
+
+    `xdist_group` is registered here as well as by xdist: the marks
+    `_assign_xdist_groups` adds would otherwise be unknown, and warn on every
+    grouped item, in a run with `-p no:xdist` (review I3c F11).
     """
+    config.addinivalue_line(
+        "markers", "xdist_group(name): run under --dist loadgroup on one xdist worker "
+        "with the other items of the same group (tests/conftest.py _assign_xdist_groups)")
     _hyg.register(config)
 
 
@@ -246,8 +253,55 @@ def _agentmem_count_path():
     return _iso.state_dir() / _AGENTMEM_SKIP_FILE
 
 
+def lpt_groups(costs, count, keys):
+    """Longest-processing-time-first: a group index below ``count`` for each
+    cost, each to the least-loaded group so far (ties to the lower index),
+    ordered by descending cost and then by ``keys``, so the answer depends only
+    on its inputs."""
+    loads = [0.0] * count
+    out = [0] * len(costs)
+    for index in sorted(range(len(costs)), key=lambda i: (-costs[i], keys[i])):
+        group = min(range(count), key=lambda k: (loads[k], k))
+        out[index] = group
+        loads[group] += costs[index]
+    return out
+
+
+def _assign_xdist_groups(items):
+    """Cost-balanced xdist groups for the modules that ask for them (test
+    regime reset, session 3).
+
+    A test module that defines ``XDIST_GROUP_COUNT``, ``XDIST_GROUP_PREFIX``
+    and ``xdist_case_cost(item)`` has each of its items marked
+    ``xdist_group("<prefix>-<k>")``, ``k < XDIST_GROUP_COUNT``, by
+    `lpt_groups` over that cost. bin/cctally-test-all runs the pytest phase
+    under ``--dist loadgroup``, where one group is one work unit on one
+    worker: the module never occupies more than that many workers at once,
+    and xdist's default reorder dispatches the large units first.
+
+    Runs from a tryfirst hook because xdist's worker appends ``@<group>`` to
+    a grouped item's node id in its own pytest_collection_modifyitems; a mark
+    added after that would group nothing. Every worker collects the same
+    items, so every worker computes the same assignment. The node id suffix is
+    stripped wherever ids are recorded (tests/_pytest_durations_plugin.py and
+    the failed-node parser in bin/cctally-test-all)."""
+    modules = {}
+    for item in items:
+        module = getattr(item, "module", None)
+        if module is not None and hasattr(module, "XDIST_GROUP_COUNT"):
+            modules.setdefault(id(module), (module, []))[1].append(item)
+    for module, members in modules.values():
+        groups = lpt_groups([float(module.xdist_case_cost(item)) for item in members],
+                            module.XDIST_GROUP_COUNT, [item.nodeid for item in members])
+        for item, group in zip(members, groups):
+            item.add_marker(pytest.mark.xdist_group("%s-%d" % (module.XDIST_GROUP_PREFIX, group)))
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(session, config, items):
-    """Record, per worker, how many collected items this gate would skip."""
+    """Assign the declared xdist groups, then record, per worker, how many
+    collected items this gate would skip."""
+    _assign_xdist_groups(items)
     if AGENTMEM_PRESENT:
         return
     count = 0
@@ -549,6 +603,38 @@ def _restore_process_timezone():
             os.environ["TZ"] = saved_tz
         if hasattr(time, "tzset"):
             time.tzset()
+
+
+@pytest.fixture(autouse=True)
+def _no_ignored_signal_outlives_its_test():
+    """Fail a test that leaves SIGHUP, SIGINT or SIGTERM at SIG_IGN, and undo it.
+
+    An ignored disposition is the one a child inherits across exec, and a bash
+    child cannot trap a signal ignored on entry. So a disposition leaked by an
+    in-process test silently disarms every later child's trap on that worker.
+    In full run 20261022T163749Z-064006cef9dc an in-process gate ``open`` in
+    test_session_isolation_native.py left SIGHUP ignored, and the failure
+    surfaced 25 minutes later as a SIGHUP test in another module. Failing the
+    leaking test points at the leak itself. Restoring the disposition keeps
+    the next test unaffected.
+    """
+    import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    found = {sig: signal.getsignal(sig) for sig in watched}
+    yield
+    leaked = [sig for sig in watched
+              if found[sig] is not signal.SIG_IGN and signal.getsignal(sig) is signal.SIG_IGN]
+    for sig in leaked:
+        signal.signal(sig, signal.SIG_DFL if found[sig] is None else found[sig])
+    if leaked:
+        pytest.fail("this test left %s at SIG_IGN; every later child of this worker would "
+                    "inherit it and could not trap it (restored)"
+                    % ", ".join(signal.Signals(sig).name for sig in leaked), pytrace=False)
 
 
 @pytest.fixture(autouse=True)
@@ -884,14 +970,19 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "STATUSLINE_TRANSPORT_MARKER_PATH": share / "statusline-transport.last",
         "STATUSLINE_AUTHORITATIVE_7D_PATH": share / "statusline-authoritative-7d.json",
         "STATUSLINE_AUTHORITATIVE_5H_PATH": share / "statusline-authoritative-5h.json",
-        # #825/#832 account-bound protocol root and its sidecars.
-        "STATUSLINE_ACCOUNT_BOUND_DIR": share / "statusline-account-bound-v1",
+        # #825/#832 account-bound protocol root and its sidecars; since
+        # #797/#823/#840 (spec 4.6 B4) the current root is v2 and v1 is the
+        # retired root whose coordination state is legacy spool input.
+        "STATUSLINE_ACCOUNT_BOUND_V1_DIR": share / "statusline-account-bound-v1",
+        "STATUSLINE_ACCOUNT_BOUND_DIR": share / "statusline-account-bound-v2",
         "LEGACY_SPOOL_BASELINE_PATH": (
-            share / "statusline-account-bound-v1" / "legacy-spool-baseline.json"),
+            share / "statusline-account-bound-v2" / "legacy-spool-baseline.json"),
         "ACCOUNT_BOUND_CUTOVER_CACHE_PATH": (
-            share / "statusline-account-bound-v1" / "cutover-coordinate.json"),
+            share / "statusline-account-bound-v2" / "cutover-coordinate.json"),
+        "ACCOUNT_BOUND_REVISION_CACHE_PATH": (
+            share / "statusline-account-bound-v2" / "revision-coordinate.json"),
         "LEGACY_WRITER_EVIDENCE_PATH": (
-            share / "statusline-account-bound-v1" / "legacy-writer-evidence.json"),
+            share / "statusline-account-bound-v2" / "legacy-writer-evidence.json"),
         # Host-global statusline cache (#529 S4). NOT under share/ — production
         # keeps it in /tmp because the real Claude Code statusline shares it, so
         # the fixture analogue is a per-test tmp file rather than an APP_DIR
@@ -1281,11 +1372,16 @@ def bound_tombstone(ns, axis, account_key="unattributed"):
     return None if not files else _json.loads(files[0].read_text())
 
 
-def write_bound_candidate(token, *, received_at, seven_day=None, five_hour=None):
+def write_bound_candidate(token, *, received_at, seven_day=None, five_hour=None,
+                          transcript_path=None):
     """Spool one current candidate bound to the active identity.
-    ``seven_day``/``five_hour`` are ``(percent, raw_resets_at)`` pairs."""
+    ``seven_day``/``five_hour`` are ``(percent, raw_resets_at)`` pairs. The
+    provider-activity witness (#797) is a real capture of
+    ``transcript_path`` — with none, the explicit ``no-transcript-path``
+    unknown a render without a transcript records."""
     sl = sys.modules["_cctally_statusline"]
     lib = sys.modules["_lib_statusline_candidates"]
+    import _lib_provider_activity
     binding = sl._capture_binding()
     assert binding is not None, "the active identity must be stable"
     sl._write_candidate(lib.Candidate(
@@ -1295,5 +1391,7 @@ def write_bound_candidate(token, *, received_at, seven_day=None, five_hour=None)
         five_hour=None if five_hour is None else lib.AxisValue(
             float(five_hour[0]), int(five_hour[1])),
         binding=binding,
+        activity=_lib_provider_activity.capture_activity(
+            transcript_path, cache_path=sl._activity_cache_path(token)),
     ))
     return binding

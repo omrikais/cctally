@@ -107,62 +107,9 @@ def staged_names(text: str, roots: tuple[str, ...] = _STAGING_ROOTS) -> set[str]
 _REDIRECT = re.compile(r'>\s*"([^"]*(?:golden|expected)[^"]*)"', re.IGNORECASE)
 
 
-# Fixture writes into one case's own scratch tree `$d` whose path contains
-# "golden" only because the tool under test keys on that exact path, so the
-# fixture cannot be renamed. Keyed by (harness, redirect target); each value is
-# (the tool whose source names the path, the rationale). An entry holds only
-# while every mention of the target's file name among the harness's reported
-# golden writes is that exact write, once per line (`_only_scratch_fixture_writes`);
-# any other mention defeats it and the recorded write is reported again.
-_SCRATCH_FIXTURE_WRITES = {
-    ("cctally-preflight-test", "$d/bin/_lib-golden-diff.sh"): (
-        "bin/cctally-preflight",
-        "heredoc-floor-declared-file plants a here-document in its own scratch "
-        "tree at the floor-bash target _FLOOR_BASH_CALLERS names, so the "
-        "pre-flight's C11 floor check fires on it. Nothing reads or writes a "
-        "golden; the scratch tree is the case's fixture.",
-    ),
-    ("cctally-preflight-test", "$d/tests/test_share_golden_discipline.py"): (
-        "bin/cctally-preflight",
-        "floor-caller-stale-file-target plants the floor-bash caller "
-        "_FLOOR_BASH_CALLERS names in its own scratch tree without the target, "
-        "so the pre-flight reports the missing target. Nothing reads or writes "
-        "a golden; the scratch tree is the case's fixture.",
-    ),
-}
-
-
-def _only_scratch_fixture_writes(text: str, target: str) -> bool:
-    """True when every reported golden write that mentions `target`'s file name
-    is the redirect `> "<target>"`, and no line carries two of them."""
-    name = target.rsplit("/", 1)[-1]
-    exact = f'> "{target}"'
-    mentions = [o for o in goldens_addressed_at_staging(text) if name in o]
-    if not mentions or any(o != exact for o in mentions):
-        return False
-    for raw in text.splitlines():
-        if raw.strip().startswith("#"):
-            continue
-        if sum(name in t for t in _REDIRECT.findall(raw)) > 1:
-            return False
-    return True
-
-
-def goldens_addressed_at_staging(text: str, harness: str | None = None) -> list[str]:
-    """Golden paths this harness builds out of a staging root.
-
-    `harness`, the harness's file name, applies its recorded scratch-fixture
-    writes; without it nothing is exempt.
-    """
-    offenders = _staged_golden_writes(text)
-    if harness is None:
-        return offenders
-    exempt = {
-        f'> "{target}"'
-        for (owner, target) in _SCRATCH_FIXTURE_WRITES
-        if owner == harness and _only_scratch_fixture_writes(text, target)
-    }
-    return [o for o in offenders if o not in exempt]
+def goldens_addressed_at_staging(text: str) -> list[str]:
+    """Golden paths this harness builds out of a staging root."""
+    return _staged_golden_writes(text)
 
 
 def _staged_golden_writes(text: str) -> list[str]:
@@ -248,7 +195,7 @@ def test_no_harness_addresses_a_golden_through_its_staging_root():
     reported = {}
     for harness in _harnesses():
         offenders = goldens_addressed_at_staging(
-            harness.read_text(encoding="utf-8"), harness=harness.name)
+            harness.read_text(encoding="utf-8"))
         if offenders:
             reported[harness.name] = offenders
     assert not reported, (
@@ -258,78 +205,6 @@ def test_no_harness_addresses_a_golden_through_its_staging_root():
         "root instead, as bin/cctally-share-v2-test does with GOLDEN_ROOT."
         % reported
     )
-
-
-# --------------------------------------------- the recorded scratch-fixture writes
-
-
-# A synthetic harness in the shape the recorded entries exempt: a case
-# allocates its own scratch tree `d` under SCRATCH_DIR and writes one fixture
-# into it whose path happens to contain "golden".
-_SCRATCH_CASE = """\
-SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cctally-preflight-XXXXXX")
-trap 'rm -rf "$SCRATCH_DIR"' EXIT
-new_tree () {
-    local d="$SCRATCH_DIR/$1"
-    printf '%s' "$d"
-}
-d=$(new_tree heredoc-floor-declared-file)
-printf '%s\\n' body > "$d/bin/_lib-golden-diff.sh"
-expect_c11 heredoc-floor-declared-file "$d" bin/_lib-golden-diff.sh:1
-"""
-
-_SCRATCH_TARGET = "$d/bin/_lib-golden-diff.sh"
-_SCRATCH_KEY = ("cctally-preflight-test", _SCRATCH_TARGET)
-
-
-def test_a_recorded_scratch_fixture_write_is_exempt_only_for_its_harness():
-    assert goldens_addressed_at_staging(_SCRATCH_CASE) == [f'> "{_SCRATCH_TARGET}"']
-    assert goldens_addressed_at_staging(
-        _SCRATCH_CASE, harness="cctally-preflight-test") == []
-    # Keyed by file: the same write in any other harness is still reported.
-    assert goldens_addressed_at_staging(
-        _SCRATCH_CASE, harness="cctally-doctor-test") == [f'> "{_SCRATCH_TARGET}"']
-
-
-@pytest.mark.parametrize("extra", [
-    pytest.param('golden="$d/bin/_lib-golden-diff.sh"\n',
-                 id="golden-variable-bound-to-the-path"),
-    pytest.param('printf x > "$SCRATCH_DIR/bin/_lib-golden-diff.sh"\n',
-                 id="written-under-the-staging-root"),
-    pytest.param('printf x > "$d/tests/fixtures/x/bin/_lib-golden-diff.sh"\n',
-                 id="written-at-another-path-in-the-case-tree"),
-    pytest.param('printf x > "$d/bin/_lib-golden-diff.sh"; '
-                 'printf y > "$d/bin/_lib-golden-diff.sh"\n',
-                 id="two-writes-on-one-line"),
-])
-def test_a_recorded_scratch_fixture_write_is_defeated_by_any_other_mention(extra):
-    """The entry holds only while every mention of the name is the scratch-tree
-    write; one other mention defeats it, and then the recorded write is reported
-    too."""
-    offenders = goldens_addressed_at_staging(
-        _SCRATCH_CASE + extra, harness="cctally-preflight-test")
-    assert f'> "{_SCRATCH_TARGET}"' in offenders, offenders
-    assert len(offenders) >= 2, offenders
-
-
-def test_every_recorded_scratch_fixture_write_is_live():
-    """Each entry names a harness that still makes exactly that write, a tool
-    that still keys on the path (which is why the fixture cannot be renamed),
-    and a rationale."""
-    assert _SCRATCH_FIXTURE_WRITES, (
-        "the scratch-fixture table is empty; delete it rather than keep it")
-    assert _SCRATCH_KEY in _SCRATCH_FIXTURE_WRITES
-    for (harness, target), (tool, rationale) in _SCRATCH_FIXTURE_WRITES.items():
-        assert rationale.strip(), (harness, target)
-        assert target.startswith("$d/"), (harness, target)
-        text = (REPO / "bin" / harness).read_text(encoding="utf-8")
-        assert f'> "{target}"' in goldens_addressed_at_staging(text), (
-            f"{harness} no longer writes {target}; remove the entry")
-        assert _only_scratch_fixture_writes(text, target), (harness, target)
-        relpath = target[len("$d/"):]
-        assert relpath in (REPO / tool).read_text(encoding="utf-8"), (
-            f"{tool} no longer names {relpath}, so the fixture can be renamed "
-            f"and the entry removed")
 
 
 # #940 F2 fix round 2 (G4): the case-tree binding check over-approximates.
@@ -472,12 +347,12 @@ def _case_tree_binding_offenders(text: str) -> list[str]:
 
 
 def test_every_case_tree_binding_is_a_scratch_tree():
-    """#940 F2-f: the scratch-fixture exemptions above hold only while `$d` is
-    a case's own scratch tree; a binding of `d` to anything else would make
-    a recorded write land outside it."""
+    """#940 F2-f: every pre-flight case writes its fixtures into `$d`, so `$d`
+    must be the case's own scratch tree; a binding of `d` to anything else
+    would make a fixture write land outside it."""
     text = (REPO / "bin" / "cctally-preflight-test").read_text(encoding="utf-8")
     assert _case_tree_binding_offenders(text) == []
-    assert text.count("d=$(new_tree ") > 100  # the scan reads the real bindings
+    assert text.count("d=$(new_tree ") > 20  # the scan reads the real bindings
     # The rule bites: other bindings are reported.
     assert _case_tree_binding_offenders('d="$REPO_ROOT/x"\nlocal d=/tmp/y\n') == [
         '1: d="$REPO_ROOT/x"', "2: local d=/tmp/y"]

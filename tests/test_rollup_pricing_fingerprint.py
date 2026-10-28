@@ -80,7 +80,7 @@ def _cache_module(tmp_path, monkeypatch):
 
     _pricing_write_authorized is a pure function over two date strings, so the
     cases below need no database at all; building a fully synced store for each
-    of them was pure cost against tests/authoritative-runtime-budget.json.
+    of them was pure cost against the suite's wall time.
     """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)

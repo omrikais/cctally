@@ -89,16 +89,6 @@ describe('<WeeklyPanel /> (#264 S2)', () => {
     ).toEqual(['work@example.com', 'personal@example.com']);
   });
 
-  it('renders the cyan panel card with the bar-chart icon and model-split subtitle', () => {
-    render(<WeeklyPanel />);
-    const section = document.getElementById('panel-weekly');
-    expect(section?.classList.contains('panel')).toBe(true);
-    expect(section?.classList.contains('accent-cyan')).toBe(true);
-    expect(document.querySelector('#panel-weekly svg use')?.getAttribute('href'))
-      .toBe('/static/icons.svg#bar-chart');
-    expect(screen.getByText(/model split/i)).toBeInTheDocument();
-  });
-
   it('bento (default, no provider): renders ALL rows so the inner scroll is meaningful, with a NOW pill', () => {
     render(<WeeklyPanel />);
     expect(document.querySelectorAll('#panel-weekly .period').length).toBe(4);

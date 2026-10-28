@@ -5,7 +5,7 @@
 # (the outer harness-pool budget — backward-compatible meaning):
 #   OUTER  — xargs -P width of the shell-harness pool.
 #   INNER  — per-harness inner fan-out cap, passed into each harness's env
-#            (config/dashboard/update/preflight/test-remote read
+#            (config/dashboard/update/preflight read
 #            CCTALLY_TEST_JOBS; release reads CCTALLY_RELEASE_TEST_JOBS).
 #            Prevents the B^2 nesting where B
 #            outer harnesses each spawn B (or, for release, nproc) inner
@@ -31,20 +31,25 @@
 # otherwise skips. Any run carrying --harness is classified `incomplete` for
 # `deliberate-subset` and exits 3 even when everything selected passes, so it
 # is never green and never a gate. With no arguments the run is a full one.
+# The retired --tier-fast, --merge-gate and --with-estate-check are usage
+# errors (test regime reset, Task 3.4).
+#
+# Harnesses are discovered (Codex Q10): every regular `bin/cctally-*-test`,
+# sorted, with `reconcile` reported last. A matching file that is not
+# executable is a usage error. A harness passes on exit 0, fails on exit 1 and
+# is incomplete on any other status; its `passed: N failed: M` summary is read
+# for the report and the metric only.
+#
+# pytest runs as two legs built by bin/_lib_test_selection.py: the bulk leg,
+# `tests/` under xdist minus the serial tests and the quarantined ids
+# (tests/quarantine.json), then the serial leg without xdist.
 #
 # CCTALLY_TEST_ALL_PLAN=1 prints the resolved plan and exits without running
 # anything (test seam). It exits 0 for a plan it could resolve, but a plan is
-# still refused for the same reasons a run is: with --harness it exits 2 for a
-# malformed or unknown harness name and 3 when the manifest those names are
-# validated against cannot be read, because a plan for a set that cannot be run
-# is not a plan. CCTALLY_TEST_ALL_FAKE_NCPU pins the core count for
-# deterministic plan tests.
-#
-# CCTALLY_LINUX_MATRIX_RUN=1 selects the release gate's Linux profile. It is a
-# full platform gate rather than an arbitrary subset: the complete pytest phase
-# and every declared harness run except `test-remote`, whose subject is the
-# macOS/Homebrew LAN-runner wrapper Gate 0 already owns. Non-plan use is
-# admitted only on a non-root GitHub-shaped Linux lane.
+# still refused for the same reasons a run is: exit 2 for a malformed or
+# unknown harness name or a non-executable harness, because a plan for a set
+# that cannot be run is not a plan. CCTALLY_TEST_ALL_FAKE_NCPU pins the core
+# count for deterministic plan tests.
 
 set -uo pipefail
 
@@ -136,10 +141,8 @@ PYTEST=${CCTALLY_PYTEST_JOBS:-$PYTEST_default}
 
 # ---- profile discrimination --------------------------------------------
 # .mirror-allowlist excludes itself, so its presence is exactly the private
-# discriminator: absent means this tree IS the shipped public subset. Resolved
-# HERE rather than inside the admission block below, because subset selection
-# validates the caller's names against the manifest rows this profile requires
-# and that happens before plan mode.
+# discriminator: absent means this tree IS the shipped public subset. It
+# decides which capabilities admission probes (agentmem is private-only).
 CONTRACT_PROFILE=public
 if [ -f "$REPO_ROOT/.mirror-allowlist" ]; then
     CONTRACT_PROFILE=private
@@ -147,7 +150,7 @@ fi
 
 # ---- subset invocation (#529 S5 sections 4.1-4.4) ----------------------
 #
-# `--harness NAME` (repeatable) selects one harness by manifest name;
+# `--harness NAME` (repeatable) selects one discovered harness by name;
 # `--with-pytest` (at most once) re-enables the pytest phase a subset run
 # otherwise skips. Any run carrying `--harness` is classified `incomplete`
 # with reason `deliberate-subset` and exits 3 EVEN WHEN EVERY SELECTED HARNESS
@@ -160,54 +163,18 @@ fi
 # publishes a record like every other terminal path. An unknown name is an
 # error rather than a silent no-op, because running nothing and reporting
 # success is the failure class #529 S1 closed.
-# ---- the tiered coverage mode (#630 S7) --------------------------------
-#
-# `--tier-fast <BASE-REV>` is a SEPARATE named coverage mode, never a relaxation
-# of `deliberate-subset`. Preserve-item 19 keeps a caller-chosen subset uncitable
-# and records that exiting 0 for it "was considered and rejected"; that stays
-# exactly as it is. The tier is citable for a different reason: `--harness` takes
-# a set the caller chose, so nothing in the tree can prove the caller chose
-# correctly, while `--tier-fast` derives its set through bin/cctally-test-owners
-# from the tree itself.
-#
-# The argument is a BASE REVISION, not a revision range, and the change set is
-# the merge-base diff UNIONED with working-tree dirt. The wrapper certifies the
-# complete materialized working tree, uncommitted and untracked inputs included
-# (preserve-item 10), so a range accepted verbatim would let a caller supply an
-# unrelated non-empty range that selected fewer harnesses than the tree actually
-# required — and receive a citable receipt for it. Because the working-tree half
-# is unioned in, a dirty tree can only WIDEN the selection, never narrow it.
-TIER_MODE=0
-TIER_BASE_REV=""
-COVERAGE_TIER_BASE_OID=""
-COVERAGE_TIER_HEAD_OID=""
-COVERAGE_TIER_COMMITTED_PATHS=0
-COVERAGE_TIER_WORKTREE_PATHS=0
-
 SUBSET_MODE=0
 SUBSET_SET=" "               # " name name ", the caller's set
 SUBSET_SEEN=()               # the same names, one array element each, for the duplicate test
 COVERAGE_MODE=full
-MERGE_MODE=0
-MERGE_DEADLINE_WORKER=0
-MERGE_MAX_SECONDS=0
-MERGE_RECORD=""
-COVERAGE_SELECTED=""         # space-separated, MANIFEST order
-COVERAGE_OMITTED=""          # space-separated, MANIFEST order
+COVERAGE_SELECTED=""         # space-separated, report order
+COVERAGE_OMITTED=""          # space-separated, report order
 COVERAGE_PYTEST=full
 # 1 once a selection has been resolved. The coverage object is published from
 # that point on and never before, so a usage refusal that never parsed a
 # selection carries none rather than describing one it does not have.
 COVERAGE_RESOLVED=0
 _with_pytest_seen=0
-# #648 D12. Off by default on a `--harness` subset and meaningless
-# anywhere else, because every other mode runs the check unconditionally.
-ESTATE_CHECK_OPT_IN=0
-LINUX_MATRIX_MODE=${CCTALLY_LINUX_MATRIX_RUN:-0}
-case "$LINUX_MATRIX_MODE" in
-    0|1) ;;
-    *) contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN must be 1 or unset" CCTALLY_LINUX_MATRIX_RUN ;;
-esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -225,7 +192,7 @@ while [ $# -gt 0 ]; do
                 '')
                     contract_usage_abort "--harness was given an empty value; an empty selection runs nothing, and running nothing is not a subset" --harness ;;
                 -*)
-                    # A manifest harness name never begins with `-`, so a token
+                    # A harness name never begins with `-`, so a token
                     # that does is the NEXT option and this one's value is
                     # missing. Accepting it produced `unknown harness
                     # '--with-pytest'`, which names the wrong mistake.
@@ -258,398 +225,18 @@ while [ $# -gt 0 ]; do
             fi
             _with_pytest_seen=1
             shift ;;
-        --with-estate-check)
-            if [ "$ESTATE_CHECK_OPT_IN" = 1 ]; then
-                contract_usage_abort "--with-estate-check may be given at most once" --with-estate-check
-            fi
-            ESTATE_CHECK_OPT_IN=1
-            shift ;;
-        --tier-fast|--merge-gate|--merge-gate-worker)
-            [ "$1" = --tier-fast ] || MERGE_MODE=1
-            [ "$1" != --merge-gate-worker ] || MERGE_DEADLINE_WORKER=1
-            # Same three separate refusals `--harness` makes, for the same
-            # reason: a caller can only fix the mistake they actually made.
-            if [ $# -lt 2 ]; then
-                contract_usage_abort "--tier-fast requires a base revision and none followed it" --tier-fast
-            fi
-            case "$2" in
-                '')
-                    contract_usage_abort "--tier-fast was given an empty base revision; the change set is derived from a revision, never from nothing" --tier-fast ;;
-                -*)
-                    contract_usage_abort "--tier-fast was given the option '$2' instead of a base revision, so its value is missing" --tier-fast ;;
-            esac
-            if [ "$TIER_MODE" = 1 ]; then
-                contract_usage_abort "--tier-fast may be given at most once; two bases are two different change sets" --tier-fast
-            fi
-            TIER_MODE=1
-            TIER_BASE_REV=$2
-            shift 2 ;;
+        --tier-fast|--merge-gate|--merge-gate-worker|--with-estate-check)
+            # Retired with the estate and the merge gate (test regime reset,
+            # Task 3.4). Named rather than reported as unrecognised, so a stale
+            # caller learns what replaced it.
+            contract_usage_abort "$1 is retired (test regime reset); run bin/cctally-test-all with no arguments for a full run, or with --harness NAME for a deliberate subset; the merge path runs the merge command's quick gate" "$1" ;;
         *)
-            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable), --with-pytest, --with-estate-check and --tier-fast BASE-REV" "$1" ;;
+            contract_usage_abort "unrecognised argument '$1'; the only arguments are --harness NAME (repeatable) and --with-pytest" "$1" ;;
     esac
 done
 
-# The tier's exclusions are stated BEFORE the --with-pytest/--harness pairing
-# rule below, so `--tier-fast X --with-pytest` names the conflict the caller
-# created rather than reporting that --with-pytest wants a --harness.
-if [ "$TIER_MODE" = 1 ]; then
-    if [ "$SUBSET_MODE" = 1 ]; then
-        contract_usage_abort "--tier-fast cannot accompany --harness: a subset is a set the caller chose and is deliberately uncitable, while a tier's set is derived from the tree" --tier-fast
-    fi
-    if [ "$_with_pytest_seen" = 1 ]; then
-        contract_usage_abort "--tier-fast cannot accompany --with-pytest: the tier narrows the harness axis alone and pytest always runs in full" --tier-fast
-    fi
-    if [ "$LINUX_MATRIX_MODE" = 1 ]; then
-        contract_usage_abort "--tier-fast cannot accompany CCTALLY_LINUX_MATRIX_RUN: the Linux profile owns its exact platform selection" --tier-fast
-    fi
-fi
-
 if [ "$_with_pytest_seen" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
     contract_usage_abort "--with-pytest requires at least one --harness; it is not a way to run the full suite" --with-pytest
-fi
-
-# #648 D12. The flag turns the estate check ON for the one mode that omits it,
-# and every other mode already runs it unconditionally, so outside a subset it
-# would be a no-op that reads like a request. Refusing says which of the two the
-# caller meant rather than accepting a word that changes nothing.
-if [ "$ESTATE_CHECK_OPT_IN" = 1 ] && [ "$SUBSET_MODE" = 0 ]; then
-    contract_usage_abort "--with-estate-check requires at least one --harness; every other mode runs the estate check unconditionally, so the flag would change nothing here" --with-estate-check
-fi
-
-if [ "$LINUX_MATRIX_MODE" = 1 ]; then
-    if [ "$SUBSET_MODE" = 1 ]; then
-        contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN cannot accompany --harness; the Linux profile owns its exact platform selection" CCTALLY_LINUX_MATRIX_RUN
-    fi
-    if [ "$CONTRACT_PROFILE" != private ]; then
-        contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN is a private pre-release profile" CCTALLY_LINUX_MATRIX_RUN
-    fi
-    if [ "${CCTALLY_TEST_ALL_PLAN:-}" != 1 ]; then
-        [ "${GITHUB_ACTIONS:-}" = true ] \
-            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN requires GITHUB_ACTIONS=true" CCTALLY_LINUX_MATRIX_RUN
-        [ "$(uname -s)" = Linux ] \
-            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN requires Linux" CCTALLY_LINUX_MATRIX_RUN
-        [ "$(id -u)" -ne 0 ] \
-            || contract_usage_abort "CCTALLY_LINUX_MATRIX_RUN refuses root" CCTALLY_LINUX_MATRIX_RUN
-    fi
-    COVERAGE_MODE=linux-matrix
-fi
-
-if [ "$TIER_MODE" = 1 ]; then
-    # The manifest is the declared estate and is loaded HERE, exactly as the
-    # subset branch loads it. Admission below re-loads it and still compares it
-    # against the whole disk in BOTH directions — a harness on disk with no
-    # manifest row and a manifest row with no harness on disk are each a
-    # refusal — and admission runs before the pool starts. Preserve-item 26 is
-    # therefore satisfied by the gate that already exists: nothing EXECUTES a
-    # narrowed estate until exact equality has been proved.
-    contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
-    _manifest_names=$(contract_manifest_harness_names "$CONTRACT_PROFILE")
-
-    # ---- 1-4: the basis, bound to the materialized tree ------------------
-    # Read-only git, and `python3 -B` because plan mode is contractually
-    # side-effect-free (preserve-item 25) and this block runs before it.
-    _tier_basis=$(printf '%s\n' 'import subprocess
-import sys
-
-root, base_rev = sys.argv[1], sys.argv[2]
-
-
-# `--no-optional-locks` on EVERY call, not only the diffs. `git diff` refreshes
-# the index'\''s stat cache and rewrites .git/index when it does, and this program
-# runs before plan mode, which preserve-item 25 requires to be literally
-# side-effect-free. The flag makes git skip taking the index lock, so the read
-# stays a read.
-def git(*args):
-    try:
-        proc = subprocess.run(
-            ["git", "--no-optional-locks", "-C", root, *args],
-            capture_output=True,
-            text=True,
-        )
-    except OSError as exc:
-        print("git could not be run: %s" % exc)
-        raise SystemExit(1)
-    if proc.returncode != 0:
-        print(
-            "git %s failed: %s"
-            % (" ".join(args), proc.stderr.strip().replace("\n", "; "))
-        )
-        raise SystemExit(1)
-    return proc.stdout
-
-
-base = git("merge-base", base_rev, "HEAD").strip()
-head = git("rev-parse", "HEAD").strip()
-
-# A rename or a copy counts as a change to BOTH paths, and both statuses carry
-# two path tokens where every other status carries one. Reading a two-token
-# record as one token does not merely lose that record: it shifts the cursor,
-# so every path AFTER it is read out of a status slot. This is the same parse
-# bin/cctally-test-owners._parse_name_status performs, and it is repeated here
-# rather than shelled out to because the tier needs the committed half and the
-# working-tree half in ONE change set.
-tokens = [
-    t for t in git("diff", "--name-status", "-M", "-z", base, "HEAD").split("\0") if t
-]
-committed = []
-index = 0
-while index < len(tokens):
-    status = tokens[index]
-    index += 1
-    if status[:1] in ("R", "C"):
-        committed.extend(tokens[index:index + 2])
-        index += 2
-    else:
-        if index < len(tokens):
-            committed.append(tokens[index])
-        index += 1
-
-# The working-tree half of the change set, over the same selection the wrapper
-# materializes: tracked paths that differ from HEAD (modified, added and deleted
-# alike), plus untracked-not-ignored paths.
-#
-# Only the first of the two is exactly "the changed subset" of the wrapper'\''s
-# `git ls-files --cached --others --exclude-standard` selection. The second
-# returns EVERY untracked-not-ignored path, changed or not, because an untracked
-# path has no committed state to differ from. That over-includes rather than
-# under-includes, which is the conservative direction and is why it is used
-# as-is.
-worktree = [t for t in git("diff", "--name-only", "-z", "HEAD").split("\0") if t]
-worktree += [
-    t
-    for t in git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
-    if t
-]
-
-committed_set, worktree_set = set(committed), set(worktree)
-union = committed_set | worktree_set
-# The transport below is line-based, so a path carrying a newline would silently
-# become two paths. Refusing is the fail-closed answer.
-for rel in sorted(union):
-    if "\n" in rel or "\r" in rel:
-        print("a changed path contains a newline, which this basis cannot carry")
-        raise SystemExit(1)
-
-print(base)
-print(head)
-print(len(committed_set))
-print(len(worktree_set))
-for rel in sorted(union):
-    print(rel)' | python3 -B - "$REPO_ROOT" "$TIER_BASE_REV"
-    # The message names the revision as CONTEXT and attributes nothing to it.
-    # The first wording said the revision was what the change set could not be
-    # derived from, which blamed the caller's argument for `git` being absent, a
-    # corrupt object, an unreadable repository, or a missing python3 — every
-    # internal failure this program can have. The interpolated diagnostic is
-    # what says which of those happened, so it is kept verbatim.
-    ) || contract_usage_abort "--tier-fast could not derive a change set (base revision '$TIER_BASE_REV'): ${_tier_basis:-the basis program produced no diagnostic}" --tier-fast
-
-    COVERAGE_TIER_BASE_OID=$(printf '%s\n' "$_tier_basis" | sed -n 1p)
-    COVERAGE_TIER_HEAD_OID=$(printf '%s\n' "$_tier_basis" | sed -n 2p)
-    COVERAGE_TIER_COMMITTED_PATHS=$(printf '%s\n' "$_tier_basis" | sed -n 3p)
-    COVERAGE_TIER_WORKTREE_PATHS=$(printf '%s\n' "$_tier_basis" | sed -n 4p)
-    _tier_paths=$(printf '%s\n' "$_tier_basis" | tail -n +5)
-
-    if [ "$MERGE_MODE" = 1 ]; then
-        _merge_plan=$(python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" \
-            --repo "$REPO_ROOT" --base "$TIER_BASE_REV" --shell) \
-            || contract_usage_abort "merge-gate selection failed" --merge-gate
-        while IFS=$'\t' read -r _key _value; do
-            case "$_key" in
-                mode) COVERAGE_MODE=$_value ;;
-                harnesses) COVERAGE_SELECTED=$_value ;;
-                omitted) COVERAGE_OMITTED=$_value ;;
-                pytest) COVERAGE_PYTEST=$_value ;;
-                seconds) MERGE_MAX_SECONDS=$_value ;;
-                record) MERGE_RECORD=$_value ;;
-            esac
-        done < <(printf '%s\n' "$_merge_plan")
-        [ -n "$MERGE_RECORD" ] || contract_usage_abort "merge selection missing" --merge-gate
-        printf 'cctally-test-all: merge gate selected %s coverage\n' "$COVERAGE_MODE" >&2
-    else
-    # ---- 5: ownership verification, BEFORE any narrow result is accepted --
-    # Ordering hazard 5. The admission gate proves the estate's NAMES; it says
-    # nothing about whether the ownership declarations used to narrow are TRUE,
-    # and only a direct declaration narrows. A failure here widens rather than
-    # trusting the map.
-    _tier_widen=0
-    _tier_owners="$REPO_ROOT/bin/cctally-test-owners"
-    if [ ! -x "$_tier_owners" ]; then
-        # A tier that cannot establish ownership selects everything; it never
-        # selects nothing.
-        #
-        # This branch used to be justified on the claim that the published
-        # public tree carries no bin/cctally-test-owners. That claim is FALSE:
-        # .mirror-allowlist line 8 is the positive glob `bin/cctally-*`, no
-        # negation covers the tool, and .githooks/_match.py classifies it
-        # `public`. Only the private overlay tests/harness-ownership.private.json
-        # is withheld, and the tool discovers that overlay by existence and
-        # operates on public rows alone when it is absent — so a tier on a
-        # published public tree attributes normally rather than always widening.
-        # The branch stays anyway: a tree that has lost the tool for any reason
-        # must still fail closed.
-        _tier_widen=1
-        printf 'cctally-test-all: --tier-fast: this tree carries no executable bin/cctally-test-owners, so ownership cannot be established; selecting the whole estate\n' >&2
-    elif ! "$_tier_owners" --verify --repo-root "$REPO_ROOT" >/dev/null 2>&1; then
-        _tier_widen=1
-        printf 'cctally-test-all: --tier-fast: ownership verification failed, so no narrowing derived from it can be trusted; selecting the whole estate (run bin/cctally-test-owners --verify to see why)\n' >&2
-    fi
-
-    # ---- 6: attribution ---------------------------------------------------
-    # `attribute().safe` and never `advisory_owners_of`: `safe` already collapses
-    # to the complete required estate whenever anything widened — an
-    # advisory-only match, an unattributed path, or an opaque harness — while
-    # the advisory map is a raw hint with no widening applied. F39 measured that
-    # this widens on 119 of 119 real merges, which is the designed fail-closed
-    # behaviour meeting real traffic rather than a defect.
-    _tier_safe=""
-    if [ "$_tier_widen" = 0 ] && [ -n "$_tier_paths" ]; then
-        _tier_safe=$(printf '%s\n' "$_tier_paths" \
-            | "$_tier_owners" --names-only --repo-root "$REPO_ROOT" 2>/dev/null \
-            | tr '\0' ' ') || {
-            _tier_widen=1
-            printf 'cctally-test-all: --tier-fast: bin/cctally-test-owners could not attribute the change set; selecting the whole estate\n' >&2
-        }
-    fi
-
-    # ---- 7: the two forced harnesses --------------------------------------
-    # `test-remote` because preserve-item 27 keeps it in the full Gate 0 and only
-    # the fixed linux-matrix profile may omit it, and `frontend` because the tier
-    # reasons about the harness axis alone and has no view of the frontend
-    # estate. Both are filtered through the ACTIVE profile's manifest names: a
-    # forced name the manifest does not carry would sit in `selected` while
-    # belonging to neither side of the partition, which is exactly what made
-    # revision 1 unimplementable on the public profile — `test-remote` is
-    # `visibility: private`, and contract_manifest_harness_names deliberately
-    # returns only public rows there.
-    _tier_want=" "
-    set -f                       # see the note on $SUBSET_SET above
-    for _forced in frontend test-remote; do
-        while IFS= read -r _n; do
-            [ "$_n" = "$_forced" ] || continue
-            case "$_tier_want" in
-                *" $_forced "*) ;;
-                *) _tier_want="$_tier_want$_forced " ;;
-            esac
-            break
-        done < <(printf '%s\n' "$_manifest_names")
-    done
-    for _n in $_tier_safe; do
-        _found=0
-        while IFS= read -r _m; do
-            [ "$_m" = "$_n" ] && { _found=1; break; }
-        done < <(printf '%s\n' "$_manifest_names")
-        if [ "$_found" != 1 ]; then
-            # Fail closed rather than dropping the name silently: attribution
-            # named a harness this profile's manifest does not declare, so the
-            # two disagree about the estate and no narrowing derived from that
-            # disagreement can be trusted.
-            _tier_widen=1
-            printf 'cctally-test-all: --tier-fast: attribution named %s, which the %s manifest does not declare; selecting the whole estate\n' "$_n" "$CONTRACT_PROFILE" >&2
-            break
-        fi
-        case "$_tier_want" in
-            *" $_n "*) ;;
-            *) _tier_want="$_tier_want$_n " ;;
-        esac
-    done
-
-    # ---- 8: the partition, in MANIFEST order ------------------------------
-    COVERAGE_SELECTED=""
-    COVERAGE_OMITTED=""
-    while IFS= read -r _n; do
-        [ -n "$_n" ] || continue
-        if [ "$_tier_widen" = 1 ]; then
-            COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
-            continue
-        fi
-        case "$_tier_want" in
-            *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
-            *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
-        esac
-    done < <(printf '%s\n' "$_manifest_names")
-    set +f
-    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
-    COVERAGE_OMITTED=${COVERAGE_OMITTED% }
-    # Asserted rather than assumed. The arithmetic lives in
-    # contract_partition_counts_agree, which is where it is also driven directly
-    # by a test (#650 item 3): the manifest count counts LINES while the two
-    # other counts count IFS-split WORDS, so a manifest name containing
-    # whitespace or a glob metacharacter makes the three disagree — and since
-    # contract_manifest_load enforces the name grammar, no manifest it accepts
-    # can reach this branch any more. It stays as the backstop for a future
-    # divergence, and it fails CLOSED into the full estate rather than refusing
-    # a run over a bookkeeping slip.
-    if ! contract_partition_counts_agree \
-            "$_manifest_names" "$COVERAGE_SELECTED" "$COVERAGE_OMITTED"; then
-        printf 'cctally-test-all: --tier-fast: the selected and omitted lists are not an exact partition of the %s manifest (%s + %s of %s); selecting the whole estate\n' \
-            "$CONTRACT_PROFILE" "$CONTRACT_PARTITION_SELECTED_COUNT" \
-            "$CONTRACT_PARTITION_OMITTED_COUNT" "$CONTRACT_PARTITION_MANIFEST_COUNT" >&2
-        COVERAGE_SELECTED=$(printf '%s' "$_manifest_names" | tr '\n' ' ')
-        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
-        COVERAGE_OMITTED=""
-    fi
-    COVERAGE_MODE=tier-fast
-    # The harness axis and nothing else. pytest runs in full, and the tier never
-    # calls bin/_lib_estate_discovery.discover(): it raises on a clean checkout
-    # until e2e/serve.sh builds the Playwright runtime, and — the reason that
-    # settles it — the aggregator has no Playwright EXECUTION axis to narrow,
-    # because bin/cctally-frontend-test runs `npx vitest run` as its estate leg.
-    COVERAGE_PYTEST=full
-    fi
-    COVERAGE_RESOLVED=1
-    unset _tier_basis _tier_paths _tier_safe _tier_want _tier_owners _tier_widen
-fi
-
-if [ "$SUBSET_MODE" = 1 ]; then
-    # Names are validated against the MANIFEST, which is the declared estate.
-    # Admission reloads it below and still compares it against the whole disk
-    # in both directions — a subset narrows what executes and never what is
-    # checked for existence.
-    contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
-    _manifest_names=$(contract_manifest_harness_names "$CONTRACT_PROFILE")
-    # `$SUBSET_SET` and `$COVERAGE_SELECTED` below are deliberately unquoted,
-    # because word splitting is how each set is walked. Pathname expansion is
-    # NOT wanted and is disabled around both loops: `--harness '*'` otherwise
-    # expanded against the working directory and refused a name the caller
-    # never typed ("unknown harness 'AGENTS.md'").
-    set -f
-    for _want in $SUBSET_SET; do
-        _found=0
-        while IFS= read -r _n; do
-            [ "$_n" = "$_want" ] && { _found=1; break; }
-        done < <(printf '%s\n' "$_manifest_names")
-        if [ "$_found" != 1 ]; then
-            contract_usage_abort "unknown harness '$_want'; it has no row in tests/authoritative-test-manifest.json for the $CONTRACT_PROFILE profile" "$_want"
-        fi
-    done
-    set +f
-    # Reported in MANIFEST order rather than caller order, so two invocations
-    # naming the same set produce byte-identical records.
-    while IFS= read -r _n; do
-        [ -n "$_n" ] || continue
-        case "$SUBSET_SET" in
-            *" $_n "*) COVERAGE_SELECTED="$COVERAGE_SELECTED$_n " ;;
-            *)         COVERAGE_OMITTED="$COVERAGE_OMITTED$_n " ;;
-        esac
-    done < <(printf '%s\n' "$_manifest_names")
-    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
-    COVERAGE_OMITTED=${COVERAGE_OMITTED% }
-    COVERAGE_MODE=subset
-    if [ "$_with_pytest_seen" = 1 ]; then
-        COVERAGE_PYTEST=full
-    else
-        COVERAGE_PYTEST=skipped
-    fi
-    COVERAGE_RESOLVED=1
-    # Belt-and-suspenders over bin/cctally-test-remote's _is_canonical_command,
-    # which already recognises only the exact no-argument command as
-    # authoritative. This closes the path where a direct caller sets the
-    # variable by hand, and it refuses BEFORE anything executes.
-    if contract_is_authoritative; then
-        contract_usage_abort "CCTALLY_AUTHORITATIVE_RUN=1 cannot accompany --harness: a subset run is deliberately incomplete and can never carry an authoritative verdict" CCTALLY_AUTHORITATIVE_RUN
-    fi
-    contract_fail incomplete deliberate-subset "" admission
 fi
 
 # Backstop dev-autodetect suppressor for the whole suite run (see the
@@ -661,125 +248,113 @@ export CCTALLY_DISABLE_DEV_AUTODETECT=1
 # harness and the pytest leg also assign it themselves.
 export CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF=1
 
-# ---- harness discovery (read-only; safe in plan mode) ------------------
-# reconcile is kept in final_harnesses ONLY as a summary-ordering device so it
-# stays the last row; it now runs inside the pool, not as a serial phase.
-#
-# The deliberately narrow `required_harnesses` gate of #446 Task B is retired:
-# tests/authoritative-test-manifest.json now declares the WHOLE estate, and
-# contract_admit_harnesses (below, after plan mode) requires exact set equality
-# in both directions plus a separate executable-bit check. Discovery here is
-# ordering only, and must stay read-only so plan mode keeps its side-effect-free
-# contract.
-final_harnesses=(reconcile)
-parallel_harnesses=()
-final_set=" ${final_harnesses[*]} "
+# ---- harness discovery (Codex Q10; read-only, so safe in plan mode) -----
+# Every regular file matching bin/cctally-*-test is a harness, sorted
+# byte-wise so the order does not depend on the caller's locale. A match that
+# is not executable is a usage error: a lost mode bit must never read as a
+# harness that was never there. `reconcile` is the summary-ordering device
+# that keeps the last report row; it runs inside the pool like the others.
+_discovered=""
 for path in "$REPO_ROOT"/bin/cctally-*-test; do
-    [ -x "$path" ] || continue
+    [ -e "$path" ] || continue
     base=$(basename "$path")
     [ "$base" = "cctally-test-all" ] && continue
+    if [ ! -f "$path" ]; then
+        contract_usage_abort "bin/$base matches the harness name pattern but is not a regular file; rename it or make it a harness" "$base"
+    fi
+    if [ ! -x "$path" ]; then
+        contract_usage_abort "bin/$base is a harness but is not executable; chmod +x it (a lost mode bit is never an absent harness)" "$base"
+    fi
     name=${base#cctally-}
     name=${name%-test}
-    case "$final_set" in *" $name "*) continue ;; esac
-    parallel_harnesses+=("$name")
+    _discovered="$_discovered$name"$'\n'
 done
+parallel_harnesses=()
+final_harnesses=()
+while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$name" = reconcile ]; then
+        final_harnesses=(reconcile)
+    else
+        parallel_harnesses+=("$name")
+    fi
+done < <(printf '%s' "$_discovered" | LC_ALL=C sort)
+unset _discovered
 # `${a[@]+"${a[@]}"}` throughout, because macOS system bash is 3.2, where a
 # bare `"${a[@]}"` on an EMPTY array is an `unbound variable` error under
 # `set -u`. The aggregator would exit 1 from the middle of a run having written
 # no outcome record, which is the one failure shape the verdict contract cannot
-# describe. `parallel_harnesses` is empty for an estate carrying no pool
-# harness at all.
-report_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} "${final_harnesses[@]}")
+# describe.
+report_harnesses=(${parallel_harnesses[@]+"${parallel_harnesses[@]}"} ${final_harnesses[@]+"${final_harnesses[@]}"})
 
-# `test-remote` verifies the macOS/Homebrew LAN execution wrapper itself. It is
-# deliberately outside the Linux/Python/filesystem compatibility profile and
-# remains mandatory in Gate 0. No caller-provided name is accepted here: this
-# fixed one-harness omission is the profile's entire definition.
-if [ "$LINUX_MATRIX_MODE" = 1 ]; then
-    linux_harnesses=()
-    linux_omitted=0
-    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
-        if [ "$h" = test-remote ]; then
-            linux_omitted=$((linux_omitted + 1))
-        else
-            linux_harnesses+=("$h")
+if [ "$SUBSET_MODE" = 1 ]; then
+    # `$SUBSET_SET` is deliberately unquoted, because word splitting is how
+    # the set is walked. Pathname expansion is NOT wanted and is disabled
+    # around the loop: `--harness '*'` otherwise expanded against the working
+    # directory and refused a name the caller never typed.
+    set -f
+    for _want in $SUBSET_SET; do
+        _found=0
+        for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
+            [ "$h" = "$_want" ] && { _found=1; break; }
+        done
+        if [ "$_found" != 1 ]; then
+            contract_usage_abort "unknown harness '$_want'; there is no executable bin/cctally-${_want}-test this host runs" "$_want"
         fi
     done
-    [ "$linux_omitted" = 1 ] \
-        || contract_usage_abort "the Linux matrix profile expected exactly one test-remote harness, found $linux_omitted" CCTALLY_LINUX_MATRIX_RUN
-    report_harnesses=(${linux_harnesses[@]+"${linux_harnesses[@]}"})
-fi
-
-# A subset narrows the EXECUTED set only, in manifest order. A selected name
-# that has no file on disk (or lost its executable bit) leaves nothing here,
-# and admission below refuses the run for that reason before the pool starts.
-#
-# The tier narrows the same way and through the same filter, so the selection
-# it recorded is the selection the pool receives; the two modes differ in how
-# the set was derived, never in how it is applied.
-if [ "$SUBSET_MODE" = 1 ] || [ "$TIER_MODE" = 1 ]; then
-    subset_harnesses=()
-    set -f                       # see the note on $SUBSET_SET above
-    for name in $COVERAGE_SELECTED; do
-        for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
-            if [ "$h" = "$name" ]; then
-                subset_harnesses+=("$name")
-                break
-            fi
-        done
-    done
     set +f
+    # Reported in REPORT order rather than caller order, so two invocations
+    # naming the same set produce byte-identical records.
+    subset_harnesses=()
+    for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
+        case "$SUBSET_SET" in
+            *" $h "*) subset_harnesses+=("$h"); COVERAGE_SELECTED="$COVERAGE_SELECTED$h " ;;
+            *)        COVERAGE_OMITTED="$COVERAGE_OMITTED${COVERAGE_OMITTED:+ }$h" ;;
+        esac
+    done
+    COVERAGE_SELECTED=${COVERAGE_SELECTED% }
     report_harnesses=(${subset_harnesses[@]+"${subset_harnesses[@]}"})
+    COVERAGE_MODE=subset
+    if [ "$_with_pytest_seen" = 1 ]; then
+        COVERAGE_PYTEST=full
+    else
+        COVERAGE_PYTEST=skipped
+    fi
+    COVERAGE_RESOLVED=1
+    # Belt-and-suspenders over the runner client, which recognises only the
+    # exact no-argument command as authoritative. This closes the path where a direct caller sets the
+    # variable by hand, and it refuses BEFORE anything executes.
+    if contract_is_authoritative; then
+        contract_usage_abort "CCTALLY_AUTHORITATIVE_RUN=1 cannot accompany --harness: a subset run is deliberately incomplete and can never carry an authoritative verdict" CCTALLY_AUTHORITATIVE_RUN
+    fi
+    contract_fail incomplete deliberate-subset "" admission
+else
+    COVERAGE_SELECTED=${report_harnesses[*]+"${report_harnesses[*]}"}
+    # ShellCheck: bin/_lib-test-contract.sh reads this when it publishes coverage.
+    # shellcheck disable=SC2034
+    COVERAGE_RESOLVED=1
 fi
 
 # ---- dispatch order (#630 S3) ------------------------------------------
 # Dispatch order is a SEPARATE array from report order (preserve-item 29).
-# Longest-processing-time first, from the committed table, because the pool is
-# tail-bound: `test-remote` is 723s of the table's 2714s total — a quarter of
-# all harness work — and sorts 58th of 61 alphabetically, so in report order it
-# starts late and holds one of four slots for the final 723s. The consequence
-# is arithmetic rather than a guess: 2714/4 = 678.5s, which is BELOW 723s, so
-# 723s is the pool's floor whatever the dispatch order and the only thing an
-# order can change is how much of it overlaps everything else.
+# Longest-processing-time first, from tests/harness-duration-hints.tsv, because
+# the pool is tail-bound: a long harness that sorts late alphabetically starts
+# late in report order and holds one slot for the run's final minutes.
 #
-# The table must be an exact cover of the FULL manifest; the current profile's
-# rows are then selected the way contract_manifest_harness_names selects names.
-# Anything wrong with it is a FALLBACK, never a refusal: a stale table must not
-# fail a gate. bin/cctally-preflight refuses it locally instead, before the
-# 16-minute round trip.
-#
-# The validation itself lives in bin/_lib_harness_durations.py, which
-# bin/cctally-preflight imports too. The two callers disagree about the
-# CONSEQUENCE — a fallback here, a local refusal there — and must never
-# disagree about the contract.
-#
-# The manifest is read through that module rather than through
-# CONTRACT_HARNESS_TABLE. That variable is populated by contract_manifest_load,
-# which runs only inside the subset branch above and again at admission — so on
-# a full run it is still empty at this point and every table row would classify
-# as an unknown harness. Reading the file directly also keeps this block from
-# turning a malformed manifest into a plan-mode refusal, which would break the
-# "plan mode exits before admission" contract the block below depends on.
+# The table holds HINTS (Codex Q10), read through bin/_lib_harness_durations.py:
+# a harness without a row is dispatched first, a row for a harness that no
+# longer exists is ignored, and a malformed row is skipped with a note. None of
+# them suppresses or refuses a harness; only a missing table or an unloadable
+# reader falls back to report order.
 #
 # `python3 -B` because plan mode is contractually side-effect-free
-# (preserve-item 25) and an ordinary import of a bin/ sibling has CPython write
-# bin/__pycache__/_lib_harness_durations.<tag>.pyc into the tree under test.
-# CI invokes this script directly on the runner with neither
-# PYTHONPYCACHEPREFIX nor PYTHONDONTWRITEBYTECODE set, so without -B the
-# aggregator writes bytecode into whatever checkout it is run in.
+# (preserve-item 25) and an ordinary import of a bin/ sibling writes
+# bin/__pycache__ into the tree under test.
 #
-# The capture takes stdout ALONE. It used to be `2>&1`, and the shell then read
-# only the first line of the merged stream — so any stderr line emitted on a
-# ZERO exit (a DeprecationWarning, anything PYTHONWARNINGS turns on) would have
-# become the dispatch list. Diagnostics belong on stderr and go there directly.
-#
-# The program prints TWO things, in this order: a provenance line naming the
-# table and its digest, then the dispatch order. The provenance is recorded
-# alongside SCHEDULER_MODE, and it is taken HERE rather than at teardown
-# because the mode is decided here: a run holds its workdir for the whole
-# sixteen minutes, so a digest read after the pool describes the tree as it
-# ended rather than the bytes the dispatch decision was taken from. It is
-# printed before the first `bail`, so every exit path records it.
+# The capture takes stdout ALONE: a stderr line emitted on a zero exit (a
+# DeprecationWarning, anything PYTHONWARNINGS turns on) must never become the
+# dispatch list. The program prints a provenance line naming the table and its
+# digest, then the dispatch order.
 # MEASUREMENT CONTROL ARM. #630 S3's decision rule compares longest-first
 # dispatch against report order, and a paired difference is only a paired
 # difference when both arms run on the SAME tree. Without this override the
@@ -809,14 +384,14 @@ _scheduler_out=$(
 import os
 import sys
 
-repo_root, profile = sys.argv[1], sys.argv[2]
+repo_root = sys.argv[1]
 sys.path.insert(0, os.path.join(repo_root, "bin"))
 try:
     import _lib_harness_durations as durations
 except ImportError as exc:
     print("unknown\tvalidator-unimportable")
     sys.stderr.write(
-        "scheduler: no duration table validator at %s/bin (%s); "
+        "scheduler: no duration hint reader at %s/bin (%s); "
         "dispatching in report order\n" % (repo_root, exc)
     )
     raise SystemExit(1)
@@ -830,31 +405,16 @@ except OSError:
     _digest = "absent"
 print("%s\t%s" % (durations.TABLE_REL, _digest))
 
-
-def bail(reason):
-    sys.stderr.write("scheduler: %s; dispatching in report order\n" % reason)
-    raise SystemExit(1)
-
-
-manifest, error = durations.read_manifest(repo_root)
-if error:
-    bail(error)
 text, error = durations.read_table(repo_root)
 if error:
-    bail(error)
-table, error = durations.validate(text, manifest)
-if error:
-    bail(error)
-order, error = durations.dispatch_order(
-    os.environ.get("REPORT_ORDER", "").split(),
-    table,
-    durations.select_for_profile(manifest, profile),
-)
-if error:
-    bail(error)
-print(" ".join(order))' |
+    sys.stderr.write("scheduler: %s; dispatching in report order\n" % error)
+    raise SystemExit(1)
+hints, problems = durations.parse_hints(text)
+for problem in problems:
+    sys.stderr.write("scheduler: ignoring duration hint %s\n" % problem)
+print(" ".join(durations.dispatch_order(os.environ.get("REPORT_ORDER", "").split(), hints)))' |
     REPORT_ORDER="${report_harnesses[*]+"${report_harnesses[*]}"}" \
-    python3 -B - "$REPO_ROOT" "$CONTRACT_PROFILE"
+    python3 -B - "$REPO_ROOT"
 )
 _scheduler_rc=$?
 # Split the provenance line off the front. Command substitution strips trailing
@@ -881,23 +441,13 @@ if [ "$_scheduler_rc" -ne 0 ]; then
 elif [ -n "$_scheduler_order" ]; then
     # `read -r -a` rather than an unquoted array assignment: word splitting is
     # the mechanism, but the assignment form also invites pathname expansion,
-    # and SC2206 is not on the gate's permitted-suppression list. A manifest
+    # and SC2206 is not on the gate's permitted-suppression list. A discovered
     # harness name carries no whitespace, so one IFS split is exact.
     read -r -a dispatch_harnesses < <(printf '%s\n' "$_scheduler_order")
     SCHEDULER_MODE=lpt
 else
-    # Exit 0 with no names at all. This is REACHED, not defence: the subset
-    # branch above reassigns `report_harnesses`, and a `--harness NAME` whose
-    # file is absent or has lost its executable bit selects nothing, so
-    # `REPORT_ORDER` is empty and the ordering has nothing to return. Plan mode
-    # runs before admission, which is what lets that tree get this far —
-    # `CCTALLY_TEST_ALL_PLAN=1 bin/cctally-test-all --harness diff` with
-    # bin/cctally-diff-test not executable prints this line and then
-    # `harnesses=`, `dispatch_harnesses=` and `scheduler=fallback`. Admission
-    # refuses the same tree on a real run, before the pool starts.
-    #
-    # Dispatching an empty list would run NOTHING while the report still
-    # described a full estate, so the fallback says so rather than staying
+    # Exit 0 with no names at all: a tree with no harness. Dispatching an
+    # empty list runs nothing, so the fallback says so rather than staying
     # silent.
     printf 'scheduler: the ordering returned no harness; dispatching in report order\n' >&2
 fi
@@ -933,55 +483,30 @@ if [ "${CCTALLY_TEST_ALL_PLAN:-}" = "1" ]; then
     # its meaning is now report order specifically rather than the single order
     # that used to be both.
     #
-    # `harnesses=` also remains the single carrier of what a subset selected. A
-    # second `selected=` line printing the same variable used to sit here; it
-    # carried no information the line above does not, while inviting a reader
-    # to equate it with the record's `coverage.selectedHarnesses`, which is the
-    # MANIFEST-ordered name list and a different thing. Set equality between
-    # the two is forced by admission; their order and their source are not.
+    # `harnesses=` also remains the single carrier of what a subset selected.
     printf 'harnesses=%s\n' "$plan_harnesses"
     printf 'dispatch_harnesses=%s\n' "${dispatch_harnesses[*]+"${dispatch_harnesses[*]}"}"
     printf 'scheduler=%s\n' "$SCHEDULER_MODE"
     printf 'mode=%s\n' "$COVERAGE_MODE"
     printf 'pytest_disposition=%s\n' "$COVERAGE_PYTEST"
-    if [ "$MERGE_MODE" = 1 ]; then
-        printf 'merge_selection=%s\n' "$MERGE_RECORD"
-    fi
-    # The tier's own lines, printed only in tier mode and named in their own
-    # namespace. `harnesses=` above stays the single carrier of a SUBSET's
-    # selection for the reason recorded there, and these do not reopen that: a
-    # tier's omitted list has no other carrier at all, and its selected list is
-    # MANIFEST-ordered where `harnesses=` is report-ordered, so they are
-    # genuinely different facts rather than the same variable twice.
-    if [ "$TIER_MODE" = 1 ]; then
-        printf 'tier_selected=%s\n' "$COVERAGE_SELECTED"
-        printf 'tier_omitted=%s\n' "$COVERAGE_OMITTED"
-        printf 'tier_base_oid=%s\n' "$COVERAGE_TIER_BASE_OID"
-        printf 'tier_head_oid=%s\n' "$COVERAGE_TIER_HEAD_OID"
-        printf 'tier_committed_paths=%s\n' "$COVERAGE_TIER_COMMITTED_PATHS"
-        printf 'tier_worktree_paths=%s\n' "$COVERAGE_TIER_WORKTREE_PATHS"
-    fi
     exit 0
 fi
 
 # ---- the evidence bridge (#529 S2) -------------------------------------
 # ONE entry point into the Python kernels, invoked by ABSOLUTE PATH derived
 # from REPO_ROOT rather than through an ambient PYTHONPATH, so a runner's
-# environment cannot redirect it. The public kernel bin/_lib_test_evidence.py
-# is required; the private bin/_lib_test_remote_observability.py supplies the
-# public-path predicate and the disclosure vocabulary and is absent from the
-# published tree, where its absence makes the transformer redact everything
-# it cannot vouch for. That is the fail-closed default, not a degradation to
-# be worked around.
+# environment cannot redirect it. The kernel bin/_lib_test_evidence.py is
+# required, and it also builds the disclosure facts (the public-path
+# predicate and the vocabulary) from this repository: where the mirror's
+# classifier is absent, as on the published tree, the predicate answers "not
+# public" for every path, which is the fail-closed default.
 EVIDENCE_KERNEL="$REPO_ROOT/bin/_lib_test_evidence.py"
-EVIDENCE_PRIVATE="$REPO_ROOT/bin/_lib_test_remote_observability.py"
 
 # The bridge program, printed rather than fed as a here-document: bash 3.2
 # and /bin/sh write here-document bodies under /private/var/tmp whatever
 # TMPDIR says (#940 C11).
 _ev_bridge() {
     printf '%s\n' 'import fcntl
-import hashlib
 import importlib.util
 import json
 import os
@@ -1027,16 +552,15 @@ REQUIRED = (
     "bound_extract_lines", "build_scrubbed_extract",
     "_coverage_gaps",
     "LEGACY_STORE", "retention_store", "carried_seeded_loss", "retention_coverage",
-    "read_evidence_index", "update_evidence_index", "record_store_loss",
-    "forget_indexed_runs", "verify_indexed_runs",
+    "build_disclosure_predicate", "build_known_tokens",
     "merge_duration_legs", "plan_evidence_evictions",
     "render_retention_notice",
     "resolve_evidence_layout", "resolve_run_id", "select_failure_windows",
     "validate_export",
 )
 
-KERNEL, PRIVATE, MODE = sys.argv[1], sys.argv[2], sys.argv[3]
-ARGS = sys.argv[4:]
+KERNEL, MODE = sys.argv[1], sys.argv[2]
+ARGS = sys.argv[3:]
 
 EV = _load(KERNEL, "_lib_test_evidence")
 if EV is not None:
@@ -1053,7 +577,6 @@ if EV is None:
         % (KERNEL, LOAD_ERROR or "unknown reason")
     )
     raise SystemExit(9)
-PRIV = _load(PRIVATE, "_lib_test_remote_observability")
 
 
 def _env(name, default=""):
@@ -1117,38 +640,30 @@ def _roots():
 
 
 def _context():
-    """The ScrubContext, with private disclosure facts injected fail-closed.
+    """The ScrubContext, with the repository'\''s disclosure facts injected
+    fail-closed.
 
-    `is_public_path` and `known_tokens` are None when the private kernel is
-    absent or refuses, which redacts more rather than less. The same rule
-    applies to the exact test-remote case identifiers.
+    `is_public_path` and `known_tokens` are None when building them raises,
+    which redacts more rather than less. They are None on the published tree
+    too, which carries no mirror matcher: there no path is disclosable and no
+    word is vouched for, so every detail is redacted, byte for byte as before
+    the vocabulary moved into the public kernel (test regime reset, session 4).
     """
-    is_public = None
-    tokens = None
-    case_ids = None
     repo = _env("EV_REPO_ROOT")
-    if PRIV is not None:
-        builder = getattr(PRIV, "build_disclosure_predicate", None) or getattr(
-            PRIV, "build_public_path_predicate", None
-        )
-        if builder is not None:
-            try:
-                is_public = builder(repo)
-            except Exception:                           # noqa: BLE001
-                is_public = None
-        try:
-            tokens = PRIV.build_known_tokens(repo)
-        except Exception:                               # noqa: BLE001
-            tokens = None
-        try:
-            case_ids = PRIV.build_known_test_remote_case_ids(repo)
-        except Exception:                               # noqa: BLE001
-            case_ids = None
+    if not repo or not os.path.isfile(os.path.join(repo, ".githooks", "_match.py")):
+        return EV.ScrubContext(roots=_roots())
+    try:
+        is_public = EV.build_disclosure_predicate(repo)
+    except Exception:                                   # noqa: BLE001
+        is_public = None
+    try:
+        tokens = EV.build_known_tokens(repo)
+    except Exception:                                   # noqa: BLE001
+        tokens = None
     return EV.ScrubContext(
         roots=_roots(),
         is_public_path=is_public,
         known_tokens=tokens,
-        known_case_ids=case_ids,
     )
 
 
@@ -1749,146 +1264,14 @@ def _acquire_retention_lock(path):
             time.sleep(0.05)
 
 
-def _iso(epoch):
-    if epoch is None:
-        return None
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(epoch)))
-
-
-class _IndexLock(object):
-    """The evidence index'\''s writer lock (#940, C8). The public kernel names
-    no lock layout, so every writer supplies one; this is the exclusive flock
-    on `<index>.lock` that the runner'\''s enrollment also takes (the private
-    runner-storage tests observe that the two exclude each other)."""
-
-    def __init__(self, index):
-        self.path = index + ".lock"
-        self.fd = None
-
-    def __enter__(self):
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except BaseException:
-            os.close(fd)
-            raise
-        self.fd = fd
-        return self
-
-    def __exit__(self, *exc):
-        fd, self.fd = self.fd, None
-        if fd is not None:
-            os.close(fd)
-        return False
-
-
-def _index_forget(index, store, run_ids):
-    """Drop runs from the evidence index (#940, C8): runs retention evicted on
-    purpose, and runs whose loss was just recorded. The kernel'\''s own reader
-    and atomic writer, under this aggregator'\''s lock, so the index has one
-    shape."""
-    EV.forget_indexed_runs(index, store_id=store, run_ids=run_ids, lock=_IndexLock(index))
-
-
-def _index_listed(index, store, run_ids):
-    """The members of `run_ids` the evidence index still lists for `store`
-    (#940 D0b), each mapped to the finish epoch the index records for it (or
-    None): a pending forget the index no longer lists has nothing left to
-    forget. An index that cannot be read keeps every one, never deciding."""
-    try:
-        runs = ((EV.read_evidence_index(index).get("stores") or {}).get(store) or {}) \
-            .get("runs") or []
-    except (OSError, ValueError):
-        return dict((r, None) for r in run_ids)
-    by_id = dict((r.get("runId"), r) for r in runs)
-    return dict((r, _indexed_finish(by_id[r])) for r in run_ids if r in by_id)
-
-
-def _indexed_finish(run):
-    """The epoch an indexed run finished (its `endedAt`, else `startedAt`):
-    the quantity retention evicts by (`finished_epoch`, else
-    `started_epoch`), never the stamp of the run id (#940 D0c). An `endedAt`
-    that does not parse falls through to `startedAt` (#940 D-2 F14). None when
-    the index records neither readably."""
-    for key in ("endedAt", "startedAt"):
-        value = run.get(key)
-        if value:
-            try:
-                return int(EV._iso_epoch(value))
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _detect_index_loss(index, store, root, current_run, seeded, evicted=(), horizon=None):
-    """R7-F7: an indexed run whose evidence is missing, truncated or changed
-    is LOST, discovered here from the index alone (no pre-seeded flag). Each
-    is recorded in the index'\''s loss list and carried in the record'\''s
-    `seededLoss`, so the store stays `coverage: degraded` until the interval
-    ages out. A run retention itself evicted (`evicted`: this pass'\''s, and any
-    earlier pass'\''s whose index forget has not yet succeeded) is planned,
-    never lost. So is a run that finished before the retention `horizon`
-    (#940 D0c: by the finish the index records, the quantity retention evicts
-    by, never by its id stamp): retention evicts it by age, so it is forgotten
-    from the index here instead of being read as loss or listed for ever.
-    Never deciding: an index that cannot be read is a note."""
-    try:
-        problems = [p for p in EV.verify_indexed_runs(index, store_id=store, root=root)
-                    if p["runId"] != current_run and p["runId"] not in evicted]
-        if not problems:
-            return
-        runs = dict((r.get("runId"), r) for r in
-                    ((EV.read_evidence_index(index).get("stores") or {}).get(store) or {})
-                    .get("runs") or [])
-        aged = set()
-        if horizon is not None:
-            for problem in problems:
-                finish = _indexed_finish(runs.get(problem["runId"]) or {})
-                if finish is not None and finish < horizon:
-                    aged.add(problem["runId"])
-        problems = [p for p in problems if p["runId"] not in aged]
-        keys = set((e.get("start"), e.get("end"), e.get("reason")) for e in seeded)
-        items = []
-        for problem in problems:
-            run = runs.get(problem["runId"]) or {}
-            items.append({"start": run.get("startedAt"), "end": run.get("endedAt"),
-                          "reason": "detected %s evidence of run %s" % (
-                              problem["kind"], problem["runId"])})
-        # #940 D0b: every loss joins the seeded loss BEFORE any index write, so
-        # an index that cannot be written does not drop a loss this pass found:
-        # the record still degrades coverage. D-1 F4: all of them first, so one
-        # failed write cannot drop the losses after it.
-        for item in items:
-            if (item["start"], item["end"], item["reason"]) not in keys:
-                seeded.append(item)
-                keys.add((item["start"], item["end"], item["reason"]))
-            sys.stderr.write("cctally-test-all: evidence loss: %s\n" % item["reason"])
-        for item in items:
-            EV.record_store_loss(index, store_id=store, start=item["start"],
-                                 end=item["end"], reason=item["reason"],
-                                 lock=_IndexLock(index))
-        _index_forget(index, store, set(p["runId"] for p in problems) | aged)
-    except (OSError, ValueError, KeyError) as exc:
-        sys.stderr.write("cctally-test-all: the evidence index %s could not be verified "
-                         "(%s: %s)\n" % (index, exc.__class__.__name__, exc))
-
-
 def _retention_pass(root, current_run, record_path):
     try:
         with open(record_path, encoding="utf-8") as handle:
             previous = json.load(handle)
     except (OSError, ValueError):
         previous = {}
-    # #940 (C8, F20): the store this pass runs on. A record written for another
-    # store never lends this one its pass count, gaps or seeded loss.
-    store = os.environ.get("CCTALLY_RUNNER_STORE_ID") or EV.retention_store(previous)
-    if previous and EV.retention_store(previous) != store:
-        sys.stderr.write(
-            "cctally-test-all: the retention record %s belongs to store %s, not %s; "
-            "starting this store'\''s record afresh\n"
-            % (record_path, EV.retention_store(previous), store))
-        previous = {}
-    index = os.environ.get("CCTALLY_RUNNER_EVIDENCE_INDEX") or ""
+    # #940 (C8, F20): the store this record describes, carried from the record.
+    store = EV.retention_store(previous)
 
     runs = _load_runs(root)
     live = {}
@@ -1942,69 +1325,6 @@ def _retention_pass(root, current_run, record_path):
     # Seeded loss is preserved until it ages out of the retention horizon (C8).
     seeded = EV.carried_seeded_loss(
         previous, now, max_age_days=_int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS))
-    # Evicted runs the index still lists: this pass'\''s, plus an earlier pass'\''s
-    # whose forget failed after its eviction succeeded. They are retried here
-    # and, until a forget succeeds, carried in the record, so no later pass
-    # reads a planned eviction as loss.
-    #
-    # #940 D0b: the carried list is accepted only as a list of run ids (a string
-    # is not a list of its characters, and an unsafe id is dropped). It is
-    # carried whenever it is non-empty, and while forgets keep failing it is
-    # reconciled against the index, so it keeps only the runs the index still
-    # lists. Each entry carries the epoch its run finished
-    # (`indexForgetPendingEnded`), the quantity retention evicts by.
-    #
-    # #940 D0c: a pass that names no index adds none of its own evictions
-    # (there is nothing to forget them from, and the CI lane'\''s unstamped ids
-    # would stay pending for ever), and it alone age-bounds what it carries:
-    # an entry whose recorded finish is older than the retention window is
-    # dropped, and one with no recorded finish is kept. A pass that names an
-    # index carries an entry while its forget fails, and loss detection forgets
-    # the runs past the window it finds listed. #940 D-2 F19: not for ever,
-    # though. An index that stays unreadable, or whose forget keeps failing,
-    # would grow the list on every pass, so a named-index pass drops an entry
-    # whose recorded finish is more than one further window past the horizon:
-    # by then loss detection forgets it as aged once the index recovers. No
-    # entry whose run finished inside the horizon is dropped.
-    window = _int("EV_MAX_AGE_DAYS", EV.DEFAULT_MAX_AGE_DAYS) * 86400
-    horizon = now - window
-    carried = previous.get("indexForgetPending")
-    carried = [r for r in carried if EV.validate_run_id(r)] if isinstance(carried, list) else []
-    carried_ended = previous.get("indexForgetPendingEnded")
-    if not isinstance(carried_ended, dict):
-        carried_ended = {}
-
-    def _epoch(value):
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-    pending_ended = dict((r, _epoch(carried_ended.get(r))) for r in carried)
-    if index:
-        for run in removed:
-            finish = run.get("finished_epoch") or run.get("started_epoch")
-            pending_ended[run["run_id"]] = _epoch(finish)
-        pending_forget = set(pending_ended)
-        try:
-            _index_forget(index, store, pending_forget)
-            forgotten = True
-        except (OSError, ValueError) as exc:
-            forgotten = False
-            sys.stderr.write("cctally-test-all: the evidence index %s could not be updated "
-                             "(%s: %s)\n" % (index, exc.__class__.__name__, exc))
-        _detect_index_loss(index, store, root, current_run, seeded, evicted=pending_forget,
-                           horizon=horizon)
-        if forgotten:
-            pending_ended = {}
-        else:
-            listed = _index_listed(index, store, pending_forget)
-            pending_ended = dict(
-                (r, pending_ended[r] if pending_ended.get(r) is not None else listed[r])
-                for r in listed)
-            pending_ended = dict((r, e) for r, e in pending_ended.items()
-                                 if e is None or e >= horizon - window)
-    else:
-        pending_ended = dict((r, e) for r, e in pending_ended.items()
-                             if e is None or e >= horizon)
-    pending_forget = set(pending_ended)
     after_runs = _load_runs(root)
     orphans, unclassified_bytes = _orphan_dirs(root, now)
     bytes_after = (
@@ -2033,14 +1353,14 @@ def _retention_pass(root, current_run, record_path):
         "schemaVersion": 1,
         "updatedAt": int(time.time()),
         "passes": int(previous.get("passes") or 0) + 1,
-        # The store this record describes (#940, F20): the observability reader
-        # de-duplicates passes on (host, store, passes).
+        # The store this record describes (#940, F20), carried unchanged from
+        # the previous record so its passes and gaps describe one store.
         "store": store,
         # An orphan is not healthy retained evidence. Its interval cannot be
         # recovered — the manifest that carried it is what went missing — so
         # the coverage state is degraded and no interval is invented for it.
-        # Seeded loss (a lost predecessor store, detected index loss) degrades
-        # it too, until it ages out.
+        # Seeded loss (a lost predecessor store) degrades it too, until it
+        # ages out.
         "coverage": EV.retention_coverage(gaps=gaps, orphans=len(orphans),
                                           seeded_loss=seeded),
         "seededLoss": seeded,
@@ -2061,11 +1381,6 @@ def _retention_pass(root, current_run, record_path):
             {run.get("reason") for run in removed if run.get("reason")}
         ),
     }
-    if pending_forget:
-        record["indexForgetPending"] = sorted(pending_forget)
-        ended = dict((r, e) for r, e in pending_ended.items() if e is not None)
-        if ended:
-            record["indexForgetPendingEnded"] = ended
     _write_atomic(record_path, json.dumps(record) + "\n")
 
     notice = EV.render_retention_notice(plan)
@@ -2145,41 +1460,17 @@ if MODE == "retention":
         os.close(lock_fd)
     raise SystemExit(0)
 
-if MODE == "index":
-    # #940 (C8, R7-F7): a FINISHED run'\''s manifest, with its expected length and
-    # digest, under the store it ran on, so a later retention pass can discover
-    # its deletion or truncation. Non-deciding: a failure is a note.
-    root, run_dir, run_id = ARGS[0], ARGS[1], ARGS[2]
-    index = os.environ.get("CCTALLY_RUNNER_EVIDENCE_INDEX") or ""
-    if not index:
-        raise SystemExit(0)
-    store = os.environ.get("CCTALLY_RUNNER_STORE_ID") or EV.LEGACY_STORE
-    manifest = os.path.join(run_dir, "manifest.json")
-    try:
-        with open(manifest, "rb") as handle:
-            data = handle.read()
-        doc = json.loads(data.decode("utf-8"))
-        EV.update_evidence_index(
-            index, store_id=store, run_id=run_id,
-            started_at=_iso(doc.get("startedEpoch")), ended_at=_iso(doc.get("finishedEpoch")),
-            length=len(data), digest="sha256:" + hashlib.sha256(data).hexdigest(),
-            relpath=os.path.relpath(manifest, root), lock=_IndexLock(index))
-    except (OSError, ValueError) as exc:
-        sys.stderr.write("cctally-test-all: run %s was not added to the evidence index %s "
-                         "(%s: %s)\n" % (run_id, index, exc.__class__.__name__, exc))
-    raise SystemExit(0)
-
 sys.stderr.write("cctally-test-all: unknown evidence mode %r\n" % MODE)
 raise SystemExit(9)'
 }
 
 _ev() {   # _ev <mode> [args...]
-    _ev_bridge | python3 - "$EVIDENCE_KERNEL" "$EVIDENCE_PRIVATE" "$@"
+    _ev_bridge | python3 - "$EVIDENCE_KERNEL" "$@"
 }
 
 # ---- run identity and the opening banner (#529 S2) ----------------------
 # AFTER plan mode, which exits before any side effect, and BEFORE admission,
-# so a run refused by a capability probe or a manifest delta is not silent
+# so a run refused by a capability probe or a regeneration variable is not silent
 # either. Resolving the identity is pure: nothing is created until admission
 # has passed.
 _evidence_kernel_abort() {
@@ -2209,165 +1500,182 @@ esac
 printf '[cctally-test-all] run %s — %s harnesses, outer=%s inner=%s pytest=%s\n' \
     "$RUN_ID" "${#report_harnesses[@]}" "$OUTER" "$INNER" "$PYTEST" >&2
 
-# ---- admission (#529 S1) -----------------------------------------------
-if [ "$COVERAGE_MODE" = merge-focused ] && [ "$MERGE_DEADLINE_WORKER" = 0 ]; then
-    # The worker form is internal and is NOT a receipt-carrying command in
-    # cctally-test-remote. Only this outer selected gate starts it, under a
-    # deadline that covers admission as well as every execution phase.
-    python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" \
-        --deadline "$((MERGE_MAX_SECONDS - SECONDS))" \
-        "$REPO_ROOT/bin/cctally-test-all" --merge-gate-worker "$TIER_BASE_REV"
-    _merge_rc=$?
-    if [ "$_merge_rc" = 124 ]; then
-        contract_note "merge gate reached its ${MERGE_MAX_SECONDS}-second execution deadline"
-        contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" budget
-        contract_finish
-    fi
-    exit "$_merge_rc"
+# ---- supervision (test regime reset, session 4) -------------------------
+# In the private tree on macOS the suite runs only inside a run of the runner
+# supervisor, whose per-run directory holds this run's TMPDIR (spec 4.6):
+# every write the suite causes then lands on the runner's external volume, and
+# the supervisor reaps and removes whatever a killed run leaves. Hosted Linux
+# CI runs this aggregator directly and is not refused. Neither is the
+# published tree, which carries no runner client and whose contributors run
+# this aggregator directly. AFTER plan mode, which executes nothing and stays
+# available everywhere.
+_supervised() {
+    local run_real tmp_real
+    [ -n "${CCTALLY_RUNNER_RUN_DIR:-}" ] && [ -n "${TMPDIR:-}" ] || return 1
+    run_real=$(cd "$CCTALLY_RUNNER_RUN_DIR" 2>/dev/null && pwd -P) || return 1
+    tmp_real=$(cd "$TMPDIR" 2>/dev/null && pwd -P) || return 1
+    case "$tmp_real/" in
+        "${run_real%/}"/*) return 0 ;;
+    esac
+    return 1
+}
+# The client's name is split in the source only: the public dependency-closure
+# guard (tests/test_public_test_dep_closure.py) reads any path-ish token for a
+# mirror-private sibling as an exec of it, and this line merely names it. The
+# printed line is unchanged.
+if [ "$CONTRACT_PROFILE" = private ] && [ "$(uname -s 2>/dev/null)" = Darwin ] \
+        && ! _supervised; then
+    contract_usage_abort "run it through bin/cctally-test""-remote bin/cctally-test-all"
 fi
 
-# ---- the suite generation (#963, spec 5.4) ------------------------------
-# Claimed HERE: after plan mode and the merge-focused dispatch, which both
-# exit before any side effect, and BEFORE admission, whose estate discovery is
-# the first subprocess that can allocate pytest temp. Every pytest allocation
-# of this run lives beneath it: the main leg's --basetemp m, the benchmark
-# leg's --basetemp b, the PYTEST_DEBUG_TEMPROOT t of implicit nested sessions,
-# and the temporary log directory. TMPDIR itself is never changed (spec 4.1).
-GEN_LIB="$REPO_ROOT/bin/_lib_test_generation.py"
-GEN_DIR=""
-GEN_TOKEN=""
-GEN_STATE=none
-_gen() { python3 -B "$GEN_LIB" "$@"; }
+# ---- the suite directory (test regime reset, session 4; spec C8) --------
+# Created HERE: after plan mode, which exits before any side effect, and
+# BEFORE admission, whose capability probes are the first subprocesses that
+# can allocate temp. Every pytest allocation of this run lives beneath it: the
+# main leg's --basetemp m, the benchmark leg's --basetemp b, the
+# PYTEST_DEBUG_TEMPROOT t of implicit nested sessions, and the temporary log
+# directory. TMPDIR itself is never changed. The template path is explicit
+# because macOS mktemp ignores TMPDIR without one.
+#
+# Every process group the run starts (the pool and each pytest leg) is reaped
+# right after its leader's `wait` returns: TERM, up to 5 s, KILL, up to 5 s,
+# while the group's number is still this run's. A group whose leader was never
+# waited (the run was interrupted) is reaped the same way at exit. The
+# directory is then removed through bin/_lib_test_temp.py (no link following,
+# one device). A directory that cannot be removed, or whose groups survive
+# SIGKILL, is kept. Under the runner supervisor it lies inside the run
+# directory, which the supervisor removes after its own reap; on hosted Linux
+# there is no supervisor, so it stays under TMPDIR until the ephemeral VM is
+# discarded.
+SUITE_TEMP_LIB="$REPO_ROOT/bin/_lib_test_temp.py"
+SUITE_DIR=""
+SUITE_NAME=""
+SUITE_STATE=none
+SUITE_GROUPS=""
+SUITE_GROUP_SURVIVED=0
 
-# The terminal half of the lifecycle, called from the EXIT trap with the exit
-# status. A generation the success path already removed is left alone (R2-F1:
-# a post-cleanup budget failure never recreates it). Whatever the status, the
-# run reaps its recorded groups and, once every one is established gone and no
-# other process carries its descendant token, removes the generation (test
-# regime reset, session 1: a failed or interrupted run no longer keeps its
-# scratch for 24 hours). Only when a descendant may still run, or the removal
-# is refused, is it kept: 128 and above records `interrupted`, anything else
-# `failed`, and both release obstructive metadata for the unchanged 24-hour
-# retention (U5).
-_gen_settle() {   # $1 exit status
-    [ "$GEN_STATE" = claimed ] || return 0
-    # Removal only once every recorded group is established gone (spec 5.4)
-    # and the sweep's own descendant-token scan sees no other holder (Review
-    # Focus 4): a detached descendant outside the recorded groups, or an
-    # environment scan that cannot see, keeps the generation. The scan never
-    # counts this run's own process or its ancestors.
-    local reaped=0
-    _gen reap --dir "$GEN_DIR" && _gen descendants --dir "$GEN_DIR" && reaped=1
-    if [ "$reaped" = 1 ] && _gen remove --dir "$GEN_DIR"; then
-        GEN_STATE=removed
+# A group whose leader this run has not yet waited. Its number cannot be
+# reused while the leader is an unwaited child, so it is safe to signal.
+_suite_record_group() {   # $1 group leader pid
+    [ -n "$1" ] || return 0
+    SUITE_GROUPS="$SUITE_GROUPS $1"
+    return 0
+}
+
+_suite_forget_group() {   # $1 group id
+    local g kept=""
+    for g in $SUITE_GROUPS; do
+        [ "$g" = "$1" ] || kept="$kept $g"
+    done
+    SUITE_GROUPS=$kept
+    return 0
+}
+
+# Status 0 while process group $1 has a member, 1 once it is gone. Only ESRCH
+# ("No such process") means gone: the group is empty and its number is free.
+# EPERM means the group exists but no member could be signalled; macOS answers
+# it for a group whose remaining members are all zombies (#1006), which Linux
+# reports as success instead. Either way the number is still that group's until
+# the zombies are reaped, so EPERM is present, and so is any failure the probe
+# cannot read: failing closed costs at most a report of a surviving group,
+# never a signal to a number this run no longer holds. LC_ALL=C pins the text
+# of the builtin's message.
+_suite_group_present() {   # $1 group id
+    local err
+    err=$(LC_ALL=C; kill -0 -"$1" 2>&1) && return 0
+    case "$err" in
+        *"No such process"*) return 1 ;;
+    esac
+    return 0
+}
+
+# Reap group $1 once and forget it. Called only while the number is this
+# run's: right after its leader's `wait` returned, or for a leader never
+# waited. TERM and KILL go only to a group a probe has just found present, and
+# a group a probe found gone is never addressed again. A group that outlives
+# SIGKILL by 5 s keeps the suite directory (SUITE_GROUP_SURVIVED).
+_suite_settle_group() {   # $1 group id
+    local pg=$1 sig waited
+    [ -n "$pg" ] || return 0
+    for sig in TERM KILL; do
+        _suite_group_present "$pg" || break
+        kill -"$sig" -"$pg" 2>/dev/null || true
+        waited=0
+        while _suite_group_present "$pg"; do
+            if [ "$waited" -ge 20 ]; then
+                if [ "$sig" = KILL ]; then
+                    contract_note "suite directory $SUITE_NAME: process group $pg survived SIGKILL"
+                    SUITE_GROUP_SURVIVED=1
+                fi
+                break
+            fi
+            sleep 0.25 2>/dev/null || sleep 1
+            waited=$((waited + 1))
+        done
+    done
+    _suite_forget_group "$pg"
+    return 0
+}
+
+# Reap every group whose leader was never waited (the cancellation path), and
+# report (status 1) when any group survived SIGKILL.
+_suite_reap_groups() {
+    local pg
+    for pg in $SUITE_GROUPS; do
+        _suite_settle_group "$pg"
+    done
+    [ "$SUITE_GROUP_SURVIVED" = 0 ]
+}
+
+# Reap, then remove. Status 1 when a group survived or the removal was
+# refused; the directory then stays.
+_suite_remove() {
+    [ "$SUITE_STATE" = created ] || return 0
+    if ! _suite_reap_groups; then
+        SUITE_STATE=retained
+        return 1
+    fi
+    if python3 -B "$SUITE_TEMP_LIB" remove "$SUITE_DIR"; then
+        SUITE_STATE=removed
         return 0
     fi
-    if [ "$1" -ge 128 ]; then
-        _gen finish --dir "$GEN_DIR" --state interrupted || true
-    else
-        _gen finish --dir "$GEN_DIR" --state failed || true
-    fi
-    GEN_STATE=retained
-    return 0
+    SUITE_STATE=retained
+    contract_note "suite directory $SUITE_NAME could not be removed beneath ${TMPDIR:-/tmp}"
+    return 1
 }
 
-# Every process group this run starts is recorded, so a later sweep can tell
-# survivors of a killed run from a reused number.
-_gen_record_group() {   # $1 group leader pid
-    [ "$GEN_STATE" = claimed ] && [ -n "$1" ] || return 0
-    _gen add-group --dir "$GEN_DIR" --pgid "$1" \
-        || contract_note "suite generation: could not record process group $1"
-    return 0
-}
-
-# Success, for the generation: nothing failed, or the only reason recorded is
-# the deliberate subset (the same test as the verdict block's
-# `_subset_other_reasons`).
-_gen_run_succeeded() {
-    [ "$CONTRACT_CLASS" = none ] && return 0
-    [ "$CONTRACT_CLASS" = incomplete ] || return 1
-    [ "$(printf '%s' "$CONTRACT_REASONS" \
-        | awk -F'\t' 'NF && $1 != "deliberate-subset"' | wc -l | tr -d ' ')" = 0 ]
-}
-
-if ! GEN_CLAIM=$(_gen claim --tmpdir "${TMPDIR:-/tmp}" --owner-pid "$$"); then
-    contract_note "suite generation: could not claim a generation beneath ${TMPDIR:-/tmp} (check TMPDIR)"
-    contract_fail infrastructure admission-scratch-failed "generation" admission
+_suite_parent=${TMPDIR:-/tmp}
+# `t` is made here, not left to pytest: an implicit nested session resolves
+# PYTEST_DEBUG_TEMPROOT and fails its setup when the root does not exist.
+if ! SUITE_DIR=$(mktemp -d "${_suite_parent%/}/cs.XXXXXX") || [ ! -d "$SUITE_DIR" ] \
+        || ! mkdir -m 700 "$SUITE_DIR/t"; then
+    [ -n "$SUITE_DIR" ] && rmdir "$SUITE_DIR" 2>/dev/null
+    contract_note "suite directory: could not create one beneath ${TMPDIR:-/tmp} (check TMPDIR)"
+    contract_fail infrastructure admission-scratch-failed "suite-directory" admission
     contract_abort
 fi
-# The claim prints the directory, then the generation's descendant token.
-GEN_DIR=${GEN_CLAIM%%$'\n'*}
-GEN_DESCENDANT_TOKEN=${GEN_CLAIM#*$'\n'}
-GEN_STATE=claimed
-GEN_TOKEN=${GEN_DIR##*/ctg-}
-# 963-CD-G3 (esc-db01a377fca6): every leg, harness and test-launched process
-# inherits this run's token after every enclosing run's, so a detached
-# descendant that escaped the recorded groups and the reservation's sampling
-# still keeps the generation while the sweep can see its environment. It is
-# deliberately inherited (spec 4.3), never owner-only.
-export CCTALLY_SUITE_GENERATIONS="${CCTALLY_SUITE_GENERATIONS:+$CCTALLY_SUITE_GENERATIONS }$GEN_DESCENDANT_TOKEN"
+SUITE_NAME=${SUITE_DIR##*/}
+SUITE_STATE=created
 # Ownership is installed immediately; _cleanup_run takes it over below.
-trap '_gen_settle $?' EXIT
+trap '_suite_remove || true' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-export PYTEST_DEBUG_TEMPROOT="$GEN_DIR/t"
-# Inspection only: it records when a killed run's ownership was first seen to
-# have ended. Reclamation waits for the exit sweep in _cleanup_run, after this
-# run's wall is frozen, so an old generation never costs this run's budget.
-_gen sweep --tmpdir "${TMPDIR:-/tmp}" --keep "$GEN_DIR" || true
+export PYTEST_DEBUG_TEMPROOT="$SUITE_DIR/t"
 
+# ---- admission (#529 S1) -----------------------------------------------
 # AFTER plan mode by design: the block above exits "before ANY side effect" and
-# tests/test_test_all_scheduler.py depends on that, while these checks parse a
-# manifest, import the allowlist classifier and (from Task 3) launch capability
-# probes. Admission runs before LOGDIR, so a refusal launches no harness and creates
-# no log directory. It does leave the suite generation claimed above (its
-# marker, its empty t/ and anything estate discovery allocated beneath it): the
-# EXIT trap marks it failed and keeps it for 24 hours like any failed run (U5,
-# no exception), and a later run's exit sweep reclaims it (#963). The library
-# itself is sourced near the top of this file, because the worker-budget checks
-# need contract_usage_abort; only the calls below have side effects.
-# CONTRACT_PROFILE is resolved with the subset block near the top of this file,
-# because selection validates names against the rows this profile requires.
+# tests/test_test_all_scheduler.py depends on that, while these checks launch
+# capability probes. Admission runs before LOGDIR, so a refusal launches no
+# harness and creates no log directory. It does leave the suite directory
+# created above, which the EXIT trap reaps and removes like any failed run. The
+# library itself is sourced near the top of this file, because the
+# worker-budget checks need contract_usage_abort; only the calls below have
+# side effects.
 #
-# This is the SECOND load on a subset run, and the repetition is deliberate:
-# keep it unconditional. `_contract_index_manifest` assigns its three lookup
-# tables rather than appending to them, so reloading is idempotent and cannot
-# double-count; making the call conditional on `COVERAGE_RESOLVED` would leave
-# selection and admission reading manifest state captured at two different
-# moments, free to disagree about the estate they are each deciding on.
-contract_manifest_load "$REPO_ROOT/tests/authoritative-test-manifest.json" || contract_abort
-# A full run's selection is the whole declared estate. It is recorded HERE
-# rather than before plan mode, so plan mode still exits without parsing the
-# manifest; a subset resolved its own coverage earlier and is left alone.
-if [ "$COVERAGE_RESOLVED" != 1 ]; then
-    if [ "$LINUX_MATRIX_MODE" = 1 ]; then
-        COVERAGE_SELECTED=""
-        COVERAGE_OMITTED=""
-        while IFS= read -r _n; do
-            [ -n "$_n" ] || continue
-            if [ "$_n" = test-remote ]; then
-                COVERAGE_OMITTED="$COVERAGE_OMITTED$_n "
-            else
-                COVERAGE_SELECTED="$COVERAGE_SELECTED$_n "
-            fi
-        done < <(printf '%s\n' "$(contract_manifest_harness_names "$CONTRACT_PROFILE")")
-        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
-        COVERAGE_OMITTED=${COVERAGE_OMITTED% }
-    else
-        COVERAGE_SELECTED=$(contract_manifest_harness_names "$CONTRACT_PROFILE" | tr '\n' ' ')
-        COVERAGE_SELECTED=${COVERAGE_SELECTED% }
-    fi
-    COVERAGE_RESOLVED=1
-fi
-contract_admit_harnesses "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
-# Covers CI, which invokes this aggregator directly. The canonical
-# bin/cctally-test-remote path needs its OWN guard as well, because the wrapper
-# forwards none of these variables over SSH — see _guard_regeneration_env there.
+# Covers CI, which invokes this aggregator directly. The runner client keeps
+# its OWN guard as well, because it forwards none of these variables to the
+# runner.
 contract_admit_regeneration || contract_abort
-# #529 S6 M4 (exception X1). A caller that KNOWS it degraded this run says so in
-# the contract's own vocabulary. Recorded rather than fatal: the run completes,
-# and only its verdict changes.
-contract_admit_external_reason
 # Capability hardness belongs to the AUTHORITATIVE profile, not to the
 # aggregator unconditionally: tests/requirements-dev.txt documents pytest-xdist
 # and pytest-timeout as optional-by-detection, and making them unconditionally
@@ -2378,116 +1686,24 @@ if ! contract_admit_capabilities "$CONTRACT_PROFILE"; then
     contract_is_authoritative && contract_abort
 fi
 
-# ---- the committed estate (#648 D6, D12) -------------------------------
-# The structural check: this tree's live pytest, frontend and suppression sets
-# against the committed estate artifact, and every artifact transition against
-# committed history for authorization. It runs HERE — after capability
-# admission and before LOGDIR exists — so a refusal launches no harness and
-# creates no log directory; its only residue is the suite generation claimed
-# before admission, kept as failed for 24 hours (#963).
-#
-# D12 says "every otherwise-admitted non-plan invocation", and these are the
-# exits that come first, named rather than assumed away:
-#   * plan mode returns before the manifest is even parsed, so it can yield no
-#     estate verdict at all;
-#   * every `contract_usage_abort` in the argument parser, the tier's exclusion
-#     rules, the Linux profile's platform guards and the worker-budget checks
-#     exit 2 long before this line;
-#   * `contract_manifest_load`, `contract_admit_harnesses`,
-#     `contract_admit_regeneration` and `contract_admit_capabilities` each abort
-#     above on their own reason code.
-# A run that reaches this line has therefore been admitted on every earlier
-# axis, which is what makes "otherwise-admitted" a description of this
-# placement rather than a claim it cannot support.
-#
-# The three-valued return is what separates D12's two failure dispositions:
-# drift and an unauthorized transition abort every mode, while an inability
-# aborts only an authoritative run and is otherwise recorded `incomplete`, so
-# the run continues and can never be green.
-if contract_estate_check_required "$COVERAGE_MODE" "$ESTATE_CHECK_OPT_IN"; then
-    contract_admit_estate "$REPO_ROOT" "$CONTRACT_PROFILE"
-    _estate_admit_rc=$?
-    if [ "$_estate_admit_rc" -eq 1 ]; then
-        contract_abort
-    fi
-fi
-
-# ---- the pytest execution declaration (#648 D7) ------------------------
-# Validated whenever the pytest phase will run, INCLUDING on a `--harness`
-# subset given --with-pytest. The complete estate check is exempt there (D12)
-# and this is not: the legs are built from the declaration on every path that
-# runs them, so a declaration that no longer expands must refuse on every such
-# path too. It is cheap — it reads the committed artifact and derives nothing.
-if [ "$COVERAGE_PYTEST" != "skipped" ]; then
-    contract_admit_estate_plan "$REPO_ROOT" "$CONTRACT_PROFILE" || contract_abort
-fi
-
-# The quarantine applier (spec 4.3), run with `python3 -c` rather than a
-# here-document for the reason _CONTRACT_BUDGET_PY records (bash 3.2 writes
-# here-document bodies outside TMPDIR). It parses the list through the one
-# shared parser, bin/_lib_quarantine.py (both id forms), and applies only the
-# pytest node ids: harness cases are the harness's own business. With a legs
-# directory it prints one node id per line after rewriting <legs>/pytest.txt
-# and <legs>/benchmark.txt without the listed nodes; without one it only
-# validates the list (the admission check below). It must never contain a
-# single quote.
-_QUARANTINE_PY='import os, sys
-
-path = sys.argv[1]
-legs = sys.argv[2] if len(sys.argv) > 2 else None
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(path))), "bin"))
-import _lib_quarantine
-try:
-    ids = _lib_quarantine.pytest_ids(_lib_quarantine.load_path(path))
-except _lib_quarantine.QuarantineError as exc:
-    print(exc)
-    sys.exit(1)
-if legs is None:
-    sys.exit(0)
-prefixes = tuple(ids)
-for name in ("pytest", "benchmark"):
-    leg = os.path.join(legs, name + ".txt")
-    if not os.path.isfile(leg) or not prefixes:
-        continue
-    with open(leg, encoding="utf-8") as handle:
-        nodes = handle.read().splitlines()
-    kept = [n for n in nodes if not n.startswith(prefixes)]
-    if kept != nodes:
-        with open(leg, "w", encoding="utf-8") as handle:
-            handle.write("".join(n + "\n" for n in kept))
-print("\n".join(ids))
-'
-
 # ---- the quarantine list (test regime reset, session 1; spec 4.3) ------
 # Validated HERE, at admission, whenever the pytest phase will run, so an
 # unreadable tests/quarantine.json refuses the run in seconds, before the
-# harness pool starts, rather than after it has run. The pytest phase applies
-# the validated list to both legs. An absent list (the public mirror may carry
+# harness pool starts, rather than after it has run. The pytest legs apply it
+# (bin/_lib_test_selection.py). An absent list (the public mirror may carry
 # none) is not checked and deselects nothing.
-if [ "$COVERAGE_PYTEST" != "skipped" ] && [ -f "$REPO_ROOT/tests/quarantine.json" ]; then
-    quarantine_out=$(python3 -c "$_QUARANTINE_PY" "$REPO_ROOT/tests/quarantine.json") || {
+QUARANTINE_LIST="$REPO_ROOT/tests/quarantine.json"
+if [ "$COVERAGE_PYTEST" != "skipped" ] && [ -f "$QUARANTINE_LIST" ]; then
+    quarantine_out=$(python3 -B "$REPO_ROOT/bin/_lib_quarantine.py" --repo "$REPO_ROOT" pytest-ids 2>&1) || {
         contract_note "pytest: tests/quarantine.json could not be applied: $quarantine_out"
-        contract_fail infrastructure estate-artifact-unreadable "tests/quarantine.json" admission
+        contract_fail infrastructure quarantine-list-unreadable "tests/quarantine.json" admission
         contract_abort
     }
 fi
 
-# ---- the committed runtime budget (#630 S7; report-only since the reset) --
-# Parsed and validated HERE, at admission. The budget is report-only (test
-# regime reset, session 1): a malformed or missing file is a note and the run
-# proceeds with the budget unevaluated; it never aborts admission. The
-# completion check re-reads nothing; it compares the computed metric against
-# the value validated here and records the result in the outcome.
-#
-# Loaded only when the run is ELIGIBLE, through the same predicate the check
-# reads — `--harness`, the tier and linux-matrix are all ineligible.
-if contract_budget_is_eligible; then
-    contract_budget_load "$REPO_ROOT/tests/authoritative-runtime-budget.json"
-fi
-
 # ---- evidence resolution (#529 S2) -------------------------------------
 # AFTER admission, so a refused run creates no evidence directory; its only
-# residue is the suite generation, kept as failed for 24 hours (#963).
+# residue is the suite directory, which its exit removes.
 #
 # The root is machine-wide and lives OUTSIDE every synced worktree, keyed by
 # {remoteDir, runId}: the remote wrapper keys its locks and handles by
@@ -2592,11 +1808,11 @@ if [ -n "$EVIDENCE_ROOT" ]; then
     _write_manifest active ""
 else
     # #963 (note R13): a temporary log directory lives inside the suite
-    # generation, so a run killed with SIGKILL leaves nothing outside its
-    # generation; the success path removes it with the generation before the
-    # budget freeze, and a failed run keeps it for 24 hours. The evidence-root
-    # branch above is unchanged: evidence is never deleted with scratch.
-    LOGDIR=$(mktemp -d "$GEN_DIR/logs.XXXXXX")
+    # directory, so a run killed with SIGKILL leaves nothing outside it (the
+    # supervisor removes its run directory); the exit removes it with the
+    # suite directory. The evidence-root branch above is unchanged: evidence
+    # is never deleted with scratch.
+    LOGDIR=$(mktemp -d "$SUITE_DIR/logs.XXXXXX")
     if [ -z "$LOGDIR" ] || [ ! -d "$LOGDIR" ]; then
         contract_note "evidence: could not allocate a temporary log directory (mktemp failed; check TMPDIR)"
         contract_fail infrastructure evidence-init-failed "" admission
@@ -2635,7 +1851,7 @@ PHASE_PID=""
 
 _phase_set() {   # atomic replacement: the reporter may read at any instant
     # #963 R30: after a successful removal on a run with no evidence root the
-    # temporary PROGRESS_DIR is gone with the generation; bash 3.2 applies the
+    # temporary PROGRESS_DIR is gone with the suite directory; bash 3.2 applies the
     # `>` redirect before `2>/dev/null`, so writing into it would print an error.
     [ -d "$PROGRESS_DIR" ] || return 0
     printf '%s' "$1" > "$PROGRESS_DIR/phase.tmp" 2>/dev/null \
@@ -2654,8 +1870,7 @@ _report_completion() {   # $1 harness, $2 index
     dur=$(cat "$LOGDIR/${h}.time" 2>/dev/null || printf '?')
     CONTRACT_CLASS=none
     CONTRACT_LAST_CODE=""
-    contract_classify_harness "$h" "$LOGDIR/${h}.log" "$LOGDIR/${h}.exit" \
-        "$(contract_min_cases "$h")"
+    contract_classify_harness "$h" "$LOGDIR/${h}.log" "$LOGDIR/${h}.exit"
     if [ "$CONTRACT_CLASS" = none ]; then
         printf '[%3s/%s] PASS  %-22s %6s cases %6ss\n' \
             "$idx" "$HARNESS_TOTAL" "$h" "$CONTRACT_LAST_PASSED" "$dur" >&2
@@ -2770,17 +1985,22 @@ _reporter_join() {
 _reap_group() {   # $1 group leader pid
     local pid=$1 waited=0
     [ -n "$pid" ] || return 0
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
-    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge 20 ]; then
-            kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-            break
-        fi
-        sleep 0.25 2>/dev/null || sleep 1
-        waited=$((waited + 1))
-    done
+    # The leader is an unwaited child here, so its number is still this run's.
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$waited" -ge 20 ]; then
+                kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+                break
+            fi
+            sleep 0.25 2>/dev/null || sleep 1
+            waited=$((waited + 1))
+        done
+    fi
     wait "$pid" 2>/dev/null || true
+    # The leader is waited: reap what is left of its group now, while the
+    # number is still this run's, and never again.
+    _suite_settle_group "$pid"
     return 0
 }
 
@@ -2808,26 +2028,14 @@ _cleanup_run() {
         _collect_timings
         _write_manifest "$state" "$rc"
         _harden_evidence_modes
-        # #940 (C8, R7-F7): the finished manifest goes into the runner's
-        # evidence index, so its loss is discoverable later. Non-deciding.
-        if [ -n "${CCTALLY_RUNNER_EVIDENCE_INDEX:-}" ]; then
-            _ev index "$EVIDENCE_ROOT" "$EVIDENCE_DIR" "$RUN_ID" >/dev/null || true
-        fi
     fi
     rm -rf "$PROGRESS_DIR" 2>/dev/null || true
     if [ "$LOGDIR_IS_TEMPORARY" = 1 ]; then
         rm -rf "$LOGDIR"
     fi
-    # #963: a failed or interrupted run removes its generation here once its
-    # groups are reaped, or keeps it (released, marked) for 24 hours while one
-    # may still run; a successful one already removed it before the freeze.
-    _gen_settle "$rc"
-    # Reclaim generations whose ownership ended and whose 24 hours ran out:
-    # after this run's wall is frozen, and never on an interrupted exit, which
-    # must leave promptly.
-    if [ "$GEN_STATE" != none ] && [ "$rc" -lt 128 ]; then
-        _gen sweep --tmpdir "${TMPDIR:-/tmp}" --keep "$GEN_DIR" --reclaim || true
-    fi
+    # The suite directory, unless the run already removed it before the
+    # freeze: reap any group whose leader was never waited, then remove it.
+    _suite_remove || true
     return $rc
 }
 
@@ -2937,7 +2145,7 @@ _emit_failure_context() {   # $1 subject, $2 logfile
 # nested aggregator would otherwise write this run's outcome. The list is
 # computed once, after every export above; arrays cannot cross into the
 # `bash -c` workers, so run_one reads the exported space-separated form.
-if ! _owner_names=$(_gen owner-env-names); then
+if ! _owner_names=$(python3 -B "$REPO_ROOT/bin/_lib_test_generation.py" owner-env-names); then
     contract_note "owner environment: the owner-only classification could not be read"
     contract_fail infrastructure admission-scratch-failed "owner-environment" admission
     contract_abort
@@ -2957,7 +2165,7 @@ run_one() {
     # arrives.
     : > "$LOGDIR/${h}.started"
     # Cap each harness's OWN inner fan-out at INNER. config/dashboard/update/
-    # preflight/test-remote read CCTALLY_TEST_JOBS; release reads
+    # preflight read CCTALLY_TEST_JOBS; release reads
     # CCTALLY_RELEASE_TEST_JOBS. INNER
     # is exported below so it is non-empty in this xargs-spawned subshell.
     # `scrub` removes the owner-only variables (spec 4.3) before the harness's
@@ -2996,9 +2204,13 @@ set -m
     | xargs -P "$OUTER" -I {} bash -c 'run_one "$@"' _ {} ; } &
 POOL_PID=$!
 set +m
-_gen_record_group "$POOL_PID"
+_suite_record_group "$POOL_PID"
 wait "$POOL_PID"
+# Cleared BEFORE the reap: an interrupt during it must not hand the teardown a
+# leader this run has already waited.
+pool_leader=$POOL_PID
 POOL_PID=""
+_suite_settle_group "$pool_leader"
 pool_wall=$((SECONDS - pool_start))
 # The reporter is joined BEFORE the parent writes any multiline diagnostic. A
 # heartbeat landing inside a `---- … ----` block would split a diagnostic the
@@ -3015,44 +2227,39 @@ declare -a rows
 
 for h in ${report_harnesses[@]+"${report_harnesses[@]}"}; do
     log="$LOGDIR/${h}.log"
-    # The verdict comes from the classifier (exit sidecar + summary grammar +
-    # the manifest floor); this loop keeps only the human row render.
-    contract_classify_harness "$h" "$log" "$LOGDIR/${h}.exit" "$(contract_min_cases "$h")"
+    # The verdict comes from the classifier (the exit status, Codex Q10); the
+    # summary line only feeds this row and the totals.
+    contract_classify_harness "$h" "$log" "$LOGDIR/${h}.exit"
     p=$CONTRACT_LAST_PASSED
     f=$CONTRACT_LAST_FAILED
-    if [ "$CONTRACT_LAST_SUMMARY_OK" != 1 ]; then
-        # Never finished, or finished without a readable summary; flag loudly.
-        rows+=("$(printf '%5s/%s   %s  (%s — see log)' '?' '?' "$h" "$CONTRACT_LAST_CODE")")
-        total_fail=$((total_fail + 1))
-        echo "---- $h output ($CONTRACT_LAST_CODE) ----" >&2
-        _emit_failure_context "$h" "$log"
-        echo "---- end $h ----" >&2
+    if [ "$CONTRACT_LAST_SUMMARY_OK" = 1 ]; then
+        total_pass=$((total_pass + p))
+        total_fail=$((total_fail + f))
+        counts=$(printf '%5s/%s' "$p" "$f")
+    else
+        counts=$(printf '%5s/%s' '?' '?')
+    fi
+    if [ "$CONTRACT_LAST_HARNESS_OK" = 1 ]; then
+        rows+=("$counts   $h")
         continue
     fi
-    total_pass=$((total_pass + p))
-    total_fail=$((total_fail + f))
-    rows+=("$(printf '%5s/%s   %s' "$p" "$f" "$h")")
-    if [ "$f" -ne 0 ]; then
-        echo "---- $h FAIL details ----" >&2
-        # The forward-only awk rule this replaces started AT the marker, so a
-        # harness that prints its explanation BEFORE the marker had that
-        # explanation discarded and the window filled with the next case's
-        # output instead (#529 finding F7). The kernel selects forty preceding
-        # lines, the marker and two hundred following ones, merges overlapping
-        # windows, and allocates a bounded budget across every failed subject.
-        _emit_failure_context "$h" "$log"
-        echo "---- end $h ----" >&2
-    fi
+    rows+=("$counts   $h  ($CONTRACT_LAST_CODE — see log)")
+    echo "---- $h FAIL details ($CONTRACT_LAST_CODE) ----" >&2
+    # The kernel selects forty preceding lines, the marker and two hundred
+    # following ones, merges overlapping windows, and allocates a bounded
+    # budget across every failed subject (#529 finding F7).
+    _emit_failure_context "$h" "$log"
+    echo "---- end $h ----" >&2
 done
 
 printf '[cctally-test-all] shell pool complete — %s passed, %s failed, %ss\n' \
     "$total_pass" "$total_fail" "$pool_wall" >&2
 
-# pytest tests/ after the pool (skipped if pytest is unavailable). The bulk
-# estate uses pytest-xdist when available. Wall-clock benchmarks are excluded
-# from that CPU-saturated phase and run once afterward without xdist; otherwise
-# scheduler contention, rather than the code under test, can consume their
-# ceilings.
+# pytest after the pool (recorded incomplete if pytest is unavailable). The
+# bulk leg uses pytest-xdist when available. The serial tests (wall-clock
+# bounds, nested pytest trees) are excluded from that CPU-saturated leg and run
+# once afterward without xdist; otherwise scheduler contention, rather than the
+# code under test, can consume their ceilings.
 pytest_status="SKIPPED"
 pytest_failed_nodes=""
 pytest_wall=0
@@ -3107,352 +2314,205 @@ print(match.group(1).decode() if match else "0")' | python3 - "$1"
 # invocations collect repository tests under tests/, whose node IDs are Python
 # paths followed by `::...`; accepting arbitrary `FAILED worker::crashed` prose
 # would turn an infrastructure message into a product failure.
+#
+# The id is printed without the `@<group>` suffix `--dist loadgroup` gives a
+# grouped node (tests/conftest.py `_assign_xdist_groups`), so it can be passed
+# back to pytest: a trailing `@<name>` whose name holds no `]`, `/` or `:`,
+# which is xdist's own rule that the last `@` follows the last `]`.
 _parse_pytest_failed_nodes() {   # <logfile>
     grep -E '^(FAILED|ERROR) tests/[[:alnum:]_./-]+\.py::[^[:space:]]+' \
-        "$1" || true
+        "$1" | sed -E 's/^((FAILED|ERROR) [^[:space:]]*)@[A-Za-z0-9_.-]+( |$)/\1\3/' || true
 }
 
-# #648 D7. WHAT THE LEG ACTUALLY COLLECTED, against what it was declared to own.
-#
-# One direction only, and deliberately: a DECLARED identifier that was not
-# collected is a narrowing, which is the failure M13 measured. An identifier
-# collected but not declared is not a narrowing, and reporting it here would
-# duplicate the estate check's own `manifest-unexpected-pytest-node` while
-# firing on every synthetic tree whose plan declares nothing.
-#
-# FAIL CLOSED on a missing observed record. The plugin writes one file per
-# process, so an empty directory means the plugin never ran — a comparison that
-# did not happen, which must not read as agreement.
-_estate_leg_observed_check() {   # <leg> <expected-file> <observed-dir>
-    local leg=$1 expected=$2 observed=$3 missing count first
-    if [ ! -f "$expected" ]; then
-        contract_note "pytest: the '$leg' leg declared no node list at $expected — the execution declaration could not be expanded, so what this leg collected cannot be checked against what it owns"
-        contract_fail infrastructure manifest-missing-pytest-node "$leg" pytest
-        return 1
+# One leg's arguments, read from the NUL-separated list
+# bin/_lib_test_selection.py wrote, into PYTEST_LEG. An empty file is a leg the
+# selection emptied.
+_read_leg() {   # <file>
+    local arg
+    PYTEST_LEG=()
+    [ -f "$1" ] || return 0
+    while IFS= read -r -d '' arg; do
+        PYTEST_LEG+=("$arg")
+    done < "$1"
+}
+
+# Runs one pytest leg as its own process group, for the reasons given at the
+# pool: `wait` is interruptible by a trapped signal and the group is reapable.
+# Sets leg_rc and leg_wall.
+_run_pytest_leg() {   # <leg> <log> <durations-path> <args...>
+    local leg=$1 log=$2 durations=$3 start=$SECONDS leader
+    shift 3
+    set -m
+    { cd "$REPO_ROOT" \
+      && CCTALLY_DURATIONS_PATH="$durations" \
+         CCTALLY_DURATIONS_LEG="$leg" \
+         "${pytest_env_sanitize[@]}" python3 -m pytest "$@" ; } \
+        > "$log" 2>&1 &
+    PHASE_PID=$!
+    set +m
+    _suite_record_group "$PHASE_PID"
+    wait "$PHASE_PID"
+    leg_rc=$?
+    leader=$PHASE_PID
+    PHASE_PID=""
+    _suite_settle_group "$leader"
+    leg_wall=$((SECONDS - start))
+}
+
+# Classifies one finished leg: 1 is product (or infrastructure when no failing
+# node can be named), 5 (nothing collected) is incomplete, 2/3/4 are
+# infrastructure. Called UNCONDITIONALLY, including on a clean run, because the
+# call records the leg's passed-item count for the normalized metric.
+_classify_pytest_leg() {   # <subject> <rc> <log>; appends to pytest_failed_nodes
+    local subject=$1 rc=$2 log=$3 nodes="" state=unknown
+    if [ "$rc" -ne 0 ]; then
+        pytest_status="FAIL"
+        nodes=$(_parse_pytest_failed_nodes "$log")
+        if [ -n "$nodes" ]; then
+            pytest_failed_nodes="${pytest_failed_nodes:+$pytest_failed_nodes$'\n'}$nodes"
+        fi
     fi
-    # An expected set that is empty makes the comparison vacuous, which is
-    # correct for a tree that records no estate and is never the real tree's
-    # case: the artifact's own schema requires every leg's share to be
-    # non-empty. Returning early also keeps the missing-directory branch below
-    # from firing on a tree that legitimately asked for nothing.
-    if [ ! -s "$expected" ]; then
-        return 0
+    if [ "$rc" -eq 1 ]; then
+        if [ -n "$nodes" ]; then state=present; else state=none; fi
     fi
-    if [ ! -d "$observed" ] || [ -z "$(ls -A "$observed" 2>/dev/null)" ]; then
-        contract_note "pytest: the '$leg' leg recorded nothing it collected (no files under $observed) — tests/_estate_leg_plugin.py did not run, so this leg's collection is unverified and the run refuses rather than assume it was complete"
-        contract_fail infrastructure manifest-missing-pytest-node "$leg" pytest
-        return 1
-    fi
-    missing=$(LC_ALL=C comm -23 \
-        <(LC_ALL=C sort -u "$expected") \
-        <(cat "$observed"/*.txt 2>/dev/null | LC_ALL=C sort -u))
-    [ -n "$missing" ] || return 0
-    count=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
-    first=$(printf '%s\n' "$missing" | head -n 1)
-    contract_note "pytest: the '$leg' leg was declared to own $count node identifier(s) it did not collect, beginning with '$first' — the leg was narrowed after its argv was built (a conftest hook, a plugin, or an option), so this run verified less than it claims"
-    contract_fail infrastructure manifest-missing-pytest-node "$first" pytest
-    return 1
+    contract_classify_pytest "$rc" "$subject" "$(_parse_pytest_passed "$log")" "$state"
 }
 
 if [ "$COVERAGE_PYTEST" = "skipped" ]; then
-    # A subset run skips the pytest phase, and the serial benchmark leg with
-    # it, unless --with-pytest was given (section 4.3). Nothing is recorded
-    # here: the run is ALREADY classified `incomplete` for `deliberate-subset`,
-    # and this is not the `pytest-unavailable` shape, where an estate that
-    # should have run silently did not. This is safe only because every subset
-    # path is unconditionally incomplete and exits 3.
+    # A subset run skips the pytest phase, and the serial leg with it, unless
+    # --with-pytest was given (section 4.3). Nothing is recorded here: the run
+    # is ALREADY classified `incomplete` for `deliberate-subset`.
     printf '[cctally-test-all] pytest phase skipped — deliberate subset (pass --with-pytest to run it)\n' >&2
 elif python3 -m pytest --version >/dev/null 2>&1; then
     pytest_status="PASS"
     pytest_log="$LOGDIR/pytest.log"
-    pytest_serial_targets=()
-    pytest_timeout_args=()
-    # #648 D7. The two legs are built from the ONE `pytestExecution`
-    # declaration, validated at admission. The file and node literals that used
-    # to sit here, and the `[ -f ... ]` guards around them, are gone: a target
-    # that no longer exists is now an admission failure rather than a leg that
-    # silently ran less.
-    pytest_estate_selectors_seen=0
-    # -rfE forces the "short test summary info" section to emit FAILED/ERROR
-    # node IDs on every run (issue #141: otherwise a Phase-3 flake under xdist
-    # is undiagnosable once the interleaved stderr is rm -rf'd on EXIT).
-    pytest_args=(tests/ -q -rfE -p tests._estate_leg_plugin)
-    estate_observed_root="$LOGDIR/estate-observed"
+    pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
+    pytest_dump_main=0
+    pytest_dump_benchmark=0
+    # ---- the two legs (test regime reset, Task 3.4; spec 4.7 steps 2-3) --
+    # bin/_lib_test_selection.py builds both: the bulk leg runs tests/ under
+    # xdist minus the serial files and nodes and the quarantined ids; the
+    # serial leg runs the serial tests without xdist, minus the quarantined
+    # ids. The quick gate builds its legs with the same function. A leg the
+    # selection emptied is omitted; exit 5 on a leg it did not empty is
+    # incomplete. `--dist loadgroup` keeps each xdist group of
+    # tests/conftest.py `_assign_xdist_groups` (today the F17 oracle) on one
+    # worker, so its heavy cases never occupy more workers than it has groups.
+    pytest_jobs=0
+    if python3 -c 'import xdist' >/dev/null 2>&1; then
+        pytest_jobs=$PYTEST
+    fi
+    legs_dir="$LOGDIR/pytest-legs"
+    legs_args=(legs --repo "$REPO_ROOT" --jobs "$pytest_jobs" --out "$legs_dir")
+    [ -f "$QUARANTINE_LIST" ] && legs_args+=(--quarantine "$QUARANTINE_LIST")
+    legs_out=$(python3 -B "$REPO_ROOT/bin/_lib_test_selection.py" "${legs_args[@]}" 2>&1)
+    case $? in
+        0) ;;
+        1)
+            # Admission validated the list; this refusal is for a list that
+            # changed since.
+            contract_note "pytest: tests/quarantine.json could not be applied: $legs_out"
+            contract_fail infrastructure quarantine-list-unreadable "tests/quarantine.json" pytest
+            contract_abort ;;
+        *)
+            contract_note "pytest: the pytest legs could not be built: $legs_out"
+            contract_fail infrastructure pytest-internal "selection" pytest
+            contract_abort ;;
+    esac
+    case "$legs_out" in
+        *quarantined=0*) ;;
+        *quarantined=*)
+            printf '[cctally-test-all] quarantine: %s node id(s) deselected from both pytest legs (tests/quarantine.json)\n' \
+                "${legs_out##*quarantined=}" >&2 ;;
+    esac
+    # Options every leg takes, appended after the selection's own.
+    pytest_common=()
+    # pytest-timeout, optional-by-detection: a hung test otherwise wedges the
+    # whole suite (and, in CI, a job for GitHub's default 6h). Thread method so
+    # a wedged C call / uncatchable loop still trips it.
+    if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
+        pytest_common+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
+    fi
+    # PYTEST_ADDOPTS used to carry `--durations=0` on the retired local Linux
+    # lane; a variable that can only ADD a reporting flag replaces it.
+    if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
+        pytest_common+=(--durations=0)
+    fi
     # ---- per-test durations (#630 S1, F3) --------------------------------
-    # Authoritative runs with an evidence directory only. A standalone `-p`
-    # plugin rather than pytest.ini or conftest.py: both of those would change
-    # behaviour for anyone running pytest directly, and conftest.py belongs to
-    # another session. The two legs are separate PROCESSES, so each writes its
-    # own intermediate file under $PROGRESS_DIR — which is removed after the
-    # export — and the aggregator merges them into timings/ afterwards.
+    # Runs with an evidence directory that are authoritative or ask for
+    # durations (CCTALLY_PYTEST_DURATIONS=1: the nightly broad run, which is
+    # not authoritative and must not become so, because that flag also
+    # tightens refusals). A standalone `-p` plugin rather than pytest.ini or
+    # conftest.py, which would change behaviour for anyone running pytest
+    # directly. Each leg writes its own intermediate file under $PROGRESS_DIR,
+    # merged into timings/ afterwards.
     pytest_durations_main=""
     pytest_durations_bench=""
     pytest_durations_legs=()
-    if [ -n "$EVIDENCE_DIR" ] && contract_is_authoritative; then
+    if [ -n "$EVIDENCE_DIR" ] && { contract_is_authoritative || [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; }; then
         pytest_durations_main="$PROGRESS_DIR/durations-pytest.jsonl.gz"
         pytest_durations_bench="$PROGRESS_DIR/durations-benchmark.jsonl.gz"
-        pytest_args+=(-p tests._pytest_durations_plugin)
-        pytest_durations_legs+=("$pytest_durations_main")
+        pytest_common+=(-p tests._pytest_durations_plugin)
     fi
-    while IFS=$'\t' read -r _sel_kind _sel_value; do
-        [ -n "$_sel_value" ] || continue
-        pytest_estate_selectors_seen=1
-        pytest_serial_targets+=("$_sel_value")
-        case "$_sel_kind" in
-            file) pytest_args+=(--ignore="$_sel_value") ;;
-            node) pytest_args+=(--deselect="$_sel_value") ;;
-        esac
-    done < <(printf '%s\n' "$CONTRACT_ESTATE_SELECTORS")
-    # The per-leg node lists, for the collected-identifier proof below. This is
-    # the second expansion: admission ran `--validate-legs`, which writes
-    # nothing because it precedes LOGDIR. A failure here cannot be silent —
-    # the comparison treats a missing expected list as a failure.
-    estate_leg_dir="$LOGDIR/estate-legs"
-    estate_plan_log="$LOGDIR/estate-legs.log"
-    python3 "$REPO_ROOT/bin/_lib_test_estate.py" --repo "$REPO_ROOT" \
-        --profile "$CONTRACT_PROFILE" --plan-legs "$estate_leg_dir" \
-        > "$estate_plan_log" 2>&1 || true
-    # ---- the quarantine list (test regime reset, session 1; spec 4.3) ----
-    # tests/quarantine.json names flaky nodes. Each is deselected from both
-    # legs below and dropped here from both expected leg lists, with pytest's
-    # own --deselect semantics (a node-id prefix), because a node deselected
-    # but still expected would fail the observed-collection check as
-    # manifest-missing-pytest-node. An absent list (the public mirror may
-    # carry none) deselects nothing; admission already refused an unreadable
-    # one, and this refusal stays only for a list that changed since. The
-    # scheduled CI run executes the listed nodes in a separate report-only leg.
-    quarantine_ids=()
-    if [ -f "$REPO_ROOT/tests/quarantine.json" ]; then
-        quarantine_out=$(python3 -c "$_QUARANTINE_PY" \
-            "$REPO_ROOT/tests/quarantine.json" "$estate_leg_dir") || {
-            contract_note "pytest: tests/quarantine.json could not be applied: $quarantine_out"
-            contract_fail infrastructure estate-artifact-unreadable "tests/quarantine.json" pytest
-            contract_abort
-        }
-        while IFS= read -r _qid; do
-            [ -z "$_qid" ] || quarantine_ids+=("$_qid")
-        done < <(printf '%s\n' "$quarantine_out")
-        [ "${#quarantine_ids[@]}" -eq 0 ] || printf '[cctally-test-all] quarantine: %s node id(s) deselected from both pytest legs (tests/quarantine.json)\n' \
-            "${#quarantine_ids[@]}" >&2
-    fi
-    if [ "$COVERAGE_MODE" = merge-focused ]; then
-        python3 -B "$REPO_ROOT/bin/_lib_merge_gate.py" --repo "$REPO_ROOT" \
-            --base "$TIER_BASE_REV" --filter-legs "$estate_leg_dir" \
-            || { contract_fail infrastructure manifest-missing-pytest-node "merge selection" pytest; contract_abort; }
-        # The recorded per-leg lists are the execution targets as well as the
-        # observed-collection oracle. No --deselect/--ignore can narrow them.
-        pytest_args=(-q -rfE -p tests._estate_leg_plugin)
-        [ -z "$pytest_durations_main" ] || pytest_args+=(-p tests._pytest_durations_plugin)
-        while IFS= read -r _node; do
-            [ -z "$_node" ] || pytest_args+=("$_node")
-        done < "$estate_leg_dir/pytest.txt"
-        pytest_serial_targets=()
-        pytest_estate_selectors_seen=0
-        while IFS= read -r _node; do
-            if [ -n "$_node" ]; then
-                pytest_serial_targets+=("$_node")
-                pytest_estate_selectors_seen=1
-            fi
-        done < "$estate_leg_dir/benchmark.txt"
-        [ -s "$estate_leg_dir/pytest.txt" ] || { contract_fail infrastructure manifest-missing-pytest-node "empty merge smoke" pytest; contract_abort; }
-    fi
-    for _qid in ${quarantine_ids[@]+"${quarantine_ids[@]}"}; do
-        pytest_args+=("--deselect=$_qid")
-    done
-    if python3 -c 'import xdist' >/dev/null 2>&1; then
-        pytest_args+=(-n "$PYTEST")
-    fi
-    # pytest-timeout, optional-by-detection: a hung test otherwise wedges the
-    # whole suite (and, in CI, a job for GitHub's default 6h). Thread method so
-    # a wedged C call / uncatchable loop still trips it. Absent => today's
-    # behavior exactly (no flag).
-    if python3 -c 'import pytest_timeout' >/dev/null 2>&1; then
-        pytest_timeout_args+=(--timeout="${CCTALLY_PYTEST_TIMEOUT:-120}" --timeout-method=thread)
-    fi
-    pytest_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
 
     # ---- the sanitized execution environment (#648 M13, D7) --------------
-    # `PYTEST_ADDOPTS=--ignore=tests/<file>.py` narrowed an authoritative run
-    # while admission observed the complete estate, and the run exited 0. The
-    # variable is absent from `forbiddenRegeneration` and no admission check
-    # reads it, so it is REMOVED from both legs here.
-    #
-    # THE KEY LIST DELIBERATELY DIVERGES from the one the discovery subprocess
-    # uses. That list also drops CCTALLY_AGENTMEM_TEST_POLICY, which is right
-    # for COLLECTION — the derived node set must not depend on it — and wrong
-    # for EXECUTION, where the policy decides whether the agentmem-gated tests
-    # assert or skip. Dropping it here would silently weaken every authoritative
-    # run. `TZ` is likewise not pinned: the caller pins it (see CLAUDE.md), and
-    # forcing it would change what a deliberate non-UTC local run tests without
-    # saying so.
-    #
-    # THE RESIDUAL, analysed rather than left for a reader to wonder about.
-    # Two further variables reach these legs uncontrolled, and neither can
-    # narrow a run silently as the code stands.
-    #   PYTEST_DISABLE_PLUGIN_AUTOLOAD -- setting it makes pytest reject `-n`
-    #     and `--timeout`, which both legs pass, so the leg exits 4 and
-    #     contract_classify_pytest reports it. A run cannot be quietly narrowed
-    #     by it; it can only fail loudly.
-    #   PYTHONPATH -- it cannot register a plugin on its own, because a plugin
-    #     must still be named by `-p` or by an entry point, and both legs run
-    #     under `python3 -m pytest`, which puts the repository root FIRST on
-    #     sys.path. So it cannot shadow `tests` either.
-    # Neither is added to the removal list, because removing a variable that
-    # cannot narrow the run would break the deliberate uses a caller has for it
-    # while buying nothing.
-    # The owner-only variables (spec 4.3, #966(c)) are removed here as well, so
-    # no test in either leg can write this run's outcome or evidence.
+    # `PYTEST_ADDOPTS=--ignore=tests/<file>.py` narrows a run while the record
+    # claims the full one, so it is REMOVED from both legs, with PYTEST_PLUGINS
+    # and PYTEST_CURRENT_TEST. CCTALLY_AGENTMEM_TEST_POLICY is deliberately
+    # kept: it decides whether the agentmem-gated tests assert or skip. `TZ`
+    # is not pinned: the caller pins it. PYTEST_DISABLE_PLUGIN_AUTOLOAD makes
+    # pytest reject `-n` and `--timeout` (exit 4, reported), and PYTHONPATH
+    # cannot register a plugin on its own, so neither can narrow a run
+    # silently. The owner-only variables (spec 4.3, #966(c)) are removed too,
+    # so no test can write this run's outcome or evidence.
     pytest_env_sanitize=(env -u PYTEST_ADDOPTS -u PYTEST_PLUGINS -u PYTEST_CURRENT_TEST ${OWNER_SCRUB[@]+"${OWNER_SCRUB[@]}"})
     if [ -n "${PYTEST_ADDOPTS:-}" ] || [ -n "${PYTEST_PLUGINS:-}" ]; then
-        printf '[cctally-test-all] pytest: PYTEST_ADDOPTS/PYTEST_PLUGINS were present and are REMOVED from both execution legs — they can narrow a run that admission observed in full (#648 M13); use CCTALLY_PYTEST_DURATIONS=1 for per-test timings\n' >&2
+        printf '[cctally-test-all] pytest: PYTEST_ADDOPTS/PYTEST_PLUGINS were present and are REMOVED from both execution legs — they can narrow a run (#648 M13); use CCTALLY_PYTEST_DURATIONS=1 for per-test timings\n' >&2
     fi
-    # The one capability PYTEST_ADDOPTS was carrying on a shipped lane.
-    # bin/cctally-test-linux-matrix injected `--durations=0` through it on the
-    # acceptance lane because this invocation was hard-coded. A variable that
-    # can only ADD a reporting flag replaces it, so the lane keeps its timings
-    # and the narrowing hole stays closed.
-    if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
-        pytest_args+=(--durations=0)
-    fi
-    # #963 spec 5.4: an explicit basetemp inside the suite generation, outside
-    # the numbered pytest-N namespace that implicit nested sessions rotate, so
-    # no nested session can delete this leg's temp.
-    pytest_args+=(--basetemp "$GEN_DIR/m")
+
     pytest_start=$SECONDS
-    # Each leg runs as its own process group for the reasons given at the pool:
-    # `wait` is interruptible by a trapped signal and the group is reapable.
-    printf '[cctally-test-all] pytest phase started — %s xdist workers\n' "$PYTEST" >&2
     _reporter_start pytest
-    set -m
-    { cd "$REPO_ROOT" \
-      && CCTALLY_DURATIONS_PATH="$pytest_durations_main" \
-         CCTALLY_DURATIONS_LEG=pytest \
-         CCTALLY_ESTATE_OBSERVED_DIR="$estate_observed_root/pytest" \
-         "${pytest_env_sanitize[@]}" python3 -m pytest "${pytest_args[@]}" ; } \
-        > "$pytest_log" 2>&1 &
-    PHASE_PID=$!
-    set +m
-    _gen_record_group "$PHASE_PID"
-    wait "$PHASE_PID"
-    pytest_rc=$?
-    PHASE_PID=""
-    pytest_main_wall=$((SECONDS - pytest_start))
-    pytest_dump_main=0
-    pytest_dump_benchmark=0
-    # Called UNCONDITIONALLY, including on a clean run: the classification is
-    # unchanged (rc 0 returns immediately), and the call is what records the
-    # leg's passed-item count for the normalized metric. Gating it on failure
-    # would leave the denominator at zero on exactly the runs that produce it.
-    # Read for MEANING, not as a boolean: 1 is product, 5 (nothing collected)
-    # is incomplete, 2/3/4 (interrupted, internal error, usage) are
-    # infrastructure.
-    if [ "$pytest_rc" -ne 0 ]; then
-        pytest_status="FAIL"
-        pytest_dump_main=1
-        pytest_failed_nodes=$(_parse_pytest_failed_nodes "$pytest_log")
+    _read_leg "$legs_dir/bulk"
+    if [ "${#PYTEST_LEG[@]}" -gt 0 ]; then
+        printf '[cctally-test-all] pytest bulk leg started — %s xdist workers\n' "$pytest_jobs" >&2
+        # #963 spec 5.4: an explicit basetemp inside the suite directory,
+        # outside the numbered pytest-N namespace nested sessions rotate.
+        _run_pytest_leg pytest "$pytest_log" "$pytest_durations_main" \
+            "${PYTEST_LEG[@]}" ${pytest_common[@]+"${pytest_common[@]}"} --basetemp "$SUITE_DIR/m"
+        pytest_main_wall=$leg_wall
+        [ -z "$pytest_durations_main" ] || pytest_durations_legs+=("$pytest_durations_main")
+        [ "$leg_rc" -eq 0 ] || pytest_dump_main=1
+        _classify_pytest_leg pytest "$leg_rc" "$pytest_log"
     fi
-    pytest_node_state=unknown
-    if [ "$pytest_rc" -eq 1 ]; then
-        if [ -n "$pytest_failed_nodes" ]; then
-            pytest_node_state=present
-        else
-            pytest_node_state=none
-        fi
-    fi
-    contract_classify_pytest "$pytest_rc" "pytest" \
-        "$(_parse_pytest_passed "$pytest_log")" "$pytest_node_state"
-    if ! _estate_leg_observed_check pytest "$estate_leg_dir/pytest.txt" \
-            "$estate_observed_root/pytest"; then
-        pytest_status="FAIL"
-    fi
-    # #648 D7. Derived from the DECLARATION, not from an array the file-existence
-    # guards happened to fill. A declared target that vanished refuses at
-    # admission, so the only way this leg is skipped is that the artifact
-    # declares no leg but the complement — which the schema forbids for the real
-    # artifact and permits only for a tree that records no estate.
-    if [ "$pytest_estate_selectors_seen" = 1 ]; then
-        printf '[cctally-test-all] benchmark phase started — serial targets: %s\n' \
-            "${#pytest_serial_targets[@]}" >&2
+    _read_leg "$legs_dir/serial"
+    if [ "${#PYTEST_LEG[@]}" -gt 0 ]; then
+        printf '[cctally-test-all] pytest serial leg started — no xdist\n' >&2
         _phase_set benchmark
         _reporter_wait_phase benchmark
-        pytest_benchmark_log="$LOGDIR/pytest-benchmark.log"
-        pytest_benchmark_args=("${pytest_serial_targets[@]}" -q -rfE
-                               -p tests._estate_leg_plugin)
-        for _qid in ${quarantine_ids[@]+"${quarantine_ids[@]}"}; do
-            pytest_benchmark_args+=("--deselect=$_qid")
-        done
-        pytest_benchmark_args+=(${pytest_timeout_args[@]+"${pytest_timeout_args[@]}"})
-        if [ "${CCTALLY_PYTEST_DURATIONS:-}" = 1 ]; then
-            pytest_benchmark_args+=(--durations=0)
-        fi
-        if [ -n "$pytest_durations_bench" ]; then
-            pytest_benchmark_args+=(-p tests._pytest_durations_plugin)
-            pytest_durations_legs+=("$pytest_durations_bench")
-        fi
-        # #963 spec 5.4: the benchmark leg's own explicit basetemp, distinct
-        # from the main leg's, inside the suite generation.
-        pytest_benchmark_args+=(--basetemp "$GEN_DIR/b")
-        bench_start=$SECONDS
-        set -m
-        { cd "$REPO_ROOT" \
-          && CCTALLY_DURATIONS_PATH="$pytest_durations_bench" \
-             CCTALLY_DURATIONS_LEG=benchmark \
-             CCTALLY_ESTATE_OBSERVED_DIR="$estate_observed_root/benchmark" \
-             "${pytest_env_sanitize[@]}" \
-             python3 -m pytest "${pytest_benchmark_args[@]}" ; } \
-            > "$pytest_benchmark_log" 2>&1 &
-        PHASE_PID=$!
-        set +m
-        _gen_record_group "$PHASE_PID"
-        wait "$PHASE_PID"
-        pytest_benchmark_rc=$?
-        PHASE_PID=""
-        pytest_bench_wall=$((SECONDS - bench_start))
-        if [ "$pytest_benchmark_rc" -ne 0 ]; then
-            pytest_status="FAIL"
-            pytest_dump_benchmark=1
-            benchmark_failed_nodes=$(_parse_pytest_failed_nodes "$pytest_benchmark_log")
-            if [ -n "$benchmark_failed_nodes" ]; then
-                if [ -n "$pytest_failed_nodes" ]; then
-                    pytest_failed_nodes+=$'\n'
-                fi
-                pytest_failed_nodes+="$benchmark_failed_nodes"
-            fi
-        fi
-        benchmark_node_state=unknown
-        if [ "$pytest_benchmark_rc" -eq 1 ]; then
-            if [ -n "$benchmark_failed_nodes" ]; then
-                benchmark_node_state=present
-            else
-                benchmark_node_state=none
-            fi
-        fi
-        contract_classify_pytest "$pytest_benchmark_rc" "benchmark" \
-            "$(_parse_pytest_passed "$pytest_benchmark_log")" "$benchmark_node_state"
-        if ! _estate_leg_observed_check benchmark \
-                "$estate_leg_dir/benchmark.txt" \
-                "$estate_observed_root/benchmark"; then
-            pytest_status="FAIL"
-        fi
+        _run_pytest_leg benchmark "$pytest_benchmark_log" "$pytest_durations_bench" \
+            "${PYTEST_LEG[@]}" ${pytest_common[@]+"${pytest_common[@]}"} --basetemp "$SUITE_DIR/b"
+        pytest_bench_wall=$leg_wall
+        [ -z "$pytest_durations_bench" ] || pytest_durations_legs+=("$pytest_durations_bench")
+        [ "$leg_rc" -eq 0 ] || pytest_dump_benchmark=1
+        _classify_pytest_leg benchmark "$leg_rc" "$pytest_benchmark_log"
+    else
+        printf '[cctally-test-all] pytest serial leg omitted — the selection left it empty\n' >&2
     fi
     # Both legs have completed here, which is the earliest point at which the
     # merge can state completeness for either of them. Only legs that RAN are
-    # handed in: an absent benchmark leg is not incompleteness, a leg that ran
-    # and left no file is.
+    # handed in: an absent leg is not incompleteness, a leg that ran and left
+    # no file is.
     if [ "${#pytest_durations_legs[@]}" -gt 0 ]; then
-        # The merge's own summary is CAPTURED rather than discarded. An
-        # incomplete merge exits 0 — publishing a partial artifact is the
-        # correct outcome — so a note gated on the exit code alone left the
-        # completeness state visible only inside the artifact and never in the
-        # manifest, the outcome record, the extract or the operator's console.
+        # The merge's own summary is CAPTURED: an incomplete merge exits 0
+        # (publishing a partial artifact is correct), so its state is noted.
         durations_summary=$(_ev merge-durations \
                 "$EVIDENCE_DIR/timings/pytest-tests.jsonl.gz" \
-                "${pytest_durations_legs[@]}")
+                ${pytest_durations_legs[@]+"${pytest_durations_legs[@]}"})
         durations_rc=$?
         if [ "$durations_rc" -ne 0 ]; then
             contract_note "evidence: the per-test durations artifact was not published for run $RUN_ID"
         elif [[ "$durations_summary" == *INCOMPLETE* ]]; then
-            contract_note "evidence: the per-test durations artifact for run $RUN_ID is INCOMPLETE ($durations_summary) — a pytest leg did not finish, so the artifact covers fewer tests than the run executed and no estate-wide conclusion may be drawn from it"
+            contract_note "evidence: the per-test durations artifact for run $RUN_ID is INCOMPLETE ($durations_summary) — a pytest leg did not finish, so the artifact covers fewer tests than the run executed"
         fi
     fi
     pytest_wall=$((SECONDS - pytest_start))
@@ -3466,23 +2526,23 @@ elif python3 -m pytest --version >/dev/null 2>&1; then
         echo "---- end pytest ----" >&2
     fi
     if [ "$pytest_dump_benchmark" = 1 ]; then
-        echo "---- pytest benchmark FAIL details ----" >&2
+        echo "---- pytest serial leg FAIL details ----" >&2
         _emit_failure_context benchmark "$pytest_benchmark_log"
-        echo "---- end pytest benchmark ----" >&2
+        echo "---- end pytest serial leg ----" >&2
     fi
     if [ "$pytest_status" = "FAIL" ]; then
         total_fail=$((total_fail + 1))
     fi
 else
     # Unreachable on an authoritative run: pytest is an admission precondition.
-    # On a local run it is RECORDED rather than silently swallowing all 550
-    # test files behind a "SKIPPED" row.
+    # On a local run it is RECORDED rather than silently swallowing every test
+    # file behind a "SKIPPED" row.
     contract_fail incomplete pytest-unavailable "" pytest
 fi
 
-# ---- the suite generation's removal (#963 spec 5.4, J9) ----------------
+# ---- the suite directory's removal (#963 spec 5.4, J9) -----------------
 # The console's "Slowest harnesses" lines read $LOGDIR/<harness>.time. Without
-# an evidence root LOGDIR is temporary and lives inside the generation removed
+# an evidence root LOGDIR is temporary and lives inside the suite directory removed
 # below, so the lines are computed HERE, before the removal, and printed
 # unchanged at the same place in the timing section.
 slowest_lines=$(
@@ -3493,45 +2553,27 @@ slowest_lines=$(
         printf '  %4ss  %s\n' "$t" "$h"
     done
 )
-# BEFORE contract_check_runtime_budget, which freezes the wall that both the
-# normalized budget and the outcome's wallSeconds use: removal is part of the
-# run's cost, and removing after the freeze would hide it (B1). Children are
-# reaped first, and removal waits on the reaper establishing that every
-# recorded group is gone: one that survives SIGKILL, or whose state is unknown,
-# keeps the generation exactly as a refused removal does. Either way the
-# generation stays, marked failed, for 24 hours (the reaper or the remover
-# printed why) and the run fails as infrastructure. The reason's phase is
-# `pytest`, one the outcome carrier's closed phase set admits (U7: no new
-# phase); the generation is the pytest legs' temp.
-if [ "$GEN_STATE" = claimed ] && _gen_run_succeeded; then
+# BEFORE the wall is frozen for the outcome's wallSeconds and normalized
+# metric: removal is part of the run's cost, and removing after the freeze
+# would hide it (B1). Every group was reaped when its leader was waited; one
+# that survived SIGKILL, or a refused removal, keeps the directory and
+# fails the run as infrastructure. The reason's phase is `pytest`, one of the
+# record's closed phase set (U7: no new phase); the directory is the pytest
+# legs' temp.
+if [ "$SUITE_STATE" = created ]; then
     cleanup_start=$SECONDS
-    if ! _gen reap --dir "$GEN_DIR"; then
-        _gen finish --dir "$GEN_DIR" --state failed || true
-        GEN_STATE=retained
-        contract_note "suite generation $GEN_TOKEN was not removed: a recorded process group was not established as terminated; it is kept for 24 hours beneath ${TMPDIR:-/tmp}"
-        contract_fail infrastructure temp-generation-cleanup-failed "$GEN_TOKEN" pytest
-    elif _gen remove --dir "$GEN_DIR"; then
-        GEN_STATE=removed
-    else
-        GEN_STATE=retained
-        contract_note "suite generation $GEN_TOKEN could not be removed; it is kept for 24 hours beneath ${TMPDIR:-/tmp}"
-        contract_fail infrastructure temp-generation-cleanup-failed "$GEN_TOKEN" pytest
+    if ! _suite_remove; then
+        contract_note "suite directory $SUITE_NAME was not removed; it stays beneath ${TMPDIR:-/tmp}"
+        contract_fail infrastructure temp-generation-cleanup-failed "$SUITE_NAME" pytest
     fi
     cleanup_wall=$((SECONDS - cleanup_start))
 fi
 
-# ---- the normalized runtime budget (#630 S7) ---------------------------
-# AFTER every ordinary classification, so a secondary budget failure can never
-# mask the decisive test result, and BEFORE the verdict block below rather than
-# beside contract_finish, so the printed verdict and the exit code agree. Run
-# after the printed verdict, a breach would have left `Verdict: PASS (exit 0)`
-# in the scrollback above an exit 1 — the self-contradicting summary this file
-# already refuses elsewhere.
-contract_check_runtime_budget
-if [ "$COVERAGE_MODE" = merge-focused ] && [ "$SECONDS" -gt "$MERGE_MAX_SECONDS" ]; then
-    contract_note "merge gate exceeded its ${MERGE_MAX_SECONDS}-second execution budget ($SECONDS seconds)"
-    contract_fail infrastructure merge-runtime-budget-exceeded "$SECONDS" budget
-fi
+# ---- the run's wall (#529 S5) -------------------------------------------
+# Frozen HERE, after every classification and the suite directory's removal and
+# before the verdict is printed, so the record and the retained run manifest
+# publish one wallSeconds for the run.
+contract_freeze_wall_seconds
 
 echo "----"
 for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done
@@ -3549,13 +2591,14 @@ echo "Total: passed=$total_pass   failed=$total_fail   pytest=$pytest_status   (
 # ---- timing section (does not perturb the deterministic rows above) ----
 echo "----"
 echo "Timing: total=${SECONDS}s  shell-pool=${pool_wall}s  pytest=${pytest_wall}s  (outer=$OUTER inner=$INNER pytest=$PYTEST)"
+echo "Pytest legs: bulk=${pytest_main_wall}s  serial=${pytest_bench_wall}s"
 echo "Slowest harnesses:"
-# Computed before the suite generation's removal (above): without an evidence
+# Computed before the suite directory's removal (above): without an evidence
 # root the temporary LOGDIR was inside it (#963 R30).
 [ -z "$slowest_lines" ] || printf '%s\n' "$slowest_lines"
 
 # One verdict line, because `Total:` counts only summary-line failures and a
-# run refused for `case-floor-unmet` has none — the scrollback would otherwise
+# run classified incomplete can have none — the scrollback would otherwise
 # read `failed=0` above an exit 3 and contradict itself.
 echo "----"
 # 0 when `deliberate-subset` is the ONLY reason recorded, which is the case the
@@ -3569,26 +2612,8 @@ _subset_other_reasons=$(printf '%s' "$CONTRACT_REASONS" \
 # a hole in it tells an operator nothing about which case they are in.
 _selected_display=$COVERAGE_SELECTED
 [ -n "$_selected_display" ] || _selected_display='(none)'
-# The tier's own coverage sentence. Without it a green tier printed `Verdict:
-# PASS (exit 0)` and nothing else — the two sentences below are gated on the
-# SUBSET mode — so a tier that omitted most of the estate read in scrollback
-# exactly like a full run, with the mode recorded only in a file the operator is
-# not looking at.
-#
-# Deliberately NOT the subset's "NOT a gate" wording. A subset is uncitable by
-# design; a tier is citable under its own gate identity, so borrowing that
-# sentence would state the opposite of what the mode means.
-_tier_verdict_note(){
-    [ "$COVERAGE_MODE" = "tier-fast" ] || return 0
-    local sel omit
-    sel=$(printf '%s' "$COVERAGE_SELECTED" | wc -w | tr -d ' ')
-    omit=$(printf '%s' "$COVERAGE_OMITTED" | wc -w | tr -d ' ')
-    printf '  coverage: tier-fast — %s of %s harness(es) omitted; the selection was derived from the tree, and the pytest estate ran in %s\n' \
-        "$omit" "$((sel + omit))" "$COVERAGE_PYTEST"
-}
 if [ "$CONTRACT_CLASS" = "none" ]; then
     echo "Verdict: PASS (exit $(contract_exit_code))"
-    _tier_verdict_note
 elif [ "$COVERAGE_MODE" = "subset" ] && [ "$_subset_other_reasons" = "0" ]; then
     # Exiting 3 on an all-passing targeted run is deliberately surprising, so
     # this states in plain terms what happened. Exiting 0 and recording the
@@ -3608,9 +2633,6 @@ else
         printf '  this was a deliberate subset run over %s and is NOT a gate, whatever its verdict\n' \
             "$_selected_display"
     fi
-    # A FAILING tier is the same reading problem as a green one: the reasons
-    # name what broke and nothing names how much of the estate was asked.
-    _tier_verdict_note
 fi
 
 # ---- retention and eviction (#529 S2) ----------------------------------

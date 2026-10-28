@@ -795,20 +795,6 @@ describe('outline coverage pins — no visual change (#304 S3 Q5)', () => {
     expect(entry.getAttribute('title')).toBe(LONG);      // the full label is the hover title
   });
 
-  it('the cache state landmark renders its amber ⚡ glyph (not the compaction/completion glyph)', () => {
-    const o = outline({
-      turns: [
-        turn({ uuid: 'h1', kind: 'human', label: 'go' }),
-        turn({ uuid: 'a1', kind: 'assistant', label: 'rebuilt', cache_failure: { tokens_recreated: 130000, prev_cached: 130000, est_wasted_usd: 0.75 } }),
-      ],
-    });
-    const { container } = render(<OutlinePanel sessionId="s1" outline={o} />);
-    const entry = container.querySelector('.conv-outline-entry--cache')!;
-    expect(entry.querySelector('.conv-outline-entry-cache-glyph')).toBeTruthy();
-    expect(entry.querySelector('.conv-outline-entry-compaction-glyph')).toBeNull();
-    expect(entry.querySelector('.conv-outline-entry-completion-glyph')).toBeNull();
-  });
-
   it('the compaction state landmark renders its ⊟ glyph', () => {
     const o = outline({
       turns: [

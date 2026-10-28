@@ -3,7 +3,7 @@
 Every case drives the REAL `bin/cctally-test-all` against a scratch repository
 built the way `tests/test_authoritative_test_contract.py` builds its estate:
 the aggregator derives `REPO_ROOT` from its own location, so copying it, the
-contract library, the evidence kernels, a manifest and fake harnesses into a
+contract library, the evidence kernels and fake harnesses into a
 temporary tree exercises the true entry point without recursing into the real
 suite. There is deliberately NO "point the aggregator at another estate"
 environment seam — a bypass variable sitting next to the admission it would
@@ -28,8 +28,7 @@ import pytest
 import yaml
 
 import _temp_hygiene as _hyg
-from helpers.authoritative_runtime_budget import write_budget
-from tests import _estate_stub
+from tests.helpers import contract_tree as _ct
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS, remaining
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -37,7 +36,6 @@ BIN = REPO / "bin"
 RUNNER = BIN / "cctally-test-all"
 CONTRACT_LIB = BIN / "_lib-test-contract.sh"
 EVIDENCE_KERNEL = BIN / "_lib_test_evidence.py"
-PRIVATE_TEST_REMOTE_HARNESS = BIN / "cctally-test-remote-test"
 
 DEFAULT_SUMMARY = "passed: 5   failed: 0"
 
@@ -56,8 +54,7 @@ def _kernels():
     """Every `bin/_lib_test_*.py` this tree carries, matched as a CLASS.
 
     The aggregator's contract is "use whichever kernels this tree carries",
-    and the vocabulary producer is maintainer-local, so naming it here would
-    both break the mirrored public suite and misstate the contract.
+    so the capability is probed rather than a file named.
     """
     return sorted(BIN.glob("_lib_test_*.py"))
 
@@ -66,7 +63,7 @@ def _has_vocabulary_producer(path):
     """Whether a carried kernel provides the disclosure-vocabulary capability.
 
     Match the capability rather than assuming every non-evidence kernel is the
-    maintainer-local producer. The public tree also carries the independent
+    producer. The public tree also carries the independent
     isolation kernel, which made that filename-count proxy true while no
     vocabulary existed and caused public-only assertions to run against the
     intended redact-everything fallback.
@@ -78,10 +75,15 @@ def _has_vocabulary_producer(path):
     return bool(re.search(r"^def build_known_tokens\(", text, re.MULTILINE))
 
 
-# Without the maintainer-local producer the transformer has nothing to vouch
-# for a word with and redacts every detail by design, so cases that assert a
-# diagnostic SURVIVES are skipped rather than weakened on a public tree.
-VOCABULARY_AVAILABLE = any(_has_vocabulary_producer(path) for path in _kernels())
+# Without a vocabulary the transformer has nothing to vouch for a word with
+# and redacts every detail by design, so cases that assert a diagnostic
+# SURVIVES are skipped rather than weakened. The producer moved from the
+# retired private observability kernel into the public evidence kernel (test
+# regime reset, session 4), and the aggregator consults it only in a tree that
+# carries the mirror matcher, which tests/helpers/contract_tree.py copies into
+# every estate taken from the private tree.
+VOCABULARY_AVAILABLE = (any(_has_vocabulary_producer(path) for path in _kernels())
+                        and (REPO / ".githooks" / "_match.py").is_file())
 
 
 def _production_constant(name):
@@ -112,42 +114,22 @@ AUTHORITATIVE_PROGRESS_INTERVAL = _production_constant(
 )
 
 
-def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None):
+def _estate(tmp_path, harnesses=None, exits=None, smoke=True):
     """A scratch repository whose harnesses print exactly what a case needs."""
     harnesses = dict(harnesses or {"alpha": [DEFAULT_SUMMARY]})
     exits = dict(exits or {})
-    manifest_min = dict(manifest_min or {})
     repo = tmp_path / "estate"
     bindir = repo / "bin"
     testsdir = repo / "tests"
-    bindir.mkdir(parents=True)
-    testsdir.mkdir()
+    testsdir.mkdir(parents=True)
+    # The aggregator, its shell libraries, every `_lib_test_*.py` kernel and the
+    # quarantine and duration-hint readers, with an empty capability table so
+    # no case depends on what the runner has installed (test regime reset,
+    # Task 3.4: harnesses are discovered, so no manifest is written).
+    _ct.copy_aggregator(bindir)
 
-    shutil.copy2(RUNNER, bindir / "cctally-test-all")
-    # Matched as a CLASS, like the kernels below: bin/_lib-test-contract.sh
-    # sources bin/_lib-fts5-probe.sh and refuses without it (#529 S6, exception
-    # X2), so an estate that copied only the contract by name would refuse to
-    # start the moment the contract grew a second shared library.
-    for lib in sorted(BIN.glob("_lib-*.sh")):
-        shutil.copy2(lib, bindir / lib.name)
-    for kernel in _kernels():
-        shutil.copy2(kernel, bindir / kernel.name)
-    # #648 D10. The class glob above copies the estate checker too, and a
-    # scratch estate carries no committed artifact for it to check against, so
-    # every case here failed at admission on the fixture rather than on the
-    # property it asserts (51 of them, measured). The stub answers with a clean
-    # report; the aggregator's own handling of that report is not stubbed.
-    _estate_stub.install(bindir)
-    # #648 D7. Both pytest legs load `-p tests._estate_leg_plugin`, so a scratch
-    # estate that omitted it would fail on a missing module. Copied rather than
-    # guarded by an existence check: a guard around the proof is exactly the
-    # shape D7 removed from the leg construction.
-    shutil.copy2(REPO / "tests" / "_estate_leg_plugin.py",
-                 testsdir / "_estate_leg_plugin.py")
-
-    # `reconcile` stays in the aggregator's final_harnesses as an ordering
-    # device, so every estate must carry it or the pool runs a harness that is
-    # not on disk.
+    # `reconcile` is the aggregator's last report row, so every estate carries
+    # it as a real harness does.
     names = list(harnesses) + ["reconcile"]
     harnesses.setdefault("reconcile", [DEFAULT_SUMMARY])
     for name in names:
@@ -172,31 +154,6 @@ def _estate(tmp_path, harnesses=None, exits=None, smoke=True, manifest_min=None)
             "def test_known():\n    assert True\n",
             encoding="utf-8",
         )
-    (testsdir / "authoritative-test-manifest.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "minHarnessRows": 0,
-                "harnesses": [
-                    {
-                        "name": n,
-                        "visibility": "public",
-                        "minCases": manifest_min.get(n, 0),
-                        "countPolicy": "fixed",
-                    }
-                    for n in names
-                ],
-                "capabilities": [],
-                "forbiddenRegeneration": [],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    # #630 S7, one spelling since #650 item 5.
-    write_budget(testsdir)
     return repo
 
 
@@ -229,7 +186,7 @@ def _drive(est, tmp_path, extra=None, timeout=240):
         text=True,
         timeout=timeout,
     )
-    _hyg.reclaim_child_generations(tmp_path)
+    _hyg.reclaim_child_suite_dirs(tmp_path)
     return proc
 
 
@@ -241,17 +198,12 @@ def _embedded_pid_start(pid, zone):
     """Run the aggregator's exact embedded process-identity producer."""
     source = RUNNER.read_text(encoding="utf-8")
     bridge = _aggregator_bridge(source)
-    # `pid-start` needs only the public evidence kernel. Feed the optional
-    # private-kernel slot a portable non-module so this public test keeps the
-    # same dependency closure as the public mirror.
-    private = pathlib.Path(os.devnull)
     env = dict(os.environ, LC_ALL="C", TZ=zone)
     result = subprocess.run(
         [
             sys.executable,
             "-",
             str(EVIDENCE_KERNEL),
-            str(private),
             "pid-start",
             str(pid),
         ],
@@ -641,16 +593,14 @@ def _blocks(stderr):
 def test_the_banner_names_the_run_before_admission_can_refuse_it(tmp_path):
     """A run refused by an admission delta must not be silent.
 
-    The estate carries a harness with no manifest row, which admission refuses
+    The estate carries an unreadable quarantine list, which admission refuses
     before a single harness executes.
     """
     est = _estate(tmp_path)
-    stray = est / "bin" / "cctally-stray-test"
-    stray.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-    stray.chmod(0o755)
+    (est / "tests" / "quarantine.json").write_text("not json", encoding="utf-8")
     res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(tmp_path / "ev")})
     assert res.returncode == 3, res.stdout + res.stderr
-    assert "manifest row" in res.stderr or "no manifest row" in res.stderr
+    assert "tests/quarantine.json could not be applied" in res.stderr
     banner = [
         line for line in res.stderr.splitlines()
         if line.startswith("[cctally-test-all] run ")
@@ -769,7 +719,7 @@ def test_one_completion_line_is_emitted_per_harness(tmp_path):
 def test_completion_line_verdicts_agree_with_the_authoritative_classification(
     tmp_path,
 ):
-    """Acceptance criterion 2, across four registered classifier classes.
+    """Acceptance criterion 2, across three registered classifier classes.
 
     The reporter classifies with its own copy of the contract globals while
     the parent reclassifies in deterministic order afterwards, so this asserts
@@ -782,10 +732,10 @@ def test_completion_line_verdicts_agree_with_the_authoritative_classification(
             "beta": ["passed: 3   failed: 2"],          # product
             "gamma": ["no summary at all"],             # incomplete
             "delta": ["kill -TERM $$", "sleep 5"],      # killed
-            "epsilon": [DEFAULT_SUMMARY],               # floor unmet
         },
-        exits={"beta": 1},
-        manifest_min={"epsilon": 99},
+        # The exit status alone decides (Codex Q10): 1 is a product failure,
+        # any other non-signal status is incomplete.
+        exits={"beta": 1, "gamma": 2},
     )
     # `delta`'s body is shell, not printf output, so rewrite it directly.
     (est / "bin" / "cctally-delta-test").write_text(
@@ -818,7 +768,7 @@ def test_completion_line_verdicts_agree_with_the_authoritative_classification(
     assert reported["alpha"][0] == "PASS", reported
     classes = {
         "beta": "product", "gamma": "incomplete",
-        "delta": "infrastructure", "epsilon": "incomplete",
+        "delta": "infrastructure",
     }
     for name, failure_class in classes.items():
         assert reported[name][0] == "FAIL", (name, reported)
@@ -828,9 +778,8 @@ def test_completion_line_verdicts_agree_with_the_authoritative_classification(
         )
     # Non-vacuity: every class the case set out to exercise really appeared.
     assert authoritative["beta"] == {"harness-failed"}
-    assert authoritative["gamma"] == {"summary-unreadable"}
+    assert authoritative["gamma"] == {"harness-incomplete"}
     assert authoritative["delta"] == {"harness-killed"}
-    assert authoritative["epsilon"] == {"case-floor-unmet"}
 
 
 def test_a_heartbeat_never_lands_inside_a_multiline_diagnostic(tmp_path):
@@ -1034,8 +983,8 @@ def test_each_pytest_phase_change_emits_an_immediate_reporter_line(tmp_path):
     assert re.search(
         r"^\[cctally-test-all\] \d+s — benchmark running$", res.stderr, re.M
     ), res.stderr
-    assert "[cctally-test-all] pytest phase started" in res.stderr
-    assert "[cctally-test-all] benchmark phase started" in res.stderr
+    assert "[cctally-test-all] pytest bulk leg started" in res.stderr
+    assert "[cctally-test-all] pytest serial leg started" in res.stderr
 
 
 def test_pytest_and_benchmark_phase_lines_have_authoritative_failure_reasons(tmp_path):
@@ -1050,8 +999,8 @@ def test_pytest_and_benchmark_phase_lines_have_authoritative_failure_reasons(tmp
     root = tmp_path / "ev"
     res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
     assert res.returncode == 1, res.stdout + res.stderr
-    assert "[cctally-test-all] pytest phase started" in res.stderr
-    assert "[cctally-test-all] benchmark phase started" in res.stderr
+    assert "[cctally-test-all] pytest bulk leg started" in res.stderr
+    assert "[cctally-test-all] pytest serial leg started" in res.stderr
     outcome = json.loads(
         (_run_dirs(root)[0] / "export" / "outcome.json").read_text()
     )
@@ -1084,11 +1033,11 @@ def _wait_for(predicate, timeout=60.0):
 
 # A command started asynchronously by a shell without job control inherits
 # SIGINT set to SIG_IGN, and a signal ignored on entry to a shell CANNOT be
-# trapped or reset. Under `bin/cctally-test-remote --watch` the remote job is
-# detached, so `trap -p INT` in every descendant reads `trap -- '' SIGINT` and
-# no process in the tree can observe SIGINT at all. Asserting an INT path from
+# trapped or reset. When the remote job ran detached (the retired wrapper's
+# watch mode), `trap -p INT` in every descendant read `trap -- '' SIGINT` and
+# no process in the tree could observe SIGINT at all. Asserting an INT path from
 # inside that tree measures the environment rather than the aggregator, and it
-# is why this case passed in a foreground run and timed out under --watch.
+# is why this case passed in a foreground run and timed out detached.
 #
 # The shim restores the default disposition and then execs, so the aggregator
 # is the process the test signals. It is a separate single-threaded process
@@ -1265,7 +1214,7 @@ def test_an_interrupted_run_is_recorded_aborted_and_reaps_its_pool(
         lambda: not _descendants_mentioning(str(est / "bin" / "cctally-alpha-test")),
         timeout=remaining(deadline),
     ), _descendants_mentioning(str(est / "bin" / "cctally-alpha-test"))
-    _hyg.reclaim_child_generations(tmp_path)
+    _hyg.reclaim_child_suite_dirs(tmp_path)
 
 
 def _scheduler_record(root):
@@ -1317,14 +1266,14 @@ def test_the_scheduler_record_names_the_table_it_dispatched_from(tmp_path):
     shutil.copy2(
         BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
     )
-    table = est / "tests" / "authoritative-harness-durations.tsv"
+    table = est / "tests" / "harness-duration-hints.tsv"
     table.write_text("alpha\t7\nreconcile\t3\n", encoding="utf-8")
     root = tmp_path / "ev"
     res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
     assert res.returncode == 0, res.stdout + res.stderr
     record = _scheduler_record(root)
     assert record["mode"] == "lpt", record
-    assert record["table"] == "tests/authoritative-harness-durations.tsv", record
+    assert record["table"] == "tests/harness-duration-hints.tsv", record
     assert record["table_digest"] == (
         "sha256:" + hashlib.sha256(table.read_bytes()).hexdigest()
     ), record
@@ -1352,7 +1301,7 @@ def test_the_recorded_digest_is_the_one_the_dispatch_decision_was_taken_from(
     shutil.copy2(
         BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
     )
-    table = est / "tests" / "authoritative-harness-durations.tsv"
+    table = est / "tests" / "harness-duration-hints.tsv"
     dispatched = "alpha\t7\nreconcile\t3\n"
     table.write_text(dispatched, encoding="utf-8")
     (est / "bin" / "cctally-alpha-test").write_text(
@@ -1452,13 +1401,53 @@ def _canary_estate(tmp_path, extra_lines=()):
         "passed: 1   failed: 1",
     ]
     est = _estate(tmp_path, harnesses={"alpha": lines}, exits={"alpha": 1})
+    _track_harnesses(est)
     return est, canary
+
+
+def _track_harnesses(est):
+    """Commit the estate's harnesses. The disclosure vocabulary vouches for a
+    harness name only when the repository tracks the harness (test regime
+    reset, Task 3.4: the names no longer come from the estate manifest), so a
+    case asserting that `FAIL alpha: ...` survives needs a tracked `alpha`."""
+    subprocess.run(["git", "init", "-q", str(est)], check=True)
+    harnesses = sorted(p.relative_to(est).as_posix()
+                       for p in (est / "bin").glob("cctally-*-test"))
+    subprocess.run(["git", "-C", str(est), "add", *harnesses], check=True)
+
+
+_MATCHER = _ct.MATCHER
+
+
+def _export_of(est, tmp_path):
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
+    assert res.returncode == 1, res.stdout + res.stderr
+    return (_run_dirs(root)[0] / "export" / "failure-context.txt").read_text().splitlines()
+
+
+def test_the_published_tree_redacts_every_word_as_it_did_before_the_move(tmp_path):
+    """F11 (session 4 review; Review Focus 10): moving the vocabulary into the
+    public kernel left the published tree's redaction byte-identical. That tree
+    carries no mirror matcher and, before the move, no vocabulary producer, so
+    no word was vouched for and every diagnostic was redacted. A tree WITH the
+    matcher, which only the private tree has, keeps its vocabulary."""
+    published, _canary = _canary_estate(tmp_path / "published")
+    shutil.rmtree(published / ".githooks", ignore_errors=True)
+    export = _export_of(published, tmp_path / "published")
+    assert PRECEDING_DIAGNOSTIC not in export, export
+    assert any("REDACTED" in line for line in export), export
+    if not (REPO / _MATCHER).is_file():
+        return                                   # the published tree itself
+    private, _canary = _canary_estate(tmp_path / "private")
+    assert (private / _MATCHER).is_file(), "the estate did not keep its source's matcher"
+    assert PRECEDING_DIAGNOSTIC in _export_of(private, tmp_path / "private")
 
 
 @pytest.mark.skipif(
     not VOCABULARY_AVAILABLE,
-    reason="the disclosure vocabulary producer is maintainer-local; without it "
-    "the transformer redacts every detail by design",
+    reason="no disclosure vocabulary producer; without it the transformer "
+    "redacts every detail by design",
 )
 def test_the_console_is_sanitized_when_an_evidence_root_exists(tmp_path):
     est, canary = _canary_estate(tmp_path)
@@ -1490,6 +1479,12 @@ def test_the_console_is_sanitized_when_an_evidence_root_exists(tmp_path):
 # that adds one violation. The shim re-exports the real kernel unchanged and
 # leaves `apply_validation_redactions` and its internal re-validation exactly
 # as shipped: the glue is what is under test, not the kernel.
+#
+# The one exception is the disclosure vocabulary. These cases were written
+# against the fail-closed context in which no vocabulary producer is present
+# (every detail redacted), and the producer now ships in the evidence kernel
+# itself (test regime reset, session 4). The shim withdraws it, so the bridge
+# falls back to that context exactly as it does when a producer raises.
 _VALIDATOR_SHIM = '''
 import importlib.util as _ilu
 import os as _os
@@ -1506,6 +1501,14 @@ for _name in dir(_real):
         globals()[_name] = getattr(_real, _name)
 
 _REASON = _os.environ["EV_SHIM_REASON"]
+
+
+def _no_vocabulary(_repo_root):
+    raise RuntimeError("the disclosure vocabulary is withdrawn for this case")
+
+
+build_disclosure_predicate = _no_vocabulary
+build_known_tokens = _no_vocabulary
 
 
 def validate_export(lines, roots=None):
@@ -1558,9 +1561,6 @@ def _scrub_log(tmp_path, log_lines, reason, kernel=EVIDENCE_KERNEL):
             sys.executable,
             "-",
             str(shim),
-            # The private disclosure producer is deliberately absent, which is
-            # the fail-closed context the public tree runs under.
-            os.devnull,
             "scrub-log",
             "alpha",
             str(logfile),
@@ -1680,7 +1680,7 @@ def test_ci_alone_does_not_turn_sanitization_on(tmp_path):
     assert canary in res.stderr, res.stderr
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_the_export_preserves_the_diagnostic_that_precedes_the_marker(tmp_path):
     """Acceptance criterion 6."""
     est, canary = _canary_estate(tmp_path)
@@ -1696,57 +1696,7 @@ def test_the_export_preserves_the_diagnostic_that_precedes_the_marker(tmp_path):
     assert export.index(PRECEDING_DIAGNOSTIC) < export.index(CANONICAL_FAILURE)
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
-def test_the_real_aggregator_threads_source_classified_case_ids_into_the_export(
-    tmp_path,
-):
-    """The integration seam for issue #579's classified minimum field."""
-    if not PRIVATE_TEST_REMOTE_HARNESS.exists():
-        pytest.skip("private test-remote harness absent on the public tree")
-    est = _estate(
-        tmp_path,
-        harnesses={"test-remote": ["passed: 1   failed: 1"]},
-        exits={"test-remote": 1},
-    )
-    harness = est / "bin" / "cctally-test-remote-test"
-    harness.write_text(
-        """#!/usr/bin/env bash
-case_source_classified_identity(){ :; }
-printf '%s\n' 'CASE: test-remote/case_source_classified_identity line 3'
-printf '%s\n' 'CASE: test-remote/case_acme_holdings_invoice line 4'
-printf '%s\n' 'FAIL: private detail ops@example.com'
-printf '%s\n' 'passed: 1   failed: 1'
-exit 1
-""",
-        encoding="utf-8",
-    )
-    harness.chmod(0o755)
-    subprocess.run(["git", "init", "-q", str(est)], check=True)
-    subprocess.run(
-        ["git", "-C", str(est), "add", "bin/cctally-test-remote-test"],
-        check=True,
-    )
-
-    root = tmp_path / "ev"
-    res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
-    assert res.returncode == 1, res.stdout + res.stderr
-    run = _run_dirs(root)[0]
-    raw = (run / "logs" / "test-remote.log").read_text()
-    export = (run / "export" / "failure-context.txt").read_text()
-
-    known = "CASE: test-remote/case_source_classified_identity line 3"
-    forged = "CASE: test-remote/case_acme_holdings_invoice line 4"
-    private = "FAIL: private detail ops@example.com"
-    for carrier in (known, forged, private):
-        assert carrier in raw, raw
-    assert known in export, export
-    assert forged not in export, export
-    assert "acme" not in export and "invoice" not in export, export
-    assert "ops@example.com" not in export, export
-    assert "CASE: test-remote/[REDACTED: unclassified detail]" in export, export
-
-
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_indentation_counters_and_progress_families_survive_the_sanitizer(
     tmp_path,
 ):
@@ -1773,28 +1723,30 @@ def test_indentation_counters_and_progress_families_survive_the_sanitizer(
         assert kept in export, (kept, export)
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_an_unreadable_summary_dump_is_sanitized_too(tmp_path):
-    """The second of the four raw stderr paths: the whole-log dump for a
-    harness that finished without a parseable summary."""
+    """A harness without a parseable summary used to get a whole-log dump of
+    its own. Since the test regime reset a harness is judged by its exit
+    status (Codex Q10), so one that exits 2 over no summary is incomplete and
+    its log goes through the same failure-details path, sanitized."""
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     canary = f"{home}/{CANARY_TAIL}"
     est = _estate(
         tmp_path,
         harnesses={"alpha": [f"reading {canary}", "no summary here"]},
-        exits={"alpha": 0},
+        exits={"alpha": 2},
     )
     root = tmp_path / "ev"
     res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
     assert res.returncode == 3, res.stdout + res.stderr
     raw = (_run_dirs(root)[0] / "logs" / "alpha.log").read_text()
     assert f"reading {canary}" in raw.splitlines()
-    assert "---- alpha output" in res.stderr, res.stderr
+    assert "---- alpha FAIL details (harness-incomplete)" in res.stderr, res.stderr
     assert canary not in res.stderr
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_the_pytest_dump_is_sanitized(tmp_path):
     """The third and fourth raw stderr paths."""
     home = tmp_path / "home"
@@ -1818,7 +1770,7 @@ def test_the_pytest_dump_is_sanitized(tmp_path):
     assert "<path>:2: AssertionError" in export, export
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_the_export_names_the_failing_node_and_its_exception_class(tmp_path):
     """#630 S1 F1's exit criterion, asserted on the real retained artifact.
 
@@ -1923,8 +1875,7 @@ def _embedded_export(tmp_path, log_lines, extra_env=None,
     })
     env.update(extra_env or {})
     result = subprocess.run(
-        [sys.executable, "-", str(kernel), os.devnull,
-         "export", str(evidence)],
+        [sys.executable, "-", str(kernel), "export", str(evidence)],
         input=bridge, env=env, capture_output=True, text=True, check=False,
     )
     return evidence, result
@@ -2182,7 +2133,7 @@ def test_the_export_directory_holds_only_the_two_publishable_files(tmp_path):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, path
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_the_export_states_its_run_and_where_the_full_logs_are(tmp_path):
     est, _canary = _canary_estate(tmp_path)
     root = tmp_path / "ev"
@@ -2255,7 +2206,7 @@ def _embedded_retention(root, current_run, extra_env=None):
     result = subprocess.run(
         [
             sys.executable, "-",
-            str(EVIDENCE_KERNEL), os.devnull,
+            str(EVIDENCE_KERNEL),
             "retention", str(root), current_run,
         ],
         input=bridge,
@@ -2542,7 +2493,7 @@ def test_cap_eviction_is_reported_and_recorded(tmp_path):
 def test_the_producer_writes_keyed_gaps_and_can_emit_an_open_ended_one(tmp_path):
     """The gap shape the read surfaces must be written against (#630 S1, F2).
 
-    Both `cctally-test-remote --status` and `--report` indexed gaps
+    Both read surfaces of the retired remote wrapper indexed gaps
     positionally and crashed with `KeyError: 0` on the live store, because the
     only fixtures covering them hand-built `[[from, to]]` — a shape
     `_merge_intervals` has never emitted. This pins the producer's real output
@@ -2753,7 +2704,7 @@ def test_degraded_coverage_survives_a_restart(tmp_path):
     assert "degraded" in second.stderr, second.stderr
 
 
-@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="maintainer-local producer")
+@pytest.mark.skipif(not VOCABULARY_AVAILABLE, reason="no disclosure vocabulary producer")
 def test_the_extract_states_the_degraded_coverage(tmp_path):
     """A CI artifact consumer sees the gap too, in the file they are handed."""
     est, _canary = _canary_estate(tmp_path)
@@ -2813,6 +2764,18 @@ def _parse_workflow(path):
 
 def _all_workflows():
     return sorted(WORKFLOW_DIR.glob("*.yml")) + sorted(WORKFLOW_DIR.glob("*.yaml"))
+
+
+# The self-hosted suite lane. Its workflow is mirror-private, so the public tree
+# has the two hosted lanes only.
+_RELEASE_VERIFY = "release-candidate.yml:release-verify"
+
+
+def _suite_lanes():
+    hosted = ["ci.yml:test-pr", "ci-linux-matrix.yml:test-linux"]
+    if (WORKFLOW_DIR / "release-candidate.yml").exists():
+        return [_RELEASE_VERIFY] + hosted
+    return hosted
 
 
 @pytest.mark.parametrize(
@@ -2901,8 +2864,17 @@ def test_every_authoritative_ci_lane_installs_the_real_yaml_parser():
     """
     via_closure_available = _closure_pins_pyyaml()
     jobs = _evidence_jobs()
-    for label in ("ci.yml:test-macos", "ci.yml:test-pr", "ci-linux-matrix.yml:test-linux"):
+    for label in _suite_lanes():
         _body, steps, _text = jobs[label]
+        if label == _RELEASE_VERIFY:
+            # Test regime reset, Task 4.9: the private lane runs under the
+            # runner supervisor's local mode, whose provisioning installs the
+            # closure.
+            # The step execs it with the listener-variable guards (Codex Q6 item 1, E-7).
+            assert any('"${CCTALLY_RUNNER_TOOL:?is not set by the runner listener environment}" local' in str(step.get("run", ""))
+                       for step in steps if isinstance(step, dict)), label
+            assert via_closure_available, f"{_PIN_FILE_REL} does not pin PyYAML"
+            continue
         installs = [
             str(step.get("run", ""))
             for step in steps
@@ -3061,11 +3033,7 @@ def test_every_evidence_enabled_job_uploads_its_sanitized_extract():
     # Non-vacuity: the three aggregator jobs are known to set a root, so an
     # empty or shrunken set means the discovery broke, not that the estate is
     # clean.
-    assert set(jobs) >= {
-        "ci.yml:test-macos",
-        "ci.yml:test-pr",
-        "ci-linux-matrix.yml:test-linux",
-    }, sorted(jobs)
+    assert set(jobs) >= set(_suite_lanes()), sorted(jobs)
     for label, (body, steps, _text) in sorted(jobs.items()):
         assert _run_id_value(body, steps), (
             f"{label} turns evidence on without stating a run identifier; "
@@ -3083,45 +3051,48 @@ def test_every_evidence_enabled_job_uploads_its_sanitized_extract():
 
 
 def test_the_macos_lane_keeps_its_evidence_on_the_runner_store(tmp_path):
-    """#940 C4: the self-hosted suite lane's evidence root is the runner's
-    external evidence store, which its listener exports as
-    CCTALLY_RUNNER_EVIDENCE_ROOT, never the job temp; a runner without one
-    refuses before any suite step. The public Ubuntu lane is unchanged."""
+    """#940 C4: the self-hosted suite lane's (release-verify's) evidence stays
+    on the runner's external store. Since the test regime reset (Task 4.9) the
+    suite runs in the runner supervisor's run directory on that store, and its
+    evidence is exported to the job temp, which the confined listener keeps on
+    the same store, before the run directory is removed. The public Ubuntu
+    lane is unchanged."""
     jobs = _evidence_jobs()
-    _body, steps, text = jobs["ci.yml:test-macos"]
-    assert "runner.temp }}/cctally-test-evidence" not in text
-    names = [step.get("name") for step in steps if isinstance(step, dict)]
-    resolver = steps[names.index("Resolve the runner's evidence store")]
-    assert names.index("Resolve the runner's evidence store") < names.index(
-        "Run cctally test suite")
-    assert "${CCTALLY_RUNNER_EVIDENCE_ROOT:?}" in resolver["run"]
-    for step in steps:
-        env = step.get("env") if isinstance(step, dict) else None
-        if isinstance(env, dict):
-            assert "CCTALLY_TEST_EVIDENCE_ROOT" not in env, step.get("name")
-            for key in ("CCTALLY_TEST_ALL_OUTCOME_FILE", "CCTALLY_EXTRACT"):
-                if key in env:
-                    assert env[key].startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), (
-                        step.get("name"), env[key])
-    for step in _upload_steps(steps):
-        for entry in _upload_paths(step):
-            assert entry.startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), entry
-    # Execute the resolver: it exports the store for the later steps, and
-    # without the listener's variable it fails and exports nothing.
-    github_env = tmp_path / "github-env"
-    store = tmp_path / "vol" / "evidence" / "ci"
-    base = {"PATH": os.environ["PATH"], "GITHUB_ENV": str(github_env)}
-    done = subprocess.run(["bash", "-e", "-c", resolver["run"]],
-                          env={**base, "CCTALLY_RUNNER_EVIDENCE_ROOT": str(store)},
-                          capture_output=True, text=True, timeout=30)
-    assert done.returncode == 0, done.stderr
-    assert github_env.read_text() == "CCTALLY_TEST_EVIDENCE_ROOT=%s\n" % store
-    github_env.unlink()
-    refused = subprocess.run(["bash", "-e", "-c", resolver["run"]], env=base,
-                             capture_output=True, text=True, timeout=30)
-    assert refused.returncode != 0
-    assert "CCTALLY_RUNNER_EVIDENCE_ROOT" in refused.stderr
-    assert not github_env.exists()
+    if _RELEASE_VERIFY not in _suite_lanes():
+        # The public tree: no evidence-enabled job runs on a self-hosted runner.
+        assert not [label for label, (body, _steps, _text) in jobs.items()
+                    if "self-hosted" in str(body.get("runs-on"))], sorted(jobs)
+    else:
+        _body, steps, text = jobs[_RELEASE_VERIFY]
+        assert "runner.temp }}/cctally-test-evidence" not in text
+        names = [step.get("name") for step in steps if isinstance(step, dict)]
+        namer = steps[names.index("Name the exported output directories")]
+        verify = steps[names.index("Verify the candidate at exact S")]
+        assert names.index("Name the exported output directories") < names.index(
+            "Verify the candidate at exact S")
+        assert '--export "out/evidence=$CCTALLY_TEST_EVIDENCE_ROOT"' in verify["run"]
+        for step in steps:
+            env = step.get("env") if isinstance(step, dict) else None
+            if isinstance(env, dict):
+                assert "CCTALLY_TEST_EVIDENCE_ROOT" not in env, step.get("name")
+                for key in ("CCTALLY_TEST_ALL_OUTCOME_FILE", "CCTALLY_EXTRACT"):
+                    if key in env:
+                        assert env[key].startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), (
+                            step.get("name"), env[key])
+        for step in _upload_steps(steps):
+            for entry in _upload_paths(step):
+                assert entry.startswith("${{ env.CCTALLY_TEST_EVIDENCE_ROOT }}/"), entry
+        # Execute the namer: it exports the evidence root in the job temp for
+        # the later steps.
+        github_env = tmp_path / "github-env"
+        temp = tmp_path / "vol" / "runner-temp"
+        done = subprocess.run(["bash", "-e", "-c", namer["run"]],
+                              env={"PATH": os.environ["PATH"], "GITHUB_ENV": str(github_env),
+                                   "RUNNER_TEMP": str(temp), "GITHUB_RUN_ID": "7",
+                                   "GITHUB_RUN_ATTEMPT": "2"},
+                              capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0, done.stderr
+        assert "CCTALLY_TEST_EVIDENCE_ROOT=%s/evidence-7-2\n" % temp in github_env.read_text()
     # The public Ubuntu lane keeps its job-temp evidence root.
     _pr_body, pr_steps, pr_text = jobs["ci.yml:test-pr"]
     assert "${{ runner.temp }}/cctally-test-evidence" in pr_text
@@ -3221,10 +3192,22 @@ def _durations_path(root):
     return _run_dirs(root)[0].joinpath(*DURATIONS_ARTIFACT)
 
 
-def test_authoritative_run_writes_a_durations_artifact(tmp_path):
+@pytest.mark.parametrize(
+    "request_env",
+    [
+        pytest.param({"CCTALLY_AUTHORITATIVE_RUN": "1"}, id="authoritative"),
+        # The nightly broad run is not authoritative (its argv is
+        # `bin/cctally-broad-run execute ...`) but asks for durations: without
+        # the artifact its timing report has no pytest data, so every
+        # quick-gate family's pytest time is unknown.
+        pytest.param({"CCTALLY_PYTEST_DURATIONS": "1"}, id="durations-requested"),
+    ],
+)
+def test_requested_run_writes_a_durations_artifact(tmp_path, request_env):
     est = _estate(tmp_path)
     root = tmp_path / "ev"
-    res = _drive(est, tmp_path, _authoritative_env(root))
+    env = {"CCTALLY_TEST_EVIDENCE_ROOT": str(root), **request_env}
+    res = _drive(est, tmp_path, env)
     assert res.returncode == 0, res.stdout + res.stderr
     path = _durations_path(root)
     assert path.exists(), sorted(p.name for p in path.parent.iterdir())
@@ -3232,7 +3215,7 @@ def test_authoritative_run_writes_a_durations_artifact(tmp_path):
     assert any(r.get("phase") == "call" for r in records), records
 
 
-def test_non_authoritative_run_writes_no_durations_artifact(tmp_path):
+def test_unrequested_run_writes_no_durations_artifact(tmp_path):
     est = _estate(tmp_path)
     root = tmp_path / "ev"
     res = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(root)})
@@ -3491,7 +3474,7 @@ def test_a_forced_control_arm_records_itself_as_its_own_mode(tmp_path):
     shutil.copy2(
         BIN / "_lib_harness_durations.py", est / "bin" / "_lib_harness_durations.py"
     )
-    table = est / "tests" / "authoritative-harness-durations.tsv"
+    table = est / "tests" / "harness-duration-hints.tsv"
     table.write_text("alpha\t7\nreconcile\t3\n", encoding="utf-8")
     root = tmp_path / "ev"
     res = _drive(
@@ -3507,13 +3490,20 @@ def test_a_forced_control_arm_records_itself_as_its_own_mode(tmp_path):
     assert record["mode"] == "report-forced", record
     # The provenance must be identical to the treatment arm's, or the pair
     # differs in more than the one variable under test.
-    assert record["table"] == "tests/authoritative-harness-durations.tsv", record
+    assert record["table"] == "tests/harness-duration-hints.tsv", record
     assert record["table_digest"] == (
         "sha256:" + hashlib.sha256(table.read_bytes()).hexdigest()
     ), record
 
 
-# ------------------------------------- #940 C3: store identity, seeded loss, the index
+# ------------------------------------------- #940 C3: store identity, seeded loss
+#
+# The runner storage tooling that enrolled stores, seeded their records and kept
+# the evidence index is retired (test regime reset, sessions 4 and 5). What
+# survives is the retention pass's carry of an existing record: the store it
+# describes and any seeded loss, kept until the loss ages out of the retention
+# horizon. These tests write such a record directly, in the shape the retired
+# seeding left on the runners.
 
 _STORE_B = "11111111-2222-3333-4444-555555555555+66666666-7777-8888-9999-BBBBBBBBBBBB:2"
 
@@ -3530,113 +3520,48 @@ def _ev_kernel():
     return module
 
 
-def _embedded_bridge(args, extra_env=None):
-    """The aggregator's own evidence bridge, run with `args` as it runs it."""
-    source = RUNNER.read_text(encoding="utf-8")
-    bridge = _aggregator_bridge(source)
-    env = dict(os.environ, LC_ALL="C", TZ="Etc/UTC")
-    for name in ("CCTALLY_RUNNER_STORE_ID", "CCTALLY_RUNNER_EVIDENCE_INDEX"):
-        env.pop(name, None)
-    env.update(extra_env or {})
-    return subprocess.run([sys.executable, "-", str(EVIDENCE_KERNEL), os.devnull] + list(args),
-                          input=bridge, env=env, capture_output=True, text=True, check=False)
+def _write_seeded_record(root, loss):
+    (root / ".retention.json").write_text(json.dumps({
+        "schemaVersion": 1, "passes": 0, "gaps": [], "retainedRuns": 0,
+        "store": _STORE_B, "seededLoss": loss,
+        "coverage": "degraded" if loss else "complete"}))
 
 
-def test_the_retention_pass_stamps_the_runner_store(tmp_path):
-    """C3 (F20, C8): the record carries the store the pass ran on, so the
-    observability reader de-duplicates on (host, store, passes)."""
-    root = tmp_path / "ev"
-    _seed_run(root, "current", started=int(time.time()) - 60)
-    record, _result = _embedded_retention(root, "current",
-                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
-    assert record["store"] == _STORE_B
-    assert record["passes"] == 1
+def test_the_retention_pass_carries_the_store_its_record_describes(tmp_path):
+    """C3 (F20, C8): the record keeps the store it describes, and a record
+    that names none describes the legacy store."""
+    EV = _ev_kernel()
+    unseeded = tmp_path / "unseeded"
+    unseeded.mkdir()
+    _seed_run(unseeded, "current", started=int(time.time()) - 60)
+    record, _result = _embedded_retention(unseeded, "current")
+    assert record["store"] == EV.LEGACY_STORE
+    seeded = tmp_path / "seeded"
+    seeded.mkdir()
+    _write_seeded_record(seeded, [])
+    _seed_run(seeded, "current", started=int(time.time()) - 60)
+    for passes in (1, 2):
+        record, _result = _embedded_retention(seeded, "current")
+        assert record["store"] == _STORE_B
+        assert record["passes"] == passes
 
 
 def test_seeded_loss_survives_a_successful_run_until_it_ages_out(tmp_path):
-    """E: lost A -> enrolled B -> a successful run stays `coverage: degraded`
-    while the seeded loss is inside the retention horizon; an interval that
-    aged out is dropped and coverage recovers."""
-    EV = _ev_kernel()
+    """E: a record carrying seeded loss stays `coverage: degraded` after a
+    successful run while the loss is inside the retention horizon; an
+    interval that aged out is dropped and coverage recovers."""
     root = tmp_path / "ev"
     root.mkdir()
     now = int(time.time())
     recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 86400))
     ancient = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 400 * 86400))
-    EV.seed_retention_record(str(root / ".retention.json"), store_id=_STORE_B, loss=[
-        {"start": ancient, "end": recent, "reason": "drive A lost"}])
+    _write_seeded_record(root, [{"start": ancient, "end": recent, "reason": "drive A lost"}])
     _seed_run(root, "current", started=now - 60)
-    record, _result = _embedded_retention(root, "current",
-                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
+    record, _result = _embedded_retention(root, "current")
     assert record["coverage"] == "degraded"
     assert [e["reason"] for e in record["seededLoss"]] == ["drive A lost"]
-    EV.seed_retention_record(str(root / ".retention.json"), store_id=_STORE_B, loss=[])
     record_doc = json.loads((root / ".retention.json").read_text())
     record_doc["seededLoss"] = [{"start": ancient, "end": ancient, "reason": "old"}]
     (root / ".retention.json").write_text(json.dumps(record_doc))
-    record, _result = _embedded_retention(root, "current",
-                                          extra_env={"CCTALLY_RUNNER_STORE_ID": _STORE_B})
+    record, _result = _embedded_retention(root, "current")
     assert record["seededLoss"] == [] and record["coverage"] == "complete"
-
-
-def test_a_finished_run_is_indexed_with_its_length_and_digest(tmp_path):
-    """C3 (R7-F7): with CCTALLY_RUNNER_EVIDENCE_INDEX set, a finished run's
-    manifest is recorded under its store with its expected length and
-    digest."""
-    EV = _ev_kernel()
-    root = tmp_path / "ev"
-    run = _seed_run(root, "run-1", started=int(time.time()) - 600)
-    index = tmp_path / "evidence-index.json"
-    result = _embedded_bridge(["index", str(root), str(run), "run-1"], extra_env={
-        "CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index)})
-    assert result.returncode == 0, result.stderr
-    doc = EV.read_evidence_index(str(index))
-    [entry] = doc["stores"][_STORE_B]["runs"]
-    data = (run / "manifest.json").read_bytes()
-    assert entry["runId"] == "run-1" and entry["length"] == len(data)
-    assert entry["digest"] == "sha256:" + __import__("hashlib").sha256(data).hexdigest()
-
-
-@pytest.mark.parametrize("damage", ["truncate", "delete"])
-def test_a_damaged_indexed_run_is_discovered_without_a_seeded_flag(tmp_path, damage):
-    """C3 (R7-F7): deletion or truncation of indexed evidence, with the store
-    unchanged, is discovered by the next retention pass from the index alone:
-    the record degrades and names the run, and the index records the loss."""
-    EV = _ev_kernel()
-    root = tmp_path / "ev"
-    now = int(time.time())
-    run = _seed_run(root, "victim", started=now - 7200)
-    index = tmp_path / "evidence-index.json"
-    env = {"CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index)}
-    assert _embedded_bridge(["index", str(root), str(run), "victim"], extra_env=env
-                            ).returncode == 0
-    if damage == "truncate":
-        data = (run / "manifest.json").read_bytes()
-        (run / "manifest.json").write_bytes(data[: len(data) // 2])
-    else:
-        shutil.rmtree(str(run))
-    _seed_run(root, "current", started=now - 60)
-    record, _result = _embedded_retention(root, "current", extra_env=env)
-    assert record["coverage"] == "degraded"
-    assert any("victim" in e["reason"] for e in record["seededLoss"]), record
-    loss = EV.read_evidence_index(str(index))["stores"][_STORE_B]["loss"]
-    assert any("victim" in e["reason"] for e in loss), loss
-
-
-def test_an_evicted_indexed_run_is_not_a_loss(tmp_path):
-    """Retention's own eviction is planned, not lost: the evicted run leaves
-    the index and the record stays complete."""
-    EV = _ev_kernel()
-    root = tmp_path / "ev"
-    now = int(time.time())
-    run = _seed_run(root, "aged", started=now - 30 * 86400)
-    index = tmp_path / "evidence-index.json"
-    env = {"CCTALLY_RUNNER_STORE_ID": _STORE_B, "CCTALLY_RUNNER_EVIDENCE_INDEX": str(index),
-           "EV_MAX_AGE_DAYS": "12"}
-    assert _embedded_bridge(["index", str(root), str(run), "aged"], extra_env=env
-                            ).returncode == 0
-    _seed_run(root, "current", started=now - 60)
-    record, _result = _embedded_retention(root, "current", extra_env=env)
-    assert not run.exists(), "the aged run was evicted"
-    assert record["seededLoss"] == [], record
-    assert EV.read_evidence_index(str(index))["stores"][_STORE_B]["runs"] == []

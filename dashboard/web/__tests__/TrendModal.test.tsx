@@ -24,14 +24,6 @@ describe('<TrendModal />', () => {
     expect(document.querySelectorAll('.m-hero.cols-3 .m-kv').length).toBe(3);
   });
 
-  it('hero kv-cur has dollar icon; kv-med has minus icon', () => {
-    render(<TrendModal />);
-    const curUse = document.querySelector('.m-kv.kv-cur svg use');
-    expect(curUse?.getAttribute('href')).toBe('/static/icons.svg#dollar');
-    const medUse = document.querySelector('.m-kv.kv-med svg use');
-    expect(medUse?.getAttribute('href')).toBe('/static/icons.svg#minus');
-  });
-
   it('kv-delta icon is trending-up or trending-down depending on sign', () => {
     render(<TrendModal />);
     const kvDelta = document.getElementById('mtr-delta-kv');

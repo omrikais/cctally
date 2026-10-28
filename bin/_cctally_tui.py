@@ -5919,7 +5919,8 @@ def _tui_precompute_doctor_payload(
     """Precompute the dashboard envelope's small doctor block, via the
     short-TTL memo (#268 M4, spec §6).
 
-    Returns the SAME ``{severity, counts, generated_at, fingerprint}`` dict
+    Returns the SAME ``{severity, counts, generated_at, fingerprint,
+    rebuild_worker}`` dict (``_lib_doctor.envelope_block``)
     ``snapshot_to_envelope`` used to build inline (or a synthetic FAIL block
     with ``_error`` on a doctor gather/checks failure), so moving the
     computation onto the snapshot is byte-identical for a given
@@ -5938,12 +5939,7 @@ def _tui_precompute_doctor_payload(
                     now_utc=now, runtime_bind=bind)
             with _perf.phase("doctor.checks"):
                 _doc_report = _ld.run_checks(_doc_state)
-            return {
-                "severity": _doc_report.overall_severity,
-                "counts": dict(_doc_report.counts),
-                "generated_at": _ld._iso_z(_doc_report.generated_at),
-                "fingerprint": _ld.fingerprint(_doc_report),
-            }
+            return _ld.envelope_block(_doc_report)
         except Exception as exc:  # noqa: BLE001 — never crash the rebuild
             # Mirror `snapshot_to_envelope`'s inline FAIL fallback (dashboard
             # `_iso_z`: strftime, no microseconds) so a doctor failure serves
@@ -5955,12 +5951,58 @@ def _tui_precompute_doctor_payload(
                     "%Y-%m-%dT%H:%M:%SZ"
                 ),
                 "fingerprint": "sha1:" + ("0" * 40),
+                "rebuild_worker": None,
                 "_error": f"{type(exc).__name__}: {exc}",
             }
 
     return sc.doctor_payload_memo(
         now_utc, runtime_bind, ttl_s=sc.DOCTOR_MEMO_TTL_S, compute=_compute,
     )
+
+
+def _deferred_doctor_placeholder(now_utc: dt.datetime) -> dict:
+    """The schema-valid, privacy-safe doctor block a deferred frame carries
+    while the real doctor gather cannot run (it opens stats repeatedly); the
+    first successful snapshot replaces it with a real doctor payload."""
+    return {
+        "severity": "warn",
+        "counts": {"ok": 0, "warn": 1, "fail": 0},
+        "generated_at": now_utc.astimezone(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "fingerprint": "sha1:" + ("0" * 40),
+        "rebuild_worker": None,
+    }
+
+
+def _tui_rebuild_worker_value(now_utc: dt.datetime, fallback=None):
+    """#997 D10: the doctor block's ``rebuild_worker`` value for a deferred
+    frame (``{severity, summary}`` or ``None``), via a short-TTL memo.
+
+    While an epoch rebuild is pending or running every live stats open
+    defers, so neither the deferred startup frame nor a deferred tick can run
+    the doctor gather; without this the chip would show only its placeholder
+    for the whole run. The value comes from the worker snapshots alone
+    (`_cctally_store.rebuild_worker_snapshot`: file reads, the stats.db
+    header bytes and a `ps` probe; it never opens stats.db and takes no
+    cctally lock, because the detached worker owns maintenance-exclusive)
+    through the same `_lib_doctor` assessment as the `db.rebuild_worker`
+    check. Never raises: a failure returns ``fallback``.
+    """
+    try:
+        c = _cctally()
+        sc = c._load_sibling("_lib_snapshot_cache")
+
+        def _compute(now: dt.datetime):
+            _ld = c._load_sibling("_lib_doctor")
+            _cd = c._load_sibling("_cctally_doctor")
+            return _ld.rebuild_worker_envelope_value(
+                _cd._gather_rebuild_workers(), now)
+
+        return sc.rebuild_worker_memo(
+            now_utc, ttl_s=sc.REBUILD_WORKER_MEMO_TTL_S, compute=_compute)
+    except Exception:  # noqa: BLE001 — a frame must never fail on this
+        return fallback
 
 
 def _tui_precompute_envelope_config(raw_config: dict) -> dict:
@@ -9201,8 +9243,21 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
             # an index that could not be read, and reporting that as
             # non-corruption makes the envelope name the wrong fault.
             prev = ref.get()
+            # #997 D10: the doctor gather cannot run during the deferral, so
+            # refresh only the rebuild-worker aggregate the chip leads with.
+            deferred_now = pinned_now or dt.datetime.now(dt.timezone.utc)
+            prev_doctor = getattr(prev, "doctor_payload", None)
+            base_doctor = (prev_doctor if isinstance(prev_doctor, dict)
+                           else _deferred_doctor_placeholder(deferred_now))
+            doctor_payload = {
+                **base_doctor,
+                "rebuild_worker": _tui_rebuild_worker_value(
+                    deferred_now,
+                    fallback=base_doctor.get("rebuild_worker")),
+            }
             pending = dataclasses.replace(
                 prev,
+                doctor_payload=doctor_payload,
                 last_sync_error=f"stats-open: {exc}",
                 sync_failures=(
                     SyncFailureAttribution(

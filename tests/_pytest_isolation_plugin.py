@@ -1,7 +1,8 @@
 """#630 S2 — two isolation detectors, loaded only where they are wanted.
 
-Loaded with `-p tests._pytest_isolation_plugin` by
-`bin/cctally-test-load-invariance`. Never registered through `pytest.ini` or a
+Loaded with `-p tests._pytest_isolation_plugin` by the #630 S2 contended
+lane, which the test regime reset retired (session 4); nothing loads it by
+default, and a manual contended run still can. Never registered through `pytest.ini` or a
 `conftest.py`: both would change behaviour for anyone running pytest directly,
 and `tests/conftest.py` belongs to another session.
 

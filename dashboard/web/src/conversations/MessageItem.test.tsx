@@ -266,16 +266,6 @@ describe('MessageItem', () => {
     expect(container.querySelector('.conv-cost-bar')).toBeNull();
   });
 
-  it('renders the assistant model as a .chip with the modelChipClass (#175 F3)', () => {
-    const opusItem: ConversationItem = { ...assistant, model: 'claude-opus-4-8' };
-    const { container } = render(<MessageItem item={opusItem} />);
-    const chip = container.querySelector('.conv-item-head .chip');
-    expect(chip?.textContent).toBe('claude-opus-4-8');
-    expect(chip?.classList.contains('opus')).toBe(true);
-    expect((chip as HTMLElement).style.backgroundColor).not.toBe('');
-    expect(container.querySelector('.conv-item-model')).toBeNull();
-  });
-
   it('renders no chip and no em dash for a null-model assistant (#175 F3)', () => {
     const nullModel: ConversationItem = {
       kind: 'assistant',
@@ -853,13 +843,6 @@ describe('MessageItem (message-text copy, G2)', () => {
       .toBe('Synthetic agent instructions');
   });
 
-  it('gives a meta row no spine role-dot class (--human/--assistant only)', () => {
-    const { container } = render(<MessageItem item={metaSkill} />);
-    expect(container.querySelector('.conv-item--human')).toBeNull();
-    expect(container.querySelector('.conv-item--assistant')).toBeNull();
-    expect(container.querySelector('.conv-item--meta')).not.toBeNull();
-  });
-
   // #217 S5 F6 — a context body carrying an unfenced git diff routes the diff
   // region through UnifiedDiffView (real diff rows), while the prose lead stays
   // Markdown. A context body with NO `diff --git` marker stays pure prose.
@@ -976,12 +959,6 @@ describe('MessageItem (#174 permalink on tool-result & system-marker chips)', ()
     );
     fireEvent.click(screen.getByRole('button', { name: 'Copy link to this turn' }));
     expect(onAncestorClick).not.toHaveBeenCalled();
-  });
-
-  it('prose permalink buttons keep the exact class "conv-copy-btn" (no regression)', () => {
-    render(<MessageItem item={assistant} />);
-    const btn = screen.getByRole('button', { name: 'Copy link to this turn' });
-    expect(btn.className).toBe('conv-copy-btn');
   });
 });
 

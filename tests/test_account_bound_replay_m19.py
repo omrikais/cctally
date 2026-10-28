@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 import time
 
@@ -700,6 +701,8 @@ def _drive_replay(app, monkeypatch, replay):
         import types
         monkeypatch.setattr(_cctally_update, "_spawn_detached",
                             lambda command: True)
+        monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                            lambda command, **_kw: os.getpid())
         with open(core.DB_PATH, "r+b") as handle:
             handle.write(b"not a database " * 200)
         with pytest.raises(_cctally_db.StatsHealDeferred):

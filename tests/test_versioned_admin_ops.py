@@ -27,11 +27,13 @@ def _violation():
     )
 
 
-def test_repair_acknowledgement_is_emitted_only_as_v2():
+def test_repair_acknowledgement_is_emitted_only_as_v3():
+    # #797/#823/#840 (spec 4.6 B5): the previous release's v2 validator
+    # rejects the `wpr` stamp, so the current binary emits the successor.
     op = J.make_protocol_resolution(
         at="2026-10-09T00:00:00Z", violations=[_violation()],
         journal_high_water=HW, journal_prefix_hash=PREFIX)
-    assert op["payload"]["kind"] == "journal_protocol_resolution_v2"
+    assert op["payload"]["kind"] == "journal_protocol_resolution_v3"
     assert P.is_stamped(op)
     assert J.is_protocol_resolution(op)
 
@@ -43,7 +45,11 @@ def test_current_readers_accept_both_resolution_versions():
     v1_payload = dict(v2["payload"], kind="journal_protocol_resolution")
     v1 = J.make_op(at=v2["at"], src=v2["src"], payload=v1_payload,
                    writer_generation=None)
-    for record in (v1, v2):
+    # The previous release's v2 shape: `wpg` without `wpr`.
+    v2_payload = dict(v2["payload"], kind="journal_protocol_resolution_v2")
+    v2_retained = J.make_op(at=v2["at"], src=v2["src"], payload=v2_payload,
+                            writer_revision=None)
+    for record in (v1, v2_retained, v2):
         assert J.is_protocol_resolution(record)
         J._validate_protocol_resolution(record)
         fold = J.SelectorFold()
@@ -75,6 +81,7 @@ def test_reviewed_weekly_decision_kinds(monkeypatch):
 @pytest.mark.parametrize("kind", [
     "account_bound_cutover", "legacy_spool_activity",
     "journal_protocol_resolution_v2", "claude_weekly_observation_decision_v2",
+    "account_bound_revision", "journal_protocol_resolution_v3",
 ])
 def test_new_op_kinds_are_registered(kind):
     import _cctally_journal as jr

@@ -527,36 +527,119 @@ def test_spill_free_deletion_writes_each_dirty_page_once(
         conn.close()
 
 
+def _seed_small_claude_group(conn, session_id, rows, ts):
+    conn.executemany(
+        "INSERT INTO conversation_messages (session_id, uuid, source_path, "
+        "byte_offset, timestamp_utc, entry_type, text, blocks_json) "
+        "VALUES (?,?,?,?,?,?,?,'[]')",
+        [(session_id, f"{session_id}-{i}", f"/{session_id}.jsonl", i, ts,
+          "assistant", _text(i)) for i in range(rows)])
+    conn.commit()
+
+
 def test_spill_free_connection_configuration(tmp_path, monkeypatch):
-    """The deterministic half of the spill-free property, with no write
-    measured (test regime reset, session 1; spec 4.3). The WAL-frame and
-    temp-byte measurement above is quarantined (#942) and runs on the
-    scheduled run; this keeps the machine-safety configuration it depends on
-    checked on the merge path: the retention visit's deletion connection runs
-    with an in-memory temp store under the 256 MiB cache cap, and a newly
-    opened ordinary writer keeps SQLite's default cache size with in-memory
-    statement journals (#901 spec 5.3a, Q11)."""
+    """The deterministic half of the spill-free property, observed on the real
+    deletion visit with no write measured (test regime reset; spec 4.3, #942).
+
+    The WAL-frame and temp-byte measurement above is quarantined and runs on
+    the scheduled run. This drives `_maybe_prune_conversation_retention` over
+    two small expired groups, one above an injected fallback threshold, and
+    checks the machine-safety configuration that measurement depends on:
+
+    * bounded connection policy: the visit deletes on one connection of its
+      own, never the caller's, and closes it when the visit ends, so the
+      enlarged cache never outlives the visit; that connection waits a
+      bounded time for a competing writer instead of failing at once, and
+      caps the WAL it leaves behind (`journal_size_limit`), so a visit that
+      grew the WAL never leaves it at its peak size on disk;
+    * a spill-free group commits under temp_store=MEMORY
+    * and under the 256 MiB cache cap;
+    * the bounded fallback keeps that cap and moves only its statement
+      journal to the file temp store, charged as its reservation says;
+    * a writer opened afterwards keeps SQLite's default cache size with
+      in-memory statement journals (#901 spec 5.3a, Q11).
+    """
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     ns["open_cache_db"]().close()
+    conn = ns["open_conversations_db"](attach_cache=False)
+    retention = importlib.import_module("_lib_conversation_retention")
+    importlib.import_module("_lib_write_io").reset_for_tests()
+    old, fresh_ts = "2025-08-01T12:00:00.000Z", "2026-07-17T08:00:00.000Z"
+    _seed_small_claude_group(conn, "expire-small", 20, old)
+    _seed_small_claude_group(conn, "expire-large", 60, old)
+    _seed_small_claude_group(conn, "keep", 5, fresh_ts)
+    monkeypatch.setattr(retention, "DELETION_FALLBACK_ROW_THRESHOLD", 40)
+    opened, commits, bounds = [], [], []
+    real_open = retention._open_deletion_connection
+
+    class Spy:
+        def __init__(self, inner):
+            self._conn = inner
+
+        def commit(self):
+            commits.append((
+                int(self._conn.execute("PRAGMA temp_store").fetchone()[0]),
+                int(self._conn.execute("PRAGMA cache_size").fetchone()[0])))
+            bounds.append((
+                int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0]),
+                int(self._conn.execute(
+                    "PRAGMA journal_size_limit").fetchone()[0])))
+            return self._conn.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def spying_open(path):
+        spy = Spy(real_open(path))
+        opened.append(spy)
+        return spy
+
+    monkeypatch.setattr(retention, "_open_deletion_connection", spying_open)
+    ops = []
+    try:
+        stats = retention._maybe_prune_conversation_retention(
+            conn, now_utc=NOW, retention_days=180, force=True,
+            record_phase=lambda kind, payload: ops.append(payload))
+        assert stats is not None and stats.complete, stats
+        deletes = [op for op in ops if op.get("outcome") == "ok"]
+        assert sorted(op["rows"] for op in deletes) == [20, 60], ops
+        # Bounded connection policy.
+        assert len(opened) == 1, "one deletion connection per visit"
+        assert opened[0]._conn is not conn
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened[0]._conn.execute("SELECT 1")
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -2000, (
+            "the caller's connection never takes the deletion cache")
+        # Every commit of the visit runs with a bounded busy wait (neither
+        # zero nor a stall of more than a minute) and a WAL size limit
+        # (SQLite's default, -1, leaves the WAL at its peak size).
+        assert bounds and all(0 < busy <= 60_000 and limit >= 0
+                              for busy, limit in bounds), bounds
+        # Each group commits once, in order; the visit's completion stamp
+        # commits after them.
+        assert len(commits) >= len(deletes) == 2, (commits, ops)
+        by_mode = {op["mode"]: commit for op, commit in zip(deletes, commits)}
+        # temp_store=MEMORY under the 256 MiB cache cap.
+        assert by_mode["spill_free"] == (2, -retention.DELETION_CACHE_SIZE_KIB)
+        assert retention.DELETION_CACHE_SIZE_KIB == 262_144
+        # The bounded fallback: the cap kept, the file temp store, its charge.
+        assert by_mode["fallback"] == (1, -retention.DELETION_CACHE_SIZE_KIB)
+        [fallback] = [op for op in deletes if op["mode"] == "fallback"]
+        assert fallback["rows"] == 60
+        assert fallback["charged_bytes"] == retention.recompute_charge(
+            {"phase": "delete", **fallback})
+        assert conn.execute(
+            "SELECT COUNT(*) FROM conversation_messages").fetchone()[0] == 5
+    finally:
+        conn.close()
+    # A fresh ordinary writer keeps SQLite's defaults.
     fresh = ns["open_conversations_db"](attach_cache=False)
     try:
-        db_path = next(row[2] for row in fresh.execute("PRAGMA database_list")
-                       if row[1] == "main")
         assert fresh.execute("PRAGMA cache_size").fetchone()[0] == -2000
         assert fresh.execute("PRAGMA temp_store").fetchone()[0] == 2
     finally:
         fresh.close()
-    retention = importlib.import_module("_lib_conversation_retention")
-    # The visit opens its deletion connection through this seam, which is the
-    # one the measuring test instruments.
-    deletion = retention._open_deletion_connection(db_path)
-    try:
-        assert (int(deletion.execute("PRAGMA temp_store").fetchone()[0]),
-                int(deletion.execute("PRAGMA cache_size").fetchone()[0])) == (
-            2, -262144), "temp_store=MEMORY under the 256 MiB cache cap"
-    finally:
-        deletion.close()
 
 
 def test_a_group_above_the_row_threshold_takes_the_bounded_fallback(

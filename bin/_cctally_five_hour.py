@@ -38,13 +38,13 @@ Spec: docs/superpowers/specs/2026-05-30-extract-five-hour-statusline-cmd-design.
 from __future__ import annotations
 
 import argparse
-import collections
 import datetime as dt
 import json
 import sqlite3
 import sys
 
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel (#341)
+import _lib_rebuild_progress  # #997 D9 progress ticks (stdlib only)
 from _lib_five_hour import latest_five_hour_reading
 from _cctally_core import _command_as_of, eprint, now_utc_iso, open_db, parse_iso_datetime
 
@@ -989,69 +989,36 @@ def _latest_seven_day_and_window(
     retired replica or a weekly-only reading can be the newest row, and its NULL
     key would report the live block closed and leave its weekly end stale.
 
-    **The weekly value is CREDIT-AWARE**, which is the #835 change. It comes from
-    the most recent row that is not a post-floor stale replica — the same band
-    and floor predicate the stale-replica DELETE applies, applied as a read
-    filter. Held-inclusive is still right in principle here, because a held row
-    stores the EFFECTIVE weekly value and that is what a block's weekly end
-    means. What is not right is reporting a value a credit RETIRED, and #835
-    made that reachable by preserving held rows: before it, the DELETE removed
-    every post-floor replica, so this read could not see one. Excluding held rows
-    outright would be the wrong repair — it would report the block end from an
-    older tick, which is the mistake #824's comment here warned against.
+    **The weekly value is the newest row's STORED value** (#840, spec section
+    4.8). Held-inclusive, because a held row stores the effective weekly value
+    and that is what a block's weekly end means. #835 filtered it through a
+    retirement band (a value within a point of one a credit retired was skipped
+    as a replay), which also withheld every genuine climb back to that value;
+    the band is removed. Stale contributors are refused before publication
+    (spec section 4.4), and a value already poisoned in a store is corrected by
+    `db rederive`'s reviewed `retract`, never by a percentage heuristic.
 
-    **The weekly walk is BOUNDED three ways, and each bound closes a hole tranche
-    A left open (#834 S1 Gate A R1).**
+    *Scope.* The value is the NEWEST row's, within its own
+    ``(week_start_date, account_key)``; a read never reports another week's or
+    another account's percentage.
 
-    *Scope.* The walk descends only within the NEWEST row's own
-    ``(week_start_date, account_key)``. A candidate belonging to another week or
-    another account ends the walk with ``None``, because week W-1's percentage is
-    not week W's weekly end and account B's is not account A's, under any reading.
-    Before #835 this read took exactly one row, so the absent predicates could not
-    matter; a walk makes them matter.
+    *Floor.* The read answers ``None`` when that row was captured BEFORE the
+    latest credit floor in its scope, or carries an unparseable capture stamp
+    inside a credited week: such a row cannot state the week's current
+    effective weekly value, and its value is by construction the pre-credit
+    reading. That state is unreachable through either production credit path:
+    `record-credit` writes a post-credit synthetic snapshot at its own effective
+    instant, and the automatic path's floor is derived from a capture that is
+    itself in the store, so in both cases at least one row exists at or after
+    the floor and it is the newest.
 
-    *Floor.* The walk also ends with ``None`` at the first row captured BEFORE the
-    latest credit floor in that scope. This is the soundness bound: a pre-floor row
-    is never classified as retired, so without it the walk terminated on one and
-    returned its value — and that value is by construction the PRE-credit reading,
-    which is exactly the value a retirement band exists to suppress. A sub-one-point
-    credit reaches it immediately, because such a credit is legal
-    (`_doomed_snapshot_rows`) and places the post-credit synthetic inside a band
-    centred on ``from_pct``, leaving every post-floor row in the band. An
-    unparseable capture stamp inside a credited week is treated as pre-floor for
-    the same reason: the row cannot be placed relative to the floor, so it cannot
-    be certified as able to state the current value.
-
-    *Retirement.* Within the scope and at or after the floor, a retired replica is
-    skipped, and a retired value is therefore never returned.
-
-    The floor bound applies to the NEWEST row as well as to the candidates below
-    it, so a newest row captured before the latest floor answers ``None`` where the
-    pre-#835 code answered its value. That state is unreachable through either
-    production credit path: `record-credit` writes a post-credit synthetic snapshot
-    at its own effective instant, and the automatic path's floor is derived from a
-    capture that is itself in the store, so in both cases at least one row exists at
-    or after the floor and it is the newest.
-
-    An UNCREDITED week resolves no bands, so there is no floor, nothing is skipped,
-    and the read returns the newest row's value exactly as it did before #835. A
-    ``NULL`` weekly value is not a retired replica, so it still terminates the walk
-    and still answers ``None``. Both contracts are byte-stable against today.
-
-    **The residual, deliberately unfixed and filed as #840.** A genuine later climb
-    back INTO the band is still classified as a replay, so the weekly end reads the
-    newest out-of-band value until the true value passes the band's upper edge.
-    That is preferred over returning a value a credit retired, and no sound
-    discriminator is available: `record-credit`'s own synthetic post-credit
-    snapshot is written before any later replay, so "a below-band row has been
-    observed" would close the band immediately and let every replay through.
-    `test_840_characterization_a_genuine_climb_back_reads_the_older_value`
-    characterizes it.
+    An UNCREDITED week resolves no floor, and the read returns the newest row's
+    value. A ``NULL`` weekly value answers ``None``.
 
     ``account_key`` (#341, spec §3): ``None`` = merged / byte-stable; a real key /
-    ``unattributed`` scopes both selections to that account. The retirement bands
-    are resolved against the NEWEST ROW's own account, which is also the walk's
-    scope, because a credit under one account retires nothing under another.
+    ``unattributed`` scopes both selections to that account. The credit floor is
+    resolved against the NEWEST ROW's own account and week, because a credit
+    under one account bounds nothing under another.
     """
     _c = _cctally()
     acct_pred = "" if account_key is None else " WHERE account_key = ?"
@@ -1076,43 +1043,23 @@ def _latest_seven_day_and_window(
         # with this account's weekly value.
         reading = latest_five_hour_reading(conn, account_key=row["account_key"])
         key = None if reading is None else reading.window_key
-        # Axis 2: the weekly value. The scope, the bands and the floor all come
-        # from the NEWEST row and are resolved ONCE, because the walk may not
-        # leave that scope — so there is nothing to memoize per candidate.
-        #
-        # Dropping `LIMIT 1` does cost something at the storage layer: SQLite
-        # materializes the full sort before yielding the first row, measured at
-        # 9.0ms against 3.4ms on a 25,053-row store. The cost is immaterial
-        # because this runs once per invocation, but the earlier claim that the
-        # ordinary case "reads exactly one row, which is the work the single-row
-        # query did" described only the rows the cursor yields, not the work the
-        # query does, and was wrong.
-        scope = (row["week_start_date"], row["account_key"])
+        # Axis 2: the weekly value, the newest row's stored value, bounded by
+        # the latest credit floor of its own week and account (#840).
         bands = _c._credit_retirement_bands(
             conn, week_start_date=row["week_start_date"],
             week_start_at=row["week_start_at"],
             week_end_at=row["week_end_at"],
             account_key=row["account_key"])
         floor = _c._latest_credit_floor_instant(bands)
-        pct = None
-        while row is not None:
-            if (row["week_start_date"], row["account_key"]) != scope:
-                break
-            if floor is not None:
-                try:
-                    captured = parse_iso_datetime(
-                        row["captured_at_utc"], "captured_at").timestamp()
-                except (ValueError, TypeError):
-                    captured = None
-                if captured is None or captured < floor:
-                    break
-            if not _c._weekly_value_is_retired_replica(
-                    bands,
-                    captured_at_utc=row["captured_at_utc"],
-                    weekly_percent=row["weekly_percent"]):
-                pct = row["weekly_percent"]
-                break
-            row = cur.fetchone()
+        pct = row["weekly_percent"]
+        if floor is not None:
+            try:
+                captured = parse_iso_datetime(
+                    row["captured_at_utc"], "captured_at").timestamp()
+            except (ValueError, TypeError):
+                captured = None
+            if captured is None or captured < floor:
+                pct = None
     except sqlite3.DatabaseError:
         return None, None
     return (
@@ -1121,882 +1068,30 @@ def _latest_seven_day_and_window(
     )
 
 
-def _parsed_block_instant(block, column):
-    """``block[column]`` when it is present and parses as an instant, else ``None``.
-
-    #834 S1 (#835) Gate A R8. Both observation stamps are declared `TEXT NOT NULL`,
-    so absence is not a live shape — but a fixture, a hand-built store or a legacy
-    projection can still carry an unparseable one, and the two instant helpers
-    below must degrade rather than raise.
-    """
-    value = block.get(column)
-    if not value:
-        return None
-    try:
-        parse_iso_datetime(value, column)
-    except (ValueError, TypeError):
-        return None
-    return value
-
-
-def _block_weekly_start_instant(block):
-    """The instant a block's stored weekly START was captured at, as ISO text.
-
-    #834 S1 (#835) Gate A R8. `first_observed_at_utc`, because that is the stamp
-    of the tick that wrote `seven_day_pct_at_block_start`. The live upsert in
-    bin/_cctally_record.py sets both from one fold dict on the INSERT (both are
-    omitted from its `DO UPDATE`, so the first writer owns the pair), and
-    `_backfill_five_hour_blocks` takes `first_obs` and `pct_start_7d` from its
-    single MIN-captured snapshot row.
-
-    NOT `block_start_at`, which is the window's NOMINAL start — `five_hour_resets_at`
-    minus five hours — and therefore at or before the first tick. The gap is not
-    cosmetic: a block whose nominal start precedes a credit floor but whose first
-    tick landed after it would have the floor's retired value compared against a
-    PRE-floor instant and rendered. It falls back to `block_start_at` only when the
-    observation stamp is absent or unparseable, which keeps the pre-R8 disposition
-    rather than blanking the axis.
-    """
-    return (_parsed_block_instant(block, "first_observed_at_utc")
-            or block.get("block_start_at"))
-
-
-def _block_weekly_end_instant(block, *, now_utc):
-    """The instant a block's stored weekly END was captured at, as an ISO text.
-
-    #834 S1 (#835) Gate A R8. `last_observed_at_utc`, because that is the stamp of
-    the tick that wrote `seven_day_pct_at_block_end`. All four writers of the pair
-    move the two together: the live upsert assigns
-    `last_observed_at_utc = excluded.last_observed_at_utc` and
-    `seven_day_pct_at_block_end = excluded.seven_day_pct_at_block_end` in one
-    `DO UPDATE SET` from one fold dict, `_backfill_five_hour_blocks` takes
-    `last_obs` and `pct_end_7d` from its single MAX-captured snapshot row,
-    `five_hour_block_close` freezes the whole row into one evt, and
-    `_migration_merge_5h_block_duplicates_v1` (bin/_cctally_db.py) copies both
-    from the group row whose `last_observed_at_utc` is MAX.
-
-    Gate A S1 used `five_hour_resets_at` instead, falling back to the current
-    instant while that reset was still in the future. That is the block's END, not
-    a capture instant, and it was wrong in BOTH directions. A crossed-reset block's
-    reset falls in the SUCCESSOR week, so `_block_weekly_axis_weeks` resolved the
-    successor's bounds and the credited week's bands were never consulted. A closed
-    block whose last tick predates the floor had its genuinely effective end
-    withheld, which contradicts the historical-truth rule this filter rests on.
-
-    The reset-or-now form is KEPT as the fallback for an absent or unparseable
-    stamp, so a store that cannot supply a capture instant behaves as it did
-    before R8 rather than losing the axis.
-    """
-    _c = _cctally()
-    observed = _parsed_block_instant(block, "last_observed_at_utc")
-    if observed is not None:
-        return observed
-    now_iso = _c._iso_z(now_utc)
-    resets = block.get("five_hour_resets_at")
-    if not resets:
-        return now_iso
-    try:
-        moment = parse_iso_datetime(resets, "five_hour_resets_at").timestamp()
-    except (ValueError, TypeError):
-        return now_iso
-    return resets if moment <= now_utc.timestamp() else now_iso
-
-
-#: One candidate week for `_block_weekly_axis_weeks`, as loaded once per account
-#: per render. ``lo`` / ``hi`` are the parsed `[week_start_at, week_end_at)`
-#: epochs, or ``None`` when the week carries no usable bounds.
-_AxisWeek = collections.namedtuple(
-    "_AxisWeek",
-    "week_start_date week_end_date week_start_at week_end_at lo hi")
-
-
-def _parsed_week_bounds(week_start_at, week_end_at):
-    """``(lo, hi)`` epochs for a week's bounds, or ``(None, None)``.
-
-    #834 S1 (#835) Gate A R9. Both loaders need the same verdict on the same two
-    nullable columns — `_account_axis_weeks` to decide whether a week is placed by
-    epoch or by date, `_account_axis_capture_weeks` to decide whether the identity
-    it returns carries bounds for the `week_reset_events` leg — so the parse lives
-    in one place and the two cannot disagree about which weeks have usable bounds.
-    Absent or unparseable on either side yields no bounds, which is what
-    `_credit_retirement_bands` already treats as a leg it cannot scope.
-    """
-    if week_start_at is None or week_end_at is None:
-        return None, None
-    try:
-        return (parse_iso_datetime(week_start_at, "week_start_at").timestamp(),
-                parse_iso_datetime(week_end_at, "week_end_at").timestamp())
-    except (ValueError, TypeError):
-        return None, None
-
-
-def _account_axis_weeks(conn, *, account_key, cache):
-    """Every distinct week ``account_key``'s snapshot rows name, in no order.
-
-    #834 S1 (#835) Gate A R8. ONE query per account per render, replacing one query
-    per axis instant. The per-instant form was measured at 22x the whole render's
-    prior cost on a 25,000-row store with 50 blocks, because its
-    ``unixepoch(week_start_at)`` predicate makes `idx_usage_week_start_at_time`
-    unusable — `EXPLAIN QUERY PLAN` reported `SCAN weekly_usage_snapshots` plus
-    `USE TEMP B-TREE FOR ORDER BY`, and the 50-block render performed about 51 full
-    scans and 51 full sorts. An instant-keyed memo could not collapse them: two
-    instants per block are two distinct keys.
-
-    THE WIN IS THE COLLAPSE TO ONE QUERY, NOT RESTORED INDEX USE. This query is
-    equally unindexed: `EXPLAIN QUERY PLAN` reports `SCAN weekly_usage_snapshots`
-    plus a temp B-tree. About 51 unindexed scans became one unindexed scan, which is
-    the whole of the improvement; do not read `idx_usage_week_start_at_time` as being
-    back in play. The scan verdict was measured on an empty store, on a 25,500-row
-    store and again after `ANALYZE` while this query was still a `GROUP BY`; R10
-    replaced that clause with `SELECT DISTINCT`, which changed the B-tree's stated
-    purpose and not the scan (see the R10 paragraph below for the measured plan).
-
-    THE RESIDUAL IS NOT IRREDUCIBLE, and it is accepted as shipped rather than
-    defended as minimal. `idx_usage_week_time` leads on `week_start_date`, so
-    narrowing the projection to that column alone does use it — `SELECT DISTINCT
-    week_start_date` reports `SCAN weekly_usage_snapshots USING INDEX
-    idx_usage_week_time`, measured on the same two stores, and an earlier form said
-    "grouping on that column alone", which is stale terminology since R10 replaced
-    the `GROUP BY` with `SELECT DISTINCT` — and a render only
-    needs the weeks overlapping its blocks' instant range rather than the account's
-    whole history. Both are real reductions and neither is taken, because the
-    property that matters is that the cost is CONSTANT in the number of rendered
-    blocks, which it already is. `week_end_date` and the two bounds are in the
-    projection because the date pass needs all four, which is exactly what a
-    `week_start_date`-only projection would give up.
-
-    ONE COMPARISON SEMANTIC CHANGED WITH THE FORM, unreachably. The per-instant
-    predicate compared SQLite `unixepoch()` integers, which truncate a fractional
-    second; this form compares `parse_iso_datetime(...).timestamp()` floats, which
-    keep it. The two disagree for a week bound carrying a fractional second: a
-    `week_start_at` of `…T00:00:00.500000+00:00` against a probe at
-    `…T00:00:00+00:00` is INSIDE the week under the integer compare and outside it
-    under the float one. No writer can produce that bound.
-    `_canonicalize_optional_iso` returns `isoformat(timespec="seconds")` over a
-    `_normalize_week_boundary_dt` result, which zeroes second and microsecond and
-    snaps to the hour, and `cmd_record_usage`'s pipeline derives both bounds from
-    that same normalizer and writes them with the same `timespec="seconds"`.
-
-    THE SET IS UNORDERED, AND THE QUERY IS A PLAIN `SELECT DISTINCT` (Gate A R10).
-    Through R9 it carried a `MAX(captured_at_utc || char(1) || printf('%020d', id))`
-    aggregate whose SQL alias was `rk` and whose `_AxisWeek` field was `rank` — call
-    it `rk`, because that is the alias, and earlier text here called the column
-    `rank` — introduced to reproduce the per-instant query's
-    ``ORDER BY captured_at_utc DESC, id DESC`` tie-break exactly so that which week
-    won an overlap did not change with the query's form, and kept as documentary
-    after R9 deleted the tie-break. Nothing read it: this function has one caller,
-    every pass in `_block_weekly_axis_weeks` builds an order-insensitive set, and
-    the caller ORs a predicate over the result. The grouping was there only to carry
-    the aggregate, so both went.
-
-    NOTHING PINS THE ORDER NOW. There was never a SQL `ORDER BY` on this query: the
-    order came from a Python `weeks.sort(key=lambda w: w.rank, reverse=True)` over the
-    aggregate. Through R8 a consumer tie-break in the epoch pass read it; R9 deleted
-    that tie-break and left the aggregate documentary; R10 deleted the aggregate and
-    the sort together. So the returned order is now whatever SQLite produces, and no
-    test asserts order-insensitivity of the consumer, so a future consumer that cares
-    about order has nothing to fail against. It is safe today because the one consumer
-    ORs a monotone band predicate over the whole set. A consumer that needs an order
-    must establish it itself rather than assume this one.
-
-    The statement-count test cannot see R10's REMOVAL of the aggregate and the
-    grouping, because the statement count is unchanged by it; the removal was
-    measured instead, best of five on a 25,194-row 13-week 50-block store, with the
-    order of the three forms reversed to rule out page-cache bias and the three
-    result sets asserted identical: 13.57 ms with the aggregate, 9.36 ms for the
-    bare `GROUP BY`, 2.34 ms for `SELECT DISTINCT` — so removing both took about 83%
-    off the statement, and the plan changed from `SCAN weekly_usage_snapshots` +
-    `USE TEMP B-TREE FOR GROUP BY` to the same scan + `USE TEMP B-TREE FOR DISTINCT`.
-    It is still an unindexed scan; the `idx_usage_week_time` reduction named above is
-    still not taken, for the reason given there.
-
-    DO NOT QUOTE A SPLIT BETWEEN THE TWO REMOVALS. On those figures the aggregate is
-    31% of the statement and the grouping a further 52%, but the review that checked
-    this measured 12.87-13.09 / 6.30-6.77 / 2.02-2.23 ms on its own 25,194-row store,
-    which makes the aggregate about 50% and the grouping about 34% — the same 83%
-    total, with the two components in the opposite order. The total reproduces and
-    the ranking does not, so treat the split as machine- and data-dependent.
-
-    `week_start_at` / `week_end_at` are both nullable and
-    `_derive_week_from_payload` leaves them `None` on three of its four paths, so
-    a week with no bounds is a live shape; it is retained here with ``lo``/``hi``
-    of ``None`` and placed by date instead (see `_block_weekly_axis_weeks`).
-    """
-    if account_key in cache:
-        return cache[account_key]
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT week_start_date, week_end_date, week_start_at, "
-            "       week_end_at "
-            "  FROM weekly_usage_snapshots "
-            " WHERE account_key = ?",
-            (account_key,),
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        rows = []
-    weeks: list = []
-    for r in rows:
-        lo, hi = _parsed_week_bounds(r["week_start_at"], r["week_end_at"])
-        weeks.append(_AxisWeek(
-            week_start_date=r["week_start_date"],
-            week_end_date=r["week_end_date"],
-            week_start_at=r["week_start_at"] if lo is not None else None,
-            week_end_at=r["week_end_at"] if hi is not None else None,
-            lo=lo, hi=hi))
-    cache[account_key] = weeks
-    return weeks
-
-
-def _account_axis_capture_weeks(conn, *, account_key, cache):
-    """``{capture second -> the week identities a snapshot row at that instant
-    names}``, for the capture instants ``account_key``'s blocks actually carry.
-
-    #834 S1 (#835) Gate A R9. THE STORE KEEPS A RECORD OF WHICH WEEK A CAPTURE WAS
-    OBSERVED UNDER, and this is the read of it. Round five documented its
-    over-withholding on the premise that it does not. All four writers of
-    `five_hour_blocks.seven_day_pct_at_block_start` / `_at_block_end` take the
-    matching axis STAMP from a `weekly_usage_snapshots` row's `captured_at_utc`:
-    the live upsert passes `captured_at = saved["capturedAt"]` into
-    `first_observed_at_utc` and `last_observed_at_utc` in one `INSERT … DO UPDATE`
-    and that value IS the row's `captured_at_utc` (bin/_cctally_record.py:2351,
-    :2633-2634, :6828), `_backfill_five_hour_blocks` takes them from its MIN- and
-    MAX-captured rows, `five_hour_block_close` freezes the row, and
-    `_migration_merge_5h_block_duplicates_v1` copies from the MAX-captured group
-    row. Every snapshot row carries all four week columns. So a row whose
-    `captured_at_utc` equals an axis instant NAMES the week in force at that
-    capture, with no date-range guess involved.
-
-    HELD ROWS ARE NOT EXCLUDED, which is the one judgement call in this function.
-    The rest of this tranche excludes `weekly_observation_held = 1` from weekly
-    VALUE reads, because a held row carries a reading no fresh observation
-    confirmed. This function reads no value: it reads which week the value on the
-    block's axis came from, and on a held tick that is the BASIS week by
-    construction — the held write copies the basis's four week columns verbatim
-    while keeping the tick's own `capture_at` (bin/_cctally_record.py:7190-7203),
-    and the block's axis takes `fold.weekly.effective_pct`, the same
-    carried-forward value, stamped with that same `capture_at`. The held row is
-    therefore the provenance record of the number on the axis, and the credits
-    that retired that number are the basis week's.
-
-    Two consequences follow. A held row is exactly how a pre-credit weekly value
-    reaches a post-credit capture instant, which is the case this whole tranche
-    exists to handle, and excluding it would drop the only exact evidence of which
-    week's floor applies. And because no predicate names
-    `weekly_observation_held`, a store that stops short of epoch 1015 is served
-    unchanged and `weekly_held_exclusion` is not needed here. Pinned by
-    `tests/test_five_hour_breakdown.py::test_835_r9_a_held_capture_record_names_the_basis_week_it_carried`
-    and `::test_835_r9_a_pre_column_store_resolves_the_capture_record`.
-
-    THE SET IS BOUNDED BY THE ACCOUNT'S BLOCK COUNT, NOT BY ITS SNAPSHOT HISTORY,
-    and the form was chosen on measurement rather than on shape. Re-measured at Gate
-    A R10, because R10 replaced `_account_axis_weeks`' grouped query with a plain
-    `SELECT DISTINCT` and the earlier round's figures for that statement no longer
-    described what ships. All three were timed in ONE session on a 25,194-row,
-    13-week, 50-block store — the store `_account_axis_weeks` documents its own
-    numbers against — best of five each, with the order reversed to rule out
-    page-cache bias:
-
-      - this narrowed query: 2.10-2.27 ms, 50 rows, `SCAN weekly_usage_snapshots`
-        plus a `LIST SUBQUERY` that SEARCHes `five_hour_blocks` on its own index;
-      - `_account_axis_weeks`' `SELECT DISTINCT`: 2.06-2.13 ms, 13 rows;
-      - one ungrouped full-row scan serving BOTH passes from a single statement:
-        14.18-14.38 ms, 25,194 rows, a bare `SCAN weekly_usage_snapshots`.
-
-    So the two statements together cost 4.40 ms against the single statement's
-    14.18 ms and retain 63 rows against 25,194 — a 400th. Two statements per account
-    per render is the cheaper form on both axes, and it keeps the property that
-    matters: the cost is CONSTANT in the number of rendered blocks. Bounded by the
-    account's own `five_hour_blocks` rows rather than by which of them this render
-    shows, which is why no instant range has to be threaded down from the caller.
-
-    TWO EARLIER ROUNDS DISAGREED ABOUT THE SINGLE-STATEMENT FIGURE — this docstring
-    said 22.03 ms and `docs/five-hour-gotchas.md` said 21.97 ms for the same query on
-    the same store — and neither number survives, because both were taken against the
-    superseded grouped form of the week query. The figures above replace both rather
-    than reconciling them.
-
-    THE NARROWING AND THE MATCH USE DIFFERENT READERS, deliberately. SQLite's
-    `unixepoch()` selects the rows; `parse_iso_datetime(...).timestamp()` keys
-    them and keys the probe, so the match itself is Python's and is consistent
-    between map and probe. Both readers truncate to the second, which is how two
-    ISO spellings of one moment — `Z` against `+00:00` — compare equal.
-
-    A NAIVE STAMP IS A LIVE SHAPE, and the two readings of it differ. An earlier
-    form of this paragraph said no writer produces one, citing `now_utc_iso()`.
-    That is wrong: `_coerce_payload_captured_at` (bin/_cctally_record.py:6576-6585)
-    returns the PAYLOAD's `capturedAt` verbatim whenever `parse_iso_datetime`
-    accepts it, `parse_iso_datetime` accepts a naive string and reads it host-local,
-    and `insert_usage_snapshot` then stores that text. Driven with
-    `TZ=America/Los_Angeles`: a payload `capturedAt` of `2026-04-30T13:00:00` is
-    stored as `captured_at_utc = '2026-04-30T13:00:00'`, and `unixepoch()` reads it
-    1777554000 against Python's 1777579200.
-
-    THE FAILURE IS A MIXED PAIR, NOT A NAIVE STAMP, AND IT IS THE MATCH THAT MISSES
-    RATHER THAN THE NARROWING THAT EXCLUDES. The same earlier paragraph stated it
-    the other way round. Each reader is self-consistent across the two sides it
-    compares, so the spelling only matters when the snapshot stamp and the block
-    stamp are spelled DIFFERENTLY. All four pairings, driven on that same non-UTC
-    host: equal naive text narrows IN and the Python match HITS; `Z` against
-    `+00:00` narrows IN and HITS; naive against offset-carrying, in either
-    direction, narrows IN and the PYTHON MATCH MISSES, after which the instant falls
-    through to the two fallback passes.
-
-    SO THE RESIDUAL IS NARROWER THAN A NAIVE STAMP'S EXISTENCE. Every one of the
-    four axis writers takes the block stamp from a `weekly_usage_snapshots` row's
-    own `captured_at_utc` text — the live upsert from `saved["capturedAt"]`, the
-    backfill from its MIN- and MAX-captured rows, the close from the frozen row, the
-    merge migration from the MAX-captured group row — so the pair the capture pass
-    compares always shares a spelling and the pass is correct on a naive store. A
-    mixed pair needs the two texts to diverge after both were written, which is a
-    hand-built or externally-edited store. The degradation is then a fallback rather
-    than a misclassification, which is the one part of the earlier paragraph that
-    held.
-    """
-    if account_key in cache:
-        return cache[account_key]
-    try:
-        rows = conn.execute(
-            "SELECT captured_at_utc, week_start_date, week_start_at, week_end_at "
-            "  FROM weekly_usage_snapshots "
-            " WHERE account_key = ? "
-            "   AND unixepoch(captured_at_utc) IN ("
-            "        SELECT unixepoch(first_observed_at_utc) "
-            "          FROM five_hour_blocks WHERE account_key = ? "
-            "        UNION "
-            "        SELECT unixepoch(last_observed_at_utc) "
-            "          FROM five_hour_blocks WHERE account_key = ?)",
-            (account_key, account_key, account_key),
-        ).fetchall()
-    except sqlite3.DatabaseError:
-        rows = []
-    carried: dict = {}
-    for r in rows:
-        try:
-            second = int(parse_iso_datetime(
-                r["captured_at_utc"], "captured_at_utc").timestamp())
-        except (ValueError, TypeError):
-            continue
-        lo, _hi = _parsed_week_bounds(r["week_start_at"], r["week_end_at"])
-        identity = (
-            r["week_start_date"],
-            r["week_start_at"] if lo is not None else None,
-            r["week_end_at"] if lo is not None else None,
-        )
-        # A dict as an ordered set: two rows of one week at one instant are one
-        # identity, and `_credit_retirement_bands` would answer both alike.
-        carried.setdefault(second, {})[identity] = None
-    out = {second: tuple(ids) for second, ids in carried.items()}
-    cache[account_key] = out
-    return out
-
-
-def _account_axis_bounds_by_start_date(weeks):
-    """``{week_start_date -> that week's bounds-carrying identities}``, from an
-    already-loaded `_account_axis_weeks` set.
-
-    #834 S1 (#835) Gate A R10. The index the capture pass substitutes from when its
-    matched row carries no bounds of its own. Derived from the account's OWN week
-    set and nothing else, which is the property that separates it from
-    `_get_canonical_boundary_for_date`; built once per account per render, so the
-    substitution adds no query and no per-instant scan.
-
-    Bounds-free weeks are absent by construction: an entry exists only for a
-    `week_start_date` some row of that account spells bounds for, which is exactly
-    the condition under which a substitution is possible.
-    """
-    out: dict = {}
-    for week in weeks:
-        if week.lo is None:
-            continue
-        out.setdefault(week.week_start_date, {})[
-            (week.week_start_date, week.week_start_at, week.week_end_at)] = None
-    return {date: tuple(ids) for date, ids in out.items()}
-
-
-def _block_weekly_axis_weeks(conn, *, account_key, instant_iso, cache):
-    """Every week identity whose credits can have retired a value captured at
-    ``instant_iso`` under ``account_key``, as ``(week_start_date, week_start_at,
-    week_end_at)`` triples. Empty when no week names the instant.
-
-    THREE PASSES, IN THIS ORDER: the CAPTURE pass matches the instant against the
-    `captured_at_utc` of the account's own snapshot rows and answers from the week
-    those rows name; the EPOCH pass places the instant inside a week's parsed
-    `[week_start_at, week_end_at)` bounds; the DATE pass asks which bounds-free
-    weeks declare the instant's calendar day. Each runs only when the one before it
-    resolved nothing.
-
-    THE CAPTURE PASS IS EXACT ABOUT WHICH WEEK, AND IT REPLACED AN ARGUMENT THAT
-    WAS WRONG. Gate A R8 had only the other two, and round five defended the
-    over-withholding they cause on the premise that the store keeps no record of
-    which week a capture was observed under. It keeps exactly that record: every
-    axis stamp on a block IS some snapshot row's `captured_at_utc`, and that row
-    carries all four week columns — see `_account_axis_capture_weeks`, which also
-    records why held rows are consulted rather than excluded. So for an instant a
-    capture record carries there is no week to guess, and neither fallback runs.
-
-    BEING EXACT ABOUT THE WEEK IS NOT THE SAME AS RESOLVING BOTH LEGS, which an
-    earlier form of this paragraph left unsaid while the date pass's own paragraphs
-    below state it carefully. `week_start_at` and `week_end_at` are nullable on the
-    matched row too, and `_credit_retirement_bands`' `week_reset_events` leg is
-    scoped purely by containment of `effective_reset_at_utc` in
-    ``[week_start_at, week_end_at)`` — that table has no `week_start_date` column at
-    all — so an identity carrying no bounds resolves the `weekly_credit_floors` leg
-    and NOT the automatic one. Through R9 that degradation combined with this pass's
-    precedence into the tranche's own defect class: a bounds-free capture row
-    pre-empted a bounds-carrying placement of the SAME week and the value an
-    automatic credit retired was published. R10 closes it by SUBSTITUTING the
-    account's own bounds (next paragraph), so the per-leg behaviour now is that both
-    legs resolve whenever any row of the named week carries parseable bounds, and
-    the manual leg alone when none does.
-
-    A BOUNDS-FREE CAPTURE IDENTITY IS REPLACED BY THE ACCOUNT'S OWN BOUNDS-CARRYING
-    ROWS OF THE SAME `week_start_date`, and the substitution is lossless. Those rows
-    are already in memory from `_account_axis_weeks`, so no query is added. It is
-    lossless because every substituted identity shares the bounds-free one's
-    `week_start_date`, so each resolves a `weekly_credit_floors` leg identical to the
-    one it replaces and ADDS the automatic leg its bounds can scope; the replaced
-    identity therefore contributes no band the substitutes do not. Several of them
-    are unioned, the way the epoch pass unions overlapping candidates, and that
-    union is here FOR ROBUSTNESS rather than for a reachable shape: no writer is
-    known to put two bound pairs under one `week_start_date`. What pins one pair per
-    date is `_usage_snapshot_columns` (bin/_cctally_record.py:6698-6710), which
-    overrides every later row's derived bounds with `_get_canonical_boundary_for_date`
-    — the FIRST established pair for that date, `ORDER BY captured_at_utc ASC, id ASC
-    LIMIT 1` — so a sub-day re-anchoring is overridden back to the first pair, and a
-    day-scale one lands under a DIFFERENT `week_start_date` because the date derives
-    from the payload's own week start. No code change is owed either way, because
-    `named.update(dict.fromkeys(… or (identity,)))` already handles one through N.
-    Two earlier forms of this sentence cited a producer and both were false. Do NOT
-    cite the timezone fork: it produces the INVERSE shape, identical bounds under two
-    different `week_start_date` values (see the two-identities paragraph below),
-    which puts one identity under each date rather than two under one. Do NOT cite
-    the boundary-shift branch of `_backfill_week_reset_events`
-    (bin/_cctally_weekrefs.py) either: it writes only `week_reset_events` and never
-    the snapshot bounds this substitution reads, and its reset test needs THREE
-    signals rather than the two an earlier form named — the boundary shifted, the
-    prior boundary was still in the future, AND `_is_reset_drop(prior_pct, cur_pct,
-    allow_reset_to_zero=False)`, which with the zero leg off is the >=25pp drop
-    (`bin/_cctally_weekrefs.py:625-637`).
-
-    CONTAINMENT OF THE INSTANT IS DELIBERATELY NOT REQUIRED OF A SUBSTITUTE, and
-    requiring it would reopen the defect on the shape this tranche exists for. A
-    HELD row carries the BASIS week's four columns with the tick's own capture
-    stamp, so a held tick after the week's end names a week whose bounds do not
-    contain its own capture instant. Filtering substitutes by containment would
-    decline to enrich exactly there.
-
-    THAT GENERALITY IS WIDER THAN THE HELD-ROW ARGUMENT NEEDS, and the excess is a
-    stated limit rather than a defended choice. The held-row shape requires only that
-    containment of the CAPTURE instant not be required. Nothing here additionally
-    requires a substitute's bounds to be consistent with the `week_start_date` they
-    are filed under, so a same-date row spelling bounds that start a week early lets
-    the `week_reset_events` leg admit a reset belonging to the PREDECESSOR week, and
-    the value is withheld although no credit of the named week retired it. No writer
-    produces a date/bounds inconsistency of that size, so the shape needs a
-    hand-built or externally-edited store; the narrower rule that would close it is
-    to require the substitute's `week_start_at` UTC date to sit within a day of
-    `week_start_date`, and it is not taken because the reachable benefit is nil and a
-    date/bounds tolerance is one more constant to get wrong.
-
-    NOTHING WIDER THAN THE ACCOUNT'S OWN ROWS IS CONSULTED.
-    `_get_canonical_boundary_for_date` (bin/_cctally_weekrefs.py:51) is the repo's
-    canonical-bounds reader and the obvious candidate, and it carries no
-    `account_key` predicate: it returns the EARLIEST bounds-carrying row for a
-    `week_start_date` across every account. On a multi-account store that does not
-    merely attach the wrong provenance, it fails to fix the defect, because another
-    account's re-anchored bounds cannot scope THIS account's credit — driven and
-    pinned by
-    `tests/test_five_hour_breakdown.py::test_835_r10_the_substitution_takes_the_accounts_own_bounds_not_another_accounts`.
-
-    ONE RESIDUAL SURVIVES, AND IT IS PRE-EXISTING RATHER THAN INTENDED. When NO row
-    of the named week carries parseable bounds there is nothing account-scoped to
-    substitute, so an automatic credit in that week is structurally invisible to
-    this filter and the value it retired is published. Closing it needs a source of
-    a week's bounds outside the account's own snapshot rows, and the paragraph above
-    says why the one that exists is not usable. Pinned, as a gap rather than as
-    correct behaviour, by the second half of
-    `::test_835_r10_a_bounds_free_capture_record_resolves_the_weeks_automatic_credit`.
-
-    A CAPTURE INSTANT CARRIED BY TWO WEEK IDENTITIES RETURNS BOTH. No tie-break is
-    invented for it and the caller's union withholds if either week retired the
-    value, which is this subsystem's established direction and what both fallback
-    passes do as well. The shape is not hypothetical: bin/_cctally_record.py:6601-6614
-    records a host briefly running the wrong timezone forking ONE physical week's
-    `week_start_date` across 18 rows, and `weekly_credit_floors` matches
-    `week_start_date` by equality, so a floor can sit under one fork and not the
-    other.
-
-    #834 S1 (#835) Gate A S1. `five_hour_blocks` carries no week columns, and the
-    retirement bands need all three: the `weekly_credit_floors` leg matches
-    `week_start_date` by equality and the `week_reset_events` leg is scoped by the
-    week's bounds. The week is therefore resolved from the account's own snapshot
-    rows, whose `week_start_at` / `week_end_at` are the same bounds
-    `_credit_retirement_bands` is written against.
-
-    The comparison is on PARSED epochs rather than on text, for the reason every
-    SQL site in this area wraps both sides in ``unixepoch()``: `block_start_at` is
-    host-local while `week_start_at` is `+00:00`, so a lexicographic compare would
-    mis-order them.
-
-    THE TWO LEGS DEGRADE INDEPENDENTLY, the way `_credit_retirement_bands`' own two
-    legs already do (#834 S1 Gate A R8). `week_start_at` and `week_end_at` are both
-    nullable and `_derive_week_from_payload` leaves them ``None`` on three of its
-    four paths, so a week with no bounds is a live shape. Gate A S1 required both
-    bounds and resolved NOTHING without them, which threw away a leg it could still
-    answer: the `weekly_credit_floors` leg matches on `week_start_date` alone, and
-    `week_start_date` / `week_end_date` are `TEXT NOT NULL`. So a bounds-free week
-    is placed by DATE instead and returned with ``None`` bounds, which resolves the
-    manual-credit leg and skips the `week_reset_events` leg — exactly what
-    `_credit_retirement_bands` does with absent bounds.
-
-    A bounds-carrying week outranks a bounds-free one, so the date pass runs only
-    when the epoch pass places the instant nowhere. The
-    date window is INCLUSIVE of `week_end_date`, because the usual bounds-free week
-    carries the week's LAST DAY there: `_derive_week_from_payload`'s third path
-    writes `week_start_date + 6 days` and its fourth derives the same through
-    `compute_week_bounds`. THE TWO READINGS DO MEET, which an earlier form of this
-    docstring denied. `_derive_week_from_payload`'s second path takes both dates
-    from the payload verbatim behind nothing but a `weekEndDate >= weekStartDate`
-    check, and `_account_axis_weeks` sends a week down this pass when its bounds are
-    present but UNPARSEABLE, where `week_end_date` came from the bounds-carrying
-    writer and is the exclusive boundary's date by construction. Either shape puts
-    one calendar day inside two weeks' inclusive ranges.
-
-    SO THE DATE PASS RETURNS EVERY CANDIDATE THAT CONTAINS THE DAY AND PICKS NONE,
-    and the caller unions their bands. Two single-choice rules were tried and each
-    published a retired value on the mirror image of the shape it fixed. Rank order
-    placed an instant in the PREDECESSOR whenever the predecessor's newest snapshot
-    row was the newer of the two. Preferring the greatest `week_start_date` fixed
-    that and broke the case where the floor sits on a LONGER declared week
-    `2026-04-20..2026-05-04` beside an uncredited `2026-04-27..2026-05-04` — the
-    exact shape whose existence is the argument against a seven-day window, so the
-    prohibition and that repair rested on one premise pointing opposite ways. No
-    reading of one week's own columns separates two candidates that both declare the
-    day, so choosing is a guess in either direction and consulting all of them is
-    not.
-
-    NEITHER FALLBACK PASS HAS A TIE-BREAK ANY MORE. Both return every candidate they
-    place the instant in, and the caller unions the bands. Through Gate A R8 the
-    epoch pass returned ONE week — the one whose group held the newest
-    `(captured_at_utc, id)`, which is what the since-removed `rk` aggregate ordered
-    by — justified by the claim that the newest anchoring is the best available
-    evidence of which window was in force at capture. That claim is vacuous on the shape that makes overlapping
-    bounds-carrying anchorings reachable at all: bin/_cctally_record.py:6601-6614
-    records a host running the wrong timezone for seven minutes forking ONE physical
-    week's `week_start_date` across 18 rows, and those two anchorings carry
-    IDENTICAL bounds and differ only in the column `weekly_credit_floors` is keyed
-    on. Both anchorings are the same window, so there is no "which window was in
-    force" to answer, and a newest-anchoring choice decides only which of two
-    spellings of one week's floors gets consulted. It also inverts the claim's own
-    logic: where two anchorings genuinely differ, that tie-break publishes the
-    loser's retired value rather than withholding it.
-
-    The two passes still differ in PRECEDENCE, deliberately. The epoch pass has real
-    half-open boundaries to test an instant against, so every candidate it keeps
-    genuinely contains the instant; the date pass has no boundaries, only two date
-    columns of which a live writer fills one with the EXCLUSIVE boundary's date, so
-    "contains the day" there does not mean "belongs to the week". A bounds-carrying
-    placement is therefore the more precise one and pre-empts the date pass
-    entirely. Pinned by
-    `tests/test_five_hour_breakdown.py::test_835_r9_the_epoch_pass_unions_every_bounds_carrying_week_it_contains`
-    and `::test_835_r8_a_bounds_carrying_week_outranks_a_bounds_free_one`.
-
-    THE DATE PASS'S UNION OVER-WITHHOLDS, AND THAT RESIDUAL IS SMALLER THAN ROUND
-    FIVE'S. When an instant genuinely belongs to an uncredited candidate and an
-    overlapping candidate was credited, the union withholds a value no credit ever
-    retired. Round five paid that on EVERY block observed on a week-boundary day,
-    because `cmd_record_usage` writes `week_end_date = week_start_date + 7 days` —
-    the exclusive boundary's date — while this pass compares inclusively, so every
-    pair of adjacent weeks shares one calendar day. The capture pass now answers
-    every such instant some snapshot row carries, which is the ordinary case, and
-    what is left is an instant NO capture record carries on a store whose weeks have
-    no parseable bounds.
-
-    The direction is the conservative one — an unavailable marker in preference to a
-    number a credit retired — and both fallback passes now take it. It is still not
-    the direction EVERY fork in this change takes: an empty result resolves no bands
-    and publishes the raw value, which is the pre-#835 disposition kept on purpose.
-    `::test_835_r8_the_union_withholds_an_uncredited_weeks_own_value` pins the trade
-    rather than leaving a later reader to find it and read it as a defect, and
-    `::test_835_r9_a_capture_record_resolves_the_week_a_shared_boundary_day_withheld`
-    pins the boundary-day case that no longer pays it.
-
-    A SEVEN-DAY WINDOW OFF `week_start_date` IS STILL NOT AN ALTERNATIVE. It assumes
-    every bounds-free week is seven days long, and the second payload path can
-    declare a longer one, whose tail a seven-day window would place NOWHERE —
-    withdrawing the manual-credit leg this pass exists to resolve. It also buys
-    nothing on the weeks whose `week_end_date` is computed rather than declared: the
-    third path and `compute_week_bounds` both write `week_start_date + 6 days`, and
-    `cmd_record_usage` writes `week_end_date` exactly `week_start_date + 7 days`, so
-    over those rows a seven-day exclusive window and this inclusive one name the
-    same days and neither separates two overlapping candidates.
-
-    ONE DIRECTION IS BOUNDED BY `cmd_record_credit`, AND THE OTHER IS NOT. That
-    command refuses without a canonical weekly boundary and always writes a
-    bounds-carrying synthetic snapshot of its own, so a manually credited week
-    normally has at least one row with bounds — which bounds the direction where a
-    credited week is reachable ONLY through the date pass. It does not bound the
-    opposite direction, the one round five introduced: that same credited week's
-    OTHER rows still form a bounds-free candidate group, because `week_end_date`
-    joins the grouping, so an instant in an adjacent bounds-free week still picks up
-    the credited week's floor and over-withholds. Do not read the synthetic snapshot
-    as bounding both.
-
-    EMPTY when no week names the instant on any pass. That resolves no bands and
-    therefore withholds nothing, which is the pre-#835 behaviour.
-
-    ``cache`` IS THE OUTER RENDER CACHE, NOT A WEEK MEMO, AND IT CHANGED SHAPE
-    SILENTLY AT GATE A R8. Gate A S1 passed a dict this function used directly as
-    ``{(account_key, instant_iso) -> weeks}``. It now carves its own sub-dicts out
-    of the dict the caller owns, and that dict is the same one
-    `_credit_aware_block_weekly_axes` carves `__bands` out of, so FOUR reserved
-    keys share one namespace:
-
-      ``__weeks``    `{account_key -> [_AxisWeek]}`, `_account_axis_weeks`' memo
-      ``__stamps``   `{account_key -> {second -> identities}}`, the capture records
-      ``__by_date``  `{account_key -> {week_start_date -> identities}}` (R10)
-      ``__bands``    `{(week, account_key) -> bands}`, owned by the caller
-
-    A caller passing the OLD shape is not detected and does not raise: every
-    `setdefault` above finds no reserved key, creates a fresh sub-dict, and the
-    pre-existing entries are simply never read. The failure is therefore a silent
-    loss of memoization — one extra pair of queries per account per render, the cost
-    the per-account load exists to remove — and never a wrong answer, because
-    nothing reads a key it did not write. The leading double underscore is what
-    keeps the two populations apart: an `account_key` is either a 32-character
-    lowercase sha256 prefix (`digest.hexdigest()[:32]`, bin/_lib_accounts.py:10,
-    :63 and :70) or the literal `unattributed` (bin/_lib_accounts.py:41), so none of
-    the four names can collide with one.
-
-    EVERY PASS IS GATED ON `_account_axis_weeks` SUCCEEDING, the capture pass
-    included, and that coupling is deliberate. It looks gratuitous, because NEITHER
-    QUERY'S COLUMN DEPENDENCY CONTAINS THE OTHER'S, so in principle a store that
-    fails one could answer the other. The week query reads `week_start_date`,
-    `week_end_date`, `week_start_at` and `week_end_at`; the capture query reads
-    `captured_at_utc`, `week_start_date`, `week_start_at` and `week_end_at`, plus
-    `first_observed_at_utc` and `last_observed_at_utc` from a SECOND table,
-    `five_hour_blocks`. So the divergence has two directions — a store carrying the
-    bounds without `week_end_date`, and one carrying `week_end_date` without
-    `captured_at_utc` or without the block table — and the claim that the capture
-    query's dependency was strictly smaller was FALSE WHEN WRITTEN in R10, because
-    the capture query has read a second table since R9. Two earlier statements of
-    this are withdrawn: the claim was authored by `f32554505`, which is later than
-    `df80ca1dd` that removed the week query's aggregate, so it cannot have "stopped
-    being true" in that round; and it was never true, because the capture query has
-    selected `first_observed_at_utc` / `last_observed_at_utc` from `five_hour_blocks`
-    since `9690c0fae`. Three reasons the gate is kept:
-
-      - The divergence is unreachable. `week_end_date` is `TEXT NOT NULL` in the
-        base `CREATE TABLE` (bin/_cctally_core.py:2127) and no migration adds it, so
-        no cctally store has the other four columns without it. The legacy shape
-        `bin/build-doctor-fixtures.py` builds lacks `week_start_at` / `week_end_at`
-        as well, so BOTH queries fail on it together.
-      - An empty week set from the ordinary cause — the account has no snapshot rows
-        — implies an empty capture map, because the capture query reads the same
-        table filtered on the same `account_key`.
-      - Since R10 the capture pass READS `weeks`, to build the substitution index
-        `_account_axis_bounds_by_start_date` returns, so running it without them
-        degrades it to returning bounds-free identities unenriched.
-
-    THAT THIRD REASON IS NOT THAT DECOUPLING WOULD BUY NOTHING. An unenriched
-    bounds-free identity still resolves the `weekly_credit_floors` leg, and the empty
-    tuple resolves neither leg, so on a store where the week query failed and the
-    capture query succeeded, decoupling WOULD buy the manual leg. What makes the gain
-    unreachable is reason 1, not any equivalence between the two dispositions. The
-    gate is kept because the divergence cannot occur on a store any cctally version
-    created, and decoupling would add a second exit path to reason about for a gain
-    no store can realise. If a future store shape makes the divergence real, the fix
-    is to run the capture pass first and gate only the two fallback passes.
-    """
-    weeks = _account_axis_weeks(
-        conn, account_key=account_key, cache=cache.setdefault("__weeks", {}))
-    if not weeks:
-        # EVERY pass is gated on the week load, the capture pass included. See the
-        # docstring: the coupling is deliberate and, since R10, load-bearing.
-        return ()
-    try:
-        instant = parse_iso_datetime(instant_iso, "axis_instant")
-    except (ValueError, TypeError):
-        return ()
-    moment = instant.timestamp()
-    # PASS 1 — the capture record. Truncated to the second on both sides, matching
-    # the `unixepoch()` the narrowing query uses; see `_account_axis_capture_weeks`.
-    carried = _account_axis_capture_weeks(
-        conn, account_key=account_key,
-        cache=cache.setdefault("__stamps", {})).get(int(moment))
-    if carried:
-        # A bounds-free matched row names the week but cannot scope the
-        # `week_reset_events` leg, and this pass pre-empts the epoch pass, so
-        # substitute the SAME week's bounds as this account's OWN other rows spell
-        # them — see the docstring for why the substitution is lossless, why
-        # containment is not required of a substitute, and what residual survives.
-        named: dict = {}
-        for identity in carried:
-            if identity[1] is not None:
-                named[identity] = None
-                continue
-            by_date = cache.setdefault("__by_date", {})
-            if account_key not in by_date:
-                by_date[account_key] = _account_axis_bounds_by_start_date(weeks)
-            # Built once per account from the already-loaded week set, so the
-            # substitution costs no query and no per-instant scan.
-            named.update(dict.fromkeys(
-                by_date[account_key].get(identity[0]) or (identity,)))
-        return tuple(named)
-    # PASS 2 — containment in a week's parsed half-open bounds. A dict as an
-    # ordered set throughout: the caller's union is order-insensitive, so the
-    # order these are visited in carries no meaning, and membership must not be a
-    # linear scan.
-    found: dict = {}
-    for week in weeks:
-        if week.lo is not None and week.lo <= moment < week.hi:
-            found[(week.week_start_date, week.week_start_at, week.week_end_at)] = (
-                None)
-    if found:
-        return tuple(found)
-    # PASS 3 — the instant's calendar day against the bounds-free weeks' declared
-    # date ranges. `.astimezone(utc)` before `.date()` for
-    # `_derive_week_from_payload`'s own reason: `parse_iso_datetime` ends in
-    # `.astimezone()`, so on a host whose offset puts the moment on another calendar
-    # date a bare `.date()` would place the instant in the wrong week. EVERY
-    # candidate that declares the day, with no preference among them — see the
-    # docstring for why no preference can be grounded here and what the union costs.
-    day = instant.astimezone(dt.timezone.utc).date().isoformat()
-    for week in weeks:
-        if week.lo is not None:
-            continue
-        # Both columns are `TEXT NOT NULL`, so a None here is a store nobody can
-        # place; skip it rather than raise comparing a string to None.
-        if week.week_start_date is None or week.week_end_date is None:
-            continue
-        if week.week_start_date <= day <= week.week_end_date:
-            # `week_end_date` is in `_account_axis_weeks`' DISTINCT projection, so
-            # two rows differing only there are two candidates carrying ONE identity.
-            # The bands would be identical, so the duplicate is dropped rather than
-            # resolved twice.
-            found[(week.week_start_date, None, None)] = None
-    return tuple(found)
-
-
 def _credit_aware_block_weekly_axes(conn, block, *, now_utc, cache=None):
-    """A block's two weekly axes, with a credit-RETIRED value replaced by ``None``.
+    """A block's two stored weekly axes,
+    ``(seven_day_pct_at_block_start, seven_day_pct_at_block_end)``.
 
-    #834 S1 (#835) Gate A S1. THE ONE READ-TIME FILTER for
-    `five_hour_blocks.seven_day_pct_at_block_start` and
-    `seven_day_pct_at_block_end`, called by `cmd_five_hour_blocks` and
-    `cmd_five_hour_breakdown` so the two cannot diverge.
-
-    WHY READ TIME, AND WHY A WRITE-TIME FILTER CANNOT SUBSTITUTE. A credit can
-    retire a value AFTER the block row was written — that is the ordinary case,
-    because the live upsert writes the block's weekly end on every tick while the
-    block is open and the credit fires later — so no write-time pass can ever be
-    sufficient. FOUR writers store these columns, not three: the live upsert in
-    bin/_cctally_record.py, `five_hour_block_close`'s frozen harvest in
-    bin/_cctally_journal.py, `_backfill_five_hour_blocks` below, and
-    `_migration_merge_5h_block_duplicates_v1` in bin/_cctally_db.py, which writes
-    `seven_day_pct_at_block_end` from the group row whose `last_observed_at_utc` is
-    MAX. The migration was omitted from the original count; the argument is
-    unaffected, because it also stores what was observed, but the number was
-    documented and wrong. All four store what the fold OBSERVED; this one read
-    decides what a credit retired may still be shown. Making one writer
-    credit-aware instead would also break
-    rebuild convergence, because the store would then hold a number where a
-    rebuilt store holds `NULL` and `tests/test_rederive_command.py` compares
-    exactly these two columns across a rebuild.
-
-    EACH AXIS IS COMPARED AGAINST THE INSTANT THAT AXIS'S VALUE WAS CAPTURED AT,
-    never against a boundary of the block: the start against
-    `_block_weekly_start_instant` (`first_observed_at_utc`), the end against
-    `_block_weekly_end_instant` (`last_observed_at_utc`). Gate A S1 used the block's
-    own boundary stamps instead and that was wrong in both directions — see those
-    two helpers. The rule separates the three positions a block's OBSERVATIONS can
-    hold relative to a credit floor. Observations entirely BEFORE the floor render
-    both stored values, because they genuinely were effective while the block ran
-    and withholding them would destroy historical truth. Observations SPANNING the
-    floor render the start and withhold a retired end. Observations entirely AFTER
-    the floor withhold both, which is the shape a post-credit replay at the retired
-    value produces.
-
-    The bands come from the block's OWN week and `account_key` — a credit under
-    one account retires nothing under another, and a crossed-reset block's two
-    axes legitimately resolve two different weeks.
-
-    ``cache`` is an optional dict shared across a multi-row render, and it holds
-    FOUR reserved keys in ONE namespace: this function's own ``__bands``, resolved
-    once per `(week, account_key)`, plus the ``__weeks``, ``__stamps`` and
-    ``__by_date`` that `_block_weekly_axis_weeks` carves out of the same dict. That
-    function's docstring states each one's shape and what happens to a caller who
-    passes the pre-R8 shape, which is a silent loss of memoization rather than a
-    wrong answer. Together they hold the account's whole week set, the capture
-    records of that account's block axis stamps, the per-`week_start_date` index of
-    bounds-carrying identities, and the bands. Each axis instant is then resolved
-    against the loaded sets in memory, so the number of queries does not grow with
-    the number of rendered blocks. The caller owns the dict and it must not outlive
-    the connection.
-    """
-    _c = _cctally()
-    p_start = block.get("seven_day_pct_at_block_start")
-    p_end = block.get("seven_day_pct_at_block_end")
-    if p_start is None and p_end is None:
-        return None, None
-    if cache is None:
-        cache = {}
-    bands = cache.setdefault("__bands", {})
-    account_key = block.get("account_key") or _lib_accounts.UNATTRIBUTED
-    out = []
-    for value, instant in (
-        (p_start, _block_weekly_start_instant(block)),
-        (p_end, _block_weekly_end_instant(block, now_utc=now_utc)),
-    ):
-        if value is None or not instant:
-            out.append(value)
-            continue
-        week_ids = _block_weekly_axis_weeks(
-            conn, account_key=account_key, instant_iso=instant, cache=cache)
-        if not week_ids:
-            out.append(value)
-            continue
-        # THE UNION OF EVERY CANDIDATE WEEK'S BANDS, so a value any one of them
-        # retired is withheld. One bounds-carrying week is one candidate; several
-        # bounds-free ones are several, because nothing in their own columns says
-        # which of them an instant belongs to. Each is still resolved by
-        # `_credit_retirement_bands` from its OWN triple, so the per-leg
-        # degradation is unchanged: a bounds-free candidate contributes its
-        # `weekly_credit_floors` leg and no `week_reset_events` leg, which cannot
-        # be scoped without bounds. The memo stays per `(week, account_key)`, so
-        # overlapping candidates shared across blocks resolve once each.
-        merged: list = []
-        for week in week_ids:
-            bk = (week, account_key)
-            if bk not in bands:
-                bands[bk] = _c._credit_retirement_bands(
-                    conn, week_start_date=week[0], week_start_at=week[1],
-                    week_end_at=week[2], account_key=account_key)
-            merged.extend(bands[bk])
-        out.append(
-            None if _c._weekly_value_is_retired_replica(
-                merged, captured_at_utc=instant, weekly_percent=value)
-            else value)
-    return out[0], out[1]
+    #840 (spec section 4.8). #835 replaced a value within a point of one a
+    credit retired with ``None`` here, which also withheld every genuine climb
+    back to that value; the retirement band is removed. Stale contributors are
+    refused before publication (spec section 4.4), and a value already
+    poisoned in a store is corrected by `db rederive`'s reviewed `retract`,
+    never by a percentage heuristic. The name, the signature and the callers
+    (`cmd_five_hour_blocks`, `cmd_five_hour_breakdown` and the dashboard's
+    block envelope) are unchanged; ``conn``, ``now_utc`` and ``cache`` are no
+    longer read."""
+    return (block.get("seven_day_pct_at_block_start"),
+            block.get("seven_day_pct_at_block_end"))
 
 
 #: The six `five_hour_milestones` columns every surface already published, plus
 #: the joined EFFECTIVE weekly value. Ordering is `captured_at_utc, id` — spec
 #: §5.2's merged-stream order, which post-credit threshold repeats depend on.
-#: The five `s.*` columns after the joined weekly value are INTERNAL. They exist
-#: only so the credit retirement bands can be resolved against the JOINED ROW's
-#: own account and week, and they are aliased because `captured_at_utc` exists on
-#: both sides of the join. `_load_five_hour_milestones` builds its result dicts
-#: key by key, so none of them can reach a published shape.
 _FIVE_HOUR_MILESTONE_SQL = """
     SELECT m.percent_threshold, m.captured_at_utc, m.block_cost_usd,
            m.marginal_cost_usd, m.seven_day_pct_at_crossing, m.reset_event_id,
-           s.weekly_percent AS effective_seven_day_pct_at_crossing,
-           s.captured_at_utc AS snapshot_captured_at_utc,
-           s.week_start_date AS snapshot_week_start_date,
-           s.week_start_at   AS snapshot_week_start_at,
-           s.week_end_at     AS snapshot_week_end_at,
-           s.account_key     AS snapshot_account_key
+           s.weekly_percent AS effective_seven_day_pct_at_crossing
       FROM five_hour_milestones m
       LEFT JOIN weekly_usage_snapshots s ON s.id = m.usage_snapshot_id
      WHERE {selector}
@@ -2036,34 +1131,12 @@ def _load_five_hour_milestones(
     put the number this change exists to stop showing back on the screen,
     silently and only in the failure case.
 
-    **The joined value is itself CREDIT-AWARE** (#834 S1 Gate A R2). A plain
-    `LEFT JOIN` is not enough: `maybe_record_milestone` sets `usage_snapshot_id`
-    to the row the tick just wrote, and the FIVE-HOUR milestone is not gated off
-    on a weekly-clamped tick — only the weekly one is — so in a credited week the
-    milestone can name a HELD row carrying a pre-credit weekly value the credit
-    retired. Publishing that as the "effective" value would render the exact
-    number #836 exists to remove, on all three human surfaces, on a new read.
-
-    So the retirement bands are resolved against the JOINED ROW's own account and
-    week — never the reader's, because a credit under one account retires nothing
-    under another — memoized per `(week, account)` across the rows of one call, and
-    a retired joined value is published as None. The surfaces already render a None
-    as the unavailable marker, so no renderer changes, and the rule above still
-    holds: never a fallback to the raw value. (The memoization is this function's
-    own: it walks many rows spanning potentially several `(week, account)` pairs.
-    `_latest_seven_day_and_window` does NOT memoize, because its walk resolves the
-    scope, the bands and the floor once from the newest row and may not leave that
-    scope, so there is nothing to memoize per candidate. An earlier version of this
-    paragraph said it did.)
-
-    THE BAND IS APPLIED HERE WITHOUT R1's FLOOR BOUND, deliberately. That bound
-    exists because a WALK can descend past every post-floor row onto a pre-floor
-    one and return the pre-credit reading the band exists to suppress. This read
-    performs no walk: each milestone names exactly ONE snapshot row through
-    `usage_snapshot_id`, and a pre-floor row's weekly value genuinely WAS the
-    effective percentage at that crossing instant. Blanking it would delete
-    historical truth rather than protect the reader, which is the same reason the
-    block's pre-floor weekly axes render.
+    **The joined value is the snapshot's STORED value** (#840, spec section
+    4.8). #834 S1 Gate A R2 replaced a joined value within a point of one a
+    credit retired with None, which also withheld genuine readings at that
+    value; the retirement band is removed, and a value already poisoned in a
+    store is corrected by `db rederive`'s reviewed `retract`. A missing joined
+    snapshot still publishes None and never falls back to the raw value.
 
     SELECTOR. Exactly one of `block_id` or `five_hour_window_key` must be given.
     `block_id` is the precise form — `five_hour_milestones.block_id` names one
@@ -2094,29 +1167,10 @@ def _load_five_hour_milestones(
     rows = conn.execute(
         _FIVE_HOUR_MILESTONE_SQL.format(selector=selector), params,
     ).fetchall()
-    _c = _cctally()
-    bands_cache: dict = {}
     out: list[dict] = []
     for r in rows:
         eff = r["effective_seven_day_pct_at_crossing"]
         raw = r["seven_day_pct_at_crossing"]
-        if eff is not None:
-            band_key = (r["snapshot_week_start_date"],
-                        r["snapshot_week_start_at"],
-                        r["snapshot_week_end_at"],
-                        r["snapshot_account_key"])
-            if band_key not in bands_cache:
-                bands_cache[band_key] = _c._credit_retirement_bands(
-                    conn,
-                    week_start_date=r["snapshot_week_start_date"],
-                    week_start_at=r["snapshot_week_start_at"],
-                    week_end_at=r["snapshot_week_end_at"],
-                    account_key=r["snapshot_account_key"])
-            if _c._weekly_value_is_retired_replica(
-                    bands_cache[band_key],
-                    captured_at_utc=r["snapshot_captured_at_utc"],
-                    weekly_percent=eff):
-                eff = None
         out.append({
             "percent_threshold": int(r["percent_threshold"]),
             "captured_at_utc":   r["captured_at_utc"],
@@ -2818,16 +1872,24 @@ def _backfill_five_hour_blocks(
                    AND snapshots.five_hour_percent     IS NOT NULL
         """
         if only_missing:
+            # #997 D19: each account's latest qualifying snapshot comes from
+            # one ranking pass over the qualifying rows (O(n log n)). A
+            # correlated subquery here re-scanned and re-sorted the table per
+            # qualifying row (quadratic: 68.4 s on a 27,521-row store, past
+            # the rebuild's progress-gap bound). The partition groups NULL
+            # account keys as `IS` did; the ORDER BY is unchanged.
             keys_sql += (
-                "   AND snapshots.id = ("
-                "       SELECT latest.id"
-                "         FROM weekly_usage_snapshots AS latest"
-                "        WHERE latest.account_key IS snapshots.account_key"
-                "          AND latest.five_hour_window_key IS NOT NULL"
-                "          AND latest.five_hour_percent IS NOT NULL"
-                "        ORDER BY unixepoch(latest.captured_at_utc) DESC,"
-                "                 latest.id DESC"
-                "        LIMIT 1"
+                "   AND snapshots.id IN ("
+                "       SELECT id FROM ("
+                "           SELECT id, ROW_NUMBER() OVER ("
+                "                      PARTITION BY account_key"
+                "                      ORDER BY unixepoch(captured_at_utc) DESC,"
+                "                               id DESC"
+                "                  ) AS rn"
+                "             FROM weekly_usage_snapshots"
+                "            WHERE five_hour_window_key IS NOT NULL"
+                "              AND five_hour_percent IS NOT NULL"
+                "       ) WHERE rn = 1"
                 "   )"
                 "   AND NOT EXISTS ("
                 "       SELECT 1 FROM five_hour_blocks AS blocks"
@@ -2898,7 +1960,11 @@ def _backfill_five_hour_blocks(
         # See cctally-dev#87.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            for key, acct in keys:
+            for block_index, (key, acct) in enumerate(keys, 1):
+                if not block_index & 1023:
+                    # #997 D9: a rebuild's open-block projection reports
+                    # progress (throttled; a no-op without a progress sink).
+                    _lib_rebuild_progress.tick(blocks=block_index)
                 # The start row (the first writer, else the MIN-captured
                 # survivor) defines the immutable block boundary values
                 # (deterministic — picking "any in-window row" would be

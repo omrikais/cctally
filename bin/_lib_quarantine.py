@@ -9,8 +9,9 @@ Stdlib only. An entry's `id` takes one of two forms:
   the `NAME` of `bin/cctally-NAME-test` and `<case>` is one scenario of that
   harness's own case inventory (`bin/cctally-NAME-test --list-cases`).
 
-`bin/cctally-test-all`, `bin/_lib_merge_gate.py` and the quick gate read the
-list through this module; the scheduled CI quarantine leg calls its CLI. An
+`bin/cctally-test-all` (through `bin/_lib_test_selection.py`) and the quick
+gate read the list through this module, and so does the nightly broad run's
+quarantine leg (bin/cctally-suite-run). An
 absent list quarantines nothing (the public mirror may carry none); a list
 that exists but cannot be read raises QuarantineError, never "nothing listed".
 

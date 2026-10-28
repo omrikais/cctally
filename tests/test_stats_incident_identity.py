@@ -519,13 +519,14 @@ def test_corruption_heal_manifest_names_its_error_and_its_forensics_bundle(ns):
     _seed_live_index()
     _destroy_header_magic(pathlib.Path(_cctally_core.DB_PATH))
 
-    prior_spawn = _cctally_update._spawn_detached
-    _cctally_update._spawn_detached = lambda _command: True
+    prior_spawn = _cctally_update._spawn_detached_with_pid
+    _cctally_update._spawn_detached_with_pid = (
+        lambda _command, **_kw: os.getpid())
     try:
         with pytest.raises(_cctally_db.StatsHealDeferred):
             _cctally_core.open_db()
     finally:
-        _cctally_update._spawn_detached = prior_spawn
+        _cctally_update._spawn_detached_with_pid = prior_spawn
     assert _cctally_store.cmd_stats_corruption_heal_internal(
         types.SimpleNamespace()
     ) == 0

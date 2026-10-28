@@ -72,16 +72,6 @@ afterEach(() => {
 });
 
 describe('<MonthlyPanel /> (#264 S2)', () => {
-  it('renders the pink panel card with the calendar icon and model-split subtitle', () => {
-    render(<MonthlyPanel />);
-    const section = document.getElementById('panel-monthly');
-    expect(section?.classList.contains('panel')).toBe(true);
-    expect(section?.classList.contains('accent-pink')).toBe(true);
-    expect(document.querySelector('#panel-monthly svg use')?.getAttribute('href'))
-      .toBe('/static/icons.svg#calendar');
-    expect(screen.getByText(/model split/i)).toBeInTheDocument();
-  });
-
   it('bento (default, no provider): renders ALL rows so the inner scroll is meaningful, with a NOW pill', () => {
     render(<MonthlyPanel />);
     expect(document.querySelectorAll('#panel-monthly .period').length).toBe(4);

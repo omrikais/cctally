@@ -764,6 +764,124 @@ def test_a_fence_over_fewer_than_two_days_is_undefined():
     assert qm.eligibility_fence([]) is None
 
 
+def _one_ulp_up(fn):
+    """`fn` with every result moved one ULP toward +inf: a C library whose
+    `log1p` or `expm1` is faithfully but not correctly rounded."""
+    return lambda x: math.nextafter(fn(x), math.inf)
+
+
+#: The weighted daily units of an era-boundary population like quota
+#: fixture 12's, whose fence glibc 2.39 and macOS disagreed on.
+_FENCE_POPULATION = [8040000.62, 7712345.5, 8399001.25, 6950210.0,
+                     9120400.75, 8800123.0, 7300456.5, 8105000.0]
+
+
+def test_the_fence_does_not_depend_on_the_c_librarys_log1p_or_expm1(
+        monkeypatch):
+    # Mutation: computing the fence through `math.log1p` / `math.expm1`.
+    # Those call the platform C library, and glibc's are not correctly
+    # rounded: on glibc 2.39 `log1p(8040000.62)` is 15.899939842647665
+    # (correct ...667), which moved quota fixture 12's `eligibilityFence`
+    # from 3287421.1702318075 on macOS to ...796 on Linux. A library one ULP
+    # off must not move the fence at all.
+    expected = qm.eligibility_fence(_FENCE_POPULATION)
+    assert expected is not None
+    monkeypatch.setattr(math, "log1p", _one_ulp_up(math.log1p))
+    monkeypatch.setattr(math, "expm1", _one_ulp_up(math.expm1))
+    assert qm.eligibility_fence(_FENCE_POPULATION) == expected
+
+
+def test_the_correctly_rounded_helpers_match_the_glibc_probe_inputs():
+    # The two calls the hosted glibc probe recorded as misrounded, pinned to
+    # their correctly rounded values (glibc returned ...665 and ...796).
+    assert qm.correctly_rounded_log1p(8040000.62) == 15.899939842647667
+    assert qm.correctly_rounded_expm1(15.005614280733706) == \
+        3287421.1702317954
+    # The macOS input to the same expm1, whose result is fixture 12's fence.
+    assert qm.correctly_rounded_expm1(15.00561428073371) == \
+        3287421.1702318075
+
+
+def _oracle(fn, x):
+    """An independent correctly rounded reference at 120 digits."""
+    import decimal
+
+    ctx = decimal.Context(prec=120, Emin=-999999, Emax=999999)
+    exact = decimal.Context(prec=2000, Emin=-999999, Emax=999999)
+    d = decimal.Decimal(x)
+    if fn == "log1p":
+        return float(ctx.ln(exact.add(decimal.Decimal(1), d)))
+    if fn == "expm1":
+        wide = decimal.Context(prec=800, Emin=-999999, Emax=999999)
+        return float(wide.subtract(wide.exp(d), decimal.Decimal(1)))
+    return float(ctx.ln(d))
+
+
+@pytest.mark.parametrize("x", [1e-300, 5e-324, 1e-17, 2.5e-9, 0.1, 0.5, 1.0,
+                               3.0, 1234.5678, 8040000.62, 1.7e308,
+                               -0.5, -1e-12, -0.9999999999999999])
+def test_correctly_rounded_log1p_matches_an_independent_oracle(x):
+    assert qm.correctly_rounded_log1p(x) == _oracle("log1p", x)
+
+
+@pytest.mark.parametrize("x", [1e-300, -1e-300, 5e-324, 1e-17, -1e-17,
+                               2.5e-9, 0.1, -0.1, 1.0, -1.0, 15.005614280733706,
+                               -30.0, -37.0, 300.0, 709.0])
+def test_correctly_rounded_expm1_matches_an_independent_oracle(x):
+    assert qm.correctly_rounded_expm1(x) == _oracle("expm1", x)
+
+
+@pytest.mark.parametrize("x", [5e-324, 1e-300, 0.5, 0.9999999999999999, 1.0,
+                               1.0000000000000002, 2.0, 1234.5678, 1.7e308])
+def test_correctly_rounded_log_matches_an_independent_oracle(x):
+    assert qm.correctly_rounded_log(x) == _oracle("log", x)
+
+
+def test_the_correctly_rounded_helpers_keep_maths_edge_behaviour():
+    # Signed zeros pass through, as `math` passes them.
+    assert math.copysign(1.0, qm.correctly_rounded_log1p(-0.0)) == -1.0
+    assert math.copysign(1.0, qm.correctly_rounded_log1p(0.0)) == 1.0
+    assert math.copysign(1.0, qm.correctly_rounded_expm1(-0.0)) == -1.0
+    assert math.copysign(1.0, qm.correctly_rounded_expm1(0.0)) == 1.0
+    assert qm.correctly_rounded_log(1.0) == 0.0
+    # Infinities and NaN.
+    assert qm.correctly_rounded_log1p(math.inf) == math.inf
+    assert qm.correctly_rounded_expm1(math.inf) == math.inf
+    assert qm.correctly_rounded_expm1(-math.inf) == -1.0
+    assert qm.correctly_rounded_log(math.inf) == math.inf
+    for fn in (qm.correctly_rounded_log1p, qm.correctly_rounded_expm1,
+               qm.correctly_rounded_log):
+        assert math.isnan(fn(math.nan))
+    # A large negative argument is exactly -1, and a large positive one
+    # overflows the way `math.expm1` does.
+    assert qm.correctly_rounded_expm1(-1000.0) == -1.0
+    assert qm.correctly_rounded_expm1(-1e308) == -1.0
+    with pytest.raises(OverflowError):
+        qm.correctly_rounded_expm1(709.79)
+    with pytest.raises(OverflowError):
+        qm.correctly_rounded_expm1(1e308)
+    # Domain errors are the `ValueError` that `math` raises.
+    for bad in (-1.0, -2.0, -math.inf):
+        with pytest.raises(ValueError):
+            qm.correctly_rounded_log1p(bad)
+    for bad in (0.0, -0.0, -1.0, -math.inf):
+        with pytest.raises(ValueError):
+            qm.correctly_rounded_log(bad)
+
+
+def test_the_detector_statistic_does_not_call_the_c_librarys_log(monkeypatch):
+    # Mutation: computing the per-day statistic through `math.log`, which is
+    # the platform C library's and need not be correctly rounded.
+    def _platform_log(*_args):
+        raise AssertionError("the detector called the C library's log")
+
+    series = _spread(10e6, 25)
+    expected = qm.detect_change(series)
+    monkeypatch.setattr(math, "log", _platform_log)
+    # repr, because a NaN p-value never compares equal to itself.
+    assert repr(qm.detect_change(series)) == repr(expected)
+
+
 def test_componentwise_median_is_renormalised_to_a_distribution():
     # Mutation: dropping the renormalization. The componentwise medians here
     # are 0.4, 0.4, 0.4, which sum to 1.2 and are not a distribution.
@@ -785,6 +903,38 @@ def test_total_variation_distance_is_half_the_absolute_difference():
     # makes the radius test reject supported days.
     assert qm.tv_distance({"a": 0.8, "b": 0.2}, {"a": 1.0}) == pytest.approx(0.2)
     assert qm.tv_distance({"a": 1.0}, {"a": 1.0}) == pytest.approx(0.0)
+
+
+def test_total_variation_distance_does_not_depend_on_the_hash_seed():
+    # Mutation: summing the absolute differences in set iteration order with
+    # plain `sum()`. A set of strings iterates in PYTHONHASHSEED order, and
+    # Python 3.11's float `sum()` is uncompensated, so 0.1 + 0.2 + 0.3 lands
+    # on 0.6 or 0.6000000000000001 depending on the process. The public
+    # Linux matrix's 3.11 leg failed the quota harness that way on fixture 11
+    # (`familyRadiusEmpirical` ...398 against ...396). Only a 3.11 process
+    # can detect that bug: from 3.12 `sum()` of floats is compensated and
+    # returns 0.6 in every order, so this passes on 3.12+ with or without
+    # the fix. The public matrix's 3.11 leg is the guard that runs it there.
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    bin_dir = pathlib.Path(qm.__file__).resolve().parent
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "import _lib_quota_model as qm; "
+        "print(repr(qm.tv_distance({'a': 0.1, 'b': 0.2, 'c': 0.3}, {})))"
+    )
+    seen = set()
+    for seed in range(16):
+        env = dict(os.environ, PYTHONHASHSEED=str(seed))
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(bin_dir)],
+            env=env, capture_output=True, text=True, timeout=60, check=True,
+        )
+        seen.add(result.stdout.strip())
+    assert seen == {repr(0.3)}
 
 
 def test_support_radius_is_the_median_distance_plus_three_scaled_mads():

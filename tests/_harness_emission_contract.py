@@ -11,8 +11,7 @@ and no case could notice, because none of them was in the list.
 by deriving the line set from the harness source. This module is that reader,
 generalized so several subjects can share it, and it is deliberately parser-only:
 it never loads a `bin/` module, never scrubs anything, and holds no declaration
-of its own. The declarations and the scrub live in the test module, which is
-mirror-private because it loads the private observability kernel.
+of its own. The declarations and the scrub live in the test module.
 
 The reader FAILS rather than skips. Every line it cannot read is returned as an
 `Unreadable` for the caller to declare or reword, because a coverage case that

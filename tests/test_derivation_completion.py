@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import os
 import sys
 import types
 
@@ -50,6 +51,9 @@ def no_spawn(monkeypatch):
     monkeypatch.setattr(
         _cctally_update, "_spawn_detached",
         lambda command: spawned.append(command) or True)
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or os.getpid())
     return spawned
 
 

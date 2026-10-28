@@ -566,6 +566,56 @@ def test_status_counts_pending_verification_separately_from_unverified(estate):
         conn.close()
 
 
+def test_an_unchanged_status_is_not_rewritten_and_a_changed_one_is(estate, monkeypatch):
+    """#901 W8 (review I3c F1): a pass that observes the status it already
+    recorded writes nothing, however much later it runs, and `observedAt`
+    keeps the time that status was first recorded. A changed status is still
+    written, with the time of the pass that changed it."""
+    import datetime as real_dt
+    import types
+
+    ns, retained, _fresh, _mode = estate
+    cache = sys.modules["_cctally_cache"]
+    instants = [real_dt.datetime(2026, 7, 21, 9, 0, s, tzinfo=real_dt.timezone.utc)
+                for s in (0, 5, 9)]
+    now = [instants[0]]
+
+    class Clock(real_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now[0]
+
+    monkeypatch.setattr(cache, "dt", types.SimpleNamespace(
+        **{**vars(real_dt), "datetime": Clock}))
+
+    def record(conn):
+        before = conn.total_changes
+        cache._record_codex_container_status(conn, cache.CodexIngestStats(),
+                                             census_complete=True)
+        status = json.loads(conn.execute("SELECT value FROM cache_meta WHERE key=?",
+                                        ("codex_container_status",)).fetchone()[0])
+        return conn.total_changes - before, status
+
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("DELETE FROM cache_meta WHERE key=?", ("codex_container_status",))
+        written, first = record(conn)
+        assert written >= 1 and first["observedAt"] == "2026-07-21T09:00:00Z", first
+        now[0] = instants[1]
+        written, again = record(conn)
+        assert written == 0, again
+        assert again == first, (again, first)
+        conn.execute("UPDATE codex_session_files SET container_state='unverified' WHERE path=?",
+                     (str(retained),))
+        now[0] = instants[2]
+        written, changed = record(conn)
+        assert written >= 1, changed
+        assert changed["observedAt"] == "2026-07-21T09:00:09Z", changed
+        assert changed["skipped"]["verification-unverified"] == 1, changed
+    finally:
+        conn.close()
+
+
 def test_doctor_does_not_turn_an_unknown_census_into_all_clear():
     check = _compressed_check(codex_compressed_census=None,
                               codex_decoder_capability=None,

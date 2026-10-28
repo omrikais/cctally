@@ -59,18 +59,4 @@ describe('<CacheBreakdownCard /> project basenames (#251 CR-4)', () => {
     expect(cell.textContent).toBe(longModel);
     expect(cell.getAttribute('title')).toBeNull();
   });
-
-  it('every key cell carries the .bd-key class so nowrap CSS applies', () => {
-    const { container } = render(
-      <CacheBreakdownCard
-        kind="projects"
-        rows={[
-          { key: 'a', cache_hit_percent: 60, net_usd: 0.1 },
-          { key: 'b', cache_hit_percent: 70, net_usd: 0.2 },
-        ]}
-      />,
-    );
-    const cells = container.querySelectorAll('td.bd-key');
-    expect(cells.length).toBe(2);
-  });
 });

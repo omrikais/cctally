@@ -118,6 +118,7 @@ export function DoctorModal(): JSX.Element | null {
         counts: report.overall.counts,
         generated_at: report.generated_at,
         fingerprint: 'client-reconcile',
+        rebuild_worker: rebuildWorkerAggregate(report),
       },
     });
   }, [report]);
@@ -187,6 +188,23 @@ export function DoctorModal(): JSX.Element | null {
       </div>
     </div>
   );
+}
+
+// #997 D10: the client twin of `_lib_doctor.rebuild_worker_aggregate` — the
+// `db.rebuild_worker` check's `{severity, summary}` when it is not ok, else
+// null (also when the check is absent) — so the reconcile above keeps the
+// chip's rebuild-worker sentence instead of dropping it until the next tick.
+function rebuildWorkerAggregate(
+  report: DoctorReport,
+): { severity: 'warn' | 'fail'; summary: string } | null {
+  for (const cat of report.categories) {
+    for (const c of cat.checks) {
+      if (c.id === 'db.rebuild_worker') {
+        return c.severity === 'ok' ? null : { severity: c.severity, summary: c.summary };
+      }
+    }
+  }
+  return null;
 }
 
 function DoctorReportBody({ report }: { report: DoctorReport }): JSX.Element {

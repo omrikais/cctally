@@ -34,7 +34,7 @@ set -uo pipefail
 
 PORT="${1:-8797}"
 
-# lsof is native on macOS (the self-hosted e2e-reader runner) and present on the
+# lsof is native on macOS (the self-hosted runner) and present on the
 # remote test runner; -sTCP:LISTEN restricts to the actual listener (not
 # transient client sockets in TIME_WAIT).
 listeners() { lsof -ti "tcp:${PORT}" -sTCP:LISTEN 2>/dev/null || true; }

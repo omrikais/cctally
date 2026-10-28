@@ -5021,8 +5021,25 @@ def _qualification_mismatches(reference, run) -> "list[str]":
 
 # ── bounded, reaped process families (Q18: every exit reaps the family) ────
 
+_PS_STATE_TIMEOUT_S = 5.0
+
+
 def _exited_unreaped(pid: int) -> bool:
     """True once `pid` (our child) has exited, without reaping it."""
+    if not hasattr(os, "waitid"):
+        # Python added `os.waitid` on macOS only in 3.13, and the README
+        # supports 3.11. An exited child we have not reaped is a zombie, so
+        # ask `ps` for its state instead; no row means it is already gone.
+        # A `ps` that hangs is bounded and read as "not exited yet", so the
+        # caller's own deadline still decides.
+        try:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(int(pid))],
+                capture_output=True, text=True, timeout=_PS_STATE_TIMEOUT_S,
+                env=dict(os.environ, LC_ALL="C")).stdout.strip()
+        except subprocess.TimeoutExpired:
+            return False
+        return not state or state.startswith("Z")
     try:
         info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
     except ChildProcessError:

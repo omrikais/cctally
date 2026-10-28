@@ -48,6 +48,13 @@ SEG_C = "observations-2026-09.jsonl"
 
 SEGMENTS = (SEG_A, SEG_B, SEG_C)
 
+#: The segment opens of ONE streaming pass over `build_tainted` that takes the
+#: protocol evidence (#997 D12): each segment once, in canonical order, plus
+#: one re-read of segment B's prefix for the first resolution op, whose
+#: evidence point is mid-segment. The second op's evidence is B's full end,
+#: served from the streamed state with no re-read.
+TAINTED_EVIDENCE_PASS_OPENS = (SEG_A, SEG_B, SEG_B, SEG_C)
+
 CACHE_SESSION_PATH = "/tmp/claude/projects/repo/session.jsonl"
 
 

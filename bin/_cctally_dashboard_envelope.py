@@ -217,9 +217,11 @@ def _select_current_block_for_envelope(
     Delta semantics:
       - Non-crossed block: ``current_used_pct - seven_day_pct_at_block_start``
         (the natural "how much 7d% has changed during this 5h block" read), where
-        that axis is the CREDIT-AWARE read of the column rather than the stored
-        number (#834 S1, #835) — so a value an in-place weekly credit retired makes
-        both the published axis and the delta ``None``.
+        that axis is the block's stored ``seven_day_pct_at_block_start``. #835's
+        retirement band, which published ``None`` for a value within a point of
+        one an in-place weekly credit retired, is removed (#840): stale
+        contributors are refused before publication, and a stored value that is
+        already wrong is corrected by ``db rederive``'s reviewed ``retract``.
       - Crossed block (``crossed_seven_day_reset == 1``): the block straddles
         a weekly reset, so the natural delta would be dominated by the
         reset itself (e.g. −94pp) rather than the user's actual burn-rate.
@@ -281,21 +283,17 @@ def _select_current_block_for_envelope(
     # Account-qualified selection binds the block and its downstream milestone
     # read to the displayed weekly account; the unqualified order remains the
     # historical <=1-real-account fallback for published byte stability.
-    # #834 S1 (#835) Gate A R8: `first_observed_at_utc` and `five_hour_resets_at`
-    # are selected because the credit-aware read below needs them — they are the
-    # START axis's capture instant and its fallback. `seven_day_pct_at_block_end`
-    # is deliberately NOT selected, and round three's comment claiming the
-    # credit-aware read needs it was wrong: this route publishes the start axis
-    # alone, the helper's second return value is discarded, and the helper tests
-    # each axis's stored value before resolving anything, so an absent end value
-    # skips a second week resolution and a second band set for a number nobody
-    # reads. `last_observed_at_utc` stays, and NOT because the helper needs it:
-    # every column the helper reads goes through `block.get(...)`, so dropping
-    # this one would raise nothing and change no published field — the end
-    # instant it feeds is discarded with the end axis. It stays because the
-    # helper's contract is a block ROW, and pruning this SELECT to the subset the
-    # helper happens to read today would couple this route to the helper's
-    # internals. Round four's comment implied necessity instead.
+    # #834 S1 (#835) Gate A R8 selected `first_observed_at_utc`,
+    # `five_hour_resets_at` and `last_observed_at_utc` for the retirement band's
+    # week resolution. Since the band's removal (#840) the axes helper below
+    # reads only the stored `seven_day_pct_at_block_start` /
+    # `seven_day_pct_at_block_end` through `block.get(...)`, so none of the three
+    # is needed by it; they stay because the helper's contract is a block ROW,
+    # and pruning this SELECT to the subset the helper happens to read today
+    # would couple this route to the helper's internals.
+    # `seven_day_pct_at_block_end` is not selected: this route publishes the
+    # start axis alone and discards the helper's second return value, which is
+    # then `None`.
     block = conn.execute(
         """
         SELECT id, account_key,
@@ -319,14 +317,14 @@ def _select_current_block_for_envelope(
 
     crossed = bool(block["crossed_seven_day_reset"])
     # #834 S1 (#835) Gate A R8: THE THIRD CONSUMER of the two derived weekly axes
-    # goes through the one read-time filter, the same one `cmd_five_hour_blocks` and
-    # `cmd_five_hour_breakdown` use. Reading the column raw published the value an
-    # in-place weekly credit retired, and `seven_day_pct_delta_pp` then published
-    # the difference between the live post-credit percentage and that retired
-    # number, which is a burn nobody observed. Measured on a store credited at 63.0
-    # with `current_used_pct` at 20.0: `seven_day_pct_at_block_start: 63.0` and
-    # `seven_day_pct_delta_pp: -43.0`, while the helper answered `(None, None)` for
-    # the same row. `sqlite3.Row` has no `.get()`, so the row is converted.
+    # goes through the one shared axes helper, the same one `cmd_five_hour_blocks`
+    # and `cmd_five_hour_breakdown` use. #835 made that helper a read-time filter
+    # that withheld a value within a point of one an in-place weekly credit
+    # retired; #840 removed that retirement band, so the helper now returns the
+    # block's stored axes. A stale contributor is refused before it is
+    # published, and a stored value that is already wrong is corrected by
+    # `db rederive`'s reviewed `retract`, never by a percentage heuristic here.
+    # `sqlite3.Row` has no `.get()`, so the row is converted.
     #
     # Neither field is rendered by any client today: both are declared in
     # `dashboard/web/src/types/envelope.ts` and used in one vitest module,
@@ -2193,18 +2191,14 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
             _ld = sys.modules["cctally"]._load_sibling("_lib_doctor")
             _doc_state = sys.modules["cctally"].doctor_gather_state(now_utc=now_utc, runtime_bind=runtime_bind)
             _doc_report = _ld.run_checks(_doc_state)
-            doctor_envelope = {
-                "severity":     _doc_report.overall_severity,
-                "counts":       dict(_doc_report.counts),
-                "generated_at": _ld._iso_z(_doc_report.generated_at),
-                "fingerprint":  _ld.fingerprint(_doc_report),
-            }
+            doctor_envelope = _ld.envelope_block(_doc_report)
         except Exception as exc:  # noqa: BLE001 — never crash SSE on doctor failure
             doctor_envelope = {
                 "severity":     "fail",
                 "counts":       {"ok": 0, "warn": 0, "fail": 1},
                 "generated_at": _iso_z(now_utc),
                 "fingerprint":  "sha1:" + ("0" * 40),
+                "rebuild_worker": None,
                 "_error":       f"{type(exc).__name__}: {exc}",
             }
 

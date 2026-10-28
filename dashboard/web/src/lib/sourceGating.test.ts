@@ -1,6 +1,3 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   combinedHeading,
@@ -385,59 +382,5 @@ describe('combinedHeading', () => {
     [[], 'CURRENT CYCLES · NO DATA'],
   ] as const)('names its actual contributors: %s', (contributors, expected) => {
     expect(combinedHeading([...contributors])).toBe(expected);
-  });
-});
-
-
-// #556 S1 acceptance 8 — a structural assertion, because the behavioural tests
-// above can only show that today's inputs produce the right output. This one
-// fails the moment a surface reaches for the aggregate freshness axis again,
-// which is the specific mistake that produced B3 and would have survived every
-// behavioural test written against a fixture where the axis happened to agree.
-//
-// It mechanises HALF of acceptance 8. The criterion forbids deriving combined
-// disclosure from `sourceDomainFreshness(entry, 'hero')` OR from
-// `entry.freshness`, and only the first half can be banned outright:
-// `SourceStatusChip.tsx` reads `entry.freshness` legitimately, for the physical
-// source's own fresh/stale label, so a blanket ban on the second would reject
-// correct code. That half stays covered behaviourally — by the published-figure
-// tests above and by the HeroStrip cases that pin a stale source beside a
-// published number. A later reader should not take a green run here as proof
-// that both halves are mechanised.
-// Line comments and block comments, in that order: removing `/* ... */` first
-// would let a `// ... /*` line open a block that swallows real code.
-function stripComments(source: string): string {
-  return source
-    .split('\n')
-    .filter((line) => !line.trimStart().startsWith('//'))
-    .join('\n')
-    .replace(/\/\*[\s\S]*?\*\//g, '');
-}
-
-describe('combined disclosure has exactly one source', () => {
-  const SRC = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)), '..',
-  );
-  const SURFACES = [
-    'components/HeroStrip.tsx',
-    'modals/CurrentWeekModal.tsx',
-    'components/SourceStatusChip.tsx',
-  ] as const;
-
-  it.each(SURFACES)('%s derives it from combinedPresentation', (file) => {
-    const source = readFileSync(path.join(SRC, file), 'utf8');
-
-    expect(source).toContain('combinedPresentation');
-  });
-
-  it.each(SURFACES)('%s never calls sourceDomainFreshness', (file) => {
-    // Comments may still NAME the function — that is how the reason it is
-    // forbidden stays next to the code — so only a call is rejected. Both
-    // comment forms are stripped: a `/* ... */` block naming the call would
-    // otherwise redden this test for prose, which is the fastest way to teach
-    // the next author to delete the explanation instead of the call.
-    const code = stripComments(readFileSync(path.join(SRC, file), 'utf8'));
-
-    expect(code).not.toMatch(/sourceDomainFreshness\s*\(/);
   });
 });

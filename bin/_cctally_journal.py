@@ -40,6 +40,7 @@ import sqlite3
 import stat
 import sys
 import time
+from array import array
 from dataclasses import dataclass, field, replace as _dc_replace
 
 import _cctally_core
@@ -50,6 +51,7 @@ import _lib_journal
 import _lib_journal_router
 import _lib_legacy_spool
 import _lib_legacy_writer_evidence
+import _lib_rebuild_progress
 import _lib_record
 import _lib_segment_summary
 import _lib_selector_state
@@ -512,12 +514,15 @@ def _require_account_bound_cutover(now_utc=None) -> None:
         boundary = ensure_account_bound_cutover(now_utc=now_utc)
     except AccountBoundCutoverDeferred:
         return
+    # #797/#823/#840 (spec 4.6 B2): the memo names the LAST boundary op —
+    # the revision op — so a memo hit proves both fences exist.
+    last = boundary.revision if boundary.revision is not None else boundary
     try:
-        st = os.stat(journal_dir / boundary.segment)
+        st = os.stat(journal_dir / last.segment)
     except OSError:
         return
     _ACCOUNT_BOUND_CUTOVER_MEMO = (
-        str(journal_dir), boundary.segment, int(boundary.end_offset),
+        str(journal_dir), last.segment, int(last.end_offset),
         (st.st_dev, st.st_ino))
 
 
@@ -1077,6 +1082,136 @@ def plan_segment_elision(segments, high_water):
         summaries=summaries, covered=covered, verdict=reason)
 
 
+class QuotaLineSourceError(Exception):
+    """A coordinate no longer names the line the read pass saw (#997 D7)."""
+
+
+class QuotaLineSource:
+    """The final rebuild's Codex quota observations, as coordinates (#997 D7).
+
+    The read pass used to retain every observation's raw line until the cache
+    leg ran (1.64 GB on the maintainer's journal, alive across the whole pass).
+    This keeps ``(segment, offset, length)`` instead, in per-segment
+    ``array('Q')`` runs, which is 16 bytes per observation, and re-reads exactly
+    the slice the leg asks for. ``_run_bounded_recovery`` therefore keeps its
+    contract: chunk planning by index from ``lengths()`` (no read), a restart
+    at chunk zero re-reads from disk, and only one chunk's bytes are resident.
+
+    ``offset`` is the line's start and ``length`` excludes its newline, the
+    shape ``_iter_segment_lines`` yields. Every read stays inside the extent
+    the pass pinned, because it reads only bytes the pass itself saw.
+    """
+
+    __slots__ = ("_runs", "_count")
+
+    def __init__(self) -> None:
+        #: ``[segment, offsets, lengths]`` per run, in journal order. A run
+        #: holds one segment's consecutive observations; a segment can only
+        #: appear in two runs when the elided refill splices another between.
+        self._runs: list = []
+        self._count = 0
+
+    def append(self, segment: str, offset: int, length: int) -> None:
+        runs = self._runs
+        if not runs or runs[-1][0] != segment:
+            runs.append([segment, array("Q"), array("Q")])
+        runs[-1][1].append(int(offset))
+        runs[-1][2].append(int(length))
+        self._count += 1
+
+    def _extend_run(self, segment, offsets, lengths) -> None:
+        if not offsets:
+            return
+        runs = self._runs
+        if not runs or runs[-1][0] != segment:
+            runs.append([segment, array("Q"), array("Q")])
+        runs[-1][1].extend(offsets)
+        runs[-1][2].extend(lengths)
+        self._count += len(offsets)
+
+    def _copy_range(self, source: "QuotaLineSource", start: int,
+                    stop: int) -> None:
+        """Append ``source``'s observations ``[start, stop)`` to this one."""
+        base = 0
+        for segment, offsets, lengths in source._runs:
+            size = len(offsets)
+            lo = max(start - base, 0)
+            hi = min(stop - base, size)
+            if lo < hi:
+                self._extend_run(segment, offsets[lo:hi], lengths[lo:hi])
+            base += size
+            if base >= stop:
+                break
+
+    def __len__(self) -> int:
+        return self._count
+
+    def lengths(self) -> "array":
+        """Every observation's line length (without its newline), no read."""
+        out = array("Q")
+        for _segment, _offsets, lengths in self._runs:
+            out.extend(lengths)
+        return out
+
+    def lines(self, start: int, stop: int) -> list:
+        """Observations ``[start, stop)`` re-read from their segments.
+
+        Raises `QuotaLineSourceError` when a slice is short or no longer framed
+        as one line (a newline before it, unless it starts the segment; one
+        after it; none inside), which is what a truncated or rewritten segment
+        produces. The leg treats that exactly as an unreadable elided segment.
+        """
+        out: list = []
+        base = 0
+        for segment, offsets, lengths in self._runs:
+            size = len(offsets)
+            lo = max(start - base, 0)
+            hi = min(stop - base, size)
+            if lo < hi:
+                path = _cctally_core.JOURNAL_DIR / segment
+                try:
+                    with _open_segment_for_read(path) as fh:
+                        for index in range(lo, hi):
+                            out.append(_read_framed_line(
+                                fh, segment, offsets[index], lengths[index]))
+                except OSError as exc:
+                    raise QuotaLineSourceError(
+                        f"{segment}: {type(exc).__name__}: {exc}") from exc
+            base += size
+            if base >= stop:
+                break
+        return out
+
+
+def _read_framed_line(fh, segment, offset, length) -> bytes:
+    """The ``length`` bytes at ``offset``, verified to still be one line."""
+    lead = 1 if offset > 0 else 0
+    fh.seek(offset - lead)
+    data = fh.read(length + lead + 1)
+    if (len(data) != length + lead + 1
+            or (lead and data[0:1] != b"\n")
+            or data[-1:] != b"\n"
+            or b"\n" in data[lead:lead + length]):
+        raise QuotaLineSourceError(
+            f"{segment}@{offset}: the line the read pass saw is no longer "
+            "there")
+    return data[lead:lead + length]
+
+
+def _quota_line_sizes(quota_raw):
+    """Encoded size per observation (line plus newline), for chunk planning."""
+    if isinstance(quota_raw, QuotaLineSource):
+        return array("Q", (length + 1 for length in quota_raw.lengths()))
+    return [len(raw) + 1 for raw in quota_raw]
+
+
+def _quota_lines(quota_raw, start: int, stop: int) -> list:
+    """Observations ``[start, stop)`` as raw lines, from either input form."""
+    if isinstance(quota_raw, QuotaLineSource):
+        return quota_raw.lines(start, stop)
+    return quota_raw[start:stop]
+
+
 def _refill_elided_quota_raw(quota_raw, gaps, *, failures=None):
     """``(stream, complete)`` — ``quota_raw`` with the elided observations back.
 
@@ -1110,20 +1245,26 @@ def _refill_elided_quota_raw(quota_raw, gaps, *, failures=None):
     a re-read that returns a different number reports the shortfall rather than
     leaving the leg to certify a stream it never saw.
     """
+    coordinates = isinstance(quota_raw, QuotaLineSource)
     by_index: dict = {}
     complete = True
     if failures is None:
         failures = []
     for name, index, extent, expected_lines in gaps:
-        recovered = []
+        # #997 D7: a coordinate source gets each recovered observation's
+        # coordinates, not its bytes, so the refill keeps nothing either.
+        recovered = QuotaLineSource() if coordinates else []
         seen = 0
         try:
-            for _seg, _off, raw in _iter_segment_lines(
+            for seg, off, raw in _iter_segment_lines(
                     _cctally_core.JOURNAL_DIR / name, 0, int(extent)):
                 seen += 1
                 record = _lib_journal.decode_line(raw)
                 if record is not None and _is_codex_quota_obs(record):
-                    recovered.append(raw)
+                    if coordinates:
+                        recovered.append(seg, off, len(raw))
+                    else:
+                        recovered.append(raw)
         except Exception as exc:
             # A vanished segment self-heals, because the pinned vector no longer
             # matches the journal and the certificate is invalid the moment it
@@ -1144,13 +1285,25 @@ def _refill_elided_quota_raw(quota_raw, gaps, *, failures=None):
             continue
         if seen != int(expected_lines):
             complete = False
-        by_index.setdefault(int(index), []).extend(recovered)
+        by_index.setdefault(int(index), []).append(recovered)
+    if coordinates:
+        spliced = QuotaLineSource()
+        cursor = 0
+        for index in sorted(by_index):
+            bounded = min(int(index), len(quota_raw))
+            spliced._copy_range(quota_raw, cursor, bounded)
+            for recovered in by_index[index]:
+                spliced._copy_range(recovered, 0, len(recovered))
+            cursor = max(cursor, bounded)
+        spliced._copy_range(quota_raw, cursor, len(quota_raw))
+        return spliced, complete
     out: list = []
     cursor = 0
     for index in sorted(by_index):
         bounded = min(int(index), len(quota_raw))
         out.extend(quota_raw[cursor:bounded])
-        out.extend(by_index[index])
+        for recovered in by_index[index]:
+            out.extend(recovered)
         cursor = max(cursor, bounded)
     out.extend(quota_raw[cursor:])
     return out, complete
@@ -1770,16 +1923,26 @@ def _acquire_ingest_lock(mode: str, timeout_s: float) -> int | None:
     # busy-timeout branch closes + returns before this handler can fire, and a
     # successful acquire returns fd, so the fd is closed exactly once.
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    _note_lock_failure(exc)
-                    os.close(fd)
-                    return None
-                time.sleep(0.02)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, OSError) as exc:
+            if time.monotonic() >= deadline:
+                _note_lock_failure(exc)
+                os.close(fd)
+                return None
+        # #997 D9: contended, so this is a wait a worker reports.
+        with _lib_rebuild_progress.waiting("ingest-lock"):
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except (BlockingIOError, OSError) as exc:
+                    if time.monotonic() >= deadline:
+                        _note_lock_failure(exc)
+                        os.close(fd)
+                        return None
+                    time.sleep(0.02)
     except BaseException:
         os.close(fd)
         raise
@@ -1811,17 +1974,28 @@ def _acquire_maintenance_shared(mode: str, timeout_s: float) -> int | None:
             return None
     deadline = time.monotonic() + timeout_s
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                _cctally_core.note_stats_maintenance_acquired()
-                return fd
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    _note_lock_failure(exc)
-                    os.close(fd)
-                    return None
-                time.sleep(0.02)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            _cctally_core.note_stats_maintenance_acquired()
+            return fd
+        except (BlockingIOError, OSError) as exc:
+            if time.monotonic() >= deadline:
+                _note_lock_failure(exc)
+                os.close(fd)
+                return None
+        # #997 D9: contended, so this is a wait a worker reports.
+        with _lib_rebuild_progress.waiting("maintenance-lock"):
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    _cctally_core.note_stats_maintenance_acquired()
+                    return fd
+                except (BlockingIOError, OSError) as exc:
+                    if time.monotonic() >= deadline:
+                        _note_lock_failure(exc)
+                        os.close(fd)
+                        return None
+                    time.sleep(0.02)
     except BaseException:
         os.close(fd)
         raise
@@ -1846,17 +2020,28 @@ def _acquire_maintenance_exclusive(mode: str, timeout_s: float) -> int | None:
             return None
     deadline = time.monotonic() + timeout_s
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                _cctally_core.note_stats_maintenance_acquired()
-                return fd
-            except (BlockingIOError, OSError) as exc:
-                if time.monotonic() >= deadline:
-                    _note_lock_failure(exc)
-                    os.close(fd)
-                    return None
-                time.sleep(0.02)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _cctally_core.note_stats_maintenance_acquired()
+            return fd
+        except (BlockingIOError, OSError) as exc:
+            if time.monotonic() >= deadline:
+                _note_lock_failure(exc)
+                os.close(fd)
+                return None
+        # #997 D9: contended, so this is a wait a worker reports.
+        with _lib_rebuild_progress.waiting("maintenance-lock"):
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _cctally_core.note_stats_maintenance_acquired()
+                    return fd
+                except (BlockingIOError, OSError) as exc:
+                    if time.monotonic() >= deadline:
+                        _note_lock_failure(exc)
+                        os.close(fd)
+                        return None
+                    time.sleep(0.02)
     except BaseException:
         os.close(fd)
         raise
@@ -1957,8 +2142,11 @@ def _write_cursor(conn: sqlite3.Connection, segment: str, offset: int) -> None:
 #: #825/#832 fix round A: the first stats index epoch that carries
 #: `journal_derivation_frontier`. A frontier read from any earlier epoch — in
 #: practice the previous release republishing its own index — is never trusted
-#: as proof that derivation completed (Codex fix-round-1 Q1).
-DERIVATION_FRONTIER_EPOCH = 1018
+#: as proof that derivation completed (Codex fix-round-1 Q1). #797/#823/#840
+#: (spec 4.6 B6): raised to 1019 with the revision-2 fence, so a completion
+#: proof an epoch-1018 binary published, which never applied the revision-2
+#: admission, is never trusted by this binary.
+DERIVATION_FRONTIER_EPOCH = 1019
 
 #: #825/#832 revision 2 (#946, Codex design-fix-round-3 Q5): the generation of
 #: the derivation-completeness proof. Generation 1 (stored as NULL) advanced
@@ -2184,6 +2372,21 @@ def _open_segment_for_read(seg_path):
     return open(seg_path, "rb")
 
 
+def _open_segment_by_name(name):
+    """`_open_segment_for_read` for a segment basename, resolved against the
+    journal directory at call time. The prefix hasher's evidence re-read
+    (#997 D12) comes through here, so it stays visible at the one seam."""
+    return _open_segment_for_read(_cctally_core.JOURNAL_DIR / name)
+
+
+def _new_prefix_hasher():
+    """A `PrefixHashAccumulator` whose evidence re-reads go through the
+    segment-read seam (#997 D12). Every streaming pass that captures prefix
+    evidence builds its hasher here."""
+    return _lib_journal_router.PrefixHashAccumulator(
+        open_segment=_open_segment_by_name)
+
+
 def _iter_segment_lines(seg_path, lo: int, hi: int, *, on_bytes=None):
     """Stream `(basename, absolute-offset, raw-line-without-newline)` for every
     complete line in `[lo, hi)`, holding at most one chunk plus one partial line
@@ -2255,9 +2458,12 @@ def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
     pinned high-water and drives every pass from it, so two passes of the same
     rebuild cannot disagree about the journal's shape.
 
-    `on_segment` is called for EVERY segment in the range, including one this
-    function then skips because it holds no bytes in range: `journal_prefix_hash`
-    frames a zero-byte segment, so a hash accumulator has to be told it exists.
+    `on_segment(seg, size)` is called for EVERY segment in the range, including
+    one this function then skips because it holds no bytes in range:
+    `journal_prefix_hash` frames a zero-byte segment, so a hash accumulator has
+    to be told it exists. `size` is `max(hi - lo, 0)`, the exact byte count
+    `on_bytes` will receive for the segment unless it shrinks under the pass;
+    the streamed prefix hash frames the segment header with it (#997 D12).
     `on_bytes` is forwarded to `_iter_segment_lines`.
 
     `on_extent(seg, lo, hi, stat_result)` is called after this pass has pinned
@@ -2311,7 +2517,7 @@ def _iter_range_with_segments(cursor, hw, segments, *, on_segment=None,
         if on_extent is not None:
             on_extent(seg, lo, hi, stat_result)
         if on_segment is not None:
-            on_segment(seg)
+            on_segment(seg, max(hi - lo, 0))
         if lo >= hi:
             continue
         yield from _iter_segment_lines(seg_path, lo, hi, on_bytes=on_bytes)
@@ -4296,6 +4502,43 @@ def fold_policy_of(document, key=FOLD_POLICY_KEY) -> int:
     return FOLD_POLICY_HISTORICAL
 
 
+# ── Detector policy (#797/#823/#840 spec 4.9, D12) ──────────────────────────
+#
+#: The raw Claude usage observation's payload key that records the detector
+#: revision it was captured under. It is separate from `fold_policy` because
+#: the previous release's `fold_policy_of` maps every value other than 1 to
+#: its historical fold: new observations keep `fold_policy: 1` and add this
+#: additive key, which that release reads past with `.get`. Both detector
+#: changes of spec 4.9 (the five-hour credit generation in place of the pair
+#: check, and projection fills that do not advance detector state) are
+#: versioned together under it.
+DETECTOR_POLICY_KEY = "detector_policy"
+#: The same revision on a frozen statusline publication plan, frozen beside
+#: `foldPolicy` before the publication identity is computed. Recovery copies
+#: the frozen value or preserves its absence, never the running default.
+PLAN_DETECTOR_POLICY_KEY = "detectorPolicy"
+#: The revision newly captured observations and newly frozen plans carry.
+DETECTOR_POLICY = 2
+
+
+def detector_policy_of(payload) -> str:
+    """The detector a raw observation payload selects: ``"historical"`` when
+    it records no `detector_policy` (every observation an earlier release
+    journaled: the pair check and projection-fill detection, so a plain
+    rederive of old history adds or removes no credit), ``"v2"`` for exactly
+    the integer 2, and ``"unsupported"`` for any other value — a bool, a
+    float, a string, null or another revision — which selects neither
+    behavior and withholds that observation's detector step (an outcome may
+    always be withheld). Detector policy is semantic data, never transport
+    metadata."""
+    if not isinstance(payload, dict) or DETECTOR_POLICY_KEY not in payload:
+        return "historical"
+    value = payload[DETECTOR_POLICY_KEY]
+    if type(value) is int and value == DETECTOR_POLICY:
+        return "v2"
+    return "unsupported"
+
+
 @dataclass(frozen=True)
 class AxisFloor:
     """One axis's floor for EXACTLY one account, resolved on the caller's
@@ -4916,7 +5159,10 @@ _ACCOUNTS_MACHINERY_KINDS = frozenset(
      # two strict administrative kinds. None carries a target row to stamp.
      "account_bound_cutover", "legacy_spool_activity",
      "journal_protocol_resolution_v2",
-     "claude_weekly_observation_decision_v2"))
+     "claude_weekly_observation_decision_v2",
+     # #797/#823/#840 spec 4.6 B2, B5: the revision-2 boundary op and the
+     # successor of the repair acknowledgement.
+     "account_bound_revision", "journal_protocol_resolution_v3"))
 
 # Legacy-classifier exhaustiveness guard (#341, review finding P2-1). EVERY evt
 # kind in `_EVT_SPECS` and every harvest kind in `_HARVEST_SPECS` must carry a
@@ -5076,10 +5322,22 @@ def _normalize_legacy_account_stamp(record, claude_legacy_account: str) -> None:
 # Obs/op fold registry (spec §5.3 "fold op"). Keyed by `payload.kind`; the
 # built-in `_pipeline_op_fold` pipeline hook dispatches through it. 6b may
 # register more op folds; obs no longer fold directly (see the NOTE above).
+def _apply_op_weekly_observation_decision(conn, record) -> None:
+    """#797/#823/#840 spec 4.3: project a reviewed weekly decision op into
+    `claude_weekly_observation_decisions`, the read-time weekly eligibility
+    of provider samples. It writes nothing else: the decision's accounting
+    effect is still the scratch replay's (`db rederive`)."""
+    import _cctally_oauth_samples
+    _cctally_oauth_samples.apply_weekly_observation_decision_op(conn, record)
+
+
 FOLD_APPLIERS = {
     "weekly_credit_floor": _apply_op_weekly_credit_floor,
     "account_observe": _apply_op_account_observe,
     "account_label": _apply_op_account_label,
+    "claude_weekly_observation_decision": _apply_op_weekly_observation_decision,
+    "claude_weekly_observation_decision_v2": (
+        _apply_op_weekly_observation_decision),
 }
 
 
@@ -5877,6 +6135,16 @@ class ScratchRetention:
         for event_id in event_ids:
             self.applied.setdefault(event_id, _PREDECESSOR_HELD)
 
+    def applied_records(self):
+        """The decisions the projection holds at the current replay point, as
+        records (#840): what each id materialized, or for an id the
+        predecessor index holds its effective record; a tombstone is none."""
+        for event_id, held in list(self.applied.items()):
+            record = (self.effective.get(event_id)
+                      if held is _PREDECESSOR_HELD else held)
+            if record is not None:
+                yield record
+
     def _affected(self, evt) -> bool:
         if self.reference is None:
             return False
@@ -5916,7 +6184,8 @@ class ScratchRetention:
                 # The predecessor index holds this id as of an earlier
                 # revision; the retained decision is its effective one.
                 self.applied[event_id] = target
-                _rematerialize_scratch_row(conn, event_id, target)
+                _rematerialize_scratch_row(
+                    conn, event_id, target, suppressors=self.applied_records())
             return
         self.applied[event_id] = target
         if target is not None and (
@@ -5924,9 +6193,11 @@ class ScratchRetention:
             _apply_evt(conn, target)
 
 
-def _rematerialize_scratch_row(conn, event_id, target) -> None:
+def _rematerialize_scratch_row(conn, event_id, target, *,
+                               suppressors=None) -> None:
     """Bring a scratch projection row to ``target`` (None: remove it). An
-    effects-only family has no row to bring, and its effects already ran."""
+    effects-only family has no row to bring, and its effects already ran.
+    ``suppressors`` are the decisions the replay has applied so far (#840)."""
     kind = None if target is None else (target.get("payload") or {}).get("kind")
     tables = ({_EVT_SPECS[kind].table} if kind in _EVT_SPECS
               else {spec.table for spec in _EVT_SPECS.values()})
@@ -5940,7 +6211,8 @@ def _rematerialize_scratch_row(conn, event_id, target) -> None:
             _delete_scratch_row(conn, table, row[0])
         else:
             _converge_row_from_effective(
-                conn, event_id, table=table, rowid=row[0], record=target)
+                conn, event_id, table=table, rowid=row[0], record=target,
+                suppressors=suppressors)
         return
 
 
@@ -6251,7 +6523,7 @@ def _emit_harvest_row(ctx, spec, row):
                     != _lib_journal.event_content_hash(evt)):
                 _converge_row_from_effective(
                     conn, chosen["id"], table=spec.table, rowid=row["id"],
-                    record=chosen)
+                    record=chosen, suppressors=retention.applied_records())
         conn.execute(
             f"UPDATE {spec.table} SET journal_id = ? WHERE id = ?",
             (evt["id"], row["id"]),
@@ -7643,9 +7915,77 @@ _CONVERGE_OUTCOME_WORDING: dict = {
 }
 
 
-def _keep_five_hour_retirement(conn, cols: dict, rowid: int) -> None:
+#: The suppression families by the axis their exact snapshot list retires
+#: (#840, spec section 4.8): a `week_reset`'s and a `weekly_credit_effects`'
+#: list retire the WEEKLY axis, a `five_hour_credit`'s the FIVE-HOUR axis.
+_SUPPRESSOR_KINDS_BY_AXIS = {
+    "weekly": frozenset({"week_reset", "weekly_credit_effects"}),
+    "five_hour": frozenset({"five_hour_credit"}),
+}
+
+#: The effective, active decisions whose payload names a snapshot id; the
+#: membership itself is decided on the decoded payload.
+_SUPPRESSOR_CANDIDATES_SQL = (
+    "SELECT event_id, event_json FROM journal_effective_events "
+    "WHERE status = 'active' AND event_json LIKE ?")
+
+
+def _suppression_retires(conn, snapshot_id, axis, *, suppressors=None) -> bool:
+    """Whether an effective suppression decision retires ``axis`` of the
+    snapshot ``snapshot_id`` (#840, spec section 4.8).
+
+    The relation is exact membership: `(suppressor event id and revision,
+    snapshot journal id, retired axis)`. A suppressor counts when it is an
+    admitted, selected, active decision of a family that retires ``axis``,
+    its `suppression` list (on `weekly_usage_snapshots`) names the snapshot's
+    retained id (`sa:<observation-id>` or a bootstrap id, never a rowid), and
+    its effect applies at the current replay point. The decision's EFFECTIVE
+    revision is the one read, so replacing a suppressor updates its
+    memberships and tombstoning it removes them, while another active
+    suppressor can independently keep the retirement. An old event without a
+    suppression list asserts nothing, and no percentage band reconstructs
+    one.
+
+    ``suppressors`` is the replay's own set of applied decisions (a
+    derivation-completion scratch passes what its retention has applied so
+    far, so a future credit's suppression never applies early); ``None``
+    reads the live effective metadata, which ingest writes as each decision
+    folds and a rebuild writes in the same transaction as its folds, before
+    any convergence can run. A rebuild applies the same lists directly in
+    those folds."""
+    kinds = _SUPPRESSOR_KINDS_BY_AXIS[axis]
+    if not isinstance(snapshot_id, str):
+        return False
+    if suppressors is None:
+        records = []
+        for _event_id, event_json in conn.execute(
+                _SUPPRESSOR_CANDIDATES_SQL,
+                ("%" + json.dumps(snapshot_id) + "%",)).fetchall():
+            if event_json is None:
+                continue
+            record = _lib_journal.decode_line(event_json.encode("utf-8"))
+            if record is not None:
+                records.append(record)
+    else:
+        records = suppressors
+    for record in records:
+        if not isinstance(record, dict) or record.get("t") != "evt":
+            continue
+        payload = record.get("payload") or {}
+        if (payload.get("kind") not in kinds
+                or payload.get("suppression_table", "weekly_usage_snapshots")
+                != "weekly_usage_snapshots"):
+            continue
+        if snapshot_id in (payload.get("suppression") or ()):
+            return True
+    return False
+
+
+def _keep_five_hour_retirement(conn, cols: dict, rowid: int, event_id,
+                               *, suppressors=None) -> None:
     """Keep an admitted five-hour retirement through a row convergence
-    (#825/#832 spec 4.7 revision 6, fix round K15, review finding K14R-5).
+    (#825/#832 spec 4.7 revision 6, fix round K15, review finding K14R-5;
+    exact membership since #840).
 
     A five-hour credit retires an unheld stale replica in place: its
     five-hour percent, reset and window key are NULL while its
@@ -7655,9 +7995,10 @@ def _keep_five_hour_retirement(conn, cols: dict, rowid: int) -> None:
     values back, so live state would differ from a rebuild, which folds the
     event and then the credit. The row is that retired replica when it is
     unheld, all three five-hour columns are NULL while the payload carries a
-    five-hour reading, and the account holds an admitted five-hour credit of
-    the payload's window effective at or before its capture. ``cols`` then
-    converges every other column and keeps the three NULL."""
+    five-hour reading, and an effective `five_hour_credit` suppression names
+    its snapshot id (`_suppression_retires`). ``cols`` then converges every
+    other column, keeping its accepted weekly evidence, and keeps the three
+    NULL."""
     if cols.get("five_hour_percent") is None or cols.get(
             "five_hour_window_key") is None:
         return
@@ -7668,37 +8009,30 @@ def _keep_five_hour_retirement(conn, cols: dict, rowid: int) -> None:
     if (row is None or row[0] is not None or row[1] is not None
             or row[2] is not None or row[3]):
         return
-    credited = conn.execute(
-        "SELECT 1 FROM five_hour_reset_events "
-        "WHERE account_key = ? AND five_hour_window_key = ? "
-        "  AND unixepoch(effective_reset_at_utc) <= unixepoch(?) LIMIT 1",
-        (cols.get("account_key") or _lib_accounts.UNATTRIBUTED,
-         int(cols["five_hour_window_key"]), cols.get("captured_at_utc")),
-    ).fetchone()
-    if credited is None:
+    if not _suppression_retires(conn, event_id, "five_hour",
+                                suppressors=suppressors):
         return
     cols["five_hour_percent"] = None
     cols["five_hour_resets_at"] = None
     cols["five_hour_window_key"] = None
 
 
-def _keep_weekly_retirement(conn, cols: dict, rowid: int) -> None:
+def _keep_weekly_retirement(conn, cols: dict, rowid: int, event_id,
+                            *, suppressors=None) -> None:
     """Keep an admitted weekly retirement through a row convergence (#825/#832
-    spec 4.7 revision 7, fix round K16b), the weekly twin of
-    `_keep_five_hour_retirement`.
+    spec 4.7 revision 7, fix round K16b; exact membership since #840), the
+    weekly twin of `_keep_five_hour_retirement`.
 
-    A weekly credit's stale-replica cleanup keeps a band row that carries a
-    five-hour reading and makes it weekly-held, while its `snapshot_accept`
-    payload still says unheld. Converging the row from that payload would hand
-    the retired weekly value back as accepted weekly evidence. The row is that
-    converted replica when it is weekly-held while the payload is not, carries
-    a five-hour reading, and its capture and weekly value lie in the band of
-    an admitted weekly credit of its own account and week: an in-place
-    `week_reset_events` row ending that week (inclusive band) or a
-    `weekly_credit_floors` row of its start date (strict band), the same
-    bands `_cctally_record._credit_retirement_bands` reads and
-    `_weekly_value_is_retired_replica` applies. ``cols`` then converges every
-    other column and keeps the row held."""
+    A weekly suppression keeps a named row that carries a five-hour reading
+    and makes it weekly-held, while its `snapshot_accept` payload still says
+    unheld. Converging the row from that payload would hand the retired
+    weekly value back as accepted weekly evidence. The row is that converted
+    replica when it is weekly-held while the payload is not, carries a
+    five-hour reading, and an effective `week_reset` or
+    `weekly_credit_effects` suppression names its snapshot id
+    (`_suppression_retires`). ``cols`` then converges every other column,
+    keeping its valid five-hour data, and keeps the row held. An explicitly
+    held payload is converged as it is."""
     if cols.get("weekly_observation_held") not in (None, 0):
         return
     row = conn.execute(
@@ -7707,41 +8041,13 @@ def _keep_weekly_retirement(conn, cols: dict, rowid: int) -> None:
         "FROM weekly_usage_snapshots WHERE id = ?", (rowid,)).fetchone()
     if row is None or not row[0] or row[1] is None or row[2] is None:
         return
-    import _cctally_record
-    account_key = cols.get("account_key") or _lib_accounts.UNATTRIBUTED
-    bands = []
-    try:
-        week_end = _cctally_core._canonicalize_optional_iso(
-            cols.get("week_end_at"), "converge.week_end_at")
-    except (TypeError, ValueError):
-        week_end = None
-    if week_end is not None:
-        for floor_at, retired in conn.execute(
-                "SELECT effective_reset_at_utc, observed_pre_credit_pct "
-                "FROM week_reset_events "
-                "WHERE account_key = ? AND new_week_end_at = ? "
-                "  AND observed_pre_credit_pct IS NOT NULL",
-                (account_key, week_end)).fetchall():
-            bands.append((str(floor_at), float(retired), True))
-    for floor_at, retired in conn.execute(
-            "SELECT effective_at_utc, observed_pre_credit_pct "
-            "FROM weekly_credit_floors "
-            "WHERE week_start_date = ? AND account_key = ? "
-            "  AND observed_pre_credit_pct IS NOT NULL",
-            (cols.get("week_start_date"), account_key)).fetchall():
-        bands.append((str(floor_at), float(retired), False))
-    try:
-        weekly_percent = float(cols.get("weekly_percent"))
-    except (TypeError, ValueError):
-        return
-    if _cctally_record._weekly_value_is_retired_replica(
-            bands, captured_at_utc=cols.get("captured_at_utc"),
-            weekly_percent=weekly_percent):
+    if _suppression_retires(conn, event_id, "weekly",
+                            suppressors=suppressors):
         cols["weekly_observation_held"] = 1
 
 
 def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None,
-                                 record=None) -> str:
+                                 record=None, suppressors=None) -> str:
     """Bring the live physical row into agreement with the already-journaled
     effective event, and stamp `journal_id` in the SAME operation (#374 §6).
 
@@ -7768,7 +8074,9 @@ def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None,
 
     ``record`` (#825/#832 fix round E) converges to that evt-shaped record
     instead of the live effective metadata's: a derivation-completion scratch
-    replay passes the retained effective decision it holds.
+    replay passes the retained effective decision it holds, and with it
+    ``suppressors``, the decisions it has applied so far, against which a
+    retired snapshot's exact suppression membership is decided (#840).
     """
     record = (_effective_event_for_convergence(conn, event_id)
               if record is None else record)
@@ -7809,8 +8117,10 @@ def _converge_row_from_effective(conn, event_id, *, table=None, rowid=None,
         )
         return CONVERGE_DROPPED
     if target == "weekly_usage_snapshots":
-        _keep_five_hour_retirement(conn, cols, int(rowid))
-        _keep_weekly_retirement(conn, cols, int(rowid))
+        _keep_five_hour_retirement(conn, cols, int(rowid), event_id,
+                                   suppressors=suppressors)
+        _keep_weekly_retirement(conn, cols, int(rowid), event_id,
+                                suppressors=suppressors)
     assignments = ", ".join(f"{name} = ?" for name in cols)
     conn.execute(
         f"UPDATE {target} SET {assignments} WHERE id = ?",
@@ -9526,6 +9836,9 @@ def run_stats_ingest(
     the caller owns the set — and surfaces the same signal with the same manual
     remedy rather than inventing a second recovery path.
     """
+    # #797/#823/#840 spec 4.6 B2: ingest is an authoritative decision, so
+    # the revision-2 boundary is in the journal before it interprets it.
+    establish_revision_before_decision()
     kwargs = {
         "mode": mode,
         "timeout_s": timeout_s,
@@ -9818,6 +10131,8 @@ _REBUILD_REQUIRED_TABLES = frozenset(
     {
         "accounts",
         "budget_milestones",
+        "claude_oauth_samples",
+        "claude_weekly_observation_decisions",
         "five_hour_block_models",
         "five_hour_block_projects",
         "five_hour_blocks",
@@ -9870,6 +10185,8 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
         "idx_budget_milestones_codex_digest",
         "idx_budget_milestones_journal_id",
         "idx_budget_milestones_journal_id_null",
+        "idx_claude_oauth_samples_five_hour",
+        "idx_claude_oauth_samples_weekly",
         "idx_cost_week_start_at_time",
         "idx_cost_week_time",
         "idx_five_hour_block_models_block",
@@ -9933,8 +10250,11 @@ _REBUILD_REQUIRED_INDEXES = frozenset(
 # omitted column, constraint, partial predicate, or index definition.  An epoch
 # schema change must update this contract alongside STATS_INDEX_EPOCH.
 # #825/#832 revision 2 (#946): `journal_derivation_frontier.proof_generation`.
+# #797/#823/#840 epoch 1019: `claude_oauth_samples` and its two indexes,
+# `claude_weekly_observation_decisions`, and the four D11 identity columns of
+# `five_hour_credit_confirmation_state`.
 _REBUILD_SCHEMA_FINGERPRINT = (
-    "92692b90b8446b0d40aff266bb142b76b0319a749d9e75b2caf469d5461ec952"
+    "6fe811013635e0e23c5c7fc59ed88ec6563664e0a3c5df11b0964c01f253c8fc"
 )
 
 
@@ -10126,7 +10446,7 @@ def stats_index_matches_journal_prefix(
             prior_high_water = None
             cutover_captured = _CUTOVER_UNSEEN
             marker_coordinates: dict = {}
-            hasher = _lib_journal_router.PrefixHashAccumulator()
+            hasher = _new_prefix_hasher()
             # #825/#832: the same admission the rebuild applied.
             admission_boundary = _whole_prefix_admission_boundary()
             if high_water is not None:
@@ -10150,8 +10470,8 @@ def stats_index_matches_journal_prefix(
 
                 for segment, offset, raw in _iter_range_with_segments(
                     None, high_water, segments,
-                    on_segment=lambda name: hasher.begin_segment(
-                        name, prior_high_water),
+                    on_segment=lambda name, size: hasher.begin_segment(
+                        name, prior_high_water, size=size),
                     on_bytes=hasher.extend,
                     elide=_elide_segment,
                 ):
@@ -12002,7 +12322,7 @@ def _resolve_quota_cache_coverage(cache_path, high_water, decoded_end=None):
 def _rebuild_quota_cache_leg_raw(
     quota_raw, decoded, cutover_claude, counters=None, *,
     high_water=None, coverage=None, decoded_end=None, snapshot_out=None,
-    quiet=False, elision_gaps=None,
+    quiet=False, elision_gaps=None, hold_stats=None,
 ) -> float:
     """Re-materialize cache.db `quota_window_snapshots` AND the #416 Codex
     attribution map from the journal (spec §5.4 + #416 spec §3.4), fed RAW
@@ -12035,7 +12355,12 @@ def _rebuild_quota_cache_leg_raw(
     begins, exactly as the §3.5 precedence rule requires.
 
     Returns the measured flock hold in seconds, which acceptance criterion 7
-    caps.
+    caps. ``hold_stats``, when given, receives ``maxSeconds``: the longest
+    single hold, which #997 D7 adds to the rebuild record.
+
+    ``quota_raw`` is a list of raw lines or, from the final rebuild, a
+    `QuotaLineSource` of coordinates that the recovery re-reads one chunk at a
+    time (#997 D7).
     """
     file_accounts = [
         r for r in decoded if r is not None and _is_codex_file_account_op(r)
@@ -12136,7 +12461,7 @@ def _rebuild_quota_cache_leg_raw(
         quota_raw, file_accounts, cutover_claude, counters,
         cache_path=cache_path, vector=vector, covered=covered,
         high_water=high_water, coverage=coverage, quiet=quiet,
-        attributions=attributions,
+        attributions=attributions, hold_stats=hold_stats,
     )
 
 
@@ -12195,7 +12520,7 @@ def _recovery_state(cache):
 def _run_bounded_recovery(
     quota_raw, file_accounts, cutover_claude, counters, *,
     cache_path, vector, covered, high_water, coverage, quiet=False,
-    attributions=(),
+    attributions=(), hold_stats=None,
 ) -> float:
     """Recovery as resumable chunks, each capped by bytes AND record count.
 
@@ -12227,7 +12552,16 @@ def _run_bounded_recovery(
     of one pass, so a single recovery reports at most what a single unchunked
     call reports today.
 
-    Returns the total measured flock hold across every chunk.
+    Returns the total measured flock hold across every chunk; ``hold_stats``,
+    when given, receives the longest single one as ``maxSeconds``.
+
+    **A coordinate source that can no longer be re-read** (#997 D7: a short,
+    missing or reframed slice) fails the pass the way an unreadable elided
+    segment does: that chunk's observations are not applied, the covered
+    boundary is dropped so nothing is certified over them, and the remaining
+    chunks still apply, ending in `noCoverageEstablished` with `complete`
+    False. The failures are listed in the coverage block's
+    `lineSourceFailures`.
     """
     import _cctally_cache
     from _lib_cache_writer_lock import (
@@ -12238,7 +12572,7 @@ def _run_bounded_recovery(
     pass_id, started_at = _recovery_pass_identity()
     identity_root = _lib_cache_coverage.identity_root(vector)
     spans = _lib_cache_coverage.chunk_spans(
-        [len(raw) + 1 for raw in quota_raw],
+        _quota_line_sizes(quota_raw),
         byte_cap=_RECOVERY_CHUNK_BYTES, record_cap=_RECOVERY_CHUNK_RECORDS,
     )
     # NOT cleared on a restart, deliberately. §4.6 requires that one recovery
@@ -12251,6 +12585,8 @@ def _run_bounded_recovery(
     # are snapshotted here and restored on each restart.
     counter_baseline = dict(counters) if counters is not None else None
     hold_seconds = 0.0
+    max_hold_seconds = 0.0
+    source_failures: list = []
     restarts = 0
     chunk_index = 0
     applied = 0
@@ -12306,14 +12642,33 @@ def _run_bounded_recovery(
         decoded_chunk = None
         if span is not None:
             start, stop, _bytes = span
-            decoded_chunk = list(_decoded_quota_stream(
-                quota_raw[start:stop], cutover_claude, counters))
+            try:
+                decoded_chunk = list(_decoded_quota_stream(
+                    _quota_lines(quota_raw, start, stop), cutover_claude,
+                    counters))
+            except QuotaLineSourceError as exc:
+                source_failures.append(
+                    {"chunk": chunk_index, "error": str(exc)})
+                if not quiet:
+                    print(f"[rebuild] quota cache leg re-read failed: {exc}",
+                          file=sys.stderr)
+                decoded_chunk = None
+                covered = None
         try:
+            # #997 D9: a first non-blocking try, so free flocks cost no
+            # progress write; only a contended acquisition is a reported wait.
             held = acquire_cache_writer_flocks(
                 _cctally_core.CACHE_LOCK_PATH,
                 _cctally_core.CACHE_LOCK_CODEX_PATH,
-                timeout=15.0,
+                timeout=None,
             )
+            if held is None:
+                with _lib_rebuild_progress.waiting("quota-flocks"):
+                    held = acquire_cache_writer_flocks(
+                        _cctally_core.CACHE_LOCK_PATH,
+                        _cctally_core.CACHE_LOCK_CODEX_PATH,
+                        timeout=15.0,
+                    )
         except OSError as exc:
             if not quiet:
                 print(f"[rebuild] quota cache leg lock failed: {exc}",
@@ -12490,13 +12845,22 @@ def _run_bounded_recovery(
                 if cache is not None:
                     cache.close()
         finally:
-            hold_seconds += time.monotonic() - held_from
+            held_for = time.monotonic() - held_from
+            hold_seconds += held_for
+            max_hold_seconds = max(max_hold_seconds, held_for)
             release_cache_writer_flocks(held)
         decoded_chunk = None
+        _lib_rebuild_progress.tick(
+            chunks=committed_chunks, plannedChunks=len(plan),
+            observations=applied)
         if _RECOVERY_BETWEEN_CHUNKS is not None:
             _RECOVERY_BETWEEN_CHUNKS(committed_chunks)
 
     _record(outcome)
+    if source_failures and coverage is not None:
+        coverage["lineSourceFailures"] = source_failures
+    if hold_stats is not None:
+        hold_stats["maxSeconds"] = max_hold_seconds
     return hold_seconds
 
 
@@ -12731,6 +13095,12 @@ def rebuild_stats_index(
             raise ValueError(
                 "complete_derivation applies to the live destination only")
         import _cctally_completion
+        if high_water is None:
+            # #797/#823/#840 spec 4.6 B2: recovery and maintenance rebuilds
+            # are authoritative decisions; the revision-2 boundary is in the
+            # journal before completion reads its prefix, so completion's own
+            # append never races the boundary's.
+            establish_revision_before_decision(scan=True)
         return _cctally_completion.complete_and_rebuild(
             context=context,
             high_water=high_water,
@@ -12952,6 +13322,7 @@ def _rebuild_stats_index_locked(
                      "quota_replay")
     }
     quota_lock_hold = 0.0
+    quota_hold_stats: dict = {}
     #: Whether this generation's quota projection was materialized from a cache
     #: whose recovery left an uncovered remainder. Declared out here because the
     #: record and the result are assembled outside the try that sets it.
@@ -12980,9 +13351,11 @@ def _rebuild_stats_index_locked(
         # consumer actually needs: the decision records decoded (5.08% of a
         # production journal) and the Codex quota observations as RAW BYTES
         # (1.64 GB against roughly six gigabytes of dicts). Everything else is
-        # dropped as soon as it has contributed (#496 S4 §4).
+        # dropped as soon as it has contributed (#496 S4 §4). #997 D7: the
+        # quota observations are now retained as COORDINATES (16 bytes each)
+        # and the cache leg re-reads them one chunk at a time.
         decoded: list = []
-        quota_raw: list = []
+        quota_raw = QuotaLineSource()
         protocol_evidence = []
         prior_high_water = None
         cutover_captured = _CUTOVER_UNSEEN
@@ -12993,15 +13366,25 @@ def _rebuild_stats_index_locked(
         # 64,248 correction records carry far fewer markers than lines.
         marker_coordinates: dict = {}
         last_seen = _lib_journal_router.LastSeenAccumulator()
+        # #797/#823/#840 spec 4.3 D8: this rebuild is apply-only and never runs
+        # the pipeline that projects provider samples live, so the pass offers
+        # every ADMITTED record to the same projection, in bounded batches on
+        # the scratch index.
+        import _cctally_oauth_samples
+        samples = _cctally_oauth_samples.RebuildProjector(conn)
         summaries = _SegmentSummaryCollector()
         # F12 (#496 S5b §5). Planned before the first segment is reached, from
         # the sidecar this pass's predecessor wrote and the coverage certificate
         # Stage 3 mints. A plan that elides nothing is exactly today's pass.
         elision = plan_segment_elision(segments, hw)
-        hasher = _lib_journal_router.PrefixHashAccumulator()
+        hasher = _new_prefix_hasher()
         evidence_seconds = 0.0
         prefix = traversal["stats_prefix"]
         read_started = time.monotonic()
+        # #997 D9: progress for a detached worker's state file (a no-op
+        # unless one installed a sink); ticks are throttled to one write per
+        # ten seconds.
+        _lib_rebuild_progress.phase("rebuild:read", lines=0, bytes=0)
 
         def _elide_segment(name, lo, hi, stat_result) -> bool:
             """Contribute an elided segment's share instead of reading it."""
@@ -13044,8 +13427,8 @@ def _rebuild_stats_index_locked(
         if hw is not None:
             for segment, offset, raw in _iter_range_with_segments(
                 None, hw, segments,
-                on_segment=lambda name: hasher.begin_segment(
-                    name, prior_high_water),
+                on_segment=lambda name, size: hasher.begin_segment(
+                    name, prior_high_water, size=size),
                 on_bytes=hasher.extend,
                 on_extent=lambda name, lo, hi, st: summaries.begin(
                     name, lo, hi, st, last_seen),
@@ -13053,8 +13436,16 @@ def _rebuild_stats_index_locked(
             ):
                 prefix["lines"] += 1
                 prefix["bytes"] += len(raw) + 1
+                if not prefix["lines"] & 4095:
+                    _lib_rebuild_progress.tick(
+                        lines=prefix["lines"], bytes=prefix["bytes"])
                 summaries.line(raw, offset + len(raw) + 1)
                 rec = _lib_journal.decode_line(raw)
+                if (rec is not None and rec.get("t")
+                        in _lib_journal_router.RETAINED_RECORD_TYPES):
+                    # #997 D15: a record this pass may retain is compacted
+                    # before anything holds a reference to it.
+                    rec = _lib_journal.compact_retained(rec)
                 if rec is None:
                     malformed += 1
                     summaries.malformed_line()
@@ -13088,6 +13479,7 @@ def _rebuild_stats_index_locked(
                     continue
                 rebuild_quarantine.on_record(
                     rec, segment=segment, offset=offset)
+                samples.offer(rec)
                 # `_capture_protocol_prefix_evidence` returns immediately for
                 # anything that is not an op, so this guard changes nothing it
                 # does — it moves the phase attribution's two clock reads from
@@ -13146,7 +13538,7 @@ def _rebuild_stats_index_locked(
                     decoded.append(rec)
                 else:
                     if update_quota_cache and _is_codex_quota_obs(rec):
-                        quota_raw.append(raw)
+                        quota_raw.append(segment, offset, len(raw))
                     # A PLACEHOLDER, not a dropped element. `resolve_effective_events`
                     # numbers candidates with `enumerate(records)`, and three of the
                     # seven structural violation kinds put that number inside
@@ -13165,6 +13557,8 @@ def _rebuild_stats_index_locked(
                     offset + len(raw) + 1,
                 )
         summaries.close(last_seen)
+        samples.flush()
+        samples = None
         # §6.3 "recorded, not silent": every elision refusal is a SILENT
         # fallback, and this block is the only surface that says which one.
         traversal["elision"] = elision.counters()
@@ -13193,6 +13587,7 @@ def _rebuild_stats_index_locked(
         # streamed prefix contained it, otherwise from the unvisited suffix alone
         # (falls back to `unattributed` when neither has it), so a fresh
         # single-account rebuild is byte-neutral.
+        _lib_rebuild_progress.phase("rebuild:selection")
         cutover_started = time.monotonic()
         cutover_claude = _resolve_cutover_for_rebuild(
             cutover_captured, hw, all_segments, traversal["cutover_suffix"],
@@ -13238,13 +13633,14 @@ def _rebuild_stats_index_locked(
         # Codex quota obs -> cache.db quota_window_snapshots. The retained bytes
         # are decoded inside the leg's existing transaction and freed here, so
         # the SQLite fold never runs on top of them.
+        _lib_rebuild_progress.phase("rebuild:quota-leg")
         leg_started = time.monotonic()
         if update_quota_cache:
             quota_lock_hold = _rebuild_quota_cache_leg_raw(
                 quota_raw, decoded, cutover_claude, traversal["quota_replay"],
                 high_water=hw, coverage=quota_coverage,
                 decoded_end=prior_high_water, snapshot_out=quota_snapshot,
-                elision_gaps=elision.quota_gaps)
+                elision_gaps=elision.quota_gaps, hold_stats=quota_hold_stats)
         quota_raw = []
         phase_seconds["quota_cache_leg"] = round(
             time.monotonic() - leg_started, 6)
@@ -13268,6 +13664,7 @@ def _rebuild_stats_index_locked(
 
         _stats_rebuild_test_pause("rebuild_fold_started")
         fold_started = time.monotonic()
+        _lib_rebuild_progress.phase("rebuild:fold", rows=0)
 
         # Phase 1 (txn A) — structural folds: op floors, snapshot_accept, cost
         # snapshots, resets+suppression, block_close, arming, credit effects.
@@ -13280,6 +13677,8 @@ def _rebuild_stats_index_locked(
                 else:
                     _apply_evt(conn, rec)
                 lines_folded += 1
+                if not lines_folded & 1023:
+                    _lib_rebuild_progress.tick(rows=lines_folded)
             conn.commit()
         except BaseException:
             try:
@@ -13318,12 +13717,34 @@ def _rebuild_stats_index_locked(
         # later (see the note on `structural_fold` above). It cannot move any
         # earlier without holding the bundle's 254 MiB of observations (measured
         # on the same store, 232,466 rows) across the structural fold as well.
+        #
+        # #997 D14: the read-pass state is released FIRST, so the bundle's
+        # observations (and, without a snapshot, the projection's own load in
+        # transaction B) reuse its memory instead of stacking on it. The
+        # open-block projection reads that state only through
+        # `journaled_block_first_observations`, so its compact result is
+        # computed here, with the three `effective` fields the result reads
+        # later. `selector_accumulators` goes too: its `SelectorFold`
+        # candidates hold decoded event records. `selector_rows` (materialized
+        # above, for `_validate_selector_state`) and the records `tail` retains
+        # for transaction B stay. The pin on the cache snapshot grows only by
+        # this compact computation; the bundle is still read before phase 2a.
+        # `rec` is the folds' loop variable, still naming the last structural
+        # event.
+        journaled_first = journaled_block_first_observations(
+            decoded, effective.by_id)
+        conflicts = effective.conflicts
+        protocol_violations = effective.protocol_violations
+        acknowledged = effective.acknowledged_protocol_violations
+        decoded = effective = stream = structural = rec = None
+        selector_accumulators = None
         quota_bundle = _read_quota_projection_bundle(quota_snapshot)
 
         # Phase 2a — OPEN 5h block projection (own txn; block-only). Closed blocks
         # came from block_close evts; this materializes the never-closed window(s)
         # so the five_hour_milestone block_id derived_fk resolves. Best-effort
         # (the open block is a projection, §5.3).
+        _lib_rebuild_progress.phase("rebuild:open-blocks")
         projection_started = time.monotonic()
         try:
             cctally = sys.modules.get("cctally")
@@ -13334,15 +13755,15 @@ def _rebuild_stats_index_locked(
                 # `snapshot_accept` in journal order, which a credit's
                 # stale-replica removal cannot delete and an earlier capture
                 # appended later cannot displace.
-                bf(conn, only_missing=True,
-                   journaled_first=journaled_block_first_observations(
-                       decoded, effective.by_id))
+                bf(conn, only_missing=True, journaled_first=journaled_first)
         except Exception as exc:  # pragma: no cover — projection is best-effort
             print(f"[rebuild] open 5h block re-materialization failed: {exc}",
                   file=sys.stderr)
         phase_seconds["open_block_projection"] = round(
             time.monotonic() - projection_started, 6)
+        journaled_first = None
 
+        _lib_rebuild_progress.phase("rebuild:stats-fold", rows=lines_folded)
         # Phase 2b + 3 (txn B) — quota projection re-materialization (after the
         # order-45 arming folds) + milestone/budget folds + cursor advance.
         conn.execute("BEGIN IMMEDIATE")
@@ -13372,6 +13793,8 @@ def _rebuild_stats_index_locked(
             for _order, _seq, _kind, rec in tail:
                 _apply_evt(conn, rec)
                 lines_folded += 1
+                if not lines_folded & 1023:
+                    _lib_rebuild_progress.tick(rows=lines_folded)
             # Fold-time `last_seen_utc` derivation (#341): re-derive each
             # account's last-seen from the whole journal. The map was
             # accumulated during the single read pass — `decoded` no longer
@@ -13396,6 +13819,7 @@ def _rebuild_stats_index_locked(
             raise
         phase_seconds["stats_fold"] = round(time.monotonic() - fold_started, 6)
 
+        _lib_rebuild_progress.phase("rebuild:validate")
         validate_started = time.monotonic()
         rows_by_table = {}
         for tbl in _REBUILD_COUNT_TABLES:
@@ -13442,15 +13866,15 @@ def _rebuild_stats_index_locked(
     # database-sized rollback journal while the scratch still exists, so the
     # multi-gigabyte replay peak must not still be resident on top of it.
     segments_read = len(segments)
-    conflicts = effective.conflicts
-    protocol_violations = effective.protocol_violations
-    acknowledged = effective.acknowledged_protocol_violations
+    # `conflicts`, `protocol_violations` and `acknowledged` were captured
+    # before the quota projection bundle loaded, where the read-pass state was
+    # released (#997 D14).
     # The pre-publication window is what F9's memory acceptance is measured
     # over: everything after this point is publication, whose rollback-journal
     # cost S3 already accounts for through projected headroom.
     peak_heap_bytes = (
         tracemalloc.get_traced_memory()[1] if tracing else 0)
-    decoded = effective = stream = structural = tail = None
+    tail = None
     segments = protocol_evidence = last_seen = None
 
     # First fresh-connection validation (#496 S1 F1). A failure here raises
@@ -13465,6 +13889,7 @@ def _rebuild_stats_index_locked(
         scratch, phase="fresh pre-publication validation"
     )
 
+    _lib_rebuild_progress.phase("rebuild:publish")
     publication_started = time.monotonic()
     incident = _publish_rebuilt_stats_index(
         scratch=scratch,
@@ -13500,7 +13925,14 @@ def _rebuild_stats_index_locked(
                 name: dict(counts) for name, counts in traversal.items()
             },
             "peakHeapBytes": peak_heap_bytes,
+            # #997 D11: the process-lifetime resident peak, which for the
+            # detached worker covers completion and this rebuild.
+            "peakResidentBytes": _lib_rebuild_progress.peak_resident_bytes(),
             "quotaLockHoldSeconds": round(quota_lock_hold, 6),
+            # #997 D7: the longest single hold; the field above stays the
+            # cumulative hold across chunks and retries.
+            "quotaLockMaxHoldSeconds": round(
+                quota_hold_stats.get("maxSeconds", 0.0), 6),
             "selectorDesynchronized": selector_desync,
             "quotaCacheCoverage": quota_coverage,
             # §4.7: distinct from `quotaCacheCoverage`, which describes the
@@ -14277,10 +14709,19 @@ def _account_bound_seam(step: str) -> None:
         seam(step)
 
 
-def _legacy_spool_paths() -> list:
-    """The previous release's statusline coordination paths (spec section 7)."""
+def _legacy_spool_paths(*, include_v1: bool = True) -> list:
+    """The previous releases' statusline coordination paths (spec section 7).
+
+    #797/#823/#840 (spec 4.6 B4): the retired v1 account-bound root's
+    coordination state — its ``accounts/`` tree and ``transport.last`` —
+    joins the pre-#825 paths. The v1 root's own caches, baseline and
+    diagnostics carry no accounting input and stay out, so an older process
+    refreshing a diagnostic file raises no trigger. ``include_v1=False`` is
+    the ORIGINAL inventory the cutover op and its anchors describe; the
+    revision boundary records the expanded one, and every rescan after it
+    compares the expanded inventory."""
     core = _cctally_core
-    return [
+    paths = [
         core.STATUSLINE_OBSERVE_MARKER_PATH,
         core.STATUSLINE_PERSIST_LOCK_PATH,
         core.STATUSLINE_CANDIDATE_DIR,
@@ -14289,6 +14730,12 @@ def _legacy_spool_paths() -> list:
         core.STATUSLINE_AUTHORITATIVE_7D_PATH,
         core.STATUSLINE_AUTHORITATIVE_5H_PATH,
     ]
+    if include_v1:
+        paths.extend([
+            core.STATUSLINE_ACCOUNT_BOUND_V1_DIR / "accounts",
+            core.STATUSLINE_ACCOUNT_BOUND_V1_DIR / "transport.last",
+        ])
+    return paths
 
 
 def _legacy_relative_name(path) -> str:
@@ -14341,9 +14788,9 @@ def _legacy_file_entry(path, rel: str):
             _lib_legacy_spool.content_digest(data))
 
 
-def capture_legacy_spool_state():
+def capture_legacy_spool_state(*, include_v1: bool = True):
     """Observe the legacy statusline spool. Content is read only to digest it;
-    it is never accounting input.
+    it is never accounting input. ``include_v1`` as in `_legacy_spool_paths`.
 
     Complete or raising (review cycle 7 825-832-CD7-J01): a spool path that
     is absent, or an entry that vanished since its directory was listed, is
@@ -14361,7 +14808,7 @@ def capture_legacy_spool_state():
         raise _legacy_inventory_incomplete(
             getattr(exc, "filename", None) or walking[0], exc, "list") from exc
 
-    for path in _legacy_spool_paths():
+    for path in _legacy_spool_paths(include_v1=include_v1):
         path = pathlib.Path(path)
         walking[0] = path
         try:
@@ -14393,8 +14840,9 @@ def _decode_anchor_record(raw: bytes):
 
 
 def _anchor_record(rec):
-    """``rec`` when it is a stamped cutover or legacy-spool-activity op, else
-    None."""
+    """``rec`` when it is a stamped cutover, revision or legacy-spool-activity
+    op, else None. Position-free: after the revision boundary a reader also
+    requires ``wpr == 2`` (`_post_revision_without_revision`)."""
     if (not isinstance(rec, dict) or rec.get("t") != "op"
             or not _lib_account_protocol.is_stamped(rec)):
         return None
@@ -14402,6 +14850,8 @@ def _anchor_record(rec):
     if not isinstance(payload, dict):
         return None
     kind = payload.get("kind")
+    if kind == _lib_account_protocol.REVISION_OP_KIND:
+        return _revision_record(rec)
     if kind == _lib_account_protocol.CUTOVER_OP_KIND:
         if rec.get("id") != _lib_account_protocol.CUTOVER_OP_ID:
             return None
@@ -14437,7 +14887,9 @@ def _inventory_uncertainty_record(rec):
             return rec
         return None
     anchor = _anchor_record(rec)
-    if (anchor is not None and kind == _lib_account_protocol.CUTOVER_OP_KIND
+    if (anchor is not None
+            and kind in (_lib_account_protocol.CUTOVER_OP_KIND,
+                         _lib_account_protocol.REVISION_OP_KIND)
             and payload.get("legacySpoolInventoryFailure") is not None):
         return rec
     return None
@@ -14453,9 +14905,24 @@ def _cutover_uncertainty(found):
 
 def _anchor_digest(rec) -> str:
     payload = rec["payload"]
-    if payload["kind"] == _lib_account_protocol.CUTOVER_OP_KIND:
+    if payload["kind"] in (_lib_account_protocol.CUTOVER_OP_KIND,
+                           _lib_account_protocol.REVISION_OP_KIND):
         return payload["legacySpoolBaselineDigest"]
     return payload["digest"]
+
+
+def _post_revision_without_revision(rec, segment, offset, revision) -> bool:
+    """Whether ``rec`` at ``(segment, offset)`` lies after the revision-2
+    boundary without carrying ``wpr == 2`` (spec 4.6 B3): such a record is
+    excluded input, so an older process's anchoring or uncertainty op there
+    never advances or opens anything ("old post-boundary anchoring ops never
+    advance the revision-2 baseline")."""
+    if revision is None:
+        return False
+    if _lib_account_protocol.is_historical(
+            _lib_account_protocol.Coordinate(segment, offset), revision):
+        return False
+    return not _lib_account_protocol.has_current_revision(rec)
 
 
 def _read_line_at(segment: str, offset: int):
@@ -14483,9 +14950,11 @@ def _read_line_at(segment: str, offset: int):
 
 
 _CUTOVER_ID_BYTES = _lib_account_protocol.CUTOVER_OP_ID.encode("ascii")
+_REVISION_ID_BYTES = _lib_account_protocol.REVISION_OP_ID.encode("ascii")
 _ANCHOR_KIND_BYTES = (
     _lib_account_protocol.CUTOVER_OP_KIND.encode("ascii"),
     _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND.encode("ascii"),
+    _lib_account_protocol.REVISION_OP_KIND.encode("ascii"),
 )
 
 
@@ -14941,7 +15410,8 @@ def _whole_prefix_admission_boundary():
     completion abort before they publish instead of disabling admission."""
     found = _verified_cutover_from_cache(_read_account_bound_cache())
     if found is not None:
-        return _lib_account_protocol.boundary_from_op(found[2])
+        return _attach_revision(
+            _lib_account_protocol.boundary_from_op(found[2]))
     summaries = read_segment_summaries()
     ranges = {}
     for seg in _lookup_segments():
@@ -14960,7 +15430,8 @@ def _whole_prefix_admission_boundary():
         ranges[seg] = (0, st.st_size)
     found = _scan_for_cutover(ranges)
     return (None if found is None
-            else _lib_account_protocol.boundary_from_op(found[2]))
+            else _attach_revision(
+                _lib_account_protocol.boundary_from_op(found[2])))
 
 
 def find_account_bound_cutover(*, publish=False):
@@ -14973,7 +15444,9 @@ def find_account_bound_cutover(*, publish=False):
     found = _locate_account_bound_cutover(publish=publish)
     if found is None:
         return None
-    return _lib_account_protocol.boundary_from_op(found[2])
+    # #797/#823/#840 (spec 4.6 B3): the revision-2 boundary rides along.
+    return _attach_revision(
+        _lib_account_protocol.boundary_from_op(found[2]), publish=publish)
 
 
 def _stats_journal_cutover_pending() -> bool:
@@ -15044,7 +15517,118 @@ def ensure_account_bound_cutover(*, now_utc=None):
     """Return the account-bound cutover boundary, establishing it if absent
     (spec 5.5). Never establishes a second boundary; a producer that loses the
     locked race installs nothing. Raises `AccountBoundCutoverDeferred` while
-    the one-time journal cutover is still pending."""
+    the one-time journal cutover is still pending.
+
+    #797/#823/#840 (spec 4.6 B2): every caller is an authoritative producer
+    — the append chokepoint (ingest emission, refresh, manual recording, the
+    dashboard), maintenance planning, recovery and the statusline's detached
+    child, never render — so this also establishes the revision-2 boundary
+    right after the original cutover, and the returned boundary carries it.
+    On a fresh install the revision op follows the cutover op immediately."""
+    boundary = _ensure_original_cutover(now_utc=now_utc)
+    return _establish_account_bound_revision(boundary, now_utc=now_utc)
+
+
+def establish_revision_before_decision(*, scan: bool = False) -> None:
+    """Establish the revision-2 boundary before an authoritative decision
+    that does not itself append (#797/#823/#840 spec 4.6 B2): an ingest or
+    rebuild interpreting a store whose original cutover exists but whose
+    revision op does not yet. A store without the original cutover is left
+    exactly as #825 leaves it: its first stamped append establishes both.
+
+    By default (the ingest tick) the original cutover is looked up WITHOUT
+    a journal scan. Proving it ABSENT takes a scan of the whole journal
+    prefix, and doing that on every tick re-read every segment the index has
+    already consumed, which #496 S5b removed: a tick opens only the segments
+    holding its unread records. So the tick asks its verified coordinate
+    cache, then the boundary its own index already holds
+    (`_index_cutover_boundary`; review RV-1: after an upgrade the v2
+    directory starts empty, and deferring every tick until the first stamped
+    append admitted an old-release write in that gap as history). Neither
+    answering, no cutover is known without a scan and the establishment
+    defers like any other unavailable lookup. ``scan=True`` (the completing
+    rebuild, which reads the whole prefix anyway) finds the cutover by a
+    scan when the cache cannot answer.
+
+    A revision op found by a scan is published to the revision cache (review
+    RV-2), so a missing revision cache costs one scan, never one per tick.
+
+    Best-effort: a deferred, unreadable, uncached or contended establishment
+    leaves the decision to run on the prefix it has. Admission is a function
+    of the journal alone, so that prefix is still interpreted consistently;
+    the next producer establishes the boundary (every stamped append runs
+    `ensure_account_bound_cutover`, which also republishes the cache)."""
+    if not account_bound_cutover_enforced():
+        return
+    try:
+        if scan:
+            cutover = find_account_bound_cutover()
+            if cutover is None or cutover.revision is not None:
+                return
+            ensure_account_bound_cutover()
+            return
+        found = _verified_cutover_from_cache(_read_account_bound_cache())
+        original = (_lib_account_protocol.boundary_from_op(found[2])
+                    if found is not None else _index_cutover_boundary())
+        if original is None:
+            return
+        cutover = _attach_revision(original, publish=True)
+        if cutover.revision is not None:
+            return
+        # Established from the known cutover directly: the original
+        # cutover's own lookup would scan for it on a cache miss.
+        _establish_account_bound_revision(original)
+    except (AccountBoundCutoverDeferred, AccountBoundCutoverUnavailable,
+            OSError):
+        return
+
+
+def _index_cutover_boundary():
+    """The original cutover boundary the live stats index recorded in its
+    admission summary, confirmed against the journal by one line read at its
+    coordinate, or None (no index, no summary boundary, an unproven WAL
+    family, or a coordinate that no longer holds that cutover op).
+
+    The index derived the boundary from the journal itself — it is the one
+    every admission decision of that index applied — so it names the first
+    cutover op without a scan. Read only: the summary is read through a
+    `mode=ro` connection only when the index's WAL family is raw-classified
+    safe (as `read_trusted_derivation_state` reads it)."""
+    import _lib_stats_wal
+
+    path = pathlib.Path(_cctally_core.DB_PATH)
+    if not path.exists():
+        return None
+    wal_index = _lib_stats_wal.inspect_wal_index_family(path)
+    if wal_index.get("verdict") not in {"coherent", "wal_absent", "wal_empty"}:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        summary = _read_admission_summary(conn)
+    except (sqlite3.Error, TypeError, ValueError, KeyError):
+        return None
+    finally:
+        conn.close()
+    if summary is None or summary.boundary is None:
+        return None
+    original = _lib_account_protocol.with_revision(summary.boundary, None)
+    raw = _read_line_at(original.segment, original.end_offset)
+    rec = None if raw is None else _decode_anchor_record(raw)
+    if rec is None or rec["payload"]["kind"] != (
+            _lib_account_protocol.CUTOVER_OP_KIND):
+        return None
+    try:
+        recorded = _lib_account_protocol.boundary_from_op(rec)
+    except ValueError:
+        return None
+    return recorded if recorded == original else None
+
+
+def _ensure_original_cutover(*, now_utc=None):
+    """The #825 establishment of the original cutover (spec 5.5)."""
     doc = _read_account_bound_cache()
     found = _verified_cutover_from_cache(doc)
     if found is not None:
@@ -15114,7 +15698,9 @@ def ensure_account_bound_cutover(*, now_utc=None):
         # the cutover op — no digest, no baseline file — so no crash can
         # leave a boundary without it.
         try:
-            state = capture_legacy_spool_state()
+            # The ORIGINAL inventory: the revision boundary that follows
+            # records the expanded one (#797/#823/#840 spec 4.6 B4).
+            state = capture_legacy_spool_state(include_v1=False)
             failure = None
         except LegacySpoolInventoryIncomplete as exc:
             state = None
@@ -15208,9 +15794,427 @@ def _frozen_extents(journal_dir, seg_name, seg_created, start) -> dict:
     return extents
 
 
-def _latest_anchor(cutover):
+# --------------------------------------------------------------------------
+# #797/#823/#840 revision 2 of the account-bound fence (spec 4.6 B1-B4)
+# --------------------------------------------------------------------------
+#
+# The revision boundary is a second durable op, `account_bound_revision` with
+# the stable id `account-bound-revision-2`, recording with the cutover's codec
+# the physical position at which it was appended and the EXPANDED legacy spool
+# baseline digest (the pre-#825 paths plus the retired v1 root's coordination
+# state). It always follows the original cutover in canonical order: like
+# every anchor it is appended under `journal.lock` to the canonically-last
+# segment, so a forward scan from the cutover op is complete. It is located
+# through its own coordinate cache (`revision-coordinate.json`), which only
+# accelerates the lookup and never confers authority, and it is established
+# with #825's 5.5 durability sequence before any authoritative decision —
+# through `ensure_account_bound_cutover`, never from render.
+#
+# Establishment preserves the original boundary, reconciles the existing
+# legacy baseline (the ORIGINAL inventory against the latest pre-revision
+# anchor, whose baseline file an older binary may have installed in the v1
+# root) and journals any difference as an ordinary `legacy_spool_activity`
+# trigger in the same locked write, carries every unresolved spool marker
+# forward (markers are journal facts and nothing here clears one), and only
+# then installs the expanded baseline under the revision op.
+
+_ACCOUNT_BOUND_REVISION_SRC = "account-bound-revision"
+_REVISION_CACHE_SCHEMA = 1
+
+
+def _revision_record(rec):
+    """``rec`` when it is a stamped revision-2 ``account_bound_revision`` op
+    under its stable id whose payload decodes, else None. An op without
+    ``wpr == 2`` is never a revision boundary (spec 4.6 B1)."""
+    if (not isinstance(rec, dict) or rec.get("t") != "op"
+            or not _lib_account_protocol.is_stamped(rec)
+            or not _lib_account_protocol.has_current_revision(rec)
+            or rec.get("id") != _lib_account_protocol.REVISION_OP_ID):
+        return None
+    payload = rec.get("payload")
+    if (not isinstance(payload, dict)
+            or payload.get("kind") != _lib_account_protocol.REVISION_OP_KIND):
+        return None
+    try:
+        _lib_account_protocol.revision_boundary_from_op(rec)
+    except ValueError:
+        return None
+    return rec
+
+
+def _revision_found_for(found, cutover):
+    """``found`` (``(segment, offset, record)``) when its revision op records
+    exactly that coordinate as its own and names ``cutover`` (the cutover
+    op's ``(segment, offset)``), else None."""
+    if found is None:
+        return None
+    rec = _revision_record(found[2])
+    if rec is None:
+        return None
+    revision = _lib_account_protocol.revision_boundary_from_op(rec)
+    if ((revision.segment, revision.end_offset) != (found[0], found[1])
+            or (revision.cutover_segment, revision.cutover_offset)
+            != tuple(cutover)):
+        return None
+    return found
+
+
+def _scan_for_revision_traversed(cutover, start=None):
+    """The first revision op after ``cutover`` in canonical order, plus the
+    traversal endpoints (``{segment: complete-line end read}``).
+
+    ``start`` maps segments to an offset a previous traversal proved holds no
+    revision op before it; every other segment at or after the cutover's is
+    read from its start (the cutover's own from the cutover op). A segment
+    sorting before the cutover's cannot hold the op and is not read. A read
+    failure raises `AccountBoundCutoverUnavailable` (absence unproven)."""
+    seg0, off0 = cutover
+    floor = _lib_journal.segment_sort_key(seg0)
+    start = start or {}
+    traversed = {}
+    sizes = _segment_sizes()
+    for seg in sorted(sizes, key=_lib_journal.segment_sort_key):
+        if _lib_journal.segment_sort_key(seg) < floor:
+            continue
+        lo = start.get(seg, off0 if seg == seg0 else 0)
+        if seg == seg0:
+            lo = max(lo, off0)
+        hi = sizes[seg]
+        traversed[seg] = lo
+        if hi <= lo:
+            continue
+        try:
+            for _name, off, raw in _iter_segment_lines(
+                    _cctally_core.JOURNAL_DIR / seg, lo, hi):
+                if _REVISION_ID_BYTES in raw:
+                    found = _revision_found_for(
+                        (seg, off, _lib_journal.decode_line(raw)), cutover)
+                    if found is not None:
+                        traversed[seg] = off
+                        return found, traversed
+                traversed[seg] = off + len(raw) + 1
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise _cutover_lookup_incomplete(seg, exc) from exc
+    return None, traversed
+
+
+def _read_revision_cache(cutover):
+    """The revision cache document when it names ``cutover``, else None."""
+    try:
+        doc = json.loads(
+            _cctally_core.ACCOUNT_BOUND_REVISION_CACHE_PATH.read_bytes())
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(doc, dict)
+            or doc.get("schemaVersion") != _REVISION_CACHE_SCHEMA):
+        return None
+    named = _cached_coordinate(doc, "cutover")
+    if named is None or (named["segment"], named["offset"]) != tuple(cutover):
+        return None
+    return doc
+
+
+def _verified_revision_from_cache(doc, cutover):
+    """``(segment, offset, record)`` when the cache names a coordinate that
+    holds this cutover's revision op, else None."""
+    coord = _cached_coordinate(doc, "revision")
+    if coord is None:
+        return None
+    raw = _read_line_at(coord["segment"], coord["offset"])
+    if raw is None:
+        return None
+    return _revision_found_for(
+        (coord["segment"], coord["offset"], _lib_journal.decode_line(raw)),
+        cutover)
+
+
+def _cached_revision_absence(doc):
+    """The cache's ``{segment: offset}`` absence prefix, or None."""
+    if doc is None or doc.get("revision") is not None:
+        return None
+    absent = doc.get("absentThrough")
+    if not isinstance(absent, dict):
+        return None
+    sizes = None
+    for seg, off in absent.items():
+        if not isinstance(seg, str) or type(off) is not int or off < 0:
+            return None
+        if sizes is None:
+            try:
+                sizes = _segment_sizes()
+            except OSError:
+                return None
+        if seg not in sizes or off > sizes[seg]:
+            return None
+    return absent
+
+
+def _publish_revision_cache(cutover, revision=None, absent_through=None):
+    """Best-effort accelerator; a failure only costs the next lookup a scan.
+    Sound for an absence prefix for the same reason the cutover's is: the
+    revision op is only ever appended after such a traversal, past it."""
+    doc = {
+        "schemaVersion": _REVISION_CACHE_SCHEMA,
+        "cutover": {"segment": cutover[0], "offset": cutover[1]},
+        "revision": (None if revision is None else
+                     {"segment": revision[0], "offset": revision[1]}),
+    }
+    if revision is None:
+        doc["absentThrough"] = dict(sorted((absent_through or {}).items()))
+    try:
+        _atomic_write_json(_cctally_core.ACCOUNT_BOUND_REVISION_CACHE_PATH, doc)
+    except OSError:
+        pass
+
+
+def _locate_revision_traversed(cutover, *, publish=False):
+    """``(found, traversed)`` for the revision op of ``cutover`` (its
+    ``(segment, offset)``): through the verified cache, else one scan from
+    the cutover op (only the suffix past a cached absence prefix).
+    ``traversed`` is empty when the cache answered."""
+    doc = _read_revision_cache(cutover)
+    found = _verified_revision_from_cache(doc, cutover)
+    if found is not None:
+        return found, {}
+    found, traversed = _scan_for_revision_traversed(
+        cutover, _cached_revision_absence(doc))
+    if publish:
+        if found is not None:
+            try:
+                _make_cutover_durable(found[0])
+            except OSError:
+                return found, traversed
+            _publish_revision_cache(cutover, found[:2])
+        else:
+            _publish_revision_cache(cutover, absent_through=traversed)
+    return found, traversed
+
+
+def _locate_revision(cutover, *, publish=False):
+    return _locate_revision_traversed(cutover, publish=publish)[0]
+
+
+def _revision_boundary_of(found):
+    return (None if found is None
+            else _lib_account_protocol.revision_boundary_from_op(found[2]))
+
+
+def _attach_revision(boundary, *, publish=False):
+    """``boundary`` (a `CutoverBoundary` or None) carrying the revision-2
+    boundary the journal records after it (spec 4.6 B3)."""
+    if boundary is None:
+        return None
+    cutover = (boundary.segment, boundary.end_offset)
+    return _lib_account_protocol.with_revision(
+        boundary, _revision_boundary_of(_locate_revision(
+            cutover, publish=publish)))
+
+
+def find_account_bound_revision(*, publish=False):
+    """The recorded `RevisionBoundary`, or None (no cutover, or no revision
+    yet). A function of the journal alone; see `find_account_bound_cutover`."""
+    boundary = find_account_bound_cutover(publish=publish)
+    return None if boundary is None else boundary.revision
+
+
+def _read_baseline_document(path, digest):
+    """The legacy spool state at ``path`` when its digest is ``digest``."""
+    try:
+        state = _lib_legacy_spool.from_document(
+            json.loads(pathlib.Path(path).read_bytes()))
+    except (OSError, ValueError):
+        return None
+    return state if state.digest() == digest else None
+
+
+def _pre_revision_baseline(digest):
+    """The installed baseline whose digest is the latest pre-revision anchor's
+    (spec 4.6 B2 "reconciles the existing legacy baseline"): the current
+    root's file (a cutover this binary established) or the retired v1 root's
+    (one the previous release established and advanced). Read only."""
+    if not isinstance(digest, str):
+        return None
+    for path in (_cctally_core.LEGACY_SPOOL_BASELINE_PATH,
+                 _cctally_core.STATUSLINE_ACCOUNT_BOUND_V1_DIR
+                 / "legacy-spool-baseline.json"):
+        state = _read_baseline_document(path, digest)
+        if state is not None:
+            return state
+    return None
+
+
+def _reconciliation_record(cutover_found):
+    """The `legacy_spool_activity` op (current-stamped, prepared) that
+    reconciles the ORIGINAL legacy inventory with the latest pre-revision
+    anchor, or None when nothing differs, no baseline was ever anchored (a
+    cutover that recorded uncertainty and nothing after it), or the original
+    inventory cannot complete (the revision op then records the failure).
+    Called under `journal.lock`, before the revision op is appended."""
+    (_seg, _off, digest, _sseg, _soff, _uncertain) = _latest_anchor(
+        cutover_found)
+    if digest is None:
+        return None
+    try:
+        original = capture_legacy_spool_state(include_v1=False)
+    except LegacySpoolInventoryIncomplete:
+        return None
+    baseline = _pre_revision_baseline(digest)
+    if baseline is None:
+        reason = "baseline-unavailable"
+        changed = tuple(sorted(entry[0] for entry in original.entries))
+    elif baseline.digest() == original.digest():
+        return None
+    else:
+        reason = "changed"
+        changed = tuple(sorted(set(_lib_legacy_spool.diff(baseline, original))))
+    return _lib_journal.prepare_record(_lib_journal.make_op(
+        at=_now_iso(), src=_LEGACY_SPOOL_ACTIVITY_SRC,
+        payload={
+            "kind": _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND,
+            "reason": reason,
+            "changed": list(changed),
+            "evidence": _lib_legacy_spool.change_evidence(changed, original),
+            "digest": original.digest(),
+        }))
+
+
+def _establish_account_bound_revision(cutover_boundary, *, now_utc=None):
+    """Return ``cutover_boundary`` carrying its revision-2 boundary,
+    establishing the revision op when absent (spec 4.6 B2; #825 spec 5.5's
+    durability sequence, unchanged). Never establishes a second revision; a
+    producer that loses the locked race installs nothing."""
+    cutover = (cutover_boundary.segment, cutover_boundary.end_offset)
+    # (1) The verified cache; (2) else a scan of a pinned prefix outside the
+    # lock, whose traversal the locked recheck resumes from.
+    found, traversed = _locate_revision_traversed(cutover, publish=False)
+    if found is not None:
+        if traversed:
+            # Found by a scan, not the verified cache: visible is not
+            # durable (fix round K13), and the cache is worth publishing.
+            # A cache hit is the steady state and writes nothing (#901).
+            _make_cutover_durable(found[0])
+            _publish_revision_cache(cutover, found[:2])
+        return _lib_account_protocol.with_revision(
+            cutover_boundary, _revision_boundary_of(found))
+    _account_bound_seam("revision-after-scan")
+
+    explicit_now = now_utc is not None
+    if now_utc is None:
+        now_utc = _utc_now()
+    journal_dir, dir_created = _journal_dir_for_append()
+    lock_fd = _acquire_leaf_lock()
+    try:
+        # (3) Recheck the suffix the unlocked scan did not traverse.
+        winner, _rechecked = _scan_for_revision_traversed(cutover, traversed)
+        if winner is not None:
+            _make_cutover_durable(winner[0])
+            _publish_revision_cache(cutover, winner[:2])
+            return _lib_account_protocol.with_revision(
+                cutover_boundary, _revision_boundary_of(winner))
+        cutover_found = (cutover[0], cutover[1], _cutover_record_at(cutover))
+        reconciliation = _reconciliation_record(cutover_found)
+        try:
+            state = capture_legacy_spool_state(include_v1=True)
+            failure = None
+        except LegacySpoolInventoryIncomplete as exc:
+            state = None
+            failure = exc.evidence()
+        continued = None
+        if failure is not None and reconciliation is None:
+            # One trigger per failure episode (#825 spec revision 5): an
+            # episode still open before the boundary already has its
+            # uncertainty record, which this failure continues.
+            prior = _latest_anchor(cutover_found)[5]
+            if prior is not None and not _inventory_episode_closed(prior):
+                continued = prior
+        _account_bound_seam("revision-after-baseline-capture")
+
+        seg_name, _seg_path, seg_created, fd = _open_append_target(
+            now_utc, explicit_now)
+        try:
+            if seg_created:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+            _repair_torn_tail(fd)
+            first = os.fstat(fd).st_size
+            head = (b"" if reconciliation is None
+                    else _lib_journal.encode_line(reconciliation))
+            start = first + len(head)
+            extents = _frozen_extents(journal_dir, seg_name,
+                                      seg_created and not head, start)
+            revision = _lib_account_protocol.RevisionBoundary(
+                segment=seg_name,
+                end_offset=start,
+                frozen_extents=extents,
+                legacy_spool_baseline_digest=(
+                    None if state is None else state.digest()),
+                cutover_segment=cutover[0],
+                cutover_offset=cutover[1],
+                legacy_spool_inventory_failure=failure,
+                continued_inventory_episode=continued,
+            )
+            record = _lib_journal.make_op(
+                at=_now_iso(), src=_ACCOUNT_BOUND_REVISION_SRC,
+                payload={"kind": _lib_account_protocol.REVISION_OP_KIND,
+                         **_lib_account_protocol.revision_boundary_payload(
+                             revision)})
+            # A stable semantic id, recognisable without its timestamp.
+            record["id"] = _lib_account_protocol.REVISION_OP_ID
+            line = _lib_journal.encode_line(_lib_journal.prepare_record(record))
+            # The reconciliation trigger and the boundary are one write: no
+            # crash leaves the trigger without the boundary it precedes.
+            _write_all(fd, head + line)
+            _account_bound_seam("revision-after-append")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if seg_created:
+            _fsync_dir(journal_dir)
+        if dir_created:
+            _fsync_dir(journal_dir.parent)
+        _account_bound_seam("revision-after-fsync")
+        if state is not None:
+            _atomic_write_json(_cctally_core.LEGACY_SPOOL_BASELINE_PATH,
+                               _lib_legacy_spool.to_document(state))
+        _account_bound_seam("revision-after-baseline-install")
+    finally:
+        _release_leaf_lock(lock_fd)
+    _publish_revision_cache(cutover, (seg_name, start))
+    _publish_account_bound_cache(
+        cutover, (seg_name, start, revision.legacy_spool_baseline_digest),
+        (seg_name, start + len(line)),
+        uncertain=(None if failure is None
+                   else continued if continued is not None
+                   else (seg_name, start)))
+    return _lib_account_protocol.with_revision(cutover_boundary, revision)
+
+
+def _cutover_record_at(cutover):
+    """The cutover op record at its coordinate (it was located before)."""
+    raw = _read_line_at(cutover[0], cutover[1])
+    rec = None if raw is None else _decode_anchor_record(raw)
+    if rec is None or rec["payload"]["kind"] != (
+            _lib_account_protocol.CUTOVER_OP_KIND):
+        raise AccountBoundCutoverUnavailable(
+            errno.EIO, "account-bound cutover op could not be re-read",
+            str(cutover[0]))
+    return rec
+
+
+def _latest_anchor(cutover, revision=None):
     """``(segment, offset, digest, scanned_segment, scanned_offset,
     uncertain)`` of the latest stamped anchoring op at or after ``cutover``.
+
+    #797/#823/#840 (spec 4.6 B2, B3): ``revision`` is the revision-2
+    boundary when one exists. The revision op is itself an anchor (its
+    expanded baseline digest, or inventory uncertainty when its inventory
+    failed), and after it only an op carrying ``wpr == 2`` anchors or opens
+    an uncertainty episode: an older process's post-boundary op is excluded
+    input.
     Current anchors are appended only by this binary, always to the
     canonically-last segment, so a forward scan from a verified anchor is
     complete.
@@ -15267,13 +16271,29 @@ def _latest_anchor(cutover):
                 if not any(token in raw for token in _ANCHOR_KIND_BYTES):
                     continue
                 rec = _lib_journal.decode_line(raw)
+                if _post_revision_without_revision(rec, seg, off, revision):
+                    continue
                 # The cutover op is the initial anchor; only a later stamped
-                # activity op advances it.
+                # activity op, or the revision op, advances it.
                 anchored = _anchor_record(rec)
-                if anchored is not None and anchored["payload"]["kind"] == (
-                        _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND):
+                kind = None if anchored is None else (
+                    anchored["payload"]["kind"])
+                if kind == _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND:
                     anchor = (seg, off, _anchor_digest(anchored))
                     uncertain = None
+                elif kind == _lib_account_protocol.REVISION_OP_KIND:
+                    anchor = (seg, off, _anchor_digest(anchored))
+                    revision_payload = anchored["payload"]
+                    episode = revision_payload.get("inventoryEpisode")
+                    if revision_payload.get(
+                            "legacySpoolInventoryFailure") is None:
+                        uncertain = None
+                    elif isinstance(episode, dict):
+                        # It continues an open episode: that episode's
+                        # record stays the uncertainty (and its closure).
+                        uncertain = (episode["segment"], episode["offset"])
+                    else:
+                        uncertain = (seg, off)
                 elif (_inventory_uncertainty_record(rec) is not None
                         and rec["payload"]["kind"]
                         == _lib_account_protocol.LEGACY_SPOOL_ACTIVITY_KIND):
@@ -15358,6 +16378,12 @@ class LegacySpoolAnchorState:
     episode_open: bool
 
 
+def _revision_of(cutover):
+    """The `RevisionBoundary` recorded after the located ``cutover``, or
+    None."""
+    return _revision_boundary_of(_locate_revision(cutover[:2]))
+
+
 def legacy_spool_anchor_state() -> "LegacySpoolAnchorState | None":
     """The anchor state, or None when no cutover exists. Raises
     `AccountBoundCutoverUnavailable` when a segment it needs is unreadable.
@@ -15369,7 +16395,7 @@ def legacy_spool_anchor_state() -> "LegacySpoolAnchorState | None":
     if cutover is None:
         return None
     (seg, off, digest, scanned_seg, scanned_off,
-     uncertain) = _latest_anchor(cutover)
+     uncertain) = _latest_anchor(cutover, _revision_of(cutover))
     if not _anchor_cache_is_current(
             cutover[:2], (seg, off, digest), (scanned_seg, scanned_off),
             uncertain):
@@ -15474,7 +16500,7 @@ def record_legacy_spool_inventory_incomplete(failure, *, now_utc=None):
         lock_fd = _acquire_leaf_lock()
         try:
             (a_seg, a_off, a_digest, _s_seg, _s_off,
-             uncertain) = _latest_anchor(cutover)
+             uncertain) = _latest_anchor(cutover, _revision_of(cutover))
             if (uncertain is not None
                     and not _inventory_episode_closed(uncertain)):
                 # Fix round K12 (K11R-7, spec section 7 *Durability*): a
@@ -15675,20 +16701,46 @@ class _PassBoundary:
     and BEFORE any interpretation. `resolve` also scans the unvisited suffix
     past the pass's high-water, where an op appended after the pin lives."""
 
-    def __init__(self):
-        self._op = None
+    def __init__(self, cutover=None):
+        #: The cutover boundary: met in the pass, or known beforehand
+        #: (``cutover``, e.g. an index's admission summary).
+        self._boundary = cutover
+        #: #797/#823/#840: the first revision-2 op the pass observed.
+        self._revision = None
 
     def observe(self, record) -> None:
-        if (self._op is None and isinstance(record, dict)
-                and record.get("id") == _lib_account_protocol.CUTOVER_OP_ID):
+        if not isinstance(record, dict):
+            return
+        rid = record.get("id")
+        if (self._boundary is None
+                and rid == _lib_account_protocol.CUTOVER_OP_ID):
             anchor = _anchor_record(record)
             if anchor is not None and anchor["payload"]["kind"] == (
                     _lib_account_protocol.CUTOVER_OP_KIND):
-                self._op = anchor
+                self._boundary = _lib_account_protocol.boundary_from_op(
+                    anchor)
+        elif (self._revision is None and self._boundary is not None
+                and rid == _lib_account_protocol.REVISION_OP_ID):
+            # A revision op belongs to the cutover the pass already met: it
+            # is appended after it, so a pass sees them in that order.
+            self._revision = _revision_record(record)
 
     def resolve(self, high_water):
-        if self._op is not None:
-            return _lib_account_protocol.boundary_from_op(self._op)
+        if self._boundary is not None:
+            boundary = _dc_replace(self._boundary, revision=None)
+            revision = None
+            if self._revision is not None:
+                revision = _lib_account_protocol.revision_boundary_from_op(
+                    self._revision)
+                if ((revision.cutover_segment, revision.cutover_offset)
+                        != (boundary.segment, boundary.end_offset)):
+                    revision = None
+            if revision is None and high_water is not None:
+                # Appended past the pass's high-water (or never observed):
+                # every record of the pass precedes it, and the lookup keeps
+                # what admission consumers see one function of the journal.
+                return _attach_revision(boundary)
+            return _lib_account_protocol.with_revision(boundary, revision)
         if high_water is None:
             return None
         start_key = _lib_journal.segment_sort_key(high_water[0])
@@ -15700,7 +16752,8 @@ class _PassBoundary:
             ranges[seg] = (high_water[1] if seg == high_water[0] else 0, size)
         found = _scan_for_cutover(ranges)
         return (None if found is None
-                else _lib_account_protocol.boundary_from_op(found[2]))
+                else _attach_revision(
+                    _lib_account_protocol.boundary_from_op(found[2])))
 
 
 def _apply_pass_admission(slots, coordinates, boundary, placeholder=None):
@@ -15796,6 +16849,10 @@ class AdmissionSummary:
     coordinate_digest: str | None = None
     complete_through: "tuple[str, int] | None" = None
     boundary: "object | None" = None
+    #: #797/#823/#840 (spec 4.6 B3): the revision-2 boundary the summary's
+    #: exclusions were classified against (`boundary.revision`), named here
+    #: because a `CutoverBoundary`'s equality is the cutover op's alone.
+    revision_id: str | None = None
 
     def extend(self, excluded) -> None:
         if not excluded:
@@ -15826,15 +16883,30 @@ def _read_admission_summary(conn):
     if row is None:
         return None
     boundary = None
+    revision_id = None
     if row[8]:
         try:
+            doc = json.loads(row[8])
+            revision_doc = doc.pop("revision", None)
             boundary = _lib_account_protocol.boundary_from_op({
                 "t": "op",
                 "payload": {"kind": _lib_account_protocol.CUTOVER_OP_KIND,
-                            **json.loads(row[8])},
+                            **doc},
             })
-        except (ValueError, TypeError):
+            if revision_doc is not None:
+                # #797/#823/#840 (spec 4.6 B3): the summary binds both fences.
+                boundary = _lib_account_protocol.with_revision(
+                    boundary,
+                    _lib_account_protocol.revision_boundary_from_op({
+                        "t": "op",
+                        "payload": {
+                            "kind": _lib_account_protocol.REVISION_OP_KIND,
+                            **revision_doc},
+                    }))
+                revision_id = _lib_account_protocol.REVISION_OP_ID
+        except (ValueError, TypeError, AttributeError):
             boundary = None
+            revision_id = None
 
     def _hw(text):
         coord = _coordinate_from_json(text)
@@ -15854,6 +16926,7 @@ def _read_admission_summary(conn):
         coordinate_digest=row[6],
         complete_through=_hw(row[7]),
         boundary=boundary,
+        revision_id=revision_id,
     )
 
 
@@ -15881,15 +16954,53 @@ def _write_admission_summary(conn, summary: AdmissionSummary) -> None:
             summary.coordinate_digest,
             _hw(summary.complete_through),
             None if summary.boundary is None else json.dumps(
-                _lib_account_protocol.boundary_payload(summary.boundary),
+                _summary_boundary_document(summary.boundary),
                 sort_keys=True, separators=(",", ":")),
         ),
     )
 
 
+def _summary_boundary_document(boundary) -> dict:
+    """The summary's ``boundary_json``: the cutover payload, plus the
+    revision-2 boundary's under ``revision`` once one applies."""
+    doc = _lib_account_protocol.boundary_payload(boundary)
+    if boundary.revision is not None:
+        doc["revision"] = _lib_account_protocol.revision_boundary_payload(
+            boundary.revision)
+    return doc
+
+
 def _evidence_now():
     """The wall clock the legacy-writer evidence records (a test seam)."""
     return _utc_now()
+
+
+def read_legacy_writer_evidence_document():
+    """``(document, seeded)``: the durable legacy-writer evidence sidecar,
+    or — when the v2 sidecar is absent — the previous release's
+    `statusline-account-bound-v1/legacy-writer-evidence.json` as its seed
+    (``seeded`` True), else ``(None, False)``.
+
+    Review RV-5 (#797/#823/#840): the sidecar moved to the v2 directory and
+    nothing carried it over, so the first scan after the upgrade recorded an
+    already-old excluded population as first observed now and the doctor
+    leg warned again for seven days — although a rebuild over unchanged
+    evidence never restarts the age. The v1 file is diagnostic evidence,
+    not coordination state (spec 4.6 B4 forbids importing that), and it is
+    only ever READ: nothing here writes, renames or deletes under v1."""
+    try:
+        return json.loads(
+            _cctally_core.LEGACY_WRITER_EVIDENCE_PATH.read_bytes()), False
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None, False
+    try:
+        doc = json.loads((_cctally_core.STATUSLINE_ACCOUNT_BOUND_V1_DIR
+                          / "legacy-writer-evidence.json").read_bytes())
+    except (OSError, ValueError):
+        return None, False
+    return doc, True
 
 
 def _record_legacy_writer_evidence(summary) -> None:
@@ -15909,16 +17020,17 @@ def _record_legacy_writer_evidence(summary) -> None:
         # new and restart the seven-day age (case F9); the rebuild records it.
         return
     path = _cctally_core.LEGACY_WRITER_EVIDENCE_PATH
-    try:
-        existing = _lib_legacy_writer_evidence.from_document(
-            json.loads(path.read_bytes()))
-    except (OSError, ValueError):
+    doc, seeded = read_legacy_writer_evidence_document()
+    existing = (None if doc is None
+                else _lib_legacy_writer_evidence.from_document(doc))
+    if (seeded and existing is not None
+            and existing.cutover_id != summary.cutover_id):
         existing = None
     updated = _lib_legacy_writer_evidence.observe(
         existing, cutover_id=summary.cutover_id,
         excluded_count=summary.excluded_total,
         coordinate_digest=summary.coordinate_digest, now=_evidence_now())
-    if updated is None or updated is existing:
+    if updated is None or (updated is existing and not seeded):
         return
     try:
         _atomic_write_json(path, _lib_legacy_writer_evidence.to_document(updated))
@@ -15937,7 +17049,19 @@ def _ingest_admission_boundary(conn, decoded, cursor):
     index that does not describe its own cursor falls back to the lookup."""
     summary = _read_admission_summary(conn)
     if summary is not None and summary.boundary is not None:
-        return summary.boundary
+        if summary.boundary.revision is not None:
+            return summary.boundary
+        # #797/#823/#840 (spec 4.6 B3): the cached summary names the
+        # original boundary only. The revision op is appended like the
+        # cutover op — at the end of the canonically-last segment, after
+        # everything the index consumed — so it is inside this batch or
+        # beyond it, and a batch record before it is historical for it.
+        # Return the cached original boundary with whatever this batch
+        # shows, never the cached summary alone.
+        pass_boundary = _PassBoundary(cutover=summary.boundary)
+        for record, _segment, _offset in decoded:
+            pass_boundary.observe(record)
+        return pass_boundary.resolve(None)
     if cursor is None or (
             summary is not None and summary.scanned_high_water == cursor):
         pass_boundary = _PassBoundary()
@@ -15963,6 +17087,9 @@ def _advance_admission_summary(conn, boundary, excluded, cursor, target) -> None
     summary.cutover_id = (
         None if boundary is None else _lib_account_protocol.CUTOVER_OP_ID)
     summary.boundary = boundary
+    summary.revision_id = (
+        None if boundary is None or boundary.revision is None
+        else _lib_account_protocol.REVISION_OP_ID)
     summary.extend(excluded)
     summary.scanned_high_water = target
     if summary.complete_through is not None:

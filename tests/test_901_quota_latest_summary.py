@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 
 import pytest
@@ -580,7 +581,11 @@ def test_the_legacy_index_is_what_sorted_each_shard(store):
     group = (ROOT_LIVE, "weekly", "primary", 10080, _iso(WEEK_RESET))
     statements = _loader_statements(physical_groups=[group])
     assert len(statements) == 1
-    assert "USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY" in statements[0].plan
+    # SQLite 3.45 words the same partial sorter "RIGHT PART OF ORDER BY".
+    assert any(
+        re.fullmatch(
+            r"USE TEMP B-TREE FOR (LAST 4 TERMS|RIGHT PART) OF ORDER BY", row)
+        for row in statements[0].plan), statements[0].plan
 
 
 def test_the_bounded_recent_read_keeps_only_its_limit_sorter(store):

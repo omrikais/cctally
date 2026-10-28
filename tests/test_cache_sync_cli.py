@@ -158,6 +158,60 @@ def test_transcript_lock_contention_names_phase_and_retry(env, monkeypatch, caps
     assert "Re-run `cctally cache-sync --rebuild`." in stderr
 
 
+def test_rebuild_on_a_filesystem_without_clones_skips_the_probe(env, capfd):
+    """A store whose filesystem cannot clone must still rebuild its transcripts.
+
+    ext4 rejects `cp --reflink=always`. The pre-rebuild quick-check needs a
+    clone and never falls back to a byte copy, so it cannot run there; the
+    rebuild must say so and continue instead of failing on every invocation.
+    The fake `cp` refuses the clone the way GNU coreutils does on hosted
+    Linux, without the pytest copy seam.
+    """
+    ns, tmp_path, monkeypatch = env
+    monkeypatch.delenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY")
+    fake_bin = tmp_path / "no-clone-bin"
+    fake_bin.mkdir()
+    invoked = tmp_path / "fake-cp-invoked"
+    fake_cp = fake_bin / "cp"
+    fake_cp.write_text(
+        "#!/bin/sh\n"
+        f"echo invoked >> '{invoked}'\n"
+        "for last; do :; done\n"
+        "echo \"cp: failed to clone '$last': Operation not supported\" >&2\n"
+        "exit 1\n"
+    )
+    fake_cp.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    _write_claude_entry(tmp_path)
+    bootstrap = ns["open_conversations_db"](attach_cache=False)
+    bootstrap.close()
+    args = argparse.Namespace(
+        source="claude",
+        rebuild=True,
+        prune_orphans=False,
+        prune_conversations=False,
+    )
+
+    assert ns["cmd_cache_sync"](args) == 0
+    stderr = capfd.readouterr().err
+    assert invoked.exists(), "the probe never reached the clone"
+    assert "transcript rebuild failed" not in stderr
+    assert "integrity check skipped" in stderr
+    assert "Operation not supported" in stderr
+    assert "claude transcripts done: 1 processed" in stderr
+    conversations = ns["open_conversations_db"](attach_cache=False)
+    try:
+        assert conversations.execute(
+            "SELECT COUNT(*) FROM cache_meta "
+            "WHERE key='conversation_rebuild_claude_pending'"
+        ).fetchone()[0] == 0
+    finally:
+        conversations.close()
+    data_dir = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_DB_PATH).parent
+    assert not list(data_dir.glob(".conversations-probe-*"))
+    assert not list((data_dir / "quarantine").glob("conversations.db-*"))
+
+
 def test_transcript_file_failure_names_phase_and_retry(
     env, monkeypatch, capsys,
 ):

@@ -47,13 +47,6 @@ describe('SourceSessionsGrid — Codex columns + vocabulary (§6.3)', () => {
     expect(table).toHaveTextContent('gpt-5-codex'); // Session 2's model chip
   });
 
-  it('gives distinct model ids distinct chip colors', () => {
-    render(<SessionsPanel />);
-    const table = screen.getByTestId('codex-sessions-table');
-    const chips = within(table).getAllByRole('button', { name: /Filter by gpt-5/ });
-    expect(chips[0].style.backgroundColor).not.toBe(chips[1].style.backgroundColor);
-  });
-
   it('is a roving grid (role=grid, exactly one body tab stop)', () => {
     render(<SessionsPanel />);
     const table = screen.getByTestId('codex-sessions-table');

@@ -242,7 +242,10 @@ def test_group_append_without_a_cutover_establishes_it_first(app):
         "label": f"l{i}"}) for i in range(2)]
     _cctally_journal.append_records(records)
     kinds = [_kind(r) for _s, _o, r in _lines()]
-    assert kinds == ["account_bound_cutover", "account_label", "account_label"]
+    # #797/#823/#840 (spec 4.6 B2): on a fresh store the revision-2 op
+    # follows the cutover op immediately.
+    assert kinds == ["account_bound_cutover", "account_bound_revision",
+                     "account_label", "account_label"]
 
 
 def test_concurrent_legacy_append_is_classified_by_physical_position(app, monkeypatch):

@@ -387,9 +387,9 @@ def test_cache_report_qa_fixture_reaches_amber_and_mixed_signs(
 #: guard reported nothing while the real worst case was 160: the guard could
 #: not see the two teardown deadlines, which were written inline as
 #: `time.monotonic() + N` and belonged to no local name. Both halves are fixed
-#: — `_clock_plus_constant` in `tests/test_timing_budget_guard.py` now counts an
-#: inline deadline, and the teardown here draws from one budget instead of
-#: three — and neither number is chosen to land on the boundary.
+#: — the guard (since deleted with its file) came to count an inline deadline,
+#: and the teardown here draws from one budget instead of three — and neither
+#: number is chosen to land on the boundary.
 _WHOLE_TEST_BUDGET_S = 75.0
 
 #: The teardown's own budget, shared by all three of its waits. Thirty is
@@ -677,10 +677,9 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
         server_thread.join(timeout=_remaining(teardown_deadline))
         _await_handler_exit(before_handlers, deadline=teardown_deadline)
         # `cmd_dashboard` also starts the conversation-sync daemon, which
-        # `stop` above releases only between iterations. `bin/cctally-test-load-
-        # invariance` caught it mid-prune, holding a commit past this item's
-        # teardown, where a later test's process-global patch would have been
-        # visible to it.
+        # `stop` above releases only between iterations. A contended run caught
+        # it mid-prune, holding a commit past this item's teardown, where a
+        # later test's process-global patch would have been visible to it.
         _await_handler_exit(
             before_handlers, deadline=teardown_deadline,
             name_contains="dashboard-conversations-sync")

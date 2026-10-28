@@ -9154,6 +9154,13 @@ def _027_codex_fork_preamble_rebuild(conn: sqlite3.Connection) -> None:
         _release_cache_db_writer_flocks(held)
 
 
+#: Pages 028 returns per committed transaction when it reclaims the dropped
+#: transcript store. The chunk bounds each transaction's WAL growth at roughly,
+#: but more than, one SQLite WAL auto-checkpoint (1000 frames): each moved page
+#: also writes its pointer-map page, its parent and the header page.
+_028_VACUUM_CHUNK_PAGES = 1000
+
+
 @cache_migration("028_split_conversation_store")
 def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
     """Move the re-derivable transcript corpus out of cache.db (#320).
@@ -9263,11 +9270,45 @@ def _028_split_conversation_store(conn: sqlite3.Connection) -> None:
             raise
         try:
             if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
-                # Python 3.11/Linux may defer this zero-column PRAGMA until the
-                # cursor is exhausted; fetchall drives it to completion.
-                conn.execute("PRAGMA incremental_vacuum").fetchall()
+                # Return the dropped tables' pages one page per statement. A
+                # bare `PRAGMA incremental_vacuum` returns no columns, and
+                # CPython 3.11's cursor steps such a statement exactly once,
+                # fetchall() or not, so it frees ONE page (#998). A statement
+                # capped at one page is complete after that first step on every
+                # Python (the `_run_incremental_vacuum_chunk` pattern). Each
+                # chunk commits so WAL auto-checkpoints run between chunks, and
+                # the loop stops when a chunk frees nothing, so it is bounded.
+                remaining = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                while remaining:
+                    # Any failure inside a chunk, including a non-database
+                    # error or an interrupt, rolls that chunk back before it
+                    # propagates, so no write transaction outlives the
+                    # conversation locks released below.
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        for _ in range(min(remaining, _028_VACUUM_CHUNK_PAGES)):
+                            conn.execute("PRAGMA incremental_vacuum(1)").fetchall()
+                        conn.commit()
+                    except BaseException:
+                        try:
+                            conn.rollback()
+                        except sqlite3.Error:
+                            pass
+                        raise
+                    left = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                    if left >= remaining:
+                        break
+                    remaining = left
         except sqlite3.DatabaseError:
-            pass
+            # Intentional: the reclaim is best effort. Raising here would leave
+            # 028 unapplied, and its next run would re-arm both conversation
+            # store rebuild-from-scratch flags; free pages left behind are
+            # harmless and `db vacuum` returns them. The guarded rollback keeps
+            # a failing rollback from turning that into a handler failure.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
     finally:
         for fh in reversed(held):
             try:
@@ -11312,6 +11353,9 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             ),
         },
     }
+    # #997 D10: additive — each detached rebuild worker's state and its
+    # read-only classification (the doctor `db.rebuild_worker` kernel).
+    payload["rebuildWorkers"] = _db_status_rebuild_workers()
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -11329,7 +11373,44 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             line = _db_status_format_row(m)
             print(line)
         print()  # blank line between DBs
+    for worker in ("epoch", "heal"):
+        info = payload["rebuildWorkers"][worker]
+        if info["classification"]["row"] != "idle":
+            print(info["classification"]["summary"])
     return 0
+
+
+def _db_status_rebuild_workers() -> dict:
+    """``{"epoch": {...}, "heal": {...}}``: each worker's run state and its
+    classification, gathered without any lock (#997 D8/D10)."""
+    import _cctally_store
+    import _lib_doctor
+
+    now_utc = _cctally_core._command_as_of()
+    out: dict = {}
+    for worker in ("epoch", "heal"):
+        try:
+            snapshot = _cctally_store.rebuild_worker_snapshot(worker)
+        except Exception:  # noqa: BLE001 — a diagnostic never fails status
+            snapshot = None
+        assessed = _lib_doctor.assess_rebuild_worker(worker, snapshot,
+                                                     now_utc)
+        details = assessed["details"]
+        out[worker] = {
+            "state": details["state"],
+            "stateUnreadable": details["stateUnreadable"],
+            "ledger": details["ledger"],
+            "liveness": details["liveness"],
+            "pending": details["pending"],
+            "recoveredDeaths": details["recoveredDeaths"],
+            "classification": {
+                "severity": assessed["severity"],
+                "row": assessed["row"],
+                "summary": assessed["summary"],
+                "warnings": assessed["warnings"],
+            },
+        }
+    return out
 
 
 def _db_status_for(

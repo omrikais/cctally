@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.116.0] - 2026-10-28
+
+### Added
+- `cctally doctor`, `cctally db status` and the dashboard's Doctor chip now say when a stats.db upgrade rebuild or auto-heal is running, has stalled, failed or died, or used more memory than its bound.
+
+### Changed
+- The stats.db upgrade rebuild that runs after an update, `cctally db rebuild` and `cctally db rederive` use far less memory and disk, and the upgrade rebuild finishes faster.
+
+### Fixed
+- After a usage credit, `cctally statusline` refuses an idle session's cached usage once it is proven stale, and five-hour views stop hiding genuine weekly values. `cctally db rederive` adds `retract`; stats.db rebuilds once after upgrading.
+- Under Python 3.11, `cctally quota --json` no longer reports a mix-support radius that differs in its last digits from one run to the next.
+- `cctally quota --json` reports the same `eligibilityFence` on Linux as on macOS; on Linux it could differ in its last digits.
+- A sync with nothing new to read no longer rewrites the compressed Codex rollout status in `cache.db` and `conversations.db`, so an idle `cctally dashboard` writes less to disk.
+- `cctally cache-sync --rebuild` rebuilds transcripts again on a filesystem without copy-on-write clones, such as ext4 on Linux, instead of failing every time.
+- On Python 3.11, the upgrade that moves transcripts out of `cache.db` now shrinks the file as intended. If you already upgraded on Python 3.11, run `cctally db vacuum --db cache` to reclaim the space.
+
 ## [1.115.0] - 2026-10-21
 
 ### Added

@@ -305,7 +305,9 @@ ALLOWLIST: "tuple[TempStructureRule, ...]" = (
         rule_id="reset-anchor-line-tiebreak",
         call_site="_cctally_cache.CodexResetAnchorResolver._components_for",
         sql_pattern=r"ORDER BY source_path, line_offset, id$",
-        detail_pattern=r"USE TEMP B-TREE FOR LAST TERM OF ORDER BY",
+        # SQLite 3.45 words this partial sorter "RIGHT PART OF ORDER BY";
+        # later versions name the term count, which must stay one.
+        detail_pattern=r"USE TEMP B-TREE FOR (LAST TERM|RIGHT PART) OF ORDER BY",
         reason=("schema bound: the partial sorter holds one run of rows tied "
                 "on (source_path, line_offset), and UNIQUE(source, "
                 "source_path, line_offset, logical_limit_key) with "
@@ -367,9 +369,10 @@ ALLOWLIST: "tuple[TempStructureRule, ...]" = (
             # prefix of the order, as idx_budget_milestones_codex_digest does
             # for `_budget_wire`) a partial "LAST n TERMS" sorter. SQLite's
             # pushOntoSorter applies the same LIMIT cap to both: it never
-            # holds more than LIMIT+OFFSET rows.
+            # holds more than LIMIT+OFFSET rows. SQLite 3.45 words the partial
+            # sorter "RIGHT PART OF ORDER BY".
             detail_pattern=(r"USE TEMP B-TREE FOR "
-                            r"(LAST (TERM|\d+ TERMS) OF )?ORDER BY"),
+                            r"((LAST (TERM|\d+ TERMS)|RIGHT PART) OF )?ORDER BY"),
             reason=("top-N: LIMIT, the panel's constant row cap; the sorter "
                     "retains at most that many rows"),
         )

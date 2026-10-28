@@ -1,0 +1,29 @@
+cctally doctor — 2026-05-13 14:22:31 UTC
+
+Install
+Hooks
+  ⚠ Recent activity (24h)    0 fires
+      → No hook fired in last 24h. Restart Claude Code, or run `cctally setup`.
+  ⚠ Last hook fire           never
+      → No hook has fired yet. Restart Claude Code.
+Auth
+Database
+  ⚠ cache.db                 absent (fresh install)
+  ⚠ Rebuild worker           the last stats.db upgrade rebuild died without finishing; the last stats.db auto-heal failed (failed)
+  ⚠ Pending migrations       62 pending
+      → Run any cctally command — opens the DB and applies pending migrations
+Journal
+Data
+Accounts
+Accounting
+  ⚠ Outcome quarantine       unavailable (no validated stats index)
+      → Run any cctally command to bring the stats index up to date, then run `cctally doctor` again.
+Pricing
+Quota
+Safety
+  ⚠ update-state.json        absent (first run)
+      → Run `cctally update --check` to populate
+Telemetry
+Performance
+
+Summary: 64 OK · 7 WARN · 0 FAIL

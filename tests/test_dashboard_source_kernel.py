@@ -1761,11 +1761,18 @@ def test_source_schema_version_is_eleven():
         "cliAndTuiReaders", "browserConsumers", "fixtures", "compatibilityOracles",
     }
     assert set(impact["consumers"]) == required
+    # The map is public but names private consumers too (a private test that
+    # reads SOURCE_SCHEMA_VERSION must be recorded, or the discovery below
+    # fails on the private tree). `.mirror-allowlist` excludes itself, so its
+    # presence marks the private tree, where every recorded path must exist.
+    # On the public mirror the existence check is off for every recorded
+    # path, public ones included; only the sorted, non-empty shape is checked.
+    private_tree = (pathlib.Path(__file__).parents[1] / ".mirror-allowlist").is_file()
     for category in required:
         paths = impact["consumers"][category]
         assert paths == sorted(set(paths)) and paths, category
         for path in paths:
-            assert (pathlib.Path(__file__).parents[1] / path).exists(), path
+            assert (pathlib.Path(__file__).parents[1] / path).exists() or not private_tree, path
     recorded = {
         path
         for paths in impact["consumers"].values()
@@ -1777,8 +1784,6 @@ def test_source_schema_version_is_eleven():
     for base in (root / "bin", root / "dashboard/web/src", root / "tests"):
         for path in base.rglob("*"):
             if not path.is_file() or "fixtures" in path.parts:
-                continue
-            if path.name.startswith("authoritative-estate"):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")

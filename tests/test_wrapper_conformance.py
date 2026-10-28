@@ -59,6 +59,9 @@ def test_map_is_complete():
             # subcommand: it asserts nothing, dispatches to no `cctally`
             # verb, and is mirror-private.
             "cctally-bash-interpreter-probe",
+            # Test regime reset, session 4 (Task 4.8). The runner supervisor's
+            # Actions job-started hook: no `cctally` verb, mirror-private.
+            "cctally-runner-job-env.sh",
         ):
             continue
         head = p.read_text(encoding="utf-8", errors="replace").splitlines()[0]

@@ -21,6 +21,7 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import datetime as dt
+import decimal
 import enum
 import hashlib
 import json
@@ -1438,6 +1439,84 @@ def unattributed_units(segments, entries, *, now,
 
 
 # ---------------------------------------------------------------------------
+# Correctly rounded logarithms and exponentials.
+#
+# `math.log`, `math.log1p` and `math.expm1` call the platform C library, and
+# C does not require those to be correctly rounded. glibc 2.39's `log1p` and
+# `expm1` are off by one ULP on inputs the eligibility fence reaches, which
+# moved quota fixture 12's `eligibilityFence` between Linux and macOS. These
+# compute in `decimal`, whose `ln` and `exp` are correctly rounded at the
+# context precision, from the float's exact value, and round once to a
+# double. At 80 significant digits that double rounding can differ from a
+# direct one only if the true value lies within 1e-80 of a midpoint between
+# two doubles, far below what any double input can produce. Each call uses
+# its own context, never the thread's, and the edge cases the decimal path
+# does not model are delegated to `math`, whose answers there are exact.
+# ---------------------------------------------------------------------------
+_CR_DIGITS = 80
+#: The exact sum of 1 and any double needs at most 1075 significant digits.
+_CR_EXACT = decimal.Context(prec=1200, Emin=-999999, Emax=999999,
+                            traps=[decimal.InvalidOperation])
+_CR_ONE = decimal.Decimal(1)
+
+
+def _cr_context(prec: int = _CR_DIGITS) -> decimal.Context:
+    return decimal.Context(prec=prec, rounding=decimal.ROUND_HALF_EVEN,
+                           Emin=-999999, Emax=999999,
+                           traps=[decimal.InvalidOperation,
+                                  decimal.DivisionByZero, decimal.Overflow])
+
+
+def correctly_rounded_log(x) -> float:
+    """`math.log(x)` correctly rounded on every platform.
+
+    Zero, negatives, infinities and NaN go to `math.log`, so the domain error
+    and the non-finite results are exactly the standard library's.
+    """
+    x = float(x)
+    if not math.isfinite(x) or x <= 0.0:
+        return math.log(x)
+    return float(_cr_context().ln(decimal.Decimal(x)))
+
+
+def correctly_rounded_log1p(x) -> float:
+    """`math.log1p(x)` correctly rounded on every platform.
+
+    `1 + x` is formed exactly, so a tiny `x` keeps every digit. Signed zeros,
+    `x <= -1` (the domain error), infinities and NaN go to `math.log1p`.
+    """
+    x = float(x)
+    if not math.isfinite(x) or x == 0.0 or x <= -1.0:
+        return math.log1p(x)
+    one_plus = _CR_EXACT.add(_CR_ONE, decimal.Decimal(x))
+    return float(_cr_context().ln(one_plus))
+
+
+def correctly_rounded_expm1(x) -> float:
+    """`math.expm1(x)` correctly rounded on every platform.
+
+    The working precision grows with `1/|x|`, so the subtraction of one keeps
+    80 significant digits however small `x` is. Below -64 the true value is
+    within 1.6e-28 of -1, which rounds to exactly -1. A finite result too
+    large for a double raises `OverflowError`, as `math.expm1` does. Signed
+    zeros, infinities and NaN go to `math.expm1`.
+    """
+    x = float(x)
+    if not math.isfinite(x) or x == 0.0:
+        return math.expm1(x)
+    if x < -64.0:
+        return -1.0
+    if x > 710.0:
+        return math.expm1(x)  # raises OverflowError
+    d = decimal.Decimal(x)
+    ctx = _cr_context(_CR_DIGITS + max(0, -d.adjusted()))
+    result = float(ctx.subtract(ctx.exp(d), _CR_ONE))
+    if math.isinf(result):
+        raise OverflowError("math range error")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Robust statistics, the eligibility fence, and composition support (§5, §15).
 # ---------------------------------------------------------------------------
 def median(xs) -> float:
@@ -1476,14 +1555,16 @@ def eligibility_fence(days) -> float | None:
     which carried between 0.8 and 1.2 million weighted units against a
     message claiming no local token history at all.
     """
-    xs = [math.log1p(u) for u in days if u is not None and u > 0.0]
+    xs = [correctly_rounded_log1p(u)
+          for u in days if u is not None and u > 0.0]
     if len(xs) < 2:
         return None
     centre = median(xs)
     spread = scaled_mad(xs, centre)
     if not math.isfinite(spread) or spread == 0.0:
         return None
-    return math.expm1(centre - ELIGIBILITY["fence_mads"] * spread)
+    return correctly_rounded_expm1(
+        centre - ELIGIBILITY["fence_mads"] * spread)
 
 
 def composition_centre(vectors) -> dict[str, float] | None:
@@ -1506,9 +1587,16 @@ def composition_centre(vectors) -> dict[str, float] | None:
 
 
 def tv_distance(p, centre) -> float:
-    """Total-variation distance, `0.5 * sum(|p_i - c_i|)`."""
+    """Total-variation distance, `0.5 * sum(|p_i - c_i|)`.
+
+    `math.fsum`, not `sum`: the keys come from a set, whose iteration order
+    follows PYTHONHASHSEED, and Python 3.11's float `sum()` is uncompensated,
+    so a plain sum moved the published radius by an ULP from one process to
+    the next. `fsum` is correctly rounded, so the result is the same in every
+    order and on every supported interpreter.
+    """
     keys = set(p) | set(centre)
-    return 0.5 * sum(abs(p.get(k, 0.0) - centre.get(k, 0.0)) for k in keys)
+    return 0.5 * math.fsum(abs(p.get(k, 0.0) - centre.get(k, 0.0)) for k in keys)
 
 
 def support_radius(vectors, centre) -> float | None:
@@ -1696,7 +1784,9 @@ def jackknife_fit(days) -> tuple[float, Interval] | None:
             return None
         replicates.append((total_units - row.units) / rest_meter)
     mean = sum(replicates) / n
-    se = math.sqrt((n - 1) / n * sum((v - mean) ** 2 for v in replicates))
+    # A product, not `** 2`, which is the C library's `pow`.
+    se = math.sqrt((n - 1) / n * sum((v - mean) * (v - mean)
+                                     for v in replicates))
     half = t_quantile_975(n - 1) * se
     return point, Interval(max(0.0, point - half), point + half)
 
@@ -1930,7 +2020,7 @@ def detect_change(series, *, override_split=None) -> DetectorResult:
     total = len(days)
     truncated = input_days - total
     scan_start = days[0].date if days else None
-    stats = [math.log(o.units / o.meter_delta) for o in days]
+    stats = [correctly_rounded_log(o.units / o.meter_delta) for o in days]
     min_base = int(TRUST["min_detect_baseline_days"])
     min_watch = int(DETECTOR["min_watch_days"])
     fence_mads = DETECTOR["fence_mads"]

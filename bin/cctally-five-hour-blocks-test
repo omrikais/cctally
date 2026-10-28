@@ -2138,4 +2138,4 @@ fhb_mode_noop
 
 echo
 echo "passed: $pass_count   failed: $fail_count"
-exit $fail_count
+[ "$fail_count" -eq 0 ]

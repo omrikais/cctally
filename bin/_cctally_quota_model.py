@@ -1211,9 +1211,22 @@ def stored_regimes(state: dict, account_key) -> list:
 # breaks the digest, so it reads as legacy too.
 _REGIME_WRITER_KEY = "wpg"
 _REGIME_WRITER_DIGEST_KEY = "wpgDigest"
+# #797/#823/#840 spec 4.6 B5: recovery also requires revision-specific
+# provenance. A revision-1 process (the previous release) writes a regime
+# with a verifying `wpg` stamp, so that stamp alone cannot tell its
+# transitions from this binary's. Every regime this binary writes also
+# carries `wpr` and a revision-specific digest over its content without any
+# of the four writer keys; a previous-release in-place `update()` keeps
+# `wpr` but cannot recompute that digest.
+_REGIME_REVISION_KEY = "wpr"
+_REGIME_REVISION_DIGEST_KEY = "wprDigest"
+_REGIME_WRITER_KEYS = (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY,
+                       _REGIME_REVISION_KEY, _REGIME_REVISION_DIGEST_KEY)
 
 
 def _regime_content_digest(regime: dict) -> str:
+    # The revision-1 digest, unchanged: over everything but the two `wpg`
+    # keys, so the previous release still verifies this binary's stamp.
     core = {k: v for k, v in regime.items()
             if k not in (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY)}
     data = json.dumps(core, sort_keys=True, separators=(",", ":"),
@@ -1221,11 +1234,24 @@ def _regime_content_digest(regime: dict) -> str:
     return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def stamp_regime(regime: dict) -> dict:
-    """``regime`` stamped as written by the current protocol generation."""
+def _regime_revision_digest(regime: dict) -> str:
     import _lib_account_protocol
-    out = {k: v for k, v in regime.items()
-           if k not in (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY)}
+    core = {k: v for k, v in regime.items() if k not in _REGIME_WRITER_KEYS}
+    data = json.dumps(
+        {"revision": _lib_account_protocol.PROTOCOL_REVISION,
+         "regime": core},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        default=str)
+    return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def stamp_regime(regime: dict) -> dict:
+    """``regime`` stamped as written by the current protocol generation and
+    revision."""
+    import _lib_account_protocol
+    out = {k: v for k, v in regime.items() if k not in _REGIME_WRITER_KEYS}
+    out[_REGIME_REVISION_KEY] = _lib_account_protocol.PROTOCOL_REVISION
+    out[_REGIME_REVISION_DIGEST_KEY] = _regime_revision_digest(out)
     out[_REGIME_WRITER_KEY] = _lib_account_protocol.PROTOCOL_GENERATION
     out[_REGIME_WRITER_DIGEST_KEY] = _regime_content_digest(out)
     return out
@@ -1237,7 +1263,12 @@ def regime_writer_is_current(regime) -> bool:
             and regime.get(_REGIME_WRITER_KEY)
             == _lib_account_protocol.PROTOCOL_GENERATION
             and regime.get(_REGIME_WRITER_DIGEST_KEY)
-            == _regime_content_digest(regime))
+            == _regime_content_digest(regime)
+            and _lib_account_protocol.has_current_revision(
+                {_lib_account_protocol.REVISION_KEY:
+                 regime.get(_REGIME_REVISION_KEY)})
+            and regime.get(_REGIME_REVISION_DIGEST_KEY)
+            == _regime_revision_digest(regime))
 
 
 def stamp_current_writes(stored: dict, reduced: dict, account_key) -> dict:

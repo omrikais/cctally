@@ -2546,7 +2546,11 @@ def test_dashboard_soak_retention_prepass_keeps_production_drain_when_it_finishe
         # A small store drains inside the deletion's own reclaim pass.
         _delete_one_message(db)
         with contextlib.closing(sqlite3.connect(db)) as conn:
-            conn.execute("PRAGMA incremental_vacuum").fetchall()
+            # executescript steps the PRAGMA to completion on every Python.
+            # execute() steps it once on every Python; the difference is that
+            # Python 3.11's fetchall() stops at the first zero-column row, so
+            # `execute(...).fetchall()` there freed a single page.
+            conn.executescript("PRAGMA incremental_vacuum;")
             conn.commit()
         return _backend([
             {"seq": 1, "phase": "delete", "outcome": "ok"},
@@ -5846,6 +5850,47 @@ def _wb_gone(pid):
             return True
         time.sleep(0.01)
     return False
+
+
+def test_exited_unreaped_without_waitid_reads_the_zombie_state(monkeypatch):
+    """Python has `os.waitid` on macOS only from 3.13, and the README supports
+    3.11, where the family reaper raised AttributeError. Without it, a running
+    child is not exited, an exited one we have not reaped (a zombie) is, and
+    the check never reaps it: `waitpid` still collects its status afterwards."""
+    soak = _load_dashboard_soak()
+    monkeypatch.delattr(os, "waitid", raising=False)
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                             stdin=subprocess.PIPE)
+    try:
+        assert soak._exited_unreaped(child.pid) is False
+        child.stdin.close()
+        deadline = time.monotonic() + 30
+        while not soak._exited_unreaped(child.pid):
+            assert time.monotonic() < deadline, "the exited child never read as exited"
+            time.sleep(0.02)
+        assert os.waitpid(child.pid, 0) == (child.pid, 0)
+        child.returncode = 0
+    finally:
+        if child.returncode is None:
+            child.kill()
+            child.wait()
+
+
+def test_exited_unreaped_without_waitid_bounds_a_hanging_ps(monkeypatch):
+    """The `ps` fallback runs under a timeout, and a `ps` that times out reads
+    as "not exited yet" rather than raising, so the caller's own deadline
+    still decides (review F6)."""
+    soak = _load_dashboard_soak()
+    monkeypatch.delattr(os, "waitid", raising=False)
+    seen = {}
+
+    def hanging_ps(cmd, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(soak.subprocess, "run", hanging_ps)
+    assert soak._exited_unreaped(os.getpid()) is False
+    assert 0 < seen["timeout"] <= 30
 
 
 @pytest.mark.parametrize("mode", ["exit", "hang"])

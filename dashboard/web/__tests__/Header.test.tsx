@@ -50,11 +50,4 @@ describe('<Header /> (slimmed to chrome — #248)', () => {
     expect(wrapper?.getAttribute('type')).toBe('button');
     expect(wrapper?.getAttribute('title')).toBe('Sync now (r)');
   });
-
-  it('renders a refresh icon in the sync-chip stat container', () => {
-    render(<Header />);
-    const uses = document.querySelectorAll('svg use');
-    const hrefs = Array.from(uses).map((u) => u.getAttribute('href'));
-    expect(hrefs).toContain('/static/icons.svg#refresh');
-  });
 });

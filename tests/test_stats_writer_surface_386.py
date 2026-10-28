@@ -89,6 +89,13 @@ STATS_TABLES = frozenset({
     # whatever DELETE fires the trigger — every one of which already runs in a
     # sanctioned scope — and created by `open_db` under the open-time guard.
     "usage_snapshot_suppressions",
+    # #797/#823/#840 epoch 1019 (spec 4.3 D8): the provider-sample projection
+    # and the reviewed weekly decision projection that resolves a sample's
+    # weekly eligibility. Ingest writes both inside `_run_cycle`'s BEGIN
+    # IMMEDIATE (the pipeline and the op fold), the rebuild into its private
+    # scratch, so they join the freeze from their first epoch.
+    "claude_oauth_samples",
+    "claude_weekly_observation_decisions",
 })
 
 #: The SQL verb pattern. It matches the VERB alone and resolves the target from
@@ -200,6 +207,11 @@ FROZEN_WRITE_SITES = {
         # block — `_apply_schema` under `stats_open_time_guard` (maintenance
         # EXCLUSIVE plus `stats_write_scope("open-time")`).
         "five_hour_credit_confirmation_state": 1,
+        # #797/#823/#840 epoch 1019: the two projection tables' `CREATE TABLE
+        # IF NOT EXISTS`, in the same guarded block (the samples indexes
+        # resolve to their index names, not the table).
+        "claude_oauth_samples": 1,
+        "claude_weekly_observation_decisions": 1,
         "weekly_cost_snapshots": 1,
         "weekly_credit_floors": 1,
         "weekly_usage_snapshots": 2,
@@ -326,6 +338,14 @@ FROZEN_WRITE_SITES = {
     # and `quota_projection_state` gained the DELETE that retires an account
     # partition the projection no longer names.
     # #825/#832 spec 5.6 item 9: the outcome-quarantine fold's persistence.
+    # #797/#823/#840 epoch 1019: `project_sample`'s INSERT OR IGNORE (live
+    # ingest and the scratch replays through `_pipeline_claude_usage`, the
+    # rebuild through `RebuildProjector`) and the reviewed weekly decision
+    # fold applier's upsert.
+    "_cctally_oauth_samples.py": {
+        "claude_oauth_samples": 1,
+        "claude_weekly_observation_decisions": 1,
+    },
     "_cctally_quarantine.py": {
         "outcome_quarantine_certificates": 1,
         "outcome_quarantine_envelope": 1,

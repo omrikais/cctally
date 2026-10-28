@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import pathlib
 import sqlite3
 import sys
@@ -441,8 +442,13 @@ def _count_stats(monkeypatch, watched):
     real_stat = pathlib.Path.stat
 
     def counting(self, *args, **kwargs):
+        # `os.path.realpath`, not `Path.resolve()`: before 3.13, a non-strict
+        # `resolve()` calls `self.stat()` to detect symlink loops, which is
+        # this very function, so every counted stat recursed until
+        # RecursionError on 3.11 and 3.12 (and pytest's failure report, which
+        # stats the test file, then died as an INTERNALERROR).
         try:
-            resolved = self.resolve()
+            resolved = pathlib.Path(os.path.realpath(self))
         except OSError:
             resolved = self
         if resolved in watched:

@@ -9,8 +9,7 @@ finite work but provides no scale-independent ceiling below it: a pass costing
 
 No wall-clock assertion appears anywhere in this file. A virtual monotonic clock
 advances only when the fake pass or the fake wait says it does, so every test
-measures the scheduling algebra and never the machine (D-1 /
-``tests/test_timing_budget_guard.py``).
+measures the scheduling algebra and never the machine (D-1).
 
 ``tests/test_dashboard_sync_cooldown.py`` owns the MAIN loop's contract; this
 file is deliberately separate rather than an extension of it.

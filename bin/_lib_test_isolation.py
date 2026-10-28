@@ -62,6 +62,11 @@ import sys
 import threading
 import time
 
+try:  # `F_GETPATH` names a directory descriptor's path on Darwin.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - every supported platform has it
+    _fcntl = None
+
 # --- reserved environment keys -------------------------------------------
 #
 # The interceptor OVERWRITES exactly these in a child's environment and copies
@@ -77,11 +82,12 @@ ENV_ROOTS = "CCTALLY_ISOLATION_ROOTS"
 ENV_BOOTSTRAP_DIR = "CCTALLY_ISOLATION_BOOTSTRAP"
 ENV_SCRATCH = "CCTALLY_ISOLATION_SCRATCH"
 ENV_SESSION = "CCTALLY_ISOLATION_SESSION"
+ENV_ROOT_ENTRIES = "CCTALLY_ISOLATION_ROOT_ENTRIES"
 
 RESERVED_ENV_KEYS = (
     ENV_LEDGER, ENV_HANDSHAKE, ENV_NODE, ENV_TOKEN,
     ENV_KERNEL_DIR, ENV_ROOTS, ENV_BOOTSTRAP_DIR, ENV_SCRATCH,
-    ENV_SESSION,
+    ENV_SESSION, ENV_ROOT_ENTRIES,
 )
 
 
@@ -208,6 +214,16 @@ def resolve_protected_roots(env=None) -> tuple[pathlib.Path, ...]:
     would otherwise have tests resolving and writing there while a detector
     built only on the password home watched somewhere else entirely.
     """
+    seen: dict[str, pathlib.Path] = {}
+    for path in _protected_root_candidates(env):
+        resolved = pathlib.Path(os.path.realpath(str(path)))
+        seen.setdefault(str(resolved), resolved)
+    return tuple(seen.values())
+
+
+def _protected_root_candidates(env=None) -> list:
+    """The protected paths as configured, before resolution: the name a root
+    is reached by can itself be a link to it (review I3c F4)."""
     env = os.environ if env is None else env
     # Imported lazily and never at module scope: the child bootstrap imports
     # this module before anything else runs, and a module-scope import would put
@@ -234,12 +250,7 @@ def resolve_protected_roots(env=None) -> tuple[pathlib.Path, ...]:
     override = (env.get("CCTALLY_DATA_DIR") or "").strip()
     if override:
         candidates.append(pathlib.Path(override).expanduser())
-
-    seen: dict[str, pathlib.Path] = {}
-    for path in candidates:
-        resolved = pathlib.Path(os.path.realpath(str(path)))
-        seen.setdefault(str(resolved), resolved)
-    return tuple(seen.values())
+    return candidates
 
 
 def resolve_child_app_dir(env) -> str | None:
@@ -269,6 +280,11 @@ _INSTALLED = False
 _INTERCEPTOR_INSTALLED = False
 
 _ROOTS: tuple[str, ...] = ()
+# The configured path of a root whose own final component is a link (review
+# I3c F4), with only its parent canonicalized. `_ROOTS` holds the resolved
+# form, which an entry removal never computes for its final component, so
+# removing the alias itself would otherwise be charged to its directory.
+_ROOT_ENTRIES: tuple[str, ...] = ()
 _LEDGER_PATH: str = ""
 _HANDSHAKE_PATH: str = ""
 _TOKEN: str = ""
@@ -356,11 +372,11 @@ def _published_session_id(env) -> str:
 
 
 def session_dir(env=None) -> pathlib.Path:
-    """The per-session directory, inside the suite generation when there is one.
+    """The per-session directory, inside the suite directory when there is one.
 
     #963 (note R11): bin/cctally-test-all exports PYTEST_DEBUG_TEMPROOT, the
-    generation's private pytest temp root; the session directory lives beneath
-    it and is removed with the generation. Without it (a bare pytest run, or a
+    suite directory's private pytest temp root; the session directory lives
+    beneath it and is removed with the suite directory. Without it (a bare pytest run, or a
     root that does not exist) the location is the one it always was.
     """
     import tempfile
@@ -1026,14 +1042,31 @@ def _match_root(resolved: str) -> str | None:
     return None
 
 
-def _guarded_path(raw) -> str | None:
-    """The canonical form of `raw` when it lands inside a protected root.
+def _fd_directory(fd: int) -> str | None:
+    """The path of the directory open at `fd`, or None when it cannot be named.
 
-    Canonicalization is not optional: a write reaching a guarded root through a
-    symlink whose own path is not guarded has to be caught, and only realpath
-    sees it. `os.path.realpath` is non-strict, so a leaf that does not exist yet
-    still resolves.
-    """
+    Darwin answers `F_GETPATH`; Linux names every descriptor under
+    /proc/self/fd. Elsewhere a name relative to a directory descriptor cannot
+    be placed, and the event is not judged rather than judged against the
+    working directory, which is never where such a name lands."""
+    if _fcntl is not None and hasattr(_fcntl, "F_GETPATH"):
+        try:
+            raw = _fcntl.fcntl(fd, _fcntl.F_GETPATH, bytes(1024))
+        except (OSError, ValueError, TypeError):
+            return None
+        return os.fsdecode(raw.split(b"\0", 1)[0]) or None
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except (OSError, ValueError):
+        return None
+
+
+def _event_name(raw, dir_fd=None) -> str | None:
+    """`raw` as a path an audit event names, placed against `dir_fd`.
+
+    A relative name with a directory descriptor lands in that directory, never
+    in the working directory (review I3c F5): shutil.rmtree's descriptor walk
+    removes every entry below its top this way."""
     if raw is None or isinstance(raw, int):
         return None
     try:
@@ -1042,6 +1075,38 @@ def _guarded_path(raw) -> str | None:
         return None
     if not text:
         return None
+    if dir_fd is not None and not os.path.isabs(text):
+        base = _fd_directory(dir_fd)
+        if base is None:
+            return None
+        text = os.path.join(base, text)
+    return text
+
+
+def _entry_form(text: str) -> str | None:
+    """`text` with its parent canonicalized and its final component kept, or
+    None when the kernel would itself resolve that component (empty, ``.`` or
+    ``..``, which a trailing separator produces)."""
+    head, tail = os.path.split(text)
+    if tail in ("", ".", ".."):
+        return None
+    try:
+        return os.path.join(os.path.realpath(head or os.curdir), tail)
+    except (OSError, ValueError):
+        return None
+
+
+def _guarded_path(raw, dir_fd=None) -> str | None:
+    """The canonical form of `raw` when it lands inside a protected root.
+
+    Canonicalization is not optional: a write reaching a guarded root through a
+    symlink whose own path is not guarded has to be caught, and only realpath
+    sees it. `os.path.realpath` is non-strict, so a leaf that does not exist yet
+    still resolves.
+    """
+    text = _event_name(raw, dir_fd)
+    if text is None:
+        return None
     try:
         resolved = os.path.realpath(text)
     except (OSError, ValueError):
@@ -1049,7 +1114,48 @@ def _guarded_path(raw) -> str | None:
     return resolved if _match_root(resolved) else None
 
 
+def _guarded_entry(raw, dir_fd=None) -> str | None:
+    """`_guarded_path` for an event that removes or replaces a directory ENTRY.
+
+    Unlinking or removing a name writes the directory that holds it, never
+    the target of a link at that name: `os.remove` of a link in scratch that
+    points into a protected root removes the link and leaves the root alone.
+    Resolving the whole path charged that removal to the link's target, so
+    the temp reclaim of a passing test whose tree held a link to ~/.claude
+    failed the session as a production write (review D2). Only the parent is
+    canonicalized and the final component is kept as it is, so a parent that
+    is itself a link into a root is still caught. A final component the
+    kernel would itself resolve (empty, ``.`` or ``..``, which a trailing
+    separator produces) falls back to resolving the whole path.
+
+    A rename removes its source entry and replaces its destination entry, so
+    both of its ends take these semantics (review I3c F5). The one link whose
+    own removal IS a write to a root is the root's configured alias: removing
+    it takes the root away from the path it is configured by (review I3c F4).
+    """
+    text = _event_name(raw, dir_fd)
+    if text is None:
+        return None
+    resolved = _entry_form(text)
+    if resolved is None:
+        return _guarded_path(text)
+    if resolved in _ROOT_ENTRIES or _match_root(resolved):
+        return resolved
+    return None
+
+
 # --- the audit hook -------------------------------------------------------
+
+
+def _dir_fd(args, index):
+    """The directory descriptor an audit event carries at `index`, or None.
+
+    CPython reports an absent `dir_fd` as -1; any negative value (AT_FDCWD
+    included) names the working directory, which is what no descriptor means."""
+    value = args[index] if len(args) > index else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _open_targets(args):
@@ -1057,46 +1163,61 @@ def _open_targets(args):
     mode = args[1] if len(args) > 1 else None
     flags = args[2] if len(args) > 2 else None
     if is_write_flags(flags) or mode_suggests_write(mode):
-        return (path,)
+        return ((path, None, False),)
     return ()
 
 
 def _sqlite_targets(args):
     database = args[0] if args else None
-    return (database,) if is_writable_sqlite_target(database) else ()
+    return ((database, None, False),) if is_writable_sqlite_target(database) else ()
 
 
-def _first(args):
-    return (args[0],) if args else ()
+def _path_at(index, fd_index=None, entry=False):
+    """One target: the path at `index`, placed against the descriptor at
+    `fd_index`, judged as an entry (`_guarded_entry`) or as a path."""
+    def extract(args):
+        if len(args) <= index:
+            return ()
+        fd = None if fd_index is None else _dir_fd(args, fd_index)
+        return ((args[index], fd, entry),)
+    return extract
 
 
-def _second(args):
-    return (args[1],) if len(args) > 1 else ()
+def _rename_targets(args):
+    return (_path_at(0, 2, entry=True)(args) + _path_at(1, 3, entry=True)(args))
 
 
-def _both(args):
-    return tuple(args[:2])
+def _link_targets(args):
+    return _path_at(0, 2)(args) + _path_at(1, 3)(args)
 
 
-# os.remove and os.unlink are the same C entry point and both raise `os.remove`;
-# os.replace raises `os.rename`. os.link guards BOTH ends, because a hardlink
-# into a protected file is a write-capable alias for it; os.symlink guards only
-# the entry being created, since its target is just a string.
+# Each extractor yields (path, dir_fd, entry) targets, with the argument
+# positions of the event's audit signature: os.remove and os.rmdir are
+# (path, dir_fd), os.rename (src, dst, src_dir_fd, dst_dir_fd), os.mkdir and
+# os.chmod (path, mode, dir_fd), os.chown (path, uid, gid, dir_fd), os.utime
+# (path, times, ns, dir_fd), os.link (src, dst, src_dir_fd, dst_dir_fd) and
+# os.symlink (src, dst, dir_fd). os.remove and os.unlink are the same C entry
+# point and both raise `os.remove`; os.replace raises `os.rename`. The entry
+# removals and both ends of a rename resolve only their parent
+# (`_guarded_entry`); every other event resolves its whole path. os.link guards
+# BOTH ends, because a hardlink into a protected file is a write-capable alias
+# for it; os.symlink guards only the entry being created, since its target is
+# just a string.
 _EVENT_TARGETS = {
     "open": _open_targets,
-    "os.remove": _first,
-    "os.rename": _both,
-    "os.truncate": _first,
-    "os.mkdir": _first,
-    "os.rmdir": _first,
-    "os.chmod": _first,
-    "os.chown": _first,
-    "os.link": _both,
-    "os.symlink": _second,
-    "os.utime": _first,
+    "os.remove": _path_at(0, 1, entry=True),
+    "os.rename": _rename_targets,
+    "os.truncate": _path_at(0),
+    "os.mkdir": _path_at(0, 2),
+    "os.rmdir": _path_at(0, 1, entry=True),
+    "os.chmod": _path_at(0, 2),
+    "os.chown": _path_at(0, 3),
+    "os.link": _link_targets,
+    "os.symlink": _path_at(1, 2),
+    "os.utime": _path_at(0, 3),
     "sqlite3.connect": _sqlite_targets,
-    "shutil.copymode": _second,
-    "shutil.copystat": _second,
+    "shutil.copymode": _path_at(1),
+    "shutil.copystat": _path_at(1),
 }
 
 
@@ -1130,8 +1251,8 @@ def _audit_hook(event, args):
     _LOCAL.busy = True
     try:
         hit = None
-        for target in extract(args):
-            hit = _guarded_path(target)
+        for target, dir_fd, entry in extract(args):
+            hit = (_guarded_entry if entry else _guarded_path)(target, dir_fd)
             if hit is not None:
                 break
         if hit is None:
@@ -1378,6 +1499,7 @@ def export_env_envelope(env=None) -> None:
     target[ENV_BOOTSTRAP_DIR] = bootstrap_dir()
     target[ENV_ROOTS] = os.pathsep.join(_ROOTS)
     target[ENV_SCRATCH] = os.pathsep.join(_SCRATCH_ROOTS)
+    target[ENV_ROOT_ENTRIES] = os.pathsep.join(_ROOT_ENTRIES)
     target["PYTHONPATH"] = _pythonpath_with_bootstrap(target.get("PYTHONPATH", ""))
 
 
@@ -1538,6 +1660,7 @@ def _child_environment(base) -> dict:
     # Measured: every `cctally five-hour-blocks --json` child in
     # tests/test_five_hour_blocks_json.py produced exactly that false positive.
     child[ENV_SCRATCH] = os.pathsep.join(_SCRATCH_ROOTS)
+    child[ENV_ROOT_ENTRIES] = os.pathsep.join(_ROOT_ENTRIES)
     child["PYTHONPATH"] = _pythonpath_with_bootstrap(child.get("PYTHONPATH", ""))
     return child
 
@@ -1616,8 +1739,13 @@ def install(roots=None, ledger_path=None, node_id_getter=None, env=None) -> None
     env = os.environ if env is None else env
     with _LOCK:
         _WORKER_ID = worker_id(env)
+        configured = list(roots) if roots is not None else []
         if roots is None:
             roots = resolve_protected_roots(env)
+            try:
+                configured = _protected_root_candidates(env)
+            except Exception:
+                configured = []
         # THIS entry point only ever GROWS the policy; `remove_protected_root`
         # is what shrinks it, and the detector's own fixtures use that to retire
         # a synthetic root. Replacing the set wholesale here discarded whatever
@@ -1627,6 +1755,8 @@ def install(roots=None, ledger_path=None, node_id_getter=None, env=None) -> None
         _ROOTS = tuple(dict.fromkeys(
             list(_ROOTS) + [os.path.realpath(str(r)) for r in roots]
         ))
+        for raw in configured:
+            _note_root_entry(raw)
         if ledger_path is None:
             # state_dir() is what mints or adopts the session identifier, so it
             # is reached ONLY here -- a child handed an explicit ledger must not
@@ -1663,6 +1793,9 @@ def install_child_from_env(env=None) -> None:
         return
     _TOKEN = env.get(ENV_TOKEN) or ""
     roots = [r for r in (env.get(ENV_ROOTS) or "").split(os.pathsep) if r]
+    # A root's alias arrives as its entry form and is judged here exactly as
+    # the parent judged it: it must still name one of the roots received.
+    roots += [e for e in (env.get(ENV_ROOT_ENTRIES) or "").split(os.pathsep) if e]
     for scratch in (env.get(ENV_SCRATCH) or "").split(os.pathsep):
         if scratch:
             register_scratch_root(scratch)
@@ -1678,6 +1811,22 @@ def install_child_from_env(env=None) -> None:
 # --- per-test state -------------------------------------------------------
 
 
+def _note_root_entry(raw) -> None:
+    """Remember a configured root path whose final component is a link to the
+    root it names, so removing that link is charged to the root (review I3c
+    F4). A path whose entry form IS its resolved form is already a root."""
+    global _ROOT_ENTRIES
+    try:
+        text = os.fsdecode(raw)
+        resolved = os.path.realpath(text)
+    except (TypeError, ValueError, OSError):
+        return
+    entry = _entry_form(text) if text else None
+    if (entry is not None and entry != resolved and resolved in _ROOTS
+            and entry not in _ROOT_ENTRIES):
+        _ROOT_ENTRIES = _ROOT_ENTRIES + (entry,)
+
+
 def add_protected_root(path) -> None:
     """Register a SYNTHETIC protected root for the duration of a test.
 
@@ -1690,13 +1839,16 @@ def add_protected_root(path) -> None:
     resolved = os.path.realpath(str(path))
     if resolved not in _ROOTS:
         _ROOTS = _ROOTS + (resolved,)
+    _note_root_entry(str(path))
     export_env_envelope()
 
 
 def remove_protected_root(path) -> None:
-    global _ROOTS
+    global _ROOTS, _ROOT_ENTRIES
     resolved = os.path.realpath(str(path))
     _ROOTS = tuple(r for r in _ROOTS if r != resolved)
+    _ROOT_ENTRIES = tuple(e for e in _ROOT_ENTRIES
+                          if os.path.realpath(e) != resolved)
     export_env_envelope()
 
 

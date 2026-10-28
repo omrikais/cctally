@@ -32,7 +32,7 @@ export function DoctorChip(): JSX.Element | null {
   const doctor = useSyncExternalStore(subscribeStore, () => getState().doctor);
   if (!doctor) return null;
 
-  const { severity, counts, generated_at } = doctor;
+  const { severity, counts, generated_at, rebuild_worker } = doctor;
   // #293 S4 (§4c): split the label into a "Doctor" WORD + an ALWAYS-present
   // compact status token (OK / warn-count / fail-count — never a bare dot), so
   // the ≤360px topbar can hide the word and keep the color-coded status even in
@@ -46,13 +46,21 @@ export function DoctorChip(): JSX.Element | null {
   } else {
     status = 'OK';
   }
-  const aria = `Doctor diagnostic: ${SEVERITY_LABEL[severity]} — ${counts.ok} OK, ${counts.warn} warn, ${counts.fail} fail`;
+  let aria = `Doctor diagnostic: ${SEVERITY_LABEL[severity]} — ${counts.ok} OK, ${counts.warn} warn, ${counts.fail} fail`;
   let tooltip = `Doctor · ${SEVERITY_LABEL[severity]} (click for report)`;
   try {
     const when = new Date(generated_at).toLocaleTimeString();
     tooltip = `Doctor · ${SEVERITY_LABEL[severity]} · checked ${when} (click for report)`;
   } catch {
     /* fall through to terse tooltip on a bad timestamp */
+  }
+  // #997 D10: a running, stalled, failed or dead stats.db rebuild worker
+  // leads the tooltip and the accessible name with its doctor sentence:
+  // `<summary> · Doctor · <SEV> · checked <T> (click for report)`. Only the
+  // title/aria-label carry it, so the visible label and layout never change.
+  if (rebuild_worker?.summary) {
+    tooltip = `${rebuild_worker.summary} · ${tooltip}`;
+    aria = tooltip;
   }
 
   return (

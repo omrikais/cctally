@@ -522,3 +522,81 @@ def test_an_unreadable_segment_tail_never_undercounts_the_excluded_population(
     monkeypatch.setattr(jr, "open", refusing_open, raising=False)
     with pytest.raises(OSError):
         jr.excluded_population(boundary)
+
+
+# --------------------------------------------------------------------------
+# An excluded legacy decision over a current reading (#825/#832 review P1-1;
+# the M20 oracle's `old-ingest-over-current` schedule, extracted)
+# --------------------------------------------------------------------------
+
+def _readings_at(app, percent):
+    conn = app.open_db()
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT account_key, weekly_percent FROM weekly_usage_snapshots "
+            "WHERE weekly_percent = ?", (percent,))]
+    finally:
+        conn.close()
+
+
+def test_an_excluded_legacy_decision_never_suppresses_the_current_reading(
+        monkeypatch, tmp_path):
+    """Detects the #825/#832 P1-1 data loss: a stamped current reading whose
+    ingest was deferred, then derived by a previous-release ingest that
+    journaled an UNSTAMPED `sa:<observation id>` decision. Admission excludes
+    that decision and a rebuild applies only admitted decisions, so before the
+    derivation-completion step the reading vanished from the index on the
+    next rebuild and never came back. It must materialize exactly once, under
+    the account it was captured for, through ingest, rebuild and rederive.
+
+    Runs through the real bound recording pipeline (`record_usage_bound`) and
+    the real `db rebuild` / `db rederive` commands; the previous release's
+    ingest is the current one with the writer stamp withheld."""
+    import _outcome_quarantine_trace as T
+
+    app = T.make_app(monkeypatch, tmp_path)
+    # After make_app: loading the script imports these modules afresh.
+    import _cctally_journal as jr
+    import _lib_account_protocol as P
+    import _lib_journal as J
+    T.retain_session_input(app, "A")
+    captured = T.identity("A")
+    end = "2026-10-12T12:00:00Z"
+    T.current(app, monkeypatch, at="2026-10-09T10:00:00Z", weekly=30,
+              week_end=end)
+    # The current reading's ingest is deferred (it found an old-epoch index).
+    with monkeypatch.context() as deferred:
+        deferred.setattr(jr, "run_stats_ingest", lambda **_kw: None)
+        T.current(app, monkeypatch, at="2026-10-09T10:10:00Z", weekly=32,
+                  week_end=end)
+    [reading] = [r for r in T.journal_records()
+                 if r.get("t") == "obs" and r.get("provider") == "claude"
+                 and (r.get("payload") or {}).get("weekly_percent") == 32]
+    assert P.is_stamped(reading) and reading.get("account") == captured
+    # The previous release's ingest derives it, stamping nothing, into the
+    # index it republished at its own epoch, which certifies no derivation.
+    with monkeypatch.context() as old_release:
+        old_release.setattr(J, "prepare_record", J.unstamped_record)
+        jr.run_stats_ingest(mode="authoritative")
+    import sqlite3
+    old_index = sqlite3.connect(_cctally_core.DB_PATH)
+    try:
+        old_index.execute(
+            f"PRAGMA user_version = {jr.DERIVATION_FRONTIER_EPOCH - 1}")
+        old_index.commit()
+    finally:
+        old_index.close()
+    decision = "sa:" + reading["id"]
+    assert any(r.get("t") == "evt" and r.get("id") == decision
+               and not P.is_stamped(r) for r in T.journal_records()), (
+        "non-vacuity: the excluded legacy decision exists")
+
+    T.rebuild(app)              # the current epoch transition's rebuild
+    assert _readings_at(app, 32.0) == [(captured, 32.0)], "after rebuild"
+    T.ingest(app)
+    assert _readings_at(app, 32.0) == [(captured, 32.0)], "after ingest"
+    T.rebuild(app)
+    assert _readings_at(app, 32.0) == [(captured, 32.0)], "after a rerun"
+    T.rederive(app)
+    assert _readings_at(app, 32.0) == [(captured, 32.0)], "after rederive"
+    assert _readings_at(app, 30.0) == [(captured, 30.0)]

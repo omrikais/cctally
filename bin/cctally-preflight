@@ -1,138 +1,75 @@
 #!/usr/bin/env python3
-"""Seconds-scale static pre-flight for a full-suite round trip (#529 S5 §5).
+"""Seconds-scale static pre-flight, over the tree or over one pushed range.
 
-Nine checks, in order:
+Four checks:
 
-  1. Compile every Python file in the REPOSITORY — not bin/ alone (#655) —
-     without writing bytecode. Files are selected by `.py` extension OR by a
-     Python shebang: bin/cctally is EXTENSIONLESS, so an extension-keyed scan
-     would skip the most important file in the tree, and
-     bin/codex-session-metrics shows that is a class rather than one special
-     case. The subject set comes from the SAME pruned walk check 2 uses, so a
-     Python syntax error outside bin/ is now found rather than invisible; the
-     two checks were asymmetric from #641 until #655 closed it.
-  2. Syntax-check every shell subject in the REPOSITORY — not bin/ alone — on
-     three legs. The primary parse uses the interpreter chosen per file from
-     its own shebang rather than assumed. A non-empty stderr from that parse is
-     a finding even at exit 0, which is how bash 5 reports an unterminated
-     here-document and how eleven of them went unreported for months. And every
-     subject whose interpreter is bash is parsed a second time by a bash 3.x
-     interpreter, because 3.2 is the floor this repository declares while
-     `#!/usr/bin/env bash` resolves to Homebrew 5.x on every box that runs the
-     suite, so the declared floor was never actually exercised. The subject set
-     is a PRUNED filesystem walk rather than `git ls-files`, because this tool
+  1. Compile every Python file without writing bytecode. Files are selected by
+     `.py` extension OR by a Python shebang: bin/cctally is EXTENSIONLESS, so an
+     extension-keyed scan would skip the most important file in the tree. The
+     subject set comes from the SAME pruned walk check 2 uses (#655).
+  2. Syntax-check every shell subject on three legs. The primary parse uses
+     the interpreter the file's own shebang names. A non-empty stderr from that
+     parse is a finding even at exit 0, which is how bash 5 reports an
+     unterminated here-document. And every subject whose interpreter is bash is
+     parsed a second time by a bash 3.x interpreter, because 3.2 is the floor
+     this repository declares while `#!/usr/bin/env bash` resolves to Homebrew
+     5.x on every box that runs the suite. The subject set is a PRUNED
+     filesystem walk rather than `git ls-files`, because the full-tree mode
      must not require a git repository: the tree it checks may be a
      materialized copy. See check_shell and iter_shell_subjects.
-  3. Invoke bin/cctally-test-owners --verify.
-  4. Validate tests/authoritative-harness-durations.tsv against the estate
-     manifest, through the SAME validator the dispatch scheduler applies. The
-     scheduler treats a bad table as a non-fatal fallback, because a stale
-     table must never fail a gate; this is where it is refused instead, at the
-     keyboard rather than sixteen minutes later.
-  5. Ask bin/cctally-test-all's side-effect-free plan mode for the dispatch
-     decision it would take, and require `scheduler=lpt`. Check 4 reads the
-     same three files the scheduler reads and would pass while the scheduler
-     still fell back at run time: python3 absent or answering non-zero,
-     _lib_harness_durations unimportable from <root>/bin, or a broken
-     shell-side capture are all silent fallbacks no file validation can see.
-     A tree carrying no aggregator has no plan to report and is not faulted.
-  6. Classify every manifest row's harness path against .mirror-allowlist and
-     compare it with the declared visibility. Private profile only. The
-     authoritative admission check on the runner is unchanged; this is
-     duplicate LOCAL coverage of a check that reads three files and executes
-     nothing, and today costs a full round trip to discover.
-  7. Check CHANGELOG.md against the user-facing entry policy in
+  3. Check CHANGELOG.md against the user-facing entry policy in
      docs/changelog-policy.md, through the same pure kernel and the same two
-     path predicates bin/cctally-changelog-lint applies. The file publishes to
-     the public repository verbatim and is reused as a release-note body and a
-     mirror commit message, so a non-compliant entry is an outward-facing
-     defect; catching it here costs a parse of one file.
-  8. Report on tests/authoritative-runtime-budget.json through the REAL
-     contract_budget_load, invoked as a caught subprocess. ADVISORY: the budget
-     is report-only since the test regime reset (session 1), and admission
-     only notes a missing or malformed file while the run proceeds, so this
-     check prints the loader's cause as a note and never fails the pre-flight.
-     That loader is embedded Python inside bin/_lib-test-contract.sh, so unlike
-     check 4 there is no module to import and no Python API to call; running
-     the shell function keeps the note in the parser's own vocabulary.
-  9. Refuse a bare, `-t` or `-p` `mktemp` and a here-document a legacy shell
-     reaches (#940 section 6.5, C11): both put temporary data outside TMPDIR
-     on macOS, where the LAN runners' confinement kills the writer. A static
-     scan of shell subjects, Python string literals and argv lists, and
-     workflow files, following `source` and `.` from every path a legacy
-     shell reaches; the rules are stated above check_temp_and_heredocs.
+     path predicates bin/cctally-changelog-lint applies.
+  4. With --changed only, run the tree's own bin/cctally-doc-lint-test when the
+     range changes a Markdown file. The suite runs that harness itself, so the
+     full-tree mode leaves it out and needs no git repository.
 
-Checks 4, 5, 6, 7, 8 and 9 are admitted under one boundary rule: pre-flight takes only
-checks that parse or verify local files deterministically and that have
-identical coverage inside the suite. No pytest, no harness execution, no
-fixture regeneration, no network probe, no runner-capability query, and no
-performance measurement. Check 5 is inside that rule rather than an exception
-to it: plan mode is the aggregator's documented side-effect-free dry run, it
-exits before admission and before any harness launch, and the suite reaches
-the same decision through tests/test_test_all_scheduler.py.
+`--changed <before>..<after>` limits every check to the files the range
+changes, which is what ci.yml's changed-checks job runs on a private push to
+main. Both endpoints of a rename count (the new path is checked; the old one
+still says what changed), a deletion leaves nothing to check, and the changelog
+is checked only when the range changes it. An all-zero or empty `before` (a new
+branch), or a range git cannot read, checks the whole tree instead, with a note.
+The files read are the working tree's, so the caller checks out `after` first.
+
+The retired checks (harness ownership, duration cover, scheduler plan,
+declared visibility, runtime budget, and the temporary-allocation and
+here-document scan) left with the estate and CI shape they guarded (test regime
+reset, Tasks 3.4 and 3.5).
 
 Exit 0 clean, 2 invalid invocation, 3 for any detected defect or for an
 inability to complete the verification. An inability to verify fails; it never
 passes. There is no --json envelope, because nothing consumes one.
 
-This is an EARLY EXIT, not a gate with unique coverage. bin/cctally-preflight-test
-runs the same checks inside the suite, which is what makes
-CCTALLY_SKIP_PREFLIGHT=1 safe: skipping removes a duplicate rather than
-removing coverage. A gate that can fail the operation it guards turns a
-detector into an outage.
-
 No wall-clock ASSERTION exists anywhere for this tool: no duration is compared
-against a ceiling, reported, or tuned, and no outcome depends on how long a
-check took. It is fast because it parses and does nothing else, and a duration
-ceiling on a shared, contended box is the defect class #529 S3 has just
-removed.
-
-Wall-clock BOUNDS do exist, and they are not that thing (#630 S3, #641, #655).
-EVERY subprocess this tool starts carries one, and each is a hang bound: it
-decides an outcome only when the subprocess never returns at all, which is the
-case that turns the pre-flight into the outage it exists to prevent. There are
-two of them, named separately because they bound materially different work:
-`_PARSE_TIMEOUT_SECONDS` on each `-n` parse, and `_SUBPROCESS_TIMEOUT_SECONDS`
-on the bash version probe, the ownership validator, the runtime-budget loader
-and the aggregator in plan mode. Both are 60 today.
-
-A third, `_SHELL_CHECK_DEADLINE_SECONDS`, is an AGGREGATE bound over check 2
-rather than a per-call one, because a per-call bound stops one stuck
-interpreter and does not stop hundreds of them. It gates whether the next parse
-is launched and never shortens a launched one; no path in this tool computes a
-timeout from the time remaining, which would launch a healthy parse with a
-fractional bound near the deadline and report it as a defect in the file.
-
-The margin is what separates a bound from a ceiling. Plan mode measures 0.16 to
-0.24 s against 60 — roughly 300x — on a path that takes no lock, opens no
-socket and sleeps nowhere; the ceiling #529 S3 removed sat at about 2.3x and
-reddened release-stamp runs on a contended box. A bound no honest run can
-approach records nothing about load; a ceiling a slow box can cross records
-load and calls it a defect.
+against a ceiling, reported, or tuned. Wall-clock BOUNDS do exist, and each is
+a hang bound that decides an outcome only when a subprocess never returns:
+`_PARSE_TIMEOUT_SECONDS` on each `-n` parse, `_SUBPROCESS_TIMEOUT_SECONDS` on
+the bash version probe, the git range reads and the doc lint, and the aggregate
+`_SHELL_CHECK_DEADLINE_SECONDS` over check 2, which gates whether the next parse
+is launched and never shortens a launched one.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.machinery
 import importlib.util
-import io
 import os
 import pathlib
 import re
 import subprocess
 import sys
 import time
-import tokenize
 
 # Check 1 compiles without writing bytecode, and this import must not undo
 # that for the tool's own directory. An ordinary import of a bin/ sibling has
-# CPython write bin/__pycache__/_lib_harness_durations.<tag>.pyc into the tree
+# CPython write bin/__pycache__/<module>.<tag>.pyc into the tree
 # under test, which is a side effect in a tool whose whole contract is that it
 # only reads. Set before the import, because the flag is read at import time.
 sys.dont_write_bytecode = True
 
-# The duration-table contract has ONE spelling, shared with the dispatch
-# scheduler in bin/cctally-test-all. Resolved from this script's own directory
+# The sibling modules this tool imports (the changelog policy kernel) are
+# resolved from this script's own directory
 # rather than through an ambient PYTHONPATH, and deliberately from the tool's
 # own tree rather than from --repo-root: the contract belongs to the binary
 # doing the checking, not to the tree being checked.
@@ -209,7 +146,6 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_DEFECT = 3
 
-_OWNERS = "cctally-test-owners"
 
 
 def _shebang(path: pathlib.Path) -> str:
@@ -379,17 +315,28 @@ def iter_source_files(root: pathlib.Path) -> list[pathlib.Path]:
     return files
 
 
-def _subjects_by_kind(root: pathlib.Path) -> dict[str, list[pathlib.Path]]:
-    """One walk, one classification pass, partitioned by kind."""
-    by_kind: dict[str, list[pathlib.Path]] = {"shell": [], "python": [], "workflow": []}
-    workflows = root / ".github" / "workflows"
-    for path in iter_source_files(root):
+def _walk_admits(rel: str) -> bool:
+    """True when the pruned walk would reach ``rel``, a repository-relative file."""
+    if any(part in _PRUNE_DIR_NAMES for part in rel.split("/")[:-1]):
+        return False
+    return _kept(rel) or not any(
+        rel == pruned or rel.startswith(pruned + "/") for pruned in _PRUNE_DIR_PATHS
+    )
+
+
+def _partition(paths: list[pathlib.Path]) -> dict[str, list[pathlib.Path]]:
+    """One classification pass over ``paths``, partitioned by kind."""
+    by_kind: dict[str, list[pathlib.Path]] = {"shell": [], "python": []}
+    for path in paths:
         kind = classify(path)
-        if not kind and path.parent == workflows and path.suffix in (".yml", ".yaml"):
-            kind = "workflow"  # check 9 reads their `run:` commands
         if kind in by_kind:
             by_kind[kind].append(path)
     return by_kind
+
+
+def _subjects_by_kind(root: pathlib.Path) -> dict[str, list[pathlib.Path]]:
+    """One walk, one classification pass, partitioned by kind."""
+    return _partition(iter_source_files(root))
 
 
 def iter_shell_subjects(root: pathlib.Path) -> list[pathlib.Path]:
@@ -420,8 +367,8 @@ def iter_python_subjects(root: pathlib.Path) -> list[pathlib.Path]:
 
 _LEGACY_BASH_ENV = "CCTALLY_PREFLIGHT_BASH32"
 
-# A hang bound on every `-n` parse, matching the one check 5 puts on the
-# aggregator. An interpreter that never returns would hang the pre-flight, and a
+# A hang bound on every `-n` parse, matching the one on the other
+# subprocesses. An interpreter that never returns would hang the pre-flight, and a
 # hung pre-flight is the outage class this tool's docstring says it exists to
 # avoid. It is generous because these are parses and nothing else: the primary
 # leg sweeps every shell subject in the tree, while the legacy bash-3.x leg
@@ -438,11 +385,9 @@ _LEGACY_BASH_ENV = "CCTALLY_PREFLIGHT_BASH32"
 _PARSE_TIMEOUT_SECONDS = 60
 
 # The same hang bound, for the subprocesses that are NOT parses: the bash
-# version probe, the ownership validator, the runtime-budget validator and the
-# aggregator in plan mode. Deliberately a SEPARATE name from the parse bound
-# even though the values match today. They bound materially different work —
-# one interpreter parsing one file, versus a Python validator or the aggregator
-# — so a later measurement that moves one must not silently move the other.
+# version probe, the git range reads of --changed and the doc lint. A SEPARATE
+# name from the parse bound even though the values match today, so a later
+# measurement that moves one does not silently move the other.
 _SUBPROCESS_TIMEOUT_SECONDS = 60
 
 # An AGGREGATE bound over the whole shell check, distinct from the per-call one.
@@ -743,266 +688,6 @@ def check_shell(
     return problems
 
 
-def check_ownership(root: pathlib.Path, owners: pathlib.Path) -> list[str]:
-    if not owners.is_file():
-        return ["%s is absent, so harness ownership cannot be verified" % owners]
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(owners), "--verify", "--repo-root", str(root)],
-            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        # This subprocess carried no bound at all until #655, while the tool's
-        # own documentation said every wall-clock bound in it is a hang bound —
-        # which invites the reading that every subprocess has one. A validator
-        # that never returns is an inability to verify ownership, which this
-        # tool reports as a defect rather than as a pass.
-        return ["harness ownership could not be verified: %s did not return "
-                "within %d seconds" % (owners, _SUBPROCESS_TIMEOUT_SECONDS)]
-    except OSError as exc:
-        return ["%s could not be run: %s" % (owners, exc)]
-    if proc.returncode == 0:
-        return []
-    lines = [ln for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
-    if not lines:
-        lines = ["%s --verify exited %d with no diagnostic" % (owners, proc.returncode)]
-    return lines
-
-
-def check_durations(root: pathlib.Path) -> list[str]:
-    """The dispatch scheduler's own validation, applied as a refusal.
-
-    Deliberately the same three calls the scheduler makes, in the same order,
-    so the two can only ever disagree about the consequence.
-    """
-    try:
-        durations = _sibling("_lib_harness_durations")
-    except _SiblingUnavailable as exc:
-        return ["the harness duration table cannot be validated: %s" % exc]
-    manifest, error = durations.read_manifest(str(root))
-    if error:
-        return [error]
-    text, error = durations.read_table(str(root))
-    if error:
-        return [error]
-    _table, error = durations.validate(text, manifest)
-    if error:
-        return [error]
-    return []
-
-
-_CONTRACT_LIB = "_lib-test-contract.sh"
-
-
-def check_runtime_budget(root: pathlib.Path) -> list[str]:
-    """Notes on the committed runtime budget, from the parser that owns it.
-
-    Advisory (test regime reset, session 1): the budget is report-only and a
-    missing or malformed file never refuses a run, so every line returned here
-    is a NOTE, never a problem, and nothing here changes the exit code.
-
-    check_durations reuses the scheduler's validator by IMPORTING
-    _lib_harness_durations and calling its Python API. There is no equivalent
-    module here: contract_budget_load is embedded Python inside a shell library,
-    so nothing can be imported and that structure cannot be reused. The real
-    loader is invoked through a caught subprocess instead, which is what keeps
-    the committed file read by the same parser that reads it at admission and
-    keeps its vocabulary in exactly one place.
-
-    Resolved from this script's own directory, exactly as _sibling resolves the
-    Python siblings and for the same reason: the contract belongs to the binary
-    doing the checking, not to the tree being checked. A library that is absent
-    or that fails is stated as a note too: the check is advisory.
-    """
-    library = _BIN_DIR / _CONTRACT_LIB
-    budget = root / "tests" / "authoritative-runtime-budget.json"
-    if not library.is_file():
-        return [
-            "the committed runtime budget cannot be validated: %s is absent, so "
-            "the loader that owns the file's contract cannot be reached" % library
-        ]
-    script = (
-        'set -uo pipefail\n'
-        'source "$1" || exit 2\n'
-        'contract_budget_load "$2"\n'
-        '[ -n "$CONTRACT_BUDGET_MAX" ] || { contract_print_diagnostics; exit 1; }\n'
-    )
-    try:
-        proc = subprocess.run(
-            ["bash", "-c", script, "cctally-preflight", str(library), str(budget)],
-            capture_output=True, text=True,
-            # The same HANG bound check 5 carries, for the same reason: it
-            # decides an outcome only when the subprocess never returns at all.
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [
-            "the committed runtime budget cannot be validated: %s could not be "
-            "run: %s" % (library, exc)
-        ]
-    if proc.returncode == 0:
-        return []
-    lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines() if ln.strip()]
-    if proc.returncode != 1 or not lines:
-        return [
-            "the committed runtime budget cannot be validated: %s exited %d "
-            "against %s%s"
-            % (library, proc.returncode, budget, (" - %s" % lines[-1]) if lines else "")
-        ]
-    # The loader's own diagnostic, verbatim. It already names the file and the
-    # cause, and restating either here would be a second spelling of a
-    # vocabulary this repository keeps in exactly one place.
-    return lines
-
-
-def _forced_dispatch() -> str:
-    """The dispatch arm the operator asked for, or "" when they asked for none.
-
-    Read through one helper so the tool and its harness agree on the spelling,
-    and so a future third arm has one place to be added.
-    """
-    return os.environ.get("CCTALLY_TEST_ALL_DISPATCH", "").strip()
-
-
-def check_scheduler_plan(root: pathlib.Path) -> list[str]:
-    """The dispatch decision, asked for rather than inferred.
-
-    check_durations reads the three files the scheduler reads, so it can only
-    prove the table is well formed. It cannot see the run-time conditions that
-    make the scheduler fall back anyway and stay silent about it: no python3 on
-    PATH, a python3 that answers non-zero, _lib_harness_durations unimportable
-    from <root>/bin, or a broken shell-side capture. Plan mode reports the
-    decision itself, exits before admission and before any harness launch, and
-    is the aggregator's own documented dry run — so asking it is the cheapest
-    honest way to check the half of §3's check 4 that file validation cannot.
-
-    A tree carrying NO aggregator has no plan to report and is not faulted:
-    this tool's synthetic-fixture callers are that shape, and a real checkout
-    that lost bin/cctally-test-all has no round trip to pre-flight. A tree
-    carrying one that lost its executable bit is the opposite case and is
-    faulted here, because nothing else sees it: bin/cctally-test-owners
-    --verify checks the mode bit of every manifest harness, and the aggregator
-    is deliberately not one of them, so conflating the two answered `clean` on
-    a tree whose pool could not start.
-    """
-    aggregator = root / "bin" / "cctally-test-all"
-    if not aggregator.exists():
-        return []
-    if not os.access(aggregator, os.X_OK):
-        return [
-            "%s is present but not executable, so the dispatch plan cannot be "
-            "read — chmod +x it" % aggregator
-        ]
-    environment = dict(os.environ)
-    environment["CCTALLY_TEST_ALL_PLAN"] = "1"
-    # Under the suite this tool runs as a harness, and the aggregator's own
-    # environment reaches it. CCTALLY_TEST_ALL_OUTCOME_FILE is set for every
-    # authoritative run, and the aggregator refuses to combine it with plan
-    # mode (exit 2, "a plan is never an authoritative outcome"), so leaving it
-    # in place would fail this check on precisely the runs that matter most.
-    environment.pop("CCTALLY_TEST_ALL_OUTCOME_FILE", None)
-    try:
-        proc = subprocess.run(
-            [str(aggregator)],
-            cwd=str(root),
-            env=environment,
-            capture_output=True,
-            text=True,
-            # This tool is seconds-scale by contract. The timeout is not a
-            # performance assertion — it is not compared against, reported, or
-            # tuned — it is the bound that keeps a hung aggregator from turning
-            # a pre-flight into the outage it exists to prevent.
-            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return ["the dispatch plan could not be read from %s: %s" % (aggregator, exc)]
-    detail = (proc.stderr or "").strip().splitlines()
-    trailer = (" — %s" % detail[-1]) if detail else ""
-    if proc.returncode != 0:
-        return [
-            "%s plan mode exited %d, so the dispatch decision cannot be read%s"
-            % (aggregator, proc.returncode, trailer)
-        ]
-    mode = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("scheduler="):
-            mode = line.split("=", 1)[1].strip()
-    if mode is None:
-        return [
-            "%s plan mode printed no scheduler= line, so the dispatch decision "
-            "cannot be read" % aggregator
-        ]
-    # The expected mode follows the operator's own explicit choice. This check
-    # exists to catch an UNINTENDED fallback, and #630 S3's measurement
-    # programme runs its control arm with CCTALLY_TEST_ALL_DISPATCH=report set.
-    # Plan mode is a subprocess and inherits the environment, so without this
-    # the wrapper would refuse every control-arm run for doing exactly what it
-    # was told. The table itself is still validated independently by
-    # check_durations, so forcing the control arm hides no table defect.
-    expected = "report-forced" if _forced_dispatch() == "report" else "lpt"
-    if mode != expected:
-        if expected == "report-forced":
-            return [
-                "CCTALLY_TEST_ALL_DISPATCH=report was set but the dispatch "
-                "scheduler reports scheduler=%s, so this run is not the control "
-                "arm it was asked for%s" % (mode, trailer)
-            ]
-        return [
-            "the dispatch scheduler reports scheduler=%s, so the pool would run "
-            "in report order rather than longest-first%s" % (mode, trailer)
-        ]
-    return []
-
-
-def check_visibility(root: pathlib.Path) -> list[str]:
-    """contract_admit_visibility, run locally.
-
-    Private profile only: .mirror-allowlist excludes itself, so its presence is
-    exactly the private discriminator, and the public tree ships neither that
-    file nor the classifier.
-    """
-    allowlist = root / ".mirror-allowlist"
-    if not allowlist.is_file():
-        return []
-    classifier = root / ".githooks" / "_match.py"
-    if not classifier.is_file():
-        return [
-            "this tree is the PRIVATE profile (.mirror-allowlist is present) but "
-            "the allowlist classifier %s is absent, so the declared visibility of "
-            "every manifest row cannot be checked — restore it, or remove "
-            ".mirror-allowlist if this tree is meant to be the public subset"
-            % classifier
-        ]
-    try:
-        durations = _sibling("_lib_harness_durations")
-    except _SiblingUnavailable as exc:
-        return ["declared visibility cannot be checked: %s" % exc]
-    manifest, error = durations.read_manifest(str(root))
-    if error:
-        return [error]
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "_cctally_preflight_match", str(classifier)
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        text = allowlist.read_text(encoding="utf-8")
-        paths = ["bin/cctally-%s-test" % name for name, _ in manifest]
-        public = set(module.classify(paths, allowlist_text=text)["public"])
-    except Exception as exc:  # the classifier is arbitrary local code
-        return ["the allowlist classifier %s could not be run: %s" % (classifier, exc)]
-    problems: list[str] = []
-    for (name, declared), path in zip(manifest, paths):
-        actual = "public" if path in public else "private"
-        if actual != declared:
-            problems.append(
-                "manifest row '%s' declares visibility '%s' but .githooks/_match.py "
-                "classifies %s as '%s' — fix the row or fix .mirror-allowlist"
-                % (name, declared, path, actual)
-            )
-    return problems
-
-
 def check_changelog(root: pathlib.Path) -> list[str]:
     """CHANGELOG.md entries must meet the policy in docs/changelog-policy.md.
 
@@ -1040,1354 +725,94 @@ def check_changelog(root: pathlib.Path) -> list[str]:
     ]
 
 
-# ---- check 9: temporary allocation forms and legacy-shell here-documents --
-#
-# #940 section 6.5 (C11). Two mechanisms put temporary data outside TMPDIR on
-# macOS whatever the environment says, and the runners' confinement profiles
-# kill a process that writes there:
-#
-#   * `mktemp` with no template, or with `-t prefix`, `-p DIR` or `--tmpdir`,
-#     allocates where the tool chooses (BSD `mktemp -t` ignores TMPDIR). The
-#     accepted form is an explicit QUOTED template ending in at least six `X`,
-#     normally `mktemp [-d] "${TMPDIR:-/tmp}/cctally-<name>.XXXXXX"`.
-#   * /bin/bash 3.2 and /bin/sh write every here-document and here-string body
-#     to /private/var/tmp. Homebrew bash 5 honours TMPDIR, so a script only it
-#     executes is exempt; `#!/usr/bin/env bash` resolves to it on every box
-#     that runs the suite (the same assumption check 2's floor leg states).
-#
-# Scope. Allocation forms are checked in every shell subject, every Python
-# subject's string literals (shell snippets embedded in tests) and Python argv
-# lists naming the tool, and the GitHub workflow files. The tool counts in
-# command position, including behind `VAR=x`, `env …`, `nice …`, `command`,
-# `exec` and `nohup`, and by any absolute path (`/usr/bin/mktemp`).
-# Here-documents are checked where a legacy shell reaches them:
-#
-#   1. a shell subject whose shebang names /bin/sh or /bin/bash (or `env sh`);
-#   2. a declared floor-bash target (`_FLOOR_BASH_CALLERS`): what a test runs
-#      under /bin/bash 3.2 through an interpreter it computes at run time, or
-#      through a bare `bash` whose environment's PATH has no Homebrew
-#      directory, which no static reading can follow: a file, a workflow
-#      step (`<workflow>#<step name>`) or a shell function
-#      (`<file>#<function>`). Every Python call of that second kind must be
-#      declared together with what it runs: an undeclared caller, or a
-#      declared caller's call that names none of its declared targets, is
-#      itself a finding;
-#   3. a file run as `/bin/sh <path>`, `/bin/bash <path>` or `sh <path>` (with
-#      any options before the path, `-o pipefail` and `--norc` included), the
-#      path resolved against the invoking file's directory and the tree root,
-#      whether the invocation is shell text or a Python argv list (also behind
-#      `os.execv("/bin/sh", …)`, wrappers such as sandbox-exec, and a bare
-#      `bash` with a PATH that has no Homebrew directory);
-#   4. a file SOURCED (`source` or `.`) by a file reached through 1–4,
-#      transitively;
-#   5. the inline `-c` payload of a legacy shell, in shell text or a Python
-#      argv list;
-#   6. a generated script: a here-document body, a shell `printf` (one format
-#      string, or one `%s\n` argument per line) or a Python string that starts
-#      with a /bin/sh or /bin/bash shebang;
-#   7. a Python string handed to /bin/sh (shell=True, os.system, os.popen);
-#   8. a workflow step run by sh (`shell: sh`, `/bin/sh` or `/bin/bash`, on
-#      the step or in a `defaults.run.shell`, which is applied to the whole
-#      file as a deliberate over-approximation).
-#
-# Every finding names the route that reached it, so a test can tell one rule
-# from another. Other workflow `run:` blocks execute under the runner's bash
-# from PATH and are not here-document subjects. `docs/` is not an execution
-# path of this repository (it holds evidence scripts run by hand) and is out
-# of this check's scope. The forms this static reading cannot see are named
-# residuals in docs/remote-testing.md. A finding on a line that carries
-# `cctally-c11-allow: <reason>` (a comment on that physical line) is a
-# narrowly identified intentional fixture, such as a confinement probe that
-# must attempt the refused form; the reason is required. Comments, Python
-# docstrings and prose are not invocations: an occurrence counts only in
-# command position, and a first argument that is a plain word ("mktemp
-# failed") is prose.
-#
-# Deterministic: the subject lists are sorted, every rule is a pure function of
-# file text and the tree's file set, and findings are reported sorted by path
-# and line.
-
-_TEMP_DOCS_PREFIX = "docs/"
-# What a caller runs under the floor bash in a way a static reading cannot
-# follow, keyed by the caller (#940 D-1 F1, D0c): an interpreter computed at
-# run time, or a bare `bash` whose environment's PATH has no Homebrew
-# directory (it then resolves to /bin/bash 3.2), handed a script the source
-# computes. A target is a tree file, a workflow step (`<workflow>#<step
-# name>`) or a shell function (`<file>#<function>`). A target applies whenever
-# it is in the tree; a subset tree (the public mirror) may lack one, which is
-# not a finding. Every Python call of the stripped-PATH kind must have its
-# caller here, and must name one of that caller's targets in its evidence (a
-# file by its basename, a step or function by its name; `_py_analyse`), so a
-# new caller, or a declared caller's call to a new target, fails the check
-# until it is declared (#940 D-2 F5). A declared target file that is gone while
-# its caller is present, and a caller that is gone from a private checkout,
-# are stale and reported.
-_FLOOR_BASH_CALLERS = {
-    # `_drive(…, interpreter=…)` with the bash older than 4.4 that
-    # `_legacy_bash()` finds.
-    "tests/test_authoritative_test_contract.py": ("bin/cctally-test-all",),
-    # `run_harness(FLOOR_BASH, …)`.
-    "tests/_source_aware_bash_refusals.py": ("bin/cctally-source-aware-test",),
-    # `bash <aggregator>` in plan mode with PATH=/usr/bin:/bin.
-    "tests/test_frontend_estate_topology.py": ("bin/cctally-test-all",),
-    # The `Derive dist-tag` step's `run:` block, extracted and run.
-    "tests/test_release_npm_workflow.py": (".github/workflows/release-npm.yml#Derive dist-tag",),
-    # The pricing-check step's `run:` block, extracted and run.
-    "tests/test_private_ci_routing.py": (
-        ".github/workflows/pricing-freshness.yml"
-        "#Run pricing-check (capture rc \u2014 exit 1 = drift, not failure)",),
-}
-# The callers the public mirror does not carry. A declared caller absent from
-# the tree is not a finding outside a private checkout (the staleness rule in
-# `check_temp_and_heredocs`), so the public subset tolerates their absence;
-# they are kept in a statement of their own so the closure guard's waiver
-# names only them.
-_FLOOR_BASH_CALLERS.update({  # mirror-private-ok: tolerated absent (above)
-    # `bash -c` scripts that source the golden-diff library.
-    "tests/test_share_golden_discipline.py": ("bin/_lib-golden-diff.sh",),
-    # Shell callers (`export PATH=/usr/bin:/bin`, then `bash -c "$(…)"`, and
-    # `/usr/bin/env -i … /bin/bash -c '… eval "$2"' _ "$body"`): not detected,
-    # declared by hand (a named residual).
-    "bin/cctally-test-remote-test": (
-        "bin/cctally-test-remote#_remote_node_resolver_body",
-        "bin/cctally-test-remote#_toolchain_fp_body",
-    ),
-})
-_MKTEMP_WORD = re.compile(r"(?:(?<![\w.$/-])|(?<=/))mktemp(?=[\s)`;|&\"']|$)")
-_COMMAND_PREFIXES = ("$(", "`", ";", "|", "&", "{", "(", "!", "'", '"', ")", "run:")
-# `time` is a prefix command below, not a keyword, so its own options
-# (`time -p`) are read through (#940 D0c).
-_COMMAND_KEYWORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "!"})
-_PREFIX_COMMANDS = frozenset({"exec", "command", "env", "nice", "nohup", "time"})
-# The prefix commands' own options that take a value, per command: `nice -n
-# N`, `env -u NAME`, `env -P DIR`, `exec -a NAME` (#940 F2, D-2 P3 #4).
-_PREFIX_VALUE_OPTIONS = {"nice": frozenset({"-n"}), "env": frozenset({"-u", "-P"}),
-                         "exec": frozenset({"-a"})}
-# The shell options that take their own argument (`-o pipefail`).
-_SHELL_VALUE_OPTIONS = frozenset({"-o", "+o", "-O", "+O"})
-_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-_SEGMENT_SPLIT = re.compile(r"\$\(|[`;|&{(]|\brun:")
-_TEMPLATE_X = re.compile(r"X{6,}$")
-_PROSE_WORD = re.compile(r"[A-Za-z][A-Za-z,;:.]*$")
-_HEREDOC_OPEN = re.compile(
-    r"(?<![<\d])<<(-?)[ \t]*(?:\\?(['\"])([^'\"\n]+)\2|\\?([A-Za-z_][\w-]*))")
-_HERESTRING = re.compile(r"<<<")
-_LEGACY_SHEBANG = re.compile(r"^#![ \t]*(?:/bin/(?:sh|bash)\b|/usr/bin/env[ \t]+sh\b)")
-# The options a legacy shell takes before its script or `-c`: short clusters
-# (`-e`, `+x`), long options (`--norc`) and an option with its own argument
-# (`-o pipefail`, `+O extglob`), which must be read as one unit.
-_SHELL_OPTION = r"(?:[-+][oO][ \t]+[\w-]+|--[\w-]+|[-+][A-Za-z]+)"
-_LEGACY_C = re.compile(
-    r"(?:/bin/(?:bash|sh)|(?<![\w/.$-])sh)[ \t]+(?:" + _SHELL_OPTION
-    + r"[ \t]+)*?-[A-Za-z]*c[ \t]+(['\"])")
-_LEGACY_INVOKE = re.compile(
-    r"(?:/bin/(?:bash|sh)|(?<![\w/.$-])sh)[ \t]+((?:" + _SHELL_OPTION + r"[ \t]+)*)")
-# A short option cluster that makes the shell read a payload, not a path.
-_PAYLOAD_OPTION = re.compile(r"(?:^|[ \t])-[A-Za-z]*[cs][A-Za-z]*(?=[ \t]|$)")
-_PRINTF_WORD = re.compile(r"(?<![\w.$/-])printf(?=[ \t])")
-_SOURCE_CMD = re.compile(r"(?:^|(?<=[\s;&|({!]))(?:source|\.)[ \t]+(?=[^\s=])")
-_PATH_TOKEN = re.compile(r"[\w.-]+(?:/[\w.-]+)*")
-_PY_LEGACY_ARGV0 = frozenset({"sh", "/bin/sh", "/bin/bash"})
-# A bare `bash` is the floor bash only when the call strips PATH (#940 D0c).
-_PY_FLOOR_ARGV0 = frozenset({"bash"})
-_PY_ARGV_WRAPPERS = frozenset({
-    "env", "/usr/bin/env", "nice", "/usr/bin/nice", "nohup", "/usr/bin/nohup",
-    "sandbox-exec", "/usr/bin/sandbox-exec"})
-_PY_EXEC_FUNCS = frozenset({"execv", "execve", "execvp", "execvpe"})
-_PY_MKTEMP = frozenset({"mktemp", "/usr/bin/mktemp", "/bin/mktemp"})
-# Only a source that names the tool, a here-document or a legacy interpreter
-# as a string can hold anything _py_analyse reports, so the rest skip the parse.
-# A `bash` followed by whitespace, or by an escape that decodes to it, counts
-# anywhere in the file (#940 D-2 fix 2, V1): a command string can put it behind
-# `VAR=x`, `exec` or `env -i`, and a superset of the string literals costs only
-# a few more parses. So does a `bash` that ends a string, its script fed on
-# standard input (`"exec bash"`), and the long escape forms `\U00000020` and
-# `\N{...}` (any named character: a superset; #940 F2, D-2 P3 #3). `\x20`
-# rather than a literal space: a pattern holding whitespace would read as a
-# shell snippet to this file's own scan.
-_PY_ANALYSE_TRIGGER = re.compile(
-    r"mktemp|<<|[\"']/bin/(?:ba)?sh[\"']|[\"'](?:ba)?sh[\"']"
-    r"|\bbash(?:[\x20\t\"']|\\[tnrvf]|\\x(?:20|09)|\\0?(?:40|11)|\\u00(?:20|09)"
-    r"|\\U000000(?:20|09)|\\N\{)")
-_HD_REASON = "here-document reachable by /bin/sh or /bin/bash 3.2"
-_ROUTE_SHEBANG = "a legacy shebang"
-_ROUTE_FLOOR = "a floor-bash entry point"
-_ROUTE_RUN = "run by a legacy shell"
-_ROUTE_SOURCED = "sourced by a legacy-shell path"
-_ROUTE_PAYLOAD = "a legacy -c payload"
-_ROUTE_GENERATED = "a generated legacy script"
-_ROUTE_SHELL_STR = "a payload handed to /bin/sh"
-_ROUTE_WORKFLOW = "a workflow step run by sh"
-_FLOOR_CALLER = ("a bash run with a PATH that has no Homebrew directory resolves to "
-                 "/bin/bash 3.2; declare what it runs in _FLOOR_BASH_CALLERS")
-# A declared caller's call that names none of its declared targets (#940 D-2
-# F5): the declaration is a (caller, target) pair, not a whole-file exemption.
-_FLOOR_TARGET = ("a bash run with a PATH that has no Homebrew directory resolves to "
-                 "/bin/bash 3.2 and runs none of the targets _FLOOR_BASH_CALLERS "
-                 "declares for this caller; declare that (caller, target) pair")
-# An intentional fixture (a probe that must exercise the refused form) is
-# exempted on its own line, with a stated reason of at least a few words.
-_ALLOW_MARKER = re.compile(r"cctally-c11-allow:\s*\S.{9,}")
+_ZERO_SHA = re.compile(r"0+")
+_RANGE_END = re.compile(r"[0-9A-Za-z][0-9A-Za-z_./^~@{}-]*")
+_DOC_LINT = "bin/cctally-doc-lint-test"
 
 
-def _hd(route: str) -> str:
-    return "%s (%s)" % (_HD_REASON, route)
+def parse_range(value: str) -> tuple[str, str] | None:
+    """``(before, after)`` from ``<before>..<after>``, or None when malformed.
 
-
-def _comment_line(line: str) -> bool:
-    return line.lstrip().startswith("#")
-
-
-def _command_position(before: str) -> bool:
-    """True when a word after ``before`` is the command of a simple command,
-    looking through leading assignments and the prefix commands that run
-    their argument (`env`, `nice`, `command`, `exec`, `nohup`, `time`)."""
-    stripped = before.rstrip()
-    if not stripped or stripped.endswith(_COMMAND_PREFIXES):
-        return True
-    if stripped == before:
-        return False  # glued to the word before it, as in `f=mktemp`
-    words = _SEGMENT_SPLIT.split(stripped)[-1].split()
-    while words and words[0] in _COMMAND_KEYWORDS:
-        words.pop(0)
-    while words:
-        word = words.pop(0)
-        if _ASSIGNMENT_WORD.match(word):
-            continue
-        if word not in _PREFIX_COMMANDS:
-            return False
-        while words and words[0].startswith("-"):
-            opt = words.pop(0)
-            if word == "command" and opt in ("-v", "-V"):
-                return False  # a lookup, not an invocation
-            if opt in _PREFIX_VALUE_OPTIONS.get(word, ()) and words:
-                words.pop(0)
-    return True
-
-
-def _shell_words(rest: str) -> list[str]:
-    """The words of one simple command, up to its first terminator."""
-    words: list[str] = []
-    i, n = 0, len(rest)
-    while i < n:
-        while i < n and rest[i] in " \t":
-            i += 1
-        if i >= n or rest[i] in ")`;|&\n" or rest.startswith("\\n", i):
-            break
-        start = i
-        quote = None
-        while i < n:
-            c = rest[i]
-            if quote:
-                if c == quote:
-                    quote = None
-            elif c in "\"'":
-                quote = c
-            elif c in " \t)`;|&\n" or rest.startswith("\\n", i):
-                break
-            i += 1
-        words.append(rest[start:i])
-    return words
-
-
-def _mktemp_problem(words: list[str]) -> str | None:
-    """Why the arguments ``words`` are not C11's form, or None."""
-    args = list(words)
-    while args and (args[0].startswith("-") or re.fullmatch(r"\"\$\{\w+\[@\]\}\"", args[0])):
-        opt = args.pop(0)
-        if opt.startswith("--tmpdir") or (re.fullmatch(r"-[A-Za-z]+", opt) and (
-                "t" in opt or "p" in opt)):
-            return "a `-t`/`-p` form, which allocates outside TMPDIR on macOS"
-    if not args:
-        return "a bare form, which allocates in the per-user temporary directory"
-    template = args[0]
-    if template == '"$@"':
-        return None  # a forwarder: its callers' arguments are checked at theirs
-    if template[:1] not in ("'", '"'):
-        if _PROSE_WORD.match(template) and "XXX" not in template:
-            return ""  # prose such as "mktemp failed", not an invocation
-        return "an unquoted template"
-    close = template.find(template[0], 1)
-    inner = template[1:close] if close > 0 else template[1:]
-    if not _TEMPLATE_X.search(inner):
-        return "a template without six trailing X"
-    return None
-
-def _scan_mktemp_line(line: str) -> list[str]:
-    out: list[str] = []
-    for match in _MKTEMP_WORD.finditer(line):
-        start = match.start()
-        if start and line[start - 1] == "/":
-            # A path-qualified tool counts only by an absolute path; `$d/mktemp`
-            # or a relative `bin/mktemp` names something else.
-            token = start - 1
-            while token > 0 and (line[token - 1].isalnum() or line[token - 1] in "_./-"):
-                token -= 1
-            if not line.startswith("/", token):
-                continue
-            before = line[:token]
-        else:
-            before = line[:start]
-        if not _command_position(before):
-            continue
-        why = _mktemp_problem(_shell_words(line[match.end():]))
-        if why:
-            out.append(why)
-    return out
-
-
-def _heredoc_delim(match: re.Match) -> str:
-    return match.group(3) if match.group(3) is not None else match.group(4)
-
-
-def _heredoc_body_end(lines: list[str], start: int, delim: str, strip: bool) -> int | None:
-    for j in range(start, len(lines)):
-        candidate = lines[j].lstrip("\t") if strip else lines[j]
-        if candidate.rstrip("\n").rstrip("\r") == delim:
-            return j
-    return None
-
-
-def _heredoc_lines(lines: list[str], first: int = 0) -> list[int]:
-    """0-based indexes of lines in ``lines`` (from ``first``) that open a
-    here-document (with its delimiter present) or use a here-string."""
-    found: list[int] = []
-    i = first
-    while i < len(lines):
-        line = lines[i]
-        if _comment_line(line):
-            i += 1
-            continue
-        if _HERESTRING.search(line):
-            found.append(i)
-        bodies = []
-        cursor = i + 1
-        for m in _HEREDOC_OPEN.finditer(line.replace("<<<", "   ")):
-            end = _heredoc_body_end(lines, cursor, _heredoc_delim(m), m.group(1) == "-")
-            if end is None:
-                continue
-            found.append(i)
-            bodies.append((cursor, end))
-            cursor = end + 1
-        i = cursor if bodies else i + 1
-    return sorted(set(found))
-
-
-def _generated_script_findings(lines: list[str]) -> list[int]:
-    """Here-documents inside here-document bodies that are legacy scripts."""
-    found: list[int] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        advanced = False
-        if not _comment_line(line):
-            for m in _HEREDOC_OPEN.finditer(line.replace("<<<", "   ")):
-                end = _heredoc_body_end(lines, i + 1, _heredoc_delim(m), m.group(1) == "-")
-                if end is None:
-                    continue
-                body = lines[i + 1:end]
-                if body and _LEGACY_SHEBANG.match(body[0]):
-                    found.extend(i + 1 + k for k in _heredoc_lines(body, 1))
-                i = end + 1
-                advanced = True
-                break
-        if not advanced:
-            i += 1
-    return found
-
-
-def _quoted_region_heredocs(text: str, starts: list[tuple[int, str]]) -> list[int]:
-    """Line numbers (1-based) of here-documents inside each quoted payload."""
-    found: list[int] = []
-    for pos, quote in starts:
-        j = pos
-        while True:
-            j = text.find(quote, j)
-            if j < 0 or quote == "'" or text[j - 1] != "\\":
-                break
-            j += 1
-        region = text[pos:] if j < 0 else text[pos:j]
-        for m in list(_HEREDOC_OPEN.finditer(region)) + list(_HERESTRING.finditer(region)):
-            found.append(text.count("\n", 0, pos + m.start()) + 1)
-    return found
-
-
-def _first_word(text: str) -> str:
-    """The first shell word of ``text``: quotes and `$( … )` are followed,
-    including quotes nested inside a command substitution, so
-    `"$(dirname "$0")/x" y` yields `"$(dirname "$0")/x"`."""
-    stack: list[str] = []
-    i, n = 0, len(text)
-    while i < n and text[i] in " \t":
-        i += 1
-    start = i
-    while i < n:
-        c = text[i]
-        top = stack[-1] if stack else ""
-        if c == "\\":
-            i += 2
-            continue
-        if c == "'" and top != '"':
-            close = text.find("'", i + 1)
-            i = n if close < 0 else close + 1
-            continue
-        if text.startswith("$(", i):
-            stack.append("(")
-            i += 2
-            continue
-        if c == '"':
-            if top == '"':
-                stack.pop()
-            else:
-                stack.append('"')
-        elif c == ")" and top == "(":
-            stack.pop()
-        elif not stack and (c in " \t\n;|&<>" or c == ")"):
-            break
-        i += 1
-    return text[start:i]
-
-
-def _resolve_word(word: str, base: str, files: frozenset[str]) -> str | None:
-    """The tree file a shell word names, read from its rightmost path token
-    and that token's `/` suffixes, against ``base`` (the invoking file's
-    directory) and then the tree root; None when nothing in the tree matches."""
-    for token in reversed(_PATH_TOKEN.findall(word)):
-        parts = token.split("/")
-        for k in range(len(parts)):
-            tail = "/".join(parts[k:])
-            for candidate in (os.path.normpath(os.path.join(base, tail)) if base else tail, tail):
-                if candidate in files:
-                    return candidate
-    return None
-
-
-def _resolve_hint(hint: str, base: str, files: frozenset[str]) -> list[str]:
-    """The tree files a Python path expression names: its string constants
-    joined by `/`, matched against ``base``, the root, then as a path suffix."""
-    direct = [c for c in (os.path.normpath(os.path.join(base, hint)) if base else hint, hint)
-              if c in files]
-    if direct:
-        return direct[:1]
-    return sorted(f for f in files if f.endswith("/" + hint))
-
-
-def _shell_invocations(text: str) -> list[str]:
-    """The first word after each `/bin/sh`, `/bin/bash` or `sh` that is a
-    script path rather than a `-c`/`-s` payload, outside comment lines."""
-    words: list[str] = []
-    for m in _LEGACY_INVOKE.finditer(text):
-        if _PAYLOAD_OPTION.search(m.group(1)):
-            continue
-        line_start = text.rfind("\n", 0, m.start()) + 1
-        if _comment_line(text[line_start:m.start()] + "x"):
-            continue
-        end = text.find("\n", m.end())
-        word = _first_word(text[m.end():] if end < 0 else text[m.end():end])
-        if word:
-            words.append(word)
-    return words
-
-
-def _source_words(lines: list[str]) -> list[str]:
-    """The operand of every `source` or `.` command on a non-comment line."""
-    words: list[str] = []
-    for line in lines:
-        if _comment_line(line):
-            continue
-        for m in _SOURCE_CMD.finditer(line):
-            if _command_position(line[:m.start()]):
-                word = _first_word(line[m.end():])
-                if word:
-                    words.append(word)
-    return words
-
-
-def _workflow_legacy(value: str) -> bool:
-    first = value.strip().strip("'\"").split()
-    return bool(first) and first[0] in _PY_LEGACY_ARGV0
-
-
-def _workflow_legacy_runs(lines: list[str]) -> list[tuple[int, list[str]]]:
-    """Each `run:` block a legacy shell executes, as (index of its first body
-    line, the body dedented). A step's own `shell:` decides; a `defaults:`
-    `run:` `shell:` anywhere in the file applies to every step without one."""
-    def indent(line: str) -> int:
-        return len(line) - len(line.lstrip(" "))
-
-    legacy = _workflow_legacy
-
-    def significant(line: str) -> bool:
-        return bool(line.strip()) and not line.lstrip().startswith("#")
-
-    default_legacy = False
-    for i, line in enumerate(lines):
-        m = re.match(r"^(\s*)shell:\s*(.+?)\s*$", line)
-        if not m or not legacy(m.group(2)):
-            continue
-        parents = []
-        level = len(m.group(1))
-        for prev in reversed(lines[:i]):
-            if significant(prev) and indent(prev) < level:
-                parents.append(prev.strip())
-                level = indent(prev)
-                if len(parents) == 2:
-                    break
-        if parents[:2] == ["run:", "defaults:"]:
-            default_legacy = True
-    runs: list[tuple[int, list[str]]] = []
-    for keys, run_at, body in _workflow_steps(lines):
-        shell = keys.get("shell")
-        if legacy(shell[1]) if shell else default_legacy:
-            runs.append((run_at, body))
-    return runs
-
-
-def _workflow_steps(lines: list[str]) -> list[tuple[dict, int, list[str]]]:
-    """Each workflow step that has a `run:`, as (its keys, each mapped to
-    (line index, value), the index of the run block's first line, the block
-    dedented)."""
-    def indent(line: str) -> int:
-        return len(line) - len(line.lstrip(" "))
-
-    def significant(line: str) -> bool:
-        return bool(line.strip()) and not line.lstrip().startswith("#")
-
-    steps: list[tuple[dict, int, list[str]]] = []
-    for i, line in enumerate(lines):
-        m = re.match(r"^(\s*)-\s+([A-Za-z_][\w-]*):", line)
-        if not m:
-            continue
-        key_indent = len(m.group(1)) + 1 + len(line[len(m.group(1)) + 1:]) - len(
-            line[len(m.group(1)) + 1:].lstrip(" "))
-        step = [(i, line[:len(m.group(1))] + " " + line[len(m.group(1)) + 1:])]
-        for j in range(i + 1, len(lines)):
-            if significant(lines[j]) and indent(lines[j]) <= len(m.group(1)):
-                break
-            step.append((j, lines[j]))
-        keys = {}
-        for j, text in step:
-            km = re.match(r"^( *)([A-Za-z_][\w-]*):\s*(.*?)\s*$", text)
-            if km and len(km.group(1)) == key_indent:
-                keys[km.group(2)] = (j, km.group(3))
-        if "run" not in keys:
-            continue
-        run_at, value = keys["run"]
-        if value and not value.startswith(("|", ">")):
-            steps.append((keys, run_at, [value]))
-            continue
-        body = []
-        for j in range(run_at + 1, len(lines)):
-            if lines[j].strip() and indent(lines[j]) <= key_indent:
-                break
-            body.append(lines[j])
-        while body and not body[-1].strip():
-            body.pop()
-        depth = min((indent(b) for b in body if b.strip()), default=0)
-        steps.append((keys, run_at + 1, [b[depth:] for b in body]))
-    return steps
-
-
-def _workflow_step_name(keys: dict) -> str | None:
-    if "name" not in keys:
+    ``before`` may be empty or all zeros, which is how a push that creates a
+    branch reports it; ``after`` is required.
+    """
+    before, sep, after = value.partition("..")
+    if not sep or not _RANGE_END.fullmatch(after) or (
+        before and not _RANGE_END.fullmatch(before)
+    ):
         return None
-    value = keys["name"][1].strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        value = value[1:-1]
-    return value
+    return before, after
 
 
-def _shell_function(lines: list[str], name: str) -> tuple[int, list[str]] | None:
-    """(index of the first line, the lines) of the shell function `name`
-    defined at column 0 as `name() {` or `name () {`, through its closing
-    `}` at column 0; None when the file defines no such function."""
-    opener = re.compile(r"^(?:function[ \t]+)?" + re.escape(name) + r"[ \t]*(?:\(\))?[ \t]*\{")
-    for i, line in enumerate(lines):
-        if opener.match(line):
-            for j in range(i + 1, len(lines)):
-                if lines[j].rstrip("\r\n") == "}":
-                    return i, lines[i:j + 1]
-            return i, lines[i:]
-    return None
-
-
-def _printf_stub_findings(lines: list[str]) -> list[int]:
-    """0-based indexes of `printf` commands whose output is a legacy script
-    holding a here-document: one quoted format string that starts with a
-    /bin/sh or /bin/bash shebang (its `\\n` read as line breaks), or a
-    `%s\\n` format with one quoted argument per line, the first of them that
-    shebang. The command may continue over backslash-newlines."""
-    found: list[int] = []
-    for i, line in enumerate(lines):
-        if _comment_line(line) or "printf" not in line:
-            continue
-        text = line.rstrip("\n")
-        j = i
-        while text.endswith("\\") and j + 1 < len(lines):
-            j += 1
-            text = text[:-1] + " " + lines[j].rstrip("\n")
-        for m in _PRINTF_WORD.finditer(text):
-            if not _command_position(text[:m.start()]):
-                continue
-            words = []
-            for word in _shell_words(text[m.end():]):
-                if len(word) < 2 or word[0] not in "'\"" or word[-1] != word[0]:
-                    break
-                words.append(word[1:-1])
-            if not words:
-                continue
-            if words[0] == "%s\\n":
-                body = words[1:]
-            else:
-                body = words[0].split("\\n")
-            if body and _LEGACY_SHEBANG.match(body[0]) and _heredoc_lines(body, 1):
-                found.append(i)
-    return found
-
-
-def _py_fstring_text(source: str) -> str:
-    """An f-string literal's text with each replacement field read as `{}`,
-    or the source itself when it is not one that parses. This is the one
-    reading on every Python (#940 F2 fix round, F2X-4): `ast.JoinedStr` drops
-    a field's conversion and format spec and decodes the escapes, so
-    `_py_string_runs` hands it the whole literal on 3.12+ too, where the
-    tokenizer splits an f-string into FSTRING_* tokens."""
-    import ast as _ast
+def _git(root: pathlib.Path, *args: str) -> subprocess.CompletedProcess | None:
     try:
-        node = _ast.parse(source, mode="eval").body
-    except (SyntaxError, ValueError):
-        return source
-    if not isinstance(node, _ast.JoinedStr):
-        return source
-    return "".join(v.value if isinstance(v, _ast.Constant) and isinstance(v.value, str)
-                   else "{}" for v in node.values)
+        return subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
-def _py_string_runs(text: str) -> list[list[tuple[int, str, str]]]:
-    """Each run of adjacent string-literal pieces that is not a bare string
-    statement (a docstring): a list of (start line, decoded text, source
-    text) pieces. An f-string is one piece whose replacement fields read as
-    `{}` (`_py_fstring_text`), whatever the interpreter's version."""
-    import ast as _ast
-    runs: list[list[tuple[int, str, str]]] = []
+def changed_paths(root: pathlib.Path, before: str, after: str) -> tuple[list[str] | None, str]:
+    """``(paths, note)``: the repository-relative paths ``before..after`` changes.
+
+    Both endpoints of a rename or copy are included and a deletion is not.
+    ``paths`` is None, with the reason in ``note``, when the whole tree must be
+    checked instead: an all-zero or empty ``before``, or a range git cannot
+    read here (a ``before`` the clone does not have, or no git at all).
+    """
+    if not before or _ZERO_SHA.fullmatch(before):
+        return None, "--changed: no previous commit (a new branch), so the whole tree is checked"
+    for end in (before, after):
+        proc = _git(root, "cat-file", "-e", end + "^{commit}")
+        if proc is None or proc.returncode != 0:
+            return None, ("--changed: %s is not a commit this clone can read, so the whole "
+                          "tree is checked" % end)
+    proc = _git(root, "diff", "--name-status", "-z", "-M", "--no-ext-diff", before, after)
+    if proc is None or proc.returncode != 0:
+        return None, ("--changed: git could not diff %s..%s, so the whole tree is checked"
+                      % (before, after))
+    fields = proc.stdout.decode("utf-8", "surrogateescape").split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index][:1]
+        width = 2 if status in ("R", "C") else 1
+        named = fields[index + 1:index + 1 + width]
+        index += 1 + width
+        if status != "D":
+            paths.extend(named)
+    return sorted(set(paths)), ""
+
+
+def check_doc_lint(root: pathlib.Path) -> list[str]:
+    """Run the tree's own doc lint; a tree that carries none is not faulted."""
+    lint = root / _DOC_LINT
+    if not lint.exists():
+        return []
     try:
-        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        return runs
-    physical = io.StringIO(text).readlines()
-
-    def source_between(start: tuple[int, int], end: tuple[int, int]) -> str:
-        (r0, c0), (r1, c1) = start, end
-        if r0 == r1:
-            return physical[r0 - 1][c0:c1]
-        return "".join([physical[r0 - 1][c0:]] + physical[r0:r1 - 1]
-                       + [physical[r1 - 1][:c1]])
-
-    fstart = getattr(tokenize, "FSTRING_START", None)
-    fend = getattr(tokenize, "FSTRING_END", None)
-    skip = (tokenize.NL, tokenize.COMMENT)
-    i, n = 0, len(tokens)
-    prev_sig = None
-    while i < n:
-        tok = tokens[i]
-        if tok.type not in (tokenize.STRING, fstart):
-            if tok.type not in skip:
-                prev_sig = tok
-            i += 1
-            continue
-        first_prev = prev_sig
-        pieces: list[tuple[int, str, str]] = []
-        depth = 0
-        fstring_start = (0, 0)
-        while i < n:
-            tok = tokens[i]
-            if depth:
-                # Python 3.12+: the literal's FSTRING_* tokens. The whole
-                # literal is read once its outermost FSTRING_END arrives,
-                # exactly as the single STRING token is read before 3.12.
-                if tok.type == fend:
-                    depth -= 1
-                    if not depth:
-                        source = source_between(fstring_start, tok.end)
-                        pieces.append((fstring_start[0], _py_fstring_text(source), source))
-                elif tok.type == fstart:
-                    depth += 1
-                i += 1
-                continue
-            if tok.type == tokenize.STRING:
-                try:
-                    value = _ast.literal_eval(tok.string)
-                    if isinstance(value, bytes):
-                        value = value.decode("utf-8", "replace")
-                except (ValueError, SyntaxError):
-                    # Before Python 3.12 an f-string is one STRING token
-                    # (#940 F2, D-2 P3 #9): read its replacement fields as
-                    # `{}`, as the FSTRING tokens above do, so the result
-                    # does not depend on the interpreter's version.
-                    value = _py_fstring_text(tok.string)
-                pieces.append((tok.start[0], value, tok.string))
-            elif tok.type == fstart:
-                depth = 1
-                fstring_start = tok.start
-            elif tok.type in skip:
-                pass
-            else:
-                break
-            i += 1
-        following = tokens[i] if i < n else None
-        statement = (first_prev is None or first_prev.type in (
-            tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT, tokenize.ENCODING)) and (
-            following is None or following.type in (tokenize.NEWLINE, tokenize.ENDMARKER))
-        if not statement and pieces:
-            runs.append(pieces)
-        prev_sig = tokens[i - 1] if i else None
-    return runs
-
-def _py_analyse(text: str) -> tuple[list[tuple[int, int, str]], list[str],
-                                     list[tuple[int, str]], list[int]]:
-    """``(spans, path hints, mktemp findings, floor-bash calls)`` for one
-    Python source.
-
-    A span is the line range of a string expression this source hands to a
-    legacy shell, with the route that hands it over: the command of a call
-    with ``shell=True`` or of ``os.system``/``os.popen``, and the ``-c``
-    payload of an argv list that runs "sh", "/bin/sh" or "/bin/bash" (at its
-    head, behind a wrapper such as sandbox-exec, or as ``os.execv``'s
-    program). A path hint is the `/`-joined string constants of the script
-    path such an argv list runs. A bare name is followed to the values
-    assigned to it anywhere in the file. A mktemp finding is an argv list
-    naming the tool in a refused form. A floor-bash call (#940 D0c) is the
-    line of a call that runs a bare `bash` (also behind `env -i`, or `env`
-    given a `PATH=`) with an environment whose PATH has no Homebrew
-    directory: an `env=` this reading can resolve that sets PATH from
-    constants without one, or sets no PATH at all (the exec default path is
-    `/usr/bin:/bin`). A command string handed to /bin/sh (``shell=True``)
-    whose first word is a bare `bash`, under such an `env=`, is one too
-    (#940 D-2 F7), also behind `VAR=x` words and prefix commands with their
-    options (`exec`, `env -i`, `nice -n 5`; fix round 2, V1), and the script
-    it names, a bare name included, is a path hint (V8). It is analysed as a legacy shell, and its caller must be
-    declared in `_FLOOR_BASH_CALLERS` together with what it runs. Each
-    floor-bash call is reported with its evidence: the string constants of
-    the function that makes it, of the module-level values that function
-    names, and of the module-level functions it calls (one hop), which is
-    what a declared target is matched against."""
-    import ast as _ast
-    try:
-        tree = _ast.parse(text)
-    except (SyntaxError, ValueError):
-        return [], [], [], []
-    # Each node's parent, so a name is read in the function that uses it
-    # (#940 D0c): `env` assigned a stripped mapping in one function and the
-    # caller's environment in another are two different values.
-    parents: dict[_ast.AST, _ast.AST] = {}
-    for node in _ast.walk(tree):
-        for child in _ast.iter_child_nodes(node):
-            parents[child] = node
-
-    def scopes(node: _ast.AST) -> list[_ast.AST]:
-        """The functions enclosing `node`, innermost first, then the module."""
-        chain: list[_ast.AST] = []
-        while node in parents:
-            node = parents[node]
-            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.Lambda)):
-                chain.append(node)
-        chain.append(tree)
-        return chain
-
-    assigned: dict[str, list[_ast.AST]] = {}
-    scoped: dict[tuple[_ast.AST, str], list[_ast.AST]] = {}
-    path_set: dict[tuple[_ast.AST, str], list[_ast.AST]] = {}
-    for node in _ast.walk(tree):
-        if isinstance(node, _ast.Assign):
-            scope = scopes(node)[0]
-            for target in node.targets:
-                if isinstance(target, _ast.Name):
-                    assigned.setdefault(target.id, []).append(node.value)
-                    scoped.setdefault((scope, target.id), []).append(node.value)
-                elif isinstance(target, _ast.Subscript) and isinstance(target.value, _ast.Name):
-                    key = target.slice
-                    index_node = getattr(_ast, "Index", None)  # Python < 3.9
-                    if index_node is not None and isinstance(key, index_node):
-                        key = key.value
-                    if isinstance(key, _ast.Constant) and key.value == "PATH":
-                        path_set.setdefault((scope, target.value.id), []).append(node.value)
-
-    def binding(table: dict, name: _ast.Name) -> list[_ast.AST] | None:
-        """The values `name` is given in the nearest enclosing scope that
-        assigns it, or None when none does."""
-        for scope in scopes(name):
-            if (scope, name.id) in table:
-                return table[(scope, name.id)]
-        return None
-
-    def path_value(expr: _ast.AST) -> str:
-        """`stripped`, `inherited` or `unknown` for an expression giving PATH."""
-        source = _ast.unparse(expr)
-        if "homebrew" in source.lower() or "environ" in source or "getenv" in source:
-            return "inherited"
-        if not isinstance(expr, (_ast.Constant, _ast.JoinedStr, _ast.BinOp)):
-            return "unknown"
-        consts = [n.value for n in _ast.walk(expr)
-                  if isinstance(n, _ast.Constant) and isinstance(n.value, str)]
-        if any(re.search(r"(?:^|:)/(?:usr/)?bin(?::|$)", c) for c in consts):
-            return "stripped"
-        return "unknown"
-
-    def env_state(expr: _ast.AST, depth: int = 0) -> str:
-        """The PATH an `env=` mapping gives the child: `stripped` (none, or
-        one without Homebrew), `inherited`, or `unknown`."""
-        if depth > 4:
-            return "unknown"
-        if isinstance(expr, _ast.Name):
-            path_values = binding(path_set, expr)
-            if path_values is not None:
-                states = {path_value(v) for v in path_values}
-            else:
-                # The nearest scope's assignments; a name no enclosing scope
-                # assigns (a parameter) falls back to every assignment of it.
-                values_ = binding(scoped, expr)
-                if values_ is None:
-                    values_ = assigned.get(expr.id, [])
-                states = {env_state(v, depth + 1) for v in values_}
-            for state in ("inherited", "unknown", "stripped"):
-                if state in states:
-                    return state
-            return "unknown"
-        if isinstance(expr, _ast.Dict):
-            state = "stripped"
-            for key, value in zip(expr.keys, expr.values):
-                if key is None:
-                    state = env_state(value, depth + 1)
-                elif isinstance(key, _ast.Constant) and key.value == "PATH":
-                    state = path_value(value)
-            return state
-        source = _ast.unparse(expr)
-        if "environ" in source or "getenv" in source:
-            if isinstance(expr, _ast.Call):
-                for kw in expr.keywords:
-                    if kw.arg == "PATH":
-                        return path_value(kw.value)
-            return "inherited"
-        return "unknown"
-
-    def floor_env_argv(elts: list[_ast.AST]) -> bool:
-        """An `env` argv wrapper that leaves the child no inherited PATH:
-        `-i` (or `-`), or a `PATH=` assignment without Homebrew."""
-        for elt in elts[1:]:
-            if not (isinstance(elt, _ast.Constant) and isinstance(elt.value, str)):
-                return False
-            if elt.value in ("-i", "-", "--ignore-environment"):
-                return True
-            if elt.value.startswith("PATH="):
-                return "homebrew" not in elt.value.lower()
-            if not (elt.value.startswith("-") or "=" in elt.value):
-                return False
-        return False
-
-    def values(expr: _ast.AST) -> list[_ast.AST]:
-        return assigned.get(expr.id, []) if isinstance(expr, _ast.Name) else [expr]
-
-    def constant(expr: _ast.AST, choices: frozenset[str]) -> bool:
-        return any(isinstance(v, _ast.Constant) and v.value in choices for v in values(expr))
-
-    def option(expr: _ast.AST) -> str | None:
-        if isinstance(expr, _ast.Constant) and isinstance(expr.value, str) \
-                and expr.value.startswith(("-", "+")):
-            return expr.value
-        return None
-
-    commands: list[tuple[_ast.AST, str]] = []
-    hints: list[str] = []
-    mktemp: list[tuple[int, str]] = []
-    floor_calls: list[int] = []
-
-    module_functions = {node.name: node for node in tree.body
-                        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
-
-    def strings(node: _ast.AST) -> set[str]:
-        return {n.value for n in _ast.walk(node)
-                if isinstance(n, _ast.Constant) and isinstance(n.value, str)}
-
-    def evidence(call: _ast.AST) -> frozenset[str]:
-        """What a floor-bash call can be matched against: the strings of its
-        enclosing function (the call itself at module level), of the
-        module-level values that function names, and of the module-level
-        functions it calls."""
-        home = scopes(call)[0]
-        body = call if home is tree else home
-        found = strings(body)
-        for node in _ast.walk(body):
-            if isinstance(node, _ast.Name):
-                for value in scoped.get((tree, node.id), []):
-                    found |= strings(value)
-            if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name):
-                callee = module_functions.get(node.func.id)
-                if callee is not None and callee is not home:
-                    found |= strings(callee)
-        return frozenset(found)
-
-    def shell_floor(expr: _ast.AST) -> tuple[list[str], bool] | None:
-        """The words after a leading bare `bash` in a constant shell command
-        string, and whether the string itself strips PATH before it (a
-        leading `env -i`/`-`, or a `PATH=` assignment without Homebrew, as
-        `floor_env_argv` reads an argv list; #940 F2, D-2 P3 #2), or None
-        when the string does not start with one. `command -v` is a lookup,
-        not a run (D-2 P3 #4)."""
-        import shlex
-        for value in values(expr):
-            if not (isinstance(value, _ast.Constant) and isinstance(value.value, str)):
-                continue
-            try:
-                words = shlex.split(value.value, comments=True)
-            except ValueError:
-                continue
-            k = 0
-            strips = False
-            lookup = False
-            while k < len(words):
-                if _ASSIGNMENT_WORD.match(words[k]):
-                    if words[k].startswith("PATH="):
-                        strips = "homebrew" not in words[k].lower()
-                    k += 1
-                elif words[k] in _PREFIX_COMMANDS:
-                    command = words[k]
-                    k += 1
-                    # Its own options (`env -i`, `nice -n 5`), read through
-                    # as the mktemp scan reads them (#940 D-2 fix 2, V1).
-                    while k < len(words) and words[k].startswith("-"):
-                        if command == "command" and words[k] in ("-v", "-V"):
-                            lookup = True
-                        if command == "env" and words[k] in ("-i", "-", "--ignore-environment"):
-                            strips = True
-                        k += 2 if words[k] in _PREFIX_VALUE_OPTIONS.get(command, ()) else 1
-                else:
-                    break
-            if lookup:
-                continue
-            if k < len(words) and words[k] == "bash":
-                return words[k + 1:], strips
-        return None
-
-    def legacy_tail(tail: list[_ast.AST]) -> None:
-        skip = False
-        for k, elt in enumerate(tail):
-            if skip:
-                skip = False
-                continue
-            opt = option(elt)
-            if opt in _SHELL_VALUE_OPTIONS:
-                skip = True  # `-o pipefail`: the next element is its value
-                continue
-            if opt is None:
-                if not isinstance(elt, _ast.Starred):
-                    consts = sorted((n.lineno, n.col_offset, n.value) for n in _ast.walk(elt)
-                                    if isinstance(n, _ast.Constant) and isinstance(n.value, str))
-                    hint = "/".join(v.strip("/") for _, _, v in consts if v.strip("/"))
-                    if hint:
-                        hints.append(hint)
-                return
-            if opt == "-c" or (opt.startswith("-") and not opt.startswith("--")
-                               and opt.endswith("c")):
-                if k + 1 < len(tail):
-                    commands.append((tail[k + 1], _ROUTE_PAYLOAD))
-                return
-            if "s" in opt and not opt.startswith("--"):
-                return  # the script arrives on stdin: a named residual
-
-    def argv(elts: list[_ast.AST], floor_env: bool, line: int) -> None:
-        if not elts:
-            return
-        if constant(elts[0], _PY_MKTEMP):
-            why = _py_mktemp_problem(elts[1:])
-            if why:
-                mktemp.append((elts[0].lineno, why))
-            return
-        k = 0
-        if constant(elts[0], _PY_LEGACY_ARGV0):
-            pass
-        elif constant(elts[0], _PY_FLOOR_ARGV0) and floor_env:
-            floor_calls.append(line)
-            floor_nodes.setdefault(line, call_node[0])
-        else:
-            if not constant(elts[0], _PY_ARGV_WRAPPERS):
-                return
-            k = next((j for j, e in enumerate(elts)
-                      if constant(e, _PY_LEGACY_ARGV0 | _PY_FLOOR_ARGV0)), -1)
-            if k < 0:
-                return
-            if constant(elts[k], _PY_FLOOR_ARGV0) and not constant(elts[k], _PY_LEGACY_ARGV0):
-                floored = floor_env or (constant(elts[0], frozenset({"env", "/usr/bin/env"}))
-                                        and floor_env_argv(elts[:k]))
-                if not floored:
-                    return
-                floor_calls.append(line)
-                floor_nodes.setdefault(line, call_node[0])
-        legacy_tail(list(elts[k + 1:]))
-
-    floor_nodes: dict[int, _ast.AST] = {}
-    call_node: list[_ast.AST] = [tree]
-    for node in _ast.walk(tree):
-        if not isinstance(node, _ast.Call) or not node.args:
-            continue
-        call_node[0] = node
-        first = node.args[0]
-        func = node.func
-        shell_true = any(k.arg == "shell" and isinstance(k.value, _ast.Constant)
-                         and k.value.value is True for k in node.keywords)
-        os_attr = func.attr if (isinstance(func, _ast.Attribute)
-                                and isinstance(func.value, _ast.Name)
-                                and func.value.id == "os") else None
-        env_kw = next((k.value for k in node.keywords if k.arg == "env"), None)
-        floor_env = env_kw is not None and env_state(env_kw) == "stripped"
-        if shell_true or os_attr in ("system", "popen"):
-            commands.append((first, _ROUTE_SHELL_STR))
-            floor = shell_floor(first)
-            tail = None
-            if floor is not None and ((shell_true and floor_env) or floor[1]):
-                tail = floor[0]
-            if tail is not None:
-                floor_calls.append(node.lineno)
-                floor_nodes.setdefault(node.lineno, node)
-                # The script path it runs, unless the payload is inline (-c),
-                # which the /bin/sh span above already covers.
-                for k, word in enumerate(tail):
-                    if word in _SHELL_VALUE_OPTIONS:
-                        continue
-                    if k and tail[k - 1] in _SHELL_VALUE_OPTIONS:
-                        continue
-                    if word.startswith(("-", "+")):
-                        if _PAYLOAD_OPTION.search(word):
-                            break
-                        continue
-                    # A bare script name (`bash x.sh`) is resolved like a path,
-                    # against this file's directory and then the root (V8).
-                    if _PATH_TOKEN.fullmatch(word):
-                        hints.append(word.strip("/"))
-                    break
-            continue
-        if os_attr in _PY_EXEC_FUNCS and len(node.args) >= 2 \
-                and constant(first, _PY_LEGACY_ARGV0) \
-                and isinstance(node.args[1], (_ast.List, _ast.Tuple)):
-            legacy_tail(list(node.args[1].elts[1:]))
-            continue
-        for arg in node.args:
-            if isinstance(arg, (_ast.List, _ast.Tuple)):
-                argv(list(arg.elts), floor_env, node.lineno)
-    spans: list[tuple[int, int, str]] = []
-    for expr, route in commands:
-        for target in values(expr):
-            if isinstance(target, (_ast.Constant, _ast.JoinedStr, _ast.BinOp)):
-                spans.append((target.lineno, getattr(target, "end_lineno", target.lineno), route))
-    return spans, hints, mktemp, [(line, evidence(floor_nodes[line]))
-                                  for line in sorted(set(floor_calls))]
+        proc = subprocess.run(
+            [str(lint)], cwd=str(root), capture_output=True, text=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ["%s could not be run: %s" % (lint, exc)]
+    if proc.returncode == 0:
+        return []
+    lines = [line for line in (proc.stdout + proc.stderr).splitlines()
+             if line.startswith(("FAIL", "SELF-CHECK"))]
+    return ["%s exited %d%s" % (lint, proc.returncode,
+                                (": " + "; ".join(lines[:5])) if lines else "")]
 
 
-def _floor_target_matches(target: str, found: frozenset[str]) -> bool:
-    """Whether a floor-bash call's evidence names a declared target: a
-    workflow step or a shell function by its name, a file by its basename.
-    The name must stand on its own (#940 D-2 fix 2, V7): neither side may
-    continue it with a name character, so `bin/cctally-test-all-extra` does
-    not name `bin/cctally-test-all`, while a `/` before it (a path component)
-    or any separator after it does."""
-    rel, _, part = target.partition("#")
-    # A full stop continues the name only when a name character follows it
-    # (`x.sh`), not when it ends a sentence (#940 F2, D-2 P3 #4).
-    needle = re.compile(r"(?<![\w.-])" + re.escape(part or os.path.basename(rel))
-                        + r"(?![\w-]|\.[\w-])")
-    return any(needle.search(value) for value in found)
-
-
-def _py_mktemp_problem(args: list) -> str | None:
-    """Why the arguments of an argv list naming `mktemp` are not C11's form,
-    or None. No shell reads them, so quoting is not a question, and a
-    template the source computes is checked where it is built."""
-    import ast as _ast
-    args = list(args)
-    while args and isinstance(args[0], _ast.Constant) and isinstance(args[0].value, str) \
-            and args[0].value.startswith("-"):
-        opt = args.pop(0).value
-        if opt.startswith("--tmpdir") or (re.fullmatch(r"-[A-Za-z]+", opt) and (
-                "t" in opt or "p" in opt)):
-            return "a `-t`/`-p` form, which allocates outside TMPDIR on macOS"
-    if not args:
-        return "a bare form, which allocates in the per-user temporary directory"
-    template = args[0]
-    if isinstance(template, _ast.JoinedStr) and template.values:
-        template = template.values[-1]
-    if not (isinstance(template, _ast.Constant) and isinstance(template.value, str)):
-        return None
-    if not _TEMPLATE_X.search(template.value):
-        return "a template without six trailing X"
-    return None
-
-
-def _raw_line_holds(decoded: str, raw_line: str) -> bool:
-    """Whether a physical source line of a literal holds a decoded line.
-    A replacement field reads as `{}` in the decoded text but keeps its
-    source spelling (`{name}`) in the raw line, so the decoded line is split
-    on `{}` and the raw line holds it when every non-empty fragment appears
-    in it, in order (#940 F2 fix round 2, G5). A line that is only fields
-    matches the first raw line that holds a field."""
-    fragments = [f for f in decoded.split("{}") if f]
-    if not fragments:
-        return "{" in raw_line
-    at = 0
-    for fragment in fragments:
-        found = raw_line.find(fragment, at)
-        if found < 0:
-            return False
-        at = found + len(fragment)
-    return True
-
-
-def _py_findings(rel: str, text: str) -> tuple[list[tuple[str, int, str]], list[str]]:
-    """The findings in one Python source and the path hints of the scripts
-    it runs under a legacy shell. A floor-bash call is a finding unless its
-    caller is declared in `_FLOOR_BASH_CALLERS` with a target the call's
-    evidence names (`_floor_target_matches`): a declaration is a (caller,
-    target) pair, not a whole-file exemption, so an undeclared caller's call
-    and a declared caller's call to an undeclared target are both findings."""
-    out: list[tuple[str, int, str]] = []
-    if _PY_ANALYSE_TRIGGER.search(text):
-        spans, hints, argv_mktemp, floor_calls = _py_analyse(text)
-    else:
-        spans, hints, argv_mktemp, floor_calls = [], [], [], []
-    for line_no, why in argv_mktemp:
-        out.append((rel, line_no, "mktemp argv: %s" % why))
-    declared = _FLOOR_BASH_CALLERS.get(rel)
-    for line_no, found in floor_calls:
-        if declared is None:
-            out.append((rel, line_no, _FLOOR_CALLER))
-        elif not any(_floor_target_matches(target, found) for target in declared):
-            out.append((rel, line_no, _FLOOR_TARGET))
-    if "mktemp" not in text and "<<" not in text:
-        return out, hints
-    for pieces in _py_string_runs(text):
-        if not any(re.search(r"\s", value) for _, value, _ in pieces):
-            continue  # one word ("mktemp", "<<<") is a token, not a snippet
-        # One shell line per entry. A piece always leaves its last line
-        # open, so the next piece continues it (implicit concatenation);
-        # an empty open line takes the next piece's line number.
-        snippet: list[tuple[int, str]] = []
-        for start, value, raw in pieces:
-            raw_lines = raw.split("\n")
-            cursor = 0
-            for k, part in enumerate(value.split("\n")):
-                # A physical line of the literal holding this decoded line:
-                # escapes (`\n`, a backslash-newline) make the two differ.
-                line_no = start
-                if len(raw_lines) > 1:
-                    for r in range(cursor, len(raw_lines)):
-                        if part.strip() and _raw_line_holds(part.strip(), raw_lines[r]) or (
-                                not part.strip() and r >= cursor):
-                            cursor = r
-                            break
-                    line_no = start + cursor
-                if k == 0 and snippet:
-                    if snippet[-1][1]:
-                        snippet[-1] = (snippet[-1][0], snippet[-1][1] + part)
-                    else:
-                        snippet[-1] = (line_no, part)
-                else:
-                    snippet.append((line_no, part))
-        for line_no, line in snippet:
-            if _comment_line(line):
-                continue
-            for why in _scan_mktemp_line(line):
-                out.append((rel, line_no, "mktemp: %s" % why))
-        lines = [line for _, line in snippet]
-        first_line = pieces[0][0]
-        route = _ROUTE_GENERATED if lines and _LEGACY_SHEBANG.match(lines[0]) else next(
-            (r for lo, hi, r in spans if lo <= first_line <= hi), None)
-        if route:
-            for k in _heredoc_lines(lines):
-                out.append((rel, snippet[k][0], _hd(route)))
-    return out, hints
-
-
-def _is_legacy_shebang(path: pathlib.Path) -> bool:
-    return bool(_LEGACY_SHEBANG.match(_shebang(path)))
-
-
-def check_temp_and_heredocs(
-    root: pathlib.Path, by_kind: dict[str, list[pathlib.Path]] | None = None
-) -> list[str]:
-    """Refuse C11 violations: bare, `-t` and `-p` `mktemp`, and here-documents
-    a legacy shell reaches. See the comment above for the rules."""
-    if by_kind is None:
-        by_kind = _subjects_by_kind(root)
-
-    def rel_of(path: pathlib.Path) -> str:
-        return path.relative_to(root).as_posix()
-
-    def in_scope(rel: str) -> bool:
-        return not rel.startswith(_TEMP_DOCS_PREFIX)
-
-    texts: dict[str, str] = {}
-    problems: list[str] = []
-
-    def read(rel: str) -> str:
-        if rel not in texts:
-            try:
-                texts[rel] = (root / rel).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as exc:
-                problems.append("%s could not be read for check 9: %s" % (rel, exc))
-                texts[rel] = ""
-        return texts[rel]
-
-    def base_of(rel: str) -> str:
-        return os.path.dirname(rel)
-
-    findings: list[tuple[str, int, str]] = []
-    shells = sorted(rel_of(p) for p in by_kind["shell"] if in_scope(rel_of(p)))
-    workflows = sorted(rel_of(p) for p in by_kind.get("workflow", []) if in_scope(rel_of(p)))
-    pythons = sorted(rel_of(p) for p in by_kind["python"] if in_scope(rel_of(p)))
-    # The tree's executable subjects: what a legacy shell can run or source.
-    files = frozenset(shells) | frozenset(workflows) | frozenset(pythons)
-    python_set = frozenset(pythons)
-
-    # Python sources: their own findings, and the scripts they run.
-    run_targets: list[str] = []
-    for rel in pythons:
-        text = read(rel)
-        found, hints = _py_findings(rel, text)
-        findings.extend(found)
-        for hint in hints:
-            run_targets.extend(_resolve_hint(hint, base_of(rel), files))
-
-    # Routes 1-4: the files a legacy shell executes, each with the first
-    # route that reached it.
-    route_of: dict[str, str] = {}
-    for rel in shells:
-        if _is_legacy_shebang(root / rel):
-            route_of[rel] = _ROUTE_SHEBANG
-    # Declared floor-bash targets: a whole file joins the routes; a workflow
-    # step or a shell function is scanned on its own below.
-    # Staleness (#940 D-2 F5). A declared FILE target that is gone while its
-    # caller is present is stale in any profile (no public caller declares a
-    # private target), exactly as a gone step or function is (below). A
-    # declared caller that is gone is stale in a private checkout: a Git
-    # checkout (`.git` present) of the private profile (.mirror-allowlist
-    # present, as check 6 uses it). The public subset lacks the private callers
-    # by design, and a synthetic tree is no checkout. A target still applies
-    # whenever it is in the tree, whatever its caller's state.
-    private_checkout = ((root / ".mirror-allowlist").is_file()
-                        and (root / ".git").exists())
-    declared_parts: list[tuple[str, str, str]] = []
-    for caller in sorted(_FLOOR_BASH_CALLERS):
-        caller_present = (root / caller).is_file()
-        if not caller_present and private_checkout:
-            problems.append(
-                "the floor-bash caller %s declared in _FLOOR_BASH_CALLERS is not in "
-                "the tree; update _FLOOR_BASH_CALLERS (#940 C11)" % caller)
-        for target in _FLOOR_BASH_CALLERS[caller]:
-            rel, _, part = target.partition("#")
-            if not (root / rel).is_file():
-                if caller_present:
-                    problems.append(
-                        "the floor-bash target %s declared for %s is not in the tree; "
-                        "update _FLOOR_BASH_CALLERS (#940 C11)" % (rel, caller))
-                continue
-            if rel not in files:
-                continue
-            if not part:
-                route_of.setdefault(rel, _ROUTE_FLOOR)
-            else:
-                declared_parts.append((caller, rel, part))
-    for rel in shells + workflows + pythons:
-        text = read(rel)
-        if "sh" not in text:
-            continue
-        for word in _shell_invocations(text):
-            target = _resolve_word(word, base_of(rel), files)
-            if target:
-                run_targets.append(target)
-    for target in sorted(set(run_targets)):
-        route_of.setdefault(target, _ROUTE_RUN)
-    queue = sorted(route_of)
-    while queue:
-        rel = queue.pop(0)
-        text = read(rel)
-        if rel in python_set or ("source" not in text and ". " not in text):
-            continue
-        for word in _source_words(text.splitlines()):
-            target = _resolve_word(word, base_of(rel), files)
-            if target and target not in route_of:
-                route_of[target] = _ROUTE_SOURCED
-                queue.append(target)
-
-    for rel in shells + workflows:
-        text = read(rel)
-        lines = text.splitlines(keepends=True)
-        if "mktemp" in text:
-            for k, line in enumerate(lines):
-                if _comment_line(line):
-                    continue
-                for why in _scan_mktemp_line(line):
-                    findings.append((rel, k + 1, "mktemp: %s" % why))
-        if "<<" not in text:
-            continue
-        if rel in workflows:
-            plain = text.splitlines()
-            for first, body in _workflow_legacy_runs(plain):
-                for k in _heredoc_lines(body):
-                    findings.append((rel, first + k + 1, _hd(_ROUTE_WORKFLOW)))
-            continue
-        if rel not in route_of:
-            for k in _generated_script_findings(lines):
-                findings.append((rel, k + 1, _hd(_ROUTE_GENERATED)))
-            if "printf" in text:
-                for k in _printf_stub_findings(lines):
-                    findings.append((rel, k + 1, _hd(_ROUTE_GENERATED)))
-        starts = [(m.end(), m.group(1)) for m in _LEGACY_C.finditer(text)]
-        for line_no in _quoted_region_heredocs(text, starts):
-            findings.append((rel, line_no, _hd(_ROUTE_PAYLOAD)))
-
-    for rel in sorted(route_of):
-        if rel in python_set:
-            continue
-        text = read(rel)
-        if "<<" not in text:
-            continue
-        for k in _heredoc_lines(text.splitlines(keepends=True)):
-            findings.append((rel, k + 1, _hd(route_of[rel])))
-
-    for caller, rel, part in declared_parts:
-        lines = read(rel).splitlines()
-        if rel in workflows:
-            found = [(run_at, body) for keys, run_at, body in _workflow_steps(lines)
-                     if _workflow_step_name(keys) == part]
-        else:
-            function = _shell_function(lines, part)
-            found = [function] if function else []
-        if not found:
-            if (root / caller).is_file():
-                problems.append(
-                    "the floor-bash target %s#%s declared for %s is not in the tree; "
-                    "update _FLOOR_BASH_CALLERS (#940 C11)" % (rel, part, caller))
-            continue
-        for first, body in found:
-            for k in _heredoc_lines(body):
-                findings.append((rel, first + k + 1, _hd(_ROUTE_FLOOR)))
-
-    for rel, line_no, message in sorted(set(findings)):
-        source_lines = texts.get(rel, "").split("\n")
-        source = source_lines[line_no - 1] if 0 < line_no <= len(source_lines) else ""
-        if _ALLOW_MARKER.search(source):
-            continue  # a narrowly identified intentional fixture, reason given
-        problems.append("%s:%d: %s (#940 C11)" % (rel, line_no, message))
-    return problems
-
-
-
-def run(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
+def run(root: pathlib.Path, changed: tuple[str, str] | None = None
+        ) -> tuple[int, list[str], list[str]]:
     """``(exit code, problems, notes)``.
 
     A NOTE is a leg that could not run for a legitimate reason (an absent bash
-    3.x interpreter), or an advisory finding (check 8, the report-only runtime
-    budget). It is stated rather than silent, because a leg that can vanish
-    without a word is a leg nobody notices has stopped running. It is not a
-    finding and does not change the exit code.
+    3.x interpreter), or a range that falls back to the whole tree. It is stated
+    rather than silent, and it does not change the exit code.
     """
     notes: list[str] = []
     bin_dir = root / "bin"
@@ -2395,28 +820,24 @@ def run(root: pathlib.Path) -> tuple[int, list[str], list[str]]:
         return EXIT_DEFECT, [
             "%s has no bin/ directory, so nothing can be checked" % root
         ], notes
-    # One walk, one classification pass, both halves handed on. Calling
-    # check_python(root) and check_shell(root, notes) here instead walks the
-    # tree twice and classifies every file twice. No count is written here,
-    # for the reason given at `_PARSE_TIMEOUT_SECONDS`.
-    #
-    # This also enumerates the SHELL subjects before check_python compiles its
-    # own, where the shell walk previously ran after check_python returned.
-    # That widens the window between a subject's is_file() at walk time and its
-    # `bash -n` at parse time, so a file deleted inside it is reported as a
-    # defect rather than skipped. The harness's real-tree case already assumes
-    # a quiescent estate for the whole run; this widens that assumption, it
-    # does not introduce it.
-    by_kind = _subjects_by_kind(root)
+    paths: list[str] | None = None
+    if changed is not None:
+        paths, note = changed_paths(root, *changed)
+        if note:
+            notes.append(note)
+    if paths is None:
+        # One walk, one classification pass, both halves handed on.
+        by_kind = _subjects_by_kind(root)
+    else:
+        by_kind = _partition([root / rel for rel in paths
+                              if _walk_admits(rel) and (root / rel).is_file()])
     problems = check_python(root, by_kind["python"])
-    problems += check_shell(root, notes, by_kind["shell"])
-    problems += check_ownership(root, pathlib.Path(__file__).resolve().parent / _OWNERS)
-    problems += check_durations(root)
-    problems += check_scheduler_plan(root)
-    problems += check_visibility(root)
-    problems += check_changelog(root)
-    notes += check_runtime_budget(root)
-    problems += check_temp_and_heredocs(root, by_kind)
+    if paths is None or by_kind["shell"]:
+        problems += check_shell(root, notes, by_kind["shell"])
+    if paths is None or "CHANGELOG.md" in paths:
+        problems += check_changelog(root)
+    if changed is not None and (paths is None or any(rel.endswith(".md") for rel in paths)):
+        problems += check_doc_lint(root)
     return (EXIT_DEFECT if problems else EXIT_OK), problems, notes
 
 
@@ -2424,20 +845,18 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="cctally-preflight",
         description=(
-            "Compile every Python file in the repository, syntax-check every "
-            "shell subject in the repository against its own interpreter and against "
-            "the declared bash 3.2 floor, verify harness ownership, validate "
-            "the harness duration table, confirm the dispatch scheduler is "
-            "armed, check declared "
-            "visibility against the mirror allowlist, check CHANGELOG.md "
-            "against the user-facing entry policy, note a missing or malformed "
-            "runtime budget through its own loader (advisory), and refuse bare, -t or -p mktemp "
-            "and legacy-shell here-documents — before a remote round trip."
+            "Compile Python, syntax-check shell against its own interpreter and "
+            "the declared bash 3.2 floor, and check CHANGELOG.md against the "
+            "user-facing entry policy, over the tree or over one pushed range."
         ),
     )
     parser.add_argument(
         "--repo-root", metavar="DIR",
         help="check this tree instead of the one containing this script",
+    )
+    parser.add_argument(
+        "--changed", metavar="BEFORE..AFTER",
+        help="check only the files this range changes, and lint changed docs",
     )
     try:
         args = parser.parse_args(argv)
@@ -2449,8 +868,15 @@ def main(argv: list[str]) -> int:
     if not root.is_dir():
         sys.stderr.write("preflight: %s is not a directory\n" % root)
         return EXIT_USAGE
+    changed = None
+    if args.changed is not None:
+        changed = parse_range(args.changed)
+        if changed is None:
+            sys.stderr.write("preflight: --changed takes <before>..<after>, not %r\n"
+                             % args.changed)
+            return EXIT_USAGE
 
-    code, problems, notes = run(root)
+    code, problems, notes = run(root, changed)
     for note in notes:
         sys.stderr.write("preflight: note: %s\n" % note)
     for problem in problems:

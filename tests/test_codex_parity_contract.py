@@ -286,7 +286,7 @@ def test_fixture_corpus_contains_no_maintainer_data():
     # it forbids, so spelling the real ones here disclosed exactly what the
     # guard exists to keep unpublished. The literal values are forbidden across
     # the whole public tree by the private guard in
-    # tests/test_test_remote_observability.py, which can hold them safely.
+    # tests/test_private_disclosure_guards.py, which can hold them safely.
     # `/home/` is deliberately absent: rollouts/secret-canary.jsonl carries the
     # synthetic `/home/fixture-user`, which is the shape this corpus is built
     # to exercise rather than a real home directory.

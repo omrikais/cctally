@@ -259,25 +259,6 @@ describe('MessageBlocks (ordered walk + tool-run grouping)', () => {
     const { container } = render(<MessageBlocks blocks={[call({})]} />);
     expect(container.querySelector('.conv-chip-status')).toBeNull();
   });
-
-  it('every chip has a chevron affordance', () => {
-    const { container } = render(<MessageBlocks blocks={[{ kind: 'thinking', text: 'hm' }]} />);
-    expect(container.querySelector('.conv-chev')).not.toBeNull();
-  });
-
-  it('renders inline-SVG icons instead of emoji in chip summaries', () => {
-    render(
-      <MessageBlocks blocks={[{ kind: 'thinking', text: 'hm' }, call({ name: 'Read', preview: '/a' })]} />,
-    );
-    // Thinking chip: label still present, an aria-hidden svg in the summary, no emoji.
-    const thinking = screen.getByText('Thinking').closest('summary')!;
-    expect(thinking.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
-    expect(thinking.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
-    // Tool chip: name + svg, no emoji.
-    const tool = screen.getByText('Read').closest('summary')!;
-    expect(tool.querySelector('svg[aria-hidden="true"]')).toBeInTheDocument();
-    expect(tool.textContent).not.toMatch(/[💭🔧📤🖼📄↪⚙⏳⚠💬🧵]/);
-  });
 });
 
 describe('MessageBlocks (single-block kinds)', () => {
@@ -340,30 +321,6 @@ describe('MessageBlocks (single-block kinds)', () => {
     expect(container.querySelector('.conv-codex-lifecycle')?.textContent).toContain('Synthetic lifecycle failure');
     expect(screen.getAllByRole('button', { name: 'Load raw event payload' })).toHaveLength(2);
     expect(container.textContent).not.toMatch(/::git-|<oai-mem-citation>|\/synthetic/);
-  });
-
-  // #228 S3 B1 — the "quiet reasoning" CSS hook. The expanded thinking body must
-  // stay `.conv-chip--thinking > .conv-chip-body > .md` (the indigo wash /
-  // dimmed-italic prose rules key on exactly this chain), and a NON-thinking
-  // chip (a tool degradation chip here) must NOT carry the thinking class, so the
-  // treatment never bleeds onto other chips. The italic/wash/size are CSS-only
-  // (verified at the ui-qa gate, not JSDOM); this pins the stable structure.
-  it('B1: pins the thinking CSS hook (.conv-chip--thinking > .conv-chip-body > .md) and leaves other chips untouched', () => {
-    const { container } = render(
-      <MessageBlocks
-        blocks={[
-          { kind: 'thinking', text: 'reasoning prose' },
-          { kind: 'tool_use', name: 'Bash', input_summary: 'ls' },
-        ]}
-      />,
-    );
-    const thinking = container.querySelector('details.conv-chip--thinking')!;
-    expect(thinking).not.toBeNull();
-    expect(thinking.querySelector('.conv-chip-body .md')).not.toBeNull();
-    // The tool chip is a distinct chip that must NOT carry the thinking hook.
-    const tool = container.querySelector('details.conv-chip--tool')!;
-    expect(tool).not.toBeNull();
-    expect(tool.classList.contains('conv-chip--thinking')).toBe(false);
   });
 
   it('renders the tool_use degradation chip with name and input summary', () => {

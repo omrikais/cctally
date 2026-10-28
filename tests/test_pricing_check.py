@@ -324,16 +324,6 @@ def test_check_table_shapes_provider_specific_and_sentinel_aware():
     assert pc.check_table_shapes({}, codex_neg, zero_sentinels=set()) != []
 
 
-@pytest.mark.parametrize("drift,open_,expected", [
-    (True, False, "create"),
-    (True, True, "update"),
-    (False, True, "close"),
-    (False, False, "noop"),
-])
-def test_pricing_issue_action(drift, open_, expected):
-    assert pc.pricing_issue_action(drift, open_) == expected
-
-
 def test_allowlist_is_non_vacuous_against_committed_snapshot():
     import json
     snap = json.loads((pathlib.Path(__file__).resolve().parent
@@ -772,24 +762,15 @@ def test_pricing_check_offline_does_not_revive_removed_sonnet_cutover(tmp_path):
     ]
 
 
-def test_pricing_issue_findings_present_stale_expired():
-    # The cron treats a stale OR expired suppression as issue-worthy (create/
-    # update), independent of value_drift / missing_from_us.
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "pricing_issue",
-        pathlib.Path(__file__).resolve().parents[1] / ".github" / "scripts" / "pricing_issue.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+def test_pricing_summary_findings_present_stale_expired():
+    # The cron reports a stale OR expired suppression as an actionable
+    # finding, independent of value_drift / missing_from_us.
+    mod = _load_summary_script()
     empty = {"drift": {"value_drift": [], "missing_from_us": []},
              "staleSuppressions": [], "expiredSuppressions": []}
     assert mod._findings_present(empty) is False
     assert mod._findings_present({**empty, "staleSuppressions": [{"model": "x"}]}) is True
     assert mod._findings_present({**empty, "expiredSuppressions": [{"model": "y"}]}) is True
-    # And the pure kernel maps that to create/update.
-    assert pc.pricing_issue_action(True, False) == "create"
-    assert pc.pricing_issue_action(True, True) == "update"
 
 
 def test_pricing_check_offline_all_history_ignores_window(tmp_path):
@@ -962,151 +943,79 @@ def test_pricing_check_bad_arg_exit2(tmp_path):
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
 
 
-# --- Issue-manager script glue (.github/scripts/pricing_issue.py) ---------
-# The load-bearing decision (pricing_issue_action) is unit-tested above; these
-# cover the script's own glue: drift_present derivation and the --dry-run
-# action mapping (which exercises the kernel-import path the cron uses).
+# --- Summary script glue (.github/scripts/pricing_summary.py) -------------
+# The weekly cron renders the payload into its step summary and writes no
+# GitHub issue (test regime reset, Task 3.6). These cover the script's glue:
+# the findings predicate, the rendered summary and its exit codes.
 
-_ISSUE_SCRIPT = (pathlib.Path(__file__).resolve().parents[1]
-                 / ".github" / "scripts" / "pricing_issue.py")
+_SUMMARY_SCRIPT = (pathlib.Path(__file__).resolve().parents[1]
+                   / ".github" / "scripts" / "pricing_summary.py")
 
 
-def _load_issue_script():
-    spec = importlib.util.spec_from_file_location("pricing_issue", _ISSUE_SCRIPT)
+def _load_summary_script():
+    spec = importlib.util.spec_from_file_location("pricing_summary", _SUMMARY_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["pricing_issue"] = mod
+    sys.modules["pricing_summary"] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-def test_issue_script_findings_present_predicate():
-    pi = _load_issue_script()
-    assert pi._findings_present({"drift": {"value_drift": [{"model": "x"}],
+def test_summary_script_findings_present_predicate():
+    ps = _load_summary_script()
+    assert ps._findings_present({"drift": {"value_drift": [{"model": "x"}],
                                         "missing_from_us": []}}) is True
-    assert pi._findings_present({"drift": {"value_drift": [],
+    assert ps._findings_present({"drift": {"value_drift": [],
                                         "missing_from_us": ["claude-new"]}}) is True
     # ahead_of_litellm is informational only — never drift (invariant #2).
-    assert pi._findings_present({"drift": {"value_drift": [], "missing_from_us": [],
+    assert ps._findings_present({"drift": {"value_drift": [], "missing_from_us": [],
                                         "ahead_of_litellm": ["claude-lead"]}}) is False
-    assert pi._findings_present({"drift": {"value_drift": [], "missing_from_us": []}}) is False
-    assert pi._findings_present({}) is False
+    assert ps._findings_present({"drift": {"value_drift": [], "missing_from_us": []}}) is False
+    assert ps._findings_present({}) is False
 
 
-def test_issue_script_build_body_renders():
-    pi = _load_issue_script()
-    body = pi._build_body({
+def test_summary_script_renders_findings_without_an_issue_marker():
+    ps = _load_summary_script()
+    summary = ps._build_summary({
         "snapshotDate": "2026-05-04", "litellmSource": "ll", "status": "ok",
         "degraded_components": [],
         "drift": {"value_drift": [{"model": "claude-a", "field": "input_cost_per_token",
                                    "ours": 1e-6, "theirs": 2e-6}],
                   "missing_from_us": ["claude-new"], "ahead_of_litellm": []},
     })
-    assert "claude-a" in body and "input_cost_per_token" in body
-    assert "claude-new" in body
-    assert "Remediation checklist" in body
-    assert "PRICING_SNAPSHOT_DATE" in body
-
-
-@pytest.mark.parametrize("findings_present", [False, True])
-def test_issue_script_never_mutates_a_manually_labeled_issue(
-    tmp_path, monkeypatch, findings_present,
-):
-    """A human issue carrying pricing-drift is not the automation ledger."""
-    pi = _load_issue_script()
-    payload = {
-        "drift": {
-            "value_drift": ([{"model": "gpt-example"}] if findings_present else []),
-            "missing_from_us": [],
-        },
-    }
-    payload_path = tmp_path / "payload.json"
-    payload_path.write_text(_json.dumps(payload))
-    calls = []
-
-    def fake_run_gh(args, *, capture=False):
-        calls.append(args)
-        if args[:2] == ["issue", "list"]:
-            return _json.dumps([{
-                "number": 606,
-                "body": "Manually filed pricing work; no automation marker.",
-            }])
-        return ""
-
-    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
-
-    assert pi.main([str(payload_path)]) == 0
-    assert not [
-        args for args in calls
-        if args[:2] in (["issue", "edit"], ["issue", "close"], ["issue", "comment"])
-    ]
-    if findings_present:
-        assert [args for args in calls if args[:2] == ["issue", "create"]]
-
-
-def test_issue_script_finds_only_the_explicitly_marked_ledger(monkeypatch):
-    pi = _load_issue_script()
-
-    def fake_run_gh(args, *, capture=False):
-        assert args[:2] == ["issue", "list"]
-        return _json.dumps([
-            {"number": 606, "body": "Manual issue with the shared label."},
-            {"number": 607, "body": f"{pi.ISSUE_MARKER}\nManaged ledger."},
-        ])
-
-    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
-
-    assert pi._find_open_issue() == 607
-
-
-def test_issue_script_body_carries_durable_ownership_marker():
-    pi = _load_issue_script()
-
-    body = pi._build_body({"drift": {}})
-
-    assert body.startswith(pi.ISSUE_MARKER + "\n")
-
-
-def test_issue_script_refuses_multiple_marked_ledgers(monkeypatch, capsys):
-    pi = _load_issue_script()
-
-    def fake_run_gh(args, *, capture=False):
-        assert args[:2] == ["issue", "list"]
-        return _json.dumps([
-            {"number": 607, "body": f"{pi.ISSUE_MARKER}\nFirst ledger."},
-            {"number": 608, "body": f"{pi.ISSUE_MARKER}\nSecond ledger."},
-        ])
-
-    monkeypatch.setattr(pi, "_run_gh", fake_run_gh)
-
-    with pytest.raises(SystemExit) as exc:
-        pi._find_open_issue()
-
-    assert exc.value.code == 2
-    assert "multiple marked pricing ledgers" in capsys.readouterr().err
+    assert "claude-a" in summary and "input_cost_per_token" in summary
+    assert "claude-new" in summary
+    assert "Remediation checklist" in summary
+    assert "PRICING_SNAPSHOT_DATE" in summary
+    assert "<!--" not in summary and "issue" not in summary.lower()
+    clean = ps._build_summary({"drift": {"value_drift": [], "missing_from_us": []}})
+    assert "No actionable pricing drift" in clean and "Remediation checklist" not in clean
 
 
 import subprocess as _sp  # noqa: E402
 
 
-@pytest.mark.parametrize("payload,expected", [
-    ({"drift": {"value_drift": [{"model": "x"}], "missing_from_us": []}}, "create"),
-    ({"drift": {"value_drift": [], "missing_from_us": []}}, "noop"),
+@pytest.mark.parametrize("payload,warned", [
+    ({"drift": {"value_drift": [{"model": "x"}], "missing_from_us": []}}, True),
+    ({"drift": {"value_drift": [], "missing_from_us": []}}, False),
 ])
-def test_issue_script_dry_run_action_mapping(tmp_path, payload, expected):
-    import json as _j
+def test_summary_script_writes_the_step_summary_and_warns_only_on_findings(tmp_path, payload, warned):
     f = tmp_path / "p.json"
-    f.write_text(_j.dumps(payload))
-    r = _sp.run([sys.executable, str(_ISSUE_SCRIPT), "--dry-run", str(f)],
-                capture_output=True, text=True)
+    f.write_text(_json.dumps(payload))
+    summary = tmp_path / "summary.md"
+    env = {"PATH": "/usr/bin:/bin", "GITHUB_STEP_SUMMARY": str(summary)}
+    r = _sp.run([sys.executable, str(_SUMMARY_SCRIPT), str(f)],
+                capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0, r.stderr
-    assert f"action={expected}" in r.stdout, r.stdout
+    assert summary.read_text().startswith("## Pricing freshness")
+    assert ("::warning title=Pricing drift::" in r.stdout) is warned, r.stdout
+    assert f"findings={'yes' if warned else 'no'}" in r.stdout
 
 
-def test_issue_script_bad_payload_exit2(tmp_path):
+def test_summary_script_bad_payload_exit2(tmp_path):
     f = tmp_path / "bad.json"
     f.write_text("not json")
-    r = _sp.run([sys.executable, str(_ISSUE_SCRIPT), "--dry-run", str(f)],
-                capture_output=True, text=True)
+    r = _sp.run([sys.executable, str(_SUMMARY_SCRIPT), str(f)],
+                capture_output=True, text=True, timeout=30)
     assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
 
 

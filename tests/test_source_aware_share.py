@@ -1330,34 +1330,18 @@ def test_source_aware_harness_uses_bash_3_compatible_read_loops():
 
 
 def test_source_aware_harness_is_a_required_bundle_gate():
-    """#529 S1 retired the narrow `required_harnesses` list of #446 Task B: the
-    estate manifest now declares EVERY harness and admission requires exact set
-    equality in both directions, so this gate is asserted against the manifest
-    rather than against a hardcoded shell array."""
+    """#529 S1 retired the narrow `required_harnesses` list of #446 Task B, and
+    the test regime reset (Task 3.4) replaced the manifest admission with
+    discovery: every executable `bin/cctally-*-test` is a harness the full run
+    executes, so these two harnesses are gates by existing and keeping their
+    executable bit (a lost bit is a usage error, never an absent harness)."""
     root = Path(__file__).resolve().parents[1]
     bundle = (root / "bin" / "cctally-test-all").read_text(encoding="utf-8")
-    manifest = json.loads(
-        (root / "tests" / "authoritative-test-manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    rows = {row["name"]: row for row in manifest["harnesses"]}
-
-    assert {"codex-quota", "source-aware"} <= set(rows)
-    assert rows["codex-quota"]["visibility"] == "public"
-    assert rows["source-aware"]["visibility"] == "public"
-
-    # test-remote is maintainer-local and deliberately unmirrored, so it is
-    # required only where it is supposed to exist: demanding it unconditionally
-    # took every public CI job down on the v1.89.0 snapshot before a single
-    # harness ran. Declaring it `private` is what scopes it to the private
-    # profile now. The behavioral contract (private tree refuses a missing or
-    # non-executable harness; public subset plans cleanly without it) is pinned
-    # in tests/test_test_all_scheduler.py; guard the discriminator here so it
-    # cannot be dropped back to an unconditional literal unnoticed.
-    assert rows["test-remote"]["visibility"] == "private"
-    assert '[ -f "$REPO_ROOT/.mirror-allowlist" ]' in bundle
-    assert "contract_admit_harnesses" in bundle
+    for name in ("codex-quota", "source-aware"):
+        harness = root / "bin" / f"cctally-{name}-test"
+        assert harness.is_file() and os.access(harness, os.X_OK), harness
+    assert '"$REPO_ROOT"/bin/cctally-*-test' in bundle
+    assert "is a harness but is not executable" in bundle
     # The retired list must not creep back: two admission mechanisms would
     # disagree the moment one of them was updated alone.
     assert "required_harnesses=(" not in bundle

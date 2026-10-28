@@ -404,7 +404,6 @@ diff_pricing = _lib_pricing_check.diff_pricing
 stale_allowlist_entries = _lib_pricing_check.stale_allowlist_entries
 expired_allowlist_entries = _lib_pricing_check.expired_allowlist_entries
 check_table_shapes = _lib_pricing_check.check_table_shapes
-pricing_issue_action = _lib_pricing_check.pricing_issue_action
 CoverageGap = _lib_pricing_check.CoverageGap
 DriftRow = _lib_pricing_check.DriftRow
 DriftResult = _lib_pricing_check.DriftResult
@@ -1258,13 +1257,11 @@ _delete_doomed_snapshot_rows = _cctally_record._delete_doomed_snapshot_rows
 # #834 S1 (#835) Gate A R4: the band is a connection-taking builder now,
 # because the held predicate is omitted on a store predating the column.
 _stale_replica_band_sql = _cctally_record._stale_replica_band_sql
-# #834 S1 (#835): the read-side twin of the band above — which weekly
-# values a week's credits retired, and the predicate that recognizes one.
-# `_latest_seven_day_and_window` reaches both through this namespace.
+# #834 S1 (#835): a week's credits and their floors.
+# `_latest_seven_day_and_window` reaches both through this namespace for its
+# credit-floor bound (the retirement band itself was removed by #840).
 _credit_retirement_bands = _cctally_record._credit_retirement_bands
 _latest_credit_floor_instant = _cctally_record._latest_credit_floor_instant
-_weekly_value_is_retired_replica = (
-    _cctally_record._weekly_value_is_retired_replica)
 _stale_replay_candidates = _cctally_record._stale_replay_candidates
 _count_stale_replays = _cctally_record._count_stale_replays
 _credit_preview_text = _cctally_record._credit_preview_text
@@ -1606,11 +1603,9 @@ _format_block_start = _cctally_five_hour._format_block_start
 _format_hhmm_in_tz = _cctally_five_hour._format_hhmm_in_tz
 _block_is_active = _cctally_five_hour._block_is_active
 _latest_seven_day_and_window = _cctally_five_hour._latest_seven_day_and_window
-# #834 S1 (#835) Gate A S1: the ONE read-time filter for a block's two
-# weekly axes. Both five-hour commands reach it through this namespace.
-_parsed_block_instant = _cctally_five_hour._parsed_block_instant
-_block_weekly_start_instant = _cctally_five_hour._block_weekly_start_instant
-_block_weekly_end_instant = _cctally_five_hour._block_weekly_end_instant
+# #834 S1 (#835) Gate A S1: the ONE read of a block's two weekly axes (the
+# stored values since #840). Both five-hour commands reach it through this
+# namespace.
 _credit_aware_block_weekly_axes = (
     _cctally_five_hour._credit_aware_block_weekly_axes)
 # #834 S1 (#836): the ONE five-hour milestone read, shared by the CLI

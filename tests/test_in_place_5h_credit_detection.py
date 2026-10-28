@@ -1298,15 +1298,20 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
             week_end_at=end_iso,
         )
         # 2. Pre-committed event row (simulates the crashed tick N
-        # that wrote the event row before dying). Use a 10-min slot in
-        # the recent past so ``unixepoch(captured_at_utc) >=
-        # unixepoch(effective_iso)`` in the DELETE predicate still
-        # matches stale-replica rows we stage at "now".
-        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        # Floor to the SAME 10-min slot that the recovery tick will
-        # compute (within the same wall-second-ish window). Using
-        # ``_floor_to_ten_minutes`` mirrors what production does.
-        precommitted_floor = ns["_floor_to_ten_minutes"](now_utc)
+        # that wrote the event row before dying). Its slot is the one
+        # the crashed tick computed: the 10-min floor of the ARMING
+        # instant (#769 S2 §3), which is the armed state seeded below
+        # (`_ARMED_AT`), so the recovery tick re-derives exactly this
+        # slot and UNIQUE absorbs its INSERT. #797/#823/#840: flooring
+        # wall-clock now instead named a different slot whenever the
+        # module was imported in an earlier 10-min slot than this test
+        # ran (routine in a full suite), and the v2 detector, which no
+        # longer pair-checks, then minted a second event. `_ARMED_AT`
+        # precedes every row staged at "now", so the DELETE predicate
+        # ``unixepoch(captured_at_utc) >= unixepoch(effective_iso)``
+        # still matches them.
+        precommitted_floor = ns["_floor_to_ten_minutes"](
+            dt.datetime.fromisoformat(_ARMED_AT))
         precommitted_iso = precommitted_floor.isoformat(timespec="seconds")
         conn.execute(
             "INSERT INTO five_hour_reset_events "
@@ -1573,11 +1578,17 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
     conn = ns["open_db"]()
     try:
         # Pre-committed event row (crash mid-flight after the INSERT
-        # landed). Use a 10-min slot in the recent past so the
-        # recovery tick's effective_iso (= 10-min floor of now) is
-        # >= this and the DELETE predicate matches stale-replica rows.
-        now_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-        precommitted_floor = ns["_floor_to_ten_minutes"](now_utc)
+        # landed), in the slot the crashed tick computed: the 10-min
+        # floor of the arming instant the armed state below carries
+        # (`_ARMED_AT`), which the recovery tick re-derives (#769 S2
+        # §3). Flooring wall-clock now named another slot whenever the
+        # module was imported in an earlier 10-min slot than this test
+        # ran, and the v2 detector (#797/#823/#840), which no longer
+        # pair-checks, then minted a second event. `_ARMED_AT` precedes
+        # the rows staged at "now", so the DELETE predicate still
+        # matches stale-replica rows.
+        precommitted_floor = ns["_floor_to_ten_minutes"](
+            dt.datetime.fromisoformat(_ARMED_AT))
         precommitted_iso = precommitted_floor.isoformat(timespec="seconds")
         conn.execute(
             "INSERT INTO five_hour_reset_events "
@@ -1703,10 +1714,38 @@ def _claude_obs_ids(ns) -> list:
     return out
 
 
-def test_characterization_823_stale_high_re_raise_mints_a_second_credit(
+def test_823_stale_high_re_raise_through_the_status_line_mints_one_credit(
+        monkeypatch, tmp_path):
+    """#823 is fixed on the status-line path (spec section 6 T9, T1 S5): the
+    complete causal tail of the characterization below — an idle session's
+    20 as the `statusline` baseline, a descent to 5 confirmed by a distinct
+    observation, provider samples at the post-credit level requested after
+    the credit, the idle session's replayed 20, and the later lows that
+    minted the second credit — driven through the real render intake and
+    detached reducer. The replay holds a receipt (i) that survives the
+    status-line credit and is proven stale by the later sample, so it is
+    refused: never published as a rise, the detector baseline stays at the
+    post-credit level, and exactly one credit is minted."""
+    import test_823_five_hour_stale_evidence_797 as F
+    import _stale_contributor_trace as S
+
+    result = F.scenario_s5(S.Trace(monkeypatch, tmp_path))
+    assert result["credits"] == [(20.0, 5.0, "2026-10-22T09:00:00+00:00")], result
+    assert result["statusline"] == [20.0, 5.0, 5.0, 6.0], result
+    assert result["after_replay"] == (5.0, None), result
+    assert result["outcomes"]["five_hour"] == 1, result
+
+
+def test_characterization_r2_direct_record_usage_stale_high_re_raise_mints_a_second_credit(
         ns, monkeypatch):
-    """CHARACTERIZATION of a KNOWN RESIDUAL (#823). This test asserts that the
-    defect currently OCCURS; it is not a statement that the behaviour is right.
+    """CHARACTERIZATION of residual R2 (spec section 7: direct
+    `record-usage`). This test asserts that the defect still OCCURS on the
+    opt-in direct recipe; it is not a statement that the behaviour is right.
+    The status-line path refuses the replay (the test above); a direct
+    `record-usage` carries no transcript evidence (U1), so no receipt or
+    staleness proof can exist for its readings and the detector — even
+    under detector policy 2, whose credit generation only replaces the pair
+    check — still sees four distinct observations.
 
     One underlying descent is credited TWICE. A source descends from 20 to 5
     and a distinct same-source observation confirms it, which is the credit the

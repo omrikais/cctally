@@ -507,6 +507,31 @@ def _fetch_dashboard_write_io(descriptor: dict, *, timeout_s: float) -> dict:
     return {**base, "probe": "ok", "reason": None, "write_io": write_io}
 
 
+_REBUILD_WORKERS = ("epoch", "heal")
+
+
+def _rebuild_worker_gather_failed(worker: str, exc: BaseException) -> dict:
+    """A snapshot that could not be gathered reads as an unreadable state
+    (the existing row), with the error in `details`, never as "has run"."""
+    return {"worker": worker, "state": None, "stateUnreadable": True,
+            "ledger": None, "ledgerUnreadable": False, "identities": {},
+            "pending": {}, "reread": False,
+            "gatherError": f"{type(exc).__name__}: {exc}"}
+
+
+def _gather_rebuild_workers() -> dict:
+    """#997 D10: each detached rebuild worker's read-only snapshot; a worker
+    whose snapshot fails is reported unreadable, the other still gathered."""
+    out: dict = {}
+    for worker in _REBUILD_WORKERS:
+        try:
+            import _cctally_store
+            out[worker] = _cctally_store.rebuild_worker_snapshot(worker)
+        except Exception as exc:  # noqa: BLE001 — reported, never fatal
+            out[worker] = _rebuild_worker_gather_failed(worker, exc)
+    return out
+
+
 def _gather_dashboard_disk_writes(
     *, fetch=None, timeout_s: float = DASHBOARD_WRITE_IO_TIMEOUT_SECONDS,
     discover: bool = True,
@@ -559,6 +584,7 @@ def _gather_legacy_writer(deep_excluded, deep_boundary,
     says the detection pause exists only when the validated index holds the
     durable `inventory-incomplete` marker. Read-only: the sidecar is never
     written here, the spool is only read, and nothing is journaled."""
+    import _cctally_journal
     import _cctally_store
     import _lib_account_protocol
 
@@ -579,11 +605,9 @@ def _gather_legacy_writer(deep_excluded, deep_boundary,
                 pc.close()
     except Exception:  # noqa: BLE001 — a diagnostic read degrades to unavailable
         row = None
-    try:
-        evidence = json.loads(
-            _cctally_core.LEGACY_WRITER_EVIDENCE_PATH.read_bytes())
-    except (OSError, ValueError):
-        evidence = None
+    # #797/#823/#840 review RV-5: the v2 sidecar, else the previous
+    # release's v1 one (read only) as its seed.
+    evidence, _seeded = _cctally_journal.read_legacy_writer_evidence_document()
     inventory = _legacy_spool_inventory_probe(inventory_marker)
     if inventory is not None:
         out["legacySpoolInventory"] = inventory
@@ -3208,6 +3232,14 @@ def _doctor_gather_state_impl(
                 discover=_discover_dashboards)
     except Exception:  # noqa: BLE001 — a probe failure must not fail doctor
         dashboard_disk_writes = {"mode": "error", "instances": []}
+    # #997 D10: the detached rebuild workers, read-only (no worker or
+    # admission flock is taken; a probe would make a starting worker `busy`).
+    try:
+        with _lib_perf.phase("doctor.rebuild_workers"):
+            rebuild_workers = _gather_rebuild_workers()
+    except Exception as exc:  # noqa: BLE001 — a gather failure must not fail doctor
+        rebuild_workers = {worker: _rebuild_worker_gather_failed(worker, exc)
+                           for worker in _REBUILD_WORKERS}
     return _lib_doctor.DoctorState(
         symlink_state=symlink_state,
         path_includes_local_bin=path_includes,
@@ -3318,6 +3350,7 @@ def _doctor_gather_state_impl(
         conversations_db_freelist_count=conversations_db_freelist_count,
         conversations_db_page_size=conversations_db_page_size,
         dashboard_disk_writes=dashboard_disk_writes,
+        rebuild_workers=rebuild_workers,
         conversations_reclaim_pending=conversations_reclaim_pending,
         codex_quota_windows=codex_quota_windows,
         codex_hook_roots=codex_hook_roots,

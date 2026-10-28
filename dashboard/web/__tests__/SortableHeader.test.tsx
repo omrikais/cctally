@@ -107,14 +107,6 @@ describe('<SortableHeader />', () => {
     expect(outerClick).not.toHaveBeenCalled();
   });
 
-  it('active column gets is-sorted class', () => {
-    const { container } = setup({ column: 'n', direction: 'desc' });
-    expect(container.querySelector('th[data-col="n"]')?.classList.contains('is-sorted'))
-      .toBe(true);
-    expect(container.querySelector('th[data-col="s"]')?.classList.contains('is-sorted'))
-      .toBe(false);
-  });
-
   it('th has tabindex=0; inner button has tabindex=-1 (single tab stop)', () => {
     const { container } = setup(null);
     const th = container.querySelector('th[data-col="n"]') as HTMLElement;

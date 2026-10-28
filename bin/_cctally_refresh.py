@@ -72,6 +72,7 @@ from _cctally_core import (
     now_utc_iso,
     _iso_to_epoch,
     _format_short_duration,
+    _command_as_of,
 )
 
 
@@ -645,6 +646,8 @@ def _refresh_usage_inproc_locked(
 
     ``binding`` was captured together with ``token`` before the fetch. The
     response is revalidated against it before ANY mutation (spec 4.6)."""
+    # #797/#823/#840 spec 4.3 D8: `q`, taken immediately before the request.
+    request_started = _oauth_request_started_now(c)
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
@@ -730,6 +733,9 @@ def _refresh_usage_inproc_locked(
         # This is the OAuth feeder — label the row "api" (spec §5). Without
         # this, cmd_record_usage would fall back to its "statusline" default.
         source="api",
+        # #797/#823/#840 spec 4.3 D8: this response's own request-start
+        # instant, carried with it and its captured binding to publication.
+        oauth_request_started_at=request_started,
     )
     authoritative = c._authoritative_record_usage(
         record_args,
@@ -974,6 +980,24 @@ def _revalidate_selected_credential(c, binding) -> bool:
     return current is not None and bool(token) and current == binding
 
 
+def _oauth_request_started_now(c) -> str:
+    """#797/#823/#840 spec 4.3 D8: the request-start instant `q` of an OAuth
+    fetch — the wall clock immediately before `_fetch_oauth_usage` is called,
+    at full clock precision, as the raw key `oauth_request_started_at` records
+    it. The provider sampled the response at or after it (assumption A-Q).
+
+    It reads the same clock as the observation's capture stamp
+    (`record_usage_bound`): the wall clock, or the harness's pinned
+    `CCTALLY_AS_OF` under `CCTALLY_TEST_PIN_CAPTURE`, so `q` never follows the
+    capture of its own response."""
+    import _lib_oauth_samples
+    if os.environ.get("CCTALLY_TEST_PIN_CAPTURE"):
+        instant = _command_as_of()
+    else:
+        instant = dt.datetime.now(dt.timezone.utc)
+    return _lib_oauth_samples.format_request_started(instant)
+
+
 def _hook_tick_oauth_skip_status(c, *, throttle_seconds: float, binding) -> str | None:
     """Return the automatic-refresh suppression reason under selected lock.
     Repair need and selected freshness are the captured account's own."""
@@ -1080,6 +1104,10 @@ def _hook_tick_oauth_refresh(
     if skipped is not None:
         return skipped, None
 
+    # #797/#823/#840 spec 4.3 D8: `q`, taken immediately before the request.
+    # It travels only with this response: a failure or a discard below drops
+    # both together.
+    request_started = _oauth_request_started_now(c)
     try:
         api = c._fetch_oauth_usage(token=token, timeout_seconds=timeout_seconds)
     except RefreshUsageRateLimitError as exc:
@@ -1105,6 +1133,7 @@ def _hook_tick_oauth_refresh(
     if parsed is None:
         return "err(parse)", None
     record_args, axes, parts = parsed
+    record_args.oauth_request_started_at = request_started
 
     # #583 S2: the nudge remains deferred until after the publication lock is
     # released. The sink contract is now enforced by the authority kernel, so

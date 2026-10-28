@@ -421,6 +421,9 @@ def test_one_compaction_predicate_answers_for_every_caller():
     """`is_compaction_row` is the single read-time authority, and the S3
     adapter routes through it rather than restating it a third time
     (#620 S3 R4)."""
+    # The adapter reaches the CLI through sys.modules["cctally"], so load it
+    # here rather than relying on an earlier test on this worker to have.
+    load_script()
     query = _query()
     sources = importlib.import_module("_cctally_diagnosis_sources")
     cases = [
@@ -520,7 +523,7 @@ def test_x4_resolves_a_parent_only_on_exactly_one_non_self_match():
 
 
 def test_x4_leaves_a_child_unallocated_when_several_parents_match():
-    sources = sys.modules["_cctally_diagnosis_sources"]
+    sources = importlib.import_module("_cctally_diagnosis_sources")
     threads = [
         {"source_root_key": "root-a", "root_thread_id": "user",
          "native_thread_id": "parent-1", "conversation_key": "v1.root-a.0",
@@ -538,7 +541,7 @@ def test_x4_leaves_a_child_unallocated_when_several_parents_match():
 
 
 def test_x4_never_resolves_a_child_to_itself():
-    sources = sys.modules["_cctally_diagnosis_sources"]
+    sources = importlib.import_module("_cctally_diagnosis_sources")
     threads = [
         {"source_root_key": "root-a", "root_thread_id": "subagent",
          "native_thread_id": "child-1", "conversation_key": "v1.root-a.1",
@@ -552,7 +555,7 @@ def test_x4_never_resolves_a_child_to_itself():
 def test_x4_is_seeded_from_the_scoped_accounting_keys_only():
     """Parent and child resolution is seeded from the scoped in-window
     accounting keys, never by walking the retained thread graph."""
-    sources = sys.modules["_cctally_diagnosis_sources"]
+    sources = importlib.import_module("_cctally_diagnosis_sources")
     threads = [
         {"source_root_key": "root-a", "root_thread_id": "user",
          "native_thread_id": "parent-1", "conversation_key": "v1.root-a.0",
@@ -572,7 +575,7 @@ def test_x4_only_the_two_exact_literals_are_recognised_origin_categories():
     """`_inferred_codex_thread_source` returns any explicit `thread_source`
     verbatim, and no resolver maps an arbitrary string onto an origin. Every
     other value is ambiguous and belongs to neither population."""
-    sources = sys.modules["_cctally_diagnosis_sources"]
+    sources = importlib.import_module("_cctally_diagnosis_sources")
     assert sources.codex_origin_category("user") == "user"
     assert sources.codex_origin_category("subagent") == "subagent"
     for value in ("vscode", "User", "SUBAGENT", "", None, "cli"):

@@ -225,6 +225,11 @@ export interface DoctorAggregate {
   // Present iff the server-side gather raised. The chip surfaces the
   // synthetic-FAIL aggregate identically; this field is informational.
   _error?: string;
+  // #997 D10: the `db.rebuild_worker` check's sentence when it is not ok
+  // (a running, stalled, failed or dead stats.db upgrade rebuild or
+  // auto-heal); null when it is ok and in the synthetic fallback blocks.
+  // The chip leads its tooltip and aria-label with `summary`.
+  rebuild_worker?: { severity: 'ok' | 'warn' | 'fail'; summary: string } | null;
 }
 
 // The `available` cooking predicate + semver comparison live in

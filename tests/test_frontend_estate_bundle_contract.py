@@ -162,7 +162,7 @@ def test_every_bundle_ci_job_provisions_the_frontend_estate() -> None:
                 f"{relative} {job}: `npm ci` is not scoped to dashboard/web, so it "
                 "installs no vitest for bin/cctally-frontend-test"
             )
-    # Three lanes run the bundle: test-macos and test-pr in ci.yml, test-linux in
-    # ci-linux-matrix.yml. A drop below three means a lane was renamed or removed
+    # Two lanes run the bundle: test-pr in ci.yml, test-linux in
+    # ci-linux-matrix.yml. A drop below two means a lane was renamed or removed
     # and this contract stopped covering it.
-    assert seen >= 3, f"expected at least three bundle lanes, found {seen}"
+    assert seen >= 2, f"expected at least two bundle lanes, found {seen}"

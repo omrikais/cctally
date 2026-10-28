@@ -304,6 +304,10 @@ def test_codex_tick_hands_a_declined_byte_zero_replay_to_a_drain_worker(
     monkeypatch.setattr(
         _cctally_update, "_spawn_detached",
         lambda command: spawned.append(command) or True)
+    # #997 D8: the rebuild workers spawn through the pid-returning seam.
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda command, env=None: spawned.append(command) or os.getpid())
     monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
     monkeypatch.setitem(
         ns, "sync_codex_cache",
@@ -519,6 +523,10 @@ def test_codex_tick_defers_a_pending_stats_epoch_rebuild(
     monkeypatch.setattr(
         _cctally_update, "_spawn_detached",
         lambda command: spawned.append(command) or True)
+    # #997 D8: the rebuild workers spawn through the pid-returning seam.
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda command, env=None: spawned.append(command) or os.getpid())
     monkeypatch.setitem(
         ns, "open_cache_db", lambda: calls.append("open-cache") or None)
     monkeypatch.setitem(

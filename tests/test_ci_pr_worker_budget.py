@@ -20,11 +20,13 @@ def _test_pr_job() -> str:
     return _job("test-pr")
 
 
-def test_private_same_repo_pr_uses_self_hosted_macos_authority() -> None:
-    job = _job("test-macos", "dashboard-build-stability")
-
-    assert "github.event_name == 'pull_request'" in job
-    assert "github.event.pull_request.head.repo.full_name == github.repository" in job
+def test_private_pr_runs_no_self_hosted_job() -> None:
+    # A private pull request runs nothing: both self-hosted jobs are push-only.
+    for name, next_name in (("changed-checks", "dashboard-build-stability"),
+                            ("dashboard-build-stability", "test-pr")):
+        job = _job(name, next_name)
+        assert "github.event_name == 'push'" in job, name
+        assert "pull_request" not in job.split("runs-on:", 1)[0], name
 
 
 def test_hosted_pr_lane_is_reserved_for_public_mirror_prs() -> None:

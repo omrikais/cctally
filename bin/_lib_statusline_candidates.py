@@ -12,6 +12,8 @@ import math
 import re
 from typing import Callable, Mapping
 
+import _lib_provider_activity
+
 
 #: Candidate and tombstone documents.  Every session on this machine writes
 #: candidates, so this version may only move when peer sessions running the
@@ -59,6 +61,11 @@ class Candidate:
     #: The immutable `AccountBinding` captured with this candidate (#825/#832
     #: spec 4.2). The reducer partitions by its account; it is never inferred.
     binding: object | None = None
+    #: The provider-activity witness (#797 spec 4.2,
+    #: `_lib_provider_activity.ActivityWitness`) captured once at this
+    #: arrival, before its intake commit. Required in every v2 candidate
+    #: document, so the intake identity hashes it; never recomputed.
+    activity: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,6 +312,16 @@ def _require_ascii_source(value: object) -> str:
     except UnicodeEncodeError as exc:
         raise StateValidationError("source must be ASCII") from exc
     return value
+
+
+def validate_activity(value: object):
+    """The candidate's activity witness, or ``StateValidationError``: a
+    missing or malformed witness makes the v2 document malformed and never
+    silently reads as ``unknown`` (#797 spec 4.2)."""
+    try:
+        return _lib_provider_activity.witness_from_json(value)
+    except _lib_provider_activity.MalformedWitness as exc:
+        raise StateValidationError(str(exc)) from exc
 
 
 def _axis_value(
@@ -1118,7 +1135,14 @@ def _reduce_axis(
     scope=None,
     drop_allowed: bool = True,
     evidence: AxisEvidence | None = None,
+    member_facts: Mapping[str, object] | None = None,
 ) -> _AxisDecision:
+    # #797 spec 4.4 (Q3): the per-member refusal facts
+    # (`_lib_stale_proof.MemberFacts`, keyed by contributor token) are
+    # resolved before the kernel. None, or no refused member, reduces
+    # exactly as before.
+    refused = frozenset(
+        token for token, facts in (member_facts or {}).items() if facts.refused)
     reduced_data = _reduced_candidate(
         candidates, axis=axis, tombstone=tombstone, db_axis=db_axis
     )
@@ -1137,8 +1161,11 @@ def _reduce_axis(
             # ordinary first post-floor reading; one captured before it is
             # stale and is never relabelled as post-floor. The reading opens
             # no consensus and spends no attempt, under either gate.
+            # #797 spec 4.4: a refused member is excluded from the post-floor
+            # set; every other member keeps the receipt-floor test.
             post = tuple((candidate, value) for candidate, value in in_window
-                         if candidate.received_at >= int(evidence.floor_epoch))
+                         if candidate.token not in refused
+                         and candidate.received_at >= int(evidence.floor_epoch))
             if not post:
                 verdict = CLASS_STALE
             else:
@@ -1184,7 +1211,13 @@ def _reduce_axis(
     # drop.  The maximum decides what is displayed; it may not erase the
     # evidence that a drop is pending, which is why the low is read separately
     # here and why a rise is a publication rather than a branch of its own.
-    rising = reduced.percent > db_axis.percent
+    # #797 spec 4.4 (Q3): `rising` and the published value come from the
+    # members that are not refused; low evidence, supporter retraction,
+    # unanimity, pending membership, `reduced_percent`, deadlines and attempt
+    # accounting keep the unfiltered set. The eligible value applies at every
+    # rising return (plain, armed, cancelled and reconciled).
+    rise = _eligible_rise(reduced, in_window, refused, db_axis)
+    rising = rise is not None and rise.percent > db_axis.percent
     low = min(value.percent for _, value in in_window)
     armed = (
         pending is not None
@@ -1196,7 +1229,7 @@ def _reduce_axis(
         if rising:
             # The rise moves the baseline and no drop is pending against the old
             # one, so there is nothing to preserve.
-            return _AxisDecision("PUBLISH_DB", reduced, None)
+            return _AxisDecision("PUBLISH_DB", rise, None)
         if low >= db_axis.percent:
             return _AxisDecision(
                 "WRITE_CONTROL" if pending is not None else "NOOP", None, None
@@ -1212,7 +1245,7 @@ def _reduce_axis(
     # A cancelled or already-recorded drop stops being pending, and a rise still
     # publishes on the way out.
     cancelled = _AxisDecision(
-        "PUBLISH_DB" if rising else "WRITE_CONTROL", reduced if rising else None, None
+        "PUBLISH_DB" if rising else "WRITE_CONTROL", rise if rising else None, None
     )
     if _supporters_retracted(pending, in_window, db_axis):
         return cancelled
@@ -1245,7 +1278,7 @@ def _reduce_axis(
         # reporting a higher number erased another session's real reset.  The
         # retained low keeps its meaning, because the baseline only moved UP —
         # a low armed below the old baseline is still a drop below the new one.
-        return _AxisDecision("PUBLISH_DB", reduced, updated)
+        return _AxisDecision("PUBLISH_DB", rise, updated)
 
     unanimous = (
         reduced.percent < db_axis.percent
@@ -1289,6 +1322,25 @@ def _reduce_axis(
     )
 
 
+def _eligible_rise(
+    reduced: AxisValue,
+    in_window: tuple[tuple[Candidate, AxisValue], ...],
+    refused: frozenset,
+    db_axis: AxisProjection,
+) -> AxisValue | None:
+    """The same-window maximum over members that are not refused (#797 spec
+    4.4), or None when every member is refused. Without a refused member it
+    is ``reduced`` itself."""
+    if not refused or not any(c.token in refused for c, _ in in_window):
+        return reduced
+    eligible = [value.percent for candidate, value in in_window
+                if candidate.token not in refused]
+    if not eligible:
+        return None
+    return AxisValue(max(eligible), db_axis.raw_resets_at,
+                     canonical_key=reduced.canonical_key)
+
+
 def reduce_candidates(
     candidates: tuple[Candidate, ...] | list[Candidate],
     *,
@@ -1298,6 +1350,7 @@ def reduce_candidates(
     now_epoch: int,
     account_key: str | None = None,
     drop_consensus_allowed: bool = True,
+    member_facts: Mapping[str, Mapping[str, object]] | None = None,
 ) -> ReductionDecision:
     """Reduce active candidates independently for 5h and 7d axes.
 
@@ -1319,7 +1372,12 @@ def reduce_candidates(
     reading after a retiring floor); a stale reading takes the older-window
     disposition, and an unclassifiable one is named in ``unknown_axes`` (fix
     rounds K13 and K14c).
+
+    ``member_facts`` maps an axis to its per-member refusal facts (#797 spec
+    4.4, `_lib_stale_proof.MemberFacts` by contributor token). None, or an
+    axis without facts, means every member is eligible.
     """
+    facts = member_facts or {}
     active = tuple(
         candidate
         for candidate in candidates
@@ -1335,6 +1393,7 @@ def reduce_candidates(
         scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "fiveHour"),
         drop_allowed=drop_consensus_allowed,
         evidence=axis_evidence(db, "fiveHour"),
+        member_facts=facts.get("fiveHour"),
     )
     seven = _reduce_axis(
         "sevenDay",
@@ -1346,6 +1405,7 @@ def reduce_candidates(
         scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "sevenDay"),
         drop_allowed=drop_consensus_allowed,
         evidence=axis_evidence(db, "sevenDay"),
+        member_facts=facts.get("sevenDay"),
     )
     next_control = ControlState(
         db_projection=db,

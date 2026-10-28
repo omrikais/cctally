@@ -88,8 +88,12 @@ Database
         conversations_quick_check: None
   ✓ Version ahead            none ahead
       details:
-        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1018, 'mismatch': False}
+        stats.db: {'user_version': 0, 'legacy_head': 13, 'epoch': 1019, 'mismatch': False}
         cache.db: {'user_version': 0, 'registry_size': 49, 'ahead': False}
+  ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
+      details:
+        epoch: {'state': None, 'stateUnreadable': False, 'ledgerUnreadable': False, 'ledger': {'unresolved': [], 'counts': {}, 'lastDeathAt': None, 'newest': None}, 'liveness': None, 'pending': {'present': False, 'since': None, 'indexPending': False}, 'recoveredDeaths': [], 'rows': []}
+        heal: {'state': None, 'stateUnreadable': False, 'ledgerUnreadable': False, 'ledger': {'unresolved': [], 'counts': {}, 'lastDeathAt': None, 'newest': None}, 'liveness': None, 'pending': {'present': False, 'since': None, 'indexPending': None}, 'recoveredDeaths': [], 'rows': []}
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
       details:
@@ -357,4 +361,4 @@ Performance
         instances: []
         maintenance: {'charged_bytes': 0, 'largest_charge_bytes': 0, 'window_start': '2026-05-12T14:00:00Z', 'window_end': '2026-05-13T14:22:31Z', 'window_minutes': 1462, 'allowance_bytes': 6136266752, 'verdict': 'ok'}
 
-Summary: 58 OK · 9 WARN · 3 FAIL
+Summary: 59 OK · 9 WARN · 3 FAIL

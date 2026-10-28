@@ -6,6 +6,7 @@ the offending node's TEARDOWN report to fail; a nonzero exit is not enough.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import stat
@@ -123,7 +124,7 @@ CONTROLS = ("test_restored_tree_is_green", "test_read_only_file_is_green", "test
             "test_shared_second")
 
 
-def _run(tmp_path, source, *extra):
+def _run(tmp_path, source, *extra, env_extra=None):
     child = tmp_path / "child"
     child.mkdir()
     (child / "test_g1_cases.py").write_text(source)
@@ -136,6 +137,7 @@ def _run(tmp_path, source, *extra):
     env = {"HOME": str(tmp_path / "fake-home"), "TZ": "Etc/UTC", "PATH": "/usr/bin:/bin",
            "PYTHONPATH": os.pathsep.join([str(REPO / "tests"), str(REPO / "bin"), str(tap)]),
            "HYG_TAP_OUT": str(out)}
+    env.update(env_extra or {})
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "conftest", "-p", "hyg_tap", "-q",
          "-p", "no:cacheprovider", "--basetemp", str(tmp_path / "bt"), *extra, str(child)],
@@ -191,6 +193,179 @@ def test_unregistered_material_fails_the_session_with_its_provenance(tmp_path):
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 1, "the session did not fail on unregistered material:\n" + combined
     assert "left directory missing owner rwx (mode 0o555) by <session backstop>" in combined, combined
+
+
+RECLAIM = '''
+import os, pytest
+
+def _fill(root, name):
+    (root / "data").mkdir()
+    (root / "data" / ("marker-" + name)).write_bytes(b"x" * 4096)
+
+def test_pass_tmp_path(tmp_path):
+    _fill(tmp_path, "pass_tmp_path")
+
+def test_pass_factory(tmp_path_factory):
+    _fill(tmp_path_factory.mktemp("passfactory"), "pass_factory")
+
+def test_pass_skipped(tmp_path):
+    _fill(tmp_path, "pass_skipped")
+    pytest.skip("a skip is not a failure")
+
+def test_fail_call(tmp_path):
+    _fill(tmp_path, "fail_call")
+    assert False, "the call failed"
+
+@pytest.fixture
+def setup_fails(tmp_path):
+    _fill(tmp_path, "fail_setup")
+    raise RuntimeError("the setup failed")
+
+def test_fail_setup(setup_fails):
+    pass
+
+@pytest.fixture
+def teardown_fails(tmp_path):
+    yield tmp_path
+    raise RuntimeError("the teardown failed")
+
+def test_fail_teardown(teardown_fails):
+    _fill(teardown_fails, "fail_teardown")
+
+@pytest.fixture(scope="module")
+def shared(tmp_path_factory):
+    root = tmp_path_factory.mktemp("sharedmod")
+    _fill(root, "shared_fixture")
+    return root
+
+def test_pass_uses_shared(shared):
+    pass
+
+@pytest.mark.xfail(reason="an expected failure keeps its evidence")
+def test_xfail_expected(tmp_path):
+    _fill(tmp_path, "xfail")
+    assert False
+
+@pytest.mark.xfail(reason="an unexpected pass keeps its evidence too")
+def test_xpass_unexpected(tmp_path):
+    _fill(tmp_path, "xpass")
+
+def test_pass_with_only_an_isolation_problem(tmp_path):
+    import _lib_test_isolation as iso
+    _fill(tmp_path, "isolation_problem")
+    node = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
+    iso.record_finding(node, "write", "open", "/synthetic", "a synthetic isolation finding")
+'''
+
+
+@pytest.mark.parametrize("jobs", [None, "2"])
+def test_a_passing_nodes_temp_is_reclaimed_and_a_failing_nodes_is_kept(tmp_path, jobs):
+    """Task 3.3b: a passing test's own temp is removed when it finishes.
+
+    Every passing test used to keep its tree until the suite generation was
+    removed, and the public projection's pytest leg peaked at about 24 GB of
+    retained temp on omri-162; the hosted Linux runner ran out of disk on it.
+    A test that fails in setup, call or teardown keeps its tree as evidence,
+    so does an xfail or xpass test and a test whose only problem is an
+    isolation finding, and a shared fixture's tree is left to the fixture's
+    own owner. A skipped test's tree is reclaimed (review D5, D6)."""
+    proc, reports = _run(tmp_path, RECLAIM, *(() if jobs is None else ("-n", jobs)))
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 1, combined
+    assert _report(reports, "test_fail_call", "call")["outcome"] == "failed", combined
+    assert _report(reports, "test_fail_setup", "setup")["outcome"] == "failed", combined
+    assert _report(reports, "test_fail_teardown", "teardown")["outcome"] == "failed", combined
+    assert _report(reports, "test_pass_with_only_an_isolation_problem", "call")["outcome"] == \
+        "passed", combined
+    assert _report(reports, "test_pass_with_only_an_isolation_problem", "teardown")["outcome"] == \
+        "failed", combined
+    for name in ("test_pass_tmp_path", "test_pass_factory", "test_pass_uses_shared"):
+        assert _report(reports, name, "teardown")["outcome"] == "passed", (name, combined)
+    left = sorted(p.name[len("marker-"):] for p in (tmp_path / "bt").rglob("marker-*"))
+    assert left == ["fail_call", "fail_setup", "fail_teardown", "isolation_problem",
+                    "shared_fixture", "xfail", "xpass"], (left, combined)
+    # Every test also gets a tmp_path from the conftest's autouse migration-log
+    # pin, so the reclaimed trees are test_pass_tmp_path's one, test_pass_factory's
+    # two (tmp_path and the factory allocation), test_pass_skipped's one and
+    # test_pass_uses_shared's one: five, with nothing left behind.
+    summary = [line for line in combined.splitlines() if "temp hygiene summary:" in line]
+    assert len(summary) == 1, combined
+    assert " reclaimed=5 reclaim_left=0 reclaim_s_max=" in summary[0], summary
+
+
+REUSE = '''
+import os, pytest
+
+def _note(tmp_path):
+    assert not os.listdir(str(tmp_path)), "a fresh tmp_path already holds %r" % os.listdir(str(tmp_path))
+    (tmp_path / "mine").write_text("x")
+    with open(os.environ["HYG_PATHS_OUT"], "a") as fh:
+        fh.write(str(tmp_path) + "\\n")
+
+def test_a_long_name_that_shares_thirty_chars_first(tmp_path):
+    _note(tmp_path)
+
+def test_a_long_name_that_shares_thirty_chars_second(tmp_path):
+    _note(tmp_path)
+
+@pytest.mark.parametrize("n", [0, 1])
+def test_a_parametrized_pair_shares_one_prefix(tmp_path, n):
+    _note(tmp_path)
+'''
+
+
+@pytest.mark.parametrize("jobs", [None, "1"])
+def test_a_reclaimed_name_is_never_handed_to_a_later_test(tmp_path, jobs):
+    """Review D1: pytest numbers a new tmp_path one past the highest existing
+    number under the first 30 characters of the test's name. Freeing a passing
+    test's name let the next test with that prefix get the same directory, and
+    a process the earlier test left behind could write into the later test's
+    tree. The reclaimed name must stay taken, and its directory must be
+    empty."""
+    out = tmp_path / "paths.txt"
+    proc, reports = _run(tmp_path, REUSE, *(() if jobs is None else ("-n", jobs)),
+                         env_extra={"HYG_PATHS_OUT": str(out)})
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    paths = out.read_text().splitlines()
+    assert len(paths) == 4, (paths, combined)
+    assert len(set(paths)) == 4, "a reclaimed tmp_path was reused: %r" % paths
+    for path in paths:
+        assert os.path.isdir(path) and os.listdir(path) == [], (path, combined)
+    summary = [line for line in combined.splitlines() if "temp hygiene summary:" in line]
+    assert len(summary) == 1 and " reclaimed=4 reclaim_left=0 " in summary[0], (summary, combined)
+
+
+LINK_INTO_PROTECTED = '''
+import os, pwd
+
+def test_a_passing_test_with_a_link_to_a_protected_root(tmp_path):
+    os.symlink(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude"), str(tmp_path / "link"))
+'''
+
+
+def test_a_link_into_a_protected_root_is_reclaimed_without_a_violation(tmp_path):
+    """Review D2: removing a directory entry writes the directory that holds
+    it, never the target of a link. Reclaiming a passing test's tree that holds
+    a link into the real ~/.claude must not be charged as a production write."""
+    import pwd
+
+    target = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".claude")
+    target_existed = os.path.exists(target)
+    proc, reports = _run(tmp_path, LINK_INTO_PROTECTED)
+    combined = proc.stdout + proc.stderr
+    assert "write violation" not in combined, combined
+    assert proc.returncode == 0, combined
+    # pytest names a tmp_path after the first 30 characters of the test's
+    # name, so the directory is `test_a_passing_test_with_a_lin0`; the
+    # untruncated name never exists, and a check against it asserts nothing
+    # (review I3c F3). The reclaim leaves the directory as a tombstone.
+    trees = glob.glob(str(tmp_path / "bt" / "test_a_passing_test_with_a_lin*0"))
+    assert len(trees) == 1, (trees, combined)
+    assert os.path.isdir(trees[0]), (trees, combined)
+    assert not os.path.lexists(os.path.join(trees[0], "link")), (os.listdir(trees[0]), combined)
+    # Removing the link removed the link, never what it pointed at.
+    assert os.path.exists(target) == target_existed, combined
 
 
 SESSION_FIXTURE = '''
@@ -348,3 +523,93 @@ def test_a_serial_session_inspects_a_worker_shaped_directory(tmp_path):
     assert "popen-gw-not-a-worker/a left directory missing owner rwx (mode 0o555) " \
         "by <session backstop>" in combined, combined
     assert _undeletable(tmp_path / "bt") == [], "the guard reported a tree it did not release"
+
+
+def _patched_guard(monkeypatch, owned):
+    import _temp_hygiene as hyg
+    monkeypatch.setattr(hyg, "_OWNED", owned)
+    monkeypatch.setattr(hyg, "_SEEN", {p for paths in owned.values() for p in paths})
+    monkeypatch.setattr(hyg, "STATS", dict(hyg.STATS, reclaimed=0, reclaim_left=0))
+    return hyg
+
+
+def test_a_node_with_a_pending_handshake_keeps_its_tree(tmp_path, monkeypatch):
+    """Review D3: a Python child whose handshake had not arrived when its test
+    finished is resolved at session finish, and a missing one then fails the
+    session naming that test. Its tree is that failure's evidence, so it is
+    not reclaimed while the handshake is pending. Run in-process on PATCHED
+    registries; the control node, with nothing pending, is reclaimed."""
+    import types
+    import _lib_test_isolation as iso
+
+    pending_tree, control_tree = tmp_path / "pending", tmp_path / "control"
+    for tree in (pending_tree, control_tree):
+        (tree / "data").mkdir(parents=True)
+    pending, control = "tests/test_x.py::test_launches_a_child", "tests/test_x.py::test_control"
+    hyg = _patched_guard(monkeypatch, {("item", pending): [str(pending_tree)],
+                                       ("item", control): [str(control_tree)]})
+    monkeypatch.setattr(iso, "collect_test_violations", lambda nodeid, **kw: [])
+    monkeypatch.setattr(iso, "_PENDING_HANDSHAKES", {4242: types.SimpleNamespace(node_id=pending)})
+    for node in (pending, control):
+        hyg.after_teardown(types.SimpleNamespace(nodeid=node, stash={}))
+    assert (pending_tree / "data").is_dir(), "a tree with a pending handshake was reclaimed"
+    assert os.listdir(str(control_tree)) == [], "the control tree was not reclaimed"
+    assert (hyg.STATS["reclaimed"], hyg.STATS["reclaim_left"]) == (1, 0), hyg.STATS
+
+
+def test_the_reclaim_records_what_the_removal_found_and_counts_only_what_stayed(
+        tmp_path, monkeypatch):
+    """Review D4: a violation made between the inspection and the removal (by
+    a process the test left behind) must not be silently repaired; it is
+    recorded against the test as a late hygiene finding. A refusal is not a
+    hygiene finding of its own: what it leaves behind is counted in
+    reclaim_left, and reclaim_left counts only what the removal left."""
+    import _lib_test_temp as T
+
+    hyg = _patched_guard(monkeypatch, {})
+    recorded = _recording(monkeypatch)
+    node = "tests/test_x.py::test_owner"
+    late = T.Finding(str(tmp_path / "a" / "d"), "mode", "directory missing owner rwx (mode 0o555)")
+    refused = T.Finding(str(tmp_path / "b" / "e"), "identity",
+                        "repair refused: entry changed during traversal")
+    results = {str(tmp_path / "a"): T.Result(findings=[late], removed=True),
+               str(tmp_path / "b"): T.Result(findings=[refused], left=[refused.path])}
+    monkeypatch.setattr(T, "remove", lambda path, ops=None: results[path])
+    hyg.reclaim(str(tmp_path / "a"), node)
+    hyg.reclaim(str(tmp_path / "b"), node)
+    assert recorded == [(node, "temp-hygiene", "teardown", late.path, late.detail)], recorded
+    assert (hyg.STATS["reclaimed"], hyg.STATS["reclaim_left"]) == (1, 1), hyg.STATS
+
+
+@pytest.mark.parametrize("error", [FileExistsError, PermissionError],
+                         ids=["exists", "permission"])
+def test_a_tombstone_that_cannot_be_made_is_a_late_finding(tmp_path, monkeypatch, error):
+    """Review I3c F12: only an existing entry at the reclaimed name keeps that
+    name taken. Any other failure to make the tombstone leaves the name free
+    for a later test (review D1), so it is recorded against the test as a late
+    hygiene finding and counted as left, never passed over silently."""
+    import _lib_test_temp as T
+
+    hyg = _patched_guard(monkeypatch, {})
+    recorded = _recording(monkeypatch)
+    node = "tests/test_x.py::test_owner"
+    tree = str(tmp_path / "tree")
+    monkeypatch.setattr(T, "remove", lambda path, ops=None: T.Result(removed=True))
+    real_mkdir = os.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if os.fspath(path) == tree:
+            raise error(13 if error is PermissionError else 17, "refused", tree)
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(hyg.os, "mkdir", mkdir)
+    hyg.reclaim(tree, node)
+    monkeypatch.setattr(hyg.os, "mkdir", real_mkdir)
+    if error is FileExistsError:
+        assert recorded == [], recorded
+        assert (hyg.STATS["reclaimed"], hyg.STATS["reclaim_left"]) == (1, 0), hyg.STATS
+    else:
+        assert [(r[0], r[1], r[2], r[3]) for r in recorded] == [
+            (node, "temp-hygiene", "teardown", tree)], recorded
+        assert "tombstone" in recorded[0][4], recorded
+        assert (hyg.STATS["reclaimed"], hyg.STATS["reclaim_left"]) == (0, 1), hyg.STATS

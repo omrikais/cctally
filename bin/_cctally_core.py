@@ -78,6 +78,7 @@ def _init_paths_from_env() -> None:
     global STATUSLINE_AUTHORITATIVE_7D_PATH, STATUSLINE_AUTHORITATIVE_5H_PATH
     global STATUSLINE_ACCOUNT_BOUND_DIR, LEGACY_SPOOL_BASELINE_PATH
     global ACCOUNT_BOUND_CUTOVER_CACHE_PATH, LEGACY_WRITER_EVIDENCE_PATH
+    global STATUSLINE_ACCOUNT_BOUND_V1_DIR, ACCOUNT_BOUND_REVISION_CACHE_PATH
     global OAUTH_BACKOFF_MARKER_PATH, OAUTH_BACKOFF_COUNT_PATH
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
@@ -192,11 +193,25 @@ def _init_paths_from_env() -> None:
     # the journal-anchored legacy spool baseline. The coordinate cache only
     # accelerates locating the cutover op and never confers authority; the
     # legacy-writer evidence sidecar is diagnostic only (spec section 8).
-    STATUSLINE_ACCOUNT_BOUND_DIR = APP_DIR / "statusline-account-bound-v1"
+    #
+    # #797/#823/#840 (spec 4.6 B4): revision 2 of the fence moves every
+    # current coordination file — candidates, intake, evaluations, control,
+    # pending and retry state, acknowledgements, tombstones, frozen plans,
+    # locks, transition and recovery metadata, and the protocol files below
+    # — to the v2 root. No v1 state is imported. The v1 root is retired: its
+    # `accounts/` tree and `transport.last` join the legacy spool inventory
+    # (`_cctally_journal._legacy_spool_paths`), and this binary never writes,
+    # prunes or deletes anything under it.
+    STATUSLINE_ACCOUNT_BOUND_V1_DIR = APP_DIR / "statusline-account-bound-v1"
+    STATUSLINE_ACCOUNT_BOUND_DIR = APP_DIR / "statusline-account-bound-v2"
     LEGACY_SPOOL_BASELINE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-spool-baseline.json")
     ACCOUNT_BOUND_CUTOVER_CACHE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "cutover-coordinate.json")
+    #: The revision boundary's coordinate cache; like the cutover's, it only
+    #: accelerates the lookup and never confers authority.
+    ACCOUNT_BOUND_REVISION_CACHE_PATH = (
+        STATUSLINE_ACCOUNT_BOUND_DIR / "revision-coordinate.json")
     LEGACY_WRITER_EVIDENCE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-writer-evidence.json")
     OAUTH_BACKOFF_MARKER_PATH = APP_DIR / "oauth-backoff.until"
@@ -523,7 +538,23 @@ _init_paths_from_env()
 # `_cctally_store.validated_read_snapshot` checks inside each decision
 # scope's own snapshot. An epoch transition, not a numbered migration: the
 # registry stays frozen at 13.
-STATS_INDEX_EPOCH = 1018
+# 1018 -> 1019 (#797/#823/#840 spec 4.6 B6): revision 2 of the fence changes
+# the authoritative interpretation of retained journal records again — after
+# the `account_bound_revision` boundary a Claude-scoped record without
+# `wpr == 2` is excluded — so an index, a derivation-completeness proof or a
+# selector continuation produced under revision 1 is not current. The #825
+# section 6 precedent; still no numbered migration and no accounting column.
+# The same epoch carries the provider-sample index state of stage 1 (#797
+# Task 2, spec 4.3 D8 and D11), so 1019 is introduced once: the
+# `claude_oauth_samples` projection of raw api observations carrying
+# `oauth_request_started_at`, the `claude_weekly_observation_decisions`
+# projection of reviewed weekly decision ops that resolves a sample's weekly
+# eligibility at read time, and four NULLABLE identity columns on
+# `five_hour_credit_confirmation_state` (`baseline_observation_id`,
+# `baseline_generation`, `pending_generation`, `pending_position`) that the
+# five-hour credit generation (Task 5) writes. Both projections are rebuilt
+# from the journal; the confirmation state stays disposable.
+STATS_INDEX_EPOCH = 1019
 LEGACY_STATS_HEAD = 13
 
 
@@ -2691,17 +2722,83 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # above: a rebuild legitimately loses it, and the cold-start
         # consequence is stated at `_read_five_hour_source_state` in
         # `bin/_cctally_record.py`.
+        #
+        # #797/#823/#840 epoch 1019 (spec 4.9 D11): the four identity columns
+        # the five-hour credit generation writes, all NULL until it does.
+        # `baseline_observation_id` names the observation that set the
+        # baseline; `baseline_generation` / `pending_generation` are the
+        # effective five-hour credit generation the baseline and the armed
+        # descent were observed under, encoded `"<event_id>@<revision>"` with
+        # the no-credit sentinel `"none"`; `pending_position` is the arming
+        # observation's logical position. Columns of the CREATE, not an
+        # `add_column_if_missing`: an epoch-current open returns before any
+        # schema work, so only the epoch's fresh CREATE can carry them.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state (
-                account_key            TEXT NOT NULL,
-                five_hour_window_key   INTEGER NOT NULL,
-                source                 TEXT NOT NULL,
-                baseline_pct           REAL NOT NULL,
-                pending_low_pct        REAL,
-                pending_at_utc         TEXT,
-                pending_observation_id TEXT,
+                account_key             TEXT NOT NULL,
+                five_hour_window_key    INTEGER NOT NULL,
+                source                  TEXT NOT NULL,
+                baseline_pct            REAL NOT NULL,
+                pending_low_pct         REAL,
+                pending_at_utc          TEXT,
+                pending_observation_id  TEXT,
+                baseline_observation_id TEXT,
+                baseline_generation     TEXT,
+                pending_generation      TEXT,
+                pending_position        TEXT,
                 PRIMARY KEY (account_key, five_hour_window_key, source)
+            )
+            """
+        )
+        # #797/#823/#840 epoch 1019 (spec 4.3 D8, D9): provider samples. One
+        # row per ADMITTED Claude api observation carrying a valid
+        # `oauth_request_started_at` (`requested_at_utc`, canonical
+        # full-precision UTC, so text order is time order), projected from
+        # the RAW record by `_cctally_oauth_samples.project_sample` on every
+        # derivation path, independently of the snapshot fold, the five-hour
+        # adjustment and credit suppression or retirement. Values are the raw
+        # readings, never the MAX-clamped stored ones; `weekly_resets_at_utc`
+        # is nearest-hour normalized and `five_hour_window_key` is the
+        # authoritative canonical key. Journal truth (rebuilt, never pruned),
+        # indexed by account, axis window and `q` for the exact-window read.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_oauth_samples (
+                account_key             TEXT NOT NULL,
+                observation_id          TEXT NOT NULL,
+                requested_at_utc        TEXT NOT NULL,
+                captured_at_utc         TEXT NOT NULL,
+                weekly_percent          REAL,
+                weekly_resets_at_utc    TEXT,
+                five_hour_percent       REAL,
+                five_hour_resets_at_utc TEXT,
+                five_hour_window_key    INTEGER,
+                PRIMARY KEY (account_key, observation_id)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claude_oauth_samples_weekly "
+            "ON claude_oauth_samples "
+            "(account_key, weekly_resets_at_utc, requested_at_utc)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claude_oauth_samples_five_hour "
+            "ON claude_oauth_samples "
+            "(account_key, five_hour_window_key, requested_at_utc)"
+        )
+        # The effective reviewed weekly decision per observation (latest
+        # `claude_weekly_observation_decision[_v2]` op wins, journal order),
+        # projected by that op's fold applier so a sample's weekly
+        # eligibility is resolved at read time: `hold` excludes the weekly
+        # sample only, a later `accept` restores it.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_weekly_observation_decisions (
+                observation_id TEXT PRIMARY KEY,
+                disposition    TEXT NOT NULL,
+                decision_op_id TEXT NOT NULL
             )
             """
         )

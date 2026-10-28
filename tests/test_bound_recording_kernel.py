@@ -83,23 +83,53 @@ def _snapshots(app):
         conn.close()
 
 
+def _interleave_excluded_legacy_write(app):
+    """A previous-release recorder's reading, appended raw (unstamped) after
+    the account-bound cutover, so admission excludes it."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    jr.ensure_account_bound_cutover()
+    legacy = J.unstamped_record(J.make_obs(
+        at=_iso(NOW), src="record-usage", provider="claude",
+        payload={"weekly_percent": 55.0, "resets_at": NOW + 3 * 86400,
+                 "source": "api", "captured_at": _iso(NOW)}))
+    segments = jr.list_segments()
+    import _cctally_core as core
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    segment = segments[-1] if segments else J.segment_name(jr._utc_now())
+    with open(core.JOURNAL_DIR / segment, "ab") as fh:
+        fh.write(J.encode_line(legacy))
+    return legacy["id"]
+
+
+@pytest.mark.parametrize("interleave", [False, True],
+                         ids=["plain", "excluded-legacy-write"])
 @pytest.mark.parametrize("first,second", [("A", "B"), ("B", "A")])
-def test_m1_capture_switch_publishes_only_as_the_captured_account(app, first, second):
+def test_m1_capture_switch_publishes_only_as_the_captured_account(
+        app, first, second, interleave):
     """Case M1 (#825, RED before the fix): the candidate is captured while
     `first` is active, the identity switches to `second` before the detached
-    reducer publishes, and the journal and the index still say `first`."""
+    reducer publishes, and the journal and the index still say `first`.
+
+    `excluded-legacy-write` is the M20 oracle's attribution-timing schedule,
+    extracted: a previous release's unstamped write lands between the switch
+    and the publication. Excluded by admission, it must neither carry its own
+    reading into the index nor move the captured candidate's attribution."""
     import _cctally_statusline as sl
+    import _lib_account_protocol as P
 
     captured = _identity(app, first)
     candidate = sl._candidate_from_input(_parsed(app, "peer"), received_at=NOW)
     assert candidate is not None
     sl._write_candidate(candidate)
     other = _identity(app, second)
+    legacy_id = _interleave_excluded_legacy_write(app) if interleave else None
 
     sl._statusline_reduce_and_publish(nudge_sink=lambda: None)
 
-    usage = _usage_obs(app)
+    usage = [r for r in _usage_obs(app) if r.get("id") != legacy_id]
     assert len(usage) == 1, usage
+    assert P.is_stamped(usage[0])
     assert usage[0].get("account") == captured, (
         f"published as {usage[0].get('account')!r}, captured as {captured!r} (#825)")
     assert usage[0]["payload"]["account_binding"]["accountKey"] == captured

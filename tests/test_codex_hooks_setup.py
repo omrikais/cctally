@@ -719,8 +719,7 @@ def _codex_root(home, *, key="root-1"):
 
 
 # The keyword is not spelled `timeout`: it is a handler field this builder
-# writes into a dict, and `tests/test_timing_budget_guard.py` reads every
-# `timeout=` keyword in the test estate as a blocking wait to classify.
+# writes into a dict, not a blocking wait.
 def _hooks_document(command, *, handler_timeout=30):
     handler = {"type": "command", "command": command}
     if handler_timeout is not None:

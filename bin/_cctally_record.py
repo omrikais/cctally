@@ -3428,8 +3428,13 @@ def _read_five_hour_source_state(conn, account_key, five_hour_window_key,
     """Return one contributor's five-hour state, or None when it has none.
 
     The tuple is ``(baseline_pct, pending_low_pct, pending_at_utc,
-    pending_observation_id)``; ``pending_low_pct is not None`` is the armed
-    predicate. A missing table is reported as "no state" rather than raised,
+    pending_observation_id, baseline_observation_id, baseline_generation,
+    pending_generation, pending_position)``; ``pending_low_pct is not None``
+    is the armed predicate. The last four are the v2 detector's causal facts
+    (#797/#823/#840 spec 4.9): the observation that established the baseline,
+    the credit generation the baseline and the pending descent were
+    established under, and the arming observation's capture instant. Each is
+    None on a row the historical detector or an earlier binary wrote. A missing table is reported as "no state" rather than raised,
     for the same reason the weekly debounce reader does it: the detector must
     never crash a recording tick over its own bookkeeping.
 
@@ -3467,7 +3472,9 @@ def _read_five_hour_source_state(conn, account_key, five_hour_window_key,
     try:
         row = conn.execute(
             "SELECT baseline_pct, pending_low_pct, pending_at_utc, "
-            "       pending_observation_id "
+            "       pending_observation_id, baseline_observation_id, "
+            "       baseline_generation, pending_generation, "
+            "       pending_position "
             "  FROM five_hour_credit_confirmation_state "
             " WHERE account_key = ? AND five_hour_window_key = ? "
             "   AND source = ?",
@@ -3482,19 +3489,31 @@ def _read_five_hour_source_state(conn, account_key, five_hour_window_key,
         None if row[1] is None else float(row[1]),
         row[2],
         row[3],
+        row[4],
+        row[5],
+        row[6],
+        row[7],
     )
 
 
 def _write_five_hour_source_state(conn, account_key, five_hour_window_key,
                                   source, *, baseline_pct,
                                   pending_low_pct=None, pending_at_utc=None,
-                                  pending_observation_id=None):
+                                  pending_observation_id=None,
+                                  baseline_observation_id=None,
+                                  baseline_generation=None,
+                                  pending_generation=None,
+                                  pending_position=None):
     """Upsert one contributor's state for one window, then retire that
     contributor's rows for earlier windows.
 
     The three ``pending_*`` values are written together on every call, so
     cancelling or confirming a descent is the same statement as arming one and
-    a stale pending value can never survive a state change.
+    a stale pending value can never survive a state change. The same holds
+    for the v2 causal facts (``baseline_observation_id``,
+    ``baseline_generation``, ``pending_generation``, ``pending_position``):
+    every write states all of them, so the historical detector's write
+    leaves none behind.
 
     ``pending_at_utc`` is the arming tick's DETECTION clock, which is what the
     five-hour path has always stamped into `effective_reset_at_utc`
@@ -3512,16 +3531,23 @@ def _write_five_hour_source_state(conn, account_key, five_hour_window_key,
     conn.execute(
         "INSERT INTO five_hour_credit_confirmation_state "
         "(account_key, five_hour_window_key, source, baseline_pct, "
-        " pending_low_pct, pending_at_utc, pending_observation_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        " pending_low_pct, pending_at_utc, pending_observation_id, "
+        " baseline_observation_id, baseline_generation, pending_generation, "
+        " pending_position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET "
         " baseline_pct = excluded.baseline_pct, "
         " pending_low_pct = excluded.pending_low_pct, "
         " pending_at_utc = excluded.pending_at_utc, "
-        " pending_observation_id = excluded.pending_observation_id",
+        " pending_observation_id = excluded.pending_observation_id, "
+        " baseline_observation_id = excluded.baseline_observation_id, "
+        " baseline_generation = excluded.baseline_generation, "
+        " pending_generation = excluded.pending_generation, "
+        " pending_position = excluded.pending_position",
         (account_key, int(five_hour_window_key), source, float(baseline_pct),
          None if pending_low_pct is None else float(pending_low_pct),
-         pending_at_utc, pending_observation_id),
+         pending_at_utc, pending_observation_id, baseline_observation_id,
+         baseline_generation, pending_generation, pending_position),
     )
     conn.execute(
         "DELETE FROM five_hour_credit_confirmation_state "
@@ -3532,7 +3558,8 @@ def _write_five_hour_source_state(conn, account_key, five_hour_window_key,
 
 def _step_five_hour_source_state(conn, account_key, five_hour_window_key,
                                  source, *, new_pct, observation_id,
-                                 drop_threshold, window_live, now_iso):
+                                 drop_threshold, window_live, now_iso,
+                                 generation=None, capture_at=None):
     """Advance one contributor's five-hour state by one observation.
 
     Returns ``(decision, prior_state)``, where ``prior_state`` is the row as it
@@ -3545,6 +3572,14 @@ def _step_five_hour_source_state(conn, account_key, five_hour_window_key,
     must leave the state armed so the next same-source reading below the
     baseline re-confirms and re-runs the idempotent pivots, rather than losing
     the credit outright.
+
+    ``generation`` (#797/#823/#840 spec 4.9) is the account and window's
+    current five-hour credit generation, passed only by the v2 detector. It
+    makes a state established under another generation obsolete (the
+    kernel), and it is recorded with what this observation establishes: the
+    baseline's observation and generation, and an arming observation's
+    generation and causal position (its capture instant, ``capture_at``). The
+    historical detector passes None and records none of these.
     """
     prior_state = _read_five_hour_source_state(
         conn, account_key, five_hour_window_key, source)
@@ -3556,7 +3591,11 @@ def _step_five_hour_source_state(conn, account_key, five_hour_window_key,
         observation_id=observation_id,
         drop_threshold=drop_threshold,
         window_live=window_live,
+        generation=generation,
+        baseline_generation=None if prior_state is None else prior_state[5],
+        pending_generation=None if prior_state is None else prior_state[6],
     )
+    v2 = generation is not None
     if decision.action == FIVE_HOUR_ARM:
         # The descent is recorded and nothing is emitted. The write clamp
         # raises this reading back to the baseline in
@@ -3569,18 +3608,189 @@ def _step_five_hour_source_state(conn, account_key, five_hour_window_key,
             pending_low_pct=new_pct,
             pending_at_utc=now_iso,
             pending_observation_id=observation_id,
+            baseline_observation_id=(
+                prior_state[4] if v2 and prior_state is not None else None),
+            baseline_generation=generation,
+            pending_generation=generation,
+            pending_position=capture_at if v2 else None,
         )
     elif decision.action in (FIVE_HOUR_SET_BASELINE, FIVE_HOUR_CANCEL):
         # Establish, raise, or cancel. All three write the baseline with the
         # three pending columns NULL, so a cancelled candidate cannot linger.
+        # The baseline's observation is this one unless a cancellation kept
+        # the higher prior baseline.
+        kept_prior = (prior_state is not None
+                      and float(decision.baseline_pct) != float(new_pct))
         _write_five_hour_source_state(
             conn, account_key, five_hour_window_key, source,
             baseline_pct=decision.baseline_pct,
+            baseline_observation_id=(
+                None if not v2 else
+                prior_state[4] if kept_prior else observation_id),
+            baseline_generation=generation,
         )
     # FIVE_HOUR_HOLD writes nothing: either the arming observation replayed
     # and must leave the state armed, or the reading neither raises the
     # baseline nor is eligible to arm.
     return decision, prior_state
+
+
+#: The no-credit sentinel of the five-hour credit generation (spec 4.9).
+FIVE_HOUR_NO_CREDIT_GENERATION = "none"
+#: The source-key prefix of a credit's causal facts in the disposable
+#: confirmation state (see `_record_five_hour_credit_facts`). No real
+#: contributor source carries it: the pipeline files such a source as
+#: `FIVE_HOUR_UNKNOWN_SOURCE`.
+FIVE_HOUR_CREDIT_FACTS_PREFIX = "#credit|"
+
+
+def five_hour_credit_generation(conn, five_hour_window_key, *,
+                                account_key) -> str:
+    """The account and window's current five-hour credit generation
+    (#797/#823/#840 spec 4.9, D3/D11): ``"<event_id>@<revision>"`` for the
+    selected effective credit, else ``"none"``.
+
+    The credit is the one `resolve_five_hour_reset_event` selects by logical
+    order (effective instant, detection instant, stable journal identity),
+    never by rowid, so a rebuild that renumbers rows cannot change it. The
+    event id is the harvest's natural key ``fhc:<account>:<window>:<effective>``
+    and the revision is a digest of the row's accounting content, so a
+    correction that rewrites the credit, or a tombstone that removes it,
+    gives a different generation and makes every state that depends on the
+    old one obsolete. A database error propagates."""
+    import _lib_journal
+
+    event = resolve_five_hour_reset_event(
+        conn, five_hour_window_key, account_key=account_key)
+    if isinstance(event, NoFiveHourResetEvent):
+        return FIVE_HOUR_NO_CREDIT_GENERATION
+    row = conn.execute(
+        "SELECT detected_at_utc, prior_percent, post_percent, "
+        "       effective_reset_at_utc "
+        "  FROM five_hour_reset_events WHERE id = ?",
+        (event.row_id,),
+    ).fetchone()
+    identity = _lib_journal.evt_id(
+        "fhc", account_key, int(five_hour_window_key),
+        event.effective_reset_at_utc)
+    return f"{identity}@{_five_hour_credit_revision(row)}"
+
+
+def _five_hour_credit_revision(row) -> str:
+    """A five-hour credit row's content revision: its accounting payload
+    (detection instant, both ends, effective instant), digested."""
+    import hashlib
+
+    return hashlib.sha256(json.dumps(
+        [str(row[0]), round(float(row[1]), 6), round(float(row[2]), 6),
+         str(row[3])], separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+
+
+def _position_epoch(text) -> "float | None":
+    try:
+        return parse_iso_datetime(text, "five_hour_state.position").timestamp()
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _rebase_five_hour_sources(conn, account_key, five_hour_window_key,
+                              confirming_source, *, arming_position,
+                              old_generation, new_generation):
+    """Carry every OTHER contributor of the window across a v2 credit
+    (#797/#823/#840 spec 4.9, D11).
+
+    A contributor whose pending descent was armed strictly AFTER the
+    confirming source's arming observation observed its low after the credit
+    happened, so that reading is independently observed post-credit growth:
+    it becomes the contributor's baseline in the new generation (the
+    observation identity carried with it) and the obsolete descent itself is
+    retired, never relabelled. D11's trace: A arms `20 -> 5`, B observes a
+    genuine 10, A confirms; B's `20 -> 10` is retired, its 10 is kept, and a
+    later `10 -> 0` is detected. Every other contributor state is left to the
+    generation rule, which retires it at that contributor's next
+    observation; a state recorded without a generation is stamped with the
+    old one first, so the rule reaches it too. An unknown or equal position
+    is never "after"."""
+    rows = conn.execute(
+        "SELECT source, baseline_pct, pending_low_pct, pending_at_utc, "
+        "       pending_observation_id, baseline_observation_id, "
+        "       baseline_generation, pending_generation, pending_position "
+        "  FROM five_hour_credit_confirmation_state "
+        " WHERE account_key = ? AND five_hour_window_key = ?",
+        (account_key, int(five_hour_window_key)),
+    ).fetchall()
+    armed_at = _position_epoch(arming_position)
+    for row in rows:
+        source = row[0]
+        if (source == confirming_source
+                or str(source).startswith(FIVE_HOUR_CREDIT_FACTS_PREFIX)):
+            continue
+        position = _position_epoch(row[8])
+        if (row[2] is not None
+                and row[7] in (old_generation, None)
+                and armed_at is not None and position is not None
+                and position > armed_at):
+            _write_five_hour_source_state(
+                conn, account_key, five_hour_window_key, source,
+                baseline_pct=float(row[2]),
+                baseline_observation_id=row[4],
+                baseline_generation=new_generation,
+            )
+        elif row[6] is None or (row[2] is not None and row[7] is None):
+            _write_five_hour_source_state(
+                conn, account_key, five_hour_window_key, source,
+                baseline_pct=float(row[1]),
+                pending_low_pct=row[2], pending_at_utc=row[3],
+                pending_observation_id=row[4],
+                baseline_observation_id=row[5],
+                baseline_generation=row[6] or old_generation,
+                pending_generation=(
+                    None if row[2] is None else row[7] or old_generation),
+                pending_position=row[8],
+            )
+
+
+def _record_five_hour_credit_facts(conn, account_key, five_hour_window_key,
+                                   confirming_source, *, prior_pct, post_pct,
+                                   armed_state, old_generation,
+                                   new_generation):
+    """Retain one v2 credit's causal facts beside the confirmation state
+    (#797/#823/#840 spec 4.4, 4.9): which source confirmed it, the
+    observation that established that source's baseline and the arming
+    observation. The status line resolves a five-hour credit's causal low
+    through them (a `statusline` credit, or an `api` credit whose baseline
+    and arming observations are provider samples); the confirmation state's
+    own row is replaced at the confirmation, so without this nothing would
+    say which observations a credit came from.
+
+    It is disposable exactly like the state it sits in: a rebuild drops it,
+    and a credit without facts is resolved as unknown, which invalidates and
+    so never refuses. The row is keyed by its ordinal in the window and the
+    confirming source, so the writer's trailing DELETE retires the same key
+    of earlier windows and the table stays proportional to live state. It
+    stores the credit's two ends in the baseline and pending columns, the
+    arming observation and instant, the baseline observation, and the
+    generation before (``baseline_generation``) and after
+    (``pending_generation``, which binds it to the credit's identity and
+    revision) the credit."""
+    count = conn.execute(
+        "SELECT COUNT(*) FROM five_hour_credit_confirmation_state "
+        " WHERE account_key = ? AND five_hour_window_key = ? "
+        "   AND source LIKE '#credit|%'",
+        (account_key, int(five_hour_window_key)),
+    ).fetchone()[0]
+    _write_five_hour_source_state(
+        conn, account_key, five_hour_window_key,
+        f"{FIVE_HOUR_CREDIT_FACTS_PREFIX}{int(count) + 1:02d}|{confirming_source}",
+        baseline_pct=float(prior_pct),
+        pending_low_pct=float(post_pct),
+        pending_at_utc=None if armed_state is None else armed_state[2],
+        pending_observation_id=None if armed_state is None else armed_state[3],
+        baseline_observation_id=None if armed_state is None else armed_state[4],
+        baseline_generation=old_generation,
+        pending_generation=new_generation,
+        pending_position=None if armed_state is None else armed_state[7],
+    )
 
 
 # ``CreditPlan`` / ``_parse_credit_at`` / ``_build_credit_plan`` now live in
@@ -3804,9 +4014,11 @@ def _credit_retirement_bands(conn, *, week_start_date, week_start_at,
 
     #834 S1 (#835). `_doomed_snapshot_rows` names the rows a firing credit is
     about to remove; this names, for a week that has already been credited, the
-    (floor, retired value) pairs a stored row can still match. It exists because
-    #835 preserves held rows, so a row carrying a retired weekly value can now
-    outlive the credit that retired it and a read must recognize it.
+    (floor, retired value) pairs a stored row can still match. #835 used the
+    retired values as a read-side band; #840 (spec section 4.8) removed that
+    band, so the one remaining reader is `_latest_credit_floor_instant`, which
+    takes only the floors: a stored value is read as stored, and a poisoned one
+    is corrected by `db rederive`'s reviewed `retract`.
 
     The two legs are scoped exactly the way `_reset_aware_floor`
     (bin/_cctally_core.py) scopes them, and the two must stay in step: a
@@ -3875,8 +4087,7 @@ def _latest_credit_floor_instant(bands):
     drift apart, and so a caller cannot accidentally take the FIRST floor, which
     would admit rows an intervening credit already invalidated.
 
-    An unparseable floor contributes nothing, matching
-    `_weekly_value_is_retired_replica`, which skips one for the same reason."""
+    An unparseable floor contributes nothing."""
     latest = None
     for floor_at, _retired, _inclusive in bands:
         try:
@@ -3886,71 +4097,6 @@ def _latest_credit_floor_instant(bands):
         if latest is None or moment > latest:
             latest = moment
     return latest
-
-
-def _weekly_value_is_retired_replica(bands, *, captured_at_utc, weekly_percent):
-    """True when a stored weekly value is one a credit in `bands` retired.
-
-    #834 S1 (#835). The same band and floor predicate the stale-replica DELETE
-    applies, applied as a READ filter instead of as a deletion: captured at or
-    after the credit's floor, and within 1.0 point of the value that credit
-    retired.
-
-    Instants are compared as PARSED moments rather than as text, because the two
-    sides carry mixed offset spellings (`Z` on a capture stamp, `+00:00` on a
-    floor) — the same reason every SQL site wraps both sides in `unixepoch()`.
-
-    AN UNPARSEABLE CAPTURE STAMP IS TREATED AS NOT RETIRED HERE, and what that
-    means for the read depends on the CALLER. There are three, and the floor bound
-    belongs to exactly one of them.
-
-    `_latest_seven_day_and_window` (bin/_cctally_five_hour.py) carries a floor bound
-    ahead of this predicate, added in Gate A R1. That bound treats an unparseable
-    stamp inside a credited week as pre-floor and ends the walk with `None`, which
-    is the right disposition: a row that cannot be placed relative to the floor
-    cannot be certified as able to state the week's current effective value. So
-    there, a malformed row blanks the read.
-
-    `_load_five_hour_milestones` (bin/_cctally_five_hour.py, from tranche A) carries
-    no such bound. An unparseable `snapshot_captured_at_utc` makes this function
-    return `False` and the joined effective crossing value RENDERS. A correction of
-    record: an earlier version of this docstring generalized R1's floor bound to
-    every caller, and it holds for one.
-
-    `_credit_aware_block_weekly_axes` (bin/_cctally_five_hour.py) carries no floor
-    bound either, but since Gate A R8 an unparseable instant never reaches this
-    predicate from it: `_block_weekly_axis_weeks` parses every axis instant first —
-    including `block_start_at`, which the start axis falls back to — and returns an
-    EMPTY TUPLE when it cannot, which resolves no bands. (It returned `None` when
-    this paragraph was written; R8 made it return a tuple of candidate weeks and R9
-    added a third resolution pass, and both forms are falsy, so the caller's `if not
-    week_ids` guard is unaffected. The stated value was simply stale.) The value
-    renders for that reason rather than this one. Same outcome, different mechanism,
-    and the mechanism matters because only one of the two is a deliberate decision.
-
-    What this function's own tolerance buys in every case is that a malformed stamp
-    is never MISclassified as retired, which is what keeps the uncredited-week path
-    byte-stable."""
-    if weekly_percent is None or not bands:
-        return False
-    try:
-        captured = parse_iso_datetime(captured_at_utc, "captured_at").timestamp()
-    except (ValueError, TypeError):
-        return False
-    for floor_at, retired, inclusive in bands:
-        try:
-            floor = parse_iso_datetime(floor_at, "credit_floor").timestamp()
-        except (ValueError, TypeError):
-            continue
-        if captured < floor:
-            continue
-        delta = abs(float(weekly_percent) - retired)
-        # The band's comparison belongs to the credit that set it: the automatic
-        # path is inclusive, `record-credit` is strict. See
-        # `_doomed_snapshot_rows` for why those two differ.
-        if (delta <= 1.0) if inclusive else (delta < 1.0):
-            return True
-    return False
 
 
 def _fire_in_place_credit(conn, week_start_date, cur_end_canon, weekly_percent,
@@ -4189,7 +4335,8 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                             ctx=None, account_key=_lib_accounts.UNATTRIBUTED,
                             origin_observation_id=None, capture_at=None,
                             source=None, hold_weekly_axis=False,
-                            outcomes_allowed=True, fold_policy=0):
+                            outcomes_allowed=True, fold_policy=0,
+                            detector_policy="historical"):
     """Detect + record weekly and 5h reset/credit artifacts for one usage
     observation (extracted from ``cmd_record_usage``; DB journal redesign
     §5.2.3).
@@ -4277,6 +4424,15 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
       records every doomed row in its one ``suppression`` list, exactly as
       the historical policy writes it, so the previous release folds it,
       and the current applier replays it with the same split.
+    - ``detector_policy`` (#797/#823/#840 spec 4.9, default
+      ``"historical"``): the detector revision the raw observation recorded,
+      as `_cctally_journal.detector_policy_of` reads it. ``"v2"`` decides
+      five-hour credits by the per-account, per-window credit generation
+      instead of the ``(prior_percent, post_percent)`` pair check. The
+      default keeps every direct caller, and every observation an earlier
+      release journaled, on the historical detector. The pipeline never
+      calls this for an ``"unsupported"`` revision (the step is withheld),
+      and passes a projection-filled axis as not observed (D6).
     """
     c = _cctally()
     now_utc = _as_of_or_command(as_of)
@@ -4560,6 +4716,16 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                 # SECOND reading would become the baseline and a descent
                 # between them would be invisible.
                 five_hour_source = source or FIVE_HOUR_UNKNOWN_SOURCE
+                if five_hour_source.startswith(FIVE_HOUR_CREDIT_FACTS_PREFIX):
+                    five_hour_source = FIVE_HOUR_UNKNOWN_SOURCE
+                # #797/#823/#840 spec 4.9 (D3, D11): the v2 detector decides
+                # against the window's current credit generation, read in this
+                # same transaction, so the confirmation rechecks it.
+                v2_detector = detector_policy == "v2"
+                generation = (
+                    five_hour_credit_generation(
+                        conn, five_hour_window_key, account_key=account_key)
+                    if v2_detector else None)
                 src_decision, src_state = _step_five_hour_source_state(
                     conn, account_key, five_hour_window_key, five_hour_source,
                     new_pct=float(five_hour_percent),
@@ -4567,6 +4733,8 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     drop_threshold=c._FIVE_HOUR_RESET_PCT_DROP_THRESHOLD,
                     window_live=window_live,
                     now_iso=now_utc.isoformat(timespec="seconds"),
+                    generation=generation,
+                    capture_at=capture_dt.isoformat(timespec="seconds"),
                 )
                 if src_decision.action == FIVE_HOUR_CONFIRM and not outcomes_allowed:
                     # Quarantined (spec 5.6 item 2): no event, no stale-replica
@@ -4634,21 +4802,34 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     # `post_5h_pct`, not the confirming tick's percent —
                     # comparing an armed low against a confirming percent
                     # answers no question at all.
-                    most_recent = conn.execute(
-                        "SELECT prior_percent, post_percent "
-                        "  FROM five_hour_reset_events "
-                        " WHERE five_hour_window_key = ? "
-                        "   AND account_key = ? "
-                        " ORDER BY id DESC LIMIT 1",
-                        (int(five_hour_window_key), account_key),
-                    ).fetchone()
-                    is_dup = (
-                        most_recent is not None
-                        and round(prior_5h_pct, 1)
-                        == round(float(most_recent["prior_percent"]), 1)
-                        and round(post_5h_pct, 1)
-                        == round(float(most_recent["post_percent"]), 1)
-                    )
+                    #
+                    # #797/#823/#840 spec 4.9 (D3): the v2 detector replaces
+                    # the pair check with causal retry identity plus the
+                    # credit generation. A credit is now confirmed only from a
+                    # descent armed in the current generation, so a replay of
+                    # one descent, or a second source's copy of it, can no
+                    # longer reach this point, while a genuine second
+                    # `20 -> 5` in a distinct slot is a new credit the pair
+                    # check would have swallowed. The historical detector
+                    # keeps the pair check exactly.
+                    if v2_detector:
+                        is_dup = False
+                    else:
+                        most_recent = conn.execute(
+                            "SELECT prior_percent, post_percent "
+                            "  FROM five_hour_reset_events "
+                            " WHERE five_hour_window_key = ? "
+                            "   AND account_key = ? "
+                            " ORDER BY id DESC LIMIT 1",
+                            (int(five_hour_window_key), account_key),
+                        ).fetchone()
+                        is_dup = (
+                            most_recent is not None
+                            and round(prior_5h_pct, 1)
+                            == round(float(most_recent["prior_percent"]), 1)
+                            and round(post_5h_pct, 1)
+                            == round(float(most_recent["post_percent"]), 1)
+                        )
                     # 10-min floor (spec §2.3 — bounded
                     # stacked-credit resolution; one event per
                     # 10-min slot per block). Resolved BEFORE
@@ -4911,10 +5092,37 @@ def detect_reset_and_credit(conn, *, week_start_date, week_end_at,
                     # armed so the next same-source reading below the
                     # baseline re-confirms and re-runs the idempotent
                     # pivots, rather than losing the credit outright.
+                    new_generation = None
+                    if v2_detector:
+                        # The generation this credit established (unchanged
+                        # when the ten-minute slot absorbed it). When it moved,
+                        # every other contributor is carried across it and the
+                        # credit's causal facts are retained.
+                        new_generation = five_hour_credit_generation(
+                            conn, five_hour_window_key,
+                            account_key=account_key)
+                        if new_generation != generation:
+                            _rebase_five_hour_sources(
+                                conn, account_key, five_hour_window_key,
+                                five_hour_source,
+                                arming_position=(
+                                    src_state[7] or src_state[2]
+                                    if src_state is not None else None),
+                                old_generation=generation,
+                                new_generation=new_generation)
+                            _record_five_hour_credit_facts(
+                                conn, account_key, five_hour_window_key,
+                                five_hour_source, prior_pct=prior_5h_pct,
+                                post_pct=post_5h_pct, armed_state=src_state,
+                                old_generation=generation,
+                                new_generation=new_generation)
                     _write_five_hour_source_state(
                         conn, account_key, five_hour_window_key,
                         five_hour_source,
                         baseline_pct=float(five_hour_percent),
+                        baseline_observation_id=(
+                            origin_observation_id if v2_detector else None),
+                        baseline_generation=new_generation,
                     )
         except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
             # Exception discipline (6c-gate P1): on the ingest path
@@ -6182,6 +6390,16 @@ def record_usage_bound(
         raw["five_hour_percent"] = five_hour_percent
     if five_hour_resets_at_str is not None:
         raw["five_hour_resets_at"] = five_hour_resets_at_str
+    # #797/#823/#840 spec 4.3 D8: the request-start instant `q` of the OAuth
+    # fetch publishing this reading, an additive raw key the previous release
+    # reads past with `.get`. Only an api publication whose fetch recorded `q`
+    # carries it; nothing else — a status-line reading, a direct
+    # `record-usage`, a frozen plan's recovery — ever gains one.
+    request_started = getattr(args, "oauth_request_started_at", None)
+    if (isinstance(request_started, str) and publication is None
+            and raw["source"] == "api"):
+        import _lib_oauth_samples
+        raw[_lib_oauth_samples.REQUEST_STARTED_KEY] = request_started
     # #825/#832 spec 4.7 / 5.1: the binding and the plan's stable publication
     # identity live in the RAW observation payload (never in a known event
     # payload). The previous release reads this payload by `.get`, so the extra
@@ -6207,6 +6425,13 @@ def record_usage_bound(
         raw[_jr.FOLD_POLICY_KEY] = _jr.CURRENT_FOLD_POLICY
     elif _jr.PLAN_FOLD_POLICY_KEY in publication:
         raw[_jr.FOLD_POLICY_KEY] = publication[_jr.PLAN_FOLD_POLICY_KEY]
+    # #797/#823/#840 spec 4.9 (D12): the detector revision, recorded the same
+    # way. A plan frozen before it carries none, so its recovery publishes an
+    # observation the historical detector decides, byte-identical to before.
+    if publication is None:
+        raw[_jr.DETECTOR_POLICY_KEY] = _jr.DETECTOR_POLICY
+    elif _jr.PLAN_DETECTOR_POLICY_KEY in publication:
+        raw[_jr.DETECTOR_POLICY_KEY] = publication[_jr.PLAN_DETECTOR_POLICY_KEY]
     import _lib_accounts
     # Observe-and-stamp (#341, spec §1): resolve the active Claude account from
     # ~/.claude.json (stable-read, mtime-cached) and stamp the usage obs with it.
@@ -7842,6 +8067,59 @@ def _five_hour_saved_from_fold(fold, *, snapshot_id, capture_at,
     }
 
 
+def _detector_observation_mask(payload, detector_policy, *, account_key,
+                               five_hour) -> "tuple[bool, bool] | None":
+    """``(observe_weekly, observe_five_hour)`` for one raw observation, or
+    None when its detector step is withheld (#797/#823/#840 spec 4.9, D6).
+
+    The historical detector sees every axis, as every earlier release did. A
+    v2 observation that is not a status-line publication (a direct
+    `record-usage`, an OAuth reading) is a reading of every axis it carries.
+    A v2 publication's validated provenance decides per axis: a `projection`
+    axis was filled from the store and is not a new reading of its source,
+    while `candidate` and `retained_low` axes are. Provenance that does not
+    classify a published axis for this account cannot say which axes are
+    readings, so the step is withheld."""
+    if detector_policy == "unsupported":
+        return None
+    if detector_policy == "historical" or "publication_id" not in payload:
+        return True, True
+    provenance = payload.get("publication")
+    if not isinstance(provenance, dict):
+        return None
+    observed = {}
+    for axis, present in (("sevenDay", True), ("fiveHour", five_hour)):
+        if not present:
+            observed[axis] = False
+            continue
+        source = provenance.get(axis)
+        if (not isinstance(source, dict)
+                or source.get("account") != account_key
+                or source.get("kind") not in ("candidate", "projection",
+                                              "retained_low")):
+            return None
+        observed[axis] = source["kind"] != "projection"
+    return observed["sevenDay"], observed["fiveHour"]
+
+
+def _detect_observation(c, conn, *, observe, detector_policy, **kwargs):
+    """The shared detector over one observation's observed axes (spec 4.9).
+    A projection-filled weekly axis takes the held branch (no weekly reset or
+    credit detection at all, the five-hour detector still runs); a
+    projection-filled five-hour axis is not passed, so the whole source-local
+    step — baseline, arming, confirmation, cancellation, generation change
+    and pruning — is skipped for it. The filled values stay available to the
+    fold, which the caller runs on the observation unchanged."""
+    observe_weekly, observe_five_hour = observe
+    if not observe_weekly:
+        kwargs["hold_weekly_axis"] = True
+    if not observe_five_hour:
+        kwargs["five_hour_window_key"] = None
+        kwargs["five_hour_percent"] = None
+    c.detect_reset_and_credit(
+        conn, commit=False, detector_policy=detector_policy, **kwargs)
+
+
 def _pipeline_claude_usage(ctx, rec):
     """Obs-derivation pipeline hook (spec §5.2 step 4b) — the ingest-cycle
     transplant of ``cmd_record_usage``'s derivation body.
@@ -7908,6 +8186,15 @@ def _pipeline_claude_usage(ctx, rec):
     # byte-identical on a single-account install.
     import _lib_accounts
     account_key = rec.get("account") or _lib_accounts.UNATTRIBUTED
+
+    # #797/#823/#840 spec 4.3 D8: the provider sample, projected from the RAW
+    # record before any detection or fold decision, so equal readings the fold
+    # deduplicates still each produce one, and neither the five-hour
+    # adjustment nor a credit's suppression or retirement can alter it. The
+    # same call serves live ingest and both scratch replays; the apply-only
+    # rebuild offers its read pass to the same projection.
+    import _cctally_oauth_samples
+    _cctally_oauth_samples.project_record(conn, rec)
 
     # Week boundaries from resets_at (cmd_record_usage canonicalization).
     # Normalize before deriving the date keys as well as the ISO overrides:
@@ -7976,33 +8263,37 @@ def _pipeline_claude_usage(ctx, rec):
     #    ordinary recording below continues (C3).
     import _cctally_quarantine
     gate = _cctally_quarantine.quarantine_gate(ctx, account_key)
-    c.detect_reset_and_credit(
-        conn,
-        week_start_date=week_start_date,
-        week_end_at=week_end_at,
-        weekly_percent=weekly_percent,
-        five_hour_window_key=five_hour_window_key,
-        five_hour_percent=five_hour_percent,
-        as_of=as_of,
-        commit=False,
-        ctx=ctx,
-        account_key=account_key,
-        # #750 S3: the raw journal id of the line this derivation came from.
-        # The debounce ARM records it so a byte-identical replay of the first
-        # zero cannot confirm itself.
-        origin_observation_id=rec.get("id"),
-        # The CAPTURE stamp, not `as_of`. It is what every
-        # `effective_reset_at_utc` records, so live detection and the backfill
-        # (which reads `weekly_usage_snapshots.captured_at_utc`) agree about
-        # the same physical reset.
-        capture_at=capture_at,
-        # #769 S2 §3: the contributor discriminator for five-hour credit
-        # confirmation. `payload.source`, never `rec["src"]`.
-        source=source,
-        hold_weekly_axis=hold_weekly_axis,
-        outcomes_allowed=gate.allowed,
-        fold_policy=fold_policy,
-    )
+    # #797/#823/#840 spec 4.9 (D6, D12): the detector revision this raw
+    # observation recorded, and which of its axes are readings of its source.
+    # An unsupported or malformed revision, or a v2 publication whose
+    # provenance does not classify its axes, withholds the whole detector step
+    # (an outcome may always be withheld); ordinary recording below continues.
+    detector_policy = jr.detector_policy_of(payload)
+    observe = _detector_observation_mask(
+        payload, detector_policy, account_key=account_key,
+        five_hour=five_hour_percent is not None)
+    if observe is not None:
+        _detect_observation(
+            c, conn, observe=observe, detector_policy=detector_policy,
+            week_start_date=week_start_date, week_end_at=week_end_at,
+            weekly_percent=weekly_percent,
+            five_hour_window_key=five_hour_window_key,
+            five_hour_percent=five_hour_percent, as_of=as_of, ctx=ctx,
+            account_key=account_key,
+            # #750 S3: the raw journal id of the line this derivation came
+            # from. The debounce ARM records it so a byte-identical replay of
+            # the first zero cannot confirm itself.
+            origin_observation_id=rec.get("id"),
+            # The CAPTURE stamp, not `as_of`. It is what every
+            # `effective_reset_at_utc` records, so live detection and the
+            # backfill (which reads `weekly_usage_snapshots.captured_at_utc`)
+            # agree about the same physical reset.
+            capture_at=capture_at,
+            # #769 S2 §3: the contributor discriminator for five-hour credit
+            # confirmation. `payload.source`, never `rec["src"]`.
+            source=source,
+            hold_weekly_axis=hold_weekly_axis, outcomes_allowed=gate.allowed,
+            fold_policy=fold_policy)
 
     # 2. Accept/skip DECISION (clamp + dedup), made ONCE and journaled via the
     #    snapshot_accept evt (so replay never re-derives it — spec §5.3).

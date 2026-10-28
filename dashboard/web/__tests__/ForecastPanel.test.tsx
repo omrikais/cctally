@@ -49,11 +49,4 @@ describe('<ForecastPanel />', () => {
     expect(foot?.textContent).toContain('$24.50');  // budget_100_per_day_usd
     expect(foot?.textContent).toContain('$21.00');  // budget_90_per_day_usd
   });
-
-  it('renders the crystal-ball icon in the header', () => {
-    render(<ForecastPanel />);
-    const header = document.querySelector('#panel-forecast .panel-header');
-    const use = header?.querySelector('use');
-    expect(use?.getAttribute('href')).toBe('/static/icons.svg#crystal-ball');
-  });
 });

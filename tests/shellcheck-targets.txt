@@ -10,7 +10,6 @@ public bin/_lib-fts5-probe.sh
 public bin/_lib-golden-diff.sh
 public bin/_lib-harness-env.sh
 public bin/_lib-kill-server.sh
-public bin/_lib-linux-matrix-manifest.sh
 public bin/_lib-test-contract.sh
 public bin/build-readme-screenshots.sh
 public bin/cctally-5h-canonical-test
@@ -65,7 +64,6 @@ private bin/cctally-preview
 public bin/cctally-pricing-check-test
 public bin/cctally-project
 public bin/cctally-project-test
-private bin/cctally-reap-test
 public bin/cctally-quota-test
 public bin/cctally-reconcile-test
 public bin/cctally-record-credit-test
@@ -75,6 +73,7 @@ public bin/cctally-refresh-usage
 private bin/cctally-release-harness-isolation-test
 private bin/cctally-release-test
 public bin/cctally-report-test
+private bin/cctally-runner-job-env.sh
 public bin/cctally-session-test
 public bin/cctally-settings-api-test
 public bin/cctally-setup-test
@@ -87,13 +86,9 @@ public bin/cctally-statusline-test
 public bin/cctally-subgroup-test
 public bin/cctally-sync-week
 public bin/cctally-test-all
-private bin/cctally-test-remote
-private bin/cctally-test-remote-test
 public bin/cctally-transcript
 public bin/cctally-tui
 public bin/cctally-tui-test
 public bin/cctally-update
 public bin/cctally-update-test
 public bin/cctally-weekly-test
-private bin/runner-job-hook-completed.sh
-private bin/runner-job-hook-started.sh

@@ -7,6 +7,8 @@ the fail-closed production-write detector that enforces preserve-item 3.
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -336,6 +338,171 @@ def test_a_raw_os_open_is_blocked(guarded):
 
 def test_os_remove_is_blocked(guarded):
     _blocked(os.remove, guarded.root / "doomed.txt")
+    assert (guarded.root / "doomed.txt").exists()
+
+
+def test_unlinking_a_link_into_a_guarded_root_is_allowed(guarded, tmp_path):
+    """Review D2: removing a directory entry writes the directory that holds
+    it, not the target of a link. A link in scratch that points into the root
+    (or at a file in it) is removed without touching the root."""
+    to_dir, to_file = tmp_path / "to-dir", tmp_path / "to-file"
+    os.symlink(guarded.root, to_dir)
+    os.symlink(guarded.root / "seed.txt", to_file)
+    os.remove(to_dir)
+    os.unlink(to_file)
+    assert not os.path.lexists(to_dir) and not os.path.lexists(to_file)
+    assert (guarded.root / "seed.txt").read_text() == "seed"
+
+
+def test_removing_through_a_linked_parent_is_still_blocked(guarded, tmp_path):
+    """Only the final component is left unresolved: a parent that is a link
+    into the root still lands the removal inside it."""
+    alias = tmp_path / "alias"
+    os.symlink(guarded.root, alias)
+    _blocked(os.remove, alias / "doomed.txt")
+    _blocked(os.rmdir, alias / "sub")
+    assert (guarded.root / "doomed.txt").exists() and (guarded.root / "sub").is_dir()
+
+
+def test_a_trailing_separator_through_a_link_is_still_blocked(guarded, tmp_path):
+    """A trailing separator makes the kernel follow a final link, so such a
+    path is resolved whole, like every other guarded event."""
+    alias = tmp_path / "sub-alias"
+    os.symlink(guarded.root / "sub", alias)
+    _blocked(os.rmdir, str(alias) + os.sep)
+    assert (guarded.root / "sub").is_dir()
+
+
+@pytest.fixture
+def aliased_root(guarded, tmp_path):
+    """A protected root registered by the path of a link to it: the link is
+    the root's own alias, the name by which the root is configured."""
+    import _lib_test_isolation as iso
+
+    real = tmp_path / "real-root"
+    real.mkdir()
+    alias = tmp_path / "alias-root"
+    os.symlink(real, alias)
+    iso.add_protected_root(alias)
+    try:
+        yield alias
+    finally:
+        iso.remove_protected_root(alias)
+
+
+def test_removing_a_roots_own_alias_is_blocked(aliased_root, tmp_path):
+    """Review I3c F4: removing a link that IS a root's configured path takes
+    the root away from that path, which is a write to it. Only the parent is
+    canonicalized for an entry removal, so the alias's own entry has to be
+    recognized as the root."""
+    _blocked(os.remove, aliased_root)
+    _blocked(os.unlink, aliased_root)
+    _blocked(os.rmdir, aliased_root)
+    _blocked(os.rename, aliased_root, tmp_path / "moved-alias")
+    assert os.path.islink(aliased_root)
+
+
+def test_another_link_to_an_aliased_root_is_still_removable(aliased_root, tmp_path):
+    """The D2 negative survives F4: a link in scratch that merely points at
+    the root is not the root's configured path."""
+    other = tmp_path / "other-link"
+    os.symlink(os.path.realpath(aliased_root), other)
+    os.remove(other)
+    assert not os.path.lexists(other) and os.path.islink(aliased_root)
+
+
+def test_a_child_keeps_a_roots_alias_from_being_removed(aliased_root):
+    """The alias travels in the envelope: a child installed from it blocks
+    the same removal."""
+    proc = subprocess.run(
+        [sys.executable, "-c", f"import os; os.remove({str(aliased_root)!r})"],
+        capture_output=True, text=True, timeout=120)
+    assert proc.returncode != 0 and "ProductionWriteBlocked" in proc.stderr, proc.stderr
+    assert os.path.islink(aliased_root)
+
+
+def test_renaming_a_link_out_of_a_guarded_root_is_blocked(guarded, tmp_path):
+    """Review I3c F5: a rename removes its source ENTRY, so a link inside the
+    root moved out of it is a write to the root, wherever the link points."""
+    import _lib_test_isolation as iso
+
+    root = tmp_path / "link-root"
+    root.mkdir()
+    link = root / "link-out"
+    os.symlink(guarded.outside, link)
+    iso.add_protected_root(root)
+    try:
+        _blocked(os.rename, link, tmp_path / "moved")
+        _blocked(os.replace, link, tmp_path / "moved")
+    finally:
+        iso.remove_protected_root(root)
+    assert os.path.islink(link)
+
+
+def test_replacing_a_scratch_link_to_a_root_file_is_allowed(guarded, tmp_path):
+    """The destination is an entry too: replacing a scratch link that points
+    into the root replaces the link and leaves the root's file alone."""
+    link = tmp_path / "to-seed"
+    os.symlink(guarded.root / "seed.txt", link)
+    source = tmp_path / "new.txt"
+    source.write_text("new")
+    os.replace(source, link)
+    assert not os.path.islink(link) and link.read_text() == "new"
+    assert (guarded.root / "seed.txt").read_text() == "seed"
+
+
+@pytest.fixture
+def root_fd(guarded):
+    fd = os.open(guarded.root, os.O_RDONLY)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def test_a_dir_fd_relative_removal_inside_a_root_is_blocked(guarded, root_fd, tmp_path):
+    """Review I3c F5: a name relative to `dir_fd` lands in that directory, not
+    in the working directory. shutil.rmtree removes through exactly these
+    calls."""
+    _blocked(os.unlink, "doomed.txt", dir_fd=root_fd)
+    _blocked(os.rmdir, "sub", dir_fd=root_fd)
+    _blocked(os.mkdir, "made", dir_fd=root_fd)
+    _blocked(os.rename, "seed.txt", "moved.txt", src_dir_fd=root_fd, dst_dir_fd=root_fd)
+    _blocked(os.rename, guarded.outside, "moved.txt", dst_dir_fd=root_fd)
+    assert (guarded.root / "doomed.txt").exists() and (guarded.root / "sub").is_dir()
+    assert not (guarded.root / "made").exists() and (guarded.root / "seed.txt").exists()
+
+
+def test_rmtree_inside_a_root_removes_nothing(guarded, tmp_path):
+    """The reviewer's probe: rmtree's fd-based walk unlinked the files below
+    the root before the guard stopped it at the directory."""
+    import _lib_test_isolation as iso
+
+    root = tmp_path / "tree-root"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "f.txt").write_text("x")
+    iso.add_protected_root(root)
+    try:
+        _blocked(shutil.rmtree, root / "sub")
+    finally:
+        iso.remove_protected_root(root)
+    assert (root / "sub" / "f.txt").read_text() == "x"
+
+
+def test_a_dir_fd_relative_removal_in_scratch_is_allowed(guarded, tmp_path, monkeypatch):
+    """The negative: with the working directory inside a root, a name relative
+    to a scratch `dir_fd` is resolved against the scratch directory, never
+    against the working directory."""
+    scratch = tmp_path / "scratch-dir"
+    scratch.mkdir()
+    (scratch / "doomed.txt").write_text("x")
+    monkeypatch.chdir(guarded.root)
+    fd = os.open(scratch, os.O_RDONLY)
+    try:
+        os.unlink("doomed.txt", dir_fd=fd)
+    finally:
+        os.close(fd)
+    assert not (scratch / "doomed.txt").exists()
     assert (guarded.root / "doomed.txt").exists()
 
 
@@ -2107,7 +2274,7 @@ def test_965_a_caught_retention_rejection_still_fails_the_test(tmp_path):
 
 def test_the_session_directory_follows_the_suite_temp_root(tmp_path):
     """#963 (note R11): the isolation session directory lives in the suite
-    generation's private temp root, so it is removed with it, instead of
+    directory's private temp root, so it is removed with it, instead of
     accumulating under TMPDIR for every session and every --collect-only."""
     import tempfile
 
@@ -2120,7 +2287,7 @@ def test_the_session_directory_follows_the_suite_temp_root(tmp_path):
     # ignores env once one exists), so the leaf is named through it.
     leaf = iso.session_id(env)
     assert iso.session_dir(env) == root / "cctally-isolation" / leaf, (
-        "the isolation session directory is outside the suite generation")
+        "the isolation session directory is outside the suite directory")
     fallback = pathlib.Path(tempfile.gettempdir()) / "cctally-isolation" / leaf
     for value in (str(tmp_path / "missing"), "relative/t", ""):
         env["PYTEST_DEBUG_TEMPROOT"] = value
@@ -2157,3 +2324,37 @@ def test_the_child_environment_applies_the_suite_temp_root(monkeypatch):
                         lambda child, parent: seen.append(dict(child)))
     iso._child_environment({"PATH": "/usr/bin"})
     assert seen, "_child_environment does not restore the suite temp root"
+
+
+_SIGNAL_LEAK_MODULE = """\
+import signal
+
+
+def test_a_leaks_an_ignored_sighup():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
+def test_b_runs_after_the_leak():
+    assert signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN, "the leak reached the next test"
+"""
+
+
+def test_a_test_that_leaves_a_signal_ignored_fails_by_name_and_is_undone(tmp_path):
+    """A disposition left at SIG_IGN outlives the test that set it: every later
+    child of the worker inherits it, and a bash child cannot trap a signal
+    ignored on entry. In full run 20261022T163749Z-064006cef9dc that surfaced
+    25 minutes later, as a SIGHUP test failing in another module. The
+    conftest guard fails the leaking test itself and restores the disposition
+    so the next test is not affected."""
+    module = tmp_path / "test_nested_signal_leak.py"
+    module.write_text(_SIGNAL_LEAK_MODULE)
+    synthetic = tmp_path / "nested-data"
+    synthetic.mkdir()
+    proc = _nested_pytest(module, tmp_path, synthetic, ("-rA", "-p", "no:xdist"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, out
+    assert re.search(r"^ERROR \S*test_nested_signal_leak\.py::test_a_leaks_an_ignored_sighup\b",
+                     out, re.M), out
+    assert "left SIGHUP at SIG_IGN" in out, out
+    assert re.search(r"^PASSED \S*test_nested_signal_leak\.py::test_b_runs_after_the_leak$",
+                     out, re.M), out

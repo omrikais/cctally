@@ -68,6 +68,12 @@ Glyphs: `✓` applied, `✗` failed, `·` pending, `~` skipped. The `version
 N / M known` header reads `PRAGMA user_version` for `N` and the
 in-memory registry length for `M`.
 
+After the database blocks, `db status` prints one line for each detached stats.db worker that has left a record — the upgrade rebuild that runs after an update, and the corruption auto-heal — using the same sentence as `cctally doctor`'s `db.rebuild_worker` check, for example `the last stats.db upgrade rebuild died without finishing` or `a stats.db auto-heal has been running for 12 minutes`. A worker that has never run prints nothing, so the output is unchanged on an install that never needed either.
+
+### JSON output
+
+`--json` adds a top-level `rebuildWorkers` object with an `epoch` and a `heal` member. Each carries the worker's run state (`state`: start, phase, last progress, resident and peak memory, outcome; `null` when it has never run), `stateUnreadable`, a summary of its launch ledger (`ledger`: unresolved launches, per-outcome `counts`, `lastDeathAt`, the newest launch), the probed `liveness` of a running worker (`alive`, `gone`, `unknown` or `null`), the `pending` request (`present`, `since`), the deaths a later worker recovered in the last 7 days (`recoveredDeaths`), and a `classification` (`severity`, `row`, `summary`, `warnings`) identical to the doctor check. Like the rest of `db status`, it is gathered read-only: no lock is taken and nothing is written.
+
 ### Exit codes
 
 `0` success.
@@ -297,8 +303,8 @@ cctally db rederive --family claude-usage --yes
 `--reviewed-weekly-decisions PATH` supplies an operator's exact historical
 decision for Claude raw observation IDs. It holds only the weekly axis;
 five-hour credit detection and block derivation still run. An `accept` entry
-explicitly supersedes an earlier `hold` for the same ID. Latest journal order
-wins. No value, source, cadence, or reset-count rule chooses IDs automatically,
+explicitly supersedes an earlier `hold` or `retract` for the same ID. Latest
+journal order wins. No value, source, cadence, or reset-count rule chooses IDs automatically,
 and the weekly-reset burst guard still refuses ambiguous plans.
 
 If a held observation already anchors a retained five-hour or weekly milestone,
@@ -311,6 +317,23 @@ pre-existing missing reference remains outside the correction. An
 explicit `accept` also authorizes one otherwise baseline-identical `week_reset`
 action only when that action names the accepted raw observation as its exact
 origin. It cannot admit another reset or any other baseline action.
+
+**`retract` removes a stale reading and everything it caused** (manifest
+schema 3). Use it for a weekly reading proven stale after it was recorded,
+for example an idle session's cached value replayed after a credit. Its weekly
+axis is suppressed exactly as a `hold`'s, but a `hold` keeps the outcomes that
+already depend on the reading and a `retract` does not: the planner keeps,
+supersedes or tombstones each outcome by what the corrected replay derives
+without the retracted readings. Weekly resets and credits that only the
+retracted readings caused are tombstoned, milestones that rested on them are
+re-derived or removed, and every remaining milestone's snapshot references are
+closed against the corrected selection without bringing back a tombstoned
+reset. A reset the corrected replay still derives is kept. The weekly-reset
+burst guard still refuses an ambiguous plan.
+Preview counts retractions on their own (`reviewedWeeklyDecisionCounts`, and
+the text line `reviewed decisions: hold=…, accept=…, retract=…`).
+
+One reviewed decision is stored as a single journal line, which is limited to 65,536 bytes, so one manifest holds at most about 800 retractions (each adds about 81 bytes to the stored op; a long `reason` or other entries lower the limit slightly). Split a larger set into sequential manifests, each reviewed against a fresh journal prefix and applied before the next is prepared. Decisions combine per observation ID and the latest one wins, so each later manifest lists only the IDs that remain.
 
 The UTF-8 JSON manifest has either the legacy v1 shape:
 
@@ -350,6 +373,30 @@ accepted/replay snapshot identity:
 }
 ```
 
+or the v3 shape, which is v2 with the `retract` disposition admitted in
+`weeklyAxisDecisions`:
+
+```json
+{
+  "schemaVersion": 3,
+  "journalHighWater": {"segment": "observations-2026-10.jsonl", "offset": 12345},
+  "journalPrefixHash": "sha256:<64 lowercase hex digits>",
+  "reviewedAt": "2026-10-27T08:00:00Z",
+  "reason": "Retract the replayed idle-session readings",
+  "weeklyAxisDecisions": [
+    {"observationId": "o:<exact raw ID>", "disposition": "retract"},
+    {"observationId": "o:<another raw ID>", "disposition": "hold"}
+  ],
+  "snapshotIdentityDecisions": []
+}
+```
+
+A v3 decision is stored as a schema-3 op that records each retraction both as
+a weekly `hold` and in its own retraction list. A previous release reads the
+hold projection when it finishes an interrupted derivation, and refuses
+`db rederive` over a retained schema-3 op (exit 2), so apply a `retract` with
+the release that wrote it.
+
 The snapshot pair is still subject to the automatic account, window, weekly
 axis, dependency, and uniqueness checks. `preserve` permits only the otherwise
 ambiguous intervening-observation case. A later prefix-bound `rederive`
@@ -386,8 +433,9 @@ reviewed correction actions. Use a fresh review for a changed journal prefix.
 Review both the baseline disclosure and the complete causal decision graph
 before using `--yes`.
 
-To undo a mistaken hold, review a fresh prefix and submit a later `accept`
-entry for that exact ID. To undo a snapshot identity preservation, submit a
+To undo a mistaken hold or retraction, review a fresh prefix and submit a
+later `accept` entry for that exact ID (a later `hold` turns a retraction
+back into a hold). To undo a snapshot identity preservation, submit a
 later v2 `rederive` entry for that exact pair.
 The journal line size limit also applies to the whole decision op; oversized
 manifests refuse before append.
@@ -437,7 +485,7 @@ own re-derivation is a deliberate retirement and is left alone.
 | `--yes` | Apply the previewed plan, or finish recovery of a completed batch. Without it, the command is read-only. |
 | `--json` | Emit a stamped `schemaVersion: 1` object. |
 
-JSON always includes `status`, `family`, `journalHighWater`, `batchId`, `planHash`, `actionCounts`, `actionCountsByEventKind`, `planGuard`, `preservedEventCount`, `conflicts`, `journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and retained-source errors preserve the already-captured `journalHighWater`. `uncertainCostFactCount` appears when facts the plan leaves in place lack enough provenance for automatic repricing: a closed block with a zero-cost model that cannot be proven unpriced, a close or Codex budget crossing whose retained population changed, a Codex budget crossing with a model whose direct card has since been removed, a Codex budget crossing recorded without pricing evidence, and every Codex projected alert. A no-op plan with this count does not certify that those historical amounts are correct. `status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`, `missing-source`, or `failed`. New optional keys may be added without a schema version bump. `reviewedWeeklyDecisionId` is present when this invocation supplied a manifest.
+JSON always includes `status`, `family`, `journalHighWater`, `batchId`, `planHash`, `actionCounts`, `actionCountsByEventKind`, `planGuard`, `preservedEventCount`, `conflicts`, `journalConflicts`, `dataGaps`, `errors`, `rebuild`, and `noOp`. If a readable journal exists, input and retained-source errors preserve the already-captured `journalHighWater`. `uncertainCostFactCount` appears when facts the plan leaves in place lack enough provenance for automatic repricing: a closed block with a zero-cost model that cannot be proven unpriced, a close or Codex budget crossing whose retained population changed, a Codex budget crossing with a model whose direct card has since been removed, a Codex budget crossing recorded without pricing evidence, and every Codex projected alert. A no-op plan with this count does not certify that those historical amounts are correct. `status` is `preview`, `applied`, `recovered`, `no-op`, `conflict`, `missing-source`, or `failed`. New optional keys may be added without a schema version bump. `reviewedWeeklyDecisionId` and `reviewedWeeklyDecisionCounts` (`hold`, `accept` and `retract` counts) are present when this invocation supplied a manifest.
 
 `actionCountsByEventKind` breaks the planner-owned `retain`, `supersede`,
 `tombstone`, and `add` dispositions out for every classified event kind, with

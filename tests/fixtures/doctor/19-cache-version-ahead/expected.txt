@@ -25,6 +25,7 @@ Database
   ✓ Integrity                quick_check ok
   ⚠ Version ahead            cache.db ahead (v99 > known v49) — auto-heals
       → Auto-heals on next command, or run `cctally db recover --db cache`
+  ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
   ✓ Migrations               0/62 applied
   ⚠ Pending migrations       62 pending
       → Run any cctally command — opens the DB and applies pending migrations
@@ -91,4 +92,4 @@ Telemetry
 Performance
   ✓ Dashboard disk writes    No dashboard is running.
 
-Summary: 64 OK · 6 WARN · 0 FAIL
+Summary: 65 OK · 6 WARN · 0 FAIL

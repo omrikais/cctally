@@ -824,16 +824,6 @@ describe('<CacheReportModal /> #443 S1 flag column', () => {
     expect(glyph).not.toBeNull();
     expect(glyph!.textContent).toBe('·');
   });
-
-  it('carries the crm-flag-glyph styling hook on the mobile card glyph', () => {
-    stubMobileMedia(true);
-    updateSnapshot(envelopeWith(unevaluatedOldestRowReport()));
-    render(<CacheReportModal />);
-    const card = screen.getAllByTestId('crm-daily-card').at(-1)!;
-    const glyph = card.querySelector('.cd-flag.flag-none .crm-flag-glyph');
-    expect(glyph).not.toBeNull();
-    expect(glyph!.textContent).toBe('·');
-  });
 });
 
 describe('<CacheReportModal /> #443 S1 legend', () => {

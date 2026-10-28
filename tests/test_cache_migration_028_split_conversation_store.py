@@ -45,13 +45,27 @@ def test_028_preserves_core_tables_and_is_idempotent(tmp_path, monkeypatch):
     redirect_paths(ns, monkeypatch, tmp_path)
     db = sys.modules["_cctally_db"]
     core = sys.modules["_cctally_core"]
+    # About 367 freed pages take several 50-page chunks, so the reclaim must
+    # carry on past its first chunk and stop when a chunk frees nothing.
+    monkeypatch.setattr(db, "_028_VACUUM_CHUNK_PAGES", 50)
     conn = sqlite3.connect(core.CACHE_DB_PATH)
     try:
+        # cache.db is INCREMENTAL and WAL in production, so 028 must hand the
+        # dropped transcript store's pages back to the file system there.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        conn.execute("PRAGMA journal_mode=WAL")
         db._apply_cache_schema(conn)
+        bulk_text = "transcript prose " * 120
         conn.execute(
             "INSERT INTO session_entries "
             "(source_path,line_offset,timestamp_utc,model) "
             "VALUES ('core.jsonl',0,'2026-07-20T00:00:00Z','model')"
+        )
+        conn.executemany(
+            "INSERT INTO conversation_messages "
+            "(source_path,byte_offset,entry_type,text) "
+            "VALUES ('bulk.jsonl',?,'human',?)",
+            [(offset, bulk_text) for offset in range(1, 301)],
         )
         conn.execute(
             "INSERT INTO conversation_messages "
@@ -93,7 +107,20 @@ def test_028_preserves_core_tables_and_is_idempotent(tmp_path, monkeypatch):
             "'2026-07-27T00:00:00Z')"
         )
         conn.commit()
+        pages_before = conn.execute("PRAGMA page_count").fetchone()[0]
         _handler(db)(conn)
+        # #998: on CPython 3.11 a bare `PRAGMA incremental_vacuum` steps once
+        # and frees a single page, so cache.db kept the dropped transcript
+        # store's pages on its freelist and never shrank after 028.
+        # A stop after the first chunk leaves free pages behind on a store
+        # whose dropped transcript corpus spans more than one chunk.
+        assert conn.execute("PRAGMA freelist_count").fetchone() == (0,)
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        pages_after = conn.execute("PRAGMA page_count").fetchone()[0]
+        # Bytes, not pages, so the bound holds at any page size: the file
+        # gives back at least half of the dropped prose.
+        assert page_size * (pages_before - pages_after) >= (
+            300 * len(bulk_text) // 2)
         assert conn.execute(
             "SELECT value FROM cache_meta "
             "WHERE key='codex_physical_mutation_seq'"

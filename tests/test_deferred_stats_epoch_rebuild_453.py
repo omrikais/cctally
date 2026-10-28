@@ -161,8 +161,8 @@ def test_scheduler_spawns_once_and_recent_marker_suppresses_duplicates(
     spawned: list[str] = []
     monkeypatch.setattr(
         _cctally_update,
-        "_spawn_detached",
-        lambda command: spawned.append(command) or True,
+        "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or os.getpid(),
     )
 
     assert store.defer_stats_epoch_rebuild() == "spawned"
@@ -175,11 +175,11 @@ def test_scheduler_failed_spawn_is_immediately_retryable(runtime, monkeypatch):
     _ns, core, _db, store = runtime
     import _cctally_update
 
-    outcomes = iter((False, True))
+    outcomes = iter((None, os.getpid()))
     monkeypatch.setattr(
         _cctally_update,
-        "_spawn_detached",
-        lambda _command: next(outcomes),
+        "_spawn_detached_with_pid",
+        lambda _command, **_kw: next(outcomes),
     )
 
     assert store.defer_stats_epoch_rebuild() == "failed"
@@ -205,8 +205,8 @@ def test_scheduler_suppresses_launch_while_long_worker_holds_flock(
     spawned: list[str] = []
     monkeypatch.setattr(
         _cctally_update,
-        "_spawn_detached",
-        lambda command: spawned.append(command) or True,
+        "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or os.getpid(),
     )
     try:
         assert store.defer_stats_epoch_rebuild() == "pending"
@@ -597,9 +597,70 @@ def _subprocess_env(core) -> dict[str, str]:
     return env
 
 
+def _epoch_run(store):
+    """The epoch worker's recorded run, read without touching its flock.
+
+    `_WorkerRun.begin()` writes the run only after the worker has won its
+    flock, so a recorded run is a started worker. The handshake must never
+    poll `_stats_epoch_rebuild_worker_active()`: that probe try-locks the
+    worker flock EXCLUSIVE for an instant, and a worker whose own
+    non-blocking claim lands in that instant exits `busy`, while the fresh
+    pending marker suppresses a respawn, so the test waited out its
+    backstop and failed."""
+    return (store.read_worker_state("epoch")["state"] or {}).get("run")
+
+
+@contextlib.contextmanager
+def _replay_held(core, store):
+    """Hold the stats maintenance lock SHARED, as a live reader does, for the
+    body; then release it and wait (bounded) for the deferred worker to end.
+
+    Every replay of the index, the epoch worker's or an inline one, needs that
+    lock EXCLUSIVE, so while it is held no replay can publish: a foreground
+    that returns inside the body returned while the replay stayed blocked,
+    whatever the host's speed (#453; an `elapsed < 3.0` reading of the
+    foreground failed under full-suite load). The worker the foreground
+    spawned records its run and then waits for the lock, which is the
+    "started" half of the handshake (`_await_worker_started`); releasing the
+    lock lets it finish, so the test leaves no process behind."""
+    core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(core.STATS_LOCK_MAINTENANCE_PATH, os.O_RDWR | os.O_CREAT,
+                 0o600)
+    fcntl.flock(fd, fcntl.LOCK_SH)
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+        def worker_ended():
+            run = _epoch_run(store)
+            return run is None or (
+                run.get("status") == "finished"
+                and store.process_identity(run.get("pid"))["status"] == "gone")
+
+        deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+        while not worker_ended() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert worker_ended(), "the released epoch worker never finished"
+
+
+def _await_worker_started(core, store):
+    """The foreground's deferred worker is running and blocked before any
+    replay: it has recorded its run (so it holds the worker flock) and the
+    index is still at the old epoch."""
+    deadline = time.monotonic() + PRESENCE_BACKSTOP_SECONDS
+    while _epoch_run(store) is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert _epoch_run(store) is not None, (
+        "the foreground never started the deferred epoch worker")
+    assert store._raw_user_version(core.DB_PATH) == (
+        core.STATS_INDEX_EPOCH - 1), "the replay ran while it was held"
+
+
 def test_statusline_renders_promptly_while_stats_epoch_worker_runs(runtime):
     """A Claude prompt must retain provider truth and never wait for replay."""
-    ns, core, _db, _store = runtime
+    ns, core, _db, store = runtime
     ns["open_db"]().close()
     _stamp(core.DB_PATH, core.STATS_INDEX_EPOCH - 1)
     now = int(time.time())
@@ -611,19 +672,18 @@ def test_statusline_renders_promptly_while_stats_epoch_worker_runs(runtime):
         },
     })
 
-    started = time.monotonic()
-    result = subprocess.run(
-        [str(BIN), "statusline"],
-        input=payload,
-        text=True,
-        capture_output=True,
-        env=_subprocess_env(core),
-        timeout=PRESENCE_BACKSTOP_SECONDS,
-    )
-    elapsed = time.monotonic() - started
+    with _replay_held(core, store):
+        result = subprocess.run(
+            [str(BIN), "statusline"],
+            input=payload,
+            text=True,
+            capture_output=True,
+            env=_subprocess_env(core),
+            timeout=PRESENCE_BACKSTOP_SECONDS,
+        )
+        _await_worker_started(core, store)
 
     assert result.returncode == 0, result.stderr
-    assert elapsed < 3.0
     assert "17%" in result.stdout and "23%" in result.stdout
     assert len(result.stdout.splitlines()) == 1
 
@@ -640,22 +700,21 @@ def test_stats_commands_return_retry_guidance_instead_of_partial_output(
     runtime, argv,
 ):
     """Broad fallback kernels must not swallow the epoch control signal."""
-    ns, core, _db, _store = runtime
+    ns, core, _db, store = runtime
     ns["open_db"]().close()
     _stamp(core.DB_PATH, core.STATS_INDEX_EPOCH - 1)
 
-    started = time.monotonic()
-    result = subprocess.run(
-        [str(BIN), *argv],
-        text=True,
-        capture_output=True,
-        env=_subprocess_env(core),
-        timeout=PRESENCE_BACKSTOP_SECONDS,
-    )
-    elapsed = time.monotonic() - started
+    with _replay_held(core, store):
+        result = subprocess.run(
+            [str(BIN), *argv],
+            text=True,
+            capture_output=True,
+            env=_subprocess_env(core),
+            timeout=PRESENCE_BACKSTOP_SECONDS,
+        )
+        _await_worker_started(core, store)
 
     assert result.returncode == 3
-    assert elapsed < 3.0
     assert result.stdout == ""
     assert "rebuild is running in the background; retry shortly" in result.stderr
 

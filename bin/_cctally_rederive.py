@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
@@ -28,9 +29,10 @@ import _cctally_core
 import _cctally_journal as _journal
 import _cctally_record as _record
 import _lib_account_protocol
+import _lib_clone_copy
 import _lib_journal
-import _lib_journal_router
 import _lib_json_envelope
+import _lib_rebuild_progress
 import _lib_rederive
 import _cctally_store
 from _cctally_store import StatsIndexNotCurrent
@@ -77,6 +79,10 @@ class RederivePreview:
     reviewed_decision_id: "str | None" = None
     baseline_plan: "_lib_rederive.RederivePlan | None" = None
     baseline_plan_guard: "dict | None" = None
+    # D4: the empty correction batch an unfinished reviewed decision whose
+    # plan has no actions completes with. Never reported as `batch_id`, so a
+    # preview's output is unchanged; None when there is no such decision.
+    empty_decision_batch_id: "str | None" = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,15 @@ def _cache_fingerprint(cache_conn: sqlite3.Connection, *, include_codex=False) -
     The caller must have validated the cache contract first, including
     ``validate_codex_cache_contract`` when ``include_codex`` is set (#874):
     a missing column here is a raw sqlite error, not a typed data gap.
+
+    #997 D16: the digest is `_fingerprint` of
+    ``{"codexEntries"?, "sessionEntries", "sessionFiles"}`` (each a list of
+    row lists), but the canonical JSON is fed to SHA-256 row by row as the
+    cursor yields it, in sorted key order with `_canonical_bytes`' encoder
+    settings, instead of materializing every row and one document of them
+    (+0.7 GB transient on the maintainer's cache). The bytes hashed, and so
+    the digest, are identical, so a preview's plan guard and an apply's
+    recheck agree across the change.
     """
     entry_columns = (
         "source_path", "line_offset", "timestamp_utc", "model", "input_tokens",
@@ -135,27 +150,39 @@ def _cache_fingerprint(cache_conn: sqlite3.Connection, *, include_codex=False) -
         "cache_create_1h_tokens", "cost_usd_raw", "speed", "account_key",
     )
     file_columns = ("path", "session_id", "project_path")
-    entries = [
-        list(row) for row in cache_conn.execute(
+    sections = {
+        "sessionEntries": (
             "SELECT " + ",".join(entry_columns)
-            + " FROM session_entries ORDER BY source_path, line_offset")
-    ]
-    files = [
-        list(row) for row in cache_conn.execute(
+            + " FROM session_entries ORDER BY source_path, line_offset"),
+        "sessionFiles": (
             "SELECT " + ",".join(file_columns)
-            + " FROM session_files ORDER BY path")
-    ]
-    basis = {"sessionEntries": entries, "sessionFiles": files}
+            + " FROM session_files ORDER BY path"),
+    }
     if include_codex:
-        basis["codexEntries"] = [
-            list(row) for row in cache_conn.execute(
-                "SELECT source_path,line_offset,timestamp_utc,session_id,model,"
-                "input_tokens,cached_input_tokens,output_tokens,"
-                "reasoning_output_tokens,account_key "
-                "FROM codex_session_entries ORDER BY source_path,line_offset"
-            )
-        ]
-    return _fingerprint(basis)
+        sections["codexEntries"] = (
+            "SELECT source_path,line_offset,timestamp_utc,session_id,model,"
+            "input_tokens,cached_input_tokens,output_tokens,"
+            "reasoning_output_tokens,account_key "
+            "FROM codex_session_entries ORDER BY source_path,line_offset"
+        )
+    encode = json.JSONEncoder(
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode
+    digest = hashlib.sha256()
+    digest.update(b"{")
+    for index, key in enumerate(sorted(sections)):
+        if index:
+            digest.update(b",")
+        digest.update(encode(key).encode("utf-8") + b":[")
+        first = True
+        for row in cache_conn.execute(sections[key]):
+            if not first:
+                digest.update(b",")
+            first = False
+            digest.update(encode(list(row)).encode("utf-8"))
+        digest.update(b"]")
+    digest.update(b"}")
+    return "sha256:" + digest.hexdigest()
 
 
 def _split_matches(parts, total) -> bool:
@@ -544,24 +571,30 @@ def _scratch_read_adapters(cache_conn: sqlite3.Connection):
             setattr(cctally, name, value)
 
 
+#: Op kinds the scratch replay runs through the pipeline hooks.
+_REDERIVABLE_OP_KINDS = frozenset({
+    "weekly_credit_floor", "account_observe", "account_label",
+    "accounts_cutover", "sync_week",
+})
+
+
+def _is_rederivable_raw(record: dict) -> bool:
+    """Whether the scratch replay runs ``record`` through the pipeline hooks:
+    a Claude reading from a recording source, or a deriving/registry op
+    (#997 spec D5: a per-record predicate, so the replay can test a record it
+    prepared one at a time)."""
+    t = record.get("t")
+    if t == "obs":
+        return (record.get("provider") == "claude"
+                and record.get("src") in _record._CLAUDE_OBS_SRCS)
+    if t != "op":
+        return False
+    kind = (record.get("payload") or {}).get("kind")
+    return kind in _REDERIVABLE_OP_KINDS or kind in _REVIEWED_WEEKLY_KINDS
+
+
 def _rederivable_raw_records(records: list[dict]) -> list[dict]:
-    out = []
-    for record in records:
-        if record.get("t") == "obs":
-            if (
-                record.get("provider") == "claude"
-                and record.get("src") in _record._CLAUDE_OBS_SRCS
-            ):
-                out.append(record)
-            continue
-        if record.get("t") != "op":
-            continue
-        kind = (record.get("payload") or {}).get("kind")
-        if kind in {"weekly_credit_floor", "account_observe",
-                    "account_label", "accounts_cutover", "sync_week",
-                    *_REVIEWED_WEEKLY_KINDS}:
-            out.append(record)
-    return out
+    return [record for record in records if _is_rederivable_raw(record)]
 
 
 #: #825/#832 spec 5.1: the previous release validates a reviewed weekly
@@ -596,6 +629,16 @@ _REVIEWED_OP_KEYS_V2 = frozenset({
     "journal_prefix_hash", "reason", "weekly_axis_decisions",
     "snapshot_identity_decisions",
 }) | _REVIEWED_OP_EXPECTATION_KEYS
+#: #797/#823/#840 spec 4.7 (Q5): payload schema 3 adds the canonical
+#: `weekly_axis_retractions` list beside the hold projection. Manifest schema 3
+#: keeps schema 2's keys and admits the `retract` disposition.
+_REVIEWED_OP_KEYS_V3 = _REVIEWED_OP_KEYS_V2 | frozenset({
+    "weekly_axis_retractions",
+})
+_REVIEWED_MANIFEST_DISPOSITIONS = {
+    1: ("hold", "accept"), 2: ("hold", "accept"),
+    3: ("hold", "accept", "retract"),
+}
 
 
 def _reviewed_weekly_op_from_manifest(path) -> dict:
@@ -612,9 +655,11 @@ def _reviewed_weekly_op_from_manifest(path) -> dict:
     version = manifest.get("schemaVersion")
     expected_keys = (
         _REVIEWED_MANIFEST_KEYS_V1 if version == 1
-        else _REVIEWED_MANIFEST_KEYS_V2 if version == 2
+        else _REVIEWED_MANIFEST_KEYS_V2 if version in (2, 3)
         else None
     )
+    if type(version) is not int:
+        expected_keys = None
     actual_keys = set(manifest)
     if (expected_keys is None
             or actual_keys not in (
@@ -622,7 +667,8 @@ def _reviewed_weekly_op_from_manifest(path) -> dict:
                 expected_keys | _REVIEWED_MANIFEST_EXPECTATION_KEYS,
             )):
         raise _lib_rederive.RederiveConflict(
-            "reviewed weekly decision manifest requires schemaVersion 1 or 2"
+            "reviewed weekly decision manifest requires schemaVersion 1, 2 "
+            "or 3 with exactly its fields"
         )
     for key in _REVIEWED_MANIFEST_EXPECTATION_KEYS & actual_keys:
         value = manifest[key]
@@ -684,7 +730,8 @@ def _reviewed_weekly_op_from_manifest(path) -> dict:
                 or set(item) != {"observationId", "disposition"}
                 or not isinstance(item["observationId"], str)
                 or not item["observationId"]
-                or item["disposition"] not in ("hold", "accept")):
+                or item["disposition"]
+                not in _REVIEWED_MANIFEST_DISPOSITIONS[version]):
             raise _lib_rederive.RederiveConflict(
                 "reviewed weekly decision entry is malformed"
             )
@@ -723,19 +770,18 @@ def _reviewed_weekly_op_from_manifest(path) -> dict:
             item["acceptedObservationId"], item["replayObservationId"],
         ))
         normalized_identity.append(dict(item))
-    payload = {
+    base = {
         "kind": _REVIEWED_WEEKLY_KIND,
         "schema_version": version,
         "journal_high_water": dict(hw),
         "journal_prefix_hash": digest,
         "reason": reason,
     }
-    if version == 1:
-        payload["decisions"] = sorted(
-            normalized, key=lambda item: item["observationId"])
-    else:
-        payload["weekly_axis_decisions"] = sorted(
-            normalized, key=lambda item: item["observationId"])
+    # #797/#823/#840 spec 4.7: a retraction persists as an ordinary `hold` in
+    # the decision list plus the canonical `weekly_axis_retractions` list.
+    payload = _lib_rederive.reviewed_weekly_payload(
+        version=version, decisions=normalized, base=base)
+    if version != 1:
         payload["snapshot_identity_decisions"] = sorted(
             normalized_identity,
             key=lambda item: (
@@ -776,7 +822,7 @@ def _reviewed_weekly_expected_hashes(path, *, required: bool):
             "reviewed weekly decision manifest has unexpected fields"
         )
     version = manifest.get("schemaVersion")
-    if version not in (1, 2):
+    if version not in (1, 2, 3) or type(version) is not int:
         return None
     present = _REVIEWED_MANIFEST_EXPECTATION_KEYS & set(manifest)
     if not present:
@@ -835,7 +881,13 @@ def _reviewed_op_expected_hashes(record, *, required: bool):
     return values
 
 
-def _reviewed_weekly_state(records):
+def _reviewed_weekly_decisions(records):
+    """``(effective, identity_pairs, ops)`` of the retained reviewed weekly
+    decisions of ``records``: the effective disposition per observation
+    (``hold``, ``accept`` or ``retract``; the latest logical decision wins),
+    the preserved snapshot identity pairs, and the ops in journal order.
+    Every payload goes through the one strict decoder
+    (`_lib_rederive.decode_reviewed_weekly_payload`)."""
     raw_ids = {
         record.get("id") for record in records
         if record.get("t") == "obs"
@@ -845,88 +897,54 @@ def _reviewed_weekly_state(records):
         and "resets_at" in (record.get("payload") or {})
     }
     effective = {}
+    identity_effective = {}
     ops = []
     for record in records:
         if (record.get("t") != "op" or
                 (record.get("payload") or {}).get("kind")
                 not in _REVIEWED_WEEKLY_KINDS):
             continue
-        payload = record["payload"]
-        version = payload.get("schema_version")
-        decisions = (
-            payload.get("decisions") if version == 1
-            else payload.get("weekly_axis_decisions") if version == 2
-            else None
-        )
-        identity_decisions = (
-            [] if version == 1 else payload.get("snapshot_identity_decisions")
-        )
-        if (not isinstance(decisions, list)
-                or not isinstance(identity_decisions, list)
-                or not decisions and not identity_decisions):
-            raise _lib_rederive.RederiveConflict(
-                "malformed retained reviewed weekly decision op"
-            )
-        seen = set()
-        for item in decisions:
-            if (not isinstance(item, dict)
-                    or set(item) != {"observationId", "disposition"}
-                    or not isinstance(item["observationId"], str)
-                    or item["disposition"] not in ("hold", "accept")):
-                raise _lib_rederive.RederiveConflict(
-                    "malformed retained reviewed weekly decision entry"
-                )
-            obs_id = item["observationId"]
-            if obs_id not in raw_ids or obs_id in seen:
+        decoded = _lib_rederive.decode_reviewed_weekly_payload(
+            record["payload"])
+        for obs_id, disposition in decoded.dispositions.items():
+            if obs_id not in raw_ids:
                 raise _lib_rederive.RederiveConflict(
                     f"unknown or duplicate reviewed weekly observation: {obs_id}"
                 )
-            seen.add(obs_id)
-            effective[obs_id] = item["disposition"]
-        identity_ids = set()
-        for item in identity_decisions:
-            if (not isinstance(item, dict)
-                    or set(item) != {
-                        "acceptedObservationId", "replayObservationId",
-                        "disposition",
-                    }
-                    or not all(
-                        isinstance(item.get(key), str) and item[key]
-                        for key in (
-                            "acceptedObservationId", "replayObservationId",
-                        )
-                    )
-                    or item.get("disposition") not in (
-                        "preserve", "rederive",
-                    )
-                    or item["acceptedObservationId"]
-                    == item["replayObservationId"]
-                    or item["acceptedObservationId"] in identity_ids
-                    or item["replayObservationId"] in identity_ids):
-                raise _lib_rederive.RederiveConflict(
-                    "malformed retained snapshot identity decision"
-                )
-            identity_ids.update((
-                item["acceptedObservationId"], item["replayObservationId"],
-            ))
-        ops.append(record)
-    identity_effective = {}
-    for op in ops:
-        payload = op["payload"]
-        for item in payload.get("snapshot_identity_decisions", []):
+            effective[obs_id] = disposition
+        for item in decoded.identity_decisions:
             identity_effective[
                 (item["acceptedObservationId"], item["replayObservationId"])
             ] = item["disposition"]
+        ops.append(record)
+    return effective, tuple(
+        pair for pair, disposition in identity_effective.items()
+        if disposition == "preserve"
+    ), ops
+
+
+def _reviewed_weekly_state(records):
+    """``(held, accepted, identity_pairs, ops)``. ``held`` is every
+    observation whose weekly detection the reviewed replay suppresses: an
+    effective `hold` or `retract` (spec 4.7: a retraction is suppressed
+    exactly as a hold; only hold's dependency preservation tells them
+    apart, `_reviewed_weekly_retractions`)."""
+    effective, identity_pairs, ops = _reviewed_weekly_decisions(records)
     return (frozenset(
         obs_id for obs_id, disposition in effective.items()
-        if disposition == "hold"
+        if disposition in ("hold", "retract")
     ), frozenset(
         obs_id for obs_id, disposition in effective.items()
         if disposition == "accept"
-    ), tuple(
-        pair for pair, disposition in identity_effective.items()
-        if disposition == "preserve"
-    ), ops)
+    ), identity_pairs, ops)
+
+
+def _reviewed_weekly_retractions(records) -> frozenset:
+    """The observations whose effective reviewed weekly decision is
+    `retract`."""
+    effective, _pairs, _ops = _reviewed_weekly_decisions(records)
+    return frozenset(obs_id for obs_id, disposition in effective.items()
+                     if disposition == "retract")
 
 
 class _PinnedPrefixDigest:
@@ -952,6 +970,7 @@ def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
     expected_keys = (
         _REVIEWED_OP_KEYS_V1 if version == 1
         else _REVIEWED_OP_KEYS_V2 if version == 2
+        else _REVIEWED_OP_KEYS_V3 if version == 3
         else None
     )
     if (expected_keys is None or set(payload) != expected_keys
@@ -965,10 +984,16 @@ def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
             or record != _lib_journal.make_op(
                 at=record.get("at"), src=record.get("src"), payload=payload,
                 writer_generation=record.get("wpg"),
+                # #797/#823/#840 (spec 4.6 B1): the protocol revision is part
+                # of a current decision's content-id core.
+                writer_revision=record.get("wpr"),
             )):
         raise _lib_rederive.RederiveConflict(
             "malformed retained reviewed weekly decision op"
         )
+    # #797/#823/#840 spec 4.7: the one strict decoder (schema 3's
+    # retractions must each name a same-op projected hold).
+    _lib_rederive.decode_reviewed_weekly_payload(payload)
     _reviewed_op_expected_hashes(record, required=True)
     expected = (bound["segment"], bound["offset"])
     if prior_high_water != expected or hasher.digest_at(expected) != (
@@ -980,7 +1005,10 @@ def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
         )
 
 
-def _normalize_legacy_accounts(records: list[dict]) -> None:
+def _planner_cutover_claude(records) -> str:
+    """The journal-wide Claude legacy account the planner normalizes under:
+    every `accounts_cutover` value validated first (missing or conflicting
+    values refuse), `unattributed` when the prefix has no cutover."""
     import _lib_accounts
 
     cutover_values = {
@@ -997,13 +1025,56 @@ def _normalize_legacy_accounts(records: list[dict]) -> None:
         raise _lib_rederive.RederiveConflict(
             "conflicting accounts_cutover Claude account values"
         )
-    cutover_claude = (
+    return (
         next(iter(cutover_values))
         if cutover_values
         else _lib_accounts.UNATTRIBUTED
     )
+
+
+def _normalize_legacy_accounts(records: list[dict]) -> None:
+    """Normalize every record of ``records`` IN PLACE (the pre-#997 planner
+    input; kept for callers that own a private copy)."""
+    cutover_claude = _planner_cutover_claude(records)
     for record in records:
         _journal._normalize_legacy_account_stamp(record, cutover_claude)
+
+
+def _normalized_planning_view(records, cutover_claude=None) -> list:
+    """#997 spec D5: the planner's normalized records, copy-on-write.
+
+    The same global pass as `_normalize_legacy_accounts` (every cutover value
+    validated first), but a record normalization leaves unchanged is SHARED
+    with the caller, and a changed one is a normalized deep copy. Changed
+    copies are memoized by source-object identity, so one shared object at
+    many positions (a D4 stub) yields one shared normalized object. Order,
+    multiplicity and positions are preserved and the caller's records, which
+    `apply_db_rederive` reads afterwards, are never mutated. Peak memory loses
+    the up-front deep copy of every record normalization leaves alone."""
+    if cutover_claude is None:
+        cutover_claude = _planner_cutover_claude(records)
+    changed: dict = {}
+    view = []
+    for record in records:
+        if not isinstance(record, dict):
+            view.append(record)
+            continue
+        hit = changed.get(id(record))
+        if hit is not None:
+            view.append(hit)
+            continue
+        probe = dict(record)
+        if isinstance(record.get("payload"), dict):
+            probe["payload"] = dict(record["payload"])
+        _journal._normalize_legacy_account_stamp(probe, cutover_claude)
+        if probe == record:
+            view.append(record)
+            continue
+        normalized = copy.deepcopy(record)
+        _journal._normalize_legacy_account_stamp(normalized, cutover_claude)
+        changed[id(record)] = normalized
+        view.append(normalized)
+    return view
 
 
 def _derive_desired_events(records: list[dict], cache_conn: sqlite3.Connection,
@@ -1047,24 +1118,35 @@ def _derive_desired_events_into(
             + ", ".join(sorted(unknown_ids))
         )
     conn = _cctally_core.open_db(_target_path=str(scratch_path))
+    # #997 (spec D1): a disposable scratch, never published or trusted.
+    import _cctally_store
+    _cctally_store.apply_disposable_scratch_policy(conn)
     # #825/#832 spec 5.6 item 8: the scratch replay re-evaluates the same
     # triggers and certificates over the corrected history in journal order,
     # so it can never plan an outcome ordinary processing withholds.
     import _cctally_quarantine
     fold = _cctally_quarantine.QuarantineFold.empty(held_ids=held_ids)
     try:
+        # #997 spec D5: the planner's view shares unchanged records with the
+        # caller, so the replay prepares a private copy of each record.
         return replay_scratch_records(
             conn, records, cache_conn, fold=fold, held_ids=held_ids,
-            block_sources=block_sources)
+            block_sources=block_sources, prepare=copy.deepcopy)
     finally:
         conn.close()
+
+
+#: #997 (spec D2): modifying inputs per scratch replay transaction — raw inputs
+#: plus retained `evt`/`correction` offers. One input per commit made every
+#: input pay a rollback-journal create/fsync/unlink and a database fsync.
+_SCRATCH_REPLAY_COMMIT_EVERY = 4096
 
 
 def replay_scratch_records(
     conn, records, cache_conn, *, fold, held_ids=frozenset(),
     block_sources: "dict | None" = None, coordinates=None,
     skip_indexes=frozenset(), on_input=None, read_adapters=None,
-    retention=None,
+    retention=None, prepare: "Callable[[dict], dict] | None" = None,
 ) -> list[dict]:
     """THE scratch derivation: run every rederivable raw record of
     ``records`` through the live pipeline hooks and harvest, in journal
@@ -1085,9 +1167,10 @@ def replay_scratch_records(
     `_cctally_journal.ScratchRetention`) keeps the scratch projection on the
     retained effective decisions: the emitters consult it, and every
     ``evt``/``correction`` line of ``records`` is offered to it at its own
-    position. Returns every candidate in derivation order."""
-    raw_ids = {id(record) for record in _rederivable_raw_records(
-        [record for record in records if isinstance(record, dict)])}
+    position. ``prepare`` (#997 spec D5) maps each record to the one the
+    fold, the retention and the hooks see, immediately before it is offered
+    (a per-record copy instead of a whole-list one); the raw-input test runs
+    on the prepared record. Returns every candidate in derivation order."""
     events: list[dict] = []
     reviewed_weekly_basis_by_account = {}
     hooks = (
@@ -1099,66 +1182,98 @@ def replay_scratch_records(
     import _lib_account_protocol as _protocol
     adapters = (_scratch_read_adapters(cache_conn) if read_adapters is None
                 else read_adapters)
-    with adapters:
-        for index, record in enumerate(records):
-            if not isinstance(record, dict):
-                continue
-            if record.get("t") == _protocol.EXCLUDED_PLACEHOLDER_TYPE:
-                carried = record.get("quarantine") or {}
-                fold.on_excluded(
-                    carried.get("record") or {},
-                    segment=carried.get("segment"),
-                    offset=carried.get("offset"))
-                continue
-            if (retention is not None
-                    and record.get("t") in ("evt", "correction")):
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    retention.on_journaled(conn, record)
-                    conn.commit()
-                except BaseException:
-                    conn.rollback()
-                    raise
-            coordinate = (None if coordinates is None
-                          else coordinates[index])
-            if coordinate is None:
-                gate = fold.on_record(record)
-            else:
-                gate = fold.on_record(
-                    record, segment=coordinate[0], offset=coordinate[1])
-            if id(record) not in raw_ids or index in skip_indexes:
-                continue
-            before = len(events)
-            ctx = _journal.IngestContext(
-                conn=conn,
-                batch=[record],
-                config={},
-                event_sink=events,
-                projection_writes=False,
-                held_weekly_observation_ids=held_ids,
-                reviewed_weekly_basis_by_account=(
-                    reviewed_weekly_basis_by_account),
-                block_source_evidence=block_sources,
-                quarantine=fold,
-                outcome_gate=gate,
-                scratch_retention=retention,
-            )
-            if retention is not None:
-                retention.current_input = index
+    # #997 (spec D2): one transaction holds up to
+    # `_SCRATCH_REPLAY_COMMIT_EVERY` modifying inputs. Only the commit boundary
+    # moves: each raw input keeps its own `IngestContext` and `_harvest`, in
+    # journal order, and every reader shares this connection, which sees its
+    # own uncommitted writes. On any exception the open batch rolls back and
+    # the caller discards the scratch.
+    bound = max(1, int(_SCRATCH_REPLAY_COMMIT_EVERY))
+    pending = 0
+
+    def _open_batch():
+        if not conn.in_transaction:
             conn.execute("BEGIN IMMEDIATE")
-            try:
-                for hook in hooks:
-                    hook(ctx, record)
-                _journal._harvest(ctx)
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
-            finally:
+
+    inputs = 0
+    commits = 0
+
+    def _count_input():
+        nonlocal pending, inputs, commits
+        pending += 1
+        inputs += 1
+        if pending >= bound:
+            conn.commit()
+            pending = 0
+            commits += 1
+            # #997 D9: every commit batch (throttled to one write per ten
+            # seconds; a no-op unless a worker installed a progress sink).
+            _lib_rebuild_progress.tick(inputs=inputs, commits=commits)
+        elif not inputs & 1023:
+            _lib_rebuild_progress.tick(inputs=inputs, commits=commits)
+
+    try:
+        with adapters:
+            for index, record in enumerate(records):
+                if not isinstance(record, dict):
+                    continue
+                if prepare is not None:
+                    record = prepare(record)
+                if record.get("t") == _protocol.EXCLUDED_PLACEHOLDER_TYPE:
+                    carried = record.get("quarantine") or {}
+                    fold.on_excluded(
+                        carried.get("record") or {},
+                        segment=carried.get("segment"),
+                        offset=carried.get("offset"))
+                    continue
+                if (retention is not None
+                        and record.get("t") in ("evt", "correction")):
+                    _open_batch()
+                    retention.on_journaled(conn, record)
+                    _count_input()
+                coordinate = (None if coordinates is None
+                              else coordinates[index])
+                if coordinate is None:
+                    gate = fold.on_record(record)
+                else:
+                    gate = fold.on_record(
+                        record, segment=coordinate[0], offset=coordinate[1])
+                if not _is_rederivable_raw(record) or index in skip_indexes:
+                    continue
+                before = len(events)
+                ctx = _journal.IngestContext(
+                    conn=conn,
+                    batch=[record],
+                    config={},
+                    event_sink=events,
+                    projection_writes=False,
+                    held_weekly_observation_ids=held_ids,
+                    reviewed_weekly_basis_by_account=(
+                        reviewed_weekly_basis_by_account),
+                    block_source_evidence=block_sources,
+                    quarantine=fold,
+                    outcome_gate=gate,
+                    scratch_retention=retention,
+                )
                 if retention is not None:
-                    retention.current_input = None
-            if on_input is not None:
-                on_input(index, events[before:])
+                    retention.current_input = index
+                _open_batch()
+                try:
+                    for hook in hooks:
+                        hook(ctx, record)
+                    _journal._harvest(ctx)
+                finally:
+                    if retention is not None:
+                        retention.current_input = None
+                _count_input()
+                if on_input is not None:
+                    on_input(index, events[before:])
+        if conn.in_transaction:
+            conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     return events
 
 
@@ -1196,8 +1311,9 @@ def plan_claude_usage(
     read view. Task C owns lock/snapshot orchestration; Task B owns the pure
     replay and comparison contract.
     """
-    records = copy.deepcopy(list(records))
-    _normalize_legacy_accounts(records)
+    # #997 spec D5: a copy-on-write normalized view, not a whole-list deep
+    # copy. Every planner consumer below reads this view.
+    records = _normalized_planning_view(list(records))
     report = _lib_rederive.validate_family_registry(
         evt_kinds=set(_journal._EVT_SPECS),
         op_kinds=_planner_op_kinds(),
@@ -1228,6 +1344,10 @@ def plan_claude_usage(
     held_ids, _accepted_ids, identity_pairs, reviewed_ops = (
         _reviewed_weekly_state(records)
     )
+    # #797/#823/#840 spec 4.7 (D4): a retraction is suppressed in the replay
+    # like a hold (it is in `held_ids`) but is not in hold's
+    # dependency-preservation set.
+    retracted_ids = _reviewed_weekly_retractions(records)
     config_basis = {
         "historicalConfig": "not-retained",
         "projectionPolicy": "retire-and-rematerialize",
@@ -1244,8 +1364,12 @@ def plan_claude_usage(
                 key: value for key, value in op["payload"].items()
                 if key not in _REVIEWED_OP_EXPECTATION_KEYS
             }
+            # #797/#823/#840 spec 4.6 B1: the logical identity stays the
+            # revision-1 one, so a plan an earlier writer pinned keeps its
+            # config fingerprint across the revision-2 stamp.
             logical = _lib_journal.make_op(
                 at=op["at"], src=op["src"], payload=payload,
+                writer_revision=None,
             )
             config_basis["reviewedWeeklyDecisionOps"].append({
                 "id": logical["id"], "at": logical["at"],
@@ -1306,7 +1430,8 @@ def plan_claude_usage(
         conflicted_event_ids=owned_conflicted_event_ids(selection),
         raw_observations=raw_records,
         snapshot_identity_decisions=identity_pairs,
-        reviewed_weekly_hold_ids=held_ids,
+        reviewed_weekly_hold_ids=held_ids - retracted_ids,
+        reviewed_weekly_retraction_ids=retracted_ids,
         uncertain_cost_fact_ids=(
             _uncertain_cost_facts(selection) | codex_uncertain),
         historical_close_markers=historical_markers,
@@ -1353,6 +1478,51 @@ def owned_conflicted_event_ids(selection) -> frozenset:
     return frozenset(owned)
 
 
+def _is_inert_codex_obs(record) -> bool:
+    """An admitted Codex quota observation: always admitted (its family is
+    Codex-only), never a rederivable raw input, never a Claude reading."""
+    return (record.get("t") == "obs"
+            and record.get("provider") == "codex"
+            and (record.get("payload") or {}).get("kind")
+            == "quota_window_snapshot")
+
+
+def _inert_codex_stub(record: dict, table: "dict | None" = None) -> dict:
+    """#997 spec D4: the read-only stand-in for an inert Codex quota
+    observation on the rederive path — `t`, `provider`, `src`, `account` and
+    a `payload` of `kind` plus `account_key`/`vendor` when present, which is
+    everything a consumer on this path reads (admission, positional protocol
+    selection, `_is_rederivable_raw`, `is_claude_reading`, legacy account
+    classification and normalization, the Codex pricing scan, preservation
+    and the reviewed-decision suffix checks). Equal key tuples
+    `(src, account, payload.account_key, payload.vendor)` share one object
+    from ``table`` (the reader's per-read intern table), so 2.19 M positions
+    cost a pointer each. A stub is never mutated: the planner's normalized
+    view copies it once (`_normalized_planning_view`)."""
+    payload = record.get("payload") or {}
+    key = (record.get("src"),
+           "account" in record, record.get("account"),
+           "account_key" in payload, payload.get("account_key"),
+           "vendor" in payload, payload.get("vendor"))
+    try:
+        stub = None if table is None else table.get(key)
+    except TypeError:  # an unhashable stamp: keep the record as it is
+        return record
+    if stub is not None:
+        return stub
+    stub_payload = {"kind": payload.get("kind")}
+    for name in ("account_key", "vendor"):
+        if name in payload:
+            stub_payload[name] = payload[name]
+    stub = {"t": "obs", "provider": "codex", "src": record.get("src")}
+    if "account" in record:
+        stub["account"] = record["account"]
+    stub["payload"] = stub_payload
+    if table is not None:
+        table[key] = stub
+    return stub
+
+
 def read_rederive_journal_prefix(
     high_water: "tuple[str, int] | None" = None,
 ):
@@ -1373,6 +1543,11 @@ def read_rederive_journal_prefix(
     `records` in parallel with `record_ends`. Both lists stay complete and
     aligned, so the win in this file is the removed double materialization and
     the removed hash traversals, not reduced retention.
+
+    #997 spec D4: positions are kept, but an admitted Codex quota observation
+    is retained as an interned read-only stub (`_inert_codex_stub`) rather
+    than decoded in full; no consumer on this path reads its quota payload,
+    `id` or `at`.
     """
     if high_water is None:
         high_water = _journal.journal_high_water()
@@ -1389,7 +1564,7 @@ def read_rederive_journal_prefix(
     evidence_owners: list = []
     malformed = 0
     prior_high_water = None
-    hasher = _lib_journal_router.PrefixHashAccumulator()
+    hasher = _journal._new_prefix_hasher()
     # #825/#832 (spec 5.3): admission before interpretation, resolved within
     # this one pass. A reviewed decision's validation needs the prefix digest
     # at its own position, so the digest is taken inline and the validation
@@ -1397,19 +1572,32 @@ def read_rederive_journal_prefix(
     pass_boundary = _journal._PassBoundary()
     coordinates: list = []
     pending_reviewed: list = []
+    inert_stubs: dict = {}
+    lines = 0
     for segment, offset, raw in _journal._iter_range_with_segments(
         None,
         high_water,
         segments,
-        on_segment=lambda name: hasher.begin_segment(name, prior_high_water),
+        on_segment=lambda name, size: hasher.begin_segment(
+            name, prior_high_water, size=size),
         on_bytes=hasher.extend,
     ):
+        lines += 1
+        if not lines & 4095:
+            # #997 D9 (throttled; a no-op without a progress sink).
+            _lib_rebuild_progress.tick(lines=lines)
         record = _lib_journal.decode_line(raw)
         record_end = (segment, offset + len(raw) + 1)
         if record is None:
             malformed += 1
             prior_high_water = record_end
             continue
+        inert = _is_inert_codex_obs(record)
+        if not inert:
+            # #997 D15: every record retained in full is compacted before
+            # anything holds a reference to it, so the identity checks below
+            # (`records[index] is record`) see only the compacted object.
+            record = _lib_journal.compact_retained(record)
         pass_boundary.observe(record)
         if record.get("t") == "op":
             if (record.get("payload") or {}).get("kind") in _REVIEWED_WEEKLY_KINDS:
@@ -1426,6 +1614,8 @@ def read_rederive_journal_prefix(
             )
             if len(evidence) > len(evidence_owners):
                 evidence_owners.append(len(records))
+        elif inert:
+            record = _inert_codex_stub(record, inert_stubs)
         records.append(record)
         record_ends.append(record_end)
         coordinates.append((segment, offset))
@@ -1462,8 +1652,9 @@ def read_rederive_journal_prefix(
                 record, prior, _PinnedPrefixDigest(prior, digest),
             )
     # Released before the raise below, so a malformed prefix does not pin the
-    # accumulator's buffered segment — 410 MB on the maintainer's journal — on
-    # the traceback while the exception unwinds. On the success path the frame
+    # accumulator (its hash states, registered boundaries and segment opener;
+    # since #997 D12 it streams and retains no segment bytes) on the traceback
+    # while the exception unwinds. On the success path the frame
     # dies two statements later, so this mirrors the repair reader, where the
     # release genuinely precedes a loop over every decoded record.
     hasher = None
@@ -1496,6 +1687,22 @@ def _batch_id_for_plan(plan: _lib_rederive.RederivePlan) -> "str | None":
     return f"rederive:{plan.family}:{digest}"
 
 
+def _empty_decision_batch_id(family: str, decision_id: str) -> str:
+    """D4: the id of the empty batch that completes reviewed decision
+    ``decision_id`` when its plan has no actions.
+
+    The plain path reads a reviewed decision as finished only when its own
+    completed correction batch follows it, so a decision that changes
+    nothing (a later split manifest whose observations an earlier decision
+    already holds) still gets a batch: begin and commit, ``action_count``
+    0. Keyed by the decision, because every empty action set is the same
+    and each decision needs its own completion.
+    """
+    body = {"family": family, "actions": [], "reviewedDecision": decision_id}
+    digest = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    return f"rederive:{family}:{digest}"
+
+
 def _iso_now() -> str:
     return (
         dt.datetime.now(dt.timezone.utc)
@@ -1505,45 +1712,111 @@ def _iso_now() -> str:
     )
 
 
+#: How each read-only snapshot's main file was taken, ``"clone"`` or
+#: ``"copy"`` (#997 D13). Per process; tests clear and read it.
+SNAPSHOT_COUNTS: dict = {}
+
+
+def _device_of(path) -> int:
+    """`st_dev` of ``path`` (a seam: tests report another device)."""
+    return os.stat(path).st_dev
+
+
+def _snapshot_clone_parent(path: Path, tmpdir: str) -> "str | None":
+    """Where a clonable snapshot's directory goes, or None off Darwin.
+
+    A clone shares blocks only within one volume, so the directory is under
+    `TMPDIR` when `TMPDIR` is on the source's device and otherwise in the
+    source's own directory (a data folder on an external volume with an
+    internal `TMPDIR`)."""
+    if _lib_clone_copy._PLATFORM != "darwin":
+        return None
+    try:
+        same = _device_of(tmpdir) == _device_of(path.parent)
+    except OSError:
+        return tmpdir
+    return tmpdir if same else str(path.parent)
+
+
+def _take_sqlite_snapshot(path: Path, snapshot: Path, *, clone: bool):
+    """Write a consistent snapshot of ``path`` (and its WAL prefix) to
+    ``snapshot``; return ``"clone"`` or ``"copy"``, or None when ``clone``
+    was asked for and the filesystem refused it."""
+    wal = path.with_name(path.name + "-wal")
+    snapshot_wal = snapshot.with_name(snapshot.name + "-wal")
+    # Copy the append-only WAL prefix before the main file. If a checkpoint
+    # races this read, a main-file identity change makes us retry rather
+    # than combining generations. SQLite validates the copied WAL frames.
+    for attempt in range(3):
+        before = path.stat()
+        snapshot_wal.unlink(missing_ok=True)
+        try:
+            wal_size = wal.stat().st_size
+            with wal.open("rb") as source, snapshot_wal.open("wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.truncate(wal_size)
+        except FileNotFoundError:
+            snapshot_wal.unlink(missing_ok=True)
+        if clone:
+            # A clone needs a new path, so a retry's previous snapshot goes
+            # first (#997 D13).
+            snapshot.unlink(missing_ok=True)
+            if not _lib_clone_copy.try_clone(str(path), str(snapshot)):
+                return None
+            method = "clone"
+        else:
+            shutil.copyfile(path, snapshot)
+            method = "copy"
+        after = path.stat()
+        if (
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) == (
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return method
+        if attempt == 2:
+            raise RederiveBusy(
+                "cache.db changed during the read-only preview snapshot; "
+                "retry shortly"
+            )
+    raise AssertionError("unreachable")
+
+
 @contextlib.contextmanager
 def _open_sqlite_snapshot(path: Path, *, prefix: str):
-    """Yield a query-only SQLite family copy without touching the source."""
-    with tempfile.TemporaryDirectory(
-        prefix=prefix
-    ) as tmp:
-        snapshot = Path(tmp) / path.name
-        wal = path.with_name(path.name + "-wal")
-        # Copy the append-only WAL prefix before the main file. If a checkpoint
-        # races this read, a main-file identity change makes us retry rather
-        # than combining generations. SQLite validates the copied WAL frames.
-        for attempt in range(3):
-            before = path.stat()
-            snapshot_wal = snapshot.with_name(snapshot.name + "-wal")
-            snapshot_wal.unlink(missing_ok=True)
-            try:
-                wal_size = wal.stat().st_size
-                with wal.open("rb") as source, snapshot_wal.open("wb") as target:
-                    shutil.copyfileobj(source, target, length=1024 * 1024)
-                    target.truncate(wal_size)
-            except FileNotFoundError:
-                snapshot_wal.unlink(missing_ok=True)
-            shutil.copyfile(path, snapshot)
-            after = path.stat()
-            if (
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            ) == (
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
-                break
-            if attempt == 2:
-                raise RederiveBusy(
-                    "cache.db changed during the read-only preview snapshot; "
-                    "retry shortly"
-                )
+    """Yield a query-only SQLite family copy without touching the source.
+
+    #997 D13: on Darwin the main file is a clone sharing the source's blocks
+    (the cache snapshot was a 2.54 GB copy per preview), its directory placed
+    by `_snapshot_clone_parent`. A refused clone removes that directory and
+    takes the real copy under `TMPDIR`, so a volume that cannot clone never
+    receives a copy beside the data. Elsewhere the snapshot is the real copy
+    under `TMPDIR`. The WAL prefix is always a byte copy truncated to the
+    size read. The directory is removed on exit; a crash leaves it behind.
+    """
+    tmpdir = tempfile.gettempdir()
+    parent = _snapshot_clone_parent(path, tmpdir)
+    holder = None
+    try:
+        method = None
+        if parent is not None:
+            holder = tempfile.TemporaryDirectory(prefix=prefix, dir=parent)
+            snapshot = Path(holder.name) / path.name
+            method = _take_sqlite_snapshot(path, snapshot, clone=True)
+            if method is None and parent != tmpdir:
+                holder.cleanup()
+                holder = None
+        if method is None:
+            if holder is None:
+                holder = tempfile.TemporaryDirectory(prefix=prefix, dir=tmpdir)
+            snapshot = Path(holder.name) / path.name
+            snapshot.unlink(missing_ok=True)
+            method = _take_sqlite_snapshot(path, snapshot, clone=False)
+        SNAPSHOT_COUNTS[method] = SNAPSHOT_COUNTS.get(method, 0) + 1
         conn = sqlite3.connect(snapshot)
         try:
             conn.execute("PRAGMA query_only=ON")
@@ -1551,6 +1824,9 @@ def _open_sqlite_snapshot(path: Path, *, prefix: str):
             yield conn
         finally:
             conn.close()
+    finally:
+        if holder is not None:
+            holder.cleanup()
 
 
 @contextlib.contextmanager
@@ -1719,13 +1995,40 @@ def _preview_from_snapshot(
     batch_id = _batch_id_for_plan(plan)
     generated_at = _iso_now()
     incomplete = False
-    if batch_id is not None:
-        begins = [
+
+    def _begins_of(identity):
+        return [
             record for record in records
             if record.get("t") == "correction_batch"
             and record.get("phase") == "begin"
-            and record.get("id") == batch_id
+            and record.get("id") == identity
         ]
+
+    empty_decision_batch_id = None
+    if (batch_id is None and decision_op is not None
+            and not decision_batch_completed):
+        # D4: an unfinished reviewed decision whose plan is empty completes
+        # with an empty batch, so the plain path reads it as finished. A
+        # retry after an interrupted append reuses the begin's `at`, so its
+        # lines are byte-identical.
+        empty_id = _empty_decision_batch_id(family, decision_op["id"])
+        if empty_id not in selection.completed_batches:
+            empty_id = _lib_journal.revision_batch_id(
+                empty_id, _begins_of(empty_id))
+        if empty_id not in selection.completed_batches:
+            empty_decision_batch_id = empty_id
+            begins = _begins_of(empty_id)
+            if begins:
+                generated_at = str(begins[0]["at"])
+                incomplete = True
+    if batch_id is not None:
+        # #797/#823/#840 spec 4.6 B1: an incomplete batch an earlier writer
+        # began without the revision-2 stamp is retried under a derived id,
+        # never restamped.
+        if batch_id not in selection.completed_batches:
+            batch_id = _lib_journal.revision_batch_id(
+                batch_id, _begins_of(batch_id))
+        begins = _begins_of(batch_id)
         if begins:
             generated_at = str(begins[0]["at"])
             incomplete = batch_id not in selection.completed_batches
@@ -1759,6 +2062,7 @@ def _preview_from_snapshot(
             None if decision_op is None else decision_op["id"]),
         baseline_plan=baseline_plan,
         baseline_plan_guard=baseline_plan_guard,
+        empty_decision_batch_id=empty_decision_batch_id,
     )
     if decision_op is not None and not decision_batch_completed:
         expected_hashes = _reviewed_op_expected_hashes(
@@ -1991,6 +2295,16 @@ def _stats_has_batch(batch_id: str) -> bool:
                 "WHERE batch_id = ? LIMIT 1",
                 (batch_id,),
             ).fetchone()
+            if row is None:
+                # D4: an empty batch (a reviewed decision whose plan had no
+                # actions) leaves no effective event; the index has folded
+                # it when its selector row is completed.
+                row = conn.execute(
+                    "SELECT 1 FROM journal_selector_batches "
+                    "WHERE batch_id = ? AND status = 'completed' "
+                    "AND action_count = 0",
+                    (batch_id,),
+                ).fetchone()
             return row is not None
     except (OSError, sqlite3.Error, StatsIndexNotCurrent):
         return False
@@ -2123,6 +2437,35 @@ def _assert_reviewed_plan_hashes(preview, expected_plan_hashes) -> None:
         )
 
 
+def _compact_preview(preview: RederivePreview) -> RederivePreview:
+    """#997 D18: the preview without its journal records.
+
+    `records` (every retained record of the prefix) and `record_ends` (one
+    commit coordinate per record) are read only by planning: the exact-retry
+    and materialization checks run before any rebuild starts. Every other
+    field (both plans and their hashes, `batch_id`, `incomplete_batch`, the
+    high-water marks) is kept, so the status choice, the result, the
+    renderers and every error read what they read before. The one release
+    seam: T18 disables the release by patching it to the identity.
+    """
+    return dataclasses.replace(preview, records=(), record_ends=())
+
+
+def _release_preview_records(*previews):
+    """#997 D18: compact copies of `previews`, in order, for the apply to
+    rebind immediately before a rebuild, so no full preview stays reachable
+    through any name. A preview passed under two names comes back as ONE
+    copy, so an alias stays an alias; `None` (no such preview) stays
+    `None`."""
+    copies: dict = {}
+    released = []
+    for preview in previews:
+        if preview is not None and id(preview) not in copies:
+            copies[id(preview)] = _compact_preview(preview)
+        released.append(None if preview is None else copies[id(preview)])
+    return tuple(released)
+
+
 def apply_db_rederive(
     family: str,
     *,
@@ -2136,6 +2479,9 @@ def apply_db_rederive(
     with _rederive_locks(apply=True, timeout=lock_timeout), \
             _held_past_unlock(lost):
         appended_reviewed_op = False
+        # A reviewed exact retry's preview at the decision's bound; D18
+        # releases it with the others.
+        original = None
         if reviewed_op is not None:
             durable_hashes = _reviewed_op_expected_hashes(
                 reviewed_op, required=True,
@@ -2168,12 +2514,15 @@ def apply_db_rederive(
                     if record.get("t") == "op"
                     and record.get("id") == reviewed_op["id"]
                 )
+                # D4: an empty decision's own batch is its empty one.
+                original_batch_id = (
+                    original.batch_id or original.empty_decision_batch_id)
                 if any(
                     not (
                         (record.get("t") == "correction_batch"
-                         and record.get("id") == original.batch_id)
+                         and record.get("id") == original_batch_id)
                         or (record.get("t") == "correction"
-                            and record.get("batch") == original.batch_id)
+                            and record.get("batch") == original_batch_id)
                     )
                     for record in preview.records[op_index + 1:]
                 ):
@@ -2224,13 +2573,22 @@ def apply_db_rederive(
             preview.latest_completed_batch is not None
             and not _stats_has_batch(preview.latest_completed_batch)
         )
-        if plan.actions:
-            assert preview.batch_id is not None
+        # D4: an unfinished reviewed decision whose plan is empty appends its
+        # empty completed batch here, exactly like a batch with actions, so
+        # the plain path reads the decision as finished. It reports what the
+        # decision reported before (the latest earlier batch), so the output
+        # is unchanged.
+        batch_id = preview.batch_id
+        reported_batch_id = preview.batch_id
+        if not plan.actions and preview.empty_decision_batch_id is not None:
+            batch_id = preview.empty_decision_batch_id
+            reported_batch_id = preview.latest_completed_batch
+        if batch_id is not None:
             batch = _lib_journal.make_correction_batch(
-                batch_id=preview.batch_id,
+                batch_id=batch_id,
                 family=family,
                 at=preview.generated_at,
-                actions=plan.to_correction_actions(),
+                actions=plan.to_correction_actions() if plan.actions else [],
             )
             try:
                 batch_high_water = _journal.append_records(
@@ -2242,8 +2600,11 @@ def apply_db_rederive(
                 )
             except Exception as exc:
                 raise RederiveApplyError(
-                    "correction append", preview, preview.batch_id, exc
+                    "correction append", preview, batch_id, exc
                 ) from exc
+            # #997 D18: nothing past planning reads the records.
+            preview, report_preview, original = _release_preview_records(
+                preview, report_preview, original)
             try:
                 _call_crash_hook("after-batch-commit")
                 result = _journal.rebuild_stats_index(
@@ -2258,21 +2619,25 @@ def apply_db_rederive(
                 _call_crash_hook("after-rebuild")
             except _cctally_completion.ResidualObligationNotDurable as exc:
                 raise _obligation_lost(
-                    "stats rebuild", preview, preview.batch_id, exc
+                    "stats rebuild", preview, batch_id, exc
                 ) from exc
             except Exception as exc:
                 raise RederiveApplyError(
-                    "stats rebuild", preview, preview.batch_id, exc
+                    "stats rebuild", preview, batch_id, exc
                 ) from exc
             status = (
                 "recovered"
                 if preview.incomplete_batch or recovering_prior
+                # D4: as before, completing an empty decision this
+                # invocation did not append (an interrupted apply resumed by
+                # an exact retry or a plain rederive) is a recovery.
+                or (not plan.actions and not appended_reviewed_op)
                 else "applied"
             )
             return RederiveCommandResult(
                 preview=report_preview,
                 status=status,
-                batch_id=preview.batch_id,
+                batch_id=reported_batch_id,
                 rebuild=result,
             )
 
@@ -2282,6 +2647,9 @@ def apply_db_rederive(
                 raise RederiveBusy(
                     f"completed correction batch {latest} has no commit high-water"
                 )
+            # #997 D18: nothing past planning reads the records.
+            preview, report_preview, original = _release_preview_records(
+                preview, report_preview, original)
             try:
                 result = _journal.rebuild_stats_index(
                     context=_journal.RebuildContext(
@@ -2310,6 +2678,9 @@ def apply_db_rederive(
                 rebuild=result,
             )
         if appended_reviewed_op or _reviewed_op_needs_materialization(preview):
+            # #997 D18: released only after the check above has read them.
+            preview, report_preview, original = _release_preview_records(
+                preview, report_preview, original)
             try:
                 result = _journal.rebuild_stats_index(
                     context=_journal.RebuildContext(trigger="rederive-recovery"),
@@ -2390,6 +2761,7 @@ def _command_payload(
     guarded_plan: "_lib_rederive.RederivePlan | None" = None,
     plan_guard=None,
     reviewed_decision_id=None,
+    reviewed_decision_counts=None,
 ):
     plan = guarded_plan if preview is None else preview.plan
     counts = (
@@ -2434,6 +2806,10 @@ def _command_payload(
     }
     if reviewed_decision_id is not None:
         body["reviewedWeeklyDecisionId"] = reviewed_decision_id
+    if reviewed_decision_counts is not None:
+        # #797/#823/#840 spec 4.7: the manifest's decisions by disposition,
+        # retractions counted on their own (they persist as holds).
+        body["reviewedWeeklyDecisionCounts"] = reviewed_decision_counts
     if plan is not None and plan.uncertain_cost_fact_count:
         body["uncertainCostFactCount"] = plan.uncertain_cost_fact_count
     if preview is not None and preview.baseline_plan is not None:
@@ -2511,6 +2887,23 @@ def _emit_command_payload(payload: dict, *, as_json: bool) -> None:
             "decision action counts: "
             + _counts_text(payload["decisionActionCounts"])
         )
+    if "reviewedWeeklyDecisionCounts" in payload:
+        counts = payload["reviewedWeeklyDecisionCounts"]
+        print("reviewed decisions: " + ", ".join(
+            f"{name}={counts[name]}" for name in ("hold", "accept", "retract")))
+
+
+def _reviewed_decision_counts(reviewed_op) -> "dict | None":
+    """A reviewed manifest's decisions per disposition (`hold`, `accept`,
+    `retract`), or None without a manifest."""
+    if reviewed_op is None:
+        return None
+    decoded = _lib_rederive.decode_reviewed_weekly_payload(
+        reviewed_op["payload"])
+    counts = dict.fromkeys(_lib_rederive.REVIEWED_WEEKLY_DISPOSITIONS, 0)
+    for disposition in decoded.dispositions.values():
+        counts[disposition] += 1
+    return counts
 
 
 def cmd_db_rederive(args) -> int:
@@ -2598,6 +2991,7 @@ def cmd_db_rederive(args) -> int:
                 rebuild=result.rebuild,
                 reviewed_decision_id=(
                     None if reviewed_op is None else reviewed_op["id"]),
+                reviewed_decision_counts=_reviewed_decision_counts(reviewed_op),
             )
         else:
             preview = preview_db_rederive(family, reviewed_op=reviewed_op)
@@ -2605,6 +2999,8 @@ def cmd_db_rederive(args) -> int:
                 "preview"
                 if reviewed_op is not None or preview.plan.actions
                 or preview.recovery_required
+                # D4: the apply completes an unfinished empty decision.
+                or preview.empty_decision_batch_id is not None
                 else "no-op"
             )
             payload = _command_payload(
@@ -2616,6 +3012,7 @@ def cmd_db_rederive(args) -> int:
                     else preview.batch_id
                 ),
                 reviewed_decision_id=preview.reviewed_decision_id,
+                reviewed_decision_counts=_reviewed_decision_counts(reviewed_op),
             )
     except _lib_rederive.RederiveDataGap as exc:
         payload = _command_payload(

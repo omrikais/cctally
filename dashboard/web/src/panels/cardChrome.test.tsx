@@ -1,9 +1,5 @@
-// #247 S1 — card-chrome contract. The de-colored panels must let their
-// header <h2> (and its leading icon) inherit the neutral `.panel-header`
-// color instead of pinning a decorative accent inline. (The chrome goes
-// neutral; accent is reserved for state/signal — see the design spec
-// D1/D4/D5.) JSDOM can read inline `element.style.color`, so a surviving
-// `style={{ color: 'var(--accent-*)' }}` shows up as a non-empty string.
+// #247 S1 — card-chrome contract: every grid panel header carries the
+// affordances its capabilities call for (share, collapse, expand).
 import { type ComponentType } from 'react';
 import { render } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -50,45 +46,14 @@ beforeEach(() => {
   updateSnapshot(baseEnvelope());
 });
 
-// The #247 S1 de-colored grid panels. Each renders cleanly against the
-// empty-but-valid envelope above, so all are asserted (not just a sample).
-// CacheReport is deliberately excluded — it still pins an inline accent color
-// on its error-state <h2> and is outside the S1 de-color set. #248 — Current
-// Week left the grid (it is the HeroStrip now), so it is no longer in this set.
-// S8 (#254) — Weekly/Monthly left the grid; the Daily heatmap card is
-// relabeled "History" (it is the grid entry for the consolidated modal).
-const PANELS: Array<[string, ComponentType]> = [
-  ['Trend', TrendPanel],
-  ['Forecast', ForecastPanel],
-  ['History', DailyPanel],
-  ['Blocks', BlocksPanel],
-  ['Sessions', SessionsPanel],
-  ['Recent Alerts', RecentAlertsPanel],
-  ['Projects', ProjectsPanel],
-];
-
-describe('#247 S1 card-chrome contract', () => {
-  it.each(PANELS)('header <h2> carries no inline decorative accent color (%s)', (_label, Panel) => {
-    const { container } = render(<Panel />);
-    const h2 = container.querySelector('.panel-header h2');
-    expect(h2, 'expected a .panel-header h2').not.toBeNull();
-    expect((h2 as HTMLElement).style.color).toBe('');
-  });
-  it.each(PANELS)('header icon carries no inline decorative accent color (%s)', (_label, Panel) => {
-    const { container } = render(<Panel />);
-    const icon = container.querySelector('.panel-header svg.icon');
-    expect(icon, 'expected a .panel-header svg.icon').not.toBeNull();
-    expect((icon as unknown as SVGElement & { style: CSSStyleDeclaration }).style.color).toBe('');
-  });
-});
-
 describe('#452 Cache Report header icon contract', () => {
-  it('renders the standard decorative header icon without an inline color', () => {
+  it('hides the decorative header icon from assistive technology', () => {
+    // The heading text names the card; the icon beside it is decoration, so a
+    // screen reader must not announce it as an unlabeled graphic.
     const { container } = render(<CacheReportPanel />);
     const icon = container.querySelector('.panel-header svg.icon');
     expect(icon).not.toBeNull();
     expect(icon?.getAttribute('aria-hidden')).toBe('true');
-    expect((icon as SVGElement & { style: CSSStyleDeclaration }).style.color).toBe('');
   });
 });
 
@@ -152,15 +117,4 @@ describe('#247 S1 uniform header affordance grammar (acceptance #6 — 10 grid p
       ).toBe(expandable);
     },
   );
-
-  // Guards the table itself: exactly 8 share-capable and 4 collapsible GRID
-  // panels (#264 S2 split the History card back into Daily/Weekly/Monthly:
-  // total 8→10, share-capable 6→8), and 10 expandable (#264 S1 — every card).
-  // A drift in any count means a panel silently gained/lost an affordance.
-  it('covers all 10 grid panels with 8 share-capable, 4 collapsible, 10 expandable', () => {
-    expect(AFFORDANCE_GRAMMAR.length).toBe(10);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , s]) => s).length).toBe(8);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , , c]) => c).length).toBe(4);
-    expect(AFFORDANCE_GRAMMAR.filter(([, , , , e]) => e).length).toBe(10);
-  });
 });

@@ -61,8 +61,9 @@ def _cursor():
         conn.close()
 
 
-def test_epoch_is_1018():
-    assert _cctally_core.STATS_INDEX_EPOCH == 1018
+def test_epoch_is_current():
+    # #797/#823/#840 (spec 4.6 B6) moved the epoch from 1018 to 1019.
+    assert _cctally_core.STATS_INDEX_EPOCH == 1019
     assert _cctally_core.LEGACY_STATS_HEAD == 13
 
 
@@ -145,7 +146,7 @@ def test_rebuild_never_requires_a_valid_live_index(ns):
     jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = sqlite3.connect(str(_cctally_core.DB_PATH))
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1018
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1019
         assert conn.execute(
             "SELECT name FROM sqlite_schema WHERE name = "
             "'journal_admission_summary'").fetchone() is not None
@@ -174,7 +175,7 @@ def test_persistent_republication_bounds_retries_and_keeps_the_append(
     def republishing_open(*args, **kwargs):
         # Each current open finds (or heals to) a current index; the old
         # process republishes its epoch right after, every time.
-        _set_epoch(1018)
+        _set_epoch(_cctally_core.STATS_INDEX_EPOCH)
         conn = real_open(*args, **kwargs)
         opens.append(1)
         _set_epoch(1017)

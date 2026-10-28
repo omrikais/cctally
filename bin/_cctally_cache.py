@@ -102,6 +102,7 @@ import bisect
 import collections
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import json
 import os
@@ -9268,6 +9269,18 @@ def _record_codex_container_status(conn, stats, *, census_complete: bool,
                     if cursor_table == "codex_session_files"
                     else prior.get("barrier", {})),
     }
+    # #901 W8: a pass that observes the status already recorded writes
+    # nothing. Every caller runs this at finalization, the idle tick and the
+    # idle conversation pass included, and stamping `observedAt` alone wrote a
+    # WAL frame in each store on every pass more than a second after the last.
+    # `observedAt` therefore keeps the time this status was first recorded;
+    # the other timestamps already change only with the state they date.
+    def _content(status):
+        return json.dumps({k: v for k, v in status.items() if k != "observedAt"},
+                          sort_keys=True)
+
+    if prior and "observedAt" in prior and _content(prior) == _content(record):
+        return
     _set_cache_meta(conn, CODEX_CONTAINER_STATUS_KEY,
                     json.dumps(record, sort_keys=True))
 
@@ -15496,6 +15509,54 @@ def _conversation_probe_snapshot(path: pathlib.Path):
         yield snapshot
 
 
+class ConversationProbeCloneUnavailable(OSError):
+    """The filesystem or platform cannot clone the transcript family.
+
+    The clone helper raises it when `cp` is missing, the platform has no
+    clone command, or `cp` reports that the filesystem refused the clone (see
+    :func:`_cp_refused_clone`). The pre-rebuild quick-check catches it, skips
+    and lets the rebuild continue; recovery still declines without a snapshot.
+    Every other clone failure stays a plain OSError and fails the rebuild.
+    """
+
+
+# errno values that mean "this filesystem cannot clone these files", as
+# opposed to a failure while cloning them. Linux ioctl_ficlone(2) documents
+# EOPNOTSUPP (the filesystem cannot reflink, e.g. ext4), EXDEV (the paths are
+# on different mounts, e.g. a bind mount) and EINVAL (the filesystem cannot
+# reflink these files); ioctl(2) returns ENOTTY where the kernel or filesystem
+# has no FICLONE at all. macOS clonefile(2) documents ENOTSUP and EXDEV. Each
+# is a permanent property of where the store lives. Anything else (ENOSPC,
+# EDQUOT, EACCES, EPERM, ENOENT, EIO, or a failure to open, stat or create
+# before the clone) is a real failure and must fail the rebuild: an I/O error
+# reading a damaged store is the very signal the probe exists to catch.
+_CLONE_REFUSAL_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in ("EOPNOTSUPP", "ENOTSUP", "EXDEV", "EINVAL", "ENOTTY")
+    if hasattr(errno, name)
+)
+
+
+def _cp_refused_clone(stderr: str) -> bool:
+    """Whether `cp` reported a clone refused for one of those errno values.
+
+    `cp` runs under ``LC_ALL=C``, so its strerror text is the C locale's, the
+    same text :func:`os.strerror` returns. GNU `cp --reflink=always` reports a
+    failed FICLONE as ``failed to clone DST from SRC: <strerror>``. macOS
+    `cp -c` falls back to copyfile(2), a full copy, when the target cannot
+    clone, so it rarely reports a refusal at all; when clonefile(2) does fail
+    it warns ``DST: clonefile failed: <strerror>``.
+    """
+    reasons = tuple(f": {os.strerror(code)}" for code in _CLONE_REFUSAL_ERRNOS)
+    for line in stderr.splitlines():
+        line = line.strip()
+        if "failed to clone " not in line and ": clonefile failed: " not in line:
+            continue
+        if line.endswith(reasons):
+            return True
+    return False
+
+
 def _clone_conversation_probe_member(
     source: pathlib.Path,
     destination: pathlib.Path,
@@ -15513,7 +15574,7 @@ def _clone_conversation_probe_member(
         return
     cp = shutil.which("cp")
     if cp is None:
-        raise OSError(
+        raise ConversationProbeCloneUnavailable(
             "copy-on-write transcript probe unavailable: `cp` was not found"
         )
     if sys.platform == "darwin":
@@ -15523,7 +15584,7 @@ def _clone_conversation_probe_member(
             cp, "--reflink=always", "--", str(source), str(destination),
         ]
     else:
-        raise OSError(
+        raise ConversationProbeCloneUnavailable(
             "copy-on-write transcript probe is unsupported on "
             f"{sys.platform}"
         )
@@ -15535,6 +15596,7 @@ def _clone_conversation_probe_member(
             text=True,
             timeout=_CONVERSATION_PROBE_CLONE_TIMEOUT_SECONDS,
             check=False,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OSError(
@@ -15544,9 +15606,14 @@ def _clone_conversation_probe_member(
         reason = (result.stderr or "").strip() or (
             f"cp exited {result.returncode}"
         )
+        if _cp_refused_clone(result.stderr or ""):
+            raise ConversationProbeCloneUnavailable(
+                "copy-on-write transcript probe unavailable for "
+                f"{source.name}: {reason}"
+            )
         raise OSError(
-            "copy-on-write transcript probe unavailable for "
-            f"{source.name}: {reason}"
+            f"copy-on-write transcript probe failed for {source.name}: "
+            f"{reason}"
         )
 
 
@@ -15622,6 +15689,20 @@ def _probe_conversation_rebuild(
                         probe.close()
         except sqlite3.DatabaseError as exc:
             return exc
+        except ConversationProbeCloneUnavailable as exc:
+            # The clone helper raised this because the filesystem cannot
+            # clone, which never changes: failing here failed every explicit
+            # rebuild over an existing store on such a filesystem. Skip the
+            # check (never a byte copy) and rebuild. Corruption quick_check
+            # would have found may then go unnoticed, or surface later in a
+            # rebuild worker; recovery declines without a snapshot either
+            # way, so nothing is quarantined.
+            eprint(
+                "[cache-sync] conversations.db integrity check skipped "
+                f"before the transcript rebuild ({exc}); continuing without "
+                "automatic corruption recovery"
+            )
+            return None
     finally:
         keeper_yield.close()
         if provider_locks is not None:

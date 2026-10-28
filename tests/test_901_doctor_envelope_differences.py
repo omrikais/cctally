@@ -11,7 +11,8 @@ Owner A's final commit (tests/fixtures/901/doctor-baseline/). Required:
   fingerprint) are exactly what those two verdicts imply;
 - the migration-registry views grow by exactly the cache migration revision 9
   adds after that commit (§5.3a), and by nothing else;
-- #968 adds exactly the Compressed Codex rollouts check and one OK count.
+- #968 adds exactly the Compressed Codex rollouts check and one OK count;
+- #997 adds exactly the Rebuild worker check and one OK count.
 A whole-golden refresh cannot pass this: any other byte difference fails.
 """
 
@@ -67,13 +68,14 @@ NEW_CATEGORY = {
 # Revision 9 (§5.3a, 901-PA-001 a) adds one cache migration after Owner A's
 # final commit. The doctor's registry views must grow by exactly that entry.
 #: #825/#832 (spec section 6, 8) authorizes two further differences, each
-#: asserted exactly: the stats epoch moves 1017 -> 1018 (the `db.version_ahead`
+#: asserted exactly: the stats epoch moves 1017 -> 1018, and since #797/#823/#840
+#: (spec 4.6 B6) to 1019 (the `db.version_ahead`
 #: details and summary), and the journal category gains `journal.legacy_writer`
 #: right after `journal.protocol`. On every fixture that leg is OK and reports
 #: either an unavailable summary or no cutover yet.
 # #968 adds cache migration 049; the registry views grow by that entry too.
 BASE_STATS_EPOCH = 1017
-ACCOUNT_BOUND_STATS_EPOCH = 1018
+ACCOUNT_BOUND_STATS_EPOCH = 1019
 LEGACY_WRITER_ID = "journal.legacy_writer"
 LEGACY_WRITER_AFTER = "journal.protocol"
 LEGACY_WRITER_SUMMARIES = (
@@ -83,7 +85,7 @@ LEGACY_WRITER_SUMMARIES = (
 
 
 def _with_account_bound_epoch(check):
-    """The baseline check as epoch 1018 renders it; others unchanged."""
+    """The baseline check as the current epoch renders it; others unchanged."""
     if check["id"] != "db.version_ahead":
         return check
     chk = copy.deepcopy(check)
@@ -126,6 +128,44 @@ def _split_compressed_rollouts(categories):
         out.append(dict(cat, checks=checks))
     assert found == [COMPRESSED_CHECK]
     return out
+
+#: #997 (rebuild resource bound, commit 502ec37dd): the `db` category gains
+#: exactly `db.rebuild_worker`, right after `db.version_ahead`. No baseline
+#: fixture has run a rebuild or an auto-heal worker, so it is OK on every one.
+REBUILD_WORKER_ID = "db.rebuild_worker"
+REBUILD_WORKER_AFTER = "db.version_ahead"
+_NO_WORKER_LEDGER = {"counts": {}, "lastDeathAt": None, "newest": None, "unresolved": []}
+REBUILD_WORKER_CHECK = {
+    "id": REBUILD_WORKER_ID,
+    "title": "Rebuild worker",
+    "severity": "ok",
+    "summary": "no stats.db upgrade rebuild has run; no stats.db auto-heal has run",
+    "details": {
+        "epoch": {"ledger": _NO_WORKER_LEDGER, "ledgerUnreadable": False, "liveness": None,
+                  "pending": {"indexPending": False, "present": False, "since": None},
+                  "recoveredDeaths": [], "rows": [], "state": None, "stateUnreadable": False},
+        "heal": {"ledger": _NO_WORKER_LEDGER, "ledgerUnreadable": False, "liveness": None,
+                 "pending": {"indexPending": None, "present": False, "since": None},
+                 "recoveredDeaths": [], "rows": [], "state": None, "stateUnreadable": False},
+    },
+}
+
+
+def _split_rebuild_worker(categories):
+    """``categories`` without the #997 check, which must equal REBUILD_WORKER_CHECK."""
+    out, found = [], []
+    for cat in categories:
+        checks = []
+        for chk in cat["checks"]:
+            if chk["id"] == REBUILD_WORKER_ID:
+                assert checks and checks[-1]["id"] == REBUILD_WORKER_AFTER
+                found.append(chk)
+            else:
+                checks.append(chk)
+        out.append(dict(cat, checks=checks))
+    assert found == [REBUILD_WORKER_CHECK]
+    return out
+
 
 def _split_legacy_writer(categories):
     """``categories`` without the #825/#832 leg, and that leg."""
@@ -247,7 +287,10 @@ def _report(doc):
 #: #825/#832 (spec section 8, F9/F16): the two scenarios with a current
 #: account-bound store, the only fixtures where `journal.legacy_writer` and
 #: `accounting.outcome_quarantine` report real states rather than unavailable.
-POST_BASELINE_SCENARIOS = ("40-account-bound-clear", "41-account-bound-legacy-write")
+#: #997: the scenario whose rebuild and auto-heal workers died and failed, the
+#: only fixture where `db.rebuild_worker` reports a real state.
+POST_BASELINE_SCENARIOS = ("40-account-bound-clear", "41-account-bound-legacy-write",
+                           "42-rebuild-workers-died-failed")
 
 
 def test_baseline_covers_every_doctor_scenario():
@@ -263,7 +306,8 @@ def test_only_the_authorized_doctor_differences(scenario):
     cur_full = _load(CURRENT / scenario / "expected.json")
     cur = dict(cur_full)
     cur["categories"], legacy_writer = _split_legacy_writer(
-        _split_quarantine_category(_split_compressed_rollouts(cur_full["categories"])))
+        _split_quarantine_category(_split_compressed_rollouts(
+            _split_rebuild_worker(cur_full["categories"]))))
     assert legacy_writer["severity"] == "ok"
     assert legacy_writer["title"] == "Legacy writer"
     assert legacy_writer["summary"] in LEGACY_WRITER_SUMMARIES
@@ -297,7 +341,7 @@ def test_only_the_authorized_doctor_differences(scenario):
 
     # Counts, severity and the identity slice follow from those verdicts alone.
     expected_counts = dict(base["overall"]["counts"])
-    expected_counts["ok"] = expected_counts.get("ok", 0) + 3
+    expected_counts["ok"] = expected_counts.get("ok", 0) + 4
     expected_counts["warn"] = expected_counts.get("warn", 0) + 1
     assert cur["overall"]["counts"] == expected_counts
     # Every fixture already carries a WARN or FAIL, so the roll-up holds.
@@ -312,6 +356,8 @@ def test_only_the_authorized_doctor_differences(scenario):
                 checks.append(legacy_writer)
             if chk["id"] == COMPRESSED_AFTER:
                 checks.append(COMPRESSED_CHECK)
+            if chk["id"] == REBUILD_WORKER_AFTER:
+                checks.append(REBUILD_WORKER_CHECK)
         expected_categories.append(dict(cat, checks=checks))
         if cat["id"] == QUARANTINE_AFTER:
             expected_categories.append(QUARANTINE_CATEGORY)

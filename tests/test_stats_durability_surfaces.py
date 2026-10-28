@@ -342,6 +342,11 @@ def no_spawn(monkeypatch):
         _cctally_update, "_spawn_detached",
         lambda command: spawned.append(command) or True,
     )
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or __import__(
+            "os").getpid(),
+    )
     return spawned
 
 

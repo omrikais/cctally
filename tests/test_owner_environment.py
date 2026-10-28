@@ -16,8 +16,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 _OWNER_PREFIXES = ("CCTALLY_TEST_ALL_", "CCTALLY_TEST_EVIDENCE_")
-_OWNER_NAMES = {"CCTALLY_TEST_RUN_ID", "CCTALLY_TEST_EXTERNAL_INCOMPLETE",
-                "CCTALLY_RUNNER_EVIDENCE_INDEX", "CCTALLY_REMOTE_DIR", "_CCTALLY_HARNESS_SCRUB"}
+_OWNER_NAMES = {"CCTALLY_TEST_RUN_ID", "CCTALLY_REMOTE_DIR", "_CCTALLY_HARNESS_SCRUB"}
 #: #965's test retention switch (bin/_cctally_config.py
 #: CONVERSATION_RETENTION_TEST_SWITCH; bin/_lib_test_isolation.py RETENTION_SWITCH).
 #: Execution policy that every harness and pytest leg must keep inheriting.

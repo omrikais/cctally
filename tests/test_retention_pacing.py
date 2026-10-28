@@ -595,6 +595,27 @@ def test_a_charge_lands_in_the_hour_its_operation_started(
     conn.close()
 
 
+def _chunk_driven_clock(retention, chunks):
+    """(clock, record_phase) for a visit that runs exactly ``chunks`` reclaim
+    chunks. The clock stands still, so every chunk plans with the attempt's
+    whole deadline in real time, and jumps past the deadline when the
+    ``chunks``-th chunk reports. How many chunks fit in the deadline is then
+    decided by the test, not by how fast the host runs the planner helper
+    (#942: a loaded runner fitted only one, and a late chunk planned with a
+    sliver of the deadline and was refused)."""
+    now = {"t": 0.0, "reported": 0}
+    ops = []
+
+    def record(kind, payload):
+        ops.append((kind, payload))
+        if kind == "reclaim":
+            now["reported"] += 1
+            if now["reported"] == chunks:
+                now["t"] += retention.RECLAIM_DEADLINE_SECONDS + 0.5
+
+    return (lambda: now["t"]), record, ops
+
+
 def test_a_fractional_reclaim_deadline_is_never_earlier_than_the_cadence(
         tmp_path, monkeypatch):
     ns, conn, retention, _ = _env(tmp_path, monkeypatch)
@@ -602,10 +623,13 @@ def test_a_fractional_reclaim_deadline_is_never_earlier_than_the_cadence(
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
     _eligible(monkeypatch, retention)
-    ops = []
-    assert _visit(retention, conn, FRACTIONAL, ops) is None
-    chunks = [p for kind, p in ops if kind == "reclaim" and p["outcome"] == "ok"]
-    assert len(chunks) >= 2
+    clock, record, ops = _chunk_driven_clock(retention, 3)
+    assert retention._maybe_prune_conversation_retention(
+        conn, now_utc=FRACTIONAL, retention_days=DAYS, record_phase=record,
+        clock=clock) is None
+    reclaims = [p for kind, p in ops if kind == "reclaim"]
+    assert [p["outcome"] for p in reclaims] == ["ok"] * 3, reclaims
+    chunks = reclaims
     stored = retention.read_reclaim_pending(conn)
     due = retention._parse_utc(stored["next_attempt_at"])
     cadence = FRACTIONAL + dt.timedelta(
@@ -627,16 +651,25 @@ def test_a_reclaim_attempt_stops_at_its_deadline(tmp_path, monkeypatch):
     retention._stamp_retention_prune(conn, NOW)
     conn.commit()
     _eligible(monkeypatch, retention)
-    ticks = {"n": 0.0}
-
-    def clock():
-        ticks["n"] += 1.0
-        return ticks["n"]
-
+    # The visit's clock stands still until a reclaim chunk reports, then jumps
+    # past the deadline. The first chunk therefore plans with the whole 2 s
+    # budget in real time, and only the check between chunks can stop the
+    # second. (A clock that ticks per call left the first chunk 0 s, floored
+    # to the planner's 50 ms, which a loaded host's planner can exceed.)
+    now = {"t": 0.0}
     ops = []
-    _visit(retention, conn, NOW, ops, clock=clock)
-    chunks = [p for kind, p in ops if kind == "reclaim" and p["outcome"] == "ok"]
-    assert len(chunks) == 1, "the 2 s deadline is checked between chunks"
+
+    def record(kind, payload):
+        ops.append((kind, payload))
+        if kind == "reclaim":
+            now["t"] += retention.RECLAIM_DEADLINE_SECONDS + 0.5
+
+    retention._maybe_prune_conversation_retention(
+        conn, now_utc=NOW, retention_days=DAYS, record_phase=record,
+        clock=lambda: now["t"])
+    reclaims = [p for kind, p in ops if kind == "reclaim"]
+    assert [p["outcome"] for p in reclaims] == ["ok"], (
+        "the 2 s deadline is checked between chunks", reclaims)
     assert conn.execute("PRAGMA freelist_count").fetchone()[0] == free - 16
     conn.close()
 

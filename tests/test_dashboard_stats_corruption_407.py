@@ -133,6 +133,12 @@ def test_index_only_stats_corruption_heals_once_after_handle_drain(
         "_spawn_detached",
         lambda command: spawned.append(command) or True,
     )
+    monkeypatch.setattr(
+        _cctally_update,
+        "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or __import__(
+            "os").getpid(),
+    )
     opened = []
     target_module = dashboard if snapshot_path == "initial" else tui
     real_open = target_module.open_db

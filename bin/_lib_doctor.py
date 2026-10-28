@@ -479,6 +479,11 @@ class DoctorState:
     # descriptor discovery plus one bounded loopback probe per live
     # instance elsewhere. {"mode", "instances": [...]}; None = not gathered.
     dashboard_disk_writes: Optional[dict] = None
+    # #997 D10: per detached rebuild worker ("epoch", "heal"), the read-only
+    # snapshot `_cctally_store.rebuild_worker_snapshot` gathered (run state,
+    # launch ledger, process identities probed before a re-read, pending
+    # marker). None = not gathered; the check then reads both as never run.
+    rebuild_workers: Optional[dict] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1049,7 +1054,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1018
+            epoch = 1019
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -1102,6 +1107,267 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
     return CheckResult(
         id="db.version_ahead", title="Version ahead", severity="ok",
         summary="none ahead", remediation=None, details=details,
+    )
+
+
+# --- #997 D10: the detached rebuild workers -------------------------------
+#
+# `rebuild_workers` is gathered read-only by `doctor_gather_state` through
+# `_cctally_store.rebuild_worker_snapshot` (no worker or admission flock is
+# ever taken): per worker the run state, the launch ledger, the process
+# identities probed BEFORE a re-read of both files, and the pending marker.
+# The kernel classifies it with `_lib_worker_launches` (read-only) — a death is
+# never inferred from elapsed time.
+
+#: No progress write for this long reads as "no progress" (spec D10).
+REBUILD_STALL_SECONDS = 600
+#: A marker pending this long with no worker running warns.
+REBUILD_PENDING_SECONDS = 600
+#: Recovered deaths this recent are listed in `details`.
+REBUILD_RECENT_DEATH_SECONDS = 7 * 86400
+#: §5.2's resident-memory bound.
+REBUILD_MEMORY_BOUND_BYTES = 2 * 1024 ** 3
+
+_REBUILD_NOUN = {"epoch": "stats.db upgrade rebuild",
+                 "heal": "stats.db auto-heal"}
+_REBUILD_CLEAN = {
+    "epoch": frozenset({"success", "current"}),
+    "heal": frozenset({"success", "no-request", "declined-readable"}),
+}
+_REBUILD_RETRYABLE = {
+    "epoch": frozenset(),
+    "heal": frozenset({"maintenance-busy", "ingest-busy"}),
+}
+
+
+def rebuild_outcome_class(worker: str, outcome, *, decline_reason=None,
+                          finalization=None) -> str:
+    """``clean`` | ``retryable`` | ``failing`` (spec D10 outcome classes).
+
+    ``declined-unconfirmed`` is clean only when the store re-probed healthy
+    (``integrity_check_ok``). A pending finalization never lowers the primary
+    class: it turns a clean outcome retryable and leaves a failing one
+    failing. Any outcome not listed is failing until it is added.
+    """
+    if worker == "heal" and outcome == "declined-unconfirmed":
+        primary = ("clean" if decline_reason == "integrity_check_ok"
+                   else "failing")
+    elif outcome in _REBUILD_CLEAN.get(worker, ()):
+        primary = "clean"
+    elif outcome in _REBUILD_RETRYABLE.get(worker, ()):
+        primary = "retryable"
+    else:
+        primary = "failing"
+    if primary == "clean" and finalization == "pending":
+        return "retryable"
+    return primary
+
+
+def _rebuild_parse_iso(value) -> "dt.datetime | None":
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _rebuild_age_seconds(now: dt.datetime, value) -> "float | None":
+    parsed = _rebuild_parse_iso(value)
+    if parsed is None:
+        return None
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, (now - parsed).total_seconds())
+
+
+def _rebuild_minutes(seconds) -> int:
+    return int((seconds or 0) // 60)
+
+
+def _rebuild_ledger_summary(ledger: dict) -> dict:
+    import _lib_worker_launches as wl
+    return {
+        "unresolved": [dict(e) for e in wl.unresolved(ledger)],
+        "counts": dict(ledger.get("counts") or {}),
+        "lastDeathAt": ledger.get("lastDeathAt"),
+        "newest": dict(wl.newest(ledger) or {}) or None,
+    }
+
+
+def assess_rebuild_worker(worker: str, snapshot, now_utc) -> dict:
+    """One worker's D10 classification from its read-only snapshot.
+
+    Returns ``{"severity", "warnings": [sentence, ...], "summary", "row",
+    "details"}``: ``warnings`` holds every warn sentence in table order and
+    ``summary`` the single sentence that describes the worker.
+    """
+    import _lib_worker_launches as wl
+
+    noun = _REBUILD_NOUN[worker]
+    snapshot = snapshot or {}
+    state = snapshot.get("state")
+    run = state.get("run") if isinstance(state, dict) else None
+    run = run if isinstance(run, dict) else None
+    identities = snapshot.get("identities") or {}
+    ledger = snapshot.get("ledger") or wl.empty_ledger()
+    # Read-only: settlements the evidence supports, never written back.
+    classified = wl.classify(ledger, state, identities)["ledger"]
+    pending = snapshot.get("pending") or {}
+    warnings: list = []
+    rows: list = []
+    details: dict = {
+        "state": state,
+        "stateUnreadable": bool(snapshot.get("stateUnreadable")),
+        "ledgerUnreadable": bool(snapshot.get("ledgerUnreadable")),
+        "ledger": _rebuild_ledger_summary(classified),
+        "liveness": None,
+        "pending": pending,
+        "recoveredDeaths": [],
+    }
+    if snapshot.get("gatherError"):
+        details["gatherError"] = snapshot["gatherError"]
+
+    if snapshot.get("stateUnreadable"):
+        rows.append("unreadable")
+        warnings.append(f"the {noun} state is unreadable")
+
+    running = run is not None and run.get("status") == "running"
+    running_alive = False
+    if running:
+        live = wl.liveness(run, identities)
+        details["liveness"] = live
+        if live != "gone":
+            running_alive = True
+            n = _rebuild_minutes(_rebuild_age_seconds(now_utc,
+                                                      run.get("startedAt")))
+            idle = _rebuild_age_seconds(
+                now_utc, run.get("progressAt") or run.get("startedAt"))
+            if idle is not None and idle >= REBUILD_STALL_SECONDS:
+                rows.append("stalled")
+                warnings.append(
+                    f"a {noun} has been running for {n} minutes with no "
+                    f"progress for {_rebuild_minutes(idle)} minutes")
+            else:
+                rows.append("running")
+                warnings.append(f"a {noun} has been running for {n} minutes")
+
+    # The last decisive launch, in ledger (launch) order: a launch not yet
+    # started (unacknowledged, unresolved) and a `busy` loser decide nothing.
+    decisive = None
+    for entry in reversed(classified.get("entries") or []):
+        outcome = entry.get("outcome")
+        if outcome == "busy":
+            continue
+        if not outcome and not (isinstance(entry.get("ack"), dict)
+                                and entry["ack"].get("kind") == "started"):
+            continue
+        decisive = entry
+        break
+    finished_run = run if run is not None and run.get("status") == "finished" \
+        else None
+    ok_summary = None
+    if not running_alive:
+        # A state still `running` whose process is confirmed gone is a death:
+        # any newer run would have replaced the slot when it started.
+        died = bool(decisive and decisive.get("outcome") in wl.DEATHS) \
+            or running
+        if died:
+            rows.append("died")
+            warnings.append(f"the last {noun} died without finishing")
+            details["preStart"] = bool(
+                decisive and decisive.get("outcome") == "died-pre-start")
+            details["launchId"] = (decisive or run or {}).get("launchId")
+        elif decisive is not None and decisive.get("outcome") == "spawn-failed":
+            rows.append("spawn-failed")
+            warnings.append(f"the last {noun} failed (spawn-failed)")
+        else:
+            outcome = decline = finalization = peak = None
+            if finished_run is not None and (
+                    decisive is None
+                    or decisive.get("launchId") == finished_run.get("launchId")):
+                outcome = finished_run.get("outcome")
+                decline = finished_run.get("declineReason")
+                finalization = finished_run.get("finalization")
+                peak = finished_run.get("peakResidentBytes")
+            elif decisive is not None and str(
+                    decisive.get("outcome") or "").startswith("finished:"):
+                outcome = decisive["outcome"][len("finished:"):]
+            if outcome is not None:
+                cls = rebuild_outcome_class(
+                    worker, outcome, decline_reason=decline,
+                    finalization=finalization)
+                details["outcomeClass"] = cls
+                if cls == "failing":
+                    rows.append("failed")
+                    warnings.append(f"the last {noun} failed ({outcome})")
+                if isinstance(peak, (int, float)) and \
+                        peak > REBUILD_MEMORY_BOUND_BYTES:
+                    rows.append("memory")
+                    warnings.append(
+                        f"the last {noun} used {peak / 1024 ** 3:.1f} GiB of "
+                        f"memory, above its 2 GiB bound")
+                ok_summary = f"the last {noun} finished ({outcome})"
+        if (pending.get("present") and pending.get("indexPending") is not False):
+            age = _rebuild_age_seconds(now_utc, pending.get("since"))
+            if age is not None and age >= REBUILD_PENDING_SECONDS:
+                rows.append("pending")
+                warnings.append(
+                    f"a {noun} has been pending for {_rebuild_minutes(age)} "
+                    f"minutes with no worker running")
+                if not wl.has_launch_capacity(classified):
+                    # The spawner withholds launches at capacity; the
+                    # pending row says why, with no new sentence.
+                    details["admission"] = "launch-capacity"
+                    details["unresolvedCount"] = len(
+                        wl.unresolved(classified))
+    for death in (state or {}).get("deaths") or []:
+        age = _rebuild_age_seconds(now_utc, death.get("detectedAt"))
+        if age is not None and age <= REBUILD_RECENT_DEATH_SECONDS:
+            details["recoveredDeaths"].append(dict(death))
+    if ok_summary is None:
+        ok_summary = f"no {noun} has run"
+    severity = "warn" if warnings else "ok"
+    details["rows"] = rows
+    return {
+        "severity": severity,
+        "warnings": warnings,
+        "summary": warnings[0] if warnings else ok_summary,
+        "row": rows[0] if rows else ("idle" if state is None else "ok"),
+        "details": details,
+    }
+
+
+def _check_db_rebuild_worker(s: DoctorState) -> CheckResult:
+    """`db.rebuild_worker` (#997 D10): running, stalled, dead, failed or
+    pending stats.db upgrade rebuilds and auto-heals."""
+    return rebuild_worker_check(s.rebuild_workers, s.now_utc)
+
+
+def rebuild_worker_check(rebuild_workers, now_utc) -> CheckResult:
+    """The `db.rebuild_worker` result from the gathered worker snapshots
+    alone. The doctor check and the dashboard's deferred frames
+    (`rebuild_worker_envelope_value`) both build it here, so their wording
+    and precedence cannot drift apart."""
+    snapshots = rebuild_workers or {}
+    assessed = {
+        worker: assess_rebuild_worker(worker, snapshots.get(worker),
+                                      now_utc)
+        for worker in ("epoch", "heal")
+    }
+    warnings = [w for worker in ("epoch", "heal")
+                for w in assessed[worker]["warnings"]]
+    severity = _max_severity([a["severity"] for a in assessed.values()])
+    summary = "; ".join(warnings) if warnings else "; ".join(
+        assessed[worker]["summary"] for worker in ("epoch", "heal"))
+    return CheckResult(
+        id="db.rebuild_worker", title="Rebuild worker", severity=severity,
+        summary=summary, remediation=None,
+        details={worker: assessed[worker]["details"]
+                 for worker in ("epoch", "heal")},
     )
 
 
@@ -4547,6 +4813,7 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("db.cache.file", "_check_db_cache_file"),
         ("db.integrity", "_check_db_integrity"),
         ("db.version_ahead", "_check_db_version_ahead"),
+        ("db.rebuild_worker", "_check_db_rebuild_worker"),
         ("db.migrations.applied", "_check_db_migrations_applied"),
         ("db.migrations.pending", "_check_db_migrations_pending"),
         ("db.lock_state", "_check_db_lock_state"),
@@ -5109,6 +5376,40 @@ def fingerprint(report: DoctorReport) -> str:
     payload = json.dumps(_identity_slice(report), sort_keys=True, separators=(",", ":"))
     h = hashlib.sha1(payload.encode("utf-8")).hexdigest()
     return f"sha1:{h}"
+
+
+def rebuild_worker_aggregate(checks) -> "dict | None":
+    """#997 D10: the dashboard aggregate's ``rebuild_worker`` value —
+    ``{severity, summary}`` from the ``db.rebuild_worker`` result when it is
+    not ok, else ``None`` (also when the check is absent)."""
+    for c in checks:
+        if c.id == "db.rebuild_worker":
+            if c.severity == "ok":
+                return None
+            return {"severity": c.severity, "summary": c.summary}
+    return None
+
+
+def rebuild_worker_envelope_value(rebuild_workers, now_utc) -> "dict | None":
+    """#997 D10: exactly the ``rebuild_worker`` value `envelope_block` would
+    carry for these worker snapshots, without the rest of doctor. The
+    dashboard's deferred frames use it while every stats open defers."""
+    return rebuild_worker_aggregate(
+        (rebuild_worker_check(rebuild_workers, now_utc),))
+
+
+def envelope_block(report: DoctorReport) -> dict:
+    """The dashboard envelope's small doctor block for ``report``; the TUI
+    precompute and the envelope's inline path both build it here, so the
+    two producers stay byte-identical."""
+    return {
+        "severity": report.overall_severity,
+        "counts": dict(report.counts),
+        "generated_at": _iso_z(report.generated_at),
+        "fingerprint": fingerprint(report),
+        "rebuild_worker": rebuild_worker_aggregate(
+            c for cat in report.categories for c in cat.checks),
+    }
 
 
 _GLYPH = {"ok": "✓", "warn": "⚠", "fail": "✗"}

@@ -2063,6 +2063,63 @@ def _apply_codex_window_attribution_overlay(
     ))
 
 
+class _QuotaLoadValues:
+    """The values one `load_codex_quota_observations` call shares (#997 D17).
+
+    A full load materializes every retained observation (266 k on the
+    maintainer's copy, about 2.3 KB each), and every row brought its own copy
+    of each repeated text value, its own parsed reset instants and its own
+    `QuotaWindowIdentity`. Within one call this keeps one object per distinct
+    text value, one parsed instant per distinct stored reset text, and one
+    identity per distinct tuple of ALL its fields. `limit_id` and
+    `limit_name` are outside the identity's equality, so sharing by equality
+    alone would hand one observation another's labels; the tuple includes them
+    (with their types, so a hand-written ``1`` and ``1.0`` stay apart). Every
+    shared value is immutable, so values, equality and order are unchanged.
+    """
+
+    __slots__ = ("_texts", "_resets", "_identities")
+
+    def __init__(self) -> None:
+        self._texts: dict = {}
+        self._resets: dict = {}
+        self._identities: dict = {}
+
+    def text(self, value):
+        """``value``'s shared object; a non-string is returned unchanged."""
+        if type(value) is not str:
+            return value
+        return self._texts.setdefault(value, value)
+
+    def reset(self, text: str, label: str) -> dt.datetime:
+        """`_parse_utc(text, label)`, parsed once per distinct text."""
+        parsed = self._resets.get(text)
+        if parsed is None:
+            parsed = self._resets[text] = _parse_utc(text, label)
+        return parsed
+
+    def identity(self, *, source, source_root_key, account_key,
+                 logical_limit_key, observed_slot, window_minutes, limit_id,
+                 limit_name) -> QuotaWindowIdentity:
+        key = (source, source_root_key, account_key, logical_limit_key,
+               observed_slot, type(window_minutes), window_minutes,
+               type(limit_id), limit_id, type(limit_name), limit_name)
+        identity = self._identities.get(key)
+        if identity is None:
+            text = self.text
+            identity = self._identities[key] = QuotaWindowIdentity(
+                source=text(source),
+                source_root_key=text(source_root_key),
+                account_key=text(account_key),
+                logical_limit_key=text(logical_limit_key),
+                observed_slot=text(observed_slot),
+                window_minutes=window_minutes,
+                limit_id=text(limit_id),
+                limit_name=text(limit_name),
+            )
+        return identity
+
+
 def load_codex_quota_observations(
     *,
     source_root_keys: Iterable[str] | None = None,
@@ -2463,6 +2520,9 @@ def load_codex_quota_observations(
             row_source = _iter_shard_rows(conn, shards)
         result: list[QuotaObservation] = []
         signature_tuples: dict[str, dict[str, list[tuple[object, ...]]]] = {}
+        # #997 D17: repeated values are shared within this call.
+        values = _QuotaLoadValues()
+        text = values.text
         for row in row_source:
             if not _codex_quota_required_text_present(
                 row[name] for name in _CODEX_QUOTA_REQUIRED_TEXT
@@ -2498,7 +2558,7 @@ def load_codex_quota_observations(
                     str(raw_account) if raw_account not in (None, "")
                     else _lib_accounts.UNATTRIBUTED
                 )
-                identity = QuotaWindowIdentity(
+                identity = values.identity(
                     source=str(row["source"]),
                     source_root_key=str(row["source_root_key"]),
                     account_key=account_key,
@@ -2512,16 +2572,18 @@ def load_codex_quota_observations(
                     identity=identity,
                     captured_at=_parse_utc(str(row["captured_at_utc"]), "captured_at_utc"),
                     used_percent=float(row["used_percent"]),
-                    resets_at=_parse_utc(str(row["resets_at_utc"]), "resets_at_utc"),
-                    source_path=str(row["source_path"]),
+                    resets_at=values.reset(
+                        str(row["resets_at_utc"]), "resets_at_utc"),
+                    source_path=text(str(row["source_path"])),
                     line_offset=int(row["line_offset"]),
-                    plan_type=row["plan_type"],
-                    individual_limit_json=row["individual_limit_json"],
-                    reached_type=row["reached_type"],
+                    plan_type=text(row["plan_type"]),
+                    individual_limit_json=text(row["individual_limit_json"]),
+                    reached_type=text(row["reached_type"]),
                     canonical_resets_at=(
                         None if row["canonical_resets_at_utc"] in (None, "")
-                        else _parse_utc(str(row["canonical_resets_at_utc"]),
-                                        "canonical_resets_at_utc")
+                        else values.reset(
+                            str(row["canonical_resets_at_utc"]),
+                            "canonical_resets_at_utc")
                     ),
                 )
             except (TypeError, ValueError, OverflowError):

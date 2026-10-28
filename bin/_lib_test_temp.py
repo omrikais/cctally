@@ -16,7 +16,7 @@ preceded by a fresh ``lstat`` that must show the same device, inode and file
 type. A privileged or
 unsupported flag fails visibly; there is no sudo and no fallback.
 
-Installed with the runner tooling (``bin/_lib_runner_storage.py`` INSTALL_SET),
+Installed with the runner supervisor (``bin/_lib_runner_client.py`` INSTALL_SET),
 so it parses on Python 3.9 and imports nothing outside the standard library.
 """
 from __future__ import annotations

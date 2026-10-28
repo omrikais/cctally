@@ -30,6 +30,7 @@ import struct
 import subprocess
 import sys
 import time
+import types
 from dataclasses import dataclass
 
 import pytest
@@ -961,6 +962,33 @@ def _conversation_pass(env: Env) -> None:
         conn.close()
 
 
+def _advance_container_status_clock(env: Env, *, seconds: float) -> None:
+    """Run the Codex container status recorder `seconds` later than now.
+
+    Only that recorder's clock moves: the shim replaces `dt` for the length of
+    its call, so no other product clock read, and no `isinstance` check against
+    `datetime`, sees a different class."""
+    original = env.cache._record_codex_container_status
+    real = env.cache.dt
+
+    class Later(real.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real.datetime.now(tz) + real.timedelta(seconds=seconds)
+
+    clock = types.SimpleNamespace(**{**vars(real), "datetime": Later})
+
+    def record(*args, **kwargs):
+        previous = env.cache.dt
+        env.cache.dt = clock
+        try:
+            return original(*args, **kwargs)
+        finally:
+            env.cache.dt = previous
+
+    env.mp.setattr(env.cache, "_record_codex_container_status", record)
+
+
 def _no_op_fixture(env: Env, tmp_path: pathlib.Path) -> pathlib.Path:
     for index in range(3):
         env.rollout(f"0{index}", f"conv{index}", 2)
@@ -996,6 +1024,13 @@ def test_c_a_tick_and_a_conversation_pass_with_no_new_data_write_no_frames(
     # (backfills, first-observation markers).
     _tick_cache_sync(env)
     _conversation_pass(env)
+    # A real tick follows the previous one by seconds, not microseconds. The
+    # Codex container status, stamped with a one-second clock, wrote nothing
+    # here only when the measured window happened to fall inside the settle
+    # round's second; it rewrote its `observedAt` on every later pass, one
+    # frame in each store (review I3c F1). Its clock is moved two seconds on
+    # for the measured window, so the window is always past that second.
+    _advance_container_status_clock(env, seconds=2)
 
     # Measured through the product's own open–sync–close cycle on the now
     # current-schema stores, each opening its connections through the full

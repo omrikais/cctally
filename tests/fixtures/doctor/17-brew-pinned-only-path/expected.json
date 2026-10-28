@@ -232,7 +232,7 @@
                             "user_version": 0
                         },
                         "stats.db": {
-                            "epoch": 1018,
+                            "epoch": 1019,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -242,6 +242,52 @@
                     "severity": "ok",
                     "summary": "none ahead",
                     "title": "Version ahead"
+                },
+                {
+                    "details": {
+                        "epoch": {
+                            "ledger": {
+                                "counts": {},
+                                "lastDeathAt": null,
+                                "newest": null,
+                                "unresolved": []
+                            },
+                            "ledgerUnreadable": false,
+                            "liveness": null,
+                            "pending": {
+                                "indexPending": false,
+                                "present": false,
+                                "since": null
+                            },
+                            "recoveredDeaths": [],
+                            "rows": [],
+                            "state": null,
+                            "stateUnreadable": false
+                        },
+                        "heal": {
+                            "ledger": {
+                                "counts": {},
+                                "lastDeathAt": null,
+                                "newest": null,
+                                "unresolved": []
+                            },
+                            "ledgerUnreadable": false,
+                            "liveness": null,
+                            "pending": {
+                                "indexPending": null,
+                                "present": false,
+                                "since": null
+                            },
+                            "recoveredDeaths": [],
+                            "rows": [],
+                            "state": null,
+                            "stateUnreadable": false
+                        }
+                    },
+                    "id": "db.rebuild_worker",
+                    "severity": "ok",
+                    "summary": "no stats.db upgrade rebuild has run; no stats.db auto-heal has run",
+                    "title": "Rebuild worker"
                 },
                 {
                     "details": {
@@ -1225,7 +1271,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 63,
+            "ok": 64,
             "warn": 7
         },
         "severity": "warn"

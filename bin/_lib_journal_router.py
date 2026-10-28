@@ -155,12 +155,37 @@ class PrefixHashAccumulator:
 
     The framing is `journal_prefix_hash`'s, verbatim: per segment, the 4-byte
     big-endian name length, the name, the 8-byte big-endian data length, then
-    the data. Completed segments are absorbed into a running `sha256`; only the
-    segment currently being streamed is buffered, so residency is bounded by one
-    segment. At a segment transition the caller passes the boundary the next
-    record's `prior_high_water` will name, which is the ONE offset in the
-    outgoing segment that can still be asked for; its digest is precomputed
-    before the buffer is released.
+    the data. The data length precedes the data, so `begin_segment` takes the
+    exact byte count the pass will feed (`size`) and frames the segment header
+    with it; every chunk is then hashed as it arrives and NO segment bytes are
+    retained (#997 D12). The buffered form held the whole current segment in a
+    `bytearray` grown by `extend` — 410 MB on the maintainer's largest segment
+    — and the freed growth steps stayed resident in the macOS allocator.
+
+    A digest at a fully fed segment end (every transition, and every boundary
+    not short of a torn tail) comes from the streamed state. A digest at any
+    other offset — an evidence point inside the current segment, a boundary
+    short of a torn trailing line, a feed that ended short of its declared
+    size — re-reads the segment through `open_segment(name)` in 1 MiB chunks,
+    which the production callers bind to the journal's one segment-read seam,
+    so an evidence re-read is visible to it.
+
+    Consumed extent (#997 D12, revision 10). Per segment the accumulator also
+    tracks the bytes actually fed (`consumed`) and a raw SHA-256 of those bytes
+    alone (the witness). An offset beyond `consumed` raises. Every re-read reads
+    through `consumed`, not only through the requested offset: one pass frames
+    the prefix digest at the offset and hashes `[0, consumed)` raw, and the
+    digest is returned only when the read was not short and that raw hash
+    equals the witness. A torn tail an appender truncated and replaced after
+    the pass read it, or a line the reader assembled from old and replacement
+    bytes across two reads, can therefore never be certified. A registered
+    boundary keeps its segment's `consumed` and witness with its saved hash
+    state. A segment fed short of its declared size is re-framed from its
+    consumed bytes through the same verified re-read at the next
+    `begin_segment`; when that re-read is unavailable or fails verification
+    the accumulator is poisoned and every later digest raises. A missing
+    opener, a short re-read or a failed verification raises
+    `PrefixEvidenceUnavailable`.
     """
 
     # A transition can only ever register one boundary, and consecutive empty
@@ -176,10 +201,28 @@ class PrefixHashAccumulator:
     # entry that is still live.
     _MAX_BOUNDARIES = 16
 
-    def __init__(self) -> None:
+    #: Chunk size of an evidence re-read through the opener.
+    _REREAD_CHUNK = 1 << 20
+
+    def __init__(self, *, open_segment=None) -> None:
+        self._open_segment = open_segment
+        #: The hash of every segment before the current one, absorbed.
         self._running = hashlib.sha256()
         self._current_name = None
-        self._current = bytearray()
+        #: `_running` plus the current segment's header (framed with its
+        #: declared size) and every byte fed so far.
+        self._segment = None
+        self._declared = 0
+        #: Bytes of the current segment actually fed (its consumed extent),
+        #: and the raw SHA-256 of exactly those bytes (the witness).
+        self._fed = 0
+        self._witness = hashlib.sha256()
+        #: Set when a short segment could not be re-framed from verified
+        #: bytes: the running state no longer describes the journal.
+        self._poisoned = None
+        #: `(segment, offset) -> (state before that segment, final digest or
+        #: None, consumed, witness digest)`; a `None` final digest is re-read
+        #: through the opener, verified against the witness, when read.
         self._boundaries: dict = {}
         self._boundary_order: list = []
         #: Bytes fed into an evidence digest, reported as the `protocol_evidence`
@@ -189,54 +232,91 @@ class PrefixHashAccumulator:
 
     # -- feeding ----------------------------------------------------------
 
-    def begin_segment(self, name: str, boundary=None) -> None:
-        """Start `name`, absorbing whatever segment was open before it.
+    def begin_segment(self, name: str, boundary=None, *, size: int) -> None:
+        """Start `name`, which the pass will feed `size` bytes of, absorbing
+        whatever segment was open before it.
 
         `boundary` is the `(segment, offset)` the next record's evidence would
-        name — i.e. the streaming loop's current `prior_high_water`. It is
-        resolved and cached HERE because the outgoing segment's bytes are gone
-        immediately afterwards.
+        name — i.e. the streaming loop's current `prior_high_water`. Its hash
+        state is kept HERE because the outgoing segment's state is folded into
+        the running hash immediately afterwards.
         """
         if boundary is not None:
             self._register_boundary(boundary)
         if self._current_name is not None:
-            # `hashlib.update` accepts the buffer directly, so the outgoing
-            # segment is framed WITHOUT a copy of itself. The maintainer's
-            # largest segment is 410 MB, and copying it here briefly doubled
-            # that at every transition.
-            with memoryview(self._current) as data:
-                self._absorb(self._current_name, data)
+            self._running = self._completed_segment()
         self._current_name = name
-        self._current = bytearray()
+        self._declared = int(size)
+        self._fed = 0
+        self._witness = hashlib.sha256()
+        self._segment = self._running.copy()
+        self._header(self._segment, name, self._declared)
 
-    def extend(self, data: bytes) -> None:
-        """Absorb raw bytes read from the segment currently open."""
-        self._current.extend(data)
+    def extend(self, data) -> None:
+        """Hash raw bytes read from the segment currently open."""
+        self._segment.update(data)
+        self._witness.update(data)
+        self._fed += len(data)
 
     # -- reading ----------------------------------------------------------
 
     def digest_at(self, high_water) -> "str | None":
-        """`journal_prefix_hash(high_water)`, from the streamed bytes."""
+        """`journal_prefix_hash(high_water)`, from the streamed state."""
         if high_water is None:
             return None
         segment, offset = high_water
-        if segment == self._current_name:
-            digest = self._running.copy()
-            with memoryview(self._current)[:offset] as data:
-                self._frame(digest, segment, data)
-                self.bytes_hashed += len(data)
-            self.digests_computed += 1
-            return "sha256:" + digest.hexdigest()
-        cached = self._boundaries.get((segment, offset))
-        if cached is None:
+        if self._poisoned is not None:
             raise PrefixEvidenceUnavailable(
-                f"no streamed prefix evidence for {segment}@{offset}"
+                f"no verified prefix evidence for {segment}@{offset}: "
+                f"{self._poisoned}"
             )
-        self.bytes_hashed += cached[1]
+        if segment == self._current_name:
+            if self._streamed_end(offset):
+                digest = self._segment.copy()
+            else:
+                digest = self._verified_rehash(
+                    self._running, segment, offset, self._fed,
+                    self._witness.digest())
+        else:
+            cached = self._boundaries.get((segment, offset))
+            if cached is None:
+                raise PrefixEvidenceUnavailable(
+                    f"no streamed prefix evidence for {segment}@{offset}"
+                )
+            before, final, consumed, witness = cached
+            digest = (final.copy() if final is not None
+                      else self._verified_rehash(
+                          before, segment, offset, consumed, witness))
+        self.bytes_hashed += offset
         self.digests_computed += 1
-        return cached[0]
+        return "sha256:" + digest.hexdigest()
 
     # -- internals --------------------------------------------------------
+
+    def _streamed_end(self, offset) -> bool:
+        """Whether the streamed state IS the digest at `offset`: the current
+        segment was fed exactly its declared size and `offset` is its end."""
+        return offset == self._fed == self._declared
+
+    def _completed_segment(self):
+        """The running hash with the current segment absorbed as fed."""
+        if self._fed == self._declared or self._poisoned is not None:
+            return self._segment
+        # The feed ended short of the declared size (the segment shrank under
+        # the pass): frame the bytes actually fed, as the buffered form did,
+        # from a re-read verified against them. Bytes that cannot be verified
+        # leave no running state that describes the journal, so every later
+        # digest raises rather than certifying one.
+        try:
+            return self._verified_rehash(
+                self._running, self._current_name, self._fed, self._fed,
+                self._witness.digest())
+        except (PrefixEvidenceUnavailable, OSError) as exc:
+            self._poisoned = (
+                f"short segment {self._current_name} could not be re-framed "
+                f"from its consumed bytes ({exc})"
+            )
+            return self._segment
 
     def _register_boundary(self, boundary) -> None:
         segment, offset = boundary
@@ -247,23 +327,61 @@ class PrefixHashAccumulator:
         key = (segment, offset)
         if key in self._boundaries:
             return
-        digest = self._running.copy()
-        with memoryview(self._current)[:offset] as data:
-            self._frame(digest, segment, data)
-            size = len(data)
-        self._boundaries[key] = ("sha256:" + digest.hexdigest(), size)
+        final = (self._segment.copy() if self._streamed_end(offset)
+                 else None)
+        self._boundaries[key] = (self._running.copy(), final, self._fed,
+                                 self._witness.digest())
         self._boundary_order.append(key)
         while len(self._boundary_order) > self._MAX_BOUNDARIES:
             self._boundaries.pop(self._boundary_order.pop(0), None)
 
-    def _absorb(self, name, data) -> None:
-        self._frame(self._running, name, data)
+    def _verified_rehash(self, before, name: str, offset: int,
+                         consumed: int, witness: bytes):
+        """`before` plus `name`'s first `offset` bytes, re-read from the
+        segment through the opener in `_REREAD_CHUNK` pieces.
+
+        The read always runs through `consumed`, the bytes the pass fed, and
+        its raw SHA-256 must equal `witness`; only then are the bytes the
+        digest frames the bytes the pass read."""
+        if offset > consumed:
+            raise PrefixEvidenceUnavailable(
+                f"prefix evidence {name}@{offset} lies beyond the "
+                f"{consumed} bytes the pass consumed"
+            )
+        digest = before.copy()
+        self._header(digest, name, offset)
+        if consumed <= 0:
+            return digest
+        if self._open_segment is None:
+            raise PrefixEvidenceUnavailable(
+                f"no segment opener to re-read prefix evidence for "
+                f"{name}@{offset}"
+            )
+        raw = hashlib.sha256()
+        pos = 0
+        with self._open_segment(name) as handle:
+            while pos < consumed:
+                chunk = handle.read(min(self._REREAD_CHUNK, consumed - pos))
+                if not chunk:
+                    raise PrefixEvidenceUnavailable(
+                        f"short re-read of prefix evidence for {name}@{offset}"
+                    )
+                raw.update(chunk)
+                if pos < offset:
+                    with memoryview(chunk)[:offset - pos] as framed:
+                        digest.update(framed)
+                pos += len(chunk)
+        if raw.digest() != witness:
+            raise PrefixEvidenceUnavailable(
+                f"segment {name} no longer holds the {consumed} bytes the "
+                f"pass consumed; prefix evidence {name}@{offset} is not "
+                f"certified"
+            )
+        return digest
 
     @staticmethod
-    def _frame(digest, name: str, data) -> None:
-        """`data` is any bytes-like buffer; `hashlib` consumes it in place."""
+    def _header(digest, name: str, length: int) -> None:
         encoded = name.encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)
-        digest.update(len(data).to_bytes(8, "big"))
-        digest.update(data)
+        digest.update(int(length).to_bytes(8, "big"))

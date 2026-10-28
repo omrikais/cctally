@@ -125,6 +125,10 @@ SCENARIOS = {
     # sentence).
     "40-account-bound-clear":       "account_bound_clear",
     "41-account-bound-legacy-write": "account_bound_legacy_write",
+    # #997 D10: `db.rebuild_worker` WARN from settled records only (no live
+    # pid is probed, so the golden is host-independent): the newest epoch
+    # launch died before its start, and the last heal failed.
+    "42-rebuild-workers-died-failed": "rebuild_workers_died_failed",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -365,8 +369,8 @@ def _scenario_body(slug: str) -> str:
         # window under the account-bound root; a far-future week keeps the
         # window live whatever CCTALLY_AS_OF the harness pins.
         return _scenario_body("all_ok") + textwrap.dedent("""\
-            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones"
-            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v1/accounts/unattributed/tombstones/sevenDay-4102444800.json" <<'JSON'
+            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v2/accounts/unattributed/tombstones"
+            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v2/accounts/unattributed/tombstones/sevenDay-4102444800.json" <<'JSON'
             {"schemaVersion":1,"protocolGeneration":"account-bound-v1","accountKey":"unattributed","canonicalWindowKey":4102444800,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
             JSON
         """)
@@ -647,6 +651,55 @@ def _scenario_body(slug: str) -> str:
             PY
             """)
         return _scenario_body("all_ok") + journal
+    if slug == "rebuild_workers_died_failed":
+        workers = textwrap.dedent("""\
+            APP="$HARNESS_FAKE_HOME/.local/share/cctally"
+            cat > "$APP/stats-epoch-rebuild.state.json" <<'JSON'
+            {"schemaVersion": 1, "deaths": [], "previousUnreadable": null,
+             "run": {"runId": "20260513T120000Z-0000aaaa", "launchId": "launch-a",
+                     "pid": 4242, "birth": "Wed May 13 12:00:00 2026",
+                     "status": "finished", "phase": "rebuild:publish",
+                     "startedAt": "2026-05-13T12:00:00Z",
+                     "progressAt": "2026-05-13T12:05:00Z",
+                     "finishedAt": "2026-05-13T12:06:00Z", "wallSeconds": 360.0,
+                     "outcome": "success", "peakResidentBytes": 524288000}}
+            JSON
+            cat > "$APP/stats-epoch-rebuild.launches.json" <<'JSON'
+            {"schemaVersion": 1, "lastDeathAt": "2026-05-13T14:00:00Z",
+             "counts": {"finished:success": 1, "died-pre-start": 1},
+             "entries": [
+              {"launchId": "launch-a", "at": "2026-05-13T12:00:00Z", "pid": 4242,
+               "birth": "Wed May 13 12:00:00 2026", "spawn": "ok",
+               "ack": {"kind": "started", "runId": "20260513T120000Z-0000aaaa",
+                       "at": "2026-05-13T12:00:00Z"},
+               "outcome": "finished:success", "settledAt": "2026-05-13T12:06:00Z"},
+              {"launchId": "launch-b", "at": "2026-05-13T13:59:00Z", "pid": 4343,
+               "birth": "Wed May 13 13:59:00 2026", "spawn": "ok", "ack": null,
+               "outcome": "died-pre-start", "settledAt": "2026-05-13T14:00:00Z"}]}
+            JSON
+            cat > "$APP/stats-heal.state.json" <<'JSON'
+            {"schemaVersion": 1, "deaths": [], "previousUnreadable": null,
+             "run": {"runId": "20260513T130000Z-0000bbbb", "launchId": "launch-h",
+                     "pid": 4444, "birth": "Wed May 13 13:00:00 2026",
+                     "status": "finished", "phase": "starting",
+                     "startedAt": "2026-05-13T13:00:00Z",
+                     "progressAt": "2026-05-13T13:00:00Z",
+                     "finishedAt": "2026-05-13T13:00:05Z", "wallSeconds": 5.0,
+                     "outcome": "failed", "finalization": null,
+                     "peakResidentBytes": 104857600}}
+            JSON
+            cat > "$APP/stats-heal.launches.json" <<'JSON'
+            {"schemaVersion": 1, "lastDeathAt": null,
+             "counts": {"finished:failed": 1},
+             "entries": [
+              {"launchId": "launch-h", "at": "2026-05-13T13:00:00Z", "pid": 4444,
+               "birth": "Wed May 13 13:00:00 2026", "spawn": "ok",
+               "ack": {"kind": "started", "runId": "20260513T130000Z-0000bbbb",
+                       "at": "2026-05-13T13:00:00Z"},
+               "outcome": "finished:failed", "settledAt": "2026-05-13T13:00:05Z"}]}
+            JSON
+            """)
+        return _scenario_body("all_ok") + workers
     if slug == "backup_sync_included":
         relocate = textwrap.dedent("""\
             SYNC_ROOT="$HARNESS_FAKE_HOME/Library/Mobile Documents/com~apple~CloudDocs"

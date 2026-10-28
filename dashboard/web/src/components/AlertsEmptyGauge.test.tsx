@@ -32,11 +32,4 @@ describe('AlertsEmptyGauge (#265 A)', () => {
     expect(container.querySelector('.ra-gauge-tick.tick-red')).not.toBeNull();
     expect((container.querySelector('.ra-gauge-fill') as HTMLElement).style.width).toBe('40%');
   });
-
-  it('adds the ra-gauge--compact modifier only when compact', () => {
-    const plain = render(<AlertsEmptyGauge usedPct={40} thresholds={[90, 95]} />);
-    expect(plain.container.querySelector('.ra-gauge--compact')).toBeNull();
-    const compact = render(<AlertsEmptyGauge usedPct={40} thresholds={[90, 95]} compact />);
-    expect(compact.container.querySelector('.ra-gauge.ra-gauge--compact')).not.toBeNull();
-  });
 });

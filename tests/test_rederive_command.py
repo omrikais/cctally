@@ -2095,7 +2095,11 @@ def test_a_rederive_preview_opens_each_segment_exactly_once(
 ):
     """Before the conversion each of the fixture's two resolution ops made
     `journal_prefix_hash` re-read the prefix from byte zero, so this preview
-    opened the three segments seven times rather than three."""
+    opened the three segments seven times rather than three.
+
+    #997 D12: the streamed prefix hash retains no segment bytes, so the one
+    mid-segment evidence point re-reads that segment's prefix once through
+    the seam; nothing else is reopened."""
     import journal_fixture_496_s5 as S5
 
     mod, opened, _built, _S5 = _s5_module(
@@ -2103,9 +2107,9 @@ def test_a_rederive_preview_opens_each_segment_exactly_once(
     opened.clear()
     assert mod.cmd_db_rederive(_args()) == 2
     capsys.readouterr()
-    assert opened == list(S5.SEGMENTS), (
+    assert opened == list(S5.TAINTED_EVIDENCE_PASS_OPENS), (
         "a rederive preview must open each segment through the seam exactly "
-        "once, in canonical order"
+        "once, in canonical order, plus the one mid-segment evidence re-read"
     )
 
 

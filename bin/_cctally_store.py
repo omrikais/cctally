@@ -249,6 +249,52 @@ def apply_writer_temp_store(conn: sqlite3.Connection) -> None:
     conn.execute(f"PRAGMA temp_store = {WRITER_TEMP_STORE}")
 
 
+# #997 (spec D1, D6): a full replay's DISPOSABLE scratch. Derivation
+# completion's replay copies and predecessor base, and `db rederive`'s
+# `stats.rederive.db`, are written, read once and discarded: nothing publishes
+# or trusts them, and a crash abandons the whole scratch directory. Under the
+# stats policy (`journal_mode=DELETE`, `synchronous=FULL`) every commit
+# created, wrote, fsynced and unlinked a rollback journal and fsynced the
+# database, which on a full replay was the incident's multi-gigabyte burst.
+#
+# `MEMORY`, never `OFF`: the replay rolls a failed batch back, and `ROLLBACK`
+# under `journal_mode=OFF` is undefined. The three partial indexes serve the
+# replay's per-input "latest prior row" lookups and the reset-crossing sweep;
+# their predicates restrict them to statements carrying the same terms (the
+# order-sensitivity audit is in the #997 plan's appendix). They never reach a
+# published index: `.rebuilding-*` and the live index keep the stats policy
+# and `_REBUILD_SCHEMA_FINGERPRINT`.
+_REPLAY_SCRATCH_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS replay_usage_latest_weekly "
+    "ON weekly_usage_snapshots(account_key, captured_at_utc DESC, id DESC) "
+    "WHERE week_end_at IS NOT NULL AND weekly_observation_held = 0",
+    "CREATE INDEX IF NOT EXISTS replay_usage_latest_five_hour "
+    "ON weekly_usage_snapshots(account_key, captured_at_utc DESC, id DESC) "
+    "WHERE five_hour_window_key IS NOT NULL AND five_hour_percent IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS replay_usage_week_start "
+    "ON weekly_usage_snapshots(account_key, unixepoch(week_start_at)) "
+    "WHERE week_start_at IS NOT NULL",
+)
+
+
+def apply_disposable_scratch_policy(conn: sqlite3.Connection) -> None:
+    """Put a full replay's disposable scratch connection on the #997 policy:
+    rollback journal in memory, no fsync, and the replay indexes when
+    `weekly_usage_snapshots` exists. Called right after the scratch is opened,
+    outside any transaction; commits before returning."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("PRAGMA journal_mode=MEMORY")
+    conn.execute("PRAGMA synchronous=OFF")
+    has_usage = conn.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type = 'table' "
+        "AND name = 'weekly_usage_snapshots'").fetchone()
+    if has_usage is not None:
+        for statement in _REPLAY_SCRATCH_INDEXES:
+            conn.execute(statement)
+    conn.commit()
+
+
 #: PR-3: the temp store an opener selects for the duration of PENDING schema
 #: and migration work (a first open, an upgrade, a cutover), then restores
 #: ``WRITER_TEMP_STORE``. A one-time index build or a migration over a
@@ -1780,7 +1826,14 @@ def _heal_flock_blocking(path) -> int:
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # #997 D9: contended, so the blocking wait is reported as its own
+            # phase (a no-op unless a worker installed a progress sink).
+            import _lib_rebuild_progress
+            with _lib_rebuild_progress.waiting("maintenance-lock"):
+                fcntl.flock(fd, fcntl.LOCK_EX)
     except BaseException:
         os.close(fd)
         raise
@@ -2442,6 +2495,15 @@ def _reserve_stats_corruption_heal(
                 return ("failed", None)
         admitted = dict(request)
         admitted["coalescedDetections"] = 0
+        # #997 D8: date the unresolved condition, not this request. A stale
+        # request replaced as `stale-retried` hands its date on, so the
+        # pending age never restarts across retries.
+        admitted["firstUnresolvedAt"] = (
+            (stale_request.get("firstUnresolvedAt")
+             or stale_request.get("detectedAtUtc"))
+            if stale_request else None
+        ) or request.get("firstUnresolvedAt") or request.get(
+            "detectedAtUtc") or _cctally_core.now_utc_iso()
         try:
             _cctally_db._atomic_write_private_json(marker, admitted)
         except OSError:
@@ -2484,19 +2546,54 @@ def complete_stats_corruption_heal(reservation: str) -> str:
     """
     if reservation != "reserved":
         return reservation
-    from _cctally_update import _spawn_detached
-    if _spawn_detached(STATS_CORRUPTION_HEAL_COMMAND):
+    # #997 D8 launch: the reservation is persisted under the admission flock
+    # before the spawn, and the child's identity filled under it after. The
+    # spawn itself stays outside the flock, as before, so a detection racing
+    # it can still coalesce; the ledger is keyed by launch id, so the child
+    # acknowledging first is harmless. Without the flock the worker's own
+    # acknowledgement records the launch.
+    launch_id = _new_launch_id()
+    reserve = []
+    _with_heal_admission(lambda: reserve.append(_spawner_reserve(
+        "heal", launch_id, _cctally_core.now_utc_iso())))
+    if reserve == ["withheld"]:
+        # Launch capacity: the admitted request stays pending (its marker is
+        # kept) and nothing is spawned; a later detection retries it.
+        return "pending"
+    pid = _spawn_rebuild_worker(STATS_CORRUPTION_HEAL_COMMAND, launch_id)
+    if pid is not None:
+        _with_heal_admission(lambda: _spawner_fill(
+            "heal", launch_id, pid, _cctally_core.now_utc_iso()))
         return "spawned"
     # Drop our own marker so the next detection is admitted immediately rather
     # than waiting out the retry window. Done under the admission flock, as it
     # was before the split, so no concurrent caller can coalesce onto a marker
     # that is about to disappear. If the flock is unavailable the marker stays
     # and the retry window clears it — the retryable direction.
-    _unlink_stats_heal_marker_under_admission()
+    _unlink_stats_heal_marker_under_admission(launch_id=launch_id)
     return "failed"
 
 
-def _unlink_stats_heal_marker_under_admission() -> bool:
+def _with_heal_admission(action):
+    """Run ``action`` under the heal admission flock (bounded); ``None``
+    when the flock could not be had."""
+    try:
+        fd = _heal_flock_bounded(
+            _stats_heal_admission_path(), _STATS_HEAL_ADMISSION_WAIT_S)
+    except OSError:
+        return None
+    if fd is None:
+        return None
+    try:
+        action()
+        return True
+    finally:
+        _heal_release_flock(fd)
+
+
+def _unlink_stats_heal_marker_under_admission(
+    launch_id: "str | None" = None,
+) -> bool:
     """Settle a spawn failure with the final count before allowing retry."""
     admission_fd = _heal_flock_bounded(
         _stats_heal_admission_path(), _STATS_HEAL_ADMISSION_WAIT_S
@@ -2504,6 +2601,9 @@ def _unlink_stats_heal_marker_under_admission() -> bool:
     if admission_fd is None:
         return False
     try:
+        if launch_id is not None:
+            # #997 D8: a confirmed spawn failure is a recorded failed start.
+            _spawner_fill("heal", launch_id, None, _cctally_core.now_utc_iso())
         current = _read_stats_heal_request()
         if current:
             heal_id = str(current.get("healId") or "")
@@ -2564,6 +2664,12 @@ def defer_stats_corruption_heal(request: dict) -> str:
     )
 
 
+#: #997 D10: why the last `_run_stats_corruption_heal` in this process
+#: declined an unconfirmed heal (its forensics reason), for the run state;
+#: only `integrity_check_ok` classifies clean. Reset by the worker per run.
+_last_heal_decline_reason: "str | None" = None
+
+
 def _run_stats_corruption_heal(request: dict) -> str:
     """The worker's body, under its own maintenance-EXCLUSIVE hold.
 
@@ -2579,6 +2685,7 @@ def _run_stats_corruption_heal(request: dict) -> str:
       prevent;
     * the probe is the one the DETECTION established, carried in the request.
     """
+    global _last_heal_decline_reason
     import _cctally_journal
 
     path = _cctally_core.DB_PATH
@@ -2671,6 +2778,7 @@ def _run_stats_corruption_heal(request: dict) -> str:
                     declineReason=(None if confirmed else reason),
                 )
                 if not confirmed:
+                    _last_heal_decline_reason = reason
                     return "declined-unconfirmed"
                 import _cctally_completion
                 obligation_failure = None
@@ -2704,6 +2812,52 @@ def _run_stats_corruption_heal(request: dict) -> str:
         _heal_release_maintenance_flock(maint_fd)
 
 
+def _stats_heal_worker_body(result: dict) -> bool:
+    """The heal worker's work under its flock, after its run is recorded.
+
+    Fills ``result`` with the run's primary ``outcome``, its separate
+    ``finalization`` (``done`` | ``pending``; #997 D10) and, for a declined
+    unconfirmed heal, the ``declineReason``. Returns whether it published.
+    """
+    global _last_heal_decline_reason
+    request = _read_stats_heal_request()
+    if not request:
+        _unlink_stats_heal_marker()
+        _log_stats_heal("no-request")
+        result.update(outcome="no-request", finalization="done")
+        return False
+    heal_id = str(request.get("healId") or "")
+    _last_heal_decline_reason = None
+    try:
+        outcome = _run_stats_corruption_heal(request)
+    except (_cctally_db.StatsRebuildDeferred, Exception) as exc:
+        # Retryable: the marker stays so a later detection is admitted
+        # once its retry window expires.
+        _record_stats_heal_outcome(heal_id, "failed", error=exc)
+        _log_stats_heal("error", heal_id=heal_id, error=exc)
+        result.update(outcome="failed")
+        return False
+    result.update(outcome=outcome, declineReason=(
+        _last_heal_decline_reason if outcome == "declined-unconfirmed"
+        else None))
+    if outcome in ("maintenance-busy", "ingest-busy"):
+        _log_stats_heal(outcome, heal_id=heal_id)
+        return False
+    # Fix round K11 (K9K10-R7): a heal that published but lost its
+    # residual obligation is a heal; its ring outcome is already
+    # recorded (with the obligation error) and it wakes like a success.
+    published = outcome in ("success", STATS_HEAL_RESIDUAL_NOT_DURABLE)
+    if not published:
+        _record_stats_heal_outcome(heal_id, outcome)
+    if not _finalize_stats_heal_request(heal_id):
+        _log_stats_heal("finalization-pending", heal_id=heal_id)
+        result.update(finalization="pending")
+        return False
+    result.update(finalization="done")
+    _log_stats_heal(outcome, heal_id=heal_id)
+    return published
+
+
 #: Fix round K11 (K9K10-R7): the heal published the rebuilt index, but its
 #: residual-derivation obligation could not be made durable. The heal is
 #: done (the request is finalized and the publication wake posted); the ring
@@ -2727,36 +2881,22 @@ def cmd_stats_corruption_heal_internal(args) -> int:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            _record_worker_busy("heal")
             return 0
-        request = _read_stats_heal_request()
-        if not request:
-            _unlink_stats_heal_marker()
-            _log_stats_heal("no-request")
+        # #997 D8: record the run (and any dead predecessor) before any work;
+        # a run that cannot be recorded does none.
+        run = _WorkerRun("heal")
+        if not run.begin():
             return 0
-        heal_id = str(request.get("healId") or "")
+        result = {"outcome": "failed", "finalization": None,
+                  "declineReason": None}
         try:
-            outcome = _run_stats_corruption_heal(request)
-        except (_cctally_db.StatsRebuildDeferred, Exception) as exc:
-            # Retryable: the marker stays so a later detection is admitted
-            # once its retry window expires.
-            _record_stats_heal_outcome(heal_id, "failed", error=exc)
-            _log_stats_heal("error", heal_id=heal_id, error=exc)
+            healed = _stats_heal_worker_body(result)
             return 0
-        if outcome in ("maintenance-busy", "ingest-busy"):
-            _log_stats_heal(outcome, heal_id=heal_id)
-            return 0
-        # Fix round K11 (K9K10-R7): a heal that published but lost its
-        # residual obligation is a heal; its ring outcome is already
-        # recorded (with the obligation error) and it wakes like a success.
-        published = outcome in ("success", STATS_HEAL_RESIDUAL_NOT_DURABLE)
-        if not published:
-            _record_stats_heal_outcome(heal_id, outcome)
-        if not _finalize_stats_heal_request(heal_id):
-            _log_stats_heal("finalization-pending", heal_id=heal_id)
-            return 0
-        _log_stats_heal(outcome, heal_id=heal_id)
-        healed = published
-        return 0
+        finally:
+            run.finish(result["outcome"],
+                       finalization=result["finalization"],
+                       decline_reason=result["declineReason"])
     finally:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_UN)
@@ -3126,6 +3266,750 @@ def _log_stats_epoch_rebuild(outcome: str, *, error: Exception | None = None) ->
         pass
 
 
+# --------------------------------------------------------------------------
+# #997 D8 — the detached rebuild workers' run state and launch ledger
+# --------------------------------------------------------------------------
+#
+# Both detached workers (the epoch rebuild and the corruption heal) keep two
+# private JSON records in APP_DIR, written only through
+# `_cctally_db._atomic_write_private_json`:
+#
+# * the RUN STATE (`<worker>.state.json`), written only by the holder of that
+#   worker's flock: the current or last run, its phase and progress, and the
+#   five most recent in-run deaths;
+# * the LAUNCH LEDGER (`<worker>.launches.json`), written only under that
+#   worker's admission flock: every launch and what became of it, classified
+#   by the pure kernel `_lib_worker_launches`.
+#
+# Lock order: worker flock, then admission flock (bounded wait). Spawners hold
+# admission and only probe the worker flock non-blockingly. `doctor` and
+# `db status` read both records and take neither lock. A death is settled by
+# evidence (a finished run state, or a process confirmed gone by identity),
+# never by elapsed time.
+
+import _lib_worker_launches as _wl  # noqa: E402 — stdlib-only kernel
+
+REBUILD_LAUNCH_ENV = "CCTALLY_REBUILD_LAUNCH_ID"
+#: The workers' bounded wait for their admission flock (spec D8 step 1).
+_WORKER_ADMISSION_WAIT_S = 30.0
+_WORKER_DEATHS_KEEP = 5
+_WORKER_RECORD_SCHEMA = 1
+_WORKER_FILES = {
+    "epoch": ("stats-epoch-rebuild.state.json",
+              "stats-epoch-rebuild.launches.json"),
+    "heal": ("stats-heal.state.json", "stats-heal.launches.json"),
+}
+
+
+def _worker_state_path(worker: str) -> pathlib.Path:
+    return pathlib.Path(_cctally_core.APP_DIR) / _WORKER_FILES[worker][0]
+
+
+def _worker_ledger_path(worker: str) -> pathlib.Path:
+    return pathlib.Path(_cctally_core.APP_DIR) / _WORKER_FILES[worker][1]
+
+
+def _worker_admission_path(worker: str) -> pathlib.Path:
+    if worker == "epoch":
+        return _stats_epoch_rebuild_admission_path()
+    return _stats_heal_admission_path()
+
+
+def _read_private_record(path: pathlib.Path):
+    """``(payload | None, unreadable, raw bytes | None)`` for one record.
+
+    A missing file is ``(None, False, None)``. Anything present that is not a
+    JSON object at ``schemaVersion`` 1 is unreadable; ``raw`` carries its
+    bytes for the archive when they could be read at all.
+    """
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None, False, None
+    except OSError:
+        return None, True, None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, True, raw
+    if (not isinstance(payload, dict)
+            or payload.get("schemaVersion") != _WORKER_RECORD_SCHEMA):
+        return None, True, raw
+    return payload, False, raw
+
+
+def _validated_worker_state(payload):
+    """The run state when it has the expected shape, else ``None``."""
+    if payload is None:
+        return None
+    run = payload.get("run")
+    deaths = payload.get("deaths", [])
+    if run is not None and not isinstance(run, dict):
+        return None
+    # The run's launch id keys its ledger entry and every prune's protected
+    # set: a list id is unhashable (the prune raised before the state was
+    # rewritten, so every later launch failed the same way) and an int id
+    # makes the next ledger normalization reject the whole ledger.
+    launch_id = (run or {}).get("launchId")
+    if launch_id is not None and not isinstance(launch_id, str):
+        return None
+    if not isinstance(deaths, list) or not all(
+            isinstance(d, dict) for d in deaths):
+        return None
+    return payload
+
+
+def read_worker_state(worker: str) -> dict:
+    """``{"state": dict | None, "unreadable": bool}``; never writes."""
+    payload, unreadable, _raw = _read_private_record(
+        _worker_state_path(worker))
+    if payload is not None and _validated_worker_state(payload) is None:
+        payload, unreadable = None, True
+    return {"state": payload, "unreadable": unreadable}
+
+
+def read_launch_ledger(worker: str) -> dict:
+    """``{"ledger": dict | None, "unreadable": bool}``; never writes."""
+    payload, unreadable, _raw = _read_private_record(
+        _worker_ledger_path(worker))
+    if payload is not None:
+        try:
+            payload = _wl.normalize(payload)
+        except ValueError:
+            payload, unreadable = None, True
+    return {"ledger": payload, "unreadable": unreadable}
+
+
+def _mtime_iso(path: pathlib.Path) -> "str | None":
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    return _cctally_core.now_utc_iso(
+        dt.datetime.fromtimestamp(mtime, dt.timezone.utc))
+
+
+def read_epoch_marker() -> dict:
+    """The pending epoch marker: ``{"present", "firstPendingAt", "legacy"}``.
+
+    The marker carries ``{schemaVersion: 1, firstPendingAt}``; an empty marker
+    from an older binary reads as ``firstPendingAt`` = its mtime. Never writes.
+    """
+    marker = _stats_epoch_rebuild_marker_path()
+    try:
+        raw = marker.read_bytes()
+    except FileNotFoundError:
+        return {"present": False, "firstPendingAt": None, "legacy": False}
+    except OSError:
+        return {"present": True, "firstPendingAt": _mtime_iso(marker),
+                "legacy": True}
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw.strip() else None
+    except (UnicodeDecodeError, ValueError):
+        payload = None
+    first = payload.get("firstPendingAt") if isinstance(payload, dict) else None
+    if isinstance(first, str) and first:
+        return {"present": True, "firstPendingAt": first, "legacy": False}
+    return {"present": True, "firstPendingAt": _mtime_iso(marker),
+            "legacy": True}
+
+
+def _write_epoch_marker(first_pending_at: str) -> None:
+    """Publish the marker (under the epoch admission flock). The write also
+    refreshes its mtime, which stays the retry throttle."""
+    _cctally_db._atomic_write_private_json(
+        _stats_epoch_rebuild_marker_path(),
+        {"schemaVersion": 1, "firstPendingAt": first_pending_at})
+
+
+def read_stats_heal_request_snapshot() -> "dict | None":
+    """``{"present", "healId", "firstUnresolvedAt"}`` or ``None``; never
+    writes. ``firstUnresolvedAt`` falls back to the request's detection time,
+    and an unreadable request to the marker's mtime."""
+    request = _read_stats_heal_request()
+    if request is None:
+        return None
+    if not request:
+        return {"present": True, "healId": None,
+                "firstUnresolvedAt": _mtime_iso(_stats_heal_marker_path())}
+    return {
+        "present": True,
+        "healId": request.get("healId"),
+        "firstUnresolvedAt": (request.get("firstUnresolvedAt")
+                              or request.get("detectedAtUtc")),
+    }
+
+
+def process_identity(pid) -> dict:
+    """``{"status": "alive"|"gone"|"unknown", "birth": str | None}``.
+
+    From ``ps -o stat=,lstart= -p <pid>`` under ``LC_ALL=C``: no such process
+    (``ps`` exits 1 with no output) or a zombie (``Z`` in ``stat``) is
+    ``gone``; ``ps`` failing in any other way is ``unknown``. ``birth`` is the
+    one-second-resolution start time, whitespace-normalized.
+    """
+    import subprocess
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return {"status": "unknown", "birth": None}
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10, check=False,
+            env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return {"status": "unknown", "birth": None}
+    line = out.stdout.strip()
+    if not line:
+        if out.returncode == 1 and not out.stderr.strip():
+            return {"status": "gone", "birth": None}
+        return {"status": "unknown", "birth": None}
+    stat_field, _sep, rest = line.partition(" ")
+    birth = " ".join(rest.split()) or None
+    if "Z" in stat_field:
+        return {"status": "gone", "birth": birth}
+    return {"status": "alive", "birth": birth}
+
+
+def _archive_unreadable_record(path: pathlib.Path, raw) -> "str | None":
+    """Copy an unreadable record's bytes to ``<name>.unreadable-<UTC stamp>``
+    (a new private file, ``fsync``ed); the original stays in place until its
+    replacement is published. ``None`` when its bytes could not be read."""
+    if raw is None:
+        return None
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    archive = path.with_name(f"{path.name}.unreadable-{stamp}")
+    fd = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while archiving an unreadable record")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _cctally_db._fsync_directory(path.parent)
+    return str(archive)
+
+
+def _load_ledger_for_update(worker: str) -> dict:
+    """The ledger to update under the admission flock. An unreadable one is
+    archived first and replaced by an empty ledger (raises ``OSError`` when
+    the archive cannot be written)."""
+    path = _worker_ledger_path(worker)
+    payload, unreadable, raw = _read_private_record(path)
+    if payload is not None:
+        try:
+            return _wl.normalize(payload)
+        except ValueError:
+            unreadable = True
+    if unreadable:
+        _archive_unreadable_record(path, raw)
+    return _wl.empty_ledger()
+
+
+def _write_ledger(worker: str, ledger: dict) -> None:
+    _cctally_db._atomic_write_private_json(_worker_ledger_path(worker), ledger)
+
+
+def _probe_unresolved(ledger: dict, *, skip: "str | None" = None) -> dict:
+    """``process_identity`` for each unresolved entry's pid."""
+    identities: dict = {}
+    for entry in _wl.unresolved(ledger):
+        pid = entry.get("pid")
+        if entry.get("launchId") == skip or pid in identities:
+            continue
+        if isinstance(pid, int) and pid > 0:
+            identities[pid] = process_identity(pid)
+    return identities
+
+
+def _current_run_launch_id(state) -> "str | None":
+    run = state.get("run") if isinstance(state, dict) else None
+    launch_id = run.get("launchId") if isinstance(run, dict) else None
+    return launch_id if isinstance(launch_id, str) else None
+
+
+def _spawner_classify(worker: str, ledger: dict, now: str) -> dict:
+    """The spawner's classification under the admission flock: probe the
+    unresolved pids, THEN read the run state (a run that finished before the
+    probe is then visible), and settle what that evidence settles."""
+    identities = _probe_unresolved(ledger)
+    state = read_worker_state(worker)["state"]
+    return _wl.classify(ledger, state, identities, now=now)["ledger"]
+
+
+def _spawner_reserve(worker: str, launch_id: str, now: str) -> str:
+    """Classify the ledger and persist this launch's reservation (caller
+    holds the admission flock).
+
+    ``"reserved"`` when the reservation is durable; ``"withheld"`` when
+    ``LAUNCH_CAPACITY`` entries are still unresolved after classification
+    (the settlements are written, no reservation is, and the caller must not
+    spawn: the request stays pending and `doctor` reports
+    ``details.admission = "launch-capacity"``); ``"unwritten"`` when the
+    ledger could not be written, in which case the caller still spawns and
+    the worker's acknowledgement records the launch."""
+    try:
+        ledger = _load_ledger_for_update(worker)
+        ledger = _spawner_classify(worker, ledger, now)
+        state = read_worker_state(worker)["state"]
+        protected = _current_run_launch_id(state)
+        if not _wl.has_launch_capacity(ledger):
+            _write_ledger(worker, _wl.prune(ledger, protected))
+            return "withheld"
+        ledger = _wl.reserve(ledger, launch_id=launch_id, at=now)
+        _write_ledger(worker, _wl.prune(ledger, protected))
+        return "reserved"
+    except (OSError, ValueError):
+        return "unwritten"
+
+
+def _spawner_fill(worker: str, launch_id: str, pid, now: str) -> None:
+    """Complete the reservation with the spawn's result (caller holds the
+    admission flock). ``pid is None`` records a failed spawn."""
+    try:
+        ledger = _load_ledger_for_update(worker)
+        if pid is None:
+            ledger = _wl.fill_spawn(ledger, launch_id, pid=None, birth=None,
+                                    at=now, spawn="failed")
+        else:
+            birth = process_identity(pid).get("birth")
+            ledger = _wl.fill_spawn(ledger, launch_id, pid=pid, birth=birth,
+                                    at=now)
+        state = read_worker_state(worker)["state"]
+        _write_ledger(worker, _wl.prune(ledger, _current_run_launch_id(state)))
+    except (OSError, ValueError):
+        pass
+
+
+def _spawn_rebuild_worker(command: str, launch_id: str) -> "int | None":
+    from _cctally_update import _spawn_detached_with_pid
+    return _spawn_detached_with_pid(
+        command, env={**os.environ, REBUILD_LAUNCH_ENV: launch_id})
+
+
+def _new_launch_id() -> str:
+    import uuid
+    return str(uuid.uuid4())
+
+
+def _take_launch_id() -> str:
+    """This worker's launch id, consumed from its environment so a later
+    worker started by the same process never reuses it; a worker nobody
+    launched through a spawner gets a fresh one."""
+    return os.environ.pop(REBUILD_LAUNCH_ENV, None) or _new_launch_id()
+
+
+def _worker_log(worker: str, line: str) -> None:
+    """Append one structural line to the worker's own log."""
+    try:
+        path = (_stats_epoch_rebuild_log_path() if worker == "epoch"
+                else _stats_heal_log_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        name = ("stats-epoch-rebuild" if worker == "epoch"
+                else "stats-corruption-heal")
+        data = (f"{_cctally_core.now_utc_iso()} worker={name} {line}\n"
+                ).encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def _worker_log_error(worker: str, stage: str, error=None) -> None:
+    detail = ""
+    if error is not None:
+        detail = f" error={type(error).__name__}"
+        code = getattr(error, "errno", None)
+        if code is not None:
+            detail += f" code={int(code)}"
+    _worker_log(worker, f"result=error stage={stage}{detail}")
+
+
+def _json_counters(counters) -> dict:
+    """Counters a state file can carry: JSON scalars only."""
+    return {str(k): v for k, v in (counters or {}).items()
+            if isinstance(v, (int, float, str, bool)) or v is None}
+
+
+def _record_worker_busy(worker: str) -> None:
+    """A flock loser is not a run: under the admission flock it writes only
+    its ``busy`` acknowledgement, which is also its entry's terminal."""
+    launch_id = _take_launch_id()
+    pid = os.getpid()
+
+    def unrecorded(stage: str) -> None:
+        # Without the acknowledgement the entry later reads as a pre-start
+        # death; the log keeps what really happened.
+        _worker_log(worker, (f"result=busy-unrecorded launch={launch_id} "
+                             f"pid={pid} stage={stage}"))
+
+    try:
+        fd = _heal_flock_bounded(_worker_admission_path(worker),
+                                 _WORKER_ADMISSION_WAIT_S)
+    except OSError:
+        unrecorded("admission")
+        return
+    if fd is None:
+        unrecorded("admission")
+        return
+    try:
+        now = _cctally_core.now_utc_iso()
+        ledger = _load_ledger_for_update(worker)
+        ledger = _wl.acknowledge(ledger, launch_id, "busy", at=now, pid=pid,
+                                 birth=process_identity(pid).get("birth"))
+        state = read_worker_state(worker)["state"]
+        _write_ledger(worker, _wl.prune(ledger, _current_run_launch_id(state)))
+    except (OSError, ValueError):
+        unrecorded("ledger")
+    finally:
+        _heal_release_flock(fd)
+
+
+def rebuild_worker_snapshot(worker: str) -> dict:
+    """What `doctor` and `db status` classify, gathered without any lock
+    and without writing (spec D8 "Liveness without the flock").
+
+    Reads the run state then the ledger, probes the identity of a running
+    run's pid and of each unresolved entry's pid, then re-reads both files in
+    the same order: a run that finished, an acknowledgement or outcome that
+    appeared, or a run that started in between is classified from the fresh
+    files, so a death is reported only when the process was confirmed gone
+    BEFORE a read that still shows it unfinished. (A ledger write precedes the
+    state write that replaces a run slot, so reading the state first never
+    pairs a replaced slot with a ledger that lacks the transfer.)
+    """
+    first_state = read_worker_state(worker)
+    first_ledger = read_launch_ledger(worker)
+    pids = set()
+    run = (first_state["state"] or {}).get("run")
+    if isinstance(run, dict) and run.get("status") == "running":
+        pids.add(run.get("pid"))
+    for entry in _wl.unresolved(first_ledger["ledger"] or {}):
+        pids.add(entry.get("pid"))
+    identities = {pid: process_identity(pid) for pid in pids
+                  if isinstance(pid, int) and not isinstance(pid, bool)
+                  and pid > 0}
+    state = read_worker_state(worker)
+    ledger = read_launch_ledger(worker)
+    if worker == "epoch":
+        marker = read_epoch_marker()
+        pending = {
+            "present": marker["present"],
+            "since": marker["firstPendingAt"],
+            "indexPending": (stats_epoch_rebuild_pending()
+                             if marker["present"] else False),
+        }
+    else:
+        request = read_stats_heal_request_snapshot()
+        pending = {
+            "present": request is not None,
+            "since": (request or {}).get("firstUnresolvedAt"),
+            "indexPending": None,
+        }
+    return {
+        "worker": worker,
+        "state": state["state"],
+        "stateUnreadable": state["unreadable"],
+        "ledger": ledger["ledger"],
+        "ledgerUnreadable": ledger["unreadable"],
+        "identities": identities,
+        "pending": pending,
+        "reread": (first_state != state or first_ledger != ledger),
+    }
+
+
+def _parse_utc_instant(value) -> "dt.datetime | None":
+    """An ISO-8601 instant as an aware UTC datetime (``Z`` or an offset; a
+    naive value is UTC), or ``None`` when it is not one."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _launches_before_start(entries, launch_id, pending_since) -> int:
+    """How many other launches the ledger records since ``pending_since``,
+    compared as UTC instants (``Z`` and ``+00:00`` forms are one clock; a
+    value that does not parse is never counted)."""
+    since = _parse_utc_instant(pending_since)
+    if since is None:
+        return 0
+    count = 0
+    for e in entries:
+        if e.get("launchId") == launch_id:
+            continue
+        at = _parse_utc_instant(e.get("at"))
+        if at is not None and at >= since:
+            count += 1
+    return count
+
+
+class _WorkerRun:
+    """One detached worker run, entered immediately after the worker flock is
+    won (spec D8 steps 1–5). ``begin()`` returns ``False`` when the run could
+    not be recorded, and the worker then returns without doing any work."""
+
+    def __init__(self, worker: str):
+        self.worker = worker
+        self.launch_id = _take_launch_id()
+        self.run_id = _new_heal_id()
+        self.pid = os.getpid()
+        self.birth = None
+        self.state: "dict | None" = None
+        self._started = None
+        self._ack_written = False
+
+    # -- step 1–3 ----------------------------------------------------------
+    def _pending_since(self) -> "str | None":
+        if self.worker == "epoch":
+            return read_epoch_marker().get("firstPendingAt")
+        snapshot = read_stats_heal_request_snapshot()
+        return snapshot.get("firstUnresolvedAt") if snapshot else None
+
+    def begin(self) -> bool:
+        import _lib_rebuild_progress
+
+        worker = self.worker
+        now = _cctally_core.now_utc_iso()
+        self._started = time.monotonic()
+        self.birth = process_identity(self.pid).get("birth")
+        state_path = _worker_state_path(worker)
+        prior, unreadable, raw = _read_private_record(state_path)
+        if prior is not None and _validated_worker_state(prior) is None:
+            prior, unreadable = None, True
+        previous_unreadable = (prior or {}).get("previousUnreadable")
+        if unreadable:
+            try:
+                archive = _archive_unreadable_record(state_path, raw)
+            except OSError as exc:
+                _worker_log_error(worker, "state", exc)
+                return False
+            previous_unreadable = {"detectedAt": now, "archive": archive}
+            prior = None
+        deaths = [dict(d) for d in (prior or {}).get("deaths") or []]
+        prior_run = (prior or {}).get("run")
+        prior_run = dict(prior_run) if isinstance(prior_run, dict) else None
+        new_deaths: list = []
+        # Until this worker's state write lands, the slot still names the
+        # prior run: its entry is protected from every prune made before then
+        # with this launch's own, or a worker that dies (or fails) before its
+        # state write would let the next one account the prior death twice.
+        protected = (self.launch_id, _current_run_launch_id(prior))
+        try:
+            fd = _heal_flock_bounded(_worker_admission_path(worker),
+                                     _WORKER_ADMISSION_WAIT_S)
+        except OSError as exc:
+            _worker_log_error(worker, "ledger", exc)
+            return False
+        if fd is None:
+            _worker_log_error(worker, "ledger")
+            return False
+        try:
+            try:
+                ledger = _load_ledger_for_update(worker)
+            except OSError as exc:
+                _worker_log_error(worker, "ledger", exc)
+                return False
+            ledger, prior_run = self._reconcile_prior_run(
+                ledger, prior_run, deaths, new_deaths, now)
+            identities = _probe_unresolved(ledger, skip=self.launch_id)
+            classified = _wl.classify(
+                ledger, {"run": prior_run, "deaths": deaths}, identities,
+                now=now)
+            ledger = classified["ledger"]
+            pre_start = [e for e in classified["settled"]
+                         if e.get("outcome") in _wl.DEATHS]
+            ledger = _wl.acknowledge(
+                ledger, self.launch_id, "started", self.run_id, at=now,
+                pid=self.pid, birth=self.birth)
+            pending_since = self._pending_since()
+            before = _launches_before_start(
+                ledger["entries"], self.launch_id, pending_since)
+            try:
+                _write_ledger(worker, _wl.prune(ledger, protected))
+            except OSError as exc:
+                _worker_log_error(worker, "ledger", exc)
+                return False
+            self._ack_written = True
+            run = {
+                "runId": self.run_id, "launchId": self.launch_id,
+                "pid": self.pid, "birth": self.birth,
+                "version": _worker_version(),
+                "binaryEpoch": _cctally_core.STATS_INDEX_EPOCH,
+                "indexEpoch": _raw_user_version(_cctally_core.DB_PATH),
+                "pendingSince": pending_since,
+                "launchesBeforeStart": before,
+                "status": "running", "phase": "starting",
+                "phaseStartedAt": now, "progressAt": now, "counters": {},
+                "residentBytes": _lib_rebuild_progress.current_resident_bytes(),
+                "peakResidentBytes":
+                    _lib_rebuild_progress.peak_resident_bytes(),
+                "outcome": None, "startedAt": now, "finishedAt": None,
+                "wallSeconds": None,
+            }
+            if worker == "heal":
+                run["finalization"] = None
+            self.state = {
+                "schemaVersion": _WORKER_RECORD_SCHEMA,
+                "run": run,
+                "deaths": deaths[-_WORKER_DEATHS_KEEP:],
+                "previousUnreadable": previous_unreadable,
+            }
+            try:
+                _cctally_db._atomic_write_private_json(state_path, self.state)
+            except OSError as exc:
+                self.state = None
+                try:
+                    _write_ledger(worker, _wl.prune(_wl.settle(
+                        ledger, self.launch_id, "finished:error", at=now),
+                        protected))
+                except OSError:
+                    pass
+                _worker_log_error(worker, "state", exc)
+                return False
+        finally:
+            _heal_release_flock(fd)
+        # Step 3: state first, log second.
+        for death in new_deaths:
+            _worker_log(worker, (
+                f"result=died run={death.get('runId')} pid={death.get('pid')}"
+                f" phase={death.get('lastPhase')}"))
+        for entry in pre_start:
+            if entry.get("outcome") == "died-pre-start":
+                _worker_log(worker, (
+                    f"result=died run=none launch={entry.get('launchId')} "
+                    f"pid={entry.get('pid')} phase=pre-start"))
+        _lib_rebuild_progress.install(self._sink)
+        return True
+
+    def _reconcile_prior_run(self, ledger, prior_run, deaths, new_deaths,
+                             now):
+        """Step 1 before the run slot is overwritten: transfer a finished
+        run's outcome; account a stale ``running`` run exactly once."""
+        if not prior_run or not prior_run.get("launchId"):
+            return ledger, prior_run
+        launch_id = prior_run["launchId"]
+        if prior_run.get("status") == "finished":
+            return (_wl.settle(ledger, launch_id,
+                               f"finished:{prior_run.get('outcome')}",
+                               at=now), prior_run)
+        if prior_run.get("status") != "running":
+            return ledger, prior_run
+        entry = _wl.find(ledger, launch_id)
+        terminal = (entry or {}).get("outcome")
+        if terminal and terminal not in _wl.DEATHS:
+            # A recorded terminal is authoritative (revision 6): the state
+            # write that raised had taken effect. Repair the run, no death.
+            outcome = (terminal[len("finished:"):]
+                       if terminal.startswith("finished:") else terminal)
+            prior_run.update(status="finished", outcome=outcome)
+            return ledger, prior_run
+        if not any(d.get("launchId") == launch_id for d in deaths):
+            death = {
+                "runId": prior_run.get("runId"), "launchId": launch_id,
+                "pid": prior_run.get("pid"), "birth": prior_run.get("birth"),
+                "startedAt": prior_run.get("startedAt"),
+                "lastPhase": prior_run.get("phase"),
+                "lastProgressAt": prior_run.get("progressAt"),
+                "detectedAt": now,
+            }
+            deaths.append(death)
+            new_deaths.append(death)
+        if entry is None:
+            ledger = _wl.acknowledge(
+                ledger, launch_id, "started", prior_run.get("runId"),
+                at=prior_run.get("startedAt") or now,
+                pid=prior_run.get("pid"), birth=prior_run.get("birth"))
+        ledger = _wl.settle(ledger, launch_id, "died-in-run", at=now)
+        return ledger, prior_run
+
+    # -- progress ----------------------------------------------------------
+    def _sink(self, phase, counters, forced) -> None:
+        import _lib_rebuild_progress
+
+        del forced
+        if self.state is None:
+            return
+        run = self.state["run"]
+        now = _cctally_core.now_utc_iso()
+        if phase is not None and phase != run.get("phase"):
+            run["phase"] = phase
+            run["phaseStartedAt"] = now
+        run["progressAt"] = now
+        run["counters"] = _json_counters(counters)
+        run["residentBytes"] = _lib_rebuild_progress.current_resident_bytes()
+        run["peakResidentBytes"] = _lib_rebuild_progress.peak_resident_bytes()
+        _cctally_db._atomic_write_private_json(
+            _worker_state_path(self.worker), self.state)
+
+    # -- step 5 ------------------------------------------------------------
+    def finish(self, outcome: str, *, finalization: "str | None" = None,
+               decline_reason: "str | None" = None) -> None:
+        """The state first, then the entry's terminal in the ledger."""
+        import _lib_rebuild_progress
+
+        _lib_rebuild_progress.uninstall()
+        if self.state is None:
+            return
+        worker = self.worker
+        now = _cctally_core.now_utc_iso()
+        run = self.state["run"]
+        run.update(
+            status="finished", outcome=outcome, finishedAt=now,
+            wallSeconds=round(time.monotonic() - (self._started or
+                                                  time.monotonic()), 3),
+            residentBytes=_lib_rebuild_progress.current_resident_bytes(),
+            peakResidentBytes=_lib_rebuild_progress.peak_resident_bytes(),
+        )
+        if worker == "heal":
+            run["finalization"] = finalization
+        if decline_reason is not None:
+            run["declineReason"] = decline_reason
+        try:
+            _cctally_db._atomic_write_private_json(
+                _worker_state_path(worker), self.state)
+        except OSError as exc:
+            _worker_log_error(worker, "state", exc)
+        try:
+            fd = _heal_flock_bounded(_worker_admission_path(worker),
+                                     _WORKER_ADMISSION_WAIT_S)
+        except OSError:
+            return
+        if fd is None:
+            return
+        try:
+            ledger = _load_ledger_for_update(worker)
+            ledger = _wl.settle(ledger, self.launch_id,
+                                f"finished:{outcome}", at=now)
+            _write_ledger(worker, _wl.prune(ledger, self.launch_id))
+        except (OSError, ValueError):
+            # Rule (a) transfers the outcome from the state later.
+            pass
+        finally:
+            _heal_release_flock(fd)
+
+
+def _worker_version() -> "str | None":
+    try:
+        import _lib_changelog
+        found = _lib_changelog._read_latest_changelog_version()
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
 def defer_stats_epoch_rebuild() -> str:
     """Schedule one retryable detached epoch worker without blocking callers."""
     try:
@@ -3151,23 +4035,37 @@ def defer_stats_epoch_rebuild() -> str:
             return "failed"
         if age is not None and age < _STATS_EPOCH_REBUILD_RETRY_SECONDS:
             return "pending"
+        # #997 D8: the marker dates the pending condition. `firstPendingAt`
+        # is set when it is created and preserved by every retry; an empty
+        # marker from an older binary is converted with its mtime first, so
+        # refreshing the throttle never loses when the epoch went pending.
+        now = _cctally_core.now_utc_iso()
+        first_pending_at = (read_epoch_marker().get("firstPendingAt")
+                            if age is not None else None) or now
         if _stats_epoch_rebuild_worker_active():
             # A representative replay outlives the marker retry interval.
             # Refresh the admission stamp instead of launching a process that
             # can only lose the worker flock and exit.
-            try:
-                os.utime(marker, None)
-            except OSError:
-                pass
+            if age is not None:
+                try:
+                    _write_epoch_marker(first_pending_at)
+                except OSError:
+                    pass
             return "pending"
         try:
-            marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600)
-            os.close(marker_fd)
-            os.utime(marker, None)
+            _write_epoch_marker(first_pending_at)
         except OSError:
             return "failed"
-        from _cctally_update import _spawn_detached
-        if _spawn_detached(STATS_EPOCH_REBUILD_COMMAND):
+        # #997 D8 launch: classify, persist the reservation, spawn with the
+        # launch id, then fill the child's identity (or record the failure).
+        launch_id = _new_launch_id()
+        if _spawner_reserve("epoch", launch_id, now) == "withheld":
+            # Launch capacity: the marker (just refreshed, so the retry
+            # throttle holds) keeps the request pending; nothing is spawned.
+            return "pending"
+        pid = _spawn_rebuild_worker(STATS_EPOCH_REBUILD_COMMAND, launch_id)
+        _spawner_fill("epoch", launch_id, pid, _cctally_core.now_utc_iso())
+        if pid is not None:
             return "spawned"
         _unlink_stats_epoch_marker()
         return "failed"
@@ -3250,32 +4148,48 @@ def _stats_epoch_rebuild_worker(args) -> str:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            _record_worker_busy("epoch")
             return "busy"
-        if not stats_epoch_rebuild_pending():
-            _unlink_stats_epoch_marker()
-            _log_stats_epoch_rebuild("current")
-            return "current"
-        import _cctally_completion
-        try:
-            conn = resolve_stats_epoch_mismatch()
-            conn.close()
-        except _cctally_completion.ResidualObligationNotDurable as exc:
-            _unlink_stats_epoch_marker()
-            _log_stats_epoch_rebuild(STATS_EPOCH_RESIDUAL_NOT_DURABLE,
-                                     error=exc)
-            return STATS_EPOCH_RESIDUAL_NOT_DURABLE
-        except Exception as exc:
-            _log_stats_epoch_rebuild("error", error=exc)
+        # #997 D8: record the run (and any dead predecessor) before any work;
+        # a run that cannot be recorded does none.
+        run = _WorkerRun("epoch")
+        if not run.begin():
             return "error"
-        _unlink_stats_epoch_marker()
-        _log_stats_epoch_rebuild("success")
-        return "success"
+        outcome = "error"
+        try:
+            outcome = _stats_epoch_rebuild_body()
+            return outcome
+        finally:
+            run.finish(outcome)
     finally:
         try:
             fcntl.flock(worker_fd, fcntl.LOCK_UN)
         except OSError:
             pass
         os.close(worker_fd)
+
+
+def _stats_epoch_rebuild_body() -> str:
+    """The epoch worker's work under its flock, after its run is recorded."""
+    if not stats_epoch_rebuild_pending():
+        _unlink_stats_epoch_marker()
+        _log_stats_epoch_rebuild("current")
+        return "current"
+    import _cctally_completion
+    try:
+        conn = resolve_stats_epoch_mismatch()
+        conn.close()
+    except _cctally_completion.ResidualObligationNotDurable as exc:
+        _unlink_stats_epoch_marker()
+        _log_stats_epoch_rebuild(STATS_EPOCH_RESIDUAL_NOT_DURABLE,
+                                 error=exc)
+        return STATS_EPOCH_RESIDUAL_NOT_DURABLE
+    except Exception as exc:
+        _log_stats_epoch_rebuild("error", error=exc)
+        return "error"
+    _unlink_stats_epoch_marker()
+    _log_stats_epoch_rebuild("success")
+    return "success"
 
 
 def _raw_user_version(path) -> int:

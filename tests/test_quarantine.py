@@ -1,9 +1,9 @@
 """tests/quarantine.json, the reviewed flaky-test list (spec 4.3).
 
 `bin/cctally-test-all` deselects every listed pytest node from both pytest legs
-and drops it from the expected estate legs; the quick gate excludes listed
-nodes and harness cases; the scheduled CI run executes them in a separately
-reported quarantine leg. Every reader parses the list through
+(`bin/_lib_test_selection.py`); the quick gate excludes listed
+nodes and harness cases; the nightly broad run's quarantine leg runs them.
+Every reader parses the list through
 `bin/_lib_quarantine.py`. This module checks that each entry is complete,
 that each pytest id names a node pytest can collect and each harness case a
 case its harness has, and that an unreadable list refuses a run at admission.
@@ -116,9 +116,9 @@ def test_harness_case_ids_validate_against_the_harness_inventory(tmp_path):
 def test_an_unreadable_quarantine_list_is_refused_at_admission(tmp_path, payload):
     # Reset fix round (B11): a malformed tests/quarantine.json refuses the run
     # at admission, before the harness pool starts, not after it has run.
-    from tests.test_test_all_scheduler import _quarantine_tree
+    from tests.test_test_all_scheduler import _fake_pytest_tree
 
-    runner, calls, env = _quarantine_tree(tmp_path, None)
+    runner, calls, env = _fake_pytest_tree(tmp_path)
     repo = runner.parent.parent
     (repo / "tests/quarantine.json").write_text(payload)
     marker = tmp_path / "harness-ran"
@@ -128,12 +128,12 @@ def test_an_unreadable_quarantine_list_is_refused_at_admission(tmp_path, payload
     outcome = tmp_path / "outcome.json"
     proc = subprocess.run([str(runner)], env=dict(env, CCTALLY_TEST_ALL_OUTCOME_FILE=str(outcome)),
                           text=True, capture_output=True, timeout=60)
-    _hyg.reclaim_child_generations(tmp_path)
+    _hyg.reclaim_child_suite_dirs(tmp_path)
     assert proc.returncode == 3, proc.stdout + proc.stderr
     assert "tests/quarantine.json could not be applied" in proc.stdout + proc.stderr
     reasons = json.loads(outcome.read_text())["reasons"]
     assert [(r["code"], r["subject"]) for r in reasons] == [
-        ("estate-artifact-unreadable", "tests/quarantine.json")], reasons
+        ("quarantine-list-unreadable", "tests/quarantine.json")], reasons
     assert not marker.exists(), "the harness pool ran before the quarantine list was refused"
     assert calls.read_text() == "" if calls.exists() else True
 
@@ -159,7 +159,7 @@ def _run_dashboard(tmp_path, root, *args):
     env = dict(os.environ, TMPDIR=str(tmp_path), CCTALLY_TEST_JOBS="4")
     proc = subprocess.run([str(root / "bin" / "cctally-dashboard-test"), *args], env=env,
                           capture_output=True, text=True, timeout=110)
-    _hyg.reclaim_child_generations(tmp_path)
+    _hyg.reclaim_child_suite_dirs(tmp_path)
     return proc
 
 
@@ -214,42 +214,3 @@ def test_unknown_case_name_is_refused(tmp_path):
         assert proc.returncode == 2, (args, proc.stdout[-2000:], proc.stderr[-2000:])
         assert not SUMMARY.findall(proc.stdout), args
     assert "no-such-scenario" in _run_dashboard(tmp_path, REPO, "--cases", "no-such-scenario").stderr
-
-
-def test_ci_quarantine_leg_partitions_harness_cases(tmp_path):
-    # The scheduled leg must hand pytest only pytest ids and each harness only
-    # its own cases; a harness id handed to pytest is an error that reports
-    # every quarantined test as failed.
-    import yaml
-
-    workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
-    steps = {s.get("name"): s for s in workflow["jobs"]["test-macos"]["steps"]}
-    run = steps["Run the quarantined tests (report only)"]["run"]
-    code = run.split(" -- python3 -c '", 1)[1].split("' || rc=$?", 1)[0]
-    tree = tmp_path / "tree"
-    (tree / "bin").mkdir(parents=True)
-    (tree / "tests").mkdir()
-    (tree / "bin" / "_lib_quarantine.py").symlink_to(REPO / "bin" / "_lib_quarantine.py")
-    (tree / "tests" / "test_listed.py").write_text("def test_listed():\n    pass\n")
-    calls = tmp_path / "harness-calls"
-    harness = tree / "bin" / "cctally-demo-test"
-    harness.write_text("#!/usr/bin/env bash\nprintf '%%s\\n' \"$*\" >> %s\n"
-                       "printf 'passed: 2   failed: 0\\n'\n" % calls)
-    harness.chmod(0o755)
-    entries = [dict(_entry("x"), id="tests/test_listed.py::test_listed"),
-               dict(_entry("x"), id="harness:demo::alpha"), dict(_entry("x"), id="harness:demo::beta")]
-    (tree / "tests" / "quarantine.json").write_text(json.dumps(entries))
-    summary = tmp_path / "summary.md"
-    env = dict(os.environ, GITHUB_STEP_SUMMARY=str(summary), RUNNER_TEMP=str(tmp_path),
-               CCTALLY_QUARANTINE_STARTED=str(tmp_path / "started"))
-    env.pop("PYTEST_ADDOPTS", None)
-    for key in ("PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID",
-                "PYTEST_CURRENT_TEST"):
-        env.pop(key, None)
-    proc = subprocess.run([sys.executable, "-c", code], cwd=tree, env=env, capture_output=True,
-                          text=True, timeout=120)
-    report = summary.read_text()
-    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:] + report
-    assert calls.read_text().splitlines() == ["--cases alpha,beta"]
-    assert "1 listed pytest node id(s): passed" in report, report
-    assert "harness demo, 2 listed case(s): passed" in report, report

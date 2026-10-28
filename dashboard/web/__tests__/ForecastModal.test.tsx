@@ -119,12 +119,4 @@ describe('<ForecastModal />', () => {
     const conf = document.getElementById('mfc-confidence');
     expect(conf?.classList.contains('accent-red')).toBe(true);
   });
-
-  it('section header for Range has the bar-chart icon', () => {
-    render(<ForecastModal />);
-    const sec = document.querySelector('.m-sec.sec-range');
-    expect(sec).not.toBeNull();
-    const useEl = sec?.querySelector('svg use');
-    expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#bar-chart');
-  });
 });

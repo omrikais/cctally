@@ -249,13 +249,14 @@ def test_find_accounts_cutover_op_still_returns_none_when_absent(
 
 def _streamed_digest(jr, high_water, at_prefix):
     """Drive the accumulator over `high_water` and read `at_prefix` from it."""
-    import _lib_journal_router as R
-
-    hasher = R.PrefixHashAccumulator()
+    # #997 D12: the production hasher, whose mid-segment evidence re-reads
+    # go through the segment-read seam.
+    hasher = jr._new_prefix_hasher()
     state = {"prior": None}
     for segment, offset, raw in jr._iter_range_with_segments(
         None, high_water, jr.list_segments(),
-        on_segment=lambda name: hasher.begin_segment(name, state["prior"]),
+        on_segment=lambda name, size: hasher.begin_segment(
+            name, state["prior"], size=size),
         on_bytes=hasher.extend,
     ):
         state["prior"] = (segment, offset + len(raw) + 1)

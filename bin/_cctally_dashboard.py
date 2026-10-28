@@ -11999,15 +11999,12 @@ def _dashboard_stats_deferred_snapshot(args, *, pinned_now, exc):
     # worker owns maintenance-exclusive, doing that before HTTP bind reintroduces
     # the exact multi-second startup stall this path exists to remove. Supply a
     # schema-valid, privacy-safe warning block; the first successful background
-    # snapshot replaces it with a real doctor payload.
-    doctor_payload = {
-        "severity": "warn",
-        "counts": {"ok": 0, "warn": 1, "fail": 0},
-        "generated_at": now_utc.astimezone(dt.timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        ),
-        "fingerprint": "sha1:" + ("0" * 40),
-    }
+    # snapshot replaces it with a real doctor payload. #997 D10: the block still
+    # carries the rebuild-worker aggregate, from the worker snapshots alone
+    # (lock-free, never opens stats), so the chip names the running or dead
+    # rebuild from the first frame.
+    doctor_payload = tui._deferred_doctor_placeholder(now_utc)
+    doctor_payload["rebuild_worker"] = tui._tui_rebuild_worker_value(now_utc)
     replacements = {
         # #583 S2 §6.1: this frame is degraded by construction — it carries a
         # `stats-open` error and no successful build ran, so it must not stamp

@@ -33,11 +33,6 @@
 # `import pytest, xdist, pytest_timeout, yaml, rich`, because rich imports
 # markdown-it lazily. `pip check` is what makes the closure claim true.
 #
-# Parity is enforced from both sides of the public-mirror boundary, because
-# neither test can reach the other's file: tests/test_toolchain_parity.py (public)
-# checks this file and the three workflow lanes, and bin/cctally-test-remote-test
-# (private) checks the wrapper.
-#
 # Five entries below are not imported by the product and are here because a gate
 # detects or executes them at runtime:
 #   pytest-xdist   -- bin/cctally-test-all gates `-n "$PYTEST"` on `import xdist`

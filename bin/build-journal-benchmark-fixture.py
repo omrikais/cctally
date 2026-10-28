@@ -90,10 +90,11 @@ _OBSERVATION_SEGMENTS = (
 #: It is spread across SEVERAL segments rather than piled into one, and no
 #: extra segment is allowed to be larger than the base layout's per-segment
 #: budget. Real segments are cut by UTC month, so doubling retained history
-#: genuinely adds segments rather than growing one — and the streaming
-#: protocol-evidence accumulator buffers the segment it is reading (§5.2), so a
-#: single oversized extra segment would raise peak allocation for a reason that
-#: has nothing to do with what the slope gate is measuring.
+#: genuinely adds segments rather than growing one, and the extra history is
+#: spread the same way. (The protocol-evidence accumulator once buffered the
+#: segment it was reading, §5.2, so an oversized extra segment raised peak
+#: allocation for a reason unrelated to the slope gate; since #997 D12 it
+#: streams and retains no segment bytes.)
 _EXTRA_QUOTA_SEGMENTS = tuple(
     f"observations-2024-{month:02d}.jsonl" for month in range(4, 13)
 )

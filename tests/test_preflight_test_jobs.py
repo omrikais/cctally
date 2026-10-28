@@ -11,7 +11,7 @@ Two ways that dispatch used to hang rather than finish:
 
 The second is exercised on the scheduler itself, cut out of the harness
 verbatim, so a group can be killed deterministically without paying for the
-harness's 145 real cases.
+harness's real cases.
 """
 
 from __future__ import annotations

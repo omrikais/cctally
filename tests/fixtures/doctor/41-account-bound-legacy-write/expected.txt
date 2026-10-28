@@ -20,10 +20,11 @@ Hooks
 Auth
   ✓ OAuth token              present
 Database
-  ✓ stats.db                 version 1018 / 13 known
+  ✓ stats.db                 version 1019 / 13 known
   ✓ cache.db                 version 49 / 49 known
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
+  ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
   ✓ Migrations               62/62 applied
   ✓ Pending migrations       none pending
   ✓ Locks                    free
@@ -35,7 +36,7 @@ Database
 Journal
   ✓ Journal                  1 segment(s), writable
   ✓ Journal integrity        no malformed lines
-  ✓ Journal index            index 2,790 bytes behind (within threshold)
+  ✓ Journal index            index 2,822 bytes behind (within threshold)
   ✓ Auto-heal                no auto-heal incidents
   ✓ Stats writer guard       no unsanctioned stats.db writes recorded
   ✓ Journal conflicts        no quarantined events
@@ -90,4 +91,4 @@ Telemetry
 Performance
   ✓ Dashboard disk writes    No dashboard is running.
 
-Summary: 65 OK · 5 WARN · 0 FAIL
+Summary: 66 OK · 5 WARN · 0 FAIL

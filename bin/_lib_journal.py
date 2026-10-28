@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 
 import _lib_account_protocol
@@ -222,6 +223,47 @@ def decode_line(raw: bytes) -> dict | None:
     return obj
 
 
+#: Strings up to this many characters are interned by `compact_retained`.
+#: Keys, kinds, sources, account keys, ids and timestamps fall under it; a
+#: long free-text value is rare enough that sharing it would buy nothing.
+COMPACT_INTERN_MAX_CHARS = 64
+
+
+def compact_retained(value):
+    """An equal copy of a decoded record whose keys and string values of at
+    most `COMPACT_INTERN_MAX_CHARS` characters are ``sys.intern``ed (#997 D15).
+
+    CPython's JSON decoder shares keys only within one ``loads`` call, so
+    every record a pass retains carries its own copy of every key and every
+    repeated short value: 381 k retained records took 0.83 GB decoded and
+    0.375 GB compacted on the maintainer's copy. Recursive through ``dict``
+    and ``list``; every other value (numbers, booleans, ``None``, long
+    strings) is shared unchanged. The result is a NEW record with new
+    containers, so equality, hashing, canonical encoding and mutation behave
+    exactly as on the plain record; only the object identity of equal strings
+    changes, and no consumer compares strings by identity.
+
+    Apply it immediately after decoding, before any consumer holds a
+    reference, so an identity check such as the rederive reader's
+    ``records[index] is record`` only ever sees the compacted object.
+    """
+    return _compact(value)
+
+
+def _compact(value, _intern=sys.intern):
+    kind = type(value)
+    if kind is dict:
+        return {
+            (_intern(key) if type(key) is str else key): _compact(item)
+            for key, item in value.items()
+        }
+    if kind is list:
+        return [_compact(item) for item in value]
+    if kind is str and len(value) <= COMPACT_INTERN_MAX_CHARS:
+        return _intern(value)
+    return value
+
+
 # --------------------------------------------------------------------------
 # identity
 # --------------------------------------------------------------------------
@@ -383,11 +425,29 @@ def effects_payload_digest(payload: dict, refs: dict | None = None) -> str:
 
 _WRITER_GENERATION = _lib_account_protocol.PROTOCOL_GENERATION
 _WPG = _lib_account_protocol.WRITER_GENERATION_KEY
+#: #797/#823/#840 (spec 4.6 B1): the protocol revision stamp, transport
+#: metadata exactly like ``wpg``.
+_WRITER_REVISION = _lib_account_protocol.PROTOCOL_REVISION
+_WPR = _lib_account_protocol.REVISION_KEY
+#: ``writer_revision`` default: the current revision when the record carries
+#: the current writer generation, none for a previous release's shape.
+_REVISION_DEFAULT = object()
+
+
+def _writer_core(core: dict, writer_generation, writer_revision) -> None:
+    if writer_generation is not None:
+        core[_WPG] = writer_generation
+    if writer_revision is _REVISION_DEFAULT:
+        writer_revision = (None if writer_generation is None
+                           else _WRITER_REVISION)
+    if writer_revision is not None:
+        core[_WPR] = writer_revision
 
 
 def make_obs(at: str, src: str, provider: str, payload: dict,
              account: str | None = None, *,
-             writer_generation: str | None = _WRITER_GENERATION) -> dict:
+             writer_generation: str | None = _WRITER_GENERATION,
+             writer_revision=_REVISION_DEFAULT) -> dict:
     """Build a complete ``obs`` line record (raw capture; canonicalization is
     derivation-time, never baked into the stored line — spec §4.2).
 
@@ -401,35 +461,44 @@ def make_obs(at: str, src: str, provider: str, payload: dict,
     writing protocol. It is part of the content-id core, so a current record and
     a previous-release record of the same capture are distinct lines. ``None``
     builds the previous release's exact shape (a validator re-deriving a
-    retained pre-stamp record, or a test simulating an old writer)."""
+    retained pre-stamp record, or a test simulating an old writer).
+
+    ``writer_revision`` (#797/#823/#840 spec 4.6 B1) is the top-level ``wpr``
+    protocol revision, also part of the content-id core. It defaults to the
+    current revision for a current-generation record and to none for a
+    previous release's shape; ``None`` with the current generation builds
+    the revision-1 (#825) shape."""
     core = {"t": "obs", "at": at, "src": src, "provider": provider, "payload": payload}
     if account is not None:
         core["account"] = account
-    if writer_generation is not None:
-        core[_WPG] = writer_generation
+    _writer_core(core, writer_generation, writer_revision)
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
 def make_op(at: str, src: str, payload: dict, *,
-            writer_generation: str | None = _WRITER_GENERATION) -> dict:
+            writer_generation: str | None = _WRITER_GENERATION,
+            writer_revision=_REVISION_DEFAULT) -> dict:
     """Build a complete ``op`` (operator record) line — no ``provider``.
-    ``writer_generation`` as in ``make_obs``."""
+    ``writer_generation`` and ``writer_revision`` as in ``make_obs``."""
     core = {"t": "op", "at": at, "src": src, "payload": payload}
-    if writer_generation is not None:
-        core[_WPG] = writer_generation
+    _writer_core(core, writer_generation, writer_revision)
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
 def prepare_record(record: dict) -> dict:
     """The single shared preparation step both append APIs apply (#825/#832
-    spec 5.1): return ``record`` carrying the current writer generation.
+    spec 5.1): return ``record`` carrying the current writer generation and,
+    since #797/#823/#840 (spec 4.6 B1), the current protocol revision.
 
-    A content-id record (``id`` starting ``o:``) that is not yet stamped and
-    whose id verifies over its unstamped core is re-identified over the stamped
-    core, exactly as the builders compute it. Every other id — semantic event
-    ids, bootstrap ids, correction batch ids, a content id that does not verify
-    — is preserved. Idempotent: a stamped record is returned unchanged."""
-    if _lib_account_protocol.is_stamped(record):
+    A content-id record (``id`` starting ``o:``) that is not yet fully
+    stamped and whose id verifies over its current core is re-identified over
+    the stamped core, exactly as the builders compute it. Every other id —
+    semantic event ids, bootstrap ids, correction batch ids, a content id
+    that does not verify — is preserved. Idempotent: a record carrying both
+    stamps is returned unchanged. Only records about to be appended pass
+    through here, so a retained record is never restamped."""
+    if (_lib_account_protocol.is_stamped(record)
+            and _lib_account_protocol.has_current_revision(record)):
         return record
     stamped = _lib_account_protocol.stamp(record)
     rid = record.get("id")
@@ -448,10 +517,30 @@ def unstamped_record(record: dict) -> dict:
     ``prepare_record``. Drops the writer-generation stamp and, for a content-id
     record whose id verifies over its stamped core, re-identifies it over the
     unstamped core. Any other id is preserved. For fixtures and tests that
-    simulate a pre-stamp writer; never used on a production write path."""
-    if not isinstance(record, dict) or _WPG not in record:
+    simulate a pre-stamp writer; never used on a production write path.
+    The protocol revision (``wpr``) goes with the stamp."""
+    if not isinstance(record, dict) or (
+            _WPG not in record and _WPR not in record):
         return record
-    out = {k: v for k, v in record.items() if k != _WPG}
+    out = {k: v for k, v in record.items() if k not in (_WPG, _WPR)}
+    rid = record.get("id")
+    if (record.get("t") in ("obs", "op") and isinstance(rid, str)
+            and rid.startswith("o:")):
+        core = {k: v for k, v in record.items() if k not in ("v", "id")}
+        if content_id(core) == rid:
+            out["id"] = content_id(
+                {k: v for k, v in out.items() if k not in ("v", "id")})
+    return out
+
+
+def prerevision_record(record: dict) -> dict:
+    """The revision-1 (#825 release) shape of ``record``: the current writer
+    generation without the protocol revision, re-identified like
+    ``unstamped_record``. For fixtures and tests that simulate the previous
+    release; never used on a production write path."""
+    if not isinstance(record, dict) or _WPR not in record:
+        return record
+    out = {k: v for k, v in record.items() if k != _WPR}
     rid = record.get("id")
     if (record.get("t") in ("obs", "op") and isinstance(rid, str)
             and rid.startswith("o:")):
@@ -510,11 +599,15 @@ def event_content_hash(record: dict) -> str:
 #: The previous release's exact-key repair acknowledgement. The current binary
 #: never emits it: its validator would reject the writer-generation stamp, so
 #: current acknowledgements use the versioned kind the previous release ignores
-#: as an unknown op (#825/#832 spec 5.1). Current readers accept both.
+#: as an unknown op (#825/#832 spec 5.1). Current readers accept every kind.
 _PROTOCOL_RESOLUTION_KIND = "journal_protocol_resolution"
 _PROTOCOL_RESOLUTION_V2_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V2_KIND
+#: #797/#823/#840 (spec 4.6 B5): the previous release's v2 validator rejects
+#: the protocol revision stamp, so the current binary emits this successor.
+PROTOCOL_RESOLUTION_V3_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V3_KIND
 PROTOCOL_RESOLUTION_KINDS = frozenset((
-    _PROTOCOL_RESOLUTION_KIND, _PROTOCOL_RESOLUTION_V2_KIND))
+    _PROTOCOL_RESOLUTION_KIND, _PROTOCOL_RESOLUTION_V2_KIND,
+    PROTOCOL_RESOLUTION_V3_KIND))
 _PROTOCOL_RESOLUTION_SRC = "journal-repair"
 
 
@@ -554,7 +647,7 @@ def make_protocol_resolution(
         at=at,
         src=_PROTOCOL_RESOLUTION_SRC,
         payload={
-            "kind": _PROTOCOL_RESOLUTION_V2_KIND,
+            "kind": PROTOCOL_RESOLUTION_V3_KIND,
             "violations": refs,
             "journal_high_water": {
                 "segment": segment,
@@ -588,7 +681,7 @@ def make_evt(kind: str, id: str, at: str, payload: dict, rev: int = 0) -> dict:
     body["kind"] = kind
     return {"v": LINE_VERSION, "t": "evt", "id": id, "rev": rev,
             "at": at, "src": "ingest", "payload": body,
-            _WPG: _WRITER_GENERATION}
+            _WPG: _WRITER_GENERATION, _WPR: _WRITER_REVISION}
 
 
 # --------------------------------------------------------------------------
@@ -627,8 +720,10 @@ def _protocol_violation(
 def _validate_protocol_resolution(record: dict) -> dict:
     required = {"v", "t", "id", "at", "src", "payload"}
     # #825/#832: a current record also carries the writer-generation stamp,
-    # which is part of its content-id core.
-    if set(record) not in (required, required | {_WPG}):
+    # which is part of its content-id core; #797/#823/#840 adds the protocol
+    # revision (spec 4.6 B5).
+    if set(record) not in (required, required | {_WPG},
+                           required | {_WPG, _WPR}):
         raise JournalProtocolError(
             "journal protocol resolution record shape is invalid"
         )
@@ -650,6 +745,8 @@ def _validate_protocol_resolution(record: dict) -> dict:
     }
     if _WPG in record:
         core[_WPG] = record[_WPG]
+    if _WPR in record:
+        core[_WPR] = record[_WPR]
     if record.get("id") != content_id(core):
         raise JournalProtocolError(
             "journal protocol resolution record id does not match its content"
@@ -802,6 +899,7 @@ def make_correction_batch(
         "action_count": len(cores),
         "actions_hash": actions_hash,
         _WPG: _WRITER_GENERATION,
+        _WPR: _WRITER_REVISION,
     }
     records = [{**marker, "phase": "begin"}]
     for seq, core in enumerate(cores):
@@ -813,10 +911,32 @@ def make_correction_batch(
                 "batch": batch_id,
                 "seq": seq,
                 _WPG: _WRITER_GENERATION,
+                _WPR: _WRITER_REVISION,
             }
         )
     records.append({**marker, "phase": "commit"})
     return records
+
+
+def revision_batch_id(batch_id: str, begins) -> str:
+    """The batch id a retry of ``batch_id`` appends under (#797/#823/#840
+    spec 4.6 B1).
+
+    ``begins`` are the retained begin markers already journalled under
+    ``batch_id``. A retry reuses the id only when no begin exists or one
+    carries the current revision stamp. An interrupted batch an earlier
+    writer began without that stamp is never restamped: a revision-2 copy of
+    its lines would be a marker conflict under the original id (the fold
+    hashes markers byte-exactly), and a copy without the stamp would land
+    after the revision boundary, where admission excludes it. Its plan is
+    therefore authored afresh under a derived id, and the original begin
+    stays the inert, incomplete batch it was."""
+    begins = list(begins)
+    if not begins or any(
+            _lib_account_protocol.has_current_revision(begin)
+            for begin in begins):
+        return batch_id
+    return f"{batch_id}:wpr{_lib_account_protocol.PROTOCOL_REVISION}"
 
 
 def _validate_batch_marker(record: dict) -> dict:

@@ -997,11 +997,13 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: rebuilds that were not strictly required; under-inclusion silently reuses a
 #: corpus another tree's ingest wrote, which is the defect being repaired.
 #:
-#: COST, stated rather than assumed: 155 files, and the 9.9 MB and 47 ms to
+#: COST, stated rather than assumed: 161 files, and the 9.9 MB and 47 ms to
 #: digest were measured at 139, before #834 S2 added the 140th and #901 W9's
 #: checkpoint policy the 141st; later work, ending with #825/#832's three
 #: outcome-quarantine modules and its derivation-completion step, brought it
-#: to 155. The cost is
+#: to 155, and further work, ending with #997's three rebuild-worker modules,
+#: to 161, and #797/#823/#840's provider-sample pair and its provider-activity
+#: and staleness-proof kernels to 165. The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
 #: whose marker was written by the previous tree -- for `large` that is the
@@ -1033,6 +1035,7 @@ PRODUCER_SOURCES = (
     "bin/_cctally_journal_repair.py",
     "bin/_cctally_milestone_history.py",
     "bin/_cctally_milestones.py",
+    "bin/_cctally_oauth_samples.py",
     "bin/_cctally_parser.py",
     "bin/_cctally_percent_breakdown.py",
     "bin/_cctally_pricing_check.py",
@@ -1074,6 +1077,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_cache_report_wire.py",
     "bin/_lib_cache_writer_lock.py",
     "bin/_lib_changelog.py",
+    "bin/_lib_clone_copy.py",
     "bin/_lib_codex_account_adoption.py",
     "bin/_lib_codex_drain_admission.py",
     "bin/_lib_codex_publication_barrier.py",
@@ -1124,11 +1128,13 @@ PRODUCER_SOURCES = (
     "bin/_lib_log.py",
     "bin/_lib_meter_rate_change.py",
     "bin/_lib_milestone_history.py",
+    "bin/_lib_oauth_samples.py",
     "bin/_lib_outcome_quarantine.py",
     "bin/_lib_perf.py",
     "bin/_lib_pricing.py",
     "bin/_lib_pricing_check.py",
     "bin/_lib_pricing_debug.py",
+    "bin/_lib_provider_activity.py",
     "bin/_lib_quota.py",
     "bin/_lib_quota_alert_axes.py",
     "bin/_lib_quota_calibration.py",
@@ -1136,6 +1142,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_quota_ledger.py",
     "bin/_lib_quota_model.py",
     "bin/_lib_rate_change_delivery.py",
+    "bin/_lib_rebuild_progress.py",
     "bin/_lib_reclaim_planner.py",
     "bin/_lib_record.py",
     "bin/_lib_rederive.py",
@@ -1151,6 +1158,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_source_identity.py",
     "bin/_lib_source_retry.py",
     "bin/_lib_sqlite_close.py",
+    "bin/_lib_stale_proof.py",
     "bin/_lib_stats_damage.py",
     "bin/_lib_stats_publish.py",
     "bin/_lib_stats_wal.py",
@@ -1161,6 +1169,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_transcript_access.py",
     "bin/_lib_view_models.py",
     "bin/_lib_wal_checkpoint.py",
+    "bin/_lib_worker_launches.py",
     "bin/_lib_write_budget.py",
     "bin/_lib_write_io.py",
     "bin/build-bench-fixtures.py",

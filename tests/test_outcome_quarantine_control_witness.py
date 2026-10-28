@@ -221,7 +221,7 @@ def test_a_real_journal_repair_acknowledgement_revokes_accounting(
     assert json.loads(out)["status"] == "applied"
     kinds = [(r.get("payload") or {}).get("kind") for r in _journal_records()]
     assert J.PROTOCOL_RESOLUTION_KINDS & set(kinds) == {
-        "journal_protocol_resolution_v2"}
+        "journal_protocol_resolution_v3"}
     assert T.account_quarantined(app, "A")
 
 

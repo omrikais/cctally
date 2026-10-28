@@ -114,6 +114,7 @@ import _lib_account_protocol
 import _lib_accounts
 import _lib_journal
 import _lib_journal_router
+import _lib_rebuild_progress
 import _lib_rederive
 
 #: The correction-batch family this step (and the live collision check)
@@ -152,7 +153,7 @@ def is_deriving_input(record) -> bool:
         return False
     if record.get("t") == "obs":
         import _cctally_rederive
-        return bool(_cctally_rederive._rederivable_raw_records([record]))
+        return _cctally_rederive._is_rederivable_raw(record)
     if record.get("t") == "op":
         return (record.get("payload") or {}).get("kind") in _DERIVING_OP_KINDS
     return False
@@ -800,6 +801,9 @@ def _complete(context, trusted, target, boundary):
     with tempfile.TemporaryDirectory(
             prefix="cctally-completion-", dir=str(_cctally_core.APP_DIR)) as tmp:
         base = pathlib.Path(tmp) / "predecessor.db"
+        # #997 D9: progress for a detached worker's state file (a no-op
+        # unless one installed a sink).
+        _lib_rebuild_progress.phase("completion:predecessor")
         _journal.rebuild_stats_index(
             context=_journal.RebuildContext(trigger=context.trigger),
             target_path=str(base), high_water=start,
@@ -847,6 +851,7 @@ def _apply_owed_outputs(base, start, output_end, boundary) -> frozenset:
     revision through that output end, in the rebuild's fold order (structural
     folds, the open 5h block projection, then milestones). Returns the ids
     applied, which the predecessor then holds."""
+    _lib_rebuild_progress.phase("completion:owed-outputs")
     prefix = _read_prefix(start, output_end, boundary)
     if prefix.cutover_claude is _journal._CUTOVER_UNSEEN:
         prefix.cutover_claude = _journal._resolve_cutover_for_rebuild(
@@ -873,6 +878,9 @@ def _apply_owed_outputs(base, start, output_end, boundary) -> frozenset:
         _journal._fold_order(item[1]), item[0]))
     conn = _cctally_core.open_db(_target_path=str(base))
     try:
+        # #997 (spec D1): the predecessor is a disposable scratch too.
+        import _cctally_store
+        _cctally_store.apply_disposable_scratch_policy(conn)
         for phase in ("structural", "tail"):
             if phase == "tail":
                 import sys
@@ -917,6 +925,10 @@ class _Prefix:
         self.excluded_revisions: dict = {}
         self.inert_revisions: dict = {}
         self.begin_at: dict = {}
+        #: #797/#823/#840 spec 4.6 B1: the begin markers per batch id, so a
+        #: retry of a batch an earlier writer began without the revision-2
+        #: stamp is authored under a derived id instead of restamped.
+        self.begins: dict = {}
         self.batch_family: dict = {}
         self.cutover_claude = _journal._CUTOVER_UNSEEN
         # Admitted decision ids before the window (the predecessor holds
@@ -933,25 +945,57 @@ def _bump(table: dict, record) -> None:
         table[event_id] = max(rev, table.get(event_id, rev))
 
 
+def _window_omits(record) -> bool:
+    """#997 spec D3: whether an ADMITTED record is left out of the window —
+    an observation the replay provably ignores: not a rederivable raw input
+    and not a Claude reading, so it yields no candidate and the quarantine
+    fold returns before touching state (`reading_from_record` requires
+    `is_claude_reading`). Codex quota observations, 85 % of a production
+    journal, are the population. Its line still feeds the prefix hasher and
+    its `None` slot, and `window_has_derivable_inputs` still scans it; an
+    EXCLUDED observation keeps its placeholder, which the fold's exclusion
+    trigger needs. Every window consumer reads the same compacted window
+    within one `_complete_window` call, so indexing stays consistent."""
+    if record.get("t") != "obs":
+        return False
+    import _cctally_quarantine
+    import _cctally_rederive
+    return (not _cctally_rederive._is_rederivable_raw(record)
+            and not _cctally_quarantine.is_claude_reading(record))
+
+
 def _read_prefix(start, target, boundary) -> _Prefix:
     out = _Prefix()
     segments = _journal.list_segments()
-    hasher = _lib_journal_router.PrefixHashAccumulator()
+    hasher = _journal._new_prefix_hasher()
     prior = {"hw": None}
     placeholder = _lib_account_protocol.excluded_placeholder()
     start_key = _order(start)
+    lines = 0
     for segment, offset, raw in _journal._iter_range_with_segments(
         None, target, segments,
-        on_segment=lambda name: hasher.begin_segment(name, prior["hw"]),
+        on_segment=lambda name, size: hasher.begin_segment(
+            name, prior["hw"], size=size),
         on_bytes=hasher.extend,
     ):
+        lines += 1
+        if not lines & 4095:
+            _lib_rebuild_progress.tick(lines=lines)
         end = (segment, offset + len(raw) + 1)
         record = _lib_journal.decode_line(raw)
         if record is None:
             prior["hw"] = end
             continue
         in_window = _order((segment, offset)) >= start_key
-        if not _journal._is_admitted(record, segment, offset, boundary):
+        admitted = _journal._is_admitted(record, segment, offset, boundary)
+        t = record.get("t")
+        omitted = admitted and in_window and _window_omits(record)
+        if (in_window and not omitted) or (
+                admitted and t in _lib_journal_router.RETAINED_RECORD_TYPES):
+            # #997 D15: a record the window or the selector slots keep is
+            # compacted before anything holds a reference to it.
+            record = _lib_journal.compact_retained(record)
+        if not admitted:
             out.slots.append(None)
             if record.get("t") in ("evt", "correction"):
                 _bump(out.excluded_revisions, record)
@@ -961,7 +1005,6 @@ def _read_prefix(start, target, boundary) -> _Prefix:
                 out.coordinates.append((segment, offset))
             prior["hw"] = end
             continue
-        t = record.get("t")
         if t == "op":
             _journal._capture_protocol_prefix_evidence(
                 record, prior["hw"], out.evidence, hasher=hasher)
@@ -976,10 +1019,11 @@ def _read_prefix(start, target, boundary) -> _Prefix:
                 out.legacy_origin_ids.add(record["id"])
         if t == "correction_batch" and record.get("phase") == "begin":
             out.begin_at.setdefault(record.get("id"), record.get("at"))
+            out.begins.setdefault(record.get("id"), []).append(record)
             out.batch_family.setdefault(record.get("id"), record.get("family"))
         out.slots.append(
             record if t in _lib_journal_router.RETAINED_RECORD_TYPES else None)
-        if in_window:
+        if in_window and not omitted:
             out.window.append(record)
             out.coordinates.append((segment, offset))
         prior["hw"] = end
@@ -1055,6 +1099,17 @@ def _no_cache_read_adapters():
             setattr(cctally, name, value)
 
 
+def _normalized_copy(record, cutover_claude):
+    """One window record as a replay sees it: a private deep copy, its legacy
+    account stamp normalized under ``cutover_claude`` (an excluded placeholder
+    is only copied). Reads only this record and the journal-wide cutover
+    value (#997 spec D5)."""
+    out = copy.deepcopy(record)
+    if out.get("t") != _lib_account_protocol.EXCLUDED_PLACEHOLDER_TYPE:
+        _journal._normalize_legacy_account_stamp(out, cutover_claude)
+    return out
+
+
 def _replay(base, tmp, name, prefix, held_ids, cache_conn, *, retention,
             skip=frozenset()):
     """One scratch replay of the window from the predecessor state, the
@@ -1065,17 +1120,19 @@ def _replay(base, tmp, name, prefix, held_ids, cache_conn, *, retention,
     import _cctally_rederive
     copy_path = tmp / name
     shutil.copyfile(base, copy_path)
-    records = copy.deepcopy(prefix.window)
-    for record in records:
-        if record.get("t") != _lib_account_protocol.EXCLUDED_PLACEHOLDER_TYPE:
-            _journal._normalize_legacy_account_stamp(
-                record, prefix.cutover_claude)
+    cutover_claude = prefix.cutover_claude
     by_input: dict = {}
     conn = _cctally_core.open_db(_target_path=str(copy_path))
     try:
+        # #997 (spec D1): a disposable replay copy, never published.
+        import _cctally_store
+        _cctally_store.apply_disposable_scratch_policy(conn)
         fold = _cctally_quarantine.QuarantineFold.load(conn, held_ids=held_ids)
+        # #997 spec D5: each record is copied and normalized as it is
+        # offered, never the whole window up front.
         events = _cctally_rederive.replay_scratch_records(
-            conn, records, cache_conn, fold=fold, held_ids=held_ids,
+            conn, prefix.window, cache_conn, fold=fold, held_ids=held_ids,
+            prepare=lambda record: _normalized_copy(record, cutover_claude),
             coordinates=prefix.coordinates, skip_indexes=skip,
             on_input=lambda index, derived: by_input.__setitem__(
                 index, list(derived)),
@@ -1177,6 +1234,7 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
     holds the fresh candidate only where it differs from the reference, so a
     gap's effect reaches its descendants while every unaffected decision
     stays the retained one. Their difference is the causal suffix."""
+    _lib_rebuild_progress.phase("completion:read", round=round_index)
     prefix = _read_prefix(start, target, boundary)
     if prefix.cutover_claude is _journal._CUTOVER_UNSEEN:
         prefix.cutover_claude = _journal._resolve_cutover_for_rebuild(
@@ -1203,6 +1261,7 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
     legacy = _legacy_decided_inputs(prefix)
 
     with _cache_read_view() as cache_conn:
+        _lib_rebuild_progress.phase("completion:replay-all", round=round_index)
         _events, by_input = _replay(
             base, tmp, f"all-{round_index}.db", prefix, held_ids, cache_conn,
             retention=_retention(effective, prefix, owed, legacy=legacy))
@@ -1210,6 +1269,8 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
         gap = _gap_inputs(by_input, selection, legacy)
         if not gap:
             return False
+        _lib_rebuild_progress.phase(
+            "completion:replay-without", round=round_index)
         events_a, _ = _replay(
             base, tmp, f"without-{round_index}.db", prefix, held_ids,
             cache_conn, skip=gap,
@@ -1218,6 +1279,8 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
         for event in events_a:
             reference.setdefault(
                 event["id"], _lib_journal.event_content_hash(event))
+        _lib_rebuild_progress.phase(
+            "completion:replay-with", round=round_index)
         events_b, _ = _replay(
             base, tmp, f"with-{round_index}.db", prefix, held_ids, cache_conn,
             retention=_retention(effective, prefix, owed, legacy=legacy,
@@ -1272,6 +1335,9 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
             ensure_ascii=False).encode("utf-8")).hexdigest()
         batch_id = f"{FAMILY}:{digest}"
         if batch_id not in selection.completed_batches:
+            batch_id = _lib_journal.revision_batch_id(
+                batch_id, prefix.begins.get(batch_id, ()))
+        if batch_id not in selection.completed_batches:
             records.extend(_lib_journal.make_correction_batch(
                 batch_id=batch_id, family=FAMILY,
                 # An interrupted earlier attempt's `at`, so the retry's lines
@@ -1283,5 +1349,7 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
     records.extend(plain)
     if not records:
         return False
+    _lib_rebuild_progress.phase(
+        "completion:append", round=round_index, records=len(records))
     _journal.append_records(records)
     return True

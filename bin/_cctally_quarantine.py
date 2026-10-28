@@ -380,16 +380,26 @@ class QuarantineFold:
                         kind=TRIGGER_LEGACY_SPOOL,
                         reason=str(payload.get("reason") or "changed"),
                         segment=segment, offset=offset, at=rec.get("at"))
-            elif kind == _lib_account_protocol.CUTOVER_OP_KIND:
+            elif kind in (_lib_account_protocol.CUTOVER_OP_KIND,
+                          _lib_account_protocol.REVISION_OP_KIND):
                 # Spec revision 5 (section 7, *Before the initial cutover*):
                 # a cutover that could not complete its legacy spool
                 # inventory records the uncertainty in itself, and is the
                 # same unresolved-marker trigger an `inventory-incomplete`
-                # op is, at the cutover's own position.
+                # op is, at the cutover's own position. #797/#823/#840
+                # (spec 4.6 B2): so is a revision-2 boundary whose expanded
+                # inventory could not complete.
+                expected_id = (
+                    _lib_account_protocol.CUTOVER_OP_ID
+                    if kind == _lib_account_protocol.CUTOVER_OP_KIND
+                    else _lib_account_protocol.REVISION_OP_ID)
                 if (_lib_account_protocol.is_stamped(rec)
-                        and rec.get("id") == _lib_account_protocol.CUTOVER_OP_ID
+                        and rec.get("id") == expected_id
                         and payload.get("legacySpoolInventoryFailure")
-                        is not None):
+                        is not None
+                        # A revision op continuing an open failure episode
+                        # adds no trigger: the episode already has one.
+                        and payload.get("inventoryEpisode") is None):
                     self.state.on_trigger(
                         kind=TRIGGER_LEGACY_SPOOL,
                         reason=_lib_account_protocol.INVENTORY_INCOMPLETE_REASON,

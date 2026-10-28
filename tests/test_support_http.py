@@ -108,7 +108,7 @@ def _recorded_deadline(monkeypatch, *, frame):
 
     Structural rather than wall-clock on purpose. Asserting `elapsed < N`
     would measure the runner, which is the very failure class this session
-    exists to remove, and the timing-budget guard forbids it outright.
+    exists to remove.
     """
     seen = {}
 
@@ -139,7 +139,7 @@ def test_read_event_uses_the_presence_backstop_as_the_deadline(monkeypatch):
 
 
 def test_two_frames_in_one_segment_are_both_read():
-    """#630 S2, found by `bin/cctally-test-load-invariance` on the fleet.
+    """#630 S2, found by the contended lane (since retired) on the fleet.
 
     A read returns whatever the socket has, which is not one frame. The server
     writes `ready` and `baselined` back to back, so they routinely arrive in

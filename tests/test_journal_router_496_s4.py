@@ -9,6 +9,7 @@ field or an `account_observe` op's key. See spec section 4.6.
 from __future__ import annotations
 
 import hashlib
+import io
 import pathlib
 import sys
 
@@ -215,27 +216,41 @@ def _reference_digest(frames) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+class _Segments:
+    """The opener a streamed accumulator re-reads evidence through (#997 D12):
+    a digest not at a fully fed segment end re-hashes that segment's prefix."""
+
+    def __init__(self, **files):
+        self.files = {name.replace("_", "."): data
+                      for name, data in files.items()}
+
+    def __call__(self, name):
+        return io.BytesIO(self.files[name])
+
+
 def test_prefix_hash_matches_the_framing_at_a_segment_boundary():
     acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc.begin_segment("a.jsonl", size=8)
     acc.extend(b"one\ntwo\n")
     assert acc.digest_at(("a.jsonl", 8)) == _reference_digest(
         [("a.jsonl", b"one\ntwo\n")])
 
 
 def test_prefix_hash_matches_the_framing_mid_segment():
-    acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc = R.PrefixHashAccumulator(
+        open_segment=_Segments(a_jsonl=b"one\ntwo\n"))
+    acc.begin_segment("a.jsonl", size=8)
     acc.extend(b"one\ntwo\n")
     assert acc.digest_at(("a.jsonl", 4)) == _reference_digest(
         [("a.jsonl", b"one\n")])
 
 
 def test_prefix_hash_spans_completed_segments():
-    acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc = R.PrefixHashAccumulator(
+        open_segment=_Segments(b_jsonl=b"two\nthree\n"))
+    acc.begin_segment("a.jsonl", size=4)
     acc.extend(b"one\n")
-    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4))
+    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4), size=10)
     acc.extend(b"two\nthree\n")
     assert acc.digest_at(("b.jsonl", 4)) == _reference_digest(
         [("a.jsonl", b"one\n"), ("b.jsonl", b"two\n")])
@@ -244,10 +259,11 @@ def test_prefix_hash_spans_completed_segments():
 def test_prefix_hash_serves_the_previous_segments_registered_boundary():
     """A resolution op that is the FIRST line of a segment names the previous
     segment's last line end, which is gone by the time the op is decoded."""
-    acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
-    acc.extend(b"one\ntorn-tail-without-newline")
-    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4))
+    torn = b"one\ntorn-tail-without-newline"
+    acc = R.PrefixHashAccumulator(open_segment=_Segments(a_jsonl=torn))
+    acc.begin_segment("a.jsonl", size=len(torn))
+    acc.extend(torn)
+    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4), size=4)
     acc.extend(b"two\n")
     assert acc.digest_at(("a.jsonl", 4)) == _reference_digest(
         [("a.jsonl", b"one\n")])
@@ -257,8 +273,8 @@ def test_prefix_hash_frames_an_empty_segment():
     """`journal_prefix_hash` frames a zero-byte segment; `iter_range` skips it,
     so the accumulator must still be told the segment exists."""
     acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
-    acc.begin_segment("b.jsonl", boundary=None)
+    acc.begin_segment("a.jsonl", size=0)
+    acc.begin_segment("b.jsonl", boundary=None, size=4)
     acc.extend(b"one\n")
     assert acc.digest_at(("b.jsonl", 4)) == _reference_digest(
         [("a.jsonl", b""), ("b.jsonl", b"one\n")])
@@ -266,22 +282,23 @@ def test_prefix_hash_frames_an_empty_segment():
 
 def test_prefix_hash_none_high_water_is_none():
     acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc.begin_segment("a.jsonl", size=0)
     assert acc.digest_at(None) is None
 
 
 def test_prefix_hash_refuses_an_unstreamed_prefix():
     acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc.begin_segment("a.jsonl", size=4)
     acc.extend(b"one\n")
-    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4))
+    acc.begin_segment("b.jsonl", boundary=("a.jsonl", 4), size=0)
     with pytest.raises(R.PrefixEvidenceUnavailable):
         acc.digest_at(("a.jsonl", 2))
 
 
 def test_prefix_hash_counts_only_the_bytes_it_hashed():
-    acc = R.PrefixHashAccumulator()
-    acc.begin_segment("a.jsonl")
+    acc = R.PrefixHashAccumulator(
+        open_segment=_Segments(a_jsonl=b"one\ntwo\n"))
+    acc.begin_segment("a.jsonl", size=8)
     acc.extend(b"one\ntwo\n")
     assert acc.bytes_hashed == 0
     assert acc.digests_computed == 0

@@ -302,7 +302,10 @@ def test_a_wal_reset_between_attempts_uses_no_stale_frame(
     dst.execute("PRAGMA journal_mode=WAL")
     dst.close()
     holder = sqlite3.connect(reference)
-    holder.execute("SELECT 1").fetchone()
+    # Read the schema: SQLite 3.45 does not open the database for a bare
+    # `SELECT 1`, so the holder would leave no WAL index for the planner.
+    holder.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+    assert pathlib.Path(f"{reference}-shm").exists()
     ref = _plan_in_subprocess({**request, "db": str(reference)})
     holder.close()
     assert live["ok"] and ref["ok"], (live, ref)

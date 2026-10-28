@@ -8,12 +8,33 @@ import importlib.util
 import json
 import pathlib
 import sqlite3
+import sys
 
 import pytest
 
 TOOLS = pathlib.Path(__file__).resolve().parent.parent / "bench" / "write-attribution"
 KiB = 1024
 MiB = 1024 * KiB
+
+#: Parts of the bench tools are macOS-only by design; the rest of this module
+#: runs everywhere. Each gate names the one macOS facility its cases need.
+_NEEDS_F_GETPATH = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only write-attribution tooling: bypass.c uses fcntl's "
+           "F_GETPATH, which Linux does not define")
+_NEEDS_RUSAGE_INFO = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only write-attribution tooling: the P1 runner reads its "
+           "memory footprint from proc_pid_rusage's rusage_info")
+_NEEDS_APFS_CLONE = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only write-attribution tooling: run-scratch-proof.sh "
+           "starts with an APFS clone (cp -cR)")
+_NEEDS_MACOS_SYMLINK_ATIME = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="macOS-only write-attribution tooling: the frozen capture's probe "
+           "identity includes a symlink's atime, which Linux advances on "
+           "readlink and macOS does not")
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +52,8 @@ def _no_detached_drains(monkeypatch):
         update = sys.modules.get("_cctally_update")
         if update is not None:
             monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+            monkeypatch.setattr(update, "_spawn_detached_with_pid",
+                                lambda command, **_kw: os.getpid())
 
     def load_without_detaching(*args, **kwargs):
         module = real_load(*args, **kwargs)
@@ -2178,6 +2201,7 @@ def _p1_records(turns):
     return records
 
 
+@_NEEDS_RUSAGE_INFO
 def test_the_p1_runner_measures_a_synthetic_conversation_end_to_end(tmp_path):
     """The P1 harness on this tree, without the interposer: the forced
     re-projection and the no-append pass change nothing, the small append
@@ -7918,7 +7942,8 @@ def _run_out(box, name="run-t1"):
 
 @pytest.mark.parametrize("name", [
     "run-workload.sh", "run-latency.sh", "run-clone.sh", "run-statements.sh",
-    "run-op.sh", "run-p1.sh", "run-live.sh", "run-scratch-proof.sh",
+    "run-op.sh", "run-p1.sh", "run-live.sh",
+    pytest.param("run-scratch-proof.sh", marks=_NEEDS_APFS_CLONE),
     "run-p2.sh"])
 def test_an_interrupted_runner_leaves_nothing_running_and_judges_its_family(
         tmp_path, name):
@@ -9115,6 +9140,7 @@ def _journal_quota(path, **payload):
         "source_path": str(path), "line_offset": 0, **payload}}
 
 
+@_NEEDS_MACOS_SYMLINK_ATIME
 @pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_journal_only_sources_capture_metadata_union_aliases_and_explicit_absence(tmp_path):
     fr = _load("frozen_roots")
@@ -9243,7 +9269,10 @@ def test_qualification_rejects_missing_or_changed_journal_probe_coverage(
 
 
 # #968 T14B-PREP-04: selection must not mistake unknown twins for absence.
-@pytest.mark.parametrize("shape", ["absent", "compressed", "directory-alias", "file-alias"])
+@pytest.mark.parametrize("shape", [
+    "absent", "compressed",
+    pytest.param("directory-alias", marks=_NEEDS_MACOS_SYMLINK_ATIME),
+    pytest.param("file-alias", marks=_NEEDS_MACOS_SYMLINK_ATIME)])
 @pytest.mark.parametrize("decoded_twins", [False, True])
 @pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_journal_selection_captures_both_forms_and_canonical_alias_targets(
@@ -9541,6 +9570,7 @@ def test_selftest_bypass_oracles_require_operation_denial(name, field):
                         "read live content")
 
 
+@_NEEDS_F_GETPATH
 @pytest.mark.usefixtures("release_sealed_tmp_path")
 def test_selftest_fatal_stimulus_is_owner_allowed_raw_metadata_write(tmp_path):
     """Exercise the actual C helper on fake sealed permissions, unsandboxed

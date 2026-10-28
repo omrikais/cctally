@@ -321,7 +321,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
 # =========================================================================
 #
 # Every current statusline coordination file lives under ONE sibling root,
-# `APP_DIR/statusline-account-bound-v1/`, partitioned by the exact account:
+# `APP_DIR/statusline-account-bound-v2/`, partitioned by the exact account:
 #
 #   selected.lock                       the selected-state / persist flock
 #   transport.last                      render-path transport marker
@@ -646,13 +646,37 @@ def _candidate_from_input(parsed, *, received_at: int) -> "_candidates.Candidate
     binding = _capture_binding()
     if binding is None:
         return None
+    token = _candidate_identity_token(parsed)
     return _candidates.Candidate(
-        token=_candidate_identity_token(parsed),
+        token=token,
         received_at=received_at,
         five_hour=five,
         seven_day=seven,
         binding=binding,
+        activity=_capture_activity(parsed, token),
     )
+
+
+def _activity_cache_path(token: str) -> pathlib.Path:
+    """The contributor's provider-activity scan cache in the v2 spool (#797
+    spec 4.1, D10a): one accelerator document per contributor, never read by
+    acknowledgement, detached reduction or frozen-plan recovery."""
+    if _candidates.CANDIDATE_TOKEN_RE.fullmatch(token) is None:
+        raise ValueError("invalid candidate token")
+    return _bound_root() / "activity-cache" / f"{token}.json"
+
+
+def _capture_activity(parsed, token: str):
+    """The arrival's frozen provider-activity witness (#797 spec 4.1, 4.2),
+    captured once here: in the render process, after Claude Code composed the
+    input and before the intake commit, outside the intake critical section
+    (its leaf lock forbids further locks beneath it). The transcript path is
+    read here and goes nowhere else."""
+    import _lib_provider_activity
+
+    path = parsed.transcript_path if isinstance(parsed.transcript_path, str) else None
+    return _lib_provider_activity.capture_activity(
+        path, cache_path=_activity_cache_path(token))
 
 
 #: Completion markers of the account-bound root's persistence barriers
@@ -801,13 +825,20 @@ def _atomic_write_json(path: pathlib.Path, document: dict, *,
 def _candidate_document(candidate: "_candidates.Candidate") -> dict:
     """The current candidate document: the protocol generation and the
     immutable binding travel with the raw per-axis readings (spec 4.2)."""
+    import _lib_provider_activity
+
     if candidate.binding is None:
         raise ValueError("a current candidate requires an account binding")
+    if not isinstance(candidate.activity, _lib_provider_activity.ActivityWitness):
+        raise ValueError("a current candidate requires its activity witness")
     document = {
         "schemaVersion": _candidates.SCHEMA_VERSION,
         "protocolGeneration": _candidates.PROTOCOL_GENERATION,
         "binding": candidate.binding.document(),
         "receivedAt": candidate.received_at,
+        # #797 spec 4.2: the frozen witness travels inside the document, so
+        # the intake identity hashes it and every reader revalidates it.
+        "activity": _lib_provider_activity.witness_to_json(candidate.activity),
     }
     if candidate.five_hour is not None:
         document["fiveHour"] = {
@@ -855,6 +886,9 @@ def _parse_candidate(raw: bytes, *, account_key: str, token: str, now_epoch: int
     binding = _lib_account_binding.load(doc.pop("binding", None))
     if binding.account_key != account_key:
         raise _candidates.StateValidationError("cross-account candidate")
+    if "activity" not in doc:
+        raise _candidates.StateValidationError("a current candidate requires its activity witness")
+    activity = _candidates.validate_activity(doc.pop("activity"))
     candidate = _candidates.validate_candidate_document(
         doc,
         now_epoch=now_epoch,
@@ -862,7 +896,7 @@ def _parse_candidate(raw: bytes, *, account_key: str, token: str, now_epoch: int
             axis, epoch, now_epoch),
         token=token,
     )
-    return dataclasses.replace(candidate, binding=binding)
+    return dataclasses.replace(candidate, binding=binding, activity=activity)
 
 
 def _read_account_candidates(account_key: str, *, now_epoch: int, prune: bool):
@@ -987,7 +1021,8 @@ def _five_hour_reset_admitted(raw: int, instant: int, now_epoch: int) -> bool:
             <= max(instant, now_epoch) + _FIVE_HOUR_FUTURE_BAND_SECONDS)
 
 
-def _read_db_projection_at(*, account_key: str, at: "int | None"):
+def _read_db_projection_at(*, account_key: str, at: "int | None",
+                           stale: "list | None" = None):
     """`_read_db_projection_once` plus the inclusive range of evaluation
     instants for which the same read yields the same projection: only the
     five-hour expiry grace depends on the instant, so the projection is
@@ -1000,12 +1035,13 @@ def _read_db_projection_at(*, account_key: str, at: "int | None"):
     admission moves with the wall clock, when it is the capped range."""
     validity: list = []
     projection = _read_db_projection_once(
-        account_key=account_key, at=at, validity=validity)
+        account_key=account_key, at=at, validity=validity, stale=stale)
     return projection, validity[0], validity[1]
 
 
 def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
                              validity: "list | None" = None,
+                             stale: "list | None" = None,
                              ) -> "_candidates.DbProjection":
     """Project the selected weekly and five-hour values of EXACTLY one account
     (#825/#832 spec 4.5), as seen by an evaluation at ``at`` (the wall clock
@@ -1017,7 +1053,12 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
     SELECTs, the reset-aware weekly floor and the five-hour reset generation are
     scoped to ``account_key``, so another account's rows or reset events can
     neither become this account's projection nor filter its rows. The returned
-    projection names the account it was read for."""
+    projection names the account it was read for.
+
+    ``stale``, when given, receives the account's `_StaleInputs` (#797 spec
+    4.4) read in the SAME snapshot: the weekly window's provider samples,
+    credits, accounted value and index identity the refusal facts and the
+    receipts are resolved from."""
     if not isinstance(account_key, str) or not account_key:
         raise ValueError("the statusline projection requires an exact account")
     import _cctally_journal
@@ -1074,6 +1115,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
 
         weekly_projection = None
         weekly_retired = None
+        weekly_selected = weekly_floor = reference = None
         if weekly_groups:
             canonical = max(weekly_groups)
             rows = weekly_groups[canonical]
@@ -1106,6 +1148,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
                     eligible,
                     key=lambda row: (_epoch_from_iso(row["captured_at_utc"]), int(row["id"])),
                 )
+                weekly_selected = weekly
                 raw = _epoch_from_iso(weekly["week_end_at"])
                 weekly_projection = _candidates.AxisProjection(
                     float(weekly["weekly_percent"]), raw, canonical,
@@ -1215,6 +1258,12 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
             five_admissible_at=five_admissible_at,
             weekly_retired=weekly_retired, five_retired=five_retired,
             weekly_bound=weekly_bound, instant=instant)
+        if stale is not None:
+            stale.append(_read_stale_inputs(
+                conn, account_key, groups=weekly_groups, selected=weekly_selected,
+                projection=weekly_projection, floor=weekly_floor,
+                reference=reference,
+                five_window=max(five_groups) if five_groups else None))
     finally:
         conn.close()
     if validity is not None:
@@ -1231,6 +1280,302 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
     return _candidates.DbProjection(
         five_projection, weekly_projection, account_key=account_key,
         evidence=evidence)
+
+
+@dataclasses.dataclass(frozen=True)
+class _StaleInputs:
+    """What #797 spec 4.4 resolves for one account from a classification's
+    snapshot: the latest weekly window, its accounted value
+    (`_lib_stale_proof.Accounted`, None without a window), its credits, its
+    admitted provider samples requested after ``samples_after`` (None: not
+    read, because no member or receipt needed them), whether the sample
+    projection covers the account, the stats index identity receipts are
+    bound to, and the live support identities.
+
+    The five-hour fields (Task 5) are the latest five-hour window's canonical
+    key, its accounted value (the `statusline` source's detector baseline
+    under the current credit generation, D11; None without one), its
+    credits resolved through their causal facts, and its admitted provider
+    samples requested after ``samples_after``."""
+
+    window: "int | None"
+    accounted: object
+    credits: tuple
+    samples: tuple
+    samples_after: "str | None"
+    samples_covered: bool
+    index_identity: str
+    supports: frozenset
+    five_window: "int | None" = None
+    five_accounted: object = None
+    five_credits: tuple = ()
+    five_samples: tuple = ()
+
+
+#: #797 spec 4.4: ``(samples_after, receipts_held)`` for the partition the
+#: detached reducer is working on — the earliest provider-activity instant
+#: any of its members or receipts can need a sample after, and whether it
+#: holds receipts (a refusal is then possible, so an uncovered sample
+#: projection makes classification unavailable, never "no proof needed").
+_STALE_SCOPE = contextvars.ContextVar("statusline_stale_scope", default=(None, False))
+
+
+def _stale_index_identity(conn) -> str:
+    """The stats index identity receipts are bound to: its epoch and its
+    publication stamp, which every rebuild publication rewrites (an index
+    never rebuilt has none). A rebuild, re-upgrade or epoch change gives a
+    different identity and so invalidates every receipt."""
+    epoch = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    try:
+        stamp = sorted([str(v) for v in row] for row in conn.execute(
+            "SELECT record_path, started_at_utc, stamped_at_utc "
+            "FROM stats_publication_stamp"))
+    except sqlite3.Error:
+        stamp = None
+    return hashlib.sha256(json.dumps(
+        [epoch, stamp], separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _weekly_window_of(value: "str | None") -> "int | None":
+    try:
+        raw = _epoch_from_iso(value)
+    except (TypeError, ValueError):
+        return None
+    return int(_cctally_core._normalize_week_boundary_dt(
+        dt.datetime.fromtimestamp(raw, tz=dt.timezone.utc)).timestamp())
+
+
+def _credit_cause(conn, account_key: str, origin: "str | None") -> tuple:
+    """A weekly credit's causal low (spec 4.4): its originating (dropping or
+    first-zero) observation. A provider sample carries its request instant;
+    an api reading without one is unordered; a status-line reading survives
+    receipts (R15); a missing origin is legacy; anything else unknown."""
+    if origin is None:
+        return "legacy", None
+    try:
+        row = conn.execute(
+            "SELECT requested_at_utc FROM claude_oauth_samples "
+            "WHERE account_key = ? AND observation_id = ?",
+            (account_key, origin)).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None:
+        return "provider", str(row[0])
+    # A journalled snapshot's identity is ``"sa:" + <raw observation id>``.
+    row = conn.execute(
+        "SELECT source FROM weekly_usage_snapshots "
+        "WHERE account_key = ? AND journal_id = ?",
+        (account_key, "sa:" + origin)).fetchone()
+    if row is None:
+        return "unknown", None
+    if row[0] == "statusline":
+        return "statusline", None
+    if row[0] == "api":
+        return "provider", None
+    return "unknown", None
+
+
+def _window_credits(conn, account_key: str, window: int, reference) -> tuple:
+    """Every credit of the account's weekly ``window``, resolved through its
+    causal observation: the window's in-place reset events and the manual
+    credit floors of its week."""
+    import _lib_journal
+    import _lib_stale_proof
+
+    credits = []
+    for row in conn.execute(
+            "SELECT detected_at_utc, old_week_end_at, new_week_end_at, "
+            "effective_reset_at_utc, observed_pre_credit_pct, origin_observation_id "
+            "FROM week_reset_events WHERE account_key = ?", (account_key,)):
+        if _weekly_window_of(row[2]) != window:
+            continue
+        kind, requested = _credit_cause(conn, account_key, row[5])
+        credits.append(_lib_stale_proof.CreditTransition(
+            axis="sevenDay",
+            event_id=_lib_journal.evt_id("wr", *_lib_journal.week_reset_identity_parts(
+                account_key, row[1], row[2], row[5])),
+            event_revision=hashlib.sha256(json.dumps(
+                [None if v is None else str(v) for v in row],
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+            causal_kind=kind, requested_at_utc=requested))
+    if reference is not None:
+        week = str(reference["week_start_date"])
+        for row in conn.execute(
+                "SELECT effective_at_utc, observed_pre_credit_pct, applied_at_utc "
+                "FROM weekly_credit_floors WHERE account_key = ? AND week_start_date = ?",
+                (account_key, week)):
+            credits.append(_lib_stale_proof.CreditTransition(
+                axis="sevenDay", event_id=f"wcf:{account_key}:{week}:{row[0]}",
+                event_revision=hashlib.sha256(json.dumps(
+                    [str(v) for v in row], separators=(",", ":")).encode(
+                    "utf-8")).hexdigest(),
+                causal_kind="manual", requested_at_utc=None))
+    return tuple(sorted(credits, key=lambda c: c.event_id))
+
+
+def _five_hour_accounted(conn, account_key: str, window: int):
+    """The five-hour accounted value of the window (#797 spec 4.4 (i), D11):
+    the `statusline` source's detector baseline, only when it was
+    established under the window's current five-hour credit generation. A
+    baseline of an older generation (a pre-credit high), one the historical
+    detector wrote, or a missing state earns nothing."""
+    import _cctally_journal
+    import _cctally_record
+    import _lib_stale_proof
+
+    generation = _cctally_record.five_hour_credit_generation(
+        conn, window, account_key=account_key)
+    try:
+        row = conn.execute(
+            "SELECT baseline_pct, baseline_observation_id, baseline_generation "
+            "FROM five_hour_credit_confirmation_state "
+            "WHERE account_key = ? AND five_hour_window_key = ? AND source = ?",
+            (account_key, int(window), "statusline")).fetchone()
+    except sqlite3.Error:
+        row = None
+    current = row is not None and row[2] is not None and row[2] == generation
+    return _lib_stale_proof.Accounted(
+        account_key=account_key, axis="fiveHour", window=int(window),
+        percent=float(row[0]) if current else None,
+        support_id=row[1] if current else None,
+        support_hash=hashlib.sha256(json.dumps(
+            [float(row[0]), row[1], row[2]], separators=(",", ":")).encode(
+            "utf-8")).hexdigest() if current else None,
+        floor_epoch=None, credits=(), coverage=None,
+        detector_policy=_cctally_journal.DETECTOR_POLICY)
+
+
+def _five_hour_sample_facts(conn, account_key: str, observation_id) -> tuple:
+    """``(q, raw five-hour percent)`` of an admitted provider sample, or
+    ``(None, None)`` when the observation is not one."""
+    import _cctally_oauth_samples
+
+    sample = _cctally_oauth_samples.sample_for_observation(
+        conn, account_key=account_key, observation_id=observation_id)
+    if sample is None:
+        return None, None
+    return (sample.requested_at_utc,
+            None if sample.five_hour_percent is None else float(sample.five_hour_percent))
+
+
+def _five_hour_window_credits(conn, account_key: str, window: int) -> tuple:
+    """Every five-hour credit of the window, resolved through its retained
+    causal facts (#797 spec 4.4, 4.9): a credit the `statusline` source
+    confirmed is a status-line credit; one the `api` source confirmed carries
+    its baseline observation's request instant and RAW five-hour value and
+    its ARMING observation's request instant, each read from the admitted
+    provider sample of that exact observation (never a stored, MAX-clamped
+    value, and never the later confirming observation). A credit without
+    facts (a rebuild dropped them, or another source) is unknown."""
+    import _cctally_record
+    import _lib_journal
+    import _lib_stale_proof
+
+    try:
+        facts = {}
+        for row in conn.execute(
+                "SELECT source, pending_observation_id, baseline_observation_id, "
+                "       pending_generation "
+                "FROM five_hour_credit_confirmation_state "
+                "WHERE account_key = ? AND five_hour_window_key = ? "
+                "  AND source LIKE '#credit|%'", (account_key, int(window))):
+            facts[row[3]] = (str(row[0]).split("|", 2)[-1], row[1], row[2])
+    except sqlite3.Error:
+        facts = {}
+    credits = []
+    for row in conn.execute(
+            "SELECT detected_at_utc, prior_percent, post_percent, effective_reset_at_utc "
+            "FROM five_hour_reset_events WHERE account_key = ? AND five_hour_window_key = ?",
+            (account_key, int(window))):
+        event_id = _lib_journal.evt_id("fhc", account_key, int(window), str(row[3]))
+        revision = _cctally_record._five_hour_credit_revision(row)
+        fact = facts.get(f"{event_id}@{revision}")
+        kind, arming, baseline, baseline_percent = "unknown", None, None, None
+        if fact is not None and fact[0] == "statusline":
+            kind = "statusline"
+        elif fact is not None and fact[0] == "api":
+            kind = "provider"
+            arming, _ = _five_hour_sample_facts(conn, account_key, fact[1])
+            baseline, baseline_percent = _five_hour_sample_facts(
+                conn, account_key, fact[2])
+        credits.append(_lib_stale_proof.CreditTransition(
+            axis="fiveHour", event_id=event_id, event_revision=revision,
+            causal_kind=kind, requested_at_utc=arming,
+            baseline_requested_at_utc=baseline, baseline_percent=baseline_percent,
+            arming_requested_at_utc=arming))
+    return tuple(sorted(credits, key=lambda c: c.event_id))
+
+
+def _read_stale_inputs(conn, account_key: str, *, groups, selected, projection,
+                       floor, reference, five_window=None) -> _StaleInputs:
+    """The account's `_StaleInputs` on the caller's snapshot (#797 spec 4.4).
+    Provider samples are read only when the partition's members or receipts
+    need them (`_STALE_SCOPE`); an uncovered sample projection with receipts
+    held raises `ProjectionUnavailable`, so the classification is
+    unavailable rather than silently "no proof"."""
+    import _cctally_oauth_samples
+    import _lib_stale_proof
+
+    identity = _stale_index_identity(conn)
+    if not groups and five_window is None:
+        return _StaleInputs(None, None, (), (), None, True, identity, frozenset())
+    after, receipts_held = _STALE_SCOPE.get()
+    covered = _cctally_oauth_samples.projection_covered(conn, account_key=account_key)
+    if not covered and receipts_held:
+        raise _cctally_oauth_samples.ProjectionUnavailable(
+            "the provider sample projection does not cover this account")
+    five_accounted, five_credits, five_samples = _five_hour_stale_inputs(
+        conn, account_key, five_window, after=after if covered else None)
+    if not groups:
+        # Review F-I5-1: the five-hour refusal inputs never depend on a
+        # weekly reading. The weekly fields keep the no-window shape.
+        return _StaleInputs(None, None, (), (), None, True, identity, frozenset(),
+                            five_window, five_accounted, five_credits, five_samples)
+    window = max(groups)
+    supports = {f"row:{int(row['id'])}" for row in groups[window]}
+    samples = ()
+    if after is not None and covered:
+        samples = _cctally_oauth_samples.read_samples(
+            conn, account_key=account_key, axis="weekly", window=window,
+            requested_after_utc=after)
+    supports |= {sample.observation_id for sample in samples}
+    support_id = support_hash = None
+    if selected is not None:
+        support_id = f"row:{int(selected['id'])}"
+        support_hash = hashlib.sha256(json.dumps(
+            [int(selected["id"]), float(selected["weekly_percent"]),
+             str(selected["captured_at_utc"]), str(selected["source"])],
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+    accounted = _lib_stale_proof.Accounted(
+        account_key=account_key, axis="sevenDay", window=window,
+        percent=None if projection is None else float(projection.percent),
+        support_id=support_id, support_hash=support_hash,
+        floor_epoch=None if floor is None else floor.floor_epoch,
+        credits=_window_credits(conn, account_key, window, reference),
+        coverage=None)
+    return _StaleInputs(window, accounted, accounted.credits, tuple(samples),
+                        after if covered else None, covered, identity,
+                        frozenset(supports), five_window, five_accounted,
+                        five_credits, five_samples)
+
+
+def _five_hour_stale_inputs(conn, account_key: str, five_window, *, after) -> tuple:
+    """``(accounted, credits, samples)`` of the five-hour window
+    ``five_window`` (``(None, (), ())`` without one), its admitted provider
+    samples read only when ``after`` is given (a covered projection)."""
+    import _cctally_oauth_samples
+
+    if five_window is None:
+        return None, (), ()
+    credits = _five_hour_window_credits(conn, account_key, five_window)
+    accounted = dataclasses.replace(
+        _five_hour_accounted(conn, account_key, five_window), credits=credits)
+    samples = ()
+    if after is not None:
+        samples = _cctally_oauth_samples.read_samples(
+            conn, account_key=account_key, axis="five_hour",
+            window=int(five_window), requested_after_utc=after)
+    return accounted, credits, tuple(samples)
 
 
 def _account_rows(conn, table: str, account_key: str, extra: str = "") -> int:
@@ -2283,16 +2628,30 @@ def _reinstall_tail_slots(account_key: str, tail: "_Evaluation | None", *, at: i
         _write_candidate(member)
 
 
+def _same_arrival(a: "_candidates.Candidate", b: "_candidates.Candidate") -> bool:
+    """One immutable arrival apart from its provider-activity witness: the
+    same contributor, binding, receipt second and raw readings."""
+    return dataclasses.replace(a, activity=None) == dataclasses.replace(b, activity=None)
+
+
 def _intake_membership(account_key: str, *, at: int, incoming=None) -> tuple:
     """Under the intake lock, after `_reinstall_tail_slots`: each
     contributor's latest committed arrival eligible at ``at``, with the
     incoming arrival substituted for its own contributor exactly once and
-    every other eligible contributor kept."""
+    every other eligible contributor kept.
+
+    Returns ``(members, incoming)``. An incoming arrival identical to its
+    contributor's committed one except for a later capture's witness is the
+    SAME arrival (#797 spec 4.2): it reuses the first committed witness, so
+    its intake identity is the committed one's."""
     members = {c.token: c for c in _read_account_candidates(
         account_key, now_epoch=at, prune=False)}
     if incoming is not None:
+        committed = members.get(incoming.token)
+        if committed is not None and _same_arrival(committed, incoming):
+            incoming = committed
         members[incoming.token] = incoming
-    return tuple(members[token] for token in sorted(members))
+    return tuple(members[token] for token in sorted(members)), incoming
 
 
 def _intake_enroll(account_key: str, *, acknowledged: "int | None" = None,
@@ -2325,7 +2684,7 @@ def _intake_enroll(account_key: str, *, acknowledged: "int | None" = None,
         at = incoming.received_at if incoming is not None else int(time.time())
         tail = _intake_tail_evaluation(account_key)
         _reinstall_tail_slots(account_key, tail, at=at)
-        members = _intake_membership(account_key, at=at, incoming=incoming)
+        members, incoming = _intake_membership(account_key, at=at, incoming=incoming)
         if require_members and not members:
             return None
         if tail is None and acknowledged is None:
@@ -2433,6 +2792,38 @@ class _Transition:
     #: against it (`_render_acknowledge`). Never carried over to a projection
     #: it was not proven for; None when absent.
     coverage: "dict | None" = None
+    #: #797 spec 4.4 (D7b q3): the account's accounting receipts
+    #: (`_lib_stale_proof.Receipt`), created, validated and pruned only by the
+    #: detached reducer at a covered completion; every other writer carries
+    #: them over unchanged.
+    receipts: tuple = ()
+    #: #797 spec 4.4 (D7c q3): the covered facts the render needs to tell
+    #: whether a NOOP leaves receipt work (`_StaleCache`), written with the
+    #: projection in ``control`` and, like ``coverage``, never carried over
+    #: to a projection it was not read for. None when absent.
+    stale_cache: "object | None" = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _StaleCache:
+    """The render's cached receipt-earning inputs (#797 spec 4.4, D7c q3):
+    the accounted weekly window and value, and the compact provider samples
+    read after ``samples_after`` (`_lib_stale_proof.compact_samples`)."""
+
+    window: "int | None"
+    accounted: object
+    samples: tuple
+    samples_after: "str | None"
+    samples_covered: bool
+    #: Task 5: the five-hour window and its accounted value (path (i) only,
+    #: so no samples are needed to tell whether a member could earn).
+    five_window: "int | None" = None
+    five_accounted_percent: "float | None" = None
+    #: F-I4-2: the sample identities whose receipts the completion that
+    #: wrote this cache earned or held and then had to drop at the document
+    #: limit. They are no longer receipt work for a render (eviction and
+    #: omission still mean eligible) until a writer replaces this cache.
+    omitted: frozenset = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2485,7 +2876,103 @@ def _transition_document(transition: _Transition) -> dict:
            else {"attemptEvidence": transition.attempt_evidence}),
         **({} if transition.coverage is None
            else {"journalCoverage": transition.coverage}),
+        **({} if not transition.receipts
+           else {"accountingReceipts": [_receipt_document(r)
+                                        for r in transition.receipts]}),
+        **({} if transition.stale_cache is None
+           else {"staleContributorCache": _stale_cache_document(transition.stale_cache)}),
     }
+
+
+def _receipt_document(receipt) -> dict:
+    import _lib_stale_proof
+
+    return _lib_stale_proof.receipt_to_json(receipt)
+
+
+_SAMPLE_FIELDS = ("observationId", "requestedAt", "capturedAt", "weeklyPercent",
+                  "weeklyResetsAt")
+
+
+def _stale_cache_document(cache: _StaleCache) -> dict:
+    accounted = cache.accounted
+    return {
+        "window": cache.window,
+        "accountedPercent": None if accounted is None else accounted.percent,
+        "floorEpoch": None if accounted is None else accounted.floor_epoch,
+        "samplesAfter": cache.samples_after,
+        "samplesCovered": cache.samples_covered,
+        "samples": [[s.observation_id, s.requested_at_utc, s.captured_at_utc,
+                     s.weekly_percent, s.weekly_resets_at_utc] for s in cache.samples],
+        "fiveHourWindow": cache.five_window,
+        "fiveHourAccountedPercent": cache.five_accounted_percent,
+        "omitted": sorted(cache.omitted),
+    }
+
+
+def _validate_stale_cache(value, *, account_key: str):
+    """The transition's render cache of receipt-earning inputs, or None."""
+    import _lib_oauth_samples
+    import _lib_stale_proof
+
+    if value is None:
+        return None
+    doc = _candidates._require_object(value, "staleContributorCache")
+    base = {"window", "accountedPercent", "floorEpoch", "samplesAfter",
+            "samplesCovered", "samples"}
+    five_keys = {"fiveHourWindow", "fiveHourAccountedPercent", "omitted"}
+    if set(doc) != base and set(doc) != base | five_keys:
+        raise _candidates.StateValidationError("unexpected stale contributor cache keys")
+    five_window = doc.get("fiveHourWindow")
+    five_percent = doc.get("fiveHourAccountedPercent")
+    omitted = doc.get("omitted", [])
+    if (not (five_window is None or _candidates._is_int(five_window))
+            or not isinstance(omitted, list)
+            or not all(isinstance(k, str) and len(k) == 64 for k in omitted)):
+        raise _candidates.StateValidationError("invalid stale contributor cache")
+    if five_percent is not None:
+        five_percent = _candidates._percent(five_percent)
+    window, percent, floor = doc["window"], doc["accountedPercent"], doc["floorEpoch"]
+    after, covered, rows = doc["samplesAfter"], doc["samplesCovered"], doc["samples"]
+    if (not (window is None or _candidates._is_int(window))
+            or not (floor is None or _candidates._is_int(floor))
+            or not isinstance(covered, bool) or not isinstance(rows, list)
+            or not (after is None or isinstance(after, str))):
+        raise _candidates.StateValidationError("invalid stale contributor cache")
+    if percent is not None:
+        percent = _candidates._percent(percent)
+    samples = []
+    for row in rows:
+        if (not isinstance(row, list) or len(row) != len(_SAMPLE_FIELDS)
+                or not all(isinstance(row[i], str) for i in (0, 1, 2, 4))
+                or isinstance(row[3], bool) or not isinstance(row[3], (int, float))):
+            raise _candidates.StateValidationError("invalid cached provider sample")
+        samples.append(_lib_oauth_samples.OAuthSample(
+            account_key, row[0], row[1], row[2], float(row[3]), row[4], None, None, None))
+    accounted = None
+    if window is not None:
+        accounted = _lib_stale_proof.Accounted(
+            account_key=account_key, axis="sevenDay", window=window, percent=percent,
+            support_id=None, support_hash=None, floor_epoch=floor, credits=(),
+            coverage=None)
+    return _StaleCache(window, accounted, tuple(samples), after, covered,
+                       five_window, five_percent, frozenset(omitted))
+
+
+def _validate_receipts(value, *, account_key: str) -> tuple:
+    import _lib_stale_proof
+
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value:
+        raise _candidates.StateValidationError("invalid accounting receipts")
+    try:
+        receipts = tuple(_lib_stale_proof.receipt_from_json(doc) for doc in value)
+    except _lib_stale_proof.MalformedReceipt as exc:
+        raise _candidates.StateValidationError(f"invalid accounting receipt: {exc}")
+    if any(r.account_key != account_key for r in receipts):
+        raise _candidates.StateValidationError("cross-account accounting receipt")
+    return receipts
 
 
 def _validate_publication(value, *, account_key: str):
@@ -2505,12 +2992,20 @@ def _validate_publication(value, *, account_key: str):
     # its fold-policy revision; one frozen earlier has none and keeps the
     # historical policy through recovery.
     policy_key = _cctally_journal.PLAN_FOLD_POLICY_KEY
-    if set(doc) - {policy_key} != keys:
+    # #797/#823/#840 spec 4.9 (D12): a v2 plan also freezes its detector
+    # revision, which must be exactly the integer 2; a plan frozen earlier has
+    # none and keeps the historical detector through recovery.
+    detector_key = _cctally_journal.PLAN_DETECTOR_POLICY_KEY
+    if set(doc) - {policy_key, detector_key} != keys:
         raise _candidates.StateValidationError("unexpected publication keys")
     if policy_key in doc and (
             type(doc[policy_key]) is not int
             or doc[policy_key] != _cctally_journal.FOLD_POLICY_FIRST_POST_FLOOR):
         raise _candidates.StateValidationError("invalid publication fold policy")
+    if detector_key in doc and (
+            type(doc[detector_key]) is not int
+            or doc[detector_key] != _cctally_journal.DETECTOR_POLICY):
+        raise _candidates.StateValidationError("invalid publication detector policy")
     if (not isinstance(doc["publicationId"], str)
             or _PUBLICATION_ID_RE.fullmatch(doc["publicationId"]) is None):
         raise _candidates.StateValidationError("invalid publication identity")
@@ -2573,7 +3068,8 @@ def _read_transition(account_key: str, *, now_epoch: int) -> "_Transition | None
         "intakeAcknowledged"}
     _candidates._require_exact_keys(
         doc, base_keys | ({"outcomeQuarantine", "attemptEvidence",
-                           "journalCoverage"} & set(doc)))
+                           "journalCoverage", "accountingReceipts",
+                           "staleContributorCache"} & set(doc)))
     quarantine = _validate_transition_quarantine(doc.get("outcomeQuarantine"))
     attempt_evidence = doc.get("attemptEvidence")
     if attempt_evidence is not None and (
@@ -2581,6 +3077,9 @@ def _read_transition(account_key: str, *, now_epoch: int) -> "_Transition | None
             or _EVIDENCE_RE.fullmatch(attempt_evidence) is None):
         raise _candidates.StateValidationError("invalid attempt evidence")
     coverage = _validate_coverage(doc.get("journalCoverage"))
+    receipts = _validate_receipts(doc.get("accountingReceipts"), account_key=account_key)
+    stale_cache = _validate_stale_cache(doc.get("staleContributorCache"),
+                                        account_key=account_key)
     acknowledged = doc["intakeAcknowledged"]
     if not _candidates._is_int(acknowledged) or acknowledged < -1:
         raise _candidates.StateValidationError("invalid intake checkpoint")
@@ -2619,6 +3118,8 @@ def _read_transition(account_key: str, *, now_epoch: int) -> "_Transition | None
         intake_acknowledged=acknowledged,
         attempt_evidence=attempt_evidence,
         coverage=coverage,
+        receipts=receipts,
+        stale_cache=stale_cache,
     )
 
 
@@ -2709,12 +3210,15 @@ def _statusline_control_db_agreement(*, now_epoch: int) -> bool | None:
 def _replace_transition(transition: "_Transition | None", *, account_key: str,
                         binding, projection, control=None, anchor=..., publication=...,
                         quarantine=..., acknowledged=..., attempt_evidence=...,
-                        coverage=None):
+                        coverage=None, receipts=..., stale_cache=None):
     """The next generation of ``account_key``'s transition. Every field left
     as ``...`` carries over — the intake checkpoint in particular survives
-    every writer that does not acknowledge (an OAuth reconcile). The journal
-    coverage proof is the exception: it is written only by a caller that
-    proves it for THIS projection, and is otherwise cleared (P1-2)."""
+    every writer that does not acknowledge (an OAuth reconcile), and so do
+    the accounting receipts (#797 spec 4.4: only a covered detached
+    completion replaces them). The journal coverage proof and the render's
+    stale-contributor cache are the exception: each is written only by a
+    caller that proves it for THIS projection, and is otherwise cleared
+    (P1-2)."""
     if transition is None:
         base_control = _empty_control(projection)
         generation = 0
@@ -2723,6 +3227,7 @@ def _replace_transition(transition: "_Transition | None", *, account_key: str,
         prior_quarantine = None
         prior_acknowledged = -1
         prior_evidence = None
+        prior_receipts = ()
     else:
         base_control = transition.control
         generation = transition.generation
@@ -2731,6 +3236,7 @@ def _replace_transition(transition: "_Transition | None", *, account_key: str,
         prior_quarantine = transition.quarantine
         prior_acknowledged = transition.intake_acknowledged
         prior_evidence = transition.attempt_evidence
+        prior_receipts = transition.receipts
     return _Transition(
         account_key=account_key,
         binding=binding,
@@ -2745,6 +3251,8 @@ def _replace_transition(transition: "_Transition | None", *, account_key: str,
         attempt_evidence=(prior_evidence if attempt_evidence is ...
                           else attempt_evidence),
         coverage=coverage,
+        receipts=prior_receipts if receipts is ... else tuple(receipts),
+        stale_cache=stale_cache,
     )
 
 
@@ -3255,7 +3763,8 @@ def _axis_value_document(value) -> "dict | None":
 
 def _bound_publication_plan(decision, projection, candidates, binding, *,
                             generation: int, now_epoch: int,
-                            intake_sequence: int) -> "dict | None":
+                            intake_sequence: int,
+                            refused=None) -> "dict | None":
     """Freeze one partition's combined two-axis publication plan.
 
     Every published axis records its provenance — ``candidate`` (the winning
@@ -3265,9 +3774,18 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
     the evidence) — and every one names THIS account. The plan carries its
     binding, its captured instant and a stable publication identity; the
     decision's control state rides along so a recovered plan commits the
-    same control replacement."""
+    same control replacement.
+
+    ``refused`` maps an axis to the contributor tokens the reducer refused
+    on it (#797 spec 4.4): a candidate axis's provenance names the selected
+    ELIGIBLE winner, never a refused member that happens to tie its value.
+    Refusal filters only a rise: an accepted drop (consensus or deadline,
+    below the same window's baseline) publishes exactly as today, its
+    provenance included (review RV-3), because the reducer selects it from
+    the unfiltered set."""
     import _cctally_journal
 
+    refused = refused or {}
     account_key = binding.account_key
     if projection.account_key not in (None, account_key):
         raise ValueError("cross-account publication projection")
@@ -3287,18 +3805,26 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
                 "logicalResetGeneration": source.reset_generation,
             }
             continue
+        baseline = _candidates._projection_axis(projection, axis)
+        drop = (baseline is not None
+                and baseline.canonical_key == value.canonical_key
+                and value.percent < baseline.percent)
+        excluded = () if drop else refused.get(axis, ())
         winners = sorted(
-            candidate.token for candidate in candidates
-            if (axis_value := _candidates._candidate_axis(candidate, axis)) is not None
-            and axis_value.canonical_key == value.canonical_key
-            and axis_value.percent == value.percent
+            (candidate for candidate in candidates
+             if (axis_value := _candidates._candidate_axis(candidate, axis)) is not None
+             and axis_value.canonical_key == value.canonical_key
+             and axis_value.percent == value.percent
+             and candidate.token not in excluded),
+            key=lambda candidate: candidate.token,
         )
         if winners:
             provenance[axis] = {
                 "kind": "candidate", "account": account_key,
-                "window": value.canonical_key, "token": winners[0],
+                "window": value.canonical_key, "token": winners[0].token,
                 "observationIdentity": _candidates.observation_identity(
-                    winners[0], axis, value),
+                    winners[0].token, axis, value),
+                **_activity_provenance(winners[0]),
             }
         else:
             provenance[axis] = {
@@ -3316,6 +3842,9 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
         # observation is decided under, frozen with (and inside the identity
         # of) the plan so recovery never re-policies it.
         _cctally_journal.PLAN_FOLD_POLICY_KEY: _cctally_journal.CURRENT_FOLD_POLICY,
+        # #797/#823/#840 spec 4.9 (D12): the detector revision, frozen beside
+        # the fold policy and inside the identity for the same reason.
+        _cctally_journal.PLAN_DETECTOR_POLICY_KEY: _cctally_journal.DETECTOR_POLICY,
     }
     plan["publicationId"] = hashlib.sha256(json.dumps(
         {"protocolGeneration": _candidates.PROTOCOL_GENERATION,
@@ -3328,6 +3857,307 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
     # from — its acknowledgement advances the intake checkpoint past it.
     plan["intakeSequence"] = int(intake_sequence)
     return plan
+
+
+def _activity_provenance(candidate: "_candidates.Candidate") -> dict:
+    """The selected contributor's frozen provider-activity evidence as plan
+    provenance (#797 spec 4.5): its instant (or null), its typed status and
+    the evidence revision. Part of the publication identity; never a
+    transcript path or session id."""
+    import _lib_provider_activity
+
+    activity = candidate.activity
+    if not isinstance(activity, _lib_provider_activity.ActivityWitness):
+        raise ValueError("a current candidate requires its activity witness")
+    return {
+        "providerActivityAt": activity.instant_utc,
+        "providerActivityStatus": activity.status,
+        "providerActivityRevision": activity.evidence_revision,
+    }
+
+
+# --- #797 spec 4.4: refusal facts and accounting receipts --------------------
+
+
+def _axis_members(candidates, axis: str) -> list:
+    """The ``axis`` members with known, supported provider-activity evidence
+    as `_lib_stale_proof.Member`s, in their window: the normalized weekly
+    reset, or the canonical five-hour window key (the candidate's own when
+    it carries one). A member with unknown evidence is absent: it is always
+    eligible and never earns (O5)."""
+    import _lib_stale_proof
+
+    members = []
+    for candidate in candidates:
+        value = candidate.seven_day if axis == "sevenDay" else candidate.five_hour
+        if value is None:
+            continue
+        if axis == "sevenDay":
+            window = int(_cctally_core._normalize_week_boundary_dt(
+                dt.datetime.fromtimestamp(value.raw_resets_at, tz=dt.timezone.utc)
+            ).timestamp())
+        elif value.canonical_key is not None:
+            window = int(value.canonical_key)
+        else:
+            window = int(_cctally()._canonical_5h_window_key(int(value.raw_resets_at)))
+        sigma = _lib_stale_proof.sample_identity(
+            candidate.token, candidate.activity, axis=axis,
+            percent=value.percent, window=window)
+        if sigma is not None:
+            members.append(_lib_stale_proof.Member(sigma, int(value.raw_resets_at)))
+    return members
+
+
+def _weekly_members(candidates) -> list:
+    return _axis_members(candidates, "sevenDay")
+
+
+def _all_members(candidates) -> list:
+    return [*_axis_members(candidates, "sevenDay"), *_axis_members(candidates, "fiveHour")]
+
+
+def _stale_axes(stale: "_StaleInputs") -> tuple:
+    """Per axis: ``(axis, window, samples, credits, supports)``. The
+    five-hour axis checks no supports (its accounted value is detector
+    state)."""
+    return (("sevenDay", stale.window, stale.samples, stale.credits, stale.supports),
+            ("fiveHour", stale.five_window, stale.five_samples, stale.five_credits, None))
+
+
+def _stale_member_facts(stale: "_StaleInputs | None", receipts, candidates):
+    """The reducer's per-axis member facts (#797 spec 4.4), or None when no
+    member is refused, so such a window reduces exactly as before. Each axis
+    is decided on its own window's members, samples, credits and receipts;
+    an axis without a refused member is absent (all eligible)."""
+    import _lib_stale_proof
+
+    if stale is None or not receipts:
+        return None
+    out = {}
+    for axis, window, samples, credits, supports in _stale_axes(stale):
+        if window is None:
+            continue
+        members = [m for m in _axis_members(candidates, axis) if m.sigma.window == window]
+        if not members:
+            continue
+        facts = _lib_stale_proof.refusal_facts(
+            axis, members, samples, receipts, credits,
+            index_identity=stale.index_identity, supports=supports)
+        if any(f.refused for f in facts.values()):
+            out[axis] = facts
+    return out or None
+
+
+def _refused_tokens(member_facts) -> dict:
+    return {axis: frozenset(token for token, f in facts.items() if f.refused)
+            for axis, facts in (member_facts or {}).items()}
+
+
+def _completion_instant() -> str:
+    """``e_σ``: the wall clock at a covered completion, in the samples' ``q``
+    form. It is an upper bound on the completion, taken after it; an earlier
+    one is never reconstructed (from journal capture times or otherwise)."""
+    import _lib_oauth_samples
+
+    return _lib_oauth_samples.format_request_started(
+        dt.datetime.fromtimestamp(time.time(), tz=dt.timezone.utc))
+
+
+def _completion_receipts(transition, classified, members):
+    """The receipt map and render cache a covered, completed derivation
+    installs (#797 spec 4.4, D7b q3): the transition's receipts revalidated
+    and pruned against ``classified``, merged with what ``members`` earn
+    now. Without stale inputs the map is carried over unchanged and no cache
+    is written."""
+    import _lib_stale_proof
+
+    existing = () if transition is None else transition.receipts
+    stale = getattr(classified, "stale", None)
+    if stale is None:
+        return existing, None
+    kept, earned = [], []
+    completed = _completion_instant()
+    for axis, window, samples, credits, supports in _stale_axes(stale):
+        kept.extend(_lib_stale_proof.prune_receipts(
+            [r for r in existing if r.sigma.axis == axis], credits,
+            index_identity=stale.index_identity, window=window, supports=supports))
+        accounted = stale.accounted if axis == "sevenDay" else stale.five_accounted
+        if accounted is None or window is None:
+            continue
+        # The five-hour axis earns by exact equality alone (path (i)); its
+        # samples feed refusal, never earning.
+        earned.extend(_lib_stale_proof.earn_receipts(
+            [m for m in _axis_members(members, axis) if m.sigma.window == window],
+            accounted,
+            stale.samples if axis == "sevenDay" and stale.samples_covered else (),
+            completed_at_utc=completed, index_identity=stale.index_identity))
+    receipts = _lib_stale_proof.latest_per_token(
+        _lib_stale_proof.merge_receipts(kept, earned))
+    floor = None if stale.accounted is None else stale.accounted.floor_epoch
+    cache = _StaleCache(
+        stale.window, stale.accounted,
+        () if stale.window is None else _lib_stale_proof.compact_samples(
+            stale.samples, window=stale.window, floor_epoch=floor),
+        stale.samples_after, stale.samples_covered,
+        stale.five_window,
+        None if stale.five_accounted is None else stale.five_accounted.percent)
+    return receipts, cache
+
+
+def _fit_transition(transition: _Transition, *, prior=(), referenced=()) -> _Transition:
+    """``transition`` within the 1 MiB control document limit (#797 spec
+    4.4): the oldest receipts no outstanding work references are evicted
+    first, then the receipts new since ``prior`` are omitted, and finally
+    the render cache is dropped — accounting is never blocked, and eviction
+    means eligible."""
+    import _lib_stale_proof
+
+    def size(t) -> int:
+        return len(json.dumps(_transition_document(t), sort_keys=True,
+                              separators=(",", ":"), allow_nan=False).encode("utf-8"))
+
+    limit = _candidates.CONTROL_DOCUMENT_MAX_BYTES
+    if size(transition) <= limit:
+        return transition
+    before = {r.sigma.key() for r in prior}
+    evaluated = frozenset(r.sigma.key() for r in transition.receipts)
+
+    def with_receipts(kept) -> _Transition:
+        # F-I4-2: every receipt this completion evaluated and could not keep
+        # (evicted or omitted) is recorded in the render cache, so a render
+        # does not count it as receipt work again until a writer replaces
+        # the cache. Its member stays eligible.
+        fitted = dataclasses.replace(transition, receipts=tuple(kept))
+        if fitted.stale_cache is not None:
+            fitted = dataclasses.replace(fitted, stale_cache=dataclasses.replace(
+                fitted.stale_cache,
+                omitted=evaluated - {r.sigma.key() for r in kept}))
+        return fitted
+
+    receipts = _lib_stale_proof.bounded_receipts(
+        [r for r in transition.receipts if r.sigma.key() in before],
+        [r for r in transition.receipts if r.sigma.key() not in before],
+        referenced_tokens=frozenset(referenced),
+        fits=lambda kept: size(with_receipts(kept)) <= limit)
+    fitted = with_receipts(receipts)
+    if size(fitted) > limit:
+        fitted = dataclasses.replace(fitted, stale_cache=None)
+    return fitted
+
+
+def _refusal_authority_lost(classified, facts, receipts, members) -> bool:
+    """Whether a member ``facts`` refused is no longer refused against
+    ``receipts`` — the same classification and members, only the receipt
+    map changed (review RV-4: the document limit evicted the receipt a
+    refusal rested on)."""
+    refused = _refused_tokens(facts)
+    if not any(refused.values()):
+        return False
+    after = _refused_tokens(_stale_member_facts(
+        getattr(classified, "stale", None), receipts, members))
+    return any(tokens - after.get(axis, frozenset())
+               for axis, tokens in refused.items())
+
+
+def _referenced_tokens(transition, members) -> frozenset:
+    tokens = {m.token for m in members}
+    if transition is not None:
+        for pending in transition.control.pending_drops.values():
+            if pending is not None:
+                tokens.update(pending.contributors)
+    return frozenset(tokens)
+
+
+def _receipt_work(transition: _Transition, members) -> bool:
+    """Whether a covered detached completion over ``members`` could earn a
+    receipt that ``transition`` does not hold (#797 spec 4.4, D7c q3), judged
+    from the transition's cached facts alone (C4: the render reads no
+    index). Without a cache any member with known evidence is work; a member
+    with unknown evidence is never work."""
+    import _lib_stale_proof
+
+    known = _all_members(members)
+    if not known:
+        return False
+    cache = transition.stale_cache
+    if cache is None:
+        return True
+    # F-I4-2: a receipt the writer evaluated and had to omit is not work.
+    held = {r.sigma.key() for r in transition.receipts} | set(cache.omitted)
+    for member in known:
+        if member.sigma.axis != "fiveHour" or member.sigma.key() in held:
+            continue
+        # Path (i) only: exact equality with the cached five-hour baseline.
+        if (cache.five_window is not None and member.sigma.window == cache.five_window
+                and cache.five_accounted_percent is not None
+                and member.sigma.percent == cache.five_accounted_percent):
+            return True
+    if cache.accounted is None:
+        return False
+    for member in known:
+        if (member.sigma.axis != "sevenDay" or member.sigma.window != cache.window
+                or member.sigma.key() in held):
+            continue
+        if member.sigma.percent == cache.accounted.percent:
+            return True
+        if not cache.samples_covered:
+            continue
+        bound = _lib_stale_proof.floor_microsecond(member.sigma.activity_at_utc)
+        if cache.samples_after is None or bound is None or cache.samples_after > bound:
+            return True
+        if _lib_stale_proof.earn_receipts(
+                [member], cache.accounted, cache.samples,
+                completed_at_utc="1970-01-01T00:00:00.000000Z",
+                index_identity="render"):
+            return True
+    return False
+
+
+def _stale_scope(account_key: str, candidates, transition) -> tuple:
+    """``(samples_after, receipts_held)`` for one partition's detached work
+    (`_STALE_SCOPE`): the earliest instant any member of its logged and
+    current evaluations, or any receipt it holds, needs a sample after."""
+    import _lib_stale_proof
+
+    instants = [r.sigma.activity_at_utc
+                for r in (() if transition is None else transition.receipts)]
+    sets = [candidates]
+    try:
+        sets.extend(e.members for e in _intake_evaluations(
+            account_key, after=_acknowledged_through(transition)))
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    for members in sets:
+        instants.extend(m.sigma.activity_at_utc for m in _all_members(members))
+    bounds = [b for b in (_lib_stale_proof.floor_microsecond(i) for i in instants)
+              if b is not None]
+    return (min(bounds) if bounds else None,
+            bool(transition is not None and transition.receipts))
+
+
+def _plan_members(account_key: str, plan: dict) -> tuple:
+    """The members of a frozen plan's own intake evaluation, or () when it
+    cannot be read back (nothing is then earned from it)."""
+    sequence = int(plan["intakeSequence"])
+    try:
+        evaluations = list(_intake_evaluations(
+            account_key, after=sequence - 1, through=sequence))
+    except (OSError, _candidates.StateValidationError, ValueError, TypeError, KeyError):
+        return ()
+    if len(evaluations) != 1 or evaluations[0].sequence != sequence:
+        return ()
+    return tuple(evaluations[0].members)
+
+
+def _plan_winner_refused(plan: dict, member_facts) -> bool:
+    """Whether a frozen plan's candidate provenance names a member the
+    current facts refuse on that axis (#797 spec 4.4, T4)."""
+    refused = _refused_tokens(member_facts)
+    for axis, source in (plan.get("provenance") or {}).items():
+        if (isinstance(source, dict) and source.get("kind") == "candidate"
+                and source.get("token") in refused.get(axis, ())):
+            return True
+    return False
 
 
 def _plan_record_args(plan: dict) -> argparse.Namespace:
@@ -3709,7 +4539,8 @@ def _publication_superseded(plan: dict, *, account_key: str, now_epoch: int,
 
 
 def _commit_publication(transition: _Transition, plan: dict, *, before, classified,
-                        now_epoch: int, refreshed_control=None) -> _Transition:
+                        now_epoch: int, refreshed_control=None,
+                        members=None) -> _Transition:
     """Acknowledge one publication (#825/#832 spec 4.3 revision 2, Codex
     design-fix-round-3 Q4): replace the partition's transition with the
     committed control, read from ``classified`` — a covered classification
@@ -3717,8 +4548,17 @@ def _commit_publication(transition: _Transition, plan: dict, *, before, classifi
     advance the intake checkpoint past the plan's evaluation in the SAME
     atomic write. Nothing else is evidence of completion: not the record
     kernel's exit code, not an opportunistic ``ran=False``, not the raw
-    observation alone."""
+    observation alone.
+
+    #797 spec 4.4 (D7b q3): this is the publication's completion, so the
+    receipts its evaluation's ``members`` earn (read back from the plan's
+    intake evaluation when not given) are installed in the same write, merged
+    into the CURRENT receipt map revalidated against ``classified`` — never a
+    map restored from when the plan was frozen."""
     after = classified.projection
+    if members is None:
+        members = _plan_members(transition.account_key, plan)
+    receipts, stale_cache = _completion_receipts(transition, classified, members)
     if refreshed_control is None:
         control = _candidates.validate_control_document(plan["control"], now_epoch=now_epoch)
         refreshed_control = dataclasses.replace(control, db_projection=after)
@@ -3729,7 +4569,10 @@ def _commit_publication(transition: _Transition, plan: dict, *, before, classifi
         binding=transition.binding, projection=after,
         control=refreshed_control, publication=None,
         acknowledged=max(transition.intake_acknowledged, plan["intakeSequence"]),
-        coverage=_coverage_document(classified))
+        coverage=_coverage_document(classified), receipts=receipts,
+        stale_cache=stale_cache)
+    committed = _fit_transition(committed, prior=transition.receipts,
+                                referenced=_referenced_tokens(committed, members))
     _write_transition(committed)
     _crash_point("after-checkpoint")
     if before is None or _projection_changed(before, after):
@@ -3884,9 +4727,22 @@ def _resolve_frozen_publication(transition: _Transition, *, now_epoch: int, nudg
     except _Unclassifiable as exc:
         return _Resolution(transition, None, "deferred",
                            _blocked(account_key, "deferred", exc))
+    # #797 spec 4.4 (T4): an unappended plan's dependencies are revalidated
+    # before publication. A plan whose selected contributor the current facts
+    # refuse is dropped like a superseded plan, earning nothing, and its
+    # evaluation, still unacknowledged, is reduced again with those facts.
+    facts = _stale_member_facts(classified.stale, transition.receipts,
+                                _plan_members(account_key, plan))
+    if _plan_winner_refused(plan, facts):
+        dropped = _replace_transition(
+            transition, account_key=account_key, binding=transition.binding,
+            projection=before, publication=None)
+        _write_transition(dropped)
+        return _Resolution(dropped, classified, "superseded")
+    refused = _refused_tokens(facts)
     authority = _plan_drop_authority(
         plan, classified.projection,
-        receipts=lambda: _plan_axis_receipts(account_key, plan))
+        receipts=lambda: _plan_axis_receipts(account_key, plan, refused=refused))
     if authority == _PLAN_STALE:
         # Spec 4.3 revision 6 (*Floor retired*, *Stale expired window*):
         # every reading the plan publishes on some axis is older than that
@@ -3950,11 +4806,15 @@ _PLAN_UNKNOWN = "unknown"
 _PLAN_STALE = "stale"
 
 
-def _plan_axis_receipts(account_key: str, plan: dict) -> "dict | None":
+def _plan_axis_receipts(account_key: str, plan: dict, *,
+                        refused=None) -> "dict | None":
     """Per axis, the (window, percent, receipt instant) of every member of
     the plan's own intake evaluation (fix round K14c): what a floor-retired
     window needs to decide whether the plan's reading was captured at or
-    after the floor. None when the evaluation cannot be read back."""
+    after the floor. None when the evaluation cannot be read back. A member
+    ``refused`` (axis to tokens, #797 spec 4.4) on an axis is excluded from
+    that axis's post-floor set, exactly as `CLASS_FLOOR` excludes it."""
+    refused = refused or {}
     sequence = int(plan["intakeSequence"])
     try:
         evaluations = list(_intake_evaluations(
@@ -3967,7 +4827,7 @@ def _plan_axis_receipts(account_key: str, plan: dict) -> "dict | None":
     for member in evaluations[0].members:
         for axis in _candidates.AXES:
             value = _candidates._candidate_axis(member, axis)
-            if value is not None:
+            if value is not None and member.token not in refused.get(axis, ()):
                 receipts[axis].append(
                     (value.canonical_key, value.raw_resets_at, value.percent,
                      int(member.received_at)))
@@ -4120,7 +4980,7 @@ def _later_reading_fence(axis: str, tombstone, db_axis, *, at: int,
 
 def _reduce_partition(account_key, candidates, transition, *, now_epoch, projection,
                       drop_consensus_allowed=True, fence_epoch=None,
-                      same_second_later=frozenset()):
+                      same_second_later=frozenset(), member_facts=None):
     """One partition's pure transition: (decision, anchor, canonical
     candidates, tombstones). Only this account's candidates, control,
     anchor and fences are inputs. ``now_epoch`` is the reduction instant (a
@@ -4129,7 +4989,9 @@ def _reduce_partition(account_key, candidates, transition, *, now_epoch, project
     still a fence for it. ``same_second_later`` names the axes whose
     projected reading shares the instant and was accepted after this
     evaluation (`_later_reading_fence`); only the detached reducer, which
-    can read the journal, ever supplies it."""
+    can read the journal, ever supplies it. ``member_facts`` are the
+    per-axis refusal facts (#797 spec 4.4); only the detached reducer, which
+    reads the provider samples, ever supplies them."""
     control = (
         _candidates.ControlState(projection, transition.control.pending_drops)
         if transition is not None else _empty_control(projection)
@@ -4150,7 +5012,7 @@ def _reduce_partition(account_key, candidates, transition, *, now_epoch, project
     decision = _candidates.reduce_candidates(
         active, db=projection, control=control, tombstones=tombstones,
         now_epoch=now_epoch, account_key=account_key,
-        drop_consensus_allowed=drop_consensus_allowed)
+        drop_consensus_allowed=drop_consensus_allowed, member_facts=member_facts)
     return decision, anchor, active, tombstones
 
 
@@ -4432,6 +5294,9 @@ class _Classified:
     #: projection (`_coverage_document`, P1-2 cycle 3).
     extents: tuple = ()
     render_valid: "tuple | None" = None
+    #: #797 spec 4.4: the stale-contributor inputs read in the same snapshot
+    #: (`_StaleInputs`), or None when they were not read.
+    stale: "_StaleInputs | None" = None
 
     def serves(self, at: int) -> bool:
         """Whether this classification is exactly the one an evaluation at
@@ -4525,8 +5390,9 @@ def _classify(account_key: str, frontier: "_PublicationFrontier | None", *,
             # (K11R-8): only the file fingerprint; the dependency tokens
             # are read only if a wait is installed (`_settle_wait`).
             _CLASSIFIED_FINGERPRINTS[account_key] = before
+            stale: list = []
             projection, valid, render_valid = _read_db_projection_at(
-                account_key=account_key, at=at)
+                account_key=account_key, at=at, stale=stale)
             checked = _covered_drop_status(account_key, frontier)
             after = _db_file_fingerprint()
         except _cctally().StatsRebuildDeferred:
@@ -4545,7 +5411,8 @@ def _classify(account_key: str, frontier: "_PublicationFrontier | None", *,
         status, high_water, extents = checked
         return _Classified(dataclasses.replace(projection, db_files=after),
                            status, high_water, int(at), valid,
-                           extents=tuple(extents), render_valid=render_valid)
+                           extents=tuple(extents), render_valid=render_valid,
+                           stale=stale[0] if stale else None)
     raise _Unclassifiable("coverage", blocks)
 
 
@@ -4593,7 +5460,7 @@ def _bound_append_kwargs(bound) -> dict:
 
 def _gated_reduction(account_key, candidates, transition, *, eval_epoch,
                      fence_epoch, classified: _Classified, frontier=None,
-                     same_second_later=frozenset()):
+                     same_second_later=frozenset(), member_facts=None):
     """Reduce once with drop consensus open and once closed, against the
     classified projection. Only when they differ — a drop below the baseline
     would publish — is the quarantine gate consulted, so the ordinary tick
@@ -4603,12 +5470,14 @@ def _gated_reduction(account_key, candidates, transition, *, eval_epoch,
     opened = _reduce_partition(account_key, candidates, transition,
                                now_epoch=eval_epoch, fence_epoch=fence_epoch,
                                projection=classified.projection,
-                               same_second_later=same_second_later)
+                               same_second_later=same_second_later,
+                               member_facts=member_facts)
     closed = _reduce_partition(account_key, candidates, transition,
                                now_epoch=eval_epoch, fence_epoch=fence_epoch,
                                projection=classified.projection,
                                drop_consensus_allowed=False,
-                               same_second_later=same_second_later)
+                               same_second_later=same_second_later,
+                               member_facts=member_facts)
     # Fix round K13 (review cycle 7 finding P1-2): unknown classification
     # defers the whole evaluation whatever the gate says — an open gate is
     # no classification evidence (spec 4.3 *Classification evidence*).
@@ -4714,11 +5583,15 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
         axis for axis, order in orders.items() if order == _ORDER_LATER)
     unknown = frozenset(
         axis for axis, order in orders.items() if order == _ORDER_UNKNOWN)
+    # #797 spec 4.4: the refusal facts, resolved before the pure kernel from
+    # this classification's snapshot and the transition's receipts.
+    facts = _stale_member_facts(
+        classified.stale, () if transition is None else transition.receipts, members)
     (decision, anchor, active, tombstones), withheld, unestablished = (
         _gated_reduction(
             account_key, members, transition, eval_epoch=evaluation.at,
             fence_epoch=fence_epoch, classified=classified, frontier=frontier,
-            same_second_later=same_second_later | unknown))
+            same_second_later=same_second_later | unknown, member_facts=facts))
     if unknown:
         # Fix round K6 (825-832-CD6-V01): an order that cannot be established
         # is neither later nor earlier. When the reduction is the same either
@@ -4730,7 +5603,7 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
         unfenced, unfenced_withheld, unfenced_unestablished = _gated_reduction(
             account_key, members, transition, eval_epoch=evaluation.at,
             fence_epoch=fence_epoch, classified=classified, frontier=frontier,
-            same_second_later=same_second_later)
+            same_second_later=same_second_later, member_facts=facts)
         if (unfenced[0] != decision or unfenced_withheld != withheld
                 or unfenced_unestablished != unestablished):
             return _Resolution(transition, classified, "deferred", AccountResult(
@@ -4783,15 +5656,44 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
     if decision.action == "PUBLISH_DB":
         plan = _bound_publication_plan(
             decision, projection, active, binding, generation=generation + 1,
-            now_epoch=evaluation.at, intake_sequence=evaluation.sequence)
+            now_epoch=evaluation.at, intake_sequence=evaluation.sequence,
+            refused=_refused_tokens(facts))
     if plan is None:
         if decision.action == "NOOP" and control_repair_required:
             decision = dataclasses.replace(decision, action="WRITE_CONTROL")
-        updated = _replace_transition(
+        # #797 spec 4.4 (D7a-D7c): a covered detached evaluation that
+        # publishes nothing is a completion — its receipts are earned and
+        # installed in the same atomic write as its control and checkpoint.
+        receipts, stale_cache = _completion_receipts(transition, classified, members)
+        updated = _fit_transition(_replace_transition(
             transition, account_key=account_key, binding=binding,
             projection=projection, control=decision.control, anchor=anchor,
             quarantine=quarantine, acknowledged=acknowledged,
-            coverage=_coverage_document(classified))
+            coverage=_coverage_document(classified), receipts=receipts,
+            stale_cache=stale_cache),
+            prior=() if transition is None else transition.receipts,
+            referenced=_referenced_tokens(transition, members))
+        if (transition is not None
+                and _refusal_authority_lost(classified, facts, updated.receipts,
+                                            members)):
+            # Review RV-4 (spec 4.4: dependencies of outstanding work are
+            # retained or their refusal authority is invalidated and the
+            # work re-reduced). The document limit's last resort evicted a
+            # receipt this very reduction refused a member on. That refusal
+            # has nothing left to rest on, so the evaluation is not
+            # acknowledged with it: the fitted receipts are installed with
+            # the checkpoint left below this evaluation (a crash leaves it
+            # unacknowledged, for the next pass) and it is reduced again
+            # now, the evicted member eligible. Each round evicts at least
+            # one of the receipts it started from, so this terminates.
+            invalidated = _replace_transition(
+                transition, account_key=account_key, binding=transition.binding,
+                projection=transition.control.db_projection,
+                receipts=updated.receipts)
+            _write_transition(invalidated)
+            return _reduce_evaluation(
+                account_key, evaluation, invalidated, classified=classified,
+                fence_epoch=fence_epoch, nudge_sink=nudge_sink, frontier=frontier)
         _write_transition(updated)
         _crash_point("after-checkpoint")
         return _Resolution(updated, classified, "noop", decision=decision)
@@ -4820,7 +5722,7 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
                 active, db=after, control=decision.control,
                 tombstones=tombstones, now_epoch=evaluation.at,
                 account_key=account_key,
-                drop_consensus_allowed=not withheld).control
+                drop_consensus_allowed=not withheld, member_facts=facts).control
         # The record kernel can deliberately leave the DB unchanged: the
         # first zero arms its own debounce and unsupported small drops are HWM
         # rejected. Preserve the precomputed bounded attempt state so the next
@@ -4856,6 +5758,27 @@ def _reduce_and_publish_partition(account_key, candidates, transition, *,
                                   frontier: "_PublicationFrontier | None" = None,
                                   drained: "dict | None" = None,
                                   ) -> AccountResult:
+    """`_reduce_and_publish_partition_work` under this partition's #797
+    stale scope (`_STALE_SCOPE`): which provider samples its
+    classifications read for the refusal facts and receipts."""
+    try:
+        scope = _stale_scope(account_key, candidates, transition)
+    except (OSError, ValueError, TypeError, KeyError):
+        scope = (None, bool(transition is not None and transition.receipts))
+    token = _STALE_SCOPE.set(scope)
+    try:
+        return _reduce_and_publish_partition_work(
+            account_key, candidates, transition, now_epoch=now_epoch,
+            nudge_sink=nudge_sink, frontier=frontier, drained=drained)
+    finally:
+        _STALE_SCOPE.reset(token)
+
+
+def _reduce_and_publish_partition_work(account_key, candidates, transition, *,
+                                       now_epoch: int, nudge_sink,
+                                       frontier: "_PublicationFrontier | None" = None,
+                                       drained: "dict | None" = None,
+                                       ) -> AccountResult:
     """One partition's ordered work (#825/#832 spec 4.3 revision 2, Codex
     design-fix-round-3 Q3):
 
@@ -5231,10 +6154,15 @@ def _rescan_legacy_spool() -> bool:
     import _lib_account_protocol
     import _lib_legacy_spool
 
-    if _cctally_journal.find_account_bound_cutover() is None:
+    cutover = _cctally_journal.find_account_bound_cutover()
+    if cutover is None:
         return False
     try:
-        state = _cctally_journal.capture_legacy_spool_state()
+        # #797/#823/#840 spec 4.6 B4: the v1 coordination state joins the
+        # inventory at the revision-2 boundary, never before it, so a store
+        # whose revision is not yet established compares like for like.
+        state = _cctally_journal.capture_legacy_spool_state(
+            include_v1=cutover.revision is not None)
     except _cctally_journal.LegacySpoolInventoryIncomplete as failure:
         return _cctally_journal.record_legacy_spool_inventory_incomplete(
             failure) is not None
@@ -6804,6 +7732,10 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
             # publishes a proven-empty or new-window reading, retains an
             # unknown one.
             return False
+        if _receipt_work(transition, evaluation.members):
+            # #797 spec 4.4 (D7c q3): a NOOP that leaves receipt work for
+            # either earning path is the detached reducer's to complete.
+            return False
         last = evaluation.sequence
     if last is None:
         return True
@@ -6812,7 +7744,7 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
     _write_transition(_replace_transition(
         transition, account_key=account_key, binding=transition.binding,
         projection=transition.control.db_projection, control=transition.control,
-        acknowledged=last, coverage=proof))
+        acknowledged=last, coverage=proof, stale_cache=transition.stale_cache))
     _crash_point("after-render-acknowledgement")
     _intake_compact(account_key, last)
     return True
@@ -6906,6 +7838,11 @@ def _preliminary_decision() -> "_candidates.ReductionDecision | None":
             # Fix round K13 (review cycle 7 P1-2): a reading the checkpointed
             # projection cannot classify is the detached reducer's to
             # classify, under either gate (C4: the render reads no index).
+            return fork
+        if _receipt_work(transition, active):
+            # #797 spec 4.4 (D7c q3): the NOOP leaves receipt work, so the
+            # preliminary NOOP exit must not swallow it: the detached reducer
+            # completes the evaluation and earns.
             return fork
     return None
 

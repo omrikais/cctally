@@ -1475,6 +1475,31 @@ def _spawn_detached(command: str) -> bool:
         return False
 
 
+def _spawn_detached_with_pid(
+    command: str, *, env: "dict | None" = None,
+) -> "int | None":
+    """`_spawn_detached`'s launch shape, returning the child's pid.
+
+    The detached stats rebuild workers (#997 D8) record each launch's pid and
+    start identity and hand the child its launch id through ``env``, so they
+    need the pid that `_spawn_detached`'s bool contract (kept for its other
+    callers) does not carry. ``None`` when the spawn raised.
+    """
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.realpath(sys.argv[0]), command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    except Exception:
+        return None
+    return proc.pid
+
+
 def _spawn_background_update_check() -> None:
     """Fire-and-forget the hidden ``_update-check`` worker (spec §3.6)."""
     _spawn_detached("_update-check")

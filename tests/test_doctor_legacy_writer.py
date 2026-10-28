@@ -299,6 +299,62 @@ def test_doctor_warns_from_the_sidecar_when_the_index_is_not_current(
     assert "1 record(s)" in leg.summary
 
 
+def test_the_upgrade_to_the_v2_directory_keeps_the_evidence_age(
+        ns, monkeypatch):
+    """Review RV-5 (#797/#823/#840): the sidecar moved from
+    `statusline-account-bound-v1/` to `-v2/`. An upgraded store whose v1
+    evidence names the same excluded population keeps its first-observed
+    instant — a rebuild over unchanged evidence does not restart the age —
+    read from v1 only, never writing, renaming or deleting anything there."""
+    import _cctally_doctor
+    import _cctally_journal as jr
+    import _lib_doctor
+    import _lib_journal as J
+    clock = {"now": T0}
+    monkeypatch.setattr(jr, "_evidence_now", lambda: clock["now"])
+    jr.append_record(J.make_obs(at="2026-10-09T09:00:00Z", src="statusline",
+                                provider="claude",
+                                payload={"weekly_percent": 1.0}))
+    jr.run_stats_ingest(mode="authoritative")
+    jr.ensure_account_bound_cutover()
+    seg = jr.journal_high_water()[0]
+    _raw_append(seg, [_legacy_obs(J, "2026-10-09T10:00:00Z", 70.0)])
+    jr.run_stats_ingest(mode="authoritative")
+    first = _sidecar()
+    assert first["firstObservedAt"] == T0.isoformat(timespec="seconds")
+    # The previous release kept it under v1; the v2 directory starts without it.
+    v1 = _cctally_core.STATUSLINE_ACCOUNT_BOUND_V1_DIR
+    v1.mkdir(parents=True, exist_ok=True)
+    (v1 / "legacy-writer-evidence.json").write_text(json.dumps(first))
+    _cctally_core.LEGACY_WRITER_EVIDENCE_PATH.unlink()
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+              for p in sorted(v1.rglob("*")) if p.is_file()}
+
+    clock["now"] = T0 + dt.timedelta(days=8)
+    # Doctor before anything rewrites v2 reports the continuing age.
+    data = _cctally_doctor._gather_legacy_writer(None, None)
+    leg = _lib_doctor._check_journal_legacy_writer(
+        _state(now_utc=clock["now"], legacy_writer=data))
+    assert leg.severity == "ok" and leg.details["state"] == "quiet", leg
+    # The rebuild over unchanged evidence carries the first observation.
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    assert _sidecar() == first
+    data = _cctally_doctor._gather_legacy_writer(None, None)
+    leg = _lib_doctor._check_journal_legacy_writer(
+        _state(now_utc=clock["now"], legacy_writer=data))
+    assert leg.severity == "ok" and leg.details["state"] == "quiet", leg
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in sorted(v1.rglob("*")) if p.is_file()} == before
+
+    # A different v1 population is not this one: first observed now.
+    _cctally_core.LEGACY_WRITER_EVIDENCE_PATH.unlink()
+    other = dict(first, excludedCount=first["excludedCount"] + 5)
+    (v1 / "legacy-writer-evidence.json").write_text(json.dumps(other))
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    assert _sidecar()["firstObservedAt"] == clock["now"].isoformat(
+        timespec="seconds")
+
+
 # --------------------------------------------------------------------------
 # #825/#832 spec revision 5 (section 8): an incomplete legacy spool inventory
 # --------------------------------------------------------------------------

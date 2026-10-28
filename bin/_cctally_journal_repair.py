@@ -75,7 +75,7 @@ def _read_prefix(high_water):
     malformed = 0
     prior_high_water = None
     cutover_captured = _journal._CUTOVER_UNSEEN
-    hasher = _lib_journal_router.PrefixHashAccumulator()
+    hasher = _journal._new_prefix_hasher()
     # #825/#832 (spec 5.3): admission is resolved within this one pass and
     # applied after it, before selection or normalization. An excluded record
     # — an old process's repair acknowledgement or correction batch included —
@@ -87,7 +87,8 @@ def _read_prefix(high_water):
         None,
         high_water,
         segments,
-        on_segment=lambda name: hasher.begin_segment(name, prior_high_water),
+        on_segment=lambda name, size: hasher.begin_segment(
+            name, prior_high_water, size=size),
         on_bytes=hasher.extend,
     ):
         record = _lib_journal.decode_line(raw)
@@ -122,11 +123,12 @@ def _read_prefix(high_water):
         coordinates.append((segment, offset))
         prior_high_water = record_end
     prefix_hash = hasher.digest_at(high_water)
-    # The accumulator buffers the segment it is reading — 410 MB on the
-    # maintainer's journal — so it is dropped the moment its pass ends, before
-    # the normalization loop below, exactly as `rebuild_stats_index` drops it.
-    # It is dropped before the raise too, so a malformed prefix does not pin the
-    # buffer on the traceback while the exception unwinds.
+    # The accumulator streams its hash and retains no segment bytes (#997
+    # D12), but it still holds hash states, its registered boundaries and the
+    # segment opener, and nothing after the pass needs them. It is dropped the
+    # moment its pass ends, before the normalization loop below, exactly as
+    # `rebuild_stats_index` drops it, and before the raise too, so a malformed
+    # prefix does not pin it on the traceback while the exception unwinds.
     hasher = None
     if malformed:
         raise _lib_journal.JournalProtocolError(

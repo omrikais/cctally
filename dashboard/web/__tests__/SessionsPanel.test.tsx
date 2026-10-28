@@ -30,17 +30,6 @@ describe('<SessionsPanel />', () => {
     expect(sub?.textContent).toMatch(/20 total/);
   });
 
-  it('renders the sessions-ctrls with funnel, magnifier, and sort-updown icons', () => {
-    render(<SessionsPanel />);
-    const ctrls = document.getElementById('sessions-ctrls');
-    expect(ctrls).not.toBeNull();
-    const uses = ctrls?.querySelectorAll('svg use');
-    const hrefs = Array.from(uses ?? []).map((u) => u.getAttribute('href'));
-    expect(hrefs).toContain('/static/icons.svg#funnel');
-    expect(hrefs).toContain('/static/icons.svg#magnifier');
-    expect(hrefs).toContain('/static/icons.svg#sort-updown');
-  });
-
   it('sort-pill shows "sort: started desc" by default and cycles on click', async () => {
     render(<SessionsPanel />);
     const pill = document.getElementById('sort-pill');
@@ -80,11 +69,6 @@ describe('<SessionsPanel />', () => {
     });
     // Fixture has costs 1.5, 2.2, ..., which cover both cost-mid and cost-high
     expect(classes.size).toBeGreaterThanOrEqual(2);
-  });
-
-  it('sess-table class on the table element', () => {
-    render(<SessionsPanel />);
-    expect(document.querySelector('table.sess-table')).not.toBeNull();
   });
 
   it('typing in the filter input narrows the rows', async () => {

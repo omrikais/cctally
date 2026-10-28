@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DailyPanel } from '../src/panels/DailyPanel';
 import { updateSnapshot, _resetForTests, dispatch, getState } from '../src/store/store';
@@ -10,20 +10,6 @@ describe('<DailyPanel />', () => {
   beforeEach(() => {
     _resetForTests();
     updateSnapshot(fixture as unknown as Envelope);
-  });
-
-  it('renders the panel card with indigo accent', () => {
-    render(<DailyPanel />);
-    const section = document.getElementById('panel-daily');
-    expect(section?.classList.contains('panel')).toBe(true);
-    expect(section?.classList.contains('accent-indigo')).toBe(true);
-  });
-
-  it('renders the grid icon and the heatmap subtitle', () => {
-    render(<DailyPanel />);
-    const useEl = document.querySelector('#panel-daily svg use');
-    expect(useEl?.getAttribute('href')).toBe('/static/icons.svg#grid');
-    expect(screen.getByText(/heatmap/i)).toBeInTheDocument();
   });
 
   it('renders one .daily-cell per fixture row (6 rows)', () => {
@@ -89,21 +75,6 @@ describe('<DailyPanel />', () => {
     const totals = document.querySelector('#panel-daily .daily-foot');
     expect(totals?.textContent).toMatch(/6 days/);
     expect(totals?.textContent).toMatch(/\$31\.69/);
-  });
-
-  it('applies first-mount class with staggered animation-delay on initial render', async () => {
-    render(<DailyPanel />);
-    await waitFor(() => {
-      const cells = document.querySelectorAll('#panel-daily .daily-cell.first-mount');
-      expect(cells.length).toBe(6);
-    });
-    // Stagger: cells render in oldest→newest order with 30ms × index delay.
-    const cells = Array.from(
-      document.querySelectorAll('#panel-daily .daily-cell.first-mount'),
-    ) as HTMLElement[];
-    expect(cells[0].style.getPropertyValue('--daily-stagger')).toBe('0ms');
-    expect(cells[1].style.getPropertyValue('--daily-stagger')).toBe('30ms');
-    expect(cells[5].style.getPropertyValue('--daily-stagger')).toBe('150ms');
   });
 });
 

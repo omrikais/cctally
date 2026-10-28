@@ -328,6 +328,48 @@ def _recovered(app, monkeypatch):
     assert not T.account_quarantined(app, "A")
 
 
+def _arm_then_confirm(app, monkeypatch, *, rebuild_between):
+    """After certified recovery, arm a genuine same-source five-hour 70->20
+    descent in a fresh window, optionally run a real `db rebuild`, then
+    observe 20 again. Returns the outcomes when armed and at the end."""
+    _recovered(app, monkeypatch)
+    base = T.epoch("2026-10-12T19:00:00Z")
+    five_end = T.iso(base + 4 * 3600)
+    T.run_steps(app, monkeypatch, [
+        cur(T.iso(base), 80, five=70, five_end=five_end),
+        cur(T.iso(base + 60), 80, five=20, five_end=five_end),
+    ])
+    armed = T.outcomes(app)
+    if rebuild_between:
+        T.rebuild(app)
+    T.run_steps(app, monkeypatch, [
+        cur(T.iso(base + 120), 80, five=20, five_end=five_end)])
+    return armed, T.outcomes(app)
+
+
+def test_a_rebuild_between_arm_and_confirm_mints_no_credit_after_recovery(
+        app, monkeypatch, tmp_path):
+    """Detects a rebuild that carries the disposable five-hour confirmation
+    state across (#751b; the F17 oracle's arm-rebuild-confirm schedule,
+    extracted): the confirmation state is not journaled, so a rebuild drops
+    it and a credit armed before the rebuild cannot be confirmed after it
+    (the admitted cold-start gap). Carrying it across mints a credit no
+    rebuilt index can reproduce, so a second rebuild would remove it again.
+    The uninterrupted control over the same readings mints exactly one more
+    credit, so the withheld one is real."""
+    armed, after = _arm_then_confirm(app, monkeypatch, rebuild_between=True)
+    assert after == armed, ("a credit crossed the rebuild", armed, after)
+    # The uninterrupted control, in its own store (built last: building it
+    # re-points the module paths).
+    control = T.make_app(monkeypatch, tmp_path / "uninterrupted")
+    control_armed, control_after = _arm_then_confirm(
+        control, monkeypatch, rebuild_between=False)
+    assert control_armed == armed
+    assert len(control_after["five_hour"]) == len(armed["five_hour"]) + 1, (
+        control_armed, control_after)
+    assert T.outcome_count(control_after) == T.outcome_count(armed) + 1
+
+
 def test_d_a_backdated_weekly_reading_revokes(app, monkeypatch):
     _recovered(app, monkeypatch)
     # Weekly ingress admits resets up to 30 days in the past.

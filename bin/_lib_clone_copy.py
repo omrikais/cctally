@@ -12,6 +12,9 @@ for:
   existing destination is overwritten in place (same inode), which a clone
   cannot do, so that case is a real copy. Metadata is ``shutil.copystat``'s,
   applied after the clone as after a copy.
+- :func:`try_clone` is the clone alone: True when `dst` was created as a
+  clone, False (nothing created) when the platform or filesystem refuses, so
+  a caller can choose where its real copy goes (#997 D13).
 - :func:`copytree` is ``shutil.copytree`` with :func:`copy2` as its file
   copier, so symlink policy, ignore lists, dangling-link errors and
   destination collisions are the stdlib's own code.
@@ -26,11 +29,10 @@ The optional ``counts`` mapping is incremented under ``"clone"`` or
 ``"copy"`` per file, so a caller or a measurement can see which path ran.
 This module is public and imports nothing outside the standard library.
 
-It binds ``fclonefileat`` itself rather than importing the binding in
-``bin/_lib_remote_staging.py`` (#940 D-2 F17): that module is private, so it
-is absent from the public tree that this module and its public callers ship
-in, and a public module may not import it. The staging module may import
-from this one instead (spec §6.7).
+It binds ``fclonefileat`` itself rather than importing the binding from the
+retired private staging module (#940 D-2 F17): a private module is absent
+from the public tree that this module and its public callers ship in, and a
+public module may not import it.
 """
 
 from __future__ import annotations
@@ -85,6 +87,43 @@ def _clone_fd(source_fd: int, destination: str) -> None:
         raise OSError(code, os.strerror(code), destination)
 
 
+def _clone_open_file(fd: int, src, dst, *, follow_symlinks: bool = True) -> bool:
+    """Clone the open regular file `fd` (opened from `src`) to the new path
+    `dst` and apply `src`'s metadata. False, with nothing created, when the
+    filesystem or the pair of volumes refuses the clone (`_FALLBACK_ERRNOS`);
+    any other error propagates."""
+    try:
+        _clone_fd(fd, dst)
+    except OSError as exc:
+        if exc.errno not in _FALLBACK_ERRNOS:
+            raise
+        return False
+    shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
+    return True
+
+
+def try_clone(src, dst) -> bool:
+    """Clone the regular file `src` to the NEW path `dst` (#997 D13).
+
+    True: `dst` is a clone sharing `src`'s blocks, with ``shutil.copystat``
+    metadata applied. False, with `dst` not created: the platform is not
+    Darwin (or has no ``fclonefileat``), `src` is not a regular file, or the
+    filesystem refused with a fallback errno (an unsupported filesystem, a
+    cross-volume destination, an existing `dst`). Any other error, including
+    a `src` that cannot be opened, propagates. A caller that needs a copy
+    either way makes the real copy itself on False.
+    """
+    if _fclonefileat() is None:
+        return False
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        return _clone_open_file(fd, src, dst)
+    finally:
+        os.close(fd)
+
+
 def _count(counts, method: str) -> None:
     if counts is not None:
         counts[method] = counts.get(method, 0) + 1
@@ -113,15 +152,11 @@ def copy2(src, dst, *, follow_symlinks: bool = True, counts=None):
             os.close(fd)
             fd = -1
             return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
-        try:
-            _clone_fd(fd, dst)
-        except OSError as exc:
-            if exc.errno not in _FALLBACK_ERRNOS:
-                raise
+        if not _clone_open_file(fd, src, dst,
+                                follow_symlinks=follow_symlinks):
             result = shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
             _count(counts, "copy")
             return result
-        shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
         _count(counts, "clone")
         return dst
     finally:

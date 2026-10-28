@@ -1,0 +1,7 @@
+# Spawned at runtime — never commit.
+*.db
+*.db-wal
+*.db-shm
+*.lock
+config.json.lock
+oauth-token

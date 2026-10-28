@@ -161,7 +161,50 @@ describe('Doctor chip reconcile (DOC-2)', () => {
     expect(getState().doctor).toEqual({
       severity: 'fail', counts: { ok: 20, warn: 5, fail: 1 },
       generated_at: '2026-07-02T10:05:00Z', fingerprint: 'client-reconcile',
+      rebuild_worker: null,
     });
+  });
+  // #997 D10: the reconcile must carry the db.rebuild_worker sentence, or
+  // opening the modal strips it from the chip until the next SSE tick.
+  const reportWithRebuildWorker = (severity: 'ok' | 'warn' | 'fail') => ({
+    schema_version: 1, generated_at: '2026-07-02T10:05:00Z', cctally_version: 'x',
+    overall: { severity: 'warn' as const, counts: { ok: 20, warn: 1, fail: 0 } },
+    categories: [{
+      id: 'db', title: 'Database', severity, checks: [{
+        id: 'db.rebuild_worker', title: 'Rebuild worker', severity,
+        summary: 'the last stats.db upgrade rebuild died without finishing', details: {},
+      }],
+    }],
+  });
+  it('carries a not-ok db.rebuild_worker check into the reconciled slice', () => {
+    dispatch({
+      type: 'SET_DOCTOR_AGGREGATE',
+      doctor: {
+        severity: 'warn', counts: { ok: 20, warn: 1, fail: 0 }, generated_at: '2026-07-02T10:00:00Z', fingerprint: 'sha1:x',
+        rebuild_worker: { severity: 'warn', summary: 'the last stats.db upgrade rebuild died without finishing' },
+      },
+    });
+    dispatch({ type: 'OPEN_DOCTOR_MODAL' });
+    mockDoctorReport = reportWithRebuildWorker('warn');
+    render(<DoctorModal />);
+    expect(getState().doctor?.fingerprint).toBe('client-reconcile');
+    expect(getState().doctor?.rebuild_worker).toEqual({
+      severity: 'warn', summary: 'the last stats.db upgrade rebuild died without finishing',
+    });
+  });
+  it('reconciles an ok db.rebuild_worker check to null', () => {
+    dispatch({
+      type: 'SET_DOCTOR_AGGREGATE',
+      doctor: {
+        severity: 'warn', counts: { ok: 20, warn: 1, fail: 0 }, generated_at: '2026-07-02T10:00:00Z', fingerprint: 'sha1:x',
+        rebuild_worker: { severity: 'warn', summary: 'the last stats.db upgrade rebuild died without finishing' },
+      },
+    });
+    dispatch({ type: 'OPEN_DOCTOR_MODAL' });
+    mockDoctorReport = reportWithRebuildWorker('ok');
+    render(<DoctorModal />);
+    expect(getState().doctor?.fingerprint).toBe('client-reconcile');
+    expect(getState().doctor?.rebuild_worker).toBeNull();
   });
   it('does not dispatch when the report is older-or-equal to the slice', () => {
     dispatch({

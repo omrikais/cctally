@@ -1079,6 +1079,18 @@ def alerted_at_order_key(value: object) -> str:
     return _parse_alerted_at(value).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _alerted_at_fraction_digits_sql(column: str) -> str:
+    """Every digit after the seconds' ``.``, up to the zone designator."""
+    tail = f"substr({column}, 21)"
+    return (
+        f"substr({tail}, 1, CASE "
+        f"WHEN instr({tail}, 'Z') > 0 THEN instr({tail}, 'Z') - 1 "
+        f"WHEN instr({tail}, '+') > 0 THEN instr({tail}, '+') - 1 "
+        f"WHEN instr({tail}, '-') > 0 THEN instr({tail}, '-') - 1 "
+        f"ELSE length({tail}) END)"
+    )
+
+
 def _alerted_at_fraction_sql(column: str) -> str:
     """The six-digit sub-second fraction of an ISO-8601 value, in SQLite.
 
@@ -1086,17 +1098,39 @@ def _alerted_at_fraction_sql(column: str) -> str:
     from the text itself. A UTC offset is a whole number of minutes, so the
     source fraction is also the UTC instant's fraction.
     """
-    tail = f"substr({column}, 21)"
-    digits = (
-        f"substr({tail}, 1, CASE "
-        f"WHEN instr({tail}, 'Z') > 0 THEN instr({tail}, 'Z') - 1 "
-        f"WHEN instr({tail}, '+') > 0 THEN instr({tail}, '+') - 1 "
-        f"WHEN instr({tail}, '-') > 0 THEN instr({tail}, '-') - 1 "
-        f"ELSE length({tail}) END)"
-    )
+    digits = _alerted_at_fraction_digits_sql(column)
     return (
         f"(CASE WHEN substr({column}, 20, 1) = '.' "
         f"THEN substr({digits} || '000000', 1, 6) ELSE '000000' END)"
+    )
+
+
+def _alerted_at_whole_second_sql(column: str) -> str:
+    """The value with its sub-second fraction removed, zone kept.
+
+    SQLite before 3.46 rounds a parsed fraction to the nearest millisecond, so
+    ``…00.999999`` formats as second ``01`` there and as ``00`` on later
+    versions. The seconds part must come from the whole second alone; the
+    fraction is supplied from the text by :func:`_alerted_at_fraction_sql`.
+    """
+    digits = _alerted_at_fraction_digits_sql(column)
+    return (
+        f"(CASE WHEN substr({column}, 20, 1) = '.' "
+        f"THEN substr({column}, 1, 19) || "
+        f"substr({column}, 21 + length({digits})) ELSE {column} END)"
+    )
+
+
+def _alerted_at_malformed_fraction_sql(column: str) -> str:
+    """True when the value has a ``.`` fraction that is not all digits.
+
+    :func:`_alerted_at_whole_second_sql` cuts the fraction out before
+    ``strftime`` parses the rest, so ``strftime`` alone no longer rejects
+    ``…00.abcZ``; this guard keeps such a value ``NULL``, as Python rejects it.
+    """
+    digits = _alerted_at_fraction_digits_sql(column)
+    return (
+        f"(substr({column}, 20, 1) = '.' AND {digits} GLOB '*[^0-9]*')"
     )
 
 
@@ -1111,12 +1145,18 @@ def alerted_at_order_key_sql(column: str = "alerted_at") -> str:
     every aware spelling this returns the Python helper's string —
     ``tests/test_556_s3_alert_ordering.py`` pins that agreement. A naive value
     is read as UTC here where the Python helper raises; an unparseable value
-    yields ``NULL``, which sorts last under ``DESC``. The expression names
-    ``column`` several times, so a bound parameter must be numbered (``?1``).
+    yields ``NULL``, which sorts last under ``DESC``. The two disagree on
+    spellings Python 3.11+ also accepts (``+05``, ``+0500``, a ``,`` fraction),
+    but every ``alerted_at`` writer stores Python ``isoformat()`` UTC text
+    (``…SS[.ffffff]Z`` or ``…SS[.ffffff]+00:00``), on which they agree. The
+    expression names ``column`` several times, so a bound parameter must be
+    numbered (``?1``).
     """
+    whole = _alerted_at_whole_second_sql(column)
     return (
-        f"(strftime('%Y-%m-%dT%H:%M:%S', {column}) || '.' || "
-        f"{_alerted_at_fraction_sql(column)} || 'Z')"
+        f"(CASE WHEN {_alerted_at_malformed_fraction_sql(column)} THEN NULL "
+        f"ELSE strftime('%Y-%m-%dT%H:%M:%S', {whole}) || '.' || "
+        f"{_alerted_at_fraction_sql(column)} || 'Z' END)"
     )
 
 
@@ -1130,10 +1170,12 @@ def canonical_alerted_at_sql(column: str = "alerted_at") -> str:
     :func:`alerted_at_order_key_sql`'s job.
     """
     fraction = _alerted_at_fraction_sql(column)
+    whole = _alerted_at_whole_second_sql(column)
     return (
-        f"(CASE WHEN {fraction} = '000000' "
-        f"THEN strftime('%Y-%m-%dT%H:%M:%SZ', {column}) "
-        f"ELSE strftime('%Y-%m-%dT%H:%M:%S', {column}) || '.' || {fraction} "
+        f"(CASE WHEN {_alerted_at_malformed_fraction_sql(column)} THEN NULL "
+        f"WHEN {fraction} = '000000' "
+        f"THEN strftime('%Y-%m-%dT%H:%M:%SZ', {whole}) "
+        f"ELSE strftime('%Y-%m-%dT%H:%M:%S', {whole}) || '.' || {fraction} "
         f"|| 'Z' END)"
     )
 

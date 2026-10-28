@@ -30,7 +30,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "bin"))
 
-import _lib_test_estate as _estate  # noqa: E402  -- bin/ joins sys.path above
+import _owner_expectations as _owners  # noqa: E402
 
 from conftest import load_script, redirect_paths  # noqa: E402
 from test_codex_container_transitions import env as container_env  # noqa: F401,E402
@@ -938,7 +938,7 @@ def _declared_cache_writers(cache):
     """
     scannable = set(cache.COVERAGE_WRITER_ACTIONS) - cache.COVERAGE_NON_LEAF_ACTIONS
     return {
-        site: (_estate.private_expectation(site, owner)
+        site: (_owners.private_expectation(site, owner)
                if (owner := _PRIVATE_WRITERS.get(site)) is not None
                else None)
         for site in scannable
@@ -958,13 +958,13 @@ def test_the_inventory_is_complete(core):
     observed = _scan_cache_materialization_sites(cache.COVERAGE_CACHE_FAMILIES)
     assert observed, "the scan must find writers, or this test proves nothing"
     declared = _declared_cache_writers(cache)
-    _estate.validate_owner_paths(declared)
-    expected = set(_estate.applicable_expectations(
-        declared, profile=_estate.active_profile()))
+    _owners.validate_owner_paths(declared)
+    expected = set(_owners.applicable_expectations(
+        declared, profile=_owners.active_profile()))
     assert observed == expected
 
 
-@pytest.mark.parametrize("profile", _estate.PROFILES)
+@pytest.mark.parametrize("profile", _owners.PROFILES)
 def test_the_private_writer_is_expected_only_where_its_source_exists(
         core, profile):
     """`bin/cctally-snapshot-measure` is mirror-private.
@@ -975,8 +975,8 @@ def test_the_private_writer_is_expected_only_where_its_source_exists(
     comparison never becomes a subset test.
     """
     declared = _declared_cache_writers(_cache())
-    expected = _estate.applicable_expectations(declared, profile=profile)
-    assert (_PRIVATE_WRITER in expected) is (profile == _estate.PRIVATE)
+    expected = _owners.applicable_expectations(declared, profile=profile)
+    assert (_PRIVATE_WRITER in expected) is (profile == _owners.PRIVATE)
     assert len(expected) > 1
 
 
@@ -986,10 +986,10 @@ def test_the_writer_declaration_agrees_with_the_real_boundary(core):
     On the public projection there is neither an allowlist nor a classifier, so
     this validates nothing and returns; the filtering above still runs.
     """
-    assert _estate.validate_owner_paths(_declared_cache_writers(_cache())) is None
+    assert _owners.validate_owner_paths(_declared_cache_writers(_cache())) is None
 
 
-@pytest.mark.parametrize("profile", _estate.PROFILES)
+@pytest.mark.parametrize("profile", _owners.PROFILES)
 @pytest.mark.parametrize("case", [
     "an observed writer with no assigned action",
     "an action whose public writer is absent",
@@ -1004,13 +1004,13 @@ def test_the_inventory_comparison_fails_closed_in_both_profiles(
     public profile and the equality assertion reports it there.
     """
     declared = _declared_cache_writers(_cache())
-    expected = set(_estate.applicable_expectations(declared, profile=profile))
+    expected = set(_owners.applicable_expectations(declared, profile=profile))
     assert expected, "the inventory must be non-empty, or this proves nothing"
     # `applicable_expectations` must have PARTICIPATED in building the set the
     # cases below perturb. Without this the remaining assertions hold for any
     # two sets differing by one member, and the filter under test contributes
     # nothing to them.
-    assert (_PRIVATE_WRITER in expected) is (profile == _estate.PRIVATE), case
+    assert (_PRIVATE_WRITER in expected) is (profile == _owners.PRIVATE), case
     if case == "an observed writer with no assigned action":
         extra = "_cctally_cache.brand_new_writer"
         observed = expected | {extra}
@@ -1024,7 +1024,7 @@ def test_the_inventory_comparison_fails_closed_in_both_profiles(
         undeclared = dict(declared)
         undeclared[later] = None
         expected = set(
-            _estate.applicable_expectations(undeclared, profile=profile))
+            _owners.applicable_expectations(undeclared, profile=profile))
         # The fail-closed default, and the load-bearing claim of this case: an
         # undeclared writer inside a mirror-private file stays EXPECTED on the
         # public profile, so the comparison reports it instead of filtering it.

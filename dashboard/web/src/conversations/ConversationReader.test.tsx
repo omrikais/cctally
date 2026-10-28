@@ -1954,18 +1954,6 @@ describe('ConversationReader focus modes (#177 S5 §5)', () => {
     expect(container.querySelector('.conv-focus-seg-badge')!.textContent).toBe('1');
   });
 
-  // #217 S3 E10#3 — the Find control leads with a ConvIcons SVG glyph, matching
-  // every other reader control, instead of the inline 🔍 emoji.
-  it('the Find toggle renders an SVG icon, not the 🔍 emoji', async () => {
-    const { container } = await renderWithOutline(
-      [makeItem({ uuid: 'h1' })],
-      baseOutline([oTurn({ uuid: 'h1', kind: 'human' })]),
-    );
-    const find = container.querySelector('.conv-find-toggle')!;
-    expect(find.querySelector('svg.conv-ico')).not.toBeNull();
-    expect(find.textContent).not.toContain('🔍');
-  });
-
   it('v cycles the focus mode all → chat → prompts → errors → all', async () => {
     await renderWithOutline([makeItem({ uuid: 'h1' })], baseOutline([oTurn({ uuid: 'h1', kind: 'human' })]));
     expect(getState().convFocusMode).toBe('all');

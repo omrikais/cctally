@@ -252,6 +252,109 @@ def _families():
 FAMILIES = {skel.name: skel for skel in _families()}
 
 
+# --------------------------------------------------------------------------
+# scheduling: the split by gate pair and the four xdist groups
+# --------------------------------------------------------------------------
+#
+# The release candidate's product leg (run 39772699752) ended incomplete: at
+# the tail of `--dist load`, four to eight of this module's heavy cases ran at
+# once on a disk-bound runner, each died at the 120-second per-test cap
+# (pytest-timeout's thread method takes the worker with it), and every
+# requeue put several heavy cases back at once. Two changes answer it, and
+# neither drops a check.
+#
+# The split. `test_f17_family` and `test_f17_certified_recovery_mints_the_
+# genuine_outcome` each run half of their former pairs per case (`_split`),
+# so the slowest case halves. The two halves of a function partition exactly
+# the pairs one former case ran, in the gate and under `CCTALLY_F17_FULL=1`
+# alike (`test_f17_splits_partition_the_former_pairs` pins that), and the
+# family's no-exclusion non-vacuity reference runs once, in half 0, which
+# always holds the (0, 0) pair.
+#
+# The groups. tests/conftest.py marks every item of a module that defines
+# `XDIST_GROUP_COUNT` with one of that many `xdist_group`s, balanced by
+# `xdist_case_cost` (longest first). `bin/cctally-test-all` runs the pytest
+# phase under `--dist loadgroup`, where each group is one work unit on one
+# worker, so at most four of this module's cases run at once, and xdist's
+# default reorder dispatches the large units first, so the tail is ordinary
+# short tests.
+SPLITS = (0, 1)
+XDIST_GROUP_COUNT = 4
+XDIST_GROUP_PREFIX = "f17"
+
+#: Estimated seconds per case, from the lan scheduled run 39724629894 (22
+#: October, before the split, with every F17 node present): `test_f17_family`
+#: 2,326 s over 104 cases and the recovery cases 1,295 s over 26, each halved
+#: by the split; the singletons as measured. The figures only balance the
+#: groups; a wrong one costs balance, never coverage.
+_CASE_COST_S = {
+    "test_f17_family": 11.0,
+    "test_f17_certified_recovery_mints_the_genuine_outcome": 25.0,
+    "test_f17_lazy_reference_horizon_is_exact": 50.0,
+    "test_f17_trie_execution_matches_fresh_stores": 47.0,
+    "test_f17_rejects_restored_confirmation_state_across_a_rebuild": 36.0,
+    "test_f17_rejects_a_mixed_only_credit_detection_instant": 23.0,
+    "test_f17_fixed_seeds": 17.0,
+}
+_DEFAULT_CASE_COST_S = 2.0
+
+
+def xdist_case_cost(item) -> float:
+    return _CASE_COST_S.get(getattr(item, "originalname", item.name), _DEFAULT_CASE_COST_S)
+
+
+def _split(pairs, split):
+    """Every other pair from ``split``: the halves partition ``pairs``, and
+    half 0 holds the first pair, which is (0, 0) in the gate and in the full
+    product alike."""
+    return tuple(pairs)[split::2]
+
+
+def _family_pairs(split, count):
+    """Half of a family's value pairs. ``count`` is the family's own number of
+    values (`len(skel.values)`), the count `WE.mixed_traces` itself enumerates
+    over, so a family with another number of values cannot silently run a
+    different enumeration from the one these halves partition (review I3c F7)."""
+    return _split(WE.value_pairs(count), split)
+
+
+def _recovery_pairs(split, count):
+    """Half of what one former recovery case ran: the gate ran the
+    no-exclusion pair and one pair with both slots non-trivial, and
+    `CCTALLY_F17_FULL=1` ran every pair."""
+    every = WE.value_pairs(count)
+    if len(every) > len(WE.GATE_PAIRS):
+        return _split(every, split)
+    return ((WE.GATE_PAIRS[0], WE.GATE_PAIRS[2])[split],)
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_f17_splits_partition_the_former_pairs(monkeypatch, full):
+    """The union of the halves is exactly what one former case ran, with no
+    pair run twice, and the non-vacuity pair (0, 0) is in half 0."""
+    if full:
+        monkeypatch.setenv("CCTALLY_F17_FULL", "1")
+    else:
+        monkeypatch.delenv("CCTALLY_F17_FULL", raising=False)
+    # Every family's own count, and one no family has yet, so the halves are
+    # shown to follow the count rather than a fixed four.
+    counts = sorted({len(skel.values) for skel in FAMILIES.values()} | {5})
+    for count in counts:
+        family = [pair for split in SPLITS for pair in _family_pairs(split, count)]
+        assert sorted(family) == sorted(WE.value_pairs(count)), count
+        assert len(set(family)) == len(family), count
+        assert (0, 0) in _family_pairs(0, count)
+        former_recovery = (WE.value_pairs(count) if full
+                           else (WE.GATE_PAIRS[0], WE.GATE_PAIRS[2]))
+        recovery = [pair for split in SPLITS for pair in _recovery_pairs(split, count)]
+        assert sorted(recovery) == sorted(former_recovery), count
+        assert len(set(recovery)) == len(recovery), count
+        assert all(_family_pairs(split, count) and _recovery_pairs(split, count)
+                   for split in SPLITS), count
+    if full:
+        assert len(_family_pairs(0, 5)) + len(_family_pairs(1, 5)) == 25
+
+
 def _vid(variant):
     return f"o{variant.order}-{variant.source}-{'jitter' if variant.offset else 'aligned'}"
 
@@ -278,12 +381,16 @@ def _uninterrupted_no_exclusion(store, mixed_steps, variant):
     return result
 
 
+@pytest.mark.parametrize("split", SPLITS, ids=lambda split: f"half{split}")
 @pytest.mark.parametrize("variant", WE.VARIANTS, ids=_vid)
 @pytest.mark.parametrize("family", sorted(FAMILIES))
-def test_f17_family(store, family, variant):
+def test_f17_family(store, family, variant, split):
     skel = FAMILIES[family]
-    traces = WE.mixed_traces(skel, variant)
+    traces = WE.mixed_traces(skel, variant, pairs=_family_pairs(split, len(skel.values)))
     WE.run_and_check(store, traces)
+    if split != 0:
+        return
+    # The non-vacuity reference runs once per (family, variant), here.
     label = next(label for label in traces if label.endswith("/00"))
     reference = _uninterrupted_no_exclusion(store, traces[label], variant)
     assert WE.outcome_total(reference[-1]) >= skel.genuine, (
@@ -294,19 +401,19 @@ def test_f17_family(store, family, variant):
 RECOVERY_VARIANTS = (WE.Variant(0, "api", 0), WE.Variant(1, "statusline", -1))
 
 
+@pytest.mark.parametrize("split", SPLITS, ids=lambda split: f"half{split}")
 @pytest.mark.parametrize("variant", RECOVERY_VARIANTS, ids=_vid)
 @pytest.mark.parametrize("family", sorted(FAMILIES))
-def test_f17_certified_recovery_mints_the_genuine_outcome(store, family, variant):
+def test_f17_certified_recovery_mints_the_genuine_outcome(store, family, variant, split):
     """The mixed trace, quarantined by its first excluded reading, recovers at
     the idle-gap witness and then mints the genuine credit — which every
     reference world mints too (`check`)."""
     skel = FAMILIES[family]
     # Two of the gate pairs (the no-exclusion pair and one with both slots
-    # non-trivial) carry the recovery suffix; `CCTALLY_F17_FULL=1` runs every
-    # pair.
-    pairs = None if len(WE.value_pairs()) > len(WE.GATE_PAIRS) else (
-        WE.GATE_PAIRS[0], WE.GATE_PAIRS[2])
-    traces = WE.mixed_traces(skel, variant, recovery=True, pairs=pairs)
+    # non-trivial) carry the recovery suffix, one per half; `CCTALLY_F17_FULL=1`
+    # runs every pair, half in each (`_recovery_pairs`).
+    traces = WE.mixed_traces(skel, variant, recovery=True,
+                             pairs=_recovery_pairs(split, len(skel.values)))
     results = WE.run_and_check(store, traces)
     recovery_start = len(skel.steps)
     for label, (mixed, _worlds) in results.items():

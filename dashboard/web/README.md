@@ -37,10 +37,13 @@ The Origin header is rewritten on proxied requests so the Python CSRF check acce
 
 ## Tests
 
+Maintainers run the tests on a LAN runner, never on the development Mac, from the repository root:
+
 ```bash
-npm run test          # one-shot
-npm run test:watch    # watch mode
+bin/cctally-test-remote bash -c 'cd dashboard/web && npm run test'   # one-shot
 ```
+
+Elsewhere, `npm run test` runs them once and `npm run test:watch` in watch mode.
 
 ## Build
 

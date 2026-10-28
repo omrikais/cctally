@@ -489,6 +489,11 @@ def no_spawn(monkeypatch):
         "_spawn_detached",
         lambda command: spawned.append(command) or True,
     )
+    monkeypatch.setattr(
+        _cctally_update,
+        "_spawn_detached_with_pid",
+        lambda command, **_kw: spawned.append(command) or os.getpid(),
+    )
     return spawned
 
 
@@ -759,18 +764,41 @@ def test_admission_contender_receives_the_elected_identity_before_marker_reread(
 
 
 def test_admission_rolls_back_promptly_when_occurrence_event_cannot_persist(
-    ns, tmp_path,
+    ns, tmp_path, monkeypatch,
 ):
-    """No event means no owner, no marker and no ten-second detector wait."""
+    """No event means no owner, no marker and no ten-second detector wait.
+
+    "Promptly" is the admission's own bounded ring wait reaching the ring
+    lock, not a wall-clock reading of the whole call: an `elapsed < 1.0`
+    check of that call failed under `-n 10` load while every behavior held.
+    """
     import fcntl
+    import _cctally_db
     import _cctally_store as st
 
     st._cctally_core.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    acquisitions = []
+    marker_writes = []
+    real_acquire = st._heal_flock_bounded
+    real_write = _cctally_db._atomic_write_private_json
+
+    def observed_acquire(path, timeout_s):
+        fd = real_acquire(path, timeout_s)
+        acquisitions.append((pathlib.Path(path), timeout_s, fd is not None))
+        return fd
+
+    def observed_write(path, payload):
+        if pathlib.Path(path) == st._stats_heal_marker_path():
+            marker_writes.append(payload.get("healId"))
+        return real_write(path, payload)
+
+    monkeypatch.setattr(st, "_heal_flock_bounded", observed_acquire)
+    monkeypatch.setattr(_cctally_db, "_atomic_write_private_json",
+                        observed_write)
     held = os.open(
         st._stats_heal_ring_lock_path(), os.O_WRONLY | os.O_CREAT, 0o600,
     )
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    started = time.monotonic()
     try:
         status, elected = st._reserve_stats_corruption_heal(
             {"healId": "unrecorded", "probeKind": "readability"}
@@ -778,12 +806,34 @@ def test_admission_rolls_back_promptly_when_occurrence_event_cannot_persist(
     finally:
         fcntl.flock(held, fcntl.LOCK_UN)
         os.close(held)
-    elapsed = time.monotonic() - started
 
+    # Failed admission.
     assert (status, elected) == ("failed", None)
-    assert elapsed < 1.0
+    # Timeout propagation: the occurrence event's ring lock was tried with the
+    # admission's own short wait, never the detector's ten-second ring wait,
+    # and that bounded wait is what failed.
+    ring = [(timeout, won) for path, timeout, won in acquisitions
+            if path == st._stats_heal_ring_lock_path()]
+    assert ring == [(st._STATS_HEAL_ADMISSION_RING_WAIT_S, False)], acquisitions
+    assert st._STATS_HEAL_ADMISSION_RING_WAIT_S < st._STATS_HEAL_RING_WAIT_S
+    admission = [(timeout, won) for path, timeout, won in acquisitions
+                 if path == st._stats_heal_admission_path()]
+    assert admission == [(st._STATS_HEAL_ADMISSION_WAIT_S, True)], acquisitions
+    # Rollback: the marker was written inside admission, then removed when its
+    # event could not persist. No marker, no event.
+    assert marker_writes == ["unrecorded"]
+    assert not st._stats_heal_marker_path().exists()
     assert st._read_stats_heal_request() is None
     assert st.read_stats_heal_events() == []
+    # Both locks are free again: a later detection is not held off.
+    for path in (st._stats_heal_admission_path(),
+                 st._stats_heal_ring_lock_path()):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def test_worker_finalization_reconciles_a_coalesced_count_after_ring_contention(
@@ -829,9 +879,10 @@ def test_hook_spawn_failure_clears_admission_for_immediate_retry(
         )
         assert status == "pending"
         assert elected["coalescedDetections"] == 1
-        return False
+        return None
 
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", fail_after_coalescer)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda command, **_kw: fail_after_coalescer(command))
     with pytest.raises(_cctally_db.StatsHealDeferred) as failed:
         _cctally_core.open_db()
     assert failed.value.outcome == "failed"
@@ -840,7 +891,8 @@ def test_hook_spawn_failure_clears_admission_for_immediate_retry(
     assert len(first) == 1 and first[0]["outcome"] == "spawn-failed"
     assert first[0]["coalescedDetections"] == 1
 
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _command: True)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda _command, **_kw: os.getpid())
     with pytest.raises(_cctally_db.StatsHealDeferred) as retried:
         _cctally_core.open_db()
     assert retried.value.outcome == "spawned"
@@ -880,7 +932,8 @@ def test_spawn_failure_waits_for_a_coalescer_and_settles_its_final_count(
 
     monkeypatch.setattr(_cctally_db, "_atomic_write_private_json", pause_coalescer)
     monkeypatch.setattr(st, "_heal_flock_bounded", observed_acquire)
-    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda _cmd: False)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda _cmd, **_kw: None)
     results = {}
 
     def coalesce():
@@ -1399,6 +1452,8 @@ def _corrupt_and_open_worker(bin_dir, home_dir, data_dir, q):
         import _cctally_update
 
         _cctally_update._spawn_detached = lambda _command: True
+        _cctally_update._spawn_detached_with_pid = (
+            lambda _command, **_kw: os.getpid())
         try:
             conn = _cctally_core.open_db()
         except _cctally_db.StatsHealDeferred as deferred:
@@ -1729,6 +1784,8 @@ def _heal_without_spawning_worker(bin_dir, home_dir, data_dir, q, ready, begin):
         import _cctally_update
 
         _cctally_update._spawn_detached = lambda _command: True
+        _cctally_update._spawn_detached_with_pid = (
+            lambda _command, **_kw: os.getpid())
         ready.set()
         # A barrier rather than a duration: the parent sets `begin` as soon as
         # every child is ready, so the argument is a liveness backstop and not

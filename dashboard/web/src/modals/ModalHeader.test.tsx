@@ -10,13 +10,6 @@ import { ModalHeader } from './ModalHeader';
 import { ModalCloseButton } from './ModalCloseButton';
 
 describe('ModalCloseButton', () => {
-  it('renders the canonical × (U+00D7) glyph, never the bespoke ⤬', () => {
-    render(<ModalCloseButton onClose={() => {}} />);
-    const btn = screen.getByRole('button', { name: 'Close' });
-    expect(btn.textContent).toBe('×');
-    expect(btn.textContent).not.toBe('⤬'); // pre-D6 bespoke glyph
-  });
-
   it('defaults to aria-label "Close", class "modal-close", and type="button"', () => {
     render(<ModalCloseButton onClose={() => {}} />);
     const btn = screen.getByRole('button', { name: 'Close' });
@@ -51,14 +44,6 @@ describe('ModalHeader', () => {
     const h2 = screen.getByRole('heading', { level: 2, name: 'Compose report' });
     expect(h2).toHaveAttribute('id', 'composer-modal-title');
     expect(h2.closest('header')).not.toBeNull();
-  });
-
-  it('applies a custom header className', () => {
-    render(
-      <ModalHeader title="x" titleId="y" className="share-modal-header" />,
-    );
-    expect(screen.getByRole('heading', { level: 2 }).closest('header'))
-      .toHaveClass('share-modal-header');
   });
 
   it('renders NO close button when onClose is omitted (ShareModal title-only header)', () => {

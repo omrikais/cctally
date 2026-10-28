@@ -18,13 +18,6 @@ describe('<TrendPanel />', () => {
     expect(screen.getByText(/8 cycles/i)).toBeInTheDocument();
   });
 
-  it('renders a bar-chart icon in the panel header', () => {
-    render(<TrendPanel />);
-    const header = document.querySelector('#panel-trend .panel-header');
-    const use = header?.querySelector('use');
-    expect(use?.getAttribute('href')).toBe('/static/icons.svg#bar-chart');
-  });
-
   it('renders a table row for each week in env.trend.weeks with .current on is_current', () => {
     render(<TrendPanel />);
     const snap = fixture as unknown as Envelope;

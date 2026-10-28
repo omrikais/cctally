@@ -18,23 +18,23 @@ Exceptions to "pure functions only", recorded rather than quietly taken:
   embedded Python is not importable — logic placed there could only ever be
   tested end to end. Its decision logic is factored into
   `_merge_duration_plan`, which is pure and takes the decoded legs.
-- The evidence-store functions (#940, contract C8) read and atomically write
-  one retention record or the internal evidence index each:
-  `seed_retention_record`, `read_evidence_index`, `update_evidence_index`,
-  `record_store_loss`, `forget_indexed_runs` and `verify_indexed_runs` (which
-  also reads the indexed run files). Their policy (`retention_store`,
-  `carried_seeded_loss`, `retention_coverage`) stays pure. The index writers
-  take no lock of their own: a caller that can race another writer passes
-  `lock`, a context manager held over the whole read-modify-write, and the
-  lock's layout stays with that caller.
+- The disclosure facts (`build_public_path_predicate`,
+  `build_disclosure_predicate`, `build_known_tokens`), moved here from the
+  retired private observability kernel (test regime reset, session 4), read
+  the repository they are given: `git ls-files`, the mirror's matcher and
+  allowlist when present, the contract library and the tracked fixture
+  names. They know the public-mirror grammar only through that matcher, and
+  the transformer still receives their answers as injected facts.
 """
 from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import subprocess
 import zlib
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -463,9 +463,15 @@ _DIFF_HEADER_RE = re.compile(r"^(?P<mark>---|\+\+\+)\s+(?P<path>\S+)")
 # recognise the truncated form, so a fragment of an unnormalized test
 # parameter was retained. 309 parametrize argument constants in `tests/` carry
 # a space, so the shape is reachable with today's estate.
+# Under `--dist loadgroup` xdist appends `@<group>` to a grouped node id. The
+# suffix is matched outside the node group, so it is never recorded as part of
+# the node, and a suffix after a parameter span no longer stops the tail from
+# matching, which had dropped the exception class. An `@` inside the parameter
+# span is not a suffix, and a name never holds one.
 _PYTEST_NODE_RE = re.compile(
     r"^(?P<indent>\s*)(?P<head>(?:FAILED|ERROR)\s+)"
-    r"(?P<node>[\w./-]+::[^\s\[]+(?:\[[^\]]*\])?)"
+    r"(?P<node>[\w./-]+::[^\s\[@]+(?:\[[^\]]*\])?)"
+    r"(?:@[A-Za-z0-9_.-]+)?"
     r"(?:\s+-\s+(?P<cls>[A-Za-z_][\w.]*(?:Error|Exception|Warning))\s*:\s*(?P<msg>.*))?"
 )
 # The `E ` gutter carries no payload of its own: it is stripped and the body
@@ -515,15 +521,6 @@ _MARKER_PREFIX_RE = re.compile(
     r"^(?P<indent>\s*)(?P<prefix>"
     + "|".join(HARD_MARKERS + SUPPLEMENTAL_MARKERS)
     + r")(?P<sep>:?)(?P<rest>.*)$"
-)
-# A deliberately tiny disclosure lane for the hermetic remote-wrapper harness.
-# The case name is not free text: the private caller injects the exact set of
-# `case_*` functions present in the tracked harness source.  The numeric source
-# line carries no repository or host content and makes the fixed `top-level`
-# fallback useful for older assertions that are not grouped in a function.
-_TEST_REMOTE_CASE_RE = re.compile(
-    r"^(?P<head>CASE:\s+test-remote/)(?P<case>case_[A-Za-z0-9_]+|top-level)"
-    r"(?P<tail>\s+line\s+[1-9][0-9]*)$"
 )
 # ANY `<segment>/<segment>` token, routed through the predicate. This rule used
 # to enumerate five known-public top-level directories, which left every other
@@ -600,17 +597,12 @@ class ScrubContext:
         roots=None,
         is_public_path=None,
         known_tokens=None,
-        known_case_ids=None,
     ):
         self.roots = dict(roots or {})
         self.is_public_path = is_public_path
         self.known_tokens = (
             None if known_tokens is None
             else frozenset(str(token).lower() for token in known_tokens)
-        )
-        self.known_case_ids = (
-            None if known_case_ids is None
-            else frozenset(str(case_id) for case_id in known_case_ids)
         )
         # One alternation, longest prefix first, so /Users/x/.claude does not
         # lose to /Users/x. Compiled once here rather than rebuilt per line.
@@ -636,9 +628,6 @@ class ScrubContext:
 
     def token_is_known(self, word: str) -> bool:
         return self.known_tokens is not None and word.lower() in self.known_tokens
-
-    def case_id_is_known(self, case_id: str) -> bool:
-        return self.known_case_ids is not None and case_id in self.known_case_ids
 
 
 # The reduction is a SEGMENT rewrite, not three successive text rewrites.
@@ -926,12 +915,6 @@ def scrub_line(line, ctx: "ScrubContext", *, _in_gutter: bool = False) -> str:
     if line is None:
         return UNCLASSIFIED_PLACEHOLDER
     raw = line.rstrip("\n")
-
-    case_ref = _TEST_REMOTE_CASE_RE.match(raw)
-    if case_ref:
-        if ctx.case_id_is_known(case_ref.group("case")):
-            return raw
-        return case_ref.group("head") + UNCLASSIFIED_DETAIL
 
     for pattern in _STRUCTURED_VERBATIM:
         if pattern.match(raw):
@@ -2603,40 +2586,11 @@ def render_retention_notice(plan) -> str:
 
 # ------------------------------------------------ evidence store identity and loss
 #
-# A second recorded exception to "pure functions only": the record seeding
-# and the internal evidence index below read and atomically replace small
-# JSON files, because the runner's enrollment and the aggregator's retention
-# pass must share one implementation of their shape (#940, contract C8).
-# Python 3.9 compatible: the runner tooling imports these functions.
+# The retention record's store identity and seeded loss (#940, contract C8),
+# which the aggregator's retention pass carries forward. Pure. Python 3.9
+# compatible.
 
 LEGACY_STORE = "legacy"
-EVIDENCE_INDEX_SCHEMA = 1
-
-
-def _write_json_atomic(path, doc, mode=0o644):
-    """Temporary sibling, fsync, rename, fsync of the parent directory."""
-    parent = os.path.dirname(os.path.abspath(path))
-    tmp = os.path.join(parent, ".%s.tmp-%d" % (os.path.basename(path), os.getpid()))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    try:
-        os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.rename(tmp, path)
-    dfd = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(dfd)
-    finally:
-        os.close(dfd)
-
-
-def _read_json_or_none(path):
-    try:
-        with open(path, "rb") as fh:
-            return json.loads(fh.read().decode("utf-8"))
-    except FileNotFoundError:
-        return None
 
 
 def retention_store(record):
@@ -2644,42 +2598,6 @@ def retention_store(record):
     if isinstance(record, dict) and record.get("store"):
         return record["store"]
     return LEGACY_STORE
-
-
-def _loss_key(entry):
-    return (entry.get("start"), entry.get("end"), entry.get("reason"))
-
-
-def seed_retention_record(record_path, *, store_id, loss):
-    """Seed a new evidence store's retention record before its first run.
-
-    The record carries `store` and the seeded loss intervals (each
-    `{"start": iso, "end": iso | None, "reason": text}`), and stays
-    `coverage: degraded` while any is present. Seeding the same store again
-    merges the intervals; a record that belongs to another store is refused,
-    so drive B's passes never collide with drive A's.
-    """
-    previous = _read_json_or_none(record_path)
-    if previous is not None and retention_store(previous) != store_id:
-        raise ValueError("retention record %s belongs to store %s, not %s"
-                         % (record_path, retention_store(previous), store_id))
-    record = dict(previous) if isinstance(previous, dict) else {
-        "schemaVersion": 1, "passes": 0, "gaps": [], "retainedRuns": 0}
-    merged = list(record.get("seededLoss") or [])
-    seen = {_loss_key(e) for e in merged}
-    for entry in loss or ():
-        item = {"start": entry.get("start"), "end": entry.get("end"),
-                "reason": entry.get("reason")}
-        if _loss_key(item) not in seen:
-            merged.append(item)
-            seen.add(_loss_key(item))
-    record["store"] = store_id
-    record["seededLoss"] = merged
-    record["coverage"] = retention_coverage(
-        gaps=record.get("gaps") or [], orphans=int(record.get("orphanDirs") or 0),
-        seeded_loss=merged)
-    _write_json_atomic(record_path, record)
-    return record
 
 
 _ISO_INSTANT = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?"
@@ -2724,122 +2642,407 @@ def retention_coverage(*, gaps, orphans, seeded_loss):
     return "degraded" if (gaps or orphans or seeded_loss) else "complete"
 
 
-def read_evidence_index(path):
-    """The internal evidence index, `{"schema": 1, "stores": {...}}`."""
-    doc = _read_json_or_none(path)
-    if doc is None:
-        return {"schema": EVIDENCE_INDEX_SCHEMA, "stores": {}}
-    if not isinstance(doc, dict) or doc.get("schema") != EVIDENCE_INDEX_SCHEMA:
-        raise ValueError("evidence index %s is not schema %d" % (path, EVIDENCE_INDEX_SCHEMA))
-    doc.setdefault("stores", {})
-    return doc
+# ------------------------------------------------- the disclosure facts
+#
+# Moved here from the retired private observability kernel (test regime
+# reset, session 4) so the aggregator's evidence bridge builds them from the
+# repository it runs in. They are the one place this module reads the
+# repository and runs a subprocess (`git ls-files`); the transformer above
+# still receives them only as injected `ScrubContext` facts. The public-path
+# predicate consults the mirror's own matcher (`.githooks/_match.py` against
+# `.mirror-allowlist`); on the published tree neither exists, so every path
+# answers "not public", which redacts rather than discloses.
 
 
-def _writer_lock(lock):
-    """The caller's writer lock, required (#940, C8 and D0b). The kernel names
-    no lock layout, so each caller owns its locking: a writer that can race
-    another passes the lock they share, and a sole writer (a test, a
-    single-threaded seeding) says so with `contextlib.nullcontext()`. A missing
-    lock is refused rather than run unlocked."""
-    if lock is None:
-        raise TypeError("an evidence index writer needs its caller's lock: pass lock=, "
-                        "or contextlib.nullcontext() for a sole writer")
-    return lock
+def _load_classifier(repo_root: str):
+    """`(classify, allowlist_text)` from the authoritative matcher, or `(None, None)`.
 
-
-def _store_entry(doc, store_id):
-    return doc["stores"].setdefault(store_id, {"runs": [], "loss": []})
-
-
-def update_evidence_index(path, *, store_id, run_id, started_at, ended_at, length, digest,
-                          relpath=None, lock):
-    """Record one run's expected length and digest under its store, for loss
-    detection. `relpath` (relative to the store's evidence root) locates the
-    indexed file; without it `verify_indexed_runs` looks for
-    `<remote_dir>/<run_id>/manifest.json`. `lock` is the caller's writer lock,
-    held over the read-modify-write."""
-    lock = _writer_lock(lock)
-    if not validate_run_id(run_id):
-        raise ValueError(f"unsafe run id: {run_id!r}")
-    with lock:
-        doc = read_evidence_index(path)
-        entry = _store_entry(doc, store_id)
-        run = {"runId": run_id, "startedAt": started_at, "endedAt": ended_at,
-               "length": int(length), "digest": digest}
-        if relpath is not None:
-            run["relpath"] = relpath
-        entry["runs"] = [r for r in entry["runs"] if r.get("runId") != run_id] + [run]
-        _write_json_atomic(path, doc, mode=0o600)
-    return run
-
-
-def record_store_loss(path, *, store_id, start, end, reason, lock):
-    """Record a loss interval for a store (a failed drive, a detected loss),
-    under the caller's writer `lock`."""
-    with _writer_lock(lock):
-        doc = read_evidence_index(path)
-        entry = _store_entry(doc, store_id)
-        item = {"start": start, "end": end, "reason": reason}
-        if _loss_key(item) not in {_loss_key(e) for e in entry["loss"]}:
-            entry["loss"].append(item)
-        _write_json_atomic(path, doc, mode=0o600)
-    return item
-
-
-def forget_indexed_runs(path, *, store_id, run_ids, lock):
-    """Drop `run_ids` from a store's indexed runs (runs retention evicted on
-    purpose, and runs whose loss was just recorded), under the caller's writer
-    `lock`. A store, or a set, with nothing to drop leaves the file untouched."""
-    lock = _writer_lock(lock)
-    run_ids = set(run_ids or ())
-    if not run_ids:
-        return
-    with lock:
-        doc = read_evidence_index(path)
-        entry = doc["stores"].get(store_id)
-        if not entry:
-            return
-        kept = [r for r in entry.get("runs") or [] if r.get("runId") not in run_ids]
-        if len(kept) == len(entry.get("runs") or []):
-            return
-        entry["runs"] = kept
-        _write_json_atomic(path, doc, mode=0o600)
-
-
-def _indexed_file(root, run):
-    if run.get("relpath"):
-        return os.path.join(root, run["relpath"])
+    Read from `.githooks/_match.py` against `.mirror-allowlist` rather than
+    from a second copy of the allowlist grammar, because a copy drifts and the
+    two answers then disagree about what is published.
+    """
+    matcher_path = os.path.join(repo_root, ".githooks", "_match.py")
+    allowlist_path = os.path.join(repo_root, ".mirror-allowlist")
     try:
-        names = sorted(os.listdir(root))
-    except OSError:
+        with open(allowlist_path, encoding="utf-8") as handle:
+            allowlist_text = handle.read()
+        spec = importlib.util.spec_from_file_location(
+            "_cctally_mirror_match", matcher_path
+        )
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            classify = getattr(module, "classify", None)
+            if classify is not None:
+                return classify, allowlist_text
+    except Exception:                                  # noqa: BLE001 — fail closed
+        pass
+    return None, None
+
+
+def tracked_paths(repo_root: str):
+    """Every path this repository actually tracks, or None when it cannot say.
+
+    None is fail-closed: a caller that cannot enumerate the tracked set
+    discloses nothing.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+        )
+    except Exception:                                  # noqa: BLE001 — fail closed
         return None
-    for name in names:
-        candidate = os.path.join(root, name, run["runId"], "manifest.json")
-        if os.path.lexists(candidate):
-            return candidate
-    return None
+    names = [
+        name
+        for name in proc.stdout.decode("utf-8", "replace").split("\0")
+        if name
+    ]
+    return frozenset(names) if names else None
 
 
-def verify_indexed_runs(path, *, store_id, root):
-    """Indexed runs of `store_id` whose file under `root` is missing, shorter
-    than recorded (truncated) or different (digest), each as
-    `{"runId", "kind", "expected", "found"}`. No pre-seeded flag is read."""
-    doc = read_evidence_index(path)
-    out = []
-    for run in (doc["stores"].get(store_id) or {}).get("runs") or []:
-        target = _indexed_file(root, run)
-        if target is None or not os.path.isfile(target):
-            out.append({"runId": run["runId"], "kind": "missing", "expected": run["length"],
-                        "found": None})
+def build_public_path_predicate(repo_root: str):
+    """A callable answering "may this repository-relative path be disclosed?".
+
+    Two independent facts, both required. The authoritative matcher must
+    classify the path as public, AND the repository must actually track it.
+
+    The second half is not redundant. The allowlist answers about a PATTERN,
+    and `bin/cctally-*` is a publishing glob, so the matcher answers "public"
+    for `bin/cctally-acme-holdings-test` and `docs/commands/acme-holdings.md`
+    though neither exists. A path-shaped token in a log then rode out on the
+    strength of a pattern rather than on the strength of the repository
+    containing the file — which is the same shape-versus-provenance defect the
+    transformer's own placeholder rule had. Intersecting with `git ls-files`
+    makes the answer a fact about this tree.
+
+    Fails closed on both legs. If the matcher, the allowlist or the tracked
+    listing cannot be consulted for any reason at all, every path answers "not
+    public" and is therefore redacted. Failing open would disclose private
+    paths on the strength of a missing file, which is why the exception
+    handling here is deliberately broad.
+    """
+    classify, allowlist_text = _load_classifier(repo_root)
+    tracked = tracked_paths(repo_root)
+    cache = {}
+
+    def is_public_path(rel_path) -> bool:
+        if classify is None or tracked is None:
+            return False
+        if not isinstance(rel_path, str) or not rel_path:
+            return False
+        if rel_path not in tracked:
+            return False
+        if rel_path not in cache:
+            try:
+                verdict = classify([rel_path], allowlist_text=allowlist_text)
+                cache[rel_path] = rel_path in verdict["public"]
+            except Exception:                          # noqa: BLE001 — fail closed
+                cache[rel_path] = False
+        return cache[rel_path]
+
+    return is_public_path
+
+
+_FIXTURE_PREFIX = "tests/fixtures/"
+
+
+def build_scenario_refs(repo_root: str) -> frozenset:
+    """The `<command>/<scenario>` references the shared fixture harness prints.
+
+    `bin/_lib-fixture-harness.sh` writes `PASS diff/basic`,
+    `SKIP diff/basic: no input.env` and `MISSING GOLDEN diff/basic — actual
+    output:`. The token is path-SHAPED but is not a repository-relative path,
+    so the tracked-path predicate answers "not public" and the harness
+    identity is scrubbed out of the extract along with the rest of the line —
+    fail-closed and safe, but the reader then cannot tell which scenario
+    diverged.
+
+    It is a committed repository fact all the same, so it is resolved here
+    from the same two sources the path predicate uses: the scenario directory
+    must contain a tracked file, and that file must classify as public. A
+    private fixture tree's scenario name therefore stays redacted, and the
+    forbidden-vocabulary filter applies as it does to every other name read
+    from a directory listing nobody reviewed before creating.
+    """
+    tracked = tracked_paths(repo_root)
+    classify, allowlist_text = _load_classifier(repo_root)
+    if tracked is None or classify is None:
+        return frozenset()
+
+    representative = {}
+    for path in tracked:
+        if not path.startswith(_FIXTURE_PREFIX):
             continue
-        with open(target, "rb") as fh:
-            data = fh.read()
-        if len(data) < run["length"]:
-            kind = "truncated"
-        elif "sha256:" + hashlib.sha256(data).hexdigest() != run["digest"]:
-            kind = "digest"
-        else:
+        parts = path[len(_FIXTURE_PREFIX):].split("/")
+        if len(parts) < 3:
             continue
-        out.append({"runId": run["runId"], "kind": kind, "expected": run["length"],
-                    "found": len(data)})
-    return out
+        ref = "%s/%s" % (parts[0], parts[1])
+        representative.setdefault(ref, path)
+
+    allowed = set()
+    for ref, sample in representative.items():
+        probe = set()
+        _register(probe, ref.replace("/", "-"))
+        if not probe:
+            continue                                   # a forbidden component
+        try:
+            verdict = classify([sample], allowlist_text=allowlist_text)
+        except Exception:                              # noqa: BLE001 — fail closed
+            continue
+        if sample in verdict["public"]:
+            allowed.add(ref)
+    return frozenset(allowed)
+
+
+def build_disclosure_predicate(repo_root: str):
+    """The predicate the aggregator injects into the public transformer.
+
+    A tracked public path, or a fixture scenario reference. Both are facts
+    about this repository, which is what the public kernel takes as an
+    injection and never encodes.
+    """
+    is_public = build_public_path_predicate(repo_root)
+    scenarios = build_scenario_refs(repo_root)
+
+    def predicate(rel_path) -> bool:
+        if not isinstance(rel_path, str) or not rel_path:
+            return False
+        if rel_path in scenarios:
+            return True
+        return is_public(rel_path)
+
+    return predicate
+
+
+# ---------------------------------------------------------------- the vocabulary
+#
+# The public transformer decides whether a word may be disclosed by asking
+# whether this repository can vouch for it, which is a fact this module holds
+# and injects — the same shape as `build_public_path_predicate`, applied to
+# words instead of paths. `acme-holdings-billing` and `case-floor-unmet` are
+# lexically identical, so provenance is the only thing that separates them.
+
+# The estate's own generated-output vocabulary: the words the shared harness
+# scaffolding writes, as opposed to the values it interpolates. Hand-registered
+# and reviewed rather than scanned out of the scripts, because scanning a shell
+# file would admit every word that appears in a comment. Additive: a new
+# generated word is added here, and until it is, the line carrying it is
+# redacted rather than disclosed.
+DIAGNOSTIC_TOKENS = frozenset({
+    "actual", "aggregated", "all", "benchmark", "cases", "case", "class",
+    "code", "complete", "content", "count", "counts", "details", "diff",
+    "diverged", "done", "elapsed", "error", "exit", "expected", "fail",
+    "failed", "failures", "file", "files", "fixture", "fixtures", "golden",
+    "harness", "harnesses", "incomplete", "infrastructure", "inner", "jobs",
+    "json", "killed", "line", "lines", "log", "logs", "main", "manifest",
+    "missing", "mismatch", "mode", "none", "output", "outer", "pass",
+    "passed", "phase", "pool", "product", "pytest", "queued", "reason",
+    "reasons", "run", "running", "runs", "scenario", "shell", "skipped",
+    "started", "status", "stderr", "stdout", "subject", "summary", "test",
+    "tests", "timing", "total", "trouble", "unreadable", "verdict", "warn",
+    "warning", "worker", "workers",
+    # UNITS. A unit is a word like any other and is registered here rather than
+    # exempted by shape. The public kernel used to exempt every letter run that
+    # touched a digit, which admitted `acme2026`, `2acme` and `acme3` along
+    # with `48s`, and `T` and `Z` come from the basic-form UTC stamp in a run
+    # identifier for the same reason: registered, not exempt.
+    "s", "ms", "h", "d", "pp", "kib", "mib", "gib", "q", "t", "z",
+    # The fixed words `bin/_lib-golden-diff.sh` and `bin/_lib-fixture-harness.sh`
+    # write. Swept as a set rather than one word at a time: `rc` and `IO` alone
+    # reduced the golden-diff IO-error branch — the chokepoint every fixture
+    # harness compares through — to `FAIL [REDACTED: unclassified detail]`, and
+    # every other fixed word in that scaffolding had the same effect on its own
+    # line. A repository test pins the scaffolding's emitted lines end to end.
+    "a", "as", "at", "created", "env", "has", "input", "io", "mktemp", "no",
+    "not", "of", "rc", "regen", "skip", "under", "updated",
+    # The kernel's own PLACEHOLDER NAMESPACE, registered by name because
+    # provenance rather than shape is what admits a token. A raw line arriving
+    # with a literal `<home>` in it is judged word by word like any other, so
+    # `<home>` survives on the strength of `home` being vouched for while
+    # `<acme-holdings>` is redacted for want of an entry. The previous rule
+    # exempted anything SHAPED like a placeholder, which admitted both.
+    "home", "repo", "path", "tmp", "tmpdir", "temp", "runner", "private",
+    "param", "email", "uuid", "hex", "credential", "url", "redacted",
+    "unclassified", "detail", "oversized", "exception", "message",
+    "truncated", "omitted",
+    # The fixed words the source-aware privacy leg's two pinned lines carry
+    # (#754). The lines are
+    #   FAIL source-aware: privacy canary match canary=1/6
+    #   FAIL source-aware: privacy scanner failure status=139 phase=artifact-scan canary=1/6
+    # and `source`/`aware` already arrive from the estate manifest's harness
+    # name. Only fixed words are registered: the canary VALUES are deliberately
+    # absent, because a vocabulary entry for one would publish the very token
+    # the leg exists to keep out of a generated artifact — which is why the
+    # harness prints an ordinal instead of the value it scanned for.
+    "artifact", "canary", "failure", "match", "privacy", "resolve", "scan",
+    "scanner", "self",
+    # The two words the same leg's retention lines carry (#769 S1):
+    #   source-aware: scanner evidence retained at <path>
+    #   source-aware: scanner evidence not retained
+    # Registered here rather than left to arrive from elsewhere. Both were
+    # already admissible, but only because three tracked fixture directories
+    # happen to be named for them, so renaming any of those would have turned
+    # the one sentence saying where a crash's evidence went into
+    # `[REDACTED: unclassified line]`, silently.
+    "evidence", "retained",
+    # Two words added for the same leg's remaining refusals (#769 S1 round 5),
+    # each after a reword was tried first:
+    #
+    #   FAIL source-aware: fixture builder exit status 2
+    #   FAIL source-aware: privacy canary builder exit status 3
+    #   source-aware: fixture builder output has no privacy canary, no scan run
+    #   FAIL source-aware: privacy canary count expected at least 1, actual 0
+    #
+    # `builder` names a component class this repository defines and documents —
+    # the `bin/build-<cmd>-fixtures.py` scripts, called the fixture builder
+    # throughout — and it sits in the same family as the already-registered
+    # `harness`, `fixture`, `golden` and `manifest`. Every wording that avoids
+    # it describes the failure less accurately, and this leg now has two
+    # distinct builder failures to tell apart.
+    #
+    # `least` is a generic English comparison word, registered so a
+    # minimum-count refusal can state a minimum. The empty-canary line used to
+    # print `expected 1` while six canaries are declared, which asserts a number
+    # the harness does not mean.
+    #
+    # Neither can be the token that discloses anything. Admission is decided per
+    # word, so a line pairing either of these with a machine name, a person or a
+    # client is still redacted on that other token; registering a generic or
+    # structural word only ever makes legible a line whose every other word is
+    # already vouched for.
+    "builder", "least",
+})
+
+# Words that must never enter the vocabulary, whatever source offered them.
+# `build_known_tokens` reads `tests/fixtures/` DIRECTORY NAMES at run time, so
+# a fixture directory named after a real client or after this machine would
+# silently become disclosable vocabulary, and the transformer would then emit
+# the very token the estate exists to keep out of an export. Stated as a closed
+# set here, and enforced at admission and again on the result.
+#
+# Held as SHA-256 digests of the lower-cased words, not the words: this module
+# is published, and the list names the maintainer, the maintainer's machines
+# and their hosts, which the published tree must not carry in plain text. The
+# answer for every word is the same as a plain-text set's.
+_FORBIDDEN_VOCABULARY_SHA256 = frozenset({
+    "a22f512f90576c5375fadaf44a532fe52093e86a67b69b284e7f7b82ac2852d8",
+    "eeaad69724561b665fc9b6870999f1f078186163ce6df34b360afb7cb82fc1ec",
+    "3166ba3bc7f6f7bc97da479a4e6e11120a976f52a51e8398152b2ce9fa00a06f",
+    "7f66bd0fcd6a1c01ae6f5c772b36a5fc93a8be12fc2bfa188773ab7b2e0c190e",
+    "ac61e2feb3073c6c56989e25a52e3af59ac6b05aaa26d32d3fc16f8af2ccc158",
+    "83ac208783055250d8bbcfb9a0edb410620ec90a70f01f2e3994d5d78952732a",
+})
+
+
+def _is_forbidden_word(word) -> bool:
+    return hashlib.sha256(word.encode("utf-8")).hexdigest() in _FORBIDDEN_VOCABULARY_SHA256
+
+_CONTRACT_REL = os.path.join("bin", "_lib-test-contract.sh")
+# The active registry and the tombstone list of retired codes: retained
+# outcome records still carry a retired code, and harness lines lean on its
+# words, so retiring one must not shrink the vocabulary.
+_REASON_BLOCK_RE = re.compile(
+    r"_CONTRACT_(?:RETIRED_)?REASON_CODES='(?P<body>[^']*)'", re.MULTILINE
+)
+_CAPABILITY_TABLE_RE = re.compile(
+    r"^CONTRACT_CAPABILITY_TABLE=\$'(?P<body>[^']*)'", re.MULTILINE
+)
+_HARNESS_PATH_RE = re.compile(r"^bin/cctally-(?P<name>.+)-test$")
+_TOKEN_RUN_RE = re.compile(r"[A-Za-z]+")
+
+
+def _register(tokens, name) -> None:
+    """Register a name both whole and decomposed.
+
+    Both forms occur in real output — a reason code is printed whole as
+    `case-floor-unmet` and a harness name appears inside `cctally-diff-test`
+    — and the public kernel checks maximal letter runs, so the components
+    are what it actually looks up.
+
+    A name carrying a forbidden token contributes NOTHING, not merely that one
+    component. A directory named `acme-<forbidden word>` should not put `acme` into
+    the vocabulary either: what makes it unsafe is that nobody vouched for the
+    name, and the forbidden component is the evidence of that.
+    """
+    if not isinstance(name, str):
+        return
+    name = name.strip()
+    if not name:
+        return
+    parts = [name.lower()] + [run.lower() for run in _TOKEN_RUN_RE.findall(name)]
+    if any(_is_forbidden_word(part) for part in parts):
+        return
+    tokens.update(parts)
+
+
+def build_known_tokens(repo_root: str) -> frozenset:
+    """Words this repository can vouch for, from closed committed sources.
+
+    Repository sources plus this module's own `DIAGNOSTIC_TOKENS`: the names
+    of the harnesses `bin/cctally-test-all` discovers (a regular executable
+    `bin/cctally-*-test`) among the TRACKED paths, the capability names, the
+    reason-code registry and its retired codes in `bin/_lib-test-contract.sh`, and the command
+    and scenario components of the TRACKED paths under `tests/fixtures/`.
+    Harness names came from the estate manifest until the test regime reset
+    retired it (Task 3.4).
+
+    Each source degrades on its own. A source that cannot be read
+    contributes nothing, which redacts more rather than less, so an
+    unreadable contract library costs legibility and never safety. An
+    unavailable tracked listing costs the harness and fixture legs for the
+    same reason.
+
+    Every repository-derived name is checked against the forbidden vocabulary
+    before it is admitted, and the result is filtered a second time, because
+    nobody reviews a fixture directory name for disclosure before creating it
+    and the denylist is the backstop for the ones that are committed anyway.
+    """
+    tokens = set(DIAGNOSTIC_TOKENS)
+
+    try:
+        with open(os.path.join(repo_root, _CONTRACT_REL), encoding="utf-8") as handle:
+            contract = handle.read()
+        for block in _REASON_BLOCK_RE.finditer(contract):
+            for code in block.group("body").split():
+                _register(tokens, code)
+        table = _CAPABILITY_TABLE_RE.search(contract)
+        if table:
+            for row in table.group("body").split("\\n"):
+                _register(tokens, row.split("\\t")[0])
+    except OSError:
+        pass
+
+    # The fixtures leg is read from `git ls-files`, NOT from the directory.
+    # A listing answers "what is on this disk", and the vocabulary needs
+    # "what did this repository commit": an untracked `tests/fixtures/acme/
+    # holdings/` put `acme` and `holdings` into the disclosure vocabulary, and
+    # `FAIL acme: holdings diverged` then survived the sanitizer byte for
+    # byte. The forbidden vocabulary cannot stand in for this — it is a short
+    # denylist, and this design is default-deny. It is the same
+    # pattern-versus-tracked-tree defect `build_public_path_predicate` closes
+    # for paths, closed here the same way.
+    #
+    # Directory semantics are preserved: the command component is registered
+    # from any tracked path under the prefix, and the scenario component only
+    # where a third component proves it is a directory rather than a file.
+    tracked = tracked_paths(repo_root)
+    for path in tracked or ():
+        harness = _HARNESS_PATH_RE.match(path)
+        if harness:
+            full = os.path.join(repo_root, path)
+            if (os.path.isfile(full) and not os.path.islink(full)
+                    and os.access(full, os.X_OK)):
+                _register(tokens, harness.group("name"))
+            continue
+        if not path.startswith(_FIXTURE_PREFIX):
+            continue
+        parts = path[len(_FIXTURE_PREFIX):].split("/")
+        if not parts[0]:
+            continue
+        _register(tokens, parts[0])
+        if len(parts) >= 3:
+            _register(tokens, parts[1])
+
+    return frozenset(t for t in tokens if not _is_forbidden_word(t))

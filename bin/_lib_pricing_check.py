@@ -232,15 +232,3 @@ def check_table_shapes(claude_tbl, codex_tbl, zero_sentinels) -> list:
     for model, body in codex_tbl.items():
         _check(model, body, _CODEX_REQUIRED, allow_zero=model in zero_sentinels)
     return problems
-
-
-def pricing_issue_action(findings_present: bool, existing_open: bool) -> str:
-    """Decide the cron's GitHub-issue action. Pure; the YAML executes it.
-
-    ``findings_present`` is ANY actionable finding the cron tracks — value
-    drift, missing-from-us, OR (as of #279 S7 W7) a stale/expired allowlist
-    suppression. The name generalizes the former ``drift_present``; the
-    two-state machine is unchanged."""
-    if findings_present:
-        return "update" if existing_open else "create"
-    return "close" if existing_open else "noop"

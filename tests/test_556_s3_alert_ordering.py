@@ -297,6 +297,10 @@ def test_the_sql_order_key_agrees_with_the_python_order_key():
         "2026-08-10T15:58:00.250000+02:00",
         "2026-08-10T08:13:00.000001+05:45",
         "2026-08-10T08:58:00.999999-05:00",
+        # SQLite before 3.46 rounds a fraction to the millisecond, which once
+        # carried these into the next second, minute and year.
+        "2026-08-10T13:58:59.9996Z",
+        "2026-12-31T23:59:59.999600Z",
     ]
     conn = sqlite3.connect(":memory:")
     try:
@@ -309,6 +313,24 @@ def test_the_sql_order_key_agrees_with_the_python_order_key():
                 f"SELECT {sources.canonical_alerted_at_sql('?1')}", (value,),
             ).fetchone()
             assert sql_canonical == sources.canonical_alerted_at(value), value
+        # A value Python cannot parse must yield NULL in SQL, so it sorts last
+        # under DESC and never wins a LIMIT's membership.
+        for value in (
+            "2026-08-10T13:58:00.abcZ",
+            "2026-08-10T13:58:00.5x5Z",
+            "2026-08-10T13:58:00.5 Z",
+            "garbage",
+        ):
+            with pytest.raises(ValueError):
+                sources.alerted_at_order_key(value)
+            for build in (
+                sources.alerted_at_order_key_sql,
+                sources.canonical_alerted_at_sql,
+            ):
+                (sql_value,) = conn.execute(
+                    f"SELECT {build('?1')}", (value,),
+                ).fetchone()
+                assert sql_value is None, (build.__name__, value, sql_value)
     finally:
         conn.close()
     ordered = sorted(values, key=sources.alerted_at_order_key)

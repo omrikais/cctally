@@ -45,7 +45,10 @@ def release_or_fail(path, what):
 # finishes (a test after EVERY one of its finalizers, a shared fixture when it
 # finishes, everything else once at session finish), and any finding is
 # recorded in the isolation ledger BEFORE the kernel releases the tree. The
-# recorded finding fails the owner whether or not the release succeeds.
+# recorded finding fails the owner whether or not the release succeeds. A
+# test that passed with no finding then has its own trees removed through the
+# kernel (Task 3.3b); the trees of a test that failed, xfailed or xpassed, or
+# had a problem, and a shared fixture's trees, stay.
 HYGIENE_PREFIX = "temp hygiene: "
 SESSION_BACKSTOP = "<session backstop>"
 PROBLEMS = pytest.StashKey()       # list[str], stashed on an item after its teardown
@@ -55,7 +58,10 @@ _FIXTURE_STACK = []                # fixturedefs whose setup is running
 _OWNED = {}                        # ("item", nodeid) | ("fixture", id) | ("session", "") -> [path]
 _PROVENANCE = {}                   # id(fixturedef) -> "fixture <name> (<scope>) first used by <nodeid>"
 _SEEN = set()
-STATS = {"allocations": 0, "released": 0, "inspect_s": 0.0, "release_s": 0.0, "backstop_s": 0.0}
+STATS = {"allocations": 0, "released": 0, "inspect_s": 0.0, "release_s": 0.0, "backstop_s": 0.0,
+         "reclaimed": 0, "reclaim_left": 0, "reclaim_s": 0.0}
+KEEP = pytest.StashKey()           # bool, stashed on an item whose setup or call failed,
+                                   # xfailed or xpassed: its trees are evidence
 
 
 def install():
@@ -157,13 +163,93 @@ def check_and_release(path, provenance, clock="inspect_s"):
                 recorded)
 
 
-def after_teardown(item):
-    """After EVERY finalizer of ``item``: its allocations first, then its ledger."""
+def after_teardown(item, teardown_failed=False):
+    """After EVERY finalizer of ``item``: its allocations first, then its ledger,
+    then, for a test that passed, the removal of its own trees.
+
+    A test keeps its trees when any phase failed, when it xfailed or xpassed,
+    when it has a hygiene or isolation problem, and while a Python child it
+    launched still owes its handshake: that child is resolved at session
+    finish, and a missing handshake then fails the session naming this test,
+    so its tree is that failure's evidence (review D3). A skipped test's trees
+    are reclaimed."""
     nodeid = item.nodeid
-    for path in _OWNED.pop(("item", nodeid), []):
+    paths = _OWNED.pop(("item", nodeid), [])
+    for path in paths:
         _SEEN.discard(path)
         check_and_release(path, nodeid)
-    item.stash[PROBLEMS] = list(_iso.collect_test_violations(nodeid))
+    problems = list(_iso.collect_test_violations(nodeid))
+    item.stash[PROBLEMS] = problems
+    if teardown_failed or problems or item.stash.get(KEEP, False):
+        return
+    if nodeid in _iso.pending_handshakes().values():
+        return
+    for path in paths:
+        reclaim(path, nodeid)
+
+
+def reclaim(path, nodeid):
+    """Remove a passing test's own tree through the kernel (Task 3.3b).
+
+    Every passing test used to keep its trees until the suite generation (now
+    the suite directory) was removed at the end of the run. The public projection's main pytest leg
+    then peaked at about 24 GB of retained temp, measured on omri-162, and the
+    hosted Linux runner (14 GB SSD) ran out of disk. Only a test that passed
+    with no hygiene or isolation problem gets here (see after_teardown).
+
+    The NAME is never freed (review D1). pytest numbers a new tmp_path one
+    past the highest existing number under the first 30 characters of the
+    test's name, so a freed ``<prefix>0`` would be handed to the next test with
+    that prefix, and a process the earlier test left behind could write into
+    the later test's tree, or a process-wide memo keyed by a store path could
+    carry over. Once the kernel has removed the tree, the root is recreated
+    as an empty owner-only directory: a tombstone that keeps the name taken,
+    exactly as it was before any reclaim, while the kernel's walk (lstat
+    only, no link following, one device, identity rechecked before each
+    unlink) stays the only thing that deletes. Removing only the root's
+    contents would instead need a second walk over the root's children with
+    its own identity handling, outside the kernel.
+
+    What the removal finds is not discarded (review D4). A mode or flag
+    finding is a violation made after the inspection, by a process of this
+    test, which the removal has just repaired; it is recorded against the
+    test, and because the test's ledger was already read it fails the session
+    as a late arrival. A refusal leaves its entry behind: it is counted in
+    ``reclaim_left`` and left for the suite directory's removal, never turned into
+    a failure of this test. ``reclaim_left`` counts what the removal left, not
+    the presence of a finding."""
+    t0 = time.perf_counter()
+    try:
+        res = T.remove(path)
+        late = [f for f in res.findings if f.kind not in T.REFUSAL_KINDS]
+        if late:
+            _record(nodeid, late, set())
+        ok = res.removed and not res.left
+        if res.removed:
+            try:
+                os.mkdir(path, 0o700)
+            except FileExistsError:   # something recreated it; the name stays taken
+                pass
+            except OSError as exc:
+                # The name is free again, which is what the tombstone exists
+                # to prevent (review D1): a later test could be handed it.
+                # Recorded against the test as a late hygiene finding, and
+                # counted as left (review I3c F12).
+                ok = False
+                _record(nodeid, [T.Finding(os.fspath(path), "error",
+                                           "tombstone not recreated: " + _why(exc))], set())
+    except Exception:   # never turn a passing test's cleanup into a failure
+        ok = False
+    STATS["reclaim_s"] += time.perf_counter() - t0
+    STATS["reclaimed" if ok else "reclaim_left"] += 1
+
+
+def mark_kept(item, report):
+    """Remember that ``item`` failed in setup or call, or xfailed or xpassed;
+    teardown is judged in pytest_runtest_teardown itself, before its report
+    exists."""
+    if report.when in ("setup", "call") and (report.failed or hasattr(report, "wasxfail")):
+        item.stash[KEEP] = True
 
 
 def on_fixture_done(fixturedef):
@@ -263,10 +349,13 @@ def summary_line():
     if not rows or not sum(r.get("allocations", 0) for r in rows):
         return ""
     return ("temp hygiene summary: allocations=%d released=%d inspect_s_max=%.2f "
-            "release_s_max=%.2f backstop_s_max=%.2f processes=%d" % (
+            "release_s_max=%.2f backstop_s_max=%.2f processes=%d reclaimed=%d reclaim_left=%d "
+            "reclaim_s_max=%.2f" % (
                 sum(r.get("allocations", 0) for r in rows), sum(r.get("released", 0) for r in rows),
                 max(r.get("inspect_s", 0.0) for r in rows), max(r.get("release_s", 0.0) for r in rows),
-                max(r.get("backstop_wall_s", 0.0) for r in rows), len(rows)))
+                max(r.get("backstop_wall_s", 0.0) for r in rows), len(rows),
+                sum(r.get("reclaimed", 0) for r in rows), sum(r.get("reclaim_left", 0) for r in rows),
+                max(r.get("reclaim_s", 0.0) for r in rows)))
 
 
 class Plugin(object):
@@ -302,19 +391,26 @@ class Plugin(object):
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_teardown(self, item, nextitem):
-        """Hygiene, then the isolation ledger, after EVERY finalizer of ``item``.
+        """Hygiene, then the isolation ledger, after EVERY finalizer of ``item``,
+        then the removal of a passing item's own trees (see ``after_teardown``
+        and ``reclaim``). A finalizer that raised fails the teardown, so its
+        trees are kept.
 
         Nothing is raised from here: the findings are stashed and the teardown
         report is failed in pytest_runtest_makereport, which keeps the call
         report intact and never turns a finding into an INTERNALERROR."""
+        failed = True
         try:
-            return (yield)
+            result = yield
+            failed = False
+            return result
         finally:
-            after_teardown(item)
+            after_teardown(item, teardown_failed=failed)
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_makereport(self, item, call):
         report = yield
+        mark_kept(item, report)
         if call.when == "teardown":
             apply_to_report(item, report)
         return report
@@ -330,7 +426,7 @@ def register(config):
 
 
 # --- nested launches (#963 spec 5.4, J4) ------------------------------------
-_GENERATION = re.compile(r"^ctg-[0-9a-f]{8}$")
+_SUITE_DIR = re.compile(r"^cs\.[A-Za-z0-9]{6}$")
 
 
 def nested_basetemp_args(parent, name="nested-bt"):
@@ -345,9 +441,12 @@ def child_aggregator_env(env, parent):
     """The environment for a test-launched bin/cctally-test-all.
 
     TMPDIR, TMP and TEMP name ``parent``/child-tmp, inside the launching
-    test's allocation, so the child's suite generation, retained by design
-    when the child is meant to fail, lies inside the outer generation. The
-    outer run's PYTEST_DEBUG_TEMPROOT is dropped: the child claims its own.
+    test's allocation, so the child's suite directory lies inside the outer
+    run's. The outer run's PYTEST_DEBUG_TEMPROOT is dropped: the child makes
+    its own. The runner supervisor's CCTALLY_RUNNER_RUN_DIR is carried when
+    the caller's ``env`` lacks it, because on macOS a private-tree child
+    refuses to run unless its TMPDIR lies inside that run directory, which
+    ``parent`` does.
     The outer run's owner-only variables are removed too (spec 4.3, #966(c)):
     the child never inherits the parent's outcome record, run id or evidence
     store. Apply the caller's explicit overrides AFTER this call; they may
@@ -356,6 +455,9 @@ def child_aggregator_env(env, parent):
     child = dict(env)
     G.scrub_owner_env(child)
     child.pop("PYTEST_DEBUG_TEMPROOT", None)
+    run_dir = os.environ.get("CCTALLY_RUNNER_RUN_DIR")
+    if run_dir and "CCTALLY_RUNNER_RUN_DIR" not in child:
+        child["CCTALLY_RUNNER_RUN_DIR"] = run_dir
     root = pathlib.Path(parent) / "child-tmp"
     root.mkdir(parents=True, exist_ok=True)
     for name in ("TMPDIR", "TMP", "TEMP"):
@@ -363,22 +465,23 @@ def child_aggregator_env(env, parent):
     return child
 
 
-def reclaim_child_generations(parent):
-    """Remove, through the kernel, every suite generation a test-launched child
+def reclaim_child_suite_dirs(parent):
+    """Remove, through the kernel, every suite directory a test-launched child
     aggregator left under ``parent``/child-tmp, once the caller has consumed
-    the child's results. U5's retention governs only the outermost generation;
-    a child's lives and dies with its test. A refusal fails the caller."""
+    the child's results. A child removes its own at exit; one is left only
+    when its removal was refused or the child was killed. A refusal fails the
+    caller."""
     root = pathlib.Path(parent) / "child-tmp"
     results = []
     if not root.is_dir():
         return results
     for path in sorted(root.iterdir()):
-        if not _GENERATION.match(path.name):
+        if not _SUITE_DIR.match(path.name):
             continue
         res = T.remove(str(path))
         results.append(res)
         if res.refusals or not res.removed:
-            pytest.fail("could not remove child generation %s: %s" % (
+            pytest.fail("could not remove child suite directory %s: %s" % (
                 path, "; ".join("%s: %s" % (f.detail, f.path) for f in res.findings)),
                 pytrace=False)
     return results

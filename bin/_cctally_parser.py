@@ -1849,6 +1849,11 @@ def _build_record_usage_parser(subparsers, name, *, help_text, xref=None):
                           fi
                           cctally record-usage $record_args &
                       fi
+
+                    Note: this direct recipe cannot tell an idle session's cached
+                    reading from a fresh one after a credit, so an idle session can
+                    record a value the credit already retired. `cctally statusline`
+                    can tell them apart; prefer it as the status line command.
                     """
                 ),
     )

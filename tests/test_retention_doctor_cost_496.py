@@ -9,15 +9,18 @@ Three separate claims, each with its own failure mode:
 * `plan_artifact_retention` is no longer quadratic in the root count, which is
   what let a corpus at the walk's own 5000-entry cap reach most of a second.
 
-The scaling test compares two measured ratios rather than a wall-clock
-threshold, so it fails identically on a fast and a slow machine.
+The scaling claim is checked here by counting the planner's reads of the
+reference graph's inverse index, which is deterministic: re-deriving the
+deletion closure once per selected root (the pre-fix `_Selection`) reads it
+quadratically often. The wall-clock ratio of the same claim is a resource
+measurement and runs serially, off the merge path, in
+`tests/test_retention_planner_scaling.py`.
 """
 from __future__ import annotations
 
+import collections.abc
+import dataclasses
 import datetime as dt
-import pathlib
-import sys
-import time
 
 import pytest
 
@@ -113,49 +116,66 @@ def _synthetic_members(kern, count):
     return members
 
 
-def _plan_seconds(kern, count, policy):
+class _CountingIndex(collections.abc.Mapping):
+    """`RetentionGraph.inbound_roots`, counting every entry it hands out:
+    each lookup and each key an iteration yields."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.reads = 0
+
+    def __getitem__(self, key):
+        self.reads += 1
+        return self._inner[key]
+
+    def __iter__(self):
+        for key in self._inner:
+            self.reads += 1
+            yield key
+
+    def __len__(self):
+        return len(self._inner)
+
+
+def _inverse_index_reads(kern, count, policy):
     graph = kern.build_graph(_synthetic_members(kern, count))
+    index = _CountingIndex(graph.inbound_roots)
     state = kern.RetentionState(
-        graph=graph, now_epoch=10 ** 9, free_disk_bytes=10 ** 12,
+        graph=dataclasses.replace(graph, inbound_roots=index),
+        now_epoch=10 ** 9, free_disk_bytes=10 ** 12,
     )
-    kern.plan_artifact_retention(state, policy)          # warm
-    best = None
-    for _ in range(3):
-        started = time.perf_counter()
-        kern.plan_artifact_retention(state, policy)
-        elapsed = time.perf_counter() - started
-        best = elapsed if best is None else min(best, elapsed)
-    return best
+    plan = kern.plan_artifact_retention(state, policy)
+    return index.reads, plan
 
 
-def test_the_planner_does_not_scale_quadratically_in_the_root_count(
+def test_the_planner_reads_the_reference_graph_linearly_in_the_root_count(
     tmp_path, monkeypatch,
 ):
-    """Doubling the roots must not roughly quadruple the time.
+    """Selecting every root reads each graph entry a bounded number of times.
 
-    Measured on the pre-fix planner: 8.0 ms at 142 roots, 32.1 at 284, 125.8
-    at 568 and 535.7 at 1136 — a clean 4x per doubling, inherited from
-    `_Selection` recomputing the whole closure and the whole surviving-root
-    tally per candidate. The walk's 5000-entry cap admits roughly 1600 roots,
-    so the doctor leg could reach about 0.7 s of pure planning.
-
-    A ratio is asserted rather than a wall-clock ceiling so the test means the
-    same thing on a loaded remote runner.
+    Detects the #496 S6 regression in which `_Selection` re-derived the whole
+    deletion closure for every root it added (`deletion_closure` over all
+    roots selected so far): `plan_artifact_retention` became quadratic in the
+    root count, and the periodic doctor gather at the walk's 5000-entry cap
+    spent most of a second planning. Reads are counted, not timed, so a
+    loaded runner cannot move the result. The pre-fix planner reads about 16x
+    as often over a 4x root increase; the incremental one about 4x.
     """
     _ns, _core, _doc, _ret, kern = _load(tmp_path, monkeypatch)
     policy = kern.RetentionPolicy(
         max_age_seconds=1, max_count_per_family=20,
         max_total_bytes=1, min_free_bytes=None, max_shape_examples=8,
     )
-    small = _plan_seconds(kern, 400, policy)
-    large = _plan_seconds(kern, 1600, policy)
-    ratio = large / small if small else float("inf")
-    # Quadratic over a 4x root increase is ~16x. Linear is ~4x. The gate sits
-    # well below quadratic and well above linear-plus-noise.
-    assert ratio < 8.0, (
-        f"planner scaled {ratio:.1f}x over a 4x root increase "
-        f"({small * 1000:.2f} ms -> {large * 1000:.2f} ms)"
-    )
+    small, small_plan = _inverse_index_reads(kern, 100, policy)
+    large, large_plan = _inverse_index_reads(kern, 400, policy)
+    # Non-vacuity: the selection grows with the roots (each selected root
+    # deletes its bundle with it), and the index is read at all.
+    deleted = (len(small_plan.delete_ids), len(large_plan.delete_ids))
+    assert deleted[1] > 3 * deleted[0] > 0, deleted
+    assert small > 0
+    assert large < 8 * small, (
+        f"the planner read the inverse index {large} times for 400 roots "
+        f"against {small} for 100: re-derived closures per selected root")
 
 
 def test_the_incremental_selection_matches_the_pure_closure_at_every_step(

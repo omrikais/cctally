@@ -19,6 +19,7 @@ import json
 import math
 from collections.abc import Iterable, Mapping
 
+import _lib_accounts
 from _lib_cost_provenance import (
     HISTORICAL_CLOSE_BASIS, RECORDED_CLOSE_CORRECTION_BASIS,
 )
@@ -161,6 +162,14 @@ _OP_CLASSIFICATIONS = {
     # raw prefix, outside claude-usage (its previous-release twin is consumed
     # by the selector directly and never registered).
     "journal_protocol_resolution_v2": KindClassification(
+        "retained", "journal-repair acknowledgements are audit records"),
+    # #797/#823/#840 spec 4.6 B2, B5: the revision-2 boundary is fence
+    # metadata like the cutover, and the v3 acknowledgement is the v2's
+    # successor.
+    "account_bound_revision": KindClassification(
+        "retained", "the revision-2 journal fence is replayed, never "
+        "re-derived"),
+    "journal_protocol_resolution_v3": KindClassification(
         "retained", "journal-repair acknowledgements are audit records"),
 }
 
@@ -912,6 +921,132 @@ _MILESTONE_BASE_DEPENDENCIES = {
 }
 
 
+# ── Reviewed weekly decisions (#797/#823/#840 spec 4.7, Q5, D4, U2) ─────────
+#
+# Op kind `claude_weekly_observation_decision_v2` (and the previous release's
+# `claude_weekly_observation_decision`) carries one reviewed manifest. Payload
+# schema 1 lists `decisions`, schema 2 `weekly_axis_decisions` (and snapshot
+# identity decisions), both of `hold` / `accept`. Schema 3 adds `retract`
+# WITHOUT a new projection: `weekly_axis_decisions` projects each retraction as
+# an ordinary `hold` (the previous release's completion, which recognizes only
+# a literal `hold`, then sees a weekly exclusion) and the canonical
+# `weekly_axis_retractions` list — sorted, unique, each naming a same-op
+# projected hold — gives it its causal meaning. This is the ONE strict decoder
+# every current consumer of a retained payload uses.
+
+REVIEWED_WEEKLY_SCHEMA_VERSIONS = (1, 2, 3)
+REVIEWED_WEEKLY_DISPOSITIONS = ("hold", "accept", "retract")
+_REVIEWED_WEEKLY_IDENTITY_KEYS = frozenset({
+    "acceptedObservationId", "replayObservationId", "disposition",
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewedWeeklyDecision:
+    """One decoded reviewed weekly decision payload: its schema version, the
+    disposition per observation (``hold``, ``accept`` or ``retract``, in
+    payload order), and its snapshot identity decisions."""
+
+    version: int
+    dispositions: Mapping[str, str]
+    identity_decisions: tuple
+
+
+def decode_reviewed_weekly_payload(payload) -> ReviewedWeeklyDecision:
+    """Strictly decode one retained reviewed weekly decision payload, or raise
+    :class:`RederiveConflict`."""
+    if not isinstance(payload, Mapping):
+        raise RederiveConflict("malformed retained reviewed weekly decision op")
+    version = payload.get("schema_version")
+    if type(version) is not int or version not in REVIEWED_WEEKLY_SCHEMA_VERSIONS:
+        raise RederiveConflict("malformed retained reviewed weekly decision op")
+    decisions = (payload.get("decisions") if version == 1
+                 else payload.get("weekly_axis_decisions"))
+    identity = ([] if version == 1
+                else payload.get("snapshot_identity_decisions"))
+    if (not isinstance(decisions, list) or not isinstance(identity, list)
+            or not decisions and not identity):
+        raise RederiveConflict("malformed retained reviewed weekly decision op")
+    dispositions: dict = {}
+    for item in decisions:
+        if (not isinstance(item, dict)
+                or set(item) != {"observationId", "disposition"}
+                or not isinstance(item["observationId"], str)
+                or not item["observationId"]
+                or item["disposition"] not in ("hold", "accept")):
+            raise RederiveConflict(
+                "malformed retained reviewed weekly decision entry")
+        obs_id = item["observationId"]
+        if obs_id in dispositions:
+            raise RederiveConflict(
+                f"unknown or duplicate reviewed weekly observation: {obs_id}")
+        dispositions[obs_id] = item["disposition"]
+    retractions = payload.get("weekly_axis_retractions")
+    if version < 3:
+        if "weekly_axis_retractions" in payload:
+            raise RederiveConflict(
+                "malformed retained reviewed weekly decision op")
+    else:
+        if (not isinstance(retractions, list)
+                or any(not isinstance(r, str) or not r for r in retractions)
+                or retractions != sorted(set(retractions))):
+            raise RederiveConflict(
+                "reviewed weekly retractions must be a canonical list")
+        for obs_id in retractions:
+            if dispositions.get(obs_id) != "hold":
+                raise RederiveConflict(
+                    "reviewed weekly retraction references no same-op hold: "
+                    + obs_id)
+            dispositions[obs_id] = "retract"
+    seen: set = set()
+    for item in identity:
+        if (not isinstance(item, dict)
+                or set(item) != _REVIEWED_WEEKLY_IDENTITY_KEYS
+                or not all(isinstance(item.get(key), str) and item[key]
+                           for key in ("acceptedObservationId",
+                                       "replayObservationId"))
+                or item.get("disposition") not in ("preserve", "rederive")
+                or item["acceptedObservationId"] == item["replayObservationId"]
+                or item["acceptedObservationId"] in seen
+                or item["replayObservationId"] in seen):
+            raise RederiveConflict(
+                "malformed retained snapshot identity decision")
+        seen.update((item["acceptedObservationId"], item["replayObservationId"]))
+    return ReviewedWeeklyDecision(version, dispositions, tuple(identity))
+
+
+def effective_reviewed_weekly_dispositions(payloads) -> dict:
+    """The effective disposition per observation over ``payloads`` in journal
+    order: the latest logical decision wins."""
+    effective: dict = {}
+    for payload in payloads:
+        effective.update(decode_reviewed_weekly_payload(payload).dispositions)
+    return effective
+
+
+def reviewed_weekly_payload(*, version: int, decisions, base: Mapping) -> dict:
+    """The persisted payload of one reviewed manifest: ``base`` (kind, bound,
+    reason and the other shared fields) plus ``decisions`` as
+    ``[{"observationId", "disposition"}]``, with each retraction projected as
+    an ordinary `hold` and listed in `weekly_axis_retractions` (schema 3)."""
+    payload = dict(base)
+    projected = sorted(
+        ({"observationId": item["observationId"],
+          "disposition": ("hold" if item["disposition"] == "retract"
+                          else item["disposition"])}
+         for item in decisions),
+        key=lambda item: item["observationId"])
+    if version == 1:
+        payload["decisions"] = projected
+    else:
+        payload["weekly_axis_decisions"] = projected
+    if version >= 3:
+        payload["weekly_axis_retractions"] = sorted(
+            item["observationId"] for item in decisions
+            if item["disposition"] == "retract")
+    return payload
+
+
 def _milestone_dependencies(kind: str) -> dict[str, str]:
     dependencies = dict(_MILESTONE_BASE_DEPENDENCIES)
     dependencies["reset_event_ref"] = (
@@ -1367,9 +1502,94 @@ def _without_snapshot_suppression(payload: Mapping) -> Mapping:
     return {key: value for key, value in payload.items() if key != "suppression"}
 
 
+def _retraction_unsupported_resets(
+    current: Mapping[str, Mapping], desired: Mapping[str, Mapping],
+    retracted_snapshot_ids, raw_observations: Iterable[Mapping] = (),
+) -> frozenset:
+    """#797/#823/#840 spec 4.7 (D4): the current `week_reset` events the
+    corrected replay no longer supports BECAUSE of a retraction — absent from
+    ``desired``, and whose causal predecessor was a retracted observation.
+
+    The predecessor is read from the raw journal observation stream
+    (``raw_observations``), not from the current graph: the latest
+    weekly-bearing Claude observation of the reset's account (attributed as
+    the replay attributes it, `_cctally_record._pipeline_claude_usage`)
+    captured strictly before the reset's originating low observation (whose
+    identity the reset follows, `_lib_journal` `week_reset_identity_parts`),
+    or before its `detected_at_utc` when it has no origin; equal instants
+    break by journal order. Whether the replay accepted that observation,
+    held it or stored no snapshot for it does not matter: a stale replay an
+    earlier reviewed `hold` turned into a held snapshot, or never accepted,
+    is still the reading the reset was detected against, and the latest
+    unheld snapshot before the origin is then an unrelated genuine reading
+    (review of 79847ac5a, D1). Exact identity, never a percentage
+    comparison. A reset the corrected replay still produces (alternate
+    support, review F4) is in ``desired`` and is never here."""
+    retracted = frozenset(retracted_snapshot_ids or ())
+    if not retracted:
+        return frozenset()
+    weekly: dict = {}
+    captured: dict = {}
+    for index, record in enumerate(raw_observations or ()):
+        payload = record.get("payload") or {}
+        observation_id = record.get("id")
+        if (record.get("t") != "obs" or record.get("provider") != "claude"
+                or "resets_at" not in payload
+                or payload.get("weekly_percent") is None
+                or not isinstance(observation_id, str) or not observation_id):
+            continue
+        instant = _iso_instant(payload.get("captured_at") or record.get("at"))
+        if instant is None:
+            continue
+        account = record.get("account") or _lib_accounts.UNATTRIBUTED
+        weekly.setdefault(account, []).append((instant, index, observation_id))
+        captured.setdefault(observation_id, instant)
+    unsupported = set()
+    for event_id, record in current.items():
+        payload = record.get("payload") or {}
+        if payload.get("kind") != "week_reset" or event_id in desired:
+            continue
+        origin = payload.get("origin_observation_id")
+        origin = origin if isinstance(origin, str) and origin else None
+        origin_payload = (
+            (current.get(f"sa:{origin}") or {}).get("payload") or {}
+            if origin is not None else {})
+        at = ((captured.get(origin) if origin is not None else None)
+              or _iso_instant(origin_payload.get("captured_at_utc"))
+              or _iso_instant(payload.get("detected_at_utc")))
+        if at is None:
+            continue
+        prior = [item for item in weekly.get(payload.get("account_key"), ())
+                 if item[0] < at and item[2] != origin]
+        if prior and f"sa:{max(prior)[2]}" in retracted:
+            unsupported.add(event_id)
+    return frozenset(unsupported)
+
+
+def _retraction_scope(current: Mapping[str, Mapping], retracted_snapshot_ids,
+                      unsupported_resets) -> frozenset:
+    """The event ids whose reviewed actions a retraction itself causes and
+    the reviewed delta therefore always carries (spec 4.7: explicit
+    retractions survive the baseline/reviewed plan intersection): the
+    retracted snapshots, the resets they leave unsupported, and every
+    current milestone citing either."""
+    scope = set(retracted_snapshot_ids or ()) | set(unsupported_resets or ())
+    if not scope:
+        return frozenset()
+    for event_id, record in current.items():
+        payload = record.get("payload") or {}
+        if payload.get("kind") not in _SNAPSHOT_DEPENDENT_KINDS:
+            continue
+        if (payload.get("usage_snapshot_ref") in scope
+                or payload.get("reset_event_ref") in scope):
+            scope.add(event_id)
+    return frozenset(scope)
+
+
 def _preserve_reviewed_hold_dependencies(
     current: Mapping[str, Mapping], desired: dict[str, Mapping],
     reviewed_weekly_hold_ids=(), historical_close_markers=None,
+    unsupported_resets=frozenset(),
 ) -> None:
     """Keep frozen five-hour facts reached from exact reviewed holds.
 
@@ -1384,6 +1604,13 @@ def _preserve_reviewed_hold_dependencies(
     children stay the selected frozen fact, so that update keeps the close's
     money and its block stays frozen (spec §4.1). Any unfamiliar reference
     shape refuses rather than being guessed or rewritten.
+
+    #797/#823/#840 spec 4.7 (D4): ``reviewed_weekly_hold_ids`` names the
+    ordinary holds only — a retraction is never preserved — and a held
+    milestone whose reset a retraction left unsupported
+    (``unsupported_resets``) is not kept: keeping it would restore that
+    reset, and the retraction's tombstone wins over the dangling milestone,
+    which then follows the corrected replay.
     """
     snapshot_ids = {
         f"sa:{raw_id}" for raw_id in reviewed_weekly_hold_ids
@@ -1458,6 +1685,8 @@ def _preserve_reviewed_hold_dependencies(
                 "reviewed weekly hold dependency has an unfamiliar kind: "
                 + event_id
             )
+        if payload.get("reset_event_ref") in unsupported_resets:
+            continue
         snapshot = current.get(usage_ref)
         if ((snapshot or {}).get("payload") or {}).get("kind") != "snapshot_accept":
             raise RederiveConflict(
@@ -1643,6 +1872,10 @@ class RederivePlan:
     action_counts_by_event_kind: Mapping[str, Mapping[str, int]] = dataclasses.field(
         default_factory=dict
     )
+    #: #797/#823/#840 spec 4.7: the event ids a retraction itself acts on
+    #: (`_retraction_scope`). Not part of the plan body: the retractions are
+    #: already in the config fingerprint through the decision op's payload.
+    retraction_event_ids: frozenset = frozenset()
 
     def _body(self) -> dict:
         body = {
@@ -1703,6 +1936,7 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
                             raw_observations=(),
                             snapshot_identity_decisions=(),
                             reviewed_weekly_hold_ids=(),
+                            reviewed_weekly_retraction_ids=(),
                             uncertain_cost_fact_ids=(),
                             historical_close_markers=None,
                             physical_revisions=None,
@@ -1754,12 +1988,26 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         and selected.record is not None
         and _is_owned_event(selected.record)
     }
+    if not isinstance(raw_observations, (list, tuple)):
+        raw_observations = tuple(raw_observations)
     _reconcile_snapshot_identities(
         current, desired, selection, raw_observations,
         snapshot_identity_decisions,
     )
+    # #797/#823/#840 spec 4.7 (D4): `reviewed_weekly_hold_ids` are the
+    # ordinary holds; a retraction is excluded from preservation, and the
+    # resets it leaves unsupported are never restored by a held milestone.
+    retracted_snapshot_ids = frozenset(
+        f"sa:{raw_id}" for raw_id in reviewed_weekly_retraction_ids or ()
+        if isinstance(raw_id, str) and raw_id)
+    unsupported_resets = _retraction_unsupported_resets(
+        current, desired, retracted_snapshot_ids,
+        raw_observations=raw_observations)
+    retraction_event_ids = _retraction_scope(
+        current, retracted_snapshot_ids, unsupported_resets)
     _preserve_reviewed_hold_dependencies(
         current, desired, reviewed_weekly_hold_ids, historical_close_markers,
+        unsupported_resets=unsupported_resets,
     )
     retained_event_count = sum(
         1 for selected in selection.by_id.values()
@@ -1970,6 +2218,7 @@ def build_claude_usage_plan(*, selection, desired_events: Iterable[Mapping],
         preserved_event_count=len(preserved),
         uncertain_cost_fact_count=len(uncertain_ids),
         action_counts_by_event_kind=counts_by_kind,
+        retraction_event_ids=retraction_event_ids,
     )
     if enforce_guard:
         enforce_week_reset_add_burst_guard(plan)
@@ -2162,8 +2411,14 @@ def _monetary_chain_closure(
             if action.event_id in required_ids]
 
 
-def _causal_snapshot_closure(actions, reviewed_by_id, current_events):
-    """Close explicit references, keeping a selected dependency if needed."""
+def _causal_snapshot_closure(actions, reviewed_by_id, current_events,
+                             protected=frozenset()):
+    """Close explicit references, keeping a selected dependency if needed.
+
+    #797/#823/#840 spec 4.7 (D4): a tombstone in ``protected`` (a retraction's
+    own scope) is never cancelled to keep a milestone that still names it —
+    the retraction wins, so such a milestone is a conflict here (the planner
+    never pins one, `_preserve_reviewed_hold_dependencies`)."""
     action_by_id = {action.event_id: action for action in actions}
     dependency_tombstones = set()
     for action in actions:
@@ -2177,6 +2432,10 @@ def _causal_snapshot_closure(actions, reviewed_by_id, current_events):
             dependency_action = action_by_id.get(reference)
             if (dependency_action is not None
                     and dependency_action.disposition == "tombstone"):
+                if reference in protected:
+                    raise RederiveConflict(
+                        "a retracted dependency's tombstone would be cancelled "
+                        "by milestone: " + action.event_id)
                 current = current_events.get(reference)
                 if ((current or {}).get("payload") or {}).get("kind") \
                         != expected_kind:
@@ -2215,6 +2474,34 @@ def _causal_snapshot_closure(actions, reviewed_by_id, current_events):
     return actions
 
 
+def _retained_reference_closure(actions, reviewed_by_id, current_events):
+    """#797/#823/#840 spec 4.7: unchanged retained references are validated
+    as well as proposed actions. A current milestone the delta does not act
+    on but which names an event the delta tombstones takes its reviewed
+    action; with none, the plan would leave it dangling and refuses."""
+    acted = {action.event_id for action in actions}
+    tombstoned = {action.event_id for action in actions
+                  if action.disposition == "tombstone"}
+    if not tombstoned:
+        return actions
+    for event_id, record in sorted(current_events.items()):
+        payload = (record or {}).get("payload") or {}
+        kind = payload.get("kind")
+        if event_id in acted or kind not in _SNAPSHOT_DEPENDENT_KINDS:
+            continue
+        if not any(payload.get(field) in tombstoned
+                   for field in _milestone_dependencies(kind)):
+            continue
+        reviewed = reviewed_by_id.get(event_id)
+        if reviewed is None:
+            raise RederiveConflict(
+                "a retained milestone would name a tombstoned event: "
+                + event_id)
+        actions.append(reviewed)
+        acted.add(event_id)
+    return actions
+
+
 def causal_delta_plan(
     baseline: RederivePlan, reviewed: RederivePlan, *,
     current_events: Mapping[str, Mapping],
@@ -2250,6 +2537,7 @@ def causal_delta_plan(
     }
     authorized_week_reset_origins = frozenset(
         authorized_week_reset_origins or ())
+    retraction_scope = frozenset(reviewed.retraction_event_ids or ())
     actions = [
         action for action in reviewed.actions
         if (
@@ -2261,6 +2549,9 @@ def causal_delta_plan(
                 and (action.payload or {}).get("origin_observation_id")
                 in authorized_week_reset_origins
             )
+            # #797/#823/#840 spec 4.7: an explicit retraction survives the
+            # baseline/reviewed intersection.
+            or action.event_id in retraction_scope
         )
     ]
     # Close block, monetary and explicit-reference edges to a fixed point.
@@ -2272,7 +2563,11 @@ def causal_delta_plan(
         actions = _monetary_chain_closure(
             actions, reviewed.actions, current_events)
         actions = _causal_snapshot_closure(
-            actions, reviewed_by_id, current_events)
+            actions, reviewed_by_id, current_events,
+            protected=retraction_scope)
+        if retraction_scope:
+            actions = _retained_reference_closure(
+                actions, reviewed_by_id, current_events)
         if {action.event_id for action in actions} == previous_ids:
             break
     included_ids = {action.event_id for action in actions}
@@ -2303,6 +2598,7 @@ def causal_delta_plan(
         preserved_event_count=reviewed.preserved_event_count,
         uncertain_cost_fact_count=reviewed.uncertain_cost_fact_count,
         action_counts_by_event_kind=counts_by_kind,
+        retraction_event_ids=reviewed.retraction_event_ids,
     )
 
 

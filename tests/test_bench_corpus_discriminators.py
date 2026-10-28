@@ -607,8 +607,8 @@ def test_every_codex_entry_is_placed_inside_the_live_cycle(scale):
 #
 # One item, not a pair. This was a mutating test followed by an observing test
 # that relied on file order to run second on the same worker. Under
-# `--dist load` — which is exactly what `bin/cctally-test-load-invariance`
-# runs — the two land on arbitrary workers in arbitrary order, and an observer
+# `--dist load` — which is exactly what the #630 S2 contended lane (since
+# retired) ran — the two land on arbitrary workers in arbitrary order, and an observer
 # scheduled first passes without observing anything, which is a vacuous green
 # on the one assertion the reproduction exists to make. Both halves are
 # asserted in the same item instead, so no scheduling can weaken either.

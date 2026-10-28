@@ -1,7 +1,8 @@
-"""Per-test durations for an authoritative run (#630 S1, F3).
+"""Per-test durations for an evidence run (#630 S1, F3).
 
 Loaded with `-p tests._pytest_durations_plugin` by bin/cctally-test-all on
-authoritative evidence runs only. Never enabled through pytest.ini or
+evidence runs that are authoritative or set CCTALLY_PYTEST_DURATIONS=1 (the
+nightly broad run). Never enabled through pytest.ini or
 conftest.py: both would change behaviour for anyone running pytest directly,
 and conftest.py belongs to another session.
 
@@ -28,6 +29,24 @@ _LEG_ENV = "CCTALLY_DURATIONS_LEG"
 # retention budget, and 9 buys a few percent for a large multiple of the CPU
 # on a file written while the suite is still running.
 _COMPRESS_LEVEL = 6
+
+
+def plain_nodeid(nodeid):
+    """``nodeid`` without the ``@<group>`` suffix `--dist loadgroup` adds.
+
+    An xdist worker running under ``--dist loadgroup`` appends ``@<group>`` to
+    the node id of every item carrying an ``xdist_group`` mark (bin/
+    cctally-test-all runs the pytest phase that way; tests/conftest.py
+    ``_assign_xdist_groups``). The estate declares plain ids, so the suffix is
+    removed by xdist's own rule: the last ``@`` must follow the last ``]``,
+    and here also the last ``::``, so an ``@`` inside a parameter id or a
+    directory name is kept. Kept in sync with the twin in the other recorder
+    by tests/test_xdist_group_suffix.py; each plugin is copied alone into
+    scratch estates, so neither imports the other."""
+    at = nodeid.rfind("@")
+    if at > nodeid.rfind("]") and at > nodeid.rfind("::"):
+        return nodeid[:at]
+    return nodeid
 
 
 def _writer_is_disabled(config):
@@ -97,7 +116,7 @@ class _DurationsWriter:
     def pytest_runtest_logreport(self, report):
         worker_id = getattr(report, "worker_id", None)
         self._handle.write(json.dumps({
-            "nodeId": report.nodeid,
+            "nodeId": plain_nodeid(report.nodeid),
             "phase": report.when,
             "durationSeconds": round(report.duration, 6),
             "outcome": report.outcome,

@@ -1,40 +1,36 @@
-"""Assertions for bin/cctally-test-all's worker model and phase isolation.
+"""Assertions for bin/cctally-test-all's worker model, harness discovery and
+pytest legs.
 
 Most tests invoke the runner's side-effect-free CCTALLY_TEST_ALL_PLAN=1 dry-run
 (which exits before any harness/pytest launch) with
-CCTALLY_TEST_ALL_FAKE_NCPU pinning the core count. The execution test uses a
-synthetic checkout and fake Python boundary to observe pytest phase isolation.
+CCTALLY_TEST_ALL_FAKE_NCPU pinning the core count. The execution tests use a
+synthetic checkout and a fake Python boundary to observe the two pytest legs.
 
-WARNING: calls through ``_plan`` must keep plan mode enabled. The one execution
-test builds a synthetic checkout whose harnesses and Python boundary are fakes,
-so it cannot recurse into the real suite. Short timeouts backstop both paths.
+WARNING: calls through ``_plan`` must keep plan mode enabled. The execution
+tests build a synthetic checkout whose harnesses and Python boundary are fakes,
+so they cannot recurse into the real suite. Short timeouts backstop both paths.
 """
-import importlib.machinery
-import importlib.util
 import json
 import os
 import pathlib
-import shutil
+import re
 import subprocess
 import sys
 
 import pytest
 
+import _lib_test_selection as _sel
 import _temp_hygiene as _hyg
-from tests import _estate_stub
+from tests.helpers import contract_tree as _ct
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BIN = REPO / "bin"
 RUNNER = BIN / "cctally-test-all"
-CONTRACT_LIB = BIN / "_lib-test-contract.sh"
-# .mirror-allowlist excludes itself from the mirror, so its presence is exactly the
-# marker bin/cctally-test-all uses to require the maintainer-local test-remote harness.
-PRIVATE_TREE = (REPO / ".mirror-allowlist").exists()
 
 
 def _plan(env_overrides, fake_ncpu="16", runner=RUNNER, args=()):
     env = {
-        "PATH": __import__("os").environ["PATH"],
+        "PATH": os.environ["PATH"],
         "CCTALLY_TEST_ALL_PLAN": "1",
         "CCTALLY_TEST_ALL_FAKE_NCPU": fake_ncpu,
     }
@@ -120,452 +116,357 @@ def test_rejects_non_numeric():
     assert p.returncode == 2
 
 
-@pytest.mark.skipif(
-    not PRIVATE_TREE,
-    reason="test-remote is maintainer-local; the public mirror ships no such harness",
-)
-def test_plan_explicitly_includes_test_remote_harness():
-    p = _plan({})
-    assert p.returncode == 0, p.stderr
-    assert "test-remote" in _kv(p.stdout)["harnesses"].split()
+# ----------------------------------------------------------- synthetic trees
 
-
-@pytest.mark.skipif(
-    not PRIVATE_TREE,
-    reason="the Linux profile's one omitted harness is private-only",
-)
-def test_linux_matrix_plan_excludes_only_the_mac_remote_harness():
-    full = _kv(_plan({}).stdout)
-    linux = _kv(_plan({"CCTALLY_LINUX_MATRIX_RUN": "1"}).stdout)
-    assert linux["mode"] == "linux-matrix"
-    assert set(full["harnesses"].split()) - set(linux["harnesses"].split()) == {
-        "test-remote"
-    }
-    assert linux["pytest_disposition"] == "full"
-
-
-def _copy_python_kernels(bindir, *, validator_body=None, estate_report=None,
-                         estate_legs=None):
-    """The aggregator's python dependencies, and only those.
-
-    `_lib_test_*.py` is matched as a CLASS, because the evidence bridge loads
-    whichever of those kernels a tree carries and naming them would break the
-    moment it grows another. The duration-table validator is named, because it
-    is exactly one file. This was briefly the wider `_lib_*.py`, which copied
-    every kernel in the repository — 95 files and 3.2 MB into each synthetic
-    tree instead of 3 files and 248 KB — for one module it actually needed.
-
-    ``validator_body`` writes that one file's text instead of copying it, which
-    is how the scheduler's ImportError branch is reached. DELETING the file
-    does not reach it, and that is not an oversight: under pytest,
-    tests/isolation_bootstrap/sitecustomize.py appends the REAL repository's
-    bin/ to every child process's sys.path, so a subprocess imports
-    `_lib_harness_durations` successfully no matter what the tree under test
-    carries. A module whose body raises is immune to that, because the
-    scheduler's own `sys.path.insert(0, <root>/bin)` puts this file ahead of
-    the appended directory.
-    """
-    for kernel in sorted(BIN.glob("_lib_test_*.py")):
-        shutil.copy2(kernel, bindir / kernel.name)
-    # The quarantine applier parses tests/quarantine.json through this one
-    # shared parser (test regime reset, session 2).
-    shutil.copy2(BIN / "_lib_quarantine.py", bindir / "_lib_quarantine.py")
-    # #648 D10. The glob acquires the estate checker, and a scratch tree records
-    # no artifact for it to compare against. `estate_legs` is how the one case
-    # that asserts the two pytest execution legs declares them, since the
-    # aggregator now builds both from the plan rather than from shell literals.
-    _estate_stub.install(bindir, report=estate_report, legs=estate_legs)
-    # #648 D7. Both pytest legs load `-p tests._estate_leg_plugin`, so a
-    # scratch estate that omitted it would fail on a missing module.
-    repo_tests = bindir.parent / "tests"
-    repo_tests.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(REPO / "tests" / "_estate_leg_plugin.py",
-                 repo_tests / "_estate_leg_plugin.py")
-    target = bindir / "_lib_harness_durations.py"
-    if validator_body is None:
-        shutil.copy2(BIN / "_lib_harness_durations.py", target)
-    else:
-        target.write_text(validator_body, encoding="utf-8")
-
-
-def _expected_names(private, extra=()):
-    """Manifest rows for the synthetic checkout. test-remote is declared in the
-    private profile whether or not the file is present, because its absence is
-    itself one of the conditions under test."""
-    names = [
-        ("codex-quota", "public"),
-        ("source-aware", "public"),
-        *extra,
-        # `reconcile` is the summary-ordering device bin/cctally-test-all pins
-        # as the last report row. The synthetic estate carries it so a duration
-        # table over this tree can be an exact cover of the manifest, which is
-        # what the scheduler validates before it sorts.
-        ("reconcile", "public"),
-    ]
-    if private:
-        names.append(("test-remote", "private"))
-    return names
+_BASE_HARNESSES = ("codex-quota", "source-aware", "reconcile")
 
 
 def _tree(
     tmp_path,
     *,
-    private,
-    test_remote_mode,
     durations=None,
     validator_body=None,
     extra_harnesses=(),
-    extra_manifest_harnesses=(),
     harness_bodies=None,
-    ownership=False,
-    git=False,
 ):
-    """A synthetic checkout. ``private`` writes .mirror-allowlist, which is
-    itself unmirrored and so marks the private tree; ``test_remote_mode`` is
-    None to omit the maintainer-local harness entirely (the public shape).
-    ``durations`` writes tests/authoritative-harness-durations.tsv from an
-    iterable of (name, seconds) pairs; None omits the file entirely, which is
-    itself one of the conditions under test. ``validator_body`` replaces
-    bin/_lib_harness_durations.py with the given text, which is how the
-    scheduler's ImportError branch is reached (see _copy_python_kernels).
-    ``extra_harnesses`` puts harness FILES on disk that the manifest and the
-    table do not declare, which is how a discovered harness can be absent from
-    the dispatch order."""
+    """A synthetic checkout. ``durations`` writes tests/harness-duration-hints.tsv from an iterable of
+    (name, seconds) pairs; None omits the file. ``validator_body`` replaces
+    bin/_lib_harness_durations.py with the given text (see
+    tests/helpers/contract_tree.copy_aggregator)."""
     repo = tmp_path / "repo"
     bindir = repo / "bin"
-    bindir.mkdir(parents=True)
-    runner = bindir / "cctally-test-all"
-    shutil.copy2(RUNNER, runner)
-    # The aggregator sources the contract library and reads the estate manifest
-    # at admission (#529 S1), so a synthetic checkout must carry both or every
-    # non-plan-mode case in this module fails on the fixture rather than on the
-    # property it asserts.
-    # Matched as a CLASS: bin/_lib-test-contract.sh sources bin/_lib-fts5-probe.sh
-    # and refuses without it (#529 S6, exception X2), so an estate that copied
-    # one library by name refuses to start the moment the contract grows a
-    # second. The failure is silent-looking rather than obvious — the estate
-    # aborts with the contract's own diagnostic, and every assertion about what
-    # the aggregator SHOULD have said then reads as a behaviour change.
-    for lib in sorted(BIN.glob("_lib-*.sh")):
-        shutil.copy2(lib, bindir / lib.name)
-    # bin/cctally-test-all imports the evidence kernels (#529 S2) and, since
-    # #630 S3, the duration-table validator. See _copy_python_kernels.
-    _copy_python_kernels(bindir, validator_body=validator_body)
-
+    runner = _ct.copy_aggregator(bindir, durations_validator=validator_body)
     harness_bodies = harness_bodies or {}
-    manifest_extra = [n for n, _ in extra_manifest_harnesses]
-    for name in (
-        "codex-quota", "source-aware", "reconcile",
-        *manifest_extra, *extra_harnesses,
-    ):
-        harness = bindir / f"cctally-{name}-test"
-        harness.write_text(
-            harness_bodies.get(name, "#!/usr/bin/env bash\nexit 0\n")
+    for name in (*_BASE_HARNESSES, *extra_harnesses):
+        _ct.write_harness(
+            bindir, name, harness_bodies.get(name, "#!/usr/bin/env bash\nexit 0\n")
         )
-        harness.chmod(0o755)
-
-    if private:
-        # The allowlist has to agree with the declared visibilities below, or
-        # admission reports visibility-drift instead of the property under
-        # test: every harness is public except the maintainer-local
-        # test-remote one.
-        (repo / ".mirror-allowlist").write_text(
-            "bin/cctally-test-all\nbin/_lib-*\ntests/**\nbin/cctally-*\n"
-            "!bin/cctally-test-remote-test\n"
-        )
-        # A private tree with no classifier is now an admission refusal in its
-        # own right (visibility-classifier-unavailable), so the scratch tree
-        # must carry the classifier exactly as tests/test_authoritative_test_
-        # contract.py::_estate does. The classifier is maintainer-local, so the
-        # public mirror's own suite skips instead of failing on a file it never
-        # received.
-        if not (REPO / ".githooks").exists() or not (
-            REPO / ".githooks" / "_match.py"
-        ).exists():
-            pytest.skip(
-                "the allowlist classifier .githooks/_match.py is maintainer-local"
-            )
-        githooks = repo / ".githooks"
-        githooks.mkdir(exist_ok=True)
-        shutil.copy2(REPO / ".githooks" / "_match.py", githooks / "_match.py")
-    if test_remote_mode is not None:
-        test_remote = bindir / "cctally-test-remote-test"
-        test_remote.write_text("#!/usr/bin/env bash\nexit 0\n")
-        test_remote.chmod(test_remote_mode)
-
     tests_dir = repo / "tests"
     tests_dir.mkdir(exist_ok=True)
-    (tests_dir / "authoritative-test-manifest.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "minHarnessRows": 0,
-                "harnesses": [
-                    {
-                        "name": n,
-                        "visibility": v,
-                        "minCases": 0,
-                        "countPolicy": "fixed",
-                    }
-                    for n, v in _expected_names(private, extra_manifest_harnesses)
-                ],
-                "capabilities": [],
-                "forbiddenRegeneration": [],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-
-    # NO runtime budget is written here, and that is deliberate (#650 item 5).
-    # A budget is read only by an ELIGIBLE run, which requires
-    # CCTALLY_AUTHORITATIVE_RUN=1. That variable appears nowhere in this file,
-    # and all three subprocess helpers build a fresh `env` dictionary from PATH
-    # plus explicitly named keys rather than inheriting the ambient
-    # environment — so no case here can reach an eligible run, and the two
-    # copies that used to sit at this point were dead fixture code.
     if durations is not None:
-        (tests_dir / "authoritative-harness-durations.tsv").write_text(
+        (tests_dir / "harness-duration-hints.tsv").write_text(
             "".join("%s\t%s\n" % (name, secs) for name, secs in durations)
         )
-
-    # #630 S7. The tier attributes its change set through bin/cctally-test-owners
-    # and runs that tool's own verification before accepting any narrow result,
-    # so a tier estate carries the tool, the ownership rows DERIVED from each
-    # harness's text, and the fixture directories those rows declare. Derived
-    # rather than hand-written: a hand-built row encodes the very declaration the
-    # verification is supposed to check.
-    if ownership:
-        shutil.copy2(BIN / "cctally-test-owners", bindir / "cctally-test-owners")
-        (bindir / "cctally-test-owners").chmod(0o755)
-        owners = _load_owners()
-        public_rows, private_rows = {}, {}
-        visibility = dict(_expected_names(private, extra_manifest_harnesses))
-        for name, vis in sorted(visibility.items()):
-            harness = bindir / f"cctally-{name}-test"
-            if not harness.is_file():
-                continue
-            scrape = owners.scrape_fixture_edges(
-                harness.read_text(encoding="utf-8")
-            )
-            row = {"fixturePaths": sorted(scrape.edges), "sourcePaths": []}
-            (private_rows if vis != "public" else public_rows)[name] = row
-            for edge in scrape.edges:
-                target = repo / edge
-                if edge.startswith("tests/fixtures/"):
-                    target.mkdir(parents=True, exist_ok=True)
-                    (target / "seed.json").write_text("{}\n", encoding="utf-8")
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-        (tests_dir / "harness-ownership.json").write_text(
-            json.dumps({"schemaVersion": 1, "harnesses": public_rows}, indent=2)
-            + "\n",
-            encoding="utf-8",
-        )
-        if private:
-            (tests_dir / "harness-ownership.private.json").write_text(
-                json.dumps(
-                    {"schemaVersion": 1, "harnesses": private_rows}, indent=2
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-    if git:
-        _git_commit_all(repo, "seed")
     return runner
 
 
-def _load_owners():
-    """bin/cctally-test-owners is EXTENSIONLESS, so spec_from_file_location
-    returns None for it; load it by hand the way tests/test_harness_ownership.py
-    does."""
-    loader = importlib.machinery.SourceFileLoader(
-        "_cctally_test_owners_sched", str(BIN / "cctally-test-owners")
-    )
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-def _git(repo, *args, check=True):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True, text=True, check=check, timeout=60,
-    )
-
-
-def _git_commit_all(repo, message):
-    if not (repo / ".git").exists():
-        _git(repo, "init", "-q")
-    _git(repo, "add", "-A")
-    _git(
-        repo, "-c", "user.email=t@e", "-c", "user.name=t",
-        "commit", "-q", "--allow-empty", "-m", message,
-    )
-    return _git(repo, "rev-parse", "HEAD").stdout.strip()
-
-
-def _admit(runner, env_overrides=None):
-    """Drive the runner past plan mode so admission actually runs. Admission
-    precedes LOGDIR creation, so a refusal never reaches the harness pool."""
-    # #963 J4: <parent>/<repo>/bin/cctally-test-all; the child's suite
-    # generation lies inside the test's allocation and is removed after.
+def _run(runner, env_overrides=None, args=()):
+    """Drive the runner past plan mode. The child's suite directory lies inside
+    the test's allocation and is removed after (#963 J4)."""
     parent = pathlib.Path(runner).parents[2]
     env = _hyg.child_aggregator_env(
         {"PATH": os.environ["PATH"], "CCTALLY_TEST_JOBS": "1"}, parent)
     env.update(env_overrides or {})
     proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=60
+        [str(runner), *args], env=env, capture_output=True, text=True, timeout=60
     )
-    _hyg.reclaim_child_generations(parent)
+    _hyg.reclaim_child_suite_dirs(parent)
     return proc
 
 
-def test_non_executable_test_remote_is_a_manifest_admission_error(tmp_path):
-    """The manifest, not the retired `required_harnesses` list, produces this.
-    A lost mode bit reports as a mode problem, never as an absent harness."""
-    runner = _tree(tmp_path, private=True, test_remote_mode=0o644)
-    p = _admit(runner)
-    assert p.returncode == 3, p.stdout + p.stderr
-    assert "not executable" in p.stderr
-    assert "test-remote" in p.stderr
-    assert "manifest row 'test-remote' has no" not in p.stderr
+# ------------------------------------------------------- harness discovery
 
 
-def test_missing_test_remote_is_a_manifest_admission_error_in_private_tree(
-        tmp_path):
-    """Deleting it outright is as bad as losing its executable bit (#446),
-    but the two are now distinct reason codes."""
-    runner = _tree(tmp_path, private=True, test_remote_mode=None)
-    p = _admit(runner)
-    assert p.returncode == 3, p.stdout + p.stderr
-    assert "manifest row 'test-remote' has no" in p.stderr
+def test_nonexecutable_harness_matching_the_glob_is_a_usage_error(tmp_path):
+    """Codex Q10: a matching file that lost its executable bit is an error,
+    never silently absent coverage, and the plan says so as loudly as a run."""
+    runner = _tree(tmp_path)
+    (runner.parent / "cctally-source-aware-test").chmod(0o644)
+    plan = _plan({}, runner=runner)
+    assert plan.returncode == 2, plan.stdout + plan.stderr
+    assert "cctally-source-aware-test" in plan.stderr
+    assert "not executable" in plan.stderr
+    run = _run(runner)
+    assert run.returncode == 2, run.stdout + run.stderr
+    assert "not executable" in run.stderr
 
 
-def test_plan_mode_still_exits_before_admission(tmp_path):
-    """Plan mode must stay side-effect-free: it exits before the manifest is
-    even parsed, so a tree that admission would refuse still plans."""
-    runner = _tree(tmp_path, private=True, test_remote_mode=None)
+def test_discovery_needs_no_manifest(tmp_path):
+    """The harness set is the executable glob, sorted, with reconcile last."""
+    runner = _tree(tmp_path, extra_harnesses=("alpha", "zeta"))
     p = _plan({}, runner=runner)
     assert p.returncode == 0, p.stderr
-    assert "harnesses=" in p.stdout
+    assert _kv(p.stdout)["harnesses"] == (
+        "alpha codex-quota source-aware zeta reconcile"
+    )
 
 
-def test_public_subset_tree_does_not_require_the_private_test_remote_harness(
-        tmp_path):
-    """The public mirror ships no bin/cctally-test-remote-test — .mirror-allowlist
-    excludes both it and the wrapper as maintainer-local tooling, and excludes
-    itself. Requiring it there hard-fails the public CI matrix before a single
-    harness runs (issue #131: the public matrix runs the shipped subset only)."""
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
-    p = _plan({}, runner=runner)
-    assert p.returncode == 0, p.stderr
-    assert "test-remote" not in _kv(p.stdout)["harnesses"].split()
+# ------------------------------------- supervision and the suite directory
 
 
-BENCHMARK_LEGS = [
-    {
-        "name": "benchmark",
-        "selectors": [
-            ["file", "tests/test_rebuild_benchmark.py"],
-            ["node", "tests/test_stats_writer_storm_386.py::"
-                     "test_h1_multiwriter_baseline_stays_intact"],
-            ["node", "tests/test_stats_writer_storm_386.py::"
-                     "test_dashboard_source_reader_releases_rollback_snapshot"],
-        ],
-        "nodes": [],
-    },
-    {"name": "pytest", "selectors": [], "nodes": []},
-]
+_REFUSAL = "cctally-test-all: run it through bin/cctally-test-remote bin/cctally-test-all"
 
 
-def _fake_pytest_tree(tmp_path, *, legs, extra_env=None):
+def _fake_uname(tmp_path, system):
+    fake = tmp_path / ("uname-" + system)
+    fake.mkdir(exist_ok=True)
+    (fake / "uname").write_text("#!/bin/sh\necho %s\n" % system)
+    (fake / "uname").chmod(0o755)
+    return fake
+
+
+def _unsupervised_env(tmp_path, system, **extra):
+    """A child environment on a faked platform, with the caller's run
+    directory removed unless ``extra`` names one."""
+    env = _hyg.child_aggregator_env({
+        "PATH": f"{_fake_uname(tmp_path, system)}{os.pathsep}{os.environ['PATH']}",
+        "CCTALLY_TEST_JOBS": "1",
+    }, tmp_path)
+    env.pop("CCTALLY_RUNNER_RUN_DIR", None)
+    env.update(extra)
+    return env
+
+
+def _private(runner):
+    """Mark a synthetic checkout as the private tree: `.mirror-allowlist` is
+    the aggregator's profile discriminator, and the published tree has none."""
+    (pathlib.Path(runner).parents[1] / ".mirror-allowlist").write_text("", encoding="utf-8")
+    return runner
+
+
+def test_test_all_refuses_unsupervised_on_darwin(tmp_path):
+    """Session 4: on Darwin the private tree's aggregator runs only inside a
+    supervised run, whose CCTALLY_RUNNER_RUN_DIR contains TMPDIR. Without it,
+    or with TMPDIR outside it, the run is refused with exit 2 before anything
+    executes. Hosted Linux CI runs it unsupervised, so the refusal is
+    Darwin-only, and plan mode, which executes nothing, is never refused."""
+    runner = _private(_tree(tmp_path))
+    args = ("--harness", "codex-quota")
+
+    def run(env):
+        return subprocess.run([str(runner), *args], env=env, capture_output=True,
+                              text=True, timeout=60)
+
+    bare = run(_unsupervised_env(tmp_path, "Darwin"))
+    assert bare.returncode == 2, bare.stdout + bare.stderr
+    assert _REFUSAL in bare.stderr.splitlines(), bare.stderr
+
+    elsewhere = tmp_path / "other-run"
+    elsewhere.mkdir()
+    outside = run(_unsupervised_env(tmp_path, "Darwin",
+                                    CCTALLY_RUNNER_RUN_DIR=str(elsewhere)))
+    assert outside.returncode == 2, outside.stdout + outside.stderr
+    assert _REFUSAL in outside.stderr.splitlines(), outside.stderr
+
+    supervised = run(_unsupervised_env(tmp_path, "Darwin",
+                                       CCTALLY_RUNNER_RUN_DIR=str(tmp_path)))
+    assert supervised.returncode == 3, supervised.stdout + supervised.stderr
+    assert _REFUSAL not in supervised.stderr
+
+    linux = run(_unsupervised_env(tmp_path, "Linux"))
+    assert linux.returncode == 3, linux.stdout + linux.stderr
+    assert _REFUSAL not in linux.stderr
+
+    plan = _plan({"PATH": f"{tmp_path / 'uname-Darwin'}{os.pathsep}{os.environ['PATH']}"},
+                 runner=runner)
+    assert plan.returncode == 0, plan.stderr
+    _hyg.reclaim_child_suite_dirs(tmp_path)
+
+
+def test_the_published_tree_is_never_refused_on_darwin(tmp_path):
+    """F2 (session 4 review): the published tree carries no runner client, and
+    its CONTRIBUTING.md tells a contributor to run bin/cctally-test-all, so it
+    behaves there exactly as it did before session 4: unsupervised on Darwin,
+    the run executes."""
+    runner = _tree(tmp_path)
+    proc = subprocess.run([str(runner), "--harness", "codex-quota"],
+                          env=_unsupervised_env(tmp_path, "Darwin"),
+                          capture_output=True, text=True, timeout=60)
+    _hyg.reclaim_child_suite_dirs(tmp_path)
+    assert _REFUSAL not in proc.stderr, proc.stderr
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_test_all_removes_its_suite_dir_after_reaping(tmp_path):
+    """Session 4 (spec C8): the suite directory is ``cs.XXXXXX`` beneath the
+    TMPDIR the run inherits, holding PYTEST_DEBUG_TEMPROOT. At exit the run
+    TERMs every process group it started, KILLs what outlives the grace and
+    removes the directory: a harness that leaves a TERM-ignoring descendant
+    behind in the pool's group neither keeps it alive nor keeps the directory."""
+    record = tmp_path / "lingering.txt"
+    body = (
+        "#!/usr/bin/env bash\n"
+        "trap '' TERM\n"
+        "sleep 300 </dev/null >/dev/null 2>&1 &\n"
+        "printf '%%s\\n%%s\\n' \"$!\" \"$PYTEST_DEBUG_TEMPROOT\" > %s\n"
+        "exit 0\n" % record
+    )
+    runner = _tree(tmp_path, extra_harnesses=("lingering",),
+                   harness_bodies={"lingering": body})
+    env = _hyg.child_aggregator_env(
+        {"PATH": os.environ["PATH"], "CCTALLY_TEST_JOBS": "1"}, tmp_path)
+    child_tmp = pathlib.Path(env["TMPDIR"])
+    pid = None
+    try:
+        proc = subprocess.run([str(runner), "--harness", "lingering"], env=env,
+                              capture_output=True, text=True, timeout=90)
+        assert proc.returncode == 3, proc.stdout + proc.stderr
+        pid_text, temproot = record.read_text(encoding="utf-8").splitlines()
+        pid = int(pid_text)
+        suite = pathlib.Path(temproot).parent
+        assert suite.parent == child_tmp, (suite, child_tmp)
+        assert re.match(r"^cs\.[A-Za-z0-9]{6}$", suite.name), suite.name
+        assert pathlib.Path(temproot).name == "t"
+        assert not _pid_alive(pid), "the lingering descendant %d outlived the run" % pid
+        assert not suite.exists(), "the suite directory %s was not removed" % suite
+        assert [p.name for p in child_tmp.iterdir()] == []
+    finally:
+        if pid is not None and _pid_alive(pid):
+            os.kill(pid, 9)
+
+
+def test_the_linux_matrix_variable_is_no_longer_a_profile(tmp_path):
+    """The dead private Docker profile is gone: the variable selects nothing
+    and refuses nothing."""
+    runner = _tree(tmp_path)
+    base = _plan({}, runner=runner)
+    with_var = _plan({"CCTALLY_LINUX_MATRIX_RUN": "1"}, runner=runner)
+    assert with_var.returncode == 0, with_var.stderr
+    assert _kv(with_var.stdout)["mode"] == "full"
+    assert with_var.stdout == base.stdout
+
+
+@pytest.mark.parametrize("flag,extra", [
+    ("--tier-fast", ("main",)),
+    ("--merge-gate", ("main",)),
+    ("--merge-gate-worker", ("main",)),
+    ("--with-estate-check", ()),
+])
+def test_retired_flags_are_usage_errors(tmp_path, flag, extra):
+    runner = _tree(tmp_path)
+    p = _plan({}, runner=runner, args=(flag, *extra))
+    assert p.returncode == 2, p.stdout + p.stderr
+    assert flag in p.stderr
+    assert "retired" in p.stderr
+
+
+# -------------------------------------------------- the harness exit status
+
+_SUMMARY_LIES_PASS = (
+    "#!/usr/bin/env bash\nprintf 'passed: 0   failed: 3\\n'\nexit 0\n"
+)
+_SUMMARY_LIES_FAIL = (
+    "#!/usr/bin/env bash\nprintf 'passed: 5   failed: 0\\n'\nexit 1\n"
+)
+_NO_SUMMARY_EXIT_2 = "#!/usr/bin/env bash\necho 'could not start'\nexit 2\n"
+
+
+def _outcome_reasons(path):
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    return doc, {(r["code"], r["subject"]) for r in doc["reasons"]}
+
+
+def test_harness_exit_status_decides_pass_fail_incomplete(tmp_path):
+    """Codex Q10: 0 passes, 1 fails, anything else is incomplete. The summary
+    line is diagnostic only: a harness that exits 0 while printing failures
+    passes, and one that exits 1 while printing none fails."""
+    runner = _tree(
+        tmp_path,
+        extra_harnesses=("liar-pass", "liar-fail", "broken"),
+        harness_bodies={
+            "liar-pass": _SUMMARY_LIES_PASS,
+            "liar-fail": _SUMMARY_LIES_FAIL,
+            "broken": _NO_SUMMARY_EXIT_2,
+        },
+    )
+    outcome = tmp_path / "outcome.json"
+    p = _run(runner, {"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)},
+             args=("--harness", "liar-pass", "--harness", "liar-fail",
+                   "--harness", "broken"))
+    doc, reasons = _outcome_reasons(outcome)
+    harness_reasons = {r for r in reasons if r[0] != "deliberate-subset"}
+    assert harness_reasons == {
+        ("harness-failed", "liar-fail"),
+        ("harness-incomplete", "broken"),
+    }, (doc, p.stderr)
+    assert doc["failureClass"] == "incomplete"
+    assert p.returncode == 3
+
+
+def test_a_harness_killed_by_a_signal_is_infrastructure(tmp_path):
+    runner = _tree(
+        tmp_path,
+        extra_harnesses=("killed",),
+        harness_bodies={"killed": "#!/usr/bin/env bash\nkill -9 $$\n"},
+    )
+    outcome = tmp_path / "outcome.json"
+    _run(runner, {"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)},
+         args=("--harness", "killed"))
+    _doc, reasons = _outcome_reasons(outcome)
+    assert ("harness-killed", "killed") in reasons
+
+
+# ------------------------------------------------------------ the pytest legs
+
+# The files the SERIAL entries of bin/_lib_test_selection.py name, derived
+# rather than restated (two are mirror-private, and a fake tree writes them
+# all whatever the profile).
+_SERIAL_FILES = tuple(sorted({entry.split("::")[0] for entry in _sel.SERIAL}))
+_STORM_H1 = ("tests/test_stats_writer_storm_386.py::"
+             "test_h1_multiwriter_baseline_stays_intact")
+_STORM_READER = ("tests/test_stats_writer_storm_386.py::"
+                 "test_dashboard_source_reader_releases_rollback_snapshot")
+
+
+def _quarantine_entry(node):
+    return {'id': node, 'evidence': 'inconsistent on unchanged code', 'invariant': 'x',
+            'issue': '#1', 'replacement': 'none needed', 'reviewBy': '2026-10-27'}
+
+
+def _fake_pytest_tree(tmp_path, *, serial_files=_SERIAL_FILES, quarantine=None,
+                      pytest_exit=None, extra_env=None):
     """A synthetic checkout whose pytest boundary is a recording fake.
 
-    Extracted from `test_wall_clock_benchmarks_run_outside_xdist` unchanged so
-    the execution-declaration cases can drive the same boundary. Everything but
-    `python3 -m pytest` DELEGATES to the real interpreter, because the contract
-    library parses the manifest and encodes the outcome object with stdlib json.
+    Everything but `python3 -m pytest` DELEGATES to the real interpreter,
+    because the aggregator builds its legs and encodes the outcome with
+    stdlib Python. ``pytest_exit`` maps a leg (`bulk` for the one carrying
+    `tests/`, `serial` for the other) to the status the fake returns.
 
-    Returns `(runner, calls, env)`; `calls` is the file every faked pytest argv
-    is appended to, in invocation order.
+    Returns `(runner, calls, env)`; `calls` is the file every faked pytest
+    argv is appended to, in invocation order, prefixed with the PYTEST_ADDOPTS
+    the leg was given.
     """
     repo = tmp_path / "repo"
     bindir = repo / "bin"
     tests_dir = repo / "tests"
     fake_bin = tmp_path / "fake-bin"
-    bindir.mkdir(parents=True)
-    tests_dir.mkdir()
     fake_bin.mkdir()
-    runner = bindir / "cctally-test-all"
-    shutil.copy2(RUNNER, runner)
-    for lib in sorted(BIN.glob("_lib-*.sh")):
-        shutil.copy2(lib, bindir / lib.name)
-    _copy_python_kernels(bindir, estate_legs=legs)
-
-    for name in ("codex-quota", "source-aware", "reconcile"):
-        harness = bindir / f"cctally-{name}-test"
-        harness.write_text(
-            "#!/usr/bin/env bash\nprintf 'passed: 1   failed: 0\\n'\n",
-            encoding="utf-8",
-        )
-        harness.chmod(0o755)
-
-    (tests_dir / "authoritative-test-manifest.json").write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "minHarnessRows": 0,
-                "harnesses": [
-                    {
-                        "name": n,
-                        "visibility": "public",
-                        "minCases": 0,
-                        "countPolicy": "fixed",
-                    }
-                    for n in ("codex-quota", "source-aware", "reconcile")
-                ],
-                "capabilities": [],
-                "forbiddenRegeneration": [],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    # NO runtime budget is written here, and that is deliberate (#650 item 5).
-    # A budget is read only by an ELIGIBLE run, which requires
-    # CCTALLY_AUTHORITATIVE_RUN=1, and no case here reaches one.
-    (tests_dir / "test_rebuild_benchmark.py").write_text(
-        "# execution is represented by the fake pytest below\n", encoding="utf-8",
-    )
-    (tests_dir / "test_stats_writer_storm_386.py").write_text(
-        "# execution is represented by the fake pytest below\n", encoding="utf-8",
-    )
+    runner = _ct.copy_aggregator(bindir)
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    for name in _BASE_HARNESSES:
+        _ct.write_harness(
+            bindir, name,
+            "#!/usr/bin/env bash\nprintf 'passed: 1   failed: 0\\n'\n")
+    for rel in serial_files:
+        (repo / rel).write_text("# executed by the fake pytest below\n",
+                                encoding="utf-8")
+    if quarantine is not None:
+        (tests_dir / "quarantine.json").write_text(json.dumps(quarantine))
     calls = tmp_path / "pytest-calls"
     fake_python = fake_bin / "python3"
-    # The pytest boundary is faked; everything else DELEGATES to the real
-    # interpreter, because the contract library parses the manifest and encodes
-    # the outcome object with stdlib json (`python3 -` / `python3 -c`). A stub
-    # that answered 2 to every other form would fail the fixture, not the
-    # property under test. The two optional-plugin probes keep their fixed
-    # answers so this case stays independent of what is pip-installed.
-    #
-    # The recorded line carries the ENVIRONMENT the leg was given as well as its
-    # argv, because #648 D7 sanitizes that environment and an argv-only record
-    # could not tell a sanitized leg from an unsanitized one.
+    exits = pytest_exit or {}
     fake_python.write_text(
         """#!/usr/bin/env bash
 if [ "$1" = "-m" ] && [ "$2" = "pytest" ]; then
     if [ "${3:-}" = "--version" ]; then
         exit 0
     fi
-    printf 'ADDOPTS=[%s] %s\\n' "${PYTEST_ADDOPTS:-}" "$*" >> "$CCTALLY_FAKE_PYTHON_LOG"
-    exit 0
+    printf 'ADDOPTS=[%%s] %%s\\n' "${PYTEST_ADDOPTS:-}" "$*" >> "$CCTALLY_FAKE_PYTHON_LOG"
+    leg=serial
+    for a in "$@"; do [ "$a" = tests/ ] && leg=bulk; done
+    if [ "$leg" = bulk ]; then rc=%s; else rc=%s; fi
+    echo "1 passed in 0.01s"
+    exit "$rc"
 fi
 if [ "$1" = "-c" ]; then
     case "$2" in
@@ -573,12 +474,10 @@ if [ "$1" = "-c" ]; then
     esac
 fi
 exec "$CCTALLY_REAL_PYTHON3" "$@"
-""",
+""" % (exits.get("bulk", 0), exits.get("serial", 0)),
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-
-    # #963 J4: the child's TMPDIR lies inside this test's allocation.
     env = _hyg.child_aggregator_env({
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
         "CCTALLY_FAKE_PYTHON_LOG": str(calls),
@@ -589,121 +488,152 @@ exec "$CCTALLY_REAL_PYTHON3" "$@"
     return runner, calls, env
 
 
-def test_wall_clock_benchmarks_run_outside_xdist(tmp_path):
-    """Wall-clock SLAs must not compete with the parallel pytest estate."""
-    runner, calls, env = _fake_pytest_tree(tmp_path, legs=BENCHMARK_LEGS)
+def _drive(tmp_path, runner, env):
     proc = subprocess.run(
         [str(runner)], env=env, capture_output=True, text=True, timeout=60
     )
-    _hyg.reclaim_child_generations(tmp_path)
-
-    assert proc.returncode == 0, proc.stderr
-    invocations = calls.read_text(encoding="utf-8").splitlines()
-    assert len(invocations) == 2, invocations
-    bulk, benchmark = invocations
-    assert "tests/" in bulk
-    assert "--ignore=tests/test_rebuild_benchmark.py" in bulk
-    assert (
-        "--deselect=tests/test_stats_writer_storm_386.py::"
-        "test_h1_multiwriter_baseline_stays_intact"
-    ) in bulk
-    assert (
-        "--deselect=tests/test_stats_writer_storm_386.py::"
-        "test_dashboard_source_reader_releases_rollback_snapshot"
-    ) in bulk
-    assert " -n 2" in bulk
-    assert "tests/test_rebuild_benchmark.py" in benchmark
-    assert (
-        "tests/test_stats_writer_storm_386.py::"
-        "test_h1_multiwriter_baseline_stays_intact"
-    ) in benchmark
-    assert (
-        "tests/test_stats_writer_storm_386.py::"
-        "test_dashboard_source_reader_releases_rollback_snapshot"
-    ) in benchmark
-    assert " -n " not in benchmark
+    _hyg.reclaim_child_suite_dirs(tmp_path)
+    return proc
 
 
-def test_both_legs_are_built_from_the_execution_declaration(tmp_path):
-    """#648 D7 -- ONE declaration, and the shell holds no copy of it.
+def _legs(calls):
+    lines = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+    bulk = [line for line in lines if " tests/ " in line + " "]
+    serial = [line for line in lines if line not in bulk]
+    return bulk, serial
 
-    Proven by moving the declaration rather than by reading the source: these
-    selectors name files and nodes the aggregator's retired literals never
-    mentioned, so argv that still matched the old ones would be argv built from
-    a second copy.
-    """
-    runner, calls, env = _fake_pytest_tree(tmp_path, legs=[
-        {"name": "benchmark", "selectors": [
-            ["file", "tests/test_moved_benchmark.py"],
-            ["node", "tests/test_other.py::test_moved_node"],
-        ], "nodes": []},
-        {"name": "pytest", "selectors": [], "nodes": []},
-    ])
-    proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=60
-    )
-    _hyg.reclaim_child_generations(tmp_path)
+
+def test_bulk_leg_ignores_serial_files_and_deselects_serial_and_quarantined_nodes(
+        tmp_path):
+    flaky = "tests/test_alpha.py::test_flaky"
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, quarantine=[_quarantine_entry(flaky)])
+    proc = _drive(tmp_path, runner, env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    bulk, benchmark = calls.read_text(encoding="utf-8").splitlines()
-    assert "--ignore=tests/test_moved_benchmark.py" in bulk
-    assert "--deselect=tests/test_other.py::test_moved_node" in bulk
-    assert "tests/test_rebuild_benchmark.py" not in bulk
-    assert "tests/test_moved_benchmark.py" in benchmark
-    assert "tests/test_other.py::test_moved_node" in benchmark
+    (bulk,), (serial,) = _legs(calls)
+    serial_files = [entry for entry in _sel.SERIAL if "::" not in entry]
+    assert "tests/test_rebuild_benchmark.py" in serial_files
+    for rel in serial_files:
+        assert f"--ignore={rel}" in bulk, bulk
+        assert rel in serial.split(), serial
+    for node in (_STORM_H1, _STORM_READER):
+        assert f"--deselect={node}" in bulk, bulk
+        assert node in serial.split(), serial
+    assert f"--deselect={flaky}" in bulk, bulk
+    assert f"--deselect={flaky}" in serial, serial
+    assert " -n 2" in bulk
+    assert " -n " not in serial
+    # The retired estate observer is no longer loaded by either leg.
+    assert "_estate_leg_plugin" not in bulk + serial
+
+
+def test_a_serial_target_absent_from_the_tree_is_not_selected(tmp_path):
+    """The public mirror carries fewer tests: an entry naming a file the tree
+    does not have is neither ignored nor run."""
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, serial_files=("tests/test_rebuild_benchmark.py",))
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (bulk,), (serial,) = _legs(calls)
+    assert "test_quota_mutation_coverage" not in bulk + serial
+    assert serial.split()[1:].count("tests/test_rebuild_benchmark.py") == 1
+
+
+def test_leg_emptied_by_selection_is_omitted(tmp_path):
+    """Selection empties the serial leg when every serial target is absent or
+    quarantined; the leg is then omitted rather than run to an exit 5."""
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path,
+        serial_files=("tests/test_stats_writer_storm_386.py",),
+        quarantine=[_quarantine_entry(_STORM_H1),
+                    _quarantine_entry(_STORM_READER)],
+        pytest_exit={"serial": 5},
+    )
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    bulk, serial = _legs(calls)
+    assert len(bulk) == 1 and serial == [], calls.read_text()
+
+
+def test_pytest_exit_5_on_a_nonempty_leg_is_incomplete(tmp_path):
+    outcome = tmp_path / "outcome.json"
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, pytest_exit={"serial": 5},
+        extra_env={"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)})
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    doc, reasons = _outcome_reasons(outcome)
+    assert doc["failureClass"] == "incomplete"
+    assert ("pytest-collected-nothing", "benchmark") in reasons, reasons
+
+
+def test_pytest_exit_5_on_the_bulk_leg_is_incomplete(tmp_path):
+    # The bulk leg is never emptied by the selection (it always carries
+    # `tests/`), so collecting nothing there is a run that verified nothing:
+    # it must be incomplete, never the pass a zero-failure leg would read as.
+    outcome = tmp_path / "outcome.json"
+    runner, calls, env = _fake_pytest_tree(
+        tmp_path, pytest_exit={"bulk": 5},
+        extra_env={"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)})
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    doc, reasons = _outcome_reasons(outcome)
+    assert doc["failureClass"] == "incomplete"
+    assert ("pytest-collected-nothing", "pytest") in reasons, reasons
 
 
 def test_pytest_addopts_does_not_reach_either_execution_leg(tmp_path):
-    """#648 M13, D7 -- a pre-existing hole in the gate this session inherits.
-
-    `PYTEST_ADDOPTS=--ignore=tests/<file>.py` narrows an authoritative run while
-    admission observes the complete estate, and the run still exits 0. Nothing
-    reads the variable and it is absent from `forbiddenRegeneration`, so the
-    execution legs are sanitized instead.
-    """
+    """#648 M13: `PYTEST_ADDOPTS=--ignore=tests/<file>.py` would narrow a run,
+    so the execution legs are sanitized."""
     runner, calls, env = _fake_pytest_tree(
-        tmp_path, legs=BENCHMARK_LEGS,
+        tmp_path,
         extra_env={"PYTEST_ADDOPTS": "--ignore=tests/test_rebuild_benchmark.py"},
     )
-    proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=60
-    )
-    _hyg.reclaim_child_generations(tmp_path)
+    proc = _drive(tmp_path, runner, env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    for line in calls.read_text(encoding="utf-8").splitlines():
+    lines = calls.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2, lines
+    for line in lines:
         assert line.startswith("ADDOPTS=[] "), line
     assert "PYTEST_ADDOPTS" in proc.stderr
 
 
 def test_the_durations_variable_is_the_supported_route_addopts_used_to_be(
         tmp_path):
-    """Sanitizing PYTEST_ADDOPTS removes a capability the Linux lane used.
-
-    `bin/cctally-test-linux-matrix` injected `PYTEST_ADDOPTS=--durations=0` on
-    its acceptance lane precisely because the aggregator's pytest invocation was
-    hard-coded. Sanitizing the variable without a replacement would silently
-    drop that lane's per-test timing output, so a narrow variable that cannot
-    NARROW anything takes its place.
-    """
+    """A narrow variable that cannot NARROW anything replaces the
+    `PYTEST_ADDOPTS=--durations=0` route the sanitizing removed."""
     runner, calls, env = _fake_pytest_tree(
-        tmp_path, legs=BENCHMARK_LEGS,
-        extra_env={"CCTALLY_PYTEST_DURATIONS": "1"},
+        tmp_path, extra_env={"CCTALLY_PYTEST_DURATIONS": "1"},
     )
-    proc = subprocess.run(
-        [str(runner)], env=env, capture_output=True, text=True, timeout=60
-    )
-    _hyg.reclaim_child_generations(tmp_path)
+    proc = _drive(tmp_path, runner, env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     for line in calls.read_text(encoding="utf-8").splitlines():
         assert "--durations=0" in line, line
 
 
+def test_a_tree_without_a_quarantine_list_deselects_nothing(tmp_path):
+    # The public mirror may carry no list: nothing is deselected.
+    runner, calls, env = _fake_pytest_tree(tmp_path)
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "--deselect=tests/test_alpha.py" not in calls.read_text()
+
+
+def test_the_leg_durations_are_printed(tmp_path):
+    """The first reduced full run records its leg durations from this line."""
+    runner, _calls, env = _fake_pytest_tree(tmp_path)
+    proc = _drive(tmp_path, runner, env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    legs = [line for line in proc.stdout.splitlines()
+            if line.startswith("Pytest legs:")]
+    assert len(legs) == 1, proc.stdout
+    assert "bulk=" in legs[0] and "serial=" in legs[0]
+
+
 # ------------------------------------------- the effective-configuration plan
 #
 # With all three roles explicitly exported, the internal BUDGET intermediate no
-# longer influences any worker count (#529 S5 section 2.3). Left reporting the
-# host's core count, plan output would carry a host-dependent number that
-# decides nothing, and two runners would print different plans for identical
-# effective configurations.
+# longer influences any worker count (#529 S5 section 2.3).
 
 
 def test_plan_budget_reports_the_effective_configuration_not_the_core_count():
@@ -718,9 +648,7 @@ def test_plan_budget_reports_the_effective_configuration_not_the_core_count():
     assert large.returncode == 0, large.stderr
     assert _kv(small.stdout)["budget"] == "4/2/10", small.stdout
     assert _kv(large.stdout)["budget"] == "4/2/10", large.stdout
-    # Every plan line except `ncpu=` is identical across the two hosts. The
-    # `ncpu=` line necessarily still differs, because it reports the seam's own
-    # value and test_fake_ncpu_inside_plan_mode_is_still_honoured asserts that.
+
     def _without_ncpu(text):
         return [line for line in text.splitlines() if not line.startswith("ncpu=")]
 
@@ -736,41 +664,30 @@ def test_plan_budget_still_reflects_a_combined_knob():
 
 
 def test_plan_mode_reports_the_subset_selection(tmp_path):
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    runner = _tree(tmp_path)
     p = _plan({}, runner=runner, args=("--harness", "source-aware"))
     assert p.returncode == 0, p.stdout + p.stderr
     kv = _kv(p.stdout)
     assert kv["mode"] == "subset"
     assert kv["pytest_disposition"] == "skipped"
-    # `harnesses=` is the single carrier of the selection. A second key
-    # printing the same variable under a different name used to sit beside it,
-    # inviting a reader to equate it with the record's manifest-ordered
-    # `coverage.selectedHarnesses`, which it is not.
     assert kv["harnesses"] == "source-aware"
     assert "selected" not in kv, kv
 
 
 def test_plan_mode_reports_a_full_run_as_full(tmp_path):
     subset = _kv(
-        _plan(
-            {},
-            runner=_tree(tmp_path, private=False, test_remote_mode=None),
-            args=("--harness", "source-aware"),
-        ).stdout
+        _plan({}, runner=_tree(tmp_path), args=("--harness", "source-aware")).stdout
     )
     full = _kv(_plan({}).stdout)
     assert full["mode"] == "full"
     assert full["pytest_disposition"] == "full"
-    # The real content of "full": the plan names the whole discovered estate,
-    # ordered so `reconcile` stays the last row, and it is strictly wider than
-    # a subset plan for the same key.
     names = full["harnesses"].split()
     assert len(names) > len(subset["harnesses"].split())
     assert names[-1] == "reconcile", names
 
 
 def test_plan_mode_with_a_subset_stays_side_effect_free(tmp_path):
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    runner = _tree(tmp_path)
     evidence = tmp_path / "ev"
     p = _plan(
         {"CCTALLY_TEST_EVIDENCE_ROOT": str(evidence)},
@@ -782,19 +699,14 @@ def test_plan_mode_with_a_subset_stays_side_effect_free(tmp_path):
 
 
 def test_plan_mode_still_rejects_an_unknown_harness(tmp_path):
-    """Selection is validated even in plan mode: a plan for a set that cannot
-    be run is not a plan."""
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    runner = _tree(tmp_path)
     p = _plan({}, runner=runner, args=("--harness", "no-such-harness"))
     assert p.returncode == 2, p.stdout + p.stderr
     assert "no-such-harness" in p.stderr
 
 
 def test_plan_mode_with_a_subset_publishes_no_outcome_record(tmp_path):
-    """A plan is never an authoritative outcome, and a subset plan is not one
-    either — the two modes stay mutually exclusive rather than precedence
-    ordered."""
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
+    runner = _tree(tmp_path)
     outcome = tmp_path / "outcome.json"
     p = _plan(
         {"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)},
@@ -808,67 +720,64 @@ def test_plan_mode_with_a_subset_publishes_no_outcome_record(tmp_path):
 # ------------------------------------------- dispatch order vs report order
 #
 # preserve-item 29: the printed harness row order is deterministic and
-# independent of dispatch order. Before #630 S3 that held only because the two
-# orders were the same shell array. The split below makes it structural.
+# independent of dispatch order. Duration rows are HINTS (Codex Q10): a
+# missing, stale or malformed row orders nothing and suppresses nothing.
 
 
 def test_plan_reports_dispatch_order_and_scheduler_mode_separately(tmp_path):
-    """The two orders are separately named even when identical. Without a
-    duration table the scheduler must say so rather than silently defaulting."""
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
-    proc = _plan({}, runner=runner)
-    assert proc.returncode == 0, proc.stderr
-    lines = _kv(proc.stdout)
+    runner = _tree(tmp_path)
+    lines = _kv(_plan({}, runner=runner).stdout)
     assert "harnesses" in lines and "dispatch_harnesses" in lines
     assert lines["scheduler"] == "fallback"
-    # Identical here by construction; Task 2 makes them differ.
     assert lines["dispatch_harnesses"] == lines["harnesses"]
 
 
 def test_dispatch_is_longest_first_and_ties_break_by_report_position(tmp_path):
-    """Four unequal durations plus a deliberate tie. Asserting the COMPLETE
-    sequence: checking only the first element, or set equality, would pass an
-    implementation that merely moved the longest harness to the front."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 40)],
     )
     proc = _plan({}, runner=runner)
     assert proc.returncode == 0, proc.stderr
     lines = _kv(proc.stdout)
     assert lines["scheduler"] == "lpt"
-    # report order is discovery order with reconcile appended last
     assert lines["harnesses"] == "codex-quota source-aware reconcile"
-    # 40 and 40 tie, so report position decides: source-aware precedes reconcile.
     assert lines["dispatch_harnesses"] == "source-aware reconcile codex-quota"
-    # Non-vacuity: the orders must actually differ, or this asserts nothing.
-    assert lines["dispatch_harnesses"] != lines["harnesses"]
+
+
+def test_missing_duration_hint_never_suppresses_a_harness(tmp_path):
+    """A table that names one harness, a harness nobody has timed and a row for
+    a harness that no longer exists still dispatches every discovered harness:
+    unhinted ones first, in report order, then the hinted ones longest-first."""
+    runner = _tree(
+        tmp_path,
+        extra_harnesses=("new",),
+        durations=[("source-aware", 40), ("retired-long-ago", 99),
+                   ("codex-quota", "not-a-number")],
+    )
+    proc = _plan({}, runner=runner)
+    assert proc.returncode == 0, proc.stderr
+    lines = _kv(proc.stdout)
+    assert lines["scheduler"] == "lpt", proc.stderr
+    assert lines["harnesses"] == "codex-quota new source-aware reconcile"
+    assert lines["dispatch_harnesses"] == "codex-quota new reconcile source-aware"
+    # And a real run executes the unhinted harness.
+    sentinel = tmp_path / "new-ran"
+    (runner.parent / "cctally-new-test").write_text(
+        "#!/usr/bin/env bash\ntouch %s\n" % sentinel)
+    _run(runner, args=("--harness", "new"))
+    assert sentinel.exists()
 
 
 def test_plan_mode_writes_no_bytecode_into_the_tree_it_reads(tmp_path):
-    """Preserve-item 25: plan mode stays side-effect-free.
-
-    The scheduler imports bin/_lib_harness_durations with <root>/bin on
-    sys.path, and an ordinary import has CPython write
-    bin/__pycache__/_lib_harness_durations.<tag>.pyc beside the source. The
-    remote wrapper's environment redirects that write and CI's does not, so
-    what keeps the item true is `python3 -B` rather than an ambient variable.
-    `_plan` passes a minimal environment carrying neither
-    PYTHONDONTWRITEBYTECODE nor PYTHONPYCACHEPREFIX, so a green result here
-    cannot have been produced by the caller's own environment.
-    """
+    """Preserve-item 25: plan mode stays side-effect-free; `python3 -B` keeps
+    the scheduler's import from writing bin/__pycache__."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 5)],
     )
     proc = _plan({}, runner=runner)
     assert proc.returncode == 0, proc.stderr
-    # Non-vacuity: the run really did import the module. Without this a tree
-    # whose scheduler never ran would satisfy the assertion below trivially.
     assert _kv(proc.stdout)["scheduler"] == "lpt", proc.stdout + proc.stderr
     repo = runner.parent.parent
     caches = sorted(str(p.relative_to(repo)) for p in repo.rglob("__pycache__"))
@@ -878,48 +787,22 @@ def test_plan_mode_writes_no_bytecode_into_the_tree_it_reads(tmp_path):
 @pytest.mark.parametrize(
     "mutation,expected_reason",
     [
-        ("missing", "no duration table"),
-        ("malformed", "malformed row"),
-        ("omits-a-harness", "does not cover"),
-        ("unknown-name", "unknown harness"),
-        ("validator-unimportable", "no duration table validator"),
-        ("undispatchable-harness", "would drop"),
+        ("missing", "no duration hints"),
+        ("validator-unimportable", "no duration hint reader"),
     ],
 )
-def test_a_bad_duration_table_falls_back_to_report_order(
+def test_without_usable_hints_dispatch_falls_back_to_report_order(
     tmp_path, mutation, expected_reason
 ):
-    """Each case asserts the DIAGNOSTIC and the resulting order. Asserting only
-    exit 0 would pass an implementation that ignored the table entirely.
-
-    Two of the six are not about the table's bytes. `validator-unimportable`
-    gives the tree a bin/_lib_harness_durations.py that raises on import, which
-    is the scheduler's ImportError branch. Deleting the file instead does NOT
-    reach it — see _copy_python_kernels for the measured reason.
-    `undispatchable-harness` puts a harness on disk that the manifest
-    and the table do not declare: the table is then a valid exact cover, the
-    sort silently omits the extra name, and dispatching that shorter list would
-    report and count a harness the pool never ran.
-    """
     rows = [("codex-quota", 10), ("source-aware", 40), ("reconcile", 5)]
     kwargs = {}
     if mutation == "missing":
         rows = None
-    elif mutation == "malformed":
-        rows = [("codex-quota", 10), ("source-aware", "not-a-number"), ("reconcile", 5)]
-    elif mutation == "omits-a-harness":
-        rows = [("codex-quota", 10), ("reconcile", 5)]
-    elif mutation == "unknown-name":
-        rows = rows + [("no-such-harness", 7)]
     elif mutation == "validator-unimportable":
         kwargs["validator_body"] = (
-            'raise ImportError("synthetic: this validator cannot be loaded")\n'
+            'raise ImportError("synthetic: this module cannot be loaded")\n'
         )
-    elif mutation == "undispatchable-harness":
-        kwargs["extra_harnesses"] = ("orphan",)
-    runner = _tree(
-        tmp_path, private=False, test_remote_mode=None, durations=rows, **kwargs
-    )
+    runner = _tree(tmp_path, durations=rows, **kwargs)
     proc = _plan({}, runner=runner)
     assert proc.returncode == 0, proc.stderr
     lines = _kv(proc.stdout)
@@ -929,49 +812,22 @@ def test_a_bad_duration_table_falls_back_to_report_order(
 
 
 def test_a_fallback_diagnostic_never_reaches_the_dispatch_list(tmp_path):
-    """The capture takes stdout alone.
-
-    It used to be `2>&1`, and the shell read only the first line of the merged
-    stream — so anything the interpreter printed to stderr on a ZERO exit
-    became the dispatch list. PYTHONVERBOSE reproduces that exactly and
-    deterministically: the first merged line is `import _frozen_importlib #
-    frozen`, which is what the pool would then have been asked to run. The
-    table here is perfectly good, so the assertion is that dispatch is still
-    the real longest-first sequence.
-    """
+    """The capture takes stdout alone: PYTHONVERBOSE writes import lines to
+    stderr on a zero exit, and none of them may become a harness name."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 5)],
     )
     proc = _plan({"PYTHONVERBOSE": "1"}, runner=runner)
     assert proc.returncode == 0, proc.stderr
     lines = _kv(proc.stdout)
     assert lines["scheduler"] == "lpt", proc.stdout + proc.stderr
-    assert lines["dispatch_harnesses"] == "source-aware codex-quota reconcile", (
-        proc.stdout + proc.stderr
-    )
+    assert lines["dispatch_harnesses"] == "source-aware codex-quota reconcile"
 
 
 def test_a_good_table_produces_no_diagnostic_at_all(tmp_path):
-    """The quiet path is asserted, not assumed.
-
-    The fallback branch used to echo the captured text unconditionally, so a
-    run whose capture was empty printed a bare blank line to stderr — a
-    diagnostic reporting nothing, on a run where nothing was wrong. Asserting
-    the absence of a substring would not catch that, because the defect emitted
-    no substring; the blank line IS the symptom, so the blank line is what is
-    asserted against.
-
-    `stderr == ""` was stricter than the property and carried no diagnostic
-    value: any byte from any interpreter in the chain — a DeprecationWarning, a
-    PYTHONWARNINGS setting, a locale complaint — reddened this case while
-    saying nothing about the scheduler."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 5)],
     )
     proc = _plan({}, runner=runner)
@@ -983,15 +839,8 @@ def test_a_good_table_produces_no_diagnostic_at_all(tmp_path):
 
 
 def test_the_dispatch_override_forces_report_order_on_an_identical_tree(tmp_path):
-    """#630 S3's decision rule compares longest-first dispatch against report
-    order. Without this override the only way to reach report order is to remove
-    the duration table, which faults pre-flight and reds the preflight harness's
-    real-tree case — so the two arms could not be measured on the same tree, and
-    a paired difference over two different trees is not a paired difference."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 40)],
     )
     baseline = _kv(_plan({}, runner=runner).stdout)
@@ -1000,21 +849,14 @@ def test_the_dispatch_override_forces_report_order_on_an_identical_tree(tmp_path
     lines = _kv(proc.stdout)
     assert lines["scheduler"] == "report-forced"
     assert lines["dispatch_harnesses"] == lines["harnesses"]
-    # Non-vacuity: the override is only meaningful if the unforced tree really
-    # would have dispatched in a different order.
     assert baseline["scheduler"] == "lpt"
     assert baseline["dispatch_harnesses"] != baseline["harnesses"]
-    # The estate itself must be untouched — only the order may differ.
     assert lines["harnesses"] == baseline["harnesses"]
 
 
 def test_the_dispatch_override_accepts_the_shipped_arm_explicitly(tmp_path):
-    """`lpt` names the default rather than changing it, so a measurement script
-    can state both arms rather than expressing one of them as an absence."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 40)],
     )
     proc = _plan({"CCTALLY_TEST_ALL_DISPATCH": "lpt"}, runner=runner)
@@ -1025,556 +867,11 @@ def test_the_dispatch_override_accepts_the_shipped_arm_explicitly(tmp_path):
 
 
 def test_an_unrecognized_dispatch_override_refuses_rather_than_guessing(tmp_path):
-    """Fail closed. A typo that fell through to the default would produce a run
-    labelled as the treatment arm while the operator believed it was the
-    control, and the whole measurement would be silently wrong."""
     runner = _tree(
         tmp_path,
-        private=False,
-        test_remote_mode=None,
         durations=[("codex-quota", 10), ("source-aware", 40), ("reconcile", 40)],
     )
     proc = _plan({"CCTALLY_TEST_ALL_DISPATCH": "reoprt"}, runner=runner)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "CCTALLY_TEST_ALL_DISPATCH" in proc.stderr
     assert "reoprt" in proc.stderr
-
-
-# ------------------------------------------------------ the tiered mode (#630 S7)
-#
-# `--tier-fast <BASE-REV>` takes a BASE REVISION, never a revision range, and
-# derives its change set from the merge base UNIONED with working-tree dirt. The
-# distinction is what makes the tier citable while `--harness` cannot be:
-# `--harness` takes a set the caller chose, so nothing in the tree can prove the
-# caller chose correctly, and preserve-item 19 records that exiting 0 for it "was
-# considered and rejected". A tier's set is a function of the tree.
-#
-# Revision 1 accepted an arbitrary range and passed it to `git diff`. The wrapper
-# certifies the complete MATERIALIZED working tree, uncommitted and untracked
-# inputs included (preserve-item 10), so a caller could have supplied an unrelated
-# non-empty range that selected fewer harnesses than the tree actually required
-# and received a citable receipt for it.
-
-_TIER_HARNESS = (
-    "#!/usr/bin/env bash\n"
-    'cp "$REPO_ROOT/tests/fixtures/{name}/seed.json" .\n'
-    "exit 0\n"
-)
-
-
-def _tier_tree(tmp_path, *, private=True, durations=None):
-    """A synthetic checkout the tier can actually attribute over: a git repo,
-    ownership rows derived from each harness's own text, `frontend` (public, and
-    force-included in both profiles) and `test-remote` (private, and force-
-    included only where the active profile declares it)."""
-    if private and (
-        not (REPO / ".githooks").exists()
-        or not (REPO / ".githooks" / "_match.py").exists()
-    ):
-        pytest.skip("the allowlist classifier .githooks/_match.py is maintainer-local")
-    return _tree(
-        tmp_path,
-        private=private,
-        test_remote_mode=0o755 if private else None,
-        durations=durations,
-        extra_manifest_harnesses=(("frontend", "public"),),
-        harness_bodies={
-            "codex-quota": _TIER_HARNESS.format(name="codex-quota"),
-            "source-aware": _TIER_HARNESS.format(name="source-aware"),
-        },
-        ownership=True,
-        git=True,
-    )
-
-
-def _tier_plan(runner, base, env_overrides=None, extra_args=()):
-    return _plan(
-        env_overrides or {}, runner=runner, args=("--tier-fast", base, *extra_args)
-    )
-
-
-def _head(runner):
-    return _git(runner.parent.parent, "rev-parse", "HEAD").stdout.strip()
-
-
-def _manifest_names(runner, profile):
-    doc = json.loads(
-        (runner.parent.parent / "tests" / "authoritative-test-manifest.json")
-        .read_text(encoding="utf-8")
-    )
-    return [
-        row["name"]
-        for row in doc["harnesses"]
-        if profile == "private" or row["visibility"] == "public"
-    ]
-
-
-def test_the_tier_basis_includes_working_tree_dirt(tmp_path):
-    """#630 S7 / pre-plan review P1. The wrapper certifies the MATERIALIZED
-    tree, uncommitted and untracked inputs included, so a basis computed from
-    commits alone lets an unrelated base select fewer harnesses than the tree
-    needs and still mint a citable receipt. Because the working-tree half is
-    unioned in, a dirty tree can only WIDEN the selection, never narrow it."""
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    base = _head(runner)
-
-    # One tracked modification and one untracked addition. Neither is in the
-    # committed diff against the merge base, which is empty here by construction.
-    (repo / "bin" / "cctally-source-aware-test").write_text(
-        _TIER_HARNESS.format(name="source-aware") + "# touched\n", encoding="utf-8"
-    )
-    (repo / "tests" / "fixtures" / "codex-quota" / "new.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-
-    plan = _kv(_tier_plan(runner, base).stdout)
-    selected = plan["tier_selected"].split()
-    assert "source-aware" in selected, plan
-    assert "codex-quota" in selected, plan
-    assert plan["tier_committed_paths"] == "0", plan
-    assert plan["tier_worktree_paths"] == "2", plan
-    # Non-vacuity: the tier really narrowed, so "everything is selected" cannot
-    # be what made the two assertions above true.
-    assert plan["tier_omitted"].split() == ["reconcile"], plan
-
-
-def test_the_tier_basis_counts_a_committed_change_separately(tmp_path):
-    """The other half of the union, and the control for the case above: the same
-    two paths, committed rather than left dirty, move from `worktreePaths` to
-    `committedPaths` and select the same harnesses."""
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    base = _head(runner)
-    (repo / "bin" / "cctally-source-aware-test").write_text(
-        _TIER_HARNESS.format(name="source-aware") + "# touched\n", encoding="utf-8"
-    )
-    (repo / "tests" / "fixtures" / "codex-quota" / "new.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-    _git_commit_all(repo, "work")
-
-    plan = _kv(_tier_plan(runner, base).stdout)
-    assert plan["tier_committed_paths"] == "2", plan
-    assert plan["tier_worktree_paths"] == "0", plan
-    selected = plan["tier_selected"].split()
-    assert "source-aware" in selected and "codex-quota" in selected, plan
-    assert plan["tier_omitted"].split() == ["reconcile"], plan
-
-
-def test_the_tier_basis_is_recorded_so_selection_is_reproducible(tmp_path):
-    """The resolved basis is recorded rather than left in the caller's shell
-    history, so the selection can be reproduced from the record."""
-    runner = _tier_tree(tmp_path)
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    assert len(plan["tier_base_oid"]) == 40, plan
-    assert len(plan["tier_head_oid"]) == 40, plan
-    assert plan["tier_base_oid"] == plan["tier_head_oid"], plan
-    assert plan["tier_committed_paths"].isdigit(), plan
-    assert plan["tier_worktree_paths"].isdigit(), plan
-
-
-def test_an_unresolvable_base_is_a_usage_error(tmp_path):
-    runner = _tier_tree(tmp_path)
-    p = _tier_plan(runner, "not-a-rev")
-    assert p.returncode == 2, p.stdout + p.stderr
-    assert "not-a-rev" in p.stderr, p.stderr
-
-
-def test_the_tier_refuses_a_tree_that_is_not_a_repository(tmp_path):
-    """The basis is a git computation, so a tree with no repository cannot
-    produce one. Refusing is the fail-closed answer; a tier that silently
-    proceeded would certify a selection it never derived.
-
-    #630 S7 / Task 2 review: made hermetic. `git -C <dir>` walks UP from that
-    directory, so "this tree is not a repository" was a claim about the ambient
-    filesystem rather than about the fixture — under a tmp root that happened to
-    sit inside a checkout, git would resolve an enclosing work tree and the case
-    would assert the opposite of what it names. GIT_CEILING_DIRECTORIES stops
-    the walk, and the precondition below proves it stopped."""
-    runner = _tree(
-        tmp_path, private=False, test_remote_mode=None,
-        extra_manifest_harnesses=(("frontend", "public"),), ownership=True,
-    )
-    repo = runner.parent.parent
-    ceiling = {"GIT_CEILING_DIRECTORIES": str(repo.parent)}
-    # Asserted at call time rather than assumed: if some future tmp layout let
-    # git find a work tree here anyway, this fails as a broken fixture instead
-    # of quietly turning the case below into a test of something else.
-    probe = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True,
-        env={**os.environ, **ceiling}, timeout=60,
-    )
-    assert probe.returncode != 0, (
-        "fixture precondition: the synthetic tree must resolve NO enclosing "
-        f"git work tree, and it resolved {probe.stdout.strip()!r}"
-    )
-
-    p = _tier_plan(runner, "HEAD", env_overrides=ceiling)
-    assert p.returncode == 2, p.stdout + p.stderr
-    # Named, because before the flag existed this case passed on
-    # "unrecognised argument '--tier-fast'" — an exit 2 for a different reason.
-    assert "git" in p.stderr.lower(), p.stderr
-
-
-# Each row is (argv after the runner, the stderr sentence unique to that
-# refusal). Four separate mistakes, and a caller can only fix the one they
-# made — which is exactly why `--harness` carries the same four and says so in
-# its own comment.
-#
-# Non-vacuity is what the cross-exclusion loop below buys, and it is not
-# theoretical here. Observed with the four refusals removed from
-# bin/cctally-test-all: `--tier-fast` alone crashes on `$2: unbound variable`
-# at exit 1, while the other three all reach the basis program and produce ONE
-# shared sentence — `--tier-fast could not derive a change set (base revision
-# '...')`. Three distinct mistakes collapsing into one message is the
-# precise failure this table exists to catch, and an assertion checking only
-# "exit 2 and --tier-fast appears" would pass against every one of them.
-TIER_ARGUMENT_REFUSALS = {
-    "no_value": (
-        ("--tier-fast",),
-        "--tier-fast requires a base revision and none followed it",
-    ),
-    "empty_value": (
-        ("--tier-fast", ""),
-        "was given an empty base revision",
-    ),
-    "option_as_value": (
-        ("--tier-fast", "--with-pytest"),
-        "instead of a base revision, so its value is missing",
-    ),
-    "repeated_flag": (
-        ("--tier-fast", "a", "--tier-fast", "b"),
-        "--tier-fast may be given at most once",
-    ),
-}
-
-
-@pytest.mark.parametrize("case", sorted(TIER_ARGUMENT_REFUSALS))
-def test_a_malformed_tier_argument_names_its_own_mistake(tmp_path, case):
-    """#630 S7 / Task 2 review. The four refusals shipped correct and pinned by
-    nothing: no test named any of their sentences, so a future edit collapsing
-    them into one catch-all would have been invisible."""
-    args, fragment = TIER_ARGUMENT_REFUSALS[case]
-    runner = _tree(tmp_path, private=False, test_remote_mode=None)
-    p = _plan({}, runner=runner, args=args)
-    assert p.returncode == 2, (case, p.stdout, p.stderr)
-    assert fragment in p.stderr, (case, p.stderr)
-    # No OTHER refusal's sentence, and not the generic unrecognised-argument
-    # catch-all either — that message names `--tier-fast BASE-REV` in its own
-    # text, so a token-level assertion would accept it.
-    for other, (_, other_fragment) in TIER_ARGUMENT_REFUSALS.items():
-        if other != case:
-            assert other_fragment not in p.stderr, (case, other, p.stderr)
-    assert "unrecognised argument" not in p.stderr, (case, p.stderr)
-    assert "could not derive a change set" not in p.stderr, (case, p.stderr)
-
-
-def test_the_tier_is_mutually_exclusive_with_harness(tmp_path):
-    """Preserve-item 19. A caller-chosen subset stays uncitable, so the two
-    request surfaces may not be combined into one run."""
-    runner = _tier_tree(tmp_path)
-    p = _tier_plan(runner, _head(runner), extra_args=("--harness", "source-aware"))
-    assert p.returncode == 2, p.stdout + p.stderr
-    # BOTH tokens, because the refusal has to name the conflict rather than one
-    # argument: before the flag existed this case passed on "unrecognised
-    # argument '--tier-fast'", which is an exit 2 for an unrelated reason.
-    assert "--tier-fast cannot accompany --harness" in p.stderr, p.stderr
-
-
-def test_the_tier_is_mutually_exclusive_with_with_pytest(tmp_path):
-    """The tier narrows the harness axis alone; pytest always runs in full, so
-    a flag that re-enables it means the caller misunderstood the mode."""
-    runner = _tier_tree(tmp_path)
-    p = _tier_plan(runner, _head(runner), extra_args=("--with-pytest",))
-    assert p.returncode == 2, p.stdout + p.stderr
-    assert "--tier-fast cannot accompany --with-pytest" in p.stderr, p.stderr
-
-
-def test_the_tier_is_mutually_exclusive_with_the_linux_matrix(tmp_path):
-    runner = _tier_tree(tmp_path)
-    p = _tier_plan(
-        runner, _head(runner), env_overrides={"CCTALLY_LINUX_MATRIX_RUN": "1"}
-    )
-    assert p.returncode == 2, p.stdout + p.stderr
-    assert (
-        "--tier-fast cannot accompany CCTALLY_LINUX_MATRIX_RUN" in p.stderr
-    ), p.stderr
-
-
-def test_test_remote_is_forced_only_within_the_active_profile(tmp_path):
-    """#630 S7 / pre-plan review P1. Preserve-item 27 keeps test-remote in the
-    full Gate 0, so the tier must not become the second thing that drops it —
-    but it carries `visibility: private`, it is absent from the mirror, and
-    contract_manifest_harness_names deliberately returns only public rows for
-    the public profile. Forcing it unconditionally would put a name in
-    `selected` that the public manifest does not contain, so the partition
-    assertion could never hold on a public tree. Revision 1 made the tier
-    unimplementable on the public profile in exactly this way."""
-    private = _kv(_tier_plan(_tier_tree(tmp_path / "priv"), "HEAD").stdout)
-    assert "test-remote" in private["tier_selected"].split(), private
-
-    public_runner = _tier_tree(tmp_path / "pub", private=False)
-    public = _kv(_tier_plan(public_runner, "HEAD").stdout)
-    assert "test-remote" not in public["tier_selected"].split(), public
-    assert "test-remote" not in public["tier_omitted"].split(), public
-
-
-def test_frontend_is_forced_in_both_profiles(tmp_path):
-    """`frontend` carries `visibility: public`, so it belongs to both profiles.
-    The tier reasons about the harness axis alone and has no view of the
-    frontend estate, so omitting the harness that executes it would be a
-    narrowing the tier cannot justify."""
-    for label, private in (("priv", True), ("pub", False)):
-        runner = _tier_tree(tmp_path / label, private=private)
-        plan = _kv(_tier_plan(runner, "HEAD").stdout)
-        assert "frontend" in plan["tier_selected"].split(), (label, plan)
-
-
-def test_selected_and_omitted_are_an_exact_partition(tmp_path):
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    (repo / "tests" / "fixtures" / "source-aware" / "extra.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    selected = plan["tier_selected"].split()
-    omitted = plan["tier_omitted"].split()
-    manifest = _manifest_names(runner, "private")
-    # #630 S7 / Task 2 review. The anchor comes FIRST, because without it every
-    # assertion below is satisfied by a fully widened tier: `sorted(selected +
-    # omitted) == sorted(manifest)` holds when `omitted` is empty, and both
-    # order assertions are trivially true of any subsequence. This fixture
-    # dirties one fixture directory, which is a direct ownership edge, so a
-    # narrow result is what should be observed here.
-    assert omitted, plan
-    assert sorted(selected + omitted) == sorted(manifest), plan
-    assert not (set(selected) & set(omitted)), plan
-    # Manifest order, so two invocations over the same change produce
-    # byte-identical records.
-    assert selected == [n for n in manifest if n in set(selected)], plan
-    assert omitted == [n for n in manifest if n in set(omitted)], plan
-
-
-def test_a_basis_attributing_to_nothing_runs_the_mandatory_set(tmp_path):
-    """#630 S7 / pre-plan review P2. Revision 1 refused an empty selection. That
-    rule is either wrong — checked BEFORE the force-includes it rejects a
-    legitimate no-op basis, which bin/cctally-test-owners already supports as a
-    successful query — or dead, because checked after them it can never fire.
-    The effective selection is safe UNION mandatory and is never empty."""
-    runner = _tier_tree(tmp_path)
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    selected = plan["tier_selected"].split()
-    assert selected == ["frontend", "test-remote"], plan
-    assert plan["tier_omitted"].split(), plan
-
-
-def test_an_ownership_failure_widens_to_the_full_estate(tmp_path):
-    """#630 S7 / pre-plan review P1 and ordering hazard 5. Estate equality
-    proves the estate's NAMES; it says nothing about whether the ownership
-    declarations used to narrow are true. Verification runs BEFORE a narrow
-    result is accepted, and a failure widens rather than trusting it."""
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    path = repo / "tests" / "harness-ownership.json"
-    doc = json.loads(path.read_text(encoding="utf-8"))
-    doc["harnesses"]["reconcile"]["fixturePaths"] = ["tests/fixtures/source-aware"]
-    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    assert plan["tier_omitted"] == "", plan
-    assert plan["tier_selected"].split() == _manifest_names(runner, "private"), plan
-    assert plan["mode"] == "tier-fast", plan
-
-
-def test_a_missing_owners_tool_widens_rather_than_narrowing(tmp_path):
-    """A tier that cannot establish ownership must select everything, never
-    nothing.
-
-    #630 S7 / Task 2 review corrects the justification this case shipped with.
-    It claimed the published public tree carries no bin/cctally-test-owners.
-    That is false: `.mirror-allowlist` line 8 is the positive glob
-    `bin/cctally-*`, no negation covers the tool, and .githooks/_match.py
-    classifies it `public`. Only the private overlay
-    tests/harness-ownership.private.json is withheld, and the tool discovers it
-    by existence and operates on public rows alone when it is absent — so a
-    tier on a published public tree attributes normally. The branch remains,
-    because a tree that has lost the tool for any reason must still fail
-    closed; only the reason for it was wrong."""
-    runner = _tier_tree(tmp_path)
-    (runner.parent / "cctally-test-owners").unlink()
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    assert plan["tier_omitted"] == "", plan
-    assert plan["tier_selected"].split() == _manifest_names(runner, "private"), plan
-
-
-def test_a_tier_whose_set_equals_the_estate_still_records_tier_fast(tmp_path):
-    """#630 S7 / pre-plan review P1. `coverage.mode` states INVOCATION and
-    SELECTION semantics, never the size of the result. Deciding it by result
-    would let a widened tier mint the releasable full-suite gate — and given
-    F39's measurement that attribution widens on 119 of 119 real merges, the
-    widened tier is the NORMAL case rather than the corner one."""
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    (repo / "docs").mkdir(exist_ok=True)
-    (repo / "docs" / "note.md").write_text("unattributed\n", encoding="utf-8")
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    assert plan["tier_omitted"] == "", plan
-    assert plan["mode"] == "tier-fast", plan
-    assert plan["pytest_disposition"] == "full", plan
-
-
-def test_the_tier_never_narrows_the_pytest_axis(tmp_path):
-    """Spec §3.2. The tier narrows the harness axis and nothing else: the
-    aggregator has no Playwright execution axis to narrow, because
-    bin/cctally-frontend-test runs Vitest and its Playwright involvement is lint
-    and type-checking rather than suite execution."""
-    runner = _tier_tree(tmp_path)
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    assert plan["pytest_disposition"] == "full", plan
-
-
-def test_a_tier_plan_publishes_no_outcome_record(tmp_path):
-    """Pins the plan-plus-outcome-file refusal, and nothing more than that.
-
-    #630 S7 / Task 2 review: this case says nothing about the tier. The refusal
-    fires before argv is parsed, so the same exit 2 and the same empty outcome
-    path are produced with or without `--tier-fast` — the case would pass
-    unchanged against a build that had no tier at all. It is kept because the
-    refusal is worth pinning; preserve-item 25 for tier mode specifically is
-    proved by test_a_tier_plan_stays_side_effect_free and by
-    test_a_tier_plan_writes_no_bytecode_into_the_tree_it_reads, both of which
-    reach code the tier alone runs."""
-    runner = _tier_tree(tmp_path)
-    outcome = tmp_path / "outcome.json"
-    p = _tier_plan(
-        runner, _head(runner),
-        env_overrides={"CCTALLY_TEST_ALL_OUTCOME_FILE": str(outcome)},
-    )
-    assert p.returncode == 2, p.stdout + p.stderr
-    assert "CCTALLY_TEST_ALL_PLAN" in p.stderr, p.stderr
-    assert not outcome.exists()
-
-
-def test_a_tier_plan_stays_side_effect_free(tmp_path):
-    runner = _tier_tree(tmp_path)
-    evidence = tmp_path / "ev"
-    p = _tier_plan(
-        runner, _head(runner),
-        env_overrides={"CCTALLY_TEST_EVIDENCE_ROOT": str(evidence)},
-    )
-    assert p.returncode == 0, p.stdout + p.stderr
-    assert not evidence.exists(), "plan mode must remain side-effect free"
-
-
-def test_the_tier_dispatches_only_what_it_selected(tmp_path):
-    """The selection reaches the pool, not merely the record. `harnesses=` is
-    the report order of what will execute and `dispatch_harnesses=` is what the
-    pool receives; neither may name a harness the tier omitted."""
-    runner = _tier_tree(tmp_path)
-    plan = _kv(_tier_plan(runner, _head(runner)).stdout)
-    omitted = set(plan["tier_omitted"].split())
-    assert omitted, plan
-    assert not (set(plan["harnesses"].split()) & omitted), plan
-    assert not (set(plan["dispatch_harnesses"].split()) & omitted), plan
-
-
-def test_a_tier_plan_writes_no_bytecode_into_the_tree_it_reads(tmp_path):
-    """Preserve-item 25 again, over the path the tier adds. The tier runs a
-    basis program and bin/cctally-test-owners before plan mode, and `_plan`
-    passes a minimal environment carrying neither PYTHONDONTWRITEBYTECODE nor
-    PYTHONPYCACHEPREFIX, so a green result here cannot have been produced by
-    the caller's own environment."""
-    runner = _tier_tree(tmp_path)
-    repo = runner.parent.parent
-    (repo / "tests" / "fixtures" / "source-aware" / "extra.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-    p = _tier_plan(runner, _head(runner))
-    assert p.returncode == 0, p.stdout + p.stderr
-    # Non-vacuity: the tier really resolved a selection rather than bailing out
-    # before it ever ran the tools this case is about.
-    assert _kv(p.stdout)["tier_omitted"].split(), p.stdout
-    caches = sorted(str(x.relative_to(repo)) for x in repo.rglob("__pycache__"))
-    assert caches == [], caches
-
-
-# ---------------------------------------------------------------- the quarantine list (reset session 1)
-# Moved from tests/test_merge_gate.py (test regime reset session 2, Codex Q7):
-# full-run expected-leg filtering is test-all behaviour, not the merge selector's.
-QUARANTINE_OBSERVER = '''\
-import os, pathlib, sys
-argv = sys.argv[1:]
-deselected = [a.split("=", 1)[1] for a in argv if a.startswith("--deselect=")]
-deselected += [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--deselect"]
-observed = pathlib.Path(os.environ["CCTALLY_ESTATE_OBSERVED_DIR"])
-declared = pathlib.Path(os.environ["QUARANTINE_LEGS"]) / (observed.name + ".txt")
-# pytest's own --deselect semantics: a prefix match on the node id.
-kept = [n for n in declared.read_text().split() if not n.startswith(tuple(deselected))]
-observed.mkdir(parents=True, exist_ok=True)
-(observed / "fake.txt").write_text("".join(n + "\\n" for n in kept))
-print("%d passed in 0.01s" % len(kept))
-'''
-
-
-def _quarantine_entry(node):
-    return {'id': node, 'evidence': 'inconsistent on unchanged code', 'invariant': 'x',
-            'issue': '#1', 'replacement': 'none needed', 'reviewBy': '2026-10-27'}
-
-
-def _quarantine_tree(tmp_path, quarantine):
-    """A full run whose fake pytest collects each declared leg minus what it was
-    told to deselect, exactly as the real observer plugin records it."""
-    legs = [
-        {'name': 'pytest', 'selectors': [],
-         'nodes': ['tests/test_alpha.py::test_kept', 'tests/test_alpha.py::test_flaky']},
-        {'name': 'benchmark', 'selectors': [['file', 'tests/test_rebuild_benchmark.py']],
-         'nodes': ['tests/test_rebuild_benchmark.py::test_slow[one]',
-                   'tests/test_rebuild_benchmark.py::test_slow[two]',
-                   'tests/test_rebuild_benchmark.py::test_other']},
-    ]
-    declared = tmp_path / 'declared-legs'
-    declared.mkdir()
-    for leg in legs:
-        (declared / (leg['name'] + '.txt')).write_text(''.join(n + '\n' for n in leg['nodes']))
-    observer = tmp_path / 'observer.py'
-    observer.write_text(QUARANTINE_OBSERVER)
-    runner, calls, env = _fake_pytest_tree(tmp_path, legs=legs, extra_env={
-        'QUARANTINE_LEGS': str(declared), 'QUARANTINE_OBSERVER': str(observer)})
-    fake = tmp_path / 'fake-bin/python3'
-    text = fake.read_text()
-    old = '>> "$CCTALLY_FAKE_PYTHON_LOG"\n    exit 0\n'
-    assert old in text, text
-    fake.write_text(text.replace(old, '>> "$CCTALLY_FAKE_PYTHON_LOG"\n'
-                                 '    exec "$CCTALLY_REAL_PYTHON3" "$QUARANTINE_OBSERVER" "$@"\n'))
-    if quarantine is not None:
-        (runner.parent.parent / 'tests/quarantine.json').write_text(json.dumps(quarantine))
-    return runner, calls, env
-
-
-def test_quarantined_nodes_leave_the_expected_legs(tmp_path):
-    # Review Focus 3: a node deselected from a leg but still in that leg's
-    # expected list would fail the observed-collection check with
-    # manifest-missing-pytest-node. The listed nodes are deselected from both
-    # legs (a prefix id covers every parameter) and the run stays green.
-    runner, calls, env = _quarantine_tree(tmp_path, [
-        _quarantine_entry('tests/test_alpha.py::test_flaky'),
-        _quarantine_entry('tests/test_rebuild_benchmark.py::test_slow')])
-    proc = subprocess.run([str(runner)], env=env, text=True, capture_output=True, timeout=60)
-    _hyg.reclaim_child_generations(tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert 'manifest-missing-pytest-node' not in proc.stdout + proc.stderr
-    bulk, benchmark = calls.read_text().splitlines()
-    assert '--deselect=tests/test_alpha.py::test_flaky' in bulk, bulk
-    assert '--deselect=tests/test_rebuild_benchmark.py::test_slow' in benchmark, benchmark
-
-
-def test_a_tree_without_a_quarantine_list_deselects_nothing(tmp_path):
-    # The public mirror may carry no list: nothing is deselected and the
-    # full declared legs are expected and collected.
-    runner, calls, env = _quarantine_tree(tmp_path, None)
-    proc = subprocess.run([str(runner)], env=env, text=True, capture_output=True, timeout=60)
-    _hyg.reclaim_child_generations(tmp_path)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert '--deselect=tests/test_alpha.py' not in calls.read_text()

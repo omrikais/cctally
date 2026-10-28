@@ -57,6 +57,8 @@ def _no_detached_drains(monkeypatch):
         update = sys.modules.get("_cctally_update")
         if update is not None:
             monkeypatch.setattr(update, "_spawn_detached", lambda command: True)
+            monkeypatch.setattr(update, "_spawn_detached_with_pid",
+                                lambda command, **_kw: os.getpid())
 
     def load_without_detaching(*args, **kwargs):
         module = real_load(*args, **kwargs)
@@ -92,6 +94,8 @@ def _load_build_bench():
     def load_without_detaching():
         cctally = real_load()
         sys.modules["_cctally_update"]._spawn_detached = lambda command: True
+        sys.modules["_cctally_update"]._spawn_detached_with_pid = (
+            lambda command, **_kw: os.getpid())
         return cctally
 
     mod.load_cctally = load_without_detaching

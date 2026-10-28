@@ -28,6 +28,7 @@ Database
   ⚠ cache.db                 absent (fresh install)
   ✓ Integrity                quick_check ok
   ✓ Version ahead            none ahead
+  ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
   ⚠ Pending migrations       61 pending
@@ -96,4 +97,4 @@ Telemetry
 Performance
   ✓ Dashboard disk writes    No dashboard is running.
 
-Summary: 58 OK · 9 WARN · 3 FAIL
+Summary: 59 OK · 9 WARN · 3 FAIL

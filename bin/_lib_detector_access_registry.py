@@ -420,6 +420,30 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
+        sql_fingerprint='CREATE INDEX IF NOT EXISTS idx_claude_oauth_samples_five_hour ON claude_oauth_samples (account_key, five_hour_window_key, requested_at_utc)',
+        table='claude_oauth_samples',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE INDEX IF NOT EXISTS idx_claude_oauth_samples_weekly ON claude_oauth_samples (account_key, weekly_resets_at_utc, requested_at_utc)',
+        table='claude_oauth_samples',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
         sql_fingerprint='CREATE INDEX IF NOT EXISTS idx_cost_week_start_at_time ON weekly_cost_snapshots(week_start_at, captured_at_utc DESC, id DESC)',
         table='weekly_cost_snapshots',
         keys=(),
@@ -588,6 +612,30 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_oauth_samples ( account_key TEXT NOT NULL, observation_id TEXT NOT NULL, requested_at_utc TEXT NOT NULL, captured_at_utc TEXT NOT NULL, weekly_percent REAL, weekly_resets_at_utc TEXT, five_hour_percent REAL, five_hour_resets_at_utc TEXT, five_hour_window_key INTEGER, PRIMARY KEY (account_key, observation_id) )',
+        table='claude_oauth_samples',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_weekly_observation_decisions ( observation_id TEXT PRIMARY KEY, disposition TEXT NOT NULL, decision_op_id TEXT NOT NULL )',
+        table='claude_weekly_observation_decisions',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
         sql_fingerprint="CREATE TABLE IF NOT EXISTS five_hour_block_models ( id INTEGER PRIMARY KEY AUTOINCREMENT, block_id INTEGER NOT NULL, five_hour_window_key INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_create_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0, entry_count INTEGER NOT NULL DEFAULT 0, account_key TEXT NOT NULL DEFAULT 'unattributed', UNIQUE(account_key, five_hour_window_key, model), FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id) )",
         table='five_hour_block_models',
         keys=(),
@@ -624,7 +672,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state ( account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, source TEXT NOT NULL, baseline_pct REAL NOT NULL, pending_low_pct REAL, pending_at_utc TEXT, pending_observation_id TEXT, PRIMARY KEY (account_key, five_hour_window_key, source) )',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state ( account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, source TEXT NOT NULL, baseline_pct REAL NOT NULL, pending_low_pct REAL, pending_at_utc TEXT, pending_observation_id TEXT, baseline_observation_id TEXT, baseline_generation TEXT, pending_generation TEXT, pending_position TEXT, PRIMARY KEY (account_key, five_hour_window_key, source) )',
         table='five_hour_credit_confirmation_state',
         keys=(),
         predicate='',
@@ -1030,10 +1078,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#797/#823/#840 Task 2, base 5f3db4ddd), for open_db
+    # #1, #2 and #3. Changed: only the producer `open_db` itself, whose
+    # epoch-1019 schema block now also creates `claude_oauth_samples`, its
+    # two indexes and `claude_weekly_observation_decisions`, and creates
+    # `five_hour_credit_confirmation_state` with four more NULLABLE
+    # columns. Those are literal statements, registered as their own MAINT
+    # contracts above. No line of these three dynamic sites, their helpers
+    # or the bindings they read changed, so each site's table selection,
+    # predicates, ordering, selected columns, execution condition and
+    # read-only effect are unchanged and the contract and its MAINT inert
+    # rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#1',
-        sql_shape='sha256:fccb556342da9ffa',
+        sql_shape='sha256:447a3914f169d52f',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1046,7 +1105,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#2',
-        sql_shape='sha256:4422797e3a6480ba',
+        sql_shape='sha256:596eea4ecd91f526',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1059,7 +1118,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#3',
-        sql_shape='sha256:63e58c7c98c1aa20',
+        sql_shape='sha256:425db89e4d3c5003',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1210,18 +1269,6 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_journal:_keep_five_hour_retirement',
-        sql_fingerprint='SELECT 1 FROM five_hour_reset_events WHERE account_key = ? AND five_hour_window_key = ? AND unixepoch(effective_reset_at_utc) <= unixepoch(?) LIMIT 1',
-        table='five_hour_reset_events',
-        keys=('account_key', 'five_hour_window_key'),
-        predicate='account_key = ? AND five_hour_window_key = ? AND unixepoch(effective_reset_at_utc) <= unixepoch(?)',
-        ordering='',
-        selected=('1',),
-        effects='read',
-        classes=('period-keyed', 'range-keyed'),
-        inert_rule=None,
-    ),
-    AccessContract(
-        function='_cctally_journal:_keep_five_hour_retirement',
         sql_fingerprint='SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key, weekly_observation_held FROM weekly_usage_snapshots WHERE id = ?',
         table='weekly_usage_snapshots',
         keys=('id',),
@@ -1244,29 +1291,22 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # #840 (spec section 4.8): the convergence keepers keep a retirement only
+    # through exact effective suppression membership. The candidates are the
+    # active effective decisions whose retained record names the snapshot id;
+    # membership is decided on the decoded payload's exact `suppression` list,
+    # so a row is matched by exact logical identity, never by a percentage band.
     AccessContract(
-        function='_cctally_journal:_keep_weekly_retirement',
-        sql_fingerprint='SELECT effective_reset_at_utc, observed_pre_credit_pct FROM week_reset_events WHERE account_key = ? AND new_week_end_at = ? AND observed_pre_credit_pct IS NOT NULL',
-        table='week_reset_events',
-        keys=('account_key', 'new_week_end_at'),
-        predicate='account_key = ? AND new_week_end_at = ? AND observed_pre_credit_pct IS NOT NULL',
+        function='_cctally_journal:_suppression_retires',
+        sql_fingerprint="SELECT event_id, event_json FROM journal_effective_events WHERE status = 'active' AND event_json LIKE ?",
+        table='journal_effective_events',
+        keys=(),
+        predicate="status = 'active' AND event_json LIKE ?",
         ordering='',
-        selected=('effective_reset_at_utc', 'observed_pre_credit_pct'),
+        selected=('event_id', 'event_json'),
         effects='read',
-        classes=('period-keyed',),
-        inert_rule=None,
-    ),
-    AccessContract(
-        function='_cctally_journal:_keep_weekly_retirement',
-        sql_fingerprint='SELECT effective_at_utc, observed_pre_credit_pct FROM weekly_credit_floors WHERE week_start_date = ? AND account_key = ? AND observed_pre_credit_pct IS NOT NULL',
-        table='weekly_credit_floors',
-        keys=('week_start_date', 'account_key'),
-        predicate='week_start_date = ? AND account_key = ? AND observed_pre_credit_pct IS NOT NULL',
-        ordering='',
-        selected=('effective_at_utc', 'observed_pre_credit_pct'),
-        effects='read',
-        classes=('period-keyed',),
-        inert_rule=None,
+        classes=('cross-period',),
+        inert_rule=JOURNAL,
     ),
     AccessContract(
         function='_cctally_journal:_converge_row_from_effective',
@@ -1280,10 +1320,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#797/#823/#840 Task 6 Part B, base 79847ac5a). Changed:
+    # the producer `_converge_row_from_effective` takes a `suppressors`
+    # keyword and passes it, with the converged event id, to
+    # `_keep_five_hour_retirement` and `_keep_weekly_retirement`, which now
+    # keep a retirement only through exact effective suppression membership
+    # (`_suppression_retires`, its own contract above) instead of the removed
+    # credit-band and five-hour-credit reads (their three contracts are
+    # removed). Both sites' target-table `SELECT id ... WHERE journal_id = ?`
+    # and `UPDATE ... WHERE id = ?`, their keys, predicates, execution
+    # conditions and effects are unchanged, so the contracts and their inert
+    # rules stand.
     AccessContract(
         function='_cctally_journal:_converge_row_from_effective',
         sql_fingerprint='dynamic:_cctally_journal:_converge_row_from_effective#1',
-        sql_shape='sha256:87a7fa0212f80043',
+        sql_shape='sha256:d325c0f9da12ebb6',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1296,7 +1347,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_converge_row_from_effective',
         sql_fingerprint='dynamic:_cctally_journal:_converge_row_from_effective#2',
-        sql_shape='sha256:b723310f1bacf1af',
+        sql_shape='sha256:d92a33339d28a17e',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1356,10 +1407,17 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#797/#823/#840 Task 6 Part B, base 79847ac5a). Changed:
+    # the producer `_emit_harvest_row`'s derivation-completion branch passes
+    # its retention's applied decisions (`applied_records`) to
+    # `_converge_row_from_effective` as `suppressors` (#840 exact suppression
+    # membership). The harvested table, keys, predicates, ordering, execution
+    # conditions and effects are unchanged, so the contracts and their inert
+    # rules stand.
     AccessContract(
         function='_cctally_journal:_emit_harvest_row',
         sql_fingerprint='dynamic:_cctally_journal:_emit_harvest_row#1',
-        sql_shape='sha256:36b3715496826795',
+        sql_shape='sha256:aca33abe5dcc2e43',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1372,7 +1430,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_emit_harvest_row',
         sql_fingerprint='dynamic:_cctally_journal:_emit_harvest_row#2',
-        sql_shape='sha256:36b3715496826795',
+        sql_shape='sha256:aca33abe5dcc2e43',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1562,7 +1620,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#1',
-        sql_shape='sha256:c03310d569d06566',
+        sql_shape='sha256:dbbfb479a47a1d9c',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1575,7 +1633,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#2',
-        sql_shape='sha256:4c08ed64ebe47aa4',
+        sql_shape='sha256:75c421b6460d6364',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1588,7 +1646,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#3',
-        sql_shape='sha256:4c08ed64ebe47aa4',
+        sql_shape='sha256:75c421b6460d6364',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1601,7 +1659,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#4',
-        sql_shape='sha256:9fa2bbec8283329c',
+        sql_shape='sha256:1ed2b4533f0fd067',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1614,7 +1672,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#5',
-        sql_shape='sha256:4c08ed64ebe47aa4',
+        sql_shape='sha256:75c421b6460d6364',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1678,10 +1736,67 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # passes the decoded prefix and its effective `by_id` to the pure helper,
     # which orders decisions by first appearance. No SQL was added or changed,
     # so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#997 T-A5/T-A6, base b193e984e). Added: the
+    # `_lib_rebuild_progress` bindings (`_sink`, `_phase`, `_counters`,
+    # `_last_write`, `THROTTLE_SECONDS`) and its `phase`, `tick` and `_emit`,
+    # which the producer now calls to report progress to a detached worker's
+    # state file; they hold process-local progress state, execute no SQL and
+    # are no-ops unless a worker installed a sink. Changed: the producer (the
+    # phase and tick calls, the Codex quota observations retained as
+    # `QuotaLineSource` coordinates for the cache leg, and the record's
+    # `peakResidentBytes` and `quotaLockMaxHoldSeconds`) and
+    # `_backfill_five_hour_blocks` (a throttled tick every 1,024 blocks in its
+    # insert loop). This site's `SELECT COUNT(*) FROM {tbl}` over
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#997 T-C1/T-C3 and the revision-10 fix round, base
+    # 9282d8b73). Changed: the producer builds its prefix hasher through
+    # `_new_prefix_hasher` (the streamed accumulator with its segment opener),
+    # compacts retained records with `_lib_journal.compact_retained` right
+    # after decode, computes the open-block projection's first observations
+    # and the late `effective` fields before releasing the read-pass state,
+    # and reads the quota bundle after that release. None of these executes
+    # SQL; this site's `SELECT COUNT(*) FROM {tbl}` over
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#997 D19, base 0bfc75475). Changed: the closure's
+    # imported producer `_backfill_five_hour_blocks`, whose `only_missing`
+    # key query now takes each account's latest qualifying snapshot from one
+    # `ROW_NUMBER()` ranking pass instead of a correlated subquery per row.
+    # The selected keys are identical (T19 holds the old query as its oracle);
+    # the producer's own execute sites are not registered accesses, and this
+    # site's `SELECT COUNT(*) FROM {tbl}` over `_REBUILD_COUNT_TABLES`, its
+    # execution condition and its read-only effect are unchanged, so the
+    # contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#797/#823/#840 Task 2, base 5f3db4ddd). Added: the
+    # fold applier `_cctally_journal._apply_op_weekly_observation_decision`
+    # and the function it calls,
+    # `_cctally_oauth_samples.apply_weekly_observation_decision_op`, with
+    # its bindings `_DECISION_LISTS`, `_DISPOSITIONS` and `_UPSERT_DECISION`
+    # (the reviewed weekly decision projection, upserting
+    # `claude_weekly_observation_decisions` by observation id). Changed:
+    # `FOLD_APPLIERS` (the two reviewed decision kinds now map to that
+    # applier), the helper `open_db` (the epoch-1019 schema statements, see
+    # the open_db re-pin) and the producer (its read pass offers each
+    # admitted record to `_cctally_oauth_samples.RebuildProjector`, which
+    # projects provider samples in bounded batches). This site's
+    # `SELECT COUNT(*) FROM {tbl}` over `_REBUILD_COUNT_TABLES` (left
+    # unchanged, so `db rebuild --json` keeps its counts), its execution
+    # condition and its read-only effect are unchanged, so the contract and
+    # its MAINT inert rule stand.
+    # Reviewed re-pin (#797/#823/#840 Task 6, base 31bb25621). Changed: the
+    # binding `_cctally_oauth_samples._DECISION_LISTS`, which now maps the
+    # reviewed decision payload schema 3 (the `retract` disposition) to its
+    # `weekly_axis_decisions` list, the hold projection schema 2 already
+    # used, so a retraction folds into `claude_weekly_observation_decisions`
+    # as the `hold` it projects. The applier's upsert, its table and its key
+    # are unchanged; this site's `SELECT COUNT(*) FROM {tbl}` over
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:_rebuild_stats_index_locked',
         sql_fingerprint='dynamic:_cctally_journal:_rebuild_stats_index_locked#1',
-        sql_shape='sha256:043784567bb14b97',
+        sql_shape='sha256:1663fdf5858150ab',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2347,10 +2462,16 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#997 T-C1 and the revision-10 fix round, base
+    # 9282d8b73): the producer builds its prefix hasher through
+    # `_new_prefix_hasher` and passes each segment's size to `begin_segment`
+    # (the streamed accumulator, D12). The hasher executes no SQL; the SQL
+    # text, its execution condition and its read-only effect are unchanged,
+    # so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='dynamic:_cctally_journal:stats_index_matches_journal_prefix#1',
-        sql_shape='sha256:5c869b43c418d251',
+        sql_shape='sha256:393317bef4c27f3d',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2360,10 +2481,11 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Same reviewed re-pin as #1 (#997 D12).
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='dynamic:_cctally_journal:stats_index_matches_journal_prefix#2',
-        sql_shape='sha256:46cf0672d1ac6f95',
+        sql_shape='sha256:9c0c2275046f7719',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2480,6 +2602,24 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='write',
         classes=('singleton',),
         inert_rule=Q7,
+    ),
+    # #797/#823/#840 epoch 1019 (spec 4.3 D8): the provider-sample
+    # projection, reached from `_pipeline_claude_usage` through
+    # `project_record`. One row per admitted keyed api observation, keyed by
+    # account and observation id; INSERT OR IGNORE, so a replay of the same
+    # record writes nothing. Not inert: the stale-contributor reducer reads
+    # these rows as provider evidence.
+    AccessContract(
+        function='_cctally_oauth_samples:project_sample',
+        sql_fingerprint='INSERT OR IGNORE INTO claude_oauth_samples (account_key, observation_id, requested_at_utc, captured_at_utc, weekly_percent, weekly_resets_at_utc, five_hour_percent, five_hour_resets_at_utc, five_hour_window_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        table='claude_oauth_samples',
+        keys=('account_key', 'observation_id'),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=None,
     ),
     AccessContract(
         function='_cctally_quarantine:load_state',
@@ -2904,10 +3044,16 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=CODEX,
     ),
+    # Reviewed re-pin (#997 T-C4, base 9282d8b73): the producer shares
+    # repeated text values, reset instants and `QuotaWindowIdentity` objects
+    # within one call through `_QuotaLoadValues` (D17). That helper executes
+    # no SQL and returns equal values in the same order; the SQL text, its
+    # execution condition and its read-only effect are unchanged, so the
+    # contract and its inert rule stand.
     AccessContract(
         function='_cctally_quota:load_codex_quota_observations',
         sql_fingerprint='dynamic:_cctally_quota:load_codex_quota_observations#1',
-        sql_shape='sha256:6a6e082ae339b9cf',
+        sql_shape='sha256:1f20459441a53e78',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -3115,12 +3261,53 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:_read_five_hour_source_state',
-        sql_fingerprint='SELECT baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ? AND source = ?',
+        sql_fingerprint='SELECT baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ? AND source = ?',
         table='five_hour_credit_confirmation_state',
         keys=('account_key', 'five_hour_window_key', 'source'),
         predicate='account_key = ? AND five_hour_window_key = ? AND source = ?',
         ordering='',
-        selected=('baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id'),
+        selected=('baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=None,
+    ),
+    # #797/#823/#840 spec 4.9 (D3, D11): the v2 detector's eager rebase of
+    # the window's other contributors at a credit, the ordinal of a credit's
+    # retained causal facts, and the selected credit's content for its
+    # generation (the row `resolve_five_hour_reset_event` chose by logical
+    # order; the id only fetches it). All three read one account and window.
+    AccessContract(
+        function='_cctally_record:_rebase_five_hour_sources',
+        sql_fingerprint='SELECT source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ?',
+        table='five_hour_credit_confirmation_state',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ?',
+        ordering='',
+        selected=('source', 'baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=None,
+    ),
+    AccessContract(
+        function='_cctally_record:_record_five_hour_credit_facts',
+        sql_fingerprint="SELECT COUNT(*) FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ? AND source LIKE '#credit|%'",
+        table='five_hour_credit_confirmation_state',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate="account_key = ? AND five_hour_window_key = ? AND source LIKE '#credit|%'",
+        ordering='',
+        selected=('COUNT(*)',),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=None,
+    ),
+    AccessContract(
+        function='_cctally_record:five_hour_credit_generation',
+        sql_fingerprint='SELECT detected_at_utc, prior_percent, post_percent, effective_reset_at_utc FROM five_hour_reset_events WHERE id = ?',
+        table='five_hour_reset_events',
+        keys=('id',),
+        predicate='id = ?',
+        ordering='',
+        selected=('detected_at_utc', 'prior_percent', 'post_percent', 'effective_reset_at_utc'),
         effects='read',
         classes=('period-keyed',),
         inert_rule=None,
@@ -3175,7 +3362,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:_write_five_hour_source_state',
-        sql_fingerprint='INSERT INTO five_hour_credit_confirmation_state (account_key, five_hour_window_key, source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET baseline_pct = excluded.baseline_pct, pending_low_pct = excluded.pending_low_pct, pending_at_utc = excluded.pending_at_utc, pending_observation_id = excluded.pending_observation_id',
+        sql_fingerprint='INSERT INTO five_hour_credit_confirmation_state (account_key, five_hour_window_key, source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET baseline_pct = excluded.baseline_pct, pending_low_pct = excluded.pending_low_pct, pending_at_utc = excluded.pending_at_utc, pending_observation_id = excluded.pending_observation_id, baseline_observation_id = excluded.baseline_observation_id, baseline_generation = excluded.baseline_generation, pending_generation = excluded.pending_generation, pending_position = excluded.pending_position',
         table='five_hour_credit_confirmation_state',
         keys=(),
         predicate='',
@@ -3730,6 +3917,40 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         selected=(),
         effects='read',
         classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    # #997 T-A1 (spec D1, D6): the disposable scratch policy applied to the
+    # completion replay copies, the owed-outputs predecessor and the rederive
+    # scratch, never to a published index. It probes for the usage table and,
+    # when present, creates the three partial `replay_usage_*` indexes on that
+    # scratch (`_REPLAY_SCRATCH_INDEXES`, the dynamic site). Both run on a
+    # private scratch before its replay, never inside a live automatic
+    # decision; an index changes no result set, and the order-insensitivity of
+    # every statement it can serve is audited in the #997 plan's appendix and
+    # pinned by `tests/test_997_replay_indexes.py`.
+    AccessContract(
+        function='_cctally_store:apply_disposable_scratch_policy',
+        sql_fingerprint="SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'weekly_usage_snapshots'",
+        table='weekly_usage_snapshots',
+        keys=(),
+        predicate="type = 'table' AND name = 'weekly_usage_snapshots'",
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_store:apply_disposable_scratch_policy',
+        sql_fingerprint='dynamic:_cctally_store:apply_disposable_scratch_policy#1',
+        sql_shape='sha256:fe12cdb5583c26fc',
+        table='dynamic',
+        keys=(),
+        predicate='dynamic SQL',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
         inert_rule=MAINT,
     ),
     AccessContract(

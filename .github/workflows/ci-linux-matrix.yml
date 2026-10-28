@@ -1,20 +1,31 @@
 name: CI (Linux multi-version)
 on:
   push:
-    tags: ['v*']            # post-tag validation of the shipped artifact (fires on the public mirror; #131)
-  schedule:
-    - cron: '29 7 * * 4'    # weekly Thu 07:29 UTC (public mirror) — offset off pricing-freshness's Mon 09:17
+    # The tag push run at the public commit P is the promotion gate (test regime
+    # reset, spec 4.5): `cctally-release promote` requires all three legs to have
+    # succeeded at P. The weekly cron is retired with it: promotion reads the run
+    # at P, and a scheduled run of another commit is evidence for nothing.
+    tags: ['v*']
 jobs:
   test-linux:
     # #630 S5 retired the private hosted lane. It was workflow_dispatch-only and
     # billable, and three consecutive dispatches timed out at 60 minutes with
     # zero usable verdicts. The public mirror's minutes are free, so that lane
-    # is kept. Private tag and cron events still CREATE a run record because the
+    # is kept. Private tag events still CREATE a run record because the
     # workflow is mirrored verbatim, but this guard is evaluated before
     # `runs-on`, so they consume no minutes.
     if: github.repository == 'omrikais/cctally'
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # headroom over the observed run so a hung test can't wedge the job for GitHub's default 6h (#279 S7 W4)
+    # Bounds a hung test well below GitHub's default 6h (#279 S7 W4). The
+    # basis is a hosted measurement, not a projection from macOS: private
+    # scratch run 39803552296 ran one leg (ubuntu-latest, Python 3.11) over the
+    # public projection of 666aa118c. Its shell pool took 1610 s, and its
+    # pytest phase at 4 workers was 86% through about 67 minutes later, when
+    # the scratch job's own 100-minute limit cancelled it. That projects about
+    # 78 minutes of pytest and about 105 minutes for the whole leg. 150 leaves
+    # about 45 minutes (roughly 40%) of headroom; the public repository's
+    # hosted minutes are free.
+    timeout-minutes: 150
     strategy:
       fail-fast: false                                 # see all three results
       matrix:
@@ -82,10 +93,10 @@ jobs:
       # (never skips) when dashboard/web/node_modules/.bin/vitest is absent. The
       # frontend estate is part of the authoritative bundle, so every lane that
       # runs the bundle must provision it — "the bundle passed" has to mean one
-      # thing on every lane. Without this step the lane fails on every tag push,
-      # on the weekly cron and on the private manual pre-cut gate, across all
-      # three Python versions, and this workflow is published to the public
-      # mirror, so it would break the public repository's CI too.
+      # thing on every lane. Without this step the lane fails on every release
+      # tag push, which is the promotion gate at P, across all three Python
+      # versions, and this workflow is published to the public mirror, so it
+      # would break the public repository's CI too.
       - uses: actions/setup-node@v5
         with:
           node-version-file: 'dashboard/web/.nvmrc'
@@ -125,7 +136,7 @@ jobs:
       # use (#529 S6, F20). The pin set is verified to install and close on
       # every interpreter in this matrix — 3.11, 3.12 and 3.13. --no-deps makes
       # the pin a pin; `pip check` is the closure validator --no-deps otherwise
-      # leaves unrun. Enforced structurally by tests/test_toolchain_parity.py.
+      # leaves unrun.
       - name: Install Python test deps
         run: |
           python -m pip install --no-deps -r tests/requirements-dev.txt

@@ -41,15 +41,18 @@ import journal_fixture_496_s4 as F
 #: become an assertion. `bench/README.md` states that rule; the flock property
 #: it would be measuring is asserted structurally in `tests/test_quota_journal.py`.
 
-#: Per-observation allocation that survives to the peak BEYOND the encoded byte
-#: length of the retained line. #508 Task C measured three runs on each fleet
-#: runner: the current path used 176.46--176.49 bytes/record (0.026 bytes of
-#: cross-run spread), while the rejected coordinate/routing projection added
-#: 525.90 deep bytes and raised the slope to 702.34--702.35 bytes/record. 512 is
-#: the next binary ceiling above the measured baseline: 335 bytes/record of
-#: headroom, while the controlled compact-projection mutant remains 190 bytes
-#: beyond it. Reproduce with `tests/_measure_rebuild_memory_508.py` remotely.
-_PER_RECORD_OVERHEAD_BYTES = 512
+#: Per-observation peak-allocation growth. Until #997 the read pass retained
+#: every observation's raw line, so the gate allowed the encoded bytes plus 512
+#: (#508 Task C: 176.46--176.49 bytes/record beyond the bytes, the rejected
+#: coordinate/routing projection 702.34--702.35). #997 D7 retains 16 bytes of
+#: coordinates instead and re-reads one bounded chunk at a time, so the encoded
+#: bytes are no longer part of the allowance: two runs measured 122.55 and
+#: 122.56 bytes/record of total growth for the current path and 761.65 for the
+#: controlled compact-projection mutant (639.04 deep projection bytes). 256 is
+#: the next binary ceiling above the baseline, 133 bytes/record of headroom,
+#: and the mutant stays 505 bytes beyond it. Reproduce with
+#: `tests/_measure_rebuild_memory_508.py` remotely (peakGrowthBytes / records).
+_PER_RECORD_OVERHEAD_BYTES = 256
 #: The read path alone must retain NOTHING per dropped observation. Measured
 #: delta with the cache leg disabled: 40 KB over 11,100 added observations.
 _FLAT_RETENTION_ALLOWANCE_BYTES = 1_000_000
@@ -62,10 +65,10 @@ def tier1_slope(tmp_path_factory):
     The extra observations land in segments of their own, AFTER every record the
     stats fold consumes, so the retained decision population is identical and
     only the observation population grows. They are spread across several
-    segments rather than piled into one because the streaming protocol-evidence
-    accumulator buffers the segment it is reading (§5.2), and one oversized
-    extra segment would raise peak allocation for a reason that has nothing to
-    do with what this gate measures.
+    segments rather than piled into one, as real month-cut history is. (The
+    protocol-evidence accumulator once buffered the segment it was reading,
+    §5.2, so one oversized extra segment raised peak allocation for a reason
+    unrelated to this gate; since #997 D12 it streams.)
     """
     work = tmp_path_factory.mktemp("rebuild_slope")
     base = F.run_worker(
@@ -154,7 +157,8 @@ def test_each_journal_line_is_traversed_once_and_decoded_once(tier1_slope):
     assert prefix["decodes"] == prefix["lines"] - base["malformed"]
     assert base["traversal"]["cutover_suffix"]["bytes"] == 0
     assert base["traversal"]["protocol_evidence"]["bytes"] > 0
-    # No second traversal for the quota leg: it decodes bytes already read.
+    # No second traversal for the quota leg: it re-reads only the quota
+    # observations' own slices by coordinate (#997 D7), never the journal.
     replay = base["traversal"]["quota_replay"]
     assert replay["lines"] == replay["decodes"] > 0
     assert replay["bytes"] < prefix["bytes"]
@@ -178,16 +182,16 @@ def test_doubling_inert_history_does_not_grow_the_retained_decisions(
 
 
 def test_peak_allocation_grows_only_by_the_added_observation_bytes(tier1_slope):
-    """Retaining RAW BYTES keeps peak allocation linear in observation history,
-    so "doubling inert history does not raise peak allocation" would be false
-    and must not be asserted. The bound below still distinguishes this design
-    from a regression that starts retaining decoded dictionaries again: a dict
-    per observation is several times its encoded length, not a constant on top
-    of it.
+    """Retaining coordinates keeps peak allocation linear in observation
+    history with a small slope, so "doubling inert history does not raise peak
+    allocation" would be false and must not be asserted. The bound below
+    distinguishes this design from a regression that starts retaining raw
+    lines again (#997 D7) or decoded dictionaries: either is several hundred
+    bytes per observation, not a constant of a few dozen.
     """
     base, doubled = tier1_slope
     added_records, added_bytes, growth = _slope_inputs(base, doubled)
-    allowance = added_bytes + _PER_RECORD_OVERHEAD_BYTES * added_records
+    allowance = _PER_RECORD_OVERHEAD_BYTES * added_records
     assert growth <= allowance, (
         f"peak allocation grew {growth} bytes for {added_records} added "
         f"observations totalling {added_bytes} encoded bytes; allowance "
@@ -210,7 +214,7 @@ def test_compact_projection_regression_is_rejected(
     assert growth <= old_allowance, (
         "controlled compact-projection mutant no longer demonstrates the "
         "historical gate gap")
-    allowance = added_bytes + _PER_RECORD_OVERHEAD_BYTES * added_records
+    allowance = _PER_RECORD_OVERHEAD_BYTES * added_records
     assert growth > allowance, (
         "compact-projection mutant passed the replacement memory-slope gate")
 

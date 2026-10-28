@@ -150,6 +150,7 @@ class FiveHourSourceDecision:
 def plan_five_hour_source_local_credit(
     *, baseline_pct, pending_low_pct, pending_observation_id,
     new_pct, observation_id, drop_threshold, window_live,
+    generation=None, baseline_generation=None, pending_generation=None,
 ):
     """Classify one observation against ONE contributor's own five-hour state
     (glue call site: ``detect_reset_and_credit``'s 5h branch).
@@ -173,8 +174,29 @@ def plan_five_hour_source_local_credit(
     is deliberately no maximum gap, no maximum climb and no confirmation-value
     band, because observations arrive at an unbounded interval and every finite
     threshold on the change between two of them has a legitimate crossing.
+
+    ``generation`` (#797/#823/#840 spec 4.9, D3/D11) is the account and
+    window's current five-hour credit generation, passed only by the v2
+    detector; the historical detector passes None and keeps every rule above
+    unchanged. ``baseline_generation`` and ``pending_generation`` are the
+    generations the source's baseline and its pending descent were
+    established under. A state established under another generation is
+    OBSOLETE: a credit has been recorded, corrected or tombstoned since, so
+    its baseline may be a pre-credit high and its descent may be one another
+    source already confirmed. It can neither arm nor confirm, and it is not
+    relabelled into the new generation; this observation re-establishes the
+    baseline instead. A state recorded without a generation (the historical
+    detector, an earlier binary, or a seeded fixture) is not obsolete by
+    this rule.
     """
     new_pct = float(new_pct)
+
+    if baseline_pct is not None and generation is not None and (
+            (baseline_generation is not None
+             and baseline_generation != generation)
+            or (pending_low_pct is not None and pending_generation is not None
+                and pending_generation != generation)):
+        return FiveHourSourceDecision(FIVE_HOUR_SET_BASELINE, new_pct)
 
     if baseline_pct is None:
         # No state for this source in this window. Establish the baseline and

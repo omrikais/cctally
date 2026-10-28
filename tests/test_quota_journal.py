@@ -540,6 +540,69 @@ def test_a_recovering_rebuild_does_acquire_them(tmp_path, monkeypatch):
     assert acquisitions != []
 
 
+def _quota_flock_phases(monkeypatch, *, contend: bool):
+    """The progress phases a rebuild writes, with the cache writer flocks
+    either free or held by another descriptor at the recovery's first
+    acquisition (released 0.3 s later)."""
+    import threading
+
+    import _lib_cache_writer_lock as lock
+    import _lib_rebuild_progress as progress
+
+    real = lock.acquire_cache_writer_flocks
+    names: list = []
+    acquisitions: list = []
+    timers: list = []
+
+    def acquire(global_path, provider_path, **kwargs):
+        acquisitions.append(kwargs.get("timeout"))
+        phases = [n for n in names if not n.startswith("waiting:")]
+        if contend and not timers and phases[-1:] == ["rebuild:quota-leg"]:
+            blocker = real(global_path, provider_path, timeout=None)
+            assert blocker is not None
+            timer = threading.Timer(
+                0.3, lock.release_cache_writer_flocks, args=(blocker,))
+            timers.append(timer)
+            timer.start()
+        return real(global_path, provider_path, **kwargs)
+
+    monkeypatch.setattr(lock, "acquire_cache_writer_flocks", acquire)
+    progress.install(lambda name, counters, forced: names.append(name))
+    return names, acquisitions, timers
+
+
+@pytest.mark.parametrize("contend", [False, True])
+def test_997_quota_flock_wait_is_reported_only_when_contended(
+    tmp_path, monkeypatch, contend,
+):
+    """#997 D9: free flocks are taken on a first non-blocking try and write
+    no `waiting:quota-flocks` phase (two forced progress writes per chunk
+    otherwise); held flocks are a wait, and it is reported."""
+    import _lib_rebuild_progress as progress
+
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    ns["open_cache_db"]().close()
+    jr.append_record(_codex_quota_obs(
+        jl, source_root_key="root-a", source_path="/codex/root-a/r.jsonl",
+        line_offset=10, captured_at_utc=_iso(10)), now_utc=FIXED)
+    names, acquisitions, timers = _quota_flock_phases(
+        monkeypatch, contend=contend)
+    try:
+        result = _rebuild(jr)
+    finally:
+        progress.uninstall()
+        for timer in timers:
+            timer.join()
+    assert result.quota_cache_coverage["status"] == "recovered"
+    assert acquisitions, "the recovery took no flock; the test proves nothing"
+    assert "rebuild:quota-leg" in names
+    if contend:
+        assert timers, "the recovery's acquisition was never contended"
+        assert "waiting:quota-flocks" in names
+    else:
+        assert "waiting:quota-flocks" not in names
+
+
 def test_a_late_append_invalidates_coverage_and_replays(tmp_path, monkeypatch):
     """Spec §7 case 4, and the case that establishes the certificate's own
     correctness. An append after certificate creation but before the rebuild

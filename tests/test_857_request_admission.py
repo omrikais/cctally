@@ -285,7 +285,18 @@ def test_disconnected_diagnosis_waiter_releases_its_admission_slot(
 def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
     tmp_path, monkeypatch,
 ):
-    """A timed-out physical producer cannot consume the sole slot forever."""
+    """A timed-out physical producer cannot consume the sole slot forever.
+
+    The first request's diagnosis process never returns: it is really killed
+    and reaped at the 1.5 s deadline. The second request is sent only once
+    that process is retired and the admission slot is free again (#1007):
+    on a loaded runner the reap outlasted a whole recovery deadline, and a
+    second request sent at once timed out waiting for the slot. How fast the
+    recovered request's real build runs is measured and printed, not asserted
+    against the 1.5 s deadline.
+    """
+    import os
+
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     monkeypatch.setenv(
@@ -299,20 +310,31 @@ def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
     monkeypatch.setattr(dash, "_DIAGNOSIS_ADMISSION", admission)
     sources = ns["_load_sibling"]("_cctally_diagnosis_sources")
     real_bounded = sources.build_diagnosis_bounded
+    real_terminate = sources._terminate_process_group
+    retired = threading.Event()
+    killed = []
     calls = 0
+
+    def recorded_terminate(process):
+        killed.append(process.pid)
+        real_terminate(process)
 
     def first_process_never_returns(*args, timeout_seconds, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
-            return sources._run_process_with_deadline(
-                _nonterminating_diagnosis_worker, (),
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                return sources._run_process_with_deadline(
+                    _nonterminating_diagnosis_worker, (),
+                    timeout_seconds=timeout_seconds,
+                )
+            finally:
+                retired.set()
         return real_bounded(
             *args, timeout_seconds=timeout_seconds, **kwargs,
         )
 
+    monkeypatch.setattr(sources, "_terminate_process_group", recorded_terminate)
     monkeypatch.setattr(
         sources, "build_diagnosis_bounded", first_process_never_returns,
     )
@@ -324,8 +346,33 @@ def test_http_diagnosis_recovers_after_nonterminating_process_is_retired(
             "error": "diagnosis timed out; retry shortly",
             "code": "diagnosis_timeout",
         }
+        # Retirement: the producer left its process build, and the slot it
+        # held is free again.
+        assert retired.wait(PRESENCE_BACKSTOP_SECONDS), (
+            "the timed-out diagnosis process was never retired")
+        assert admission._admission.acquire(
+            timeout=PRESENCE_BACKSTOP_SECONDS,
+        ), "the retired producer never released the diagnosis slot"
+        admission._admission.release()
+        # The process was really killed and reaped: no process, no zombie.
+        assert killed and killed[0] is not None, killed
+        try:
+            os.kill(killed[0], 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError(
+                f"diagnosis process {killed[0]} was not reaped")
+        # Recovery through the same admission. Its deadline is widened only
+        # for this request, so a slow real build on a loaded host cannot
+        # turn a recovery into a timeout.
+        admission._deadline_seconds = PRESENCE_BACKSTOP_SECONDS / 4
+        began = time.monotonic()
         recovered = client.get(path)
+        build_seconds = time.monotonic() - began
         assert recovered.status == 200, recovered.body
         assert calls == 2
+        print(json.dumps({"case": "diagnosis-http-recovery",
+                          "recoveredBuildSeconds": round(build_seconds, 3)}))
     finally:
         stop(server, thread)
