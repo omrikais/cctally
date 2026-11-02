@@ -988,3 +988,315 @@ def test_dynamic_container_helpers_write_only_their_store_and_temp_views(
                       "authorizerTargets": sorted({(schema, target)
                           for _action, target, schema, _origin in seen}),
                       "dynamicUpdateShapes": 4, "dynamicViewShapes": 2}, sort_keys=True))
+
+
+# ── #970 spec 5.5: location-only adoption and relocation verification ─────
+BARRIER_TABLES = (
+    "codex_barrier_membership", "codex_barrier_targets",
+    "codex_barrier_population", "codex_barrier_entry_threads",
+    "codex_barrier_certificates", "codex_barrier_repairs", "codex_prune_debt",
+)
+CONVERSATION_EXTRA = (
+    "codex_conversation_publications", "codex_conversation_published_threads",
+    "codex_conversation_prune_debt",
+)
+
+
+def _quota_records(session_id):
+    records = conversation_records(2, session_id=session_id)
+    records[-1]["payload"]["rate_limits"] = {
+        "limit_id": "codex", "primary": {"used_percent": 21.0,
+        "window_minutes": 10080, "resets_at": 1784966699}}
+    return records
+
+
+def _full_state(ns):
+    """Every derived row (ids included), both change ledgers, the mutation
+    sequence, the barrier state and every cursor column but container_path,
+    in both stores — plus the two container_path columns on their own."""
+    out = {}
+    locations = {}
+    for opener, cursor_table, tables in (
+            ("open_cache_db", "codex_session_files",
+             ACCOUNTING_TABLES + BARRIER_TABLES),
+            ("open_conversations_db", "codex_conversation_source_files",
+             CONVERSATION_TABLES + CONVERSATION_EXTRA)):
+        conn = ns[opener]()
+        try:
+            present = [t for t in tables if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name=?", (t,)).fetchone()]
+            # Some barrier tables are WITHOUT ROWID: take every column of every
+            # row in a stable order instead of rowid order.
+            out[opener] = {t: sorted((tuple(r) for r in conn.execute(
+                f"SELECT * FROM {t}")), key=repr) for t in present}
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT * FROM {cursor_table} ORDER BY path")]
+            locations[opener] = [r.pop("container_path") for r in rows]
+            out[opener + ":cursors"] = rows
+            out[opener + ":seq"] = conn.execute(
+                "SELECT value FROM cache_meta "
+                "WHERE key='codex_physical_mutation_seq'").fetchall()
+        finally:
+            conn.close()
+    return out, locations
+
+
+def _place(path, records, compressed):
+    write_rollout(path, records)
+    if compressed:
+        _compress(path)
+        return path.with_name(path.name + ".zst")
+    return path
+
+
+@pytest.mark.parametrize("direction", ["archive", "unarchive"])
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "zstd"])
+def test_location_adoption_changes_only_container_path(env, compressed, direction):
+    """#970 A3/G6: a same-volume archive or unarchive move is not content
+    work. Routed as a transition or a replacement it would delete and
+    re-insert history, bump the incarnation or churn the ledgers and the
+    publication barrier; it must change only the accepted location, in
+    both stores."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    start = day if direction == "archive" else archive
+    container = _place(start / _name(1), _quota_records(SHARED), compressed)
+    _sync_both(ns)
+    _sync_both(ns)
+    before, locations = _full_state(ns)
+    dest = (archive if direction == "archive" else day) / container.name
+    os.rename(container, dest)
+    _sync_both(ns)
+    after, moved = _full_state(ns)
+    assert after == before
+    logical = day / _name(1)
+    expected = None if dest == logical else str(dest)
+    for opener in ("open_cache_db", "open_conversations_db"):
+        index = [r["path"] for r in after[opener + ":cursors"]].index(str(logical))
+        assert locations[opener][index] == (
+            None if container == logical else str(container))
+        assert moved[opener][index] == expected
+    assert _cursor(ns, logical)["container_state"] == "accepted"
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "zstd"])
+def test_location_adoption_writes_only_its_cursor_table(env, monkeypatch, compressed):
+    """#970 declaration proof for the location-only `UPDATE {table} SET
+    container_path=?`. A `{table}` target is invisible to the static write
+    census, so a wrong table there could write a stats table unseen. Observe
+    the real archive move on both stores with an SQLite authorizer: each
+    adoption writes only its own cursor table in its own store, and any
+    other table is refused before SQL."""
+    from test_stats_writer_surface_386 import STATS_TABLES
+
+    ns, provider, day = env
+    cache = sys.modules["_cctally_cache"]
+    core = sys.modules["_cctally_core"]
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    container = _place(day / _name(1), _quota_records(SHARED), compressed)
+    _sync_both(ns)
+    writes = set(sys.modules["_cctally_store"]._GUARD_MUTATIONS)
+    stores = {"codex_session_files": pathlib.Path(core.CACHE_DB_PATH),
+              "codex_conversation_source_files": pathlib.Path(core.CONVERSATIONS_DB_PATH)}
+    calls = []
+    real = cache._adopt_codex_container_location
+
+    def observed(conn, table, path, selected, snap):
+        main = {r[1]: r[2] for r in conn.execute("PRAGMA database_list")}["main"]
+        seen = []
+
+        def authorizer(action, target, column, schema, origin):
+            if action in writes:
+                seen.append((target, schema))
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(authorizer)
+        try:
+            adopted = real(conn, table, path, selected, snap)
+        finally:
+            conn.set_authorizer(None)
+        calls.append((table, pathlib.Path(main), adopted, seen))
+        return adopted
+
+    monkeypatch.setattr(cache, "_adopt_codex_container_location", observed)
+    os.rename(container, archive / container.name)
+    _sync_both(ns)
+    assert sorted(call[0] for call in calls) == sorted(stores)
+    for table, main, adopted, seen in calls:
+        assert adopted is True
+        assert main == stores[table] and main != pathlib.Path(core.DB_PATH)
+        assert seen and set(seen) == {(table, "main")}
+        assert not [target for target, _schema in seen if target in STATS_TABLES]
+    conn = cache.open_cache_db()
+    try:
+        for forbidden in ("quota_window_blocks", "quota_projection_state",
+                          "five_hour_blocks", "weekly_usage_snapshots"):
+            with pytest.raises(ValueError):
+                real(conn, forbidden, str(day / _name(1)), None, None)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "zstd"])
+def test_relocation_with_new_inode_is_verified_not_reset(env, compressed):
+    """#970 A3/SR-03: a cross-volume move (copy plus delete, so a new inode)
+    must go through verification. Read as a plain replacement it would reset
+    the rollout to byte zero, delete and re-insert its rows and bump the
+    incarnation."""
+    import shutil
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    container = _place(day / _name(1), _quota_records(SHARED), compressed)
+    _sync_both(ns)
+    logical = day / _name(1)
+    incarnation = _incarnation(ns, logical)
+    before = _state(ns)
+    dest = archive / container.name
+    shutil.copy2(container, dest)
+    container.unlink()
+    _sync_both(ns)
+    assert _cursor(ns, logical)["container_state"] == "pending"
+    _drain(ns)
+    cursor = _cursor(ns, logical)
+    assert cursor["container_state"] == "accepted", cursor["container_state_reason"]
+    assert cursor["container_path"] == str(dest)
+    assert _incarnation(ns, logical) == incarnation
+    assert _state(ns) == before
+
+
+def test_legacy_plain_cursor_relocation_is_verified(env):
+    """#970 SR-03: a legacy plain cursor (no device/inode evidence) cannot
+    prove a move, so its relocation is verified, never adopted blindly and
+    never reset."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    logical = _place(day / _name(1), _quota_records(SHARED), False)
+    _sync_both(ns)
+    for opener, table in (("open_cache_db", "codex_session_files"),
+                          ("open_conversations_db",
+                           "codex_conversation_source_files")):
+        conn = ns[opener]()
+        try:
+            conn.execute(f"UPDATE {table} SET device_id=NULL, inode=NULL "
+                         "WHERE path=?", (str(logical),))
+            conn.commit()
+        finally:
+            conn.close()
+    before = _state(ns)
+    dest = archive / logical.name
+    os.rename(logical, dest)
+    _sync_both(ns)
+    assert _cursor(ns, logical)["container_state"] == "pending"
+    _drain(ns)
+    cursor = _cursor(ns, logical)
+    assert cursor["container_state"] == "accepted", cursor["container_state_reason"]
+    assert cursor["container_path"] == str(dest)
+    assert _state(ns) == before
+
+
+def test_verified_zstd_to_plain_archive_adoption_records_path(env):
+    """#970 SR-05/G7: the verifier used to write container_path only for zstd,
+    erasing a plain archive location; the next pass would then misread the
+    archived container's position and re-route it forever."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    zst = _place(day / _name(1), _quota_records(SHARED), True)
+    logical = day / _name(1)
+    _sync_both(ns)
+    before = _state(ns)
+    data = zst.read_bytes()
+    backend = rc.resolve_zstd_backend()
+    (archive / logical.name).write_bytes(backend.module.decompress(data))
+    zst.unlink()
+    _sync_both(ns)
+    _drain(ns)
+    for opener, table in (("open_cache_db", "codex_session_files"),
+                          ("open_conversations_db",
+                           "codex_conversation_source_files")):
+        conn = ns[opener]()
+        try:
+            row = conn.execute(
+                f"SELECT container_kind, container_path, container_state "
+                f"FROM {table} WHERE path=?", (str(logical),)).fetchone()
+        finally:
+            conn.close()
+        assert tuple(row) == (rc.PLAIN, str(archive / logical.name), "accepted")
+    assert _state(ns) == before
+    # The recorded location makes the next pass quiet: no new transition.
+    _sync_both(ns)
+    assert _cursor(ns, logical)["container_state"] == "accepted"
+    assert _state(ns) == before
+
+
+def test_move_racing_walk_adopts_or_retries(env, monkeypatch):
+    """#970 spec 6: a move landing between the walk's selection and its write
+    must never record a location the container no longer has (the next pass
+    would then route a phantom move); it retries and converges."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    logical = _place(day / _name(1), _quota_records(SHARED), False)
+    _sync_both(ns)
+    before, _ = _full_state(ns)
+    dest = archive / logical.name
+    os.rename(logical, dest)
+    cache_mod = sys.modules["_cctally_cache"]
+    raced = []
+
+    def move_back(table, path):
+        if not raced:
+            raced.append(table)
+            os.rename(dest, logical)
+
+    monkeypatch.setattr(cache_mod, "_CODEX_LOCATION_ADOPT_HOOK", move_back)
+    _sync_both(ns)
+    assert raced
+    after, locations = _full_state(ns)
+    assert after == before
+    assert locations["open_cache_db"] == [None, None]   # nothing phantom recorded
+    monkeypatch.setattr(cache_mod, "_CODEX_LOCATION_ADOPT_HOOK", None)
+    os.rename(logical, dest)
+    _sync_both(ns)
+    after, locations = _full_state(ns)
+    assert after == before
+    for opener in ("open_cache_db", "open_conversations_db"):
+        assert str(dest) in locations[opener]
+
+
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "zstd"])
+def test_unchanged_second_pass_is_quiet(env, monkeypatch, compressed):
+    """#970 A8: after an archive move is adopted, the next pass must be
+    quiet — no write, no decode — or every hook would redo the move."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    container = _place(day / _name(1), _quota_records(SHARED), compressed)
+    _sync_both(ns)
+    os.rename(container, archive / container.name)
+    _sync_both(ns)
+    adopted = _full_state(ns)
+    calls = {"n": 0}
+    real = rc.resolve_zstd_backend
+
+    def counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(sys.modules["_lib_codex_rollout_container"],
+                        "resolve_zstd_backend", counting)
+    _sync_both(ns)
+    assert calls["n"] == 0
+    assert _full_state(ns) == adopted

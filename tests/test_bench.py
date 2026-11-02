@@ -1542,22 +1542,24 @@ def test_dashboard_soak_prior_schema_gate_requires_both_verified_heads():
 
 def test_dashboard_soak_prior_schema_artifacts_must_reach_current_heads(tmp_path):
     soak = _load_dashboard_soak()
-    with pytest.raises(ValueError, match="schemaAfter"):
-        soak._validate_external_metrics("upgrade", "cache-044", {
-            "schemaBefore": 44, "schemaAfter": 45,
-            "migrationAppliedCount": 1, "integrityCheckOk": True,
+    heads = soak._current_schema_heads()
+    # Floors, so a registry that silently shrank or an import of the wrong
+    # tree cannot satisfy the test with its own number.
+    assert heads["cache-044"][1] >= 50, heads
+    assert heads["conversations-009"][1] >= 12, heads
+    for name, (before, head) in heads.items():
+        with pytest.raises(ValueError, match="schemaAfter"):
+            soak._validate_external_metrics("upgrade", name, {
+                "schemaBefore": before, "schemaAfter": head - 1,
+                "migrationAppliedCount": head - 1 - before,
+                "integrityCheckOk": True,
+                "regressionCount": 0, "durationMs": 1.0,
+            })
+        soak._validate_external_metrics("upgrade", name, {
+            "schemaBefore": before, "schemaAfter": head,
+            "migrationAppliedCount": head - before, "integrityCheckOk": True,
             "regressionCount": 0, "durationMs": 1.0,
         })
-    soak._validate_external_metrics("upgrade", "cache-044", {
-        "schemaBefore": 44, "schemaAfter": 48,
-        "migrationAppliedCount": 4, "integrityCheckOk": True,
-        "regressionCount": 0, "durationMs": 1.0,
-    })
-    soak._validate_external_metrics("upgrade", "conversations-009", {
-        "schemaBefore": 9, "schemaAfter": 11,
-        "migrationAppliedCount": 2, "integrityCheckOk": True,
-        "regressionCount": 0, "durationMs": 1.0,
-    })
     fixture = tmp_path / "fixture"
     fixture.mkdir()
     (fixture / "population-marker").write_text("isolated fixture\n")
@@ -1565,10 +1567,8 @@ def test_dashboard_soak_prior_schema_artifacts_must_reach_current_heads(tmp_path
         checkout=str(BIN.parent), fixture_copy=fixture,
         upgrade_temp_parent=tmp_path,
     )
-    for name, expected in {
-        "cache-044": (44, 49, 5),
-        "conversations-009": (9, 12, 3),
-    }.items():
+    for name, (before, head) in heads.items():
+        expected = (before, head, head - before)
         probe = soak._run_upgrade_probe(args, name)
         assert probe["provenance"]["command"]["exitCode"] == 0
         assert probe["execution"]["durationMs"] > 0
@@ -1709,13 +1709,12 @@ def test_dashboard_soak_supplemental_evidence_is_verified_only_with_raw_executio
         if name in ("claudeActive", "codexActive", "bothActive"):
             metrics["processCpuPercent"] += index / 10
     upgrades = {
-        "cache-044": {"schemaBefore": 44, "schemaAfter": 48,
-                      "migrationAppliedCount": 4, "integrityCheckOk": True,
-                      "regressionCount": 0, "durationMs": 200.0},
-        "conversations-009": {"schemaBefore": 9, "schemaAfter": 11,
-                              "migrationAppliedCount": 2,
-                              "integrityCheckOk": True,
-                              "regressionCount": 0, "durationMs": 250.0},
+        name: {"schemaBefore": before, "schemaAfter": head,
+               "migrationAppliedCount": head - before,
+               "integrityCheckOk": True, "regressionCount": 0,
+               "durationMs": duration}
+        for (name, (before, head)), duration in zip(
+            soak._current_schema_heads().items(), (200.0, 250.0))
     }
     small_fingerprint = "a" * 64
 
@@ -2107,9 +2106,10 @@ def test_dashboard_soak_evidence_producer_executes_and_emits_all_artifacts(
         "execution": {"durationMs": 1000.0,
                       "stdout": "upgrade ok", "stderr": ""},
         "measurements": {
-            "schemaBefore": 44 if name == "cache-044" else 9,
-            "schemaAfter": 48 if name == "cache-044" else 11,
-            "migrationAppliedCount": 4 if name == "cache-044" else 2,
+            "schemaBefore": soak._current_schema_heads()[name][0],
+            "schemaAfter": soak._current_schema_heads()[name][1],
+            "migrationAppliedCount": (soak._current_schema_heads()[name][1]
+                                      - soak._current_schema_heads()[name][0]),
             "integrityCheckOk": True, "regressionCount": 0,
             "durationMs": 1000.0,
         },

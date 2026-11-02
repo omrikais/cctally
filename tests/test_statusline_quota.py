@@ -44,7 +44,7 @@ def _injections(sl, *, regimes=()):
         active_block=lambda _now: None,
         hwm_clamp=lambda _f, _s: (None, None),
         db_latest_rate_limits=lambda: None,
-        context_pct=lambda _p, _m: None,
+        context_pct=lambda _p, _m, _w, _t: None,
         warn_once=lambda _m: None,
         quota_regimes=lambda: tuple(regimes),
     )
@@ -211,7 +211,7 @@ def test_d2_a_port_that_raises_never_takes_the_prompt_down():
         active_block=lambda _now: None,
         hwm_clamp=lambda _f, _s: (None, None),
         db_latest_rate_limits=lambda: None,
-        context_pct=lambda _p, _m: None,
+        context_pct=lambda _p, _m, _w, _t: None,
         warn_once=lambda _m: None,
         quota_regimes=_boom,
     )
@@ -233,9 +233,17 @@ def test_d2_read_takes_no_lock(monkeypatch, tmp_path):
     from conftest import redirect_paths
     redirect_paths(ns, monkeypatch, tmp_path)
     _write_calibration(ns)
+    # #1015: the marker's lineage facts come from the stats store, which
+    # must exist for a change to be asserted at all.
+    ns["open_db"]().close()
+    real_flock = fcntl.flock
 
-    def _boom(*_a, **_k):
-        raise AssertionError("the status line took a flock")
+    def _boom(fd, op):
+        # #1015 spec 5.3: the fail-fast facts read may TRY the maintenance
+        # flock shared and non-blocking; a lock that can wait is the stall.
+        if op & (fcntl.LOCK_SH | fcntl.LOCK_EX) and not op & fcntl.LOCK_NB:
+            raise AssertionError("the status line took a blocking flock")
+        return real_flock(fd, op)
 
     monkeypatch.setattr(fcntl, "flock", _boom)
     port = _build_real_port(ns)
@@ -249,6 +257,7 @@ def test_d2_never_opens_cache_db_for_quota(monkeypatch, tmp_path):
     from conftest import redirect_paths
     redirect_paths(ns, monkeypatch, tmp_path)
     _write_calibration(ns)
+    ns["open_db"]().close()  # #1015: the lineage facts' store
 
     cache = ns["_load_sibling"]("_cctally_cache")
 
@@ -267,6 +276,7 @@ def test_d2_never_calls_analyse(monkeypatch, tmp_path):
     from conftest import redirect_paths
     redirect_paths(ns, monkeypatch, tmp_path)
     _write_calibration(ns)
+    ns["open_db"]().close()  # #1015: the lineage facts' store
 
     glue = ns["_load_sibling"]("_cctally_quota_model")
 

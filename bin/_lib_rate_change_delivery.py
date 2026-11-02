@@ -107,6 +107,22 @@ def with_decided(state, identities, *, seeded=None) -> dict:
     }
 
 
+def without_decided(state, identities) -> dict:
+    """A NEW state with `identities` no longer decided (#1015 spec 5.7).
+
+    Used only to hand back a claim this run won and then could not hand off
+    (the supersession recheck could not take its read guard): the identity
+    becomes owed again so a later run retries it. A decision whose
+    notification was handed off is never removed.
+    """
+    remaining = decided_set(state) - {tuple(i) for i in identities}
+    return {
+        "schemaVersion": SCHEMA_VERSION,
+        "seededFromStats": bool(state.get("seededFromStats")),
+        "decided": [list(i) for i in sorted(remaining)],
+    }
+
+
 def owed(recorded, decided) -> tuple:
     """Recorded identities with no decision, in a stable order.
 

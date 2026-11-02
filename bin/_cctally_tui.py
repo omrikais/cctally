@@ -230,6 +230,7 @@ from _lib_fmt import _fmt_usd_accounting, stable_sum
 # nothing on the default path.
 import _lib_perf as _perf
 import _lib_tick_stats as _tick_stats
+import _lib_write_io
 import _lib_log
 
 import importlib.util as _ilu
@@ -295,6 +296,8 @@ from _lib_dashboard_sources import (
     aggregate_scope_failed,
     aggregate_scope_identity,
     build_aggregate_scope,
+    calibration_basis_digest,
+    calibration_supersession_digest,
     claude_stats_digest,
     codex_stats_digest,
     combined_accounting_version,
@@ -5167,6 +5170,9 @@ def _tui_build_snapshot_once(
             # #857: the Codex quota-dependency identity, read on the
             # signature's own cache handle. An unreadable identity is `None`.
             codex_dependency = None
+            # #1015 spec 5.4: the calibration dependency, read on this tick's
+            # own stats connection (`_tui_read_calibration_dependency`).
+            calibration_dependency = None
             with _perf.phase("signature"):
                 try:
                     dispatch_sig, codex_dependency = (
@@ -5174,6 +5180,8 @@ def _tui_build_snapshot_once(
                             conn, with_codex_dependency=True,
                         )
                     )
+                    calibration_dependency = (
+                        _tui_read_calibration_dependency(conn))
                 except QuotaProjectionIncomplete as exc:
                     # #496 S5b §4.7: ahead of the generic handler on purpose.
                     # Below it the refusal is sanitized into a generic
@@ -5209,7 +5217,16 @@ def _tui_build_snapshot_once(
                 # bytes and the signature's own contract are unchanged. `None`
                 # (an unreadable identity) is a value like any other here; the
                 # idle gate is what refuses to idle any Codex generation on it.
-                dispatch_key = (dispatch_sig, render_key, codex_dependency)
+                # #1015 spec 5.4: the calibration dependency — the sidecar's
+                # file identity and the correction-lineage and supersession
+                # digests — rides the key on the same terms, so a refit, a
+                # recorded attempt, a completed correction batch or a
+                # supersession leaves the idle path and rebuilds the forecast
+                # and the rate-change array on the next tick.
+                dispatch_key = (
+                    dispatch_sig, render_key, codex_dependency,
+                    calibration_dependency,
+                )
                 # #300: carry the change signal onto the non-idle snapshot built
                 # below. (The idle path returns `idle_snap`, which inherits the
                 # prior — equal, since idle ⇒ signature unchanged — value.)
@@ -5533,12 +5550,17 @@ def _tui_build_snapshot_once(
                 # no store at all. An unreadable file yields no marker,
                 # which is the same thing an absent one yields, because the
                 # reader cannot tell them apart without scanning sidecars.
-                _mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+                #
+                # #1015 spec 5.6: over the CLEAN regimes, on this tick's own
+                # stats connection; a superseded transition or unverifiable
+                # correction facts show no marker.
+                _qcal = _cctally()._load_sibling("_cctally_quota_calibration")
                 _qg = _cctally()._load_sibling("_cctally_quota_model")
                 _state = _qg.read_stored_state_readonly()
                 if _state is not None:
-                    quota_rate_change = _mrc.active_rate_change(
-                        _qg.stored_regimes(_state, None))
+                    quota_rate_change = _qcal.clean_active_rate_change(
+                        None, regimes=_qg.stored_regimes(_state, None),
+                        stats_conn=conn)
             except Exception as exc:
                 capture_failure("quota_rate_change", "calibration", exc)
         # ---- 5h in-place credit (v1.7.x) ----
@@ -6113,6 +6135,41 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
             )
     finally:
         cache_conn.close()
+
+
+def _tui_read_calibration_dependency(stats_conn) -> tuple:
+    """The dispatch key's `calibration_dependency` component (#1015 spec 5.4).
+
+    A tuple of the calibration sidecar's file identity
+    (``(st_ino, st_size, st_mtime_ns)``, or None when it is absent), the
+    correction-lineage digest (completed batches, their footprints, and the
+    reviewed decision rows with their op coordinates) and the supersession
+    digest (the explicit rows and the transitions' frozen lineage).
+
+    What the forecast refusal and the rate-change array's supersession label
+    depend on, and what no dispatch-signature leg reads: a sweep that only
+    rewrites the sidecar (a refit, an annotation, a recorded attempt) moves
+    the first leg, a correction batch moves the second. Both digests go
+    through `_stats_relations_digest` on ``stats_conn``, the connection the
+    tick already holds, each under its own memo namespace, so an unchanged,
+    settled stats file costs no relation scan and no extra connection, and
+    the sidecar leg is one ``stat()``. A sidecar that cannot be ``stat``-ed
+    for another reason is its own stable value: the reader treats it as no
+    calibration on every tick, so there is nothing to rebuild for.
+    """
+    qmg = _cctally()._load_sibling("_cctally_quota_model")
+    try:
+        st = os.stat(qmg.calibration_path())
+        sidecar = (st.st_ino, st.st_size, st.st_mtime_ns)
+    except FileNotFoundError:
+        sidecar = None
+    except OSError as exc:
+        sidecar = ("unreadable", exc.errno)
+    return (
+        sidecar,
+        calibration_basis_digest(stats_conn),
+        calibration_supersession_digest(stats_conn),
+    )
 
 
 def _snapshot_period_rolled_over(prior, now_utc, display_tz):
@@ -8944,10 +9001,10 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 claude_roots = tuple(
                     _cctally_core._resolve_claude_projects_dirs()
                 )
-                codex_roots = tuple(
-                    root / "sessions"
-                    for root in _cctally()._codex_home_roots()
-                )
+                # #970: native-home recognition (sessions and archive
+                # locations), the same roots the walk uses.
+                codex_roots = frontier_mod.codex_frontier_roots(
+                    _cctally()._codex_home_roots())
                 claude_guards = (_cctally_core.CLAUDE_SETTINGS_PATH,)
                 try:
                     codex_hooks_mod = _cctally()._load_sibling("_lib_codex_hooks")
@@ -8991,6 +9048,7 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                     return codex_hooks_mod.codex_hook_roots_all_enabled(hook_roots)
                 cache_conn = None
                 publish_prior = False
+                accounting_recorded = False
                 initial_cache_identity = None
                 try:
                     # The standalone ingest tree is frozen before the final
@@ -9100,7 +9158,22 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                         return result
 
                     def _finalize_frontier(active_conn):
-                        nonlocal publish_prior
+                        nonlocal publish_prior, accounting_recorded
+                        # #939 D5: this tick's accounting census and residual,
+                        # computed while each provider's mode, plan and result
+                        # are known, and reported once the frontier is final.
+                        census = {}
+                        residuals = {}
+                        for provider in ("claude", "codex"):
+                            mode = effective_modes[provider]
+                            stats = result_by_provider.get(provider)
+                            census[provider] = (
+                                frontier_mod.accounting_census_complete(
+                                    mode, stats,
+                                    expected_paths=len(plans[provider].paths)))
+                            residuals[provider] = (
+                                None if mode == "caught_up"
+                                else frontier_mod.accounting_residual(stats))
                         for provider, roots, guards in (
                             ("claude", claude_roots, claude_guards),
                             ("codex", codex_roots, codex_guards),
@@ -9132,6 +9205,11 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                                     trusted=trusted_results[provider],
                                     cutoff=cutoff,
                                 )
+                        _lib_write_io.observe_accounting_tick(
+                            ended_ns=_time.monotonic_ns(),
+                            census_complete=all(census.values()),
+                            residuals=residuals)
+                        accounting_recorded = True
                         return None
 
                     operations = (
@@ -9173,6 +9251,12 @@ def _make_run_sync_now_locked(*, ref, hub, pinned_now, display_tz_pref_override,
                 finally:
                     if cache_conn is not None:
                         cache_conn.close()
+                    if not accounting_recorded:
+                        # #939 D5: a tick that never finalized did not cover
+                        # its census, so no conversation pass counts after it.
+                        _lib_write_io.observe_accounting_tick(
+                            ended_ns=_time.monotonic_ns(),
+                            census_complete=False, residuals={})
                 _ingest.__exit__(None, None, None)
                 _p_ingest.__exit__(None, None, None)
                 _perf.stash_last_ingest(

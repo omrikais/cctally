@@ -314,3 +314,64 @@ def test_bounded_expiry_drops_unclassified_candidate():
     for _ in range(5):                                    # unclassified, never reaped
         front.cycle(known_paths=set(), committed_sizes={})
     assert "/root/child.jsonl" not in front.pending_candidates()   # expired
+
+
+# ── #970: the archive directory (spec 5.8) ───────────────────────────────────
+
+_ARCHIVED = "rollout-2026-07-20T10-01-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0401"
+_DATED = "/home/sessions/2026/07/20/" + _ARCHIVED + ".jsonl"
+
+
+def test_discovers_an_archived_file_under_its_dated_path():
+    """#970 spec 5.8: the live tail enumerates a native home's archive
+    directory FLAT and surfaces each mappable file under its dated logical
+    path. Detects a child thread archived before the stream noticed it never
+    joining the live tail, a second identity minted from the archive pathname,
+    or a nested/unmappable archive entry being ingested."""
+    fs = FakeFS()
+    fs.add_dir("/home/sessions", mtime=1)
+    fs.add_dir("/home/archived_sessions", mtime=1)
+    fs.add_file("/home/archived_sessions", _ARCHIVED + ".jsonl.zst", size=90)
+    fs.files[_DATED] = 90                 # the signature probe takes the logical
+    fs.add_file("/home/archived_sessions", "notes.jsonl", size=10)
+    nested = fs.add_subdir("/home/archived_sessions", "nested", mtime=1)
+    fs.add_file(nested, _ARCHIVED.replace("10-01-00", "10-02-00") + ".jsonl")
+    front = _frontier(fs, "/home/sessions",
+                      archive_root="/home/archived_sessions", op_budget=32)
+    got, _ = _drain(front, fs, cycles=5)
+    assert got == {_DATED}
+    assert nested not in front.known_directories()     # flat, never recursive
+    # A later archive move bumps only the archive's own mtime and is found.
+    late = _ARCHIVED.replace("10-01-00", "10-03-00")
+    fs.add_file("/home/archived_sessions", late + ".jsonl", size=40)
+    fs.files["/home/sessions/2026/07/20/" + late + ".jsonl"] = 40
+    fs.bump_mtime("/home/archived_sessions", 2)
+    got, _ = _drain(front, fs, known={_DATED}, committed={_DATED: 90},
+                    cycles=5)
+    assert got == {"/home/sessions/2026/07/20/" + late + ".jsonl"}
+
+
+def test_archive_enumeration_shares_the_budget():
+    """#970 spec 5.8: the archive directory spends the SAME per-cycle
+    operation budget as the walk root. Detects a large archive (the operator
+    has 108 rollouts there) blowing the live tail's per-poll filesystem
+    ceiling, or starving the sessions tree."""
+    fs = FakeFS()
+    fs.add_dir("/home/sessions", mtime=1)
+    day = fs.add_subdir(fs.add_subdir(fs.add_subdir(
+        "/home/sessions", "2026"), "07"), "21")
+    fs.add_file(day, "fresh.jsonl", size=30)
+    fs.add_dir("/home/archived_sessions", mtime=1)
+    expected = {day + "/fresh.jsonl"}
+    for i in range(40):
+        stem = _ARCHIVED.replace("10-01-00", f"11-{i:02d}-00")
+        fs.add_file("/home/archived_sessions", stem + ".jsonl", size=50)
+        logical = "/home/sessions/2026/07/20/" + stem + ".jsonl"
+        fs.files[logical] = 50
+        expected.add(logical)
+    budget = 6
+    front = _frontier(fs, "/home/sessions",
+                      archive_root="/home/archived_sessions", op_budget=budget)
+    got, max_ops = _drain(front, fs, cycles=300)
+    assert max_ops <= budget
+    assert got == expected

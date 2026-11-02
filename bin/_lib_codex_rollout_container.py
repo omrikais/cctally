@@ -5,7 +5,12 @@ cache, journal, configuration or CLI modules. It owns
 
 * logical normalization (``X.jsonl.zst`` -> ``X.jsonl``) — every persisted key is
   the logical path, whatever container holds the bytes;
-* container selection (plain wins, else the ``.zst`` twin, else none);
+* container selection (plain wins, else the ``.zst`` twin, else — when the
+  caller supplies an archive directory (#970) — the archived plain, then the
+  archived ``.zst``, else none), plus a strict tri-state presence probe;
+* native-home recognition and the pure archive-name mapping (#970 spec 5.1,
+  5.2). The leaf never guesses a layout: an archive location is used only when
+  a caller passes it explicitly;
 * the call-time decoder chain (stdlib ``compression.zstd`` on 3.14+, then
   ``backports.zstd``, then a typed unavailable result);
 * a decoded binary stream whose ``tell``/``seek`` speak DECODED offsets, so a
@@ -19,13 +24,20 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import datetime as _dt
+import errno as _errno
 import os
 import pathlib
+import re
 import stat as _stat
-from typing import Callable, NamedTuple, Optional, Union
+from typing import Callable, Iterable, NamedTuple, Optional, Union
 
 PLAIN = "plain"
 ZSTD = "zstd"
+DATED = "dated"
+ARCHIVE = "archive"
+SESSIONS_DIR = "sessions"
+ARCHIVE_DIR = "archived_sessions"
 PLAIN_SUFFIX = ".jsonl"
 ZSTD_SUFFIX = ".jsonl.zst"
 DECODE_CHUNK = 1 << 20
@@ -126,15 +138,23 @@ class ContainerFingerprint(NamedTuple):
     device: int
     inode: int
 
-    def watch_sig(self) -> tuple:
+    def watch_sig(self, location: str = DATED) -> tuple:
         """The live-tail signature: plain keeps today's size; zstd binds the
         container's identity, device included, exactly as the zstd generation
         token and every compressed container-unchanged check do (review P3-2,
-        round-2 N9), so a remounted container is observed as a change once."""
+        round-2 N9), so a remounted container is observed as a change once.
+
+        #970 A8: a container outside the dated location carries its location
+        as a trailing element, so a pure archive move (same size and stat
+        identity) is observed once. A dated container keeps today's shape
+        exactly, so every committed signature stays valid.
+        """
         if self.kind == PLAIN:
-            return (PLAIN, int(self.size))
-        return (ZSTD, int(self.size), int(self.mtime_ns), int(self.device),
-                int(self.inode))
+            sig = (PLAIN, int(self.size))
+        else:
+            sig = (ZSTD, int(self.size), int(self.mtime_ns), int(self.device),
+                   int(self.inode))
+        return sig if location == DATED else sig + (str(location),)
 
     def to_json(self) -> str:
         return json.dumps(list(self), separators=(",", ":"))
@@ -173,24 +193,219 @@ class SelectedContainer(NamedTuple):
     kind: str
     path: pathlib.Path
     fingerprint: ContainerFingerprint
+    #: #970: ``"dated"`` (beside the logical path) or ``"archive"`` (the
+    #: caller-supplied archive directory). Trailing with a default, so every
+    #: four-field construction stays valid.
+    location: str = DATED
 
 
-def select_container(logical: PathLike) -> "SelectedContainer | None":
-    """Plain when it exists, otherwise the ``.zst`` twin, otherwise None (5.2)."""
-    lp = pathlib.Path(logical_path(os.fspath(logical)))
-    fp = fingerprint_of(lp, PLAIN)
-    if fp is not None:
-        return SelectedContainer(lp, PLAIN, lp, fp)
-    twin = zstd_twin(lp)
-    fp = fingerprint_of(twin, ZSTD)
-    if fp is not None:
-        return SelectedContainer(lp, ZSTD, twin, fp)
+class CodexLocations(NamedTuple):
+    """One configured Codex root's container locations (#970 spec 5.1).
+
+    ``walk_root`` is the directory discovery walks and every logical path lives
+    under; ``archive_root`` is a native home's flat archive directory, or None
+    for a direct directory. Either may not exist yet.
+    """
+
+    walk_root: pathlib.Path
+    archive_root: "pathlib.Path | None"
+
+
+def home_locations(configured: PathLike) -> "CodexLocations | None":
+    """Native-home recognition (#970 spec 5.1, A7).
+
+    A configured directory with a ``sessions/`` or an ``archived_sessions/``
+    child is a native home: ``walk_root = <home>/sessions`` and
+    ``archive_root = <home>/archived_sessions``, either possibly missing, so
+    the first unarchive (which creates ``sessions/``) never changes an
+    identity. Any other existing directory is walked directly with no archive.
+    Anything else is not a root.
+    """
+    home = pathlib.Path(configured)
+    sessions, archive = home / SESSIONS_DIR, home / ARCHIVE_DIR
+    try:
+        native = sessions.is_dir() or archive.is_dir()
+    except OSError:
+        native = False
+    if native:
+        return CodexLocations(sessions, archive)
+    try:
+        if home.is_dir():
+            return CodexLocations(home, None)
+    except OSError:
+        pass
     return None
 
 
-def observe_watch_sig(logical: PathLike) -> "tuple | None":
-    selected = select_container(logical)
-    return None if selected is None else selected.fingerprint.watch_sig()
+def release_walked_archives(
+        locations: "Iterable[CodexLocations]") -> "list[CodexLocations]":
+    """Drop each archive another configured root already walks (#970 N4).
+
+    ``CODEX_HOME=<home>,<home>/archived_sessions`` names one directory twice:
+    as the home's archive and as a direct root. The direct root spells its
+    identities ``<archive>/X.jsonl``, which the home would read as a retained
+    direct-era spelling and hold its dated twins forever. A native home whose
+    canonical archive equals, or lies inside, another location's canonical
+    walk root therefore gets ``archive_root=None``: the root that walks the
+    directory keeps it, exactly as without #970. Order and every other field
+    are kept; canonicalization follows symlinks without requiring existence.
+    """
+    locations = list(locations)
+
+    def canonical(path):
+        try:
+            return pathlib.Path(os.path.realpath(path))
+        except (OSError, ValueError):
+            return pathlib.Path(os.path.abspath(path))
+
+    walks = [canonical(location.walk_root) for location in locations]
+    out: "list[CodexLocations]" = []
+    for index, location in enumerate(locations):
+        if location.archive_root is not None:
+            archive = canonical(location.archive_root)
+            if any(other != index and (archive == walk or walk in archive.parents)
+                   for other, walk in enumerate(walks)):
+                location = location._replace(archive_root=None)
+        out.append(location)
+    return out
+
+
+# The UUID shape `_lib_jsonl._CODEX_FILENAME_UUID_RE` uses; duplicated here
+# because the leaf imports only the standard library.
+_ARCHIVE_NAME_RE = re.compile(
+    r"rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-[0-9a-fA-F-]{36}"
+    r"\.jsonl(?:\.zst)?")
+
+
+def archive_name_date(name: str) -> "tuple[str, str, str] | None":
+    """``(YYYY, MM, DD)`` of a complete rollout basename, else None (#970 5.2).
+
+    Only ``rollout-YYYY-MM-DDThh-mm-ss-<uuid>.jsonl[.zst]`` with a valid
+    calendar date qualifies. The date is the filename's literal date: no
+    timezone conversion.
+    """
+    match = _ARCHIVE_NAME_RE.fullmatch(str(name))
+    if match is None:
+        return None
+    year, month, day = match.group(1), match.group(2), match.group(3)
+    try:
+        _dt.date(int(year), int(month), int(day))
+    except ValueError:
+        return None
+    return year, month, day
+
+
+def archive_dir_for(logical: PathLike,
+                    locations: "Iterable[CodexLocations]") -> "pathlib.Path | None":
+    """The archive directory whose containers belong to ``logical`` (#970 G2).
+
+    Pure path arithmetic, no I/O: only a logical path that is exactly
+    ``walk_root/YYYY/MM/DD/<name>.jsonl`` of a location with an archive, and
+    whose name's date is that ``YYYY/MM/DD``, has archive candidates.
+    """
+    lp = pathlib.Path(logical_path(os.fspath(logical)))
+    if not lp.name.endswith(PLAIN_SUFFIX):
+        return None
+    date = archive_name_date(lp.name)
+    if date is None:
+        return None
+    day = lp.parent
+    if (day.parent.parent.name, day.parent.name, day.name) != date:
+        return None
+    base = day.parent.parent.parent
+    for location in locations:
+        if location.archive_root is not None and base == location.walk_root:
+            return location.archive_root
+    return None
+
+
+def dated_logical_for_archive(
+        container: PathLike,
+        locations: "Iterable[CodexLocations]") -> "pathlib.Path | None":
+    """Map ``archive_root/<name>[.zst]`` to ``walk_root/YYYY/MM/DD/<name>``.
+
+    None for an unmappable name or a path that is not a direct child of any
+    location's archive directory (archive discovery is flat).
+    """
+    cp = pathlib.Path(container)
+    date = archive_name_date(cp.name)
+    if date is None:
+        return None
+    for location in locations:
+        if location.archive_root is not None and cp.parent == location.archive_root:
+            return location.walk_root.joinpath(*date, logical_path(cp.name))
+    return None
+
+
+def container_candidates(
+        logical: PathLike, *, archive_dir: "PathLike | None" = None,
+) -> "list[tuple[str, str, pathlib.Path]]":
+    """``(kind, location, path)`` in selection order (#970 G2)."""
+    lp = pathlib.Path(logical_path(os.fspath(logical)))
+    out = [(PLAIN, DATED, lp), (ZSTD, DATED, zstd_twin(lp))]
+    if archive_dir is not None:
+        archive = pathlib.Path(archive_dir)
+        out.append((PLAIN, ARCHIVE, archive / lp.name))
+        out.append((ZSTD, ARCHIVE, archive / (lp.name + ".zst")))
+    return out
+
+
+def select_container(logical: PathLike, *,
+                     archive_dir: "PathLike | None" = None,
+                     ) -> "SelectedContainer | None":
+    """The first regular container in selection order, else None.
+
+    Plain when it exists, otherwise the ``.zst`` twin (#968 5.2); with an
+    explicit ``archive_dir``, then ``archive_dir/<name>.jsonl`` and
+    ``archive_dir/<name>.jsonl.zst`` (#970 5.2). Lenient: a stat error reads as
+    absent. Destructive callers use ``probe_containers`` instead.
+    """
+    lp = pathlib.Path(logical_path(os.fspath(logical)))
+    for kind, location, path in container_candidates(lp, archive_dir=archive_dir):
+        fp = fingerprint_of(path, kind)
+        if fp is not None:
+            return SelectedContainer(lp, kind, path, fp, location)
+    return None
+
+
+_ABSENT_ERRNOS = frozenset({_errno.ENOENT, _errno.ENOTDIR})
+
+
+def probe_containers(logical: PathLike, *,
+                     archive_dir: "PathLike | None" = None,
+                     ) -> "tuple[str, SelectedContainer | None]":
+    """Strict tri-state presence (#970 spec 5.2, A4).
+
+    ``("present", selected)`` for the first regular candidate in selection
+    order; ``("absent", None)`` only when EVERY candidate's stat failed with
+    ``ENOENT``/``ENOTDIR``; ``("unknown", None)`` otherwise — any other stat
+    error (an unreadable directory) or a candidate that exists but is not a
+    regular file. Absence is never inferred from an error.
+    """
+    lp = pathlib.Path(logical_path(os.fspath(logical)))
+    unknown = False
+    for kind, location, path in container_candidates(lp, archive_dir=archive_dir):
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            if exc.errno not in _ABSENT_ERRNOS:
+                unknown = True
+            continue
+        if not _stat.S_ISREG(st.st_mode):
+            unknown = True
+            continue
+        fp = ContainerFingerprint(kind, os.fspath(path), int(st.st_size),
+                                  int(st.st_mtime_ns), int(st.st_dev),
+                                  int(st.st_ino))
+        return "present", SelectedContainer(lp, kind, path, fp, location)
+    return ("unknown", None) if unknown else ("absent", None)
+
+
+def observe_watch_sig(logical: PathLike, *,
+                      archive_dir: "PathLike | None" = None) -> "tuple | None":
+    selected = select_container(logical, archive_dir=archive_dir)
+    return (None if selected is None
+            else selected.fingerprint.watch_sig(selected.location))
 
 
 class DecodedZstdStream:

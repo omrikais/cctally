@@ -133,7 +133,7 @@ See [docs/commands/blocks.md](docs/commands/blocks.md) and [docs/commands/five-h
 
 ## Codex
 
-If you also use OpenAI's Codex CLI, cctally tracks it with the same depth. `cctally codex daily`, `monthly`, and `session` are drop-in replacements for the ccusage codex commands, reading from your local `~/.codex/sessions/`. `cctally codex weekly` adds a subscription week rollup, and `cctally codex quota` shows your native Codex rate limit windows.
+If you also use OpenAI's Codex CLI, cctally tracks it with the same depth. `cctally codex daily`, `monthly`, and `session` are drop-in replacements for the ccusage codex commands, reading from your local `~/.codex/sessions/`, archived threads in `~/.codex/archived_sessions/` included. `cctally codex weekly` adds a subscription week rollup, and `cctally codex quota` shows your native Codex rate limit windows.
 
 <p align="center">
   <img src="docs/img/cli-codex-daily.svg" alt="cctally codex daily: Codex cost by day">

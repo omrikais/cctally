@@ -76,14 +76,28 @@ STATS_TABLES = frozenset({
     # writes it into its private scratch, so it joins the freeze from its
     # first epoch rather than repeating #768.
     "journal_admission_summary",
+    # #956 class 2 (epoch 1021, spec 4.6.3): the five-hour block-opening fact,
+    # a harvest family written by the creating cycle inside `_run_cycle`'s
+    # BEGIN IMMEDIATE and by the fold into a rebuild's private scratch. It
+    # joins the freeze from its first epoch, like the admission summary above.
+    "five_hour_block_openings",
+    # #943 epoch 1021 (spec 4.2.2): the five-hour credit boundary companion,
+    # a harvest family the confirm leg writes inside `_run_cycle`'s BEGIN
+    # IMMEDIATE and the generic fold writes into a rebuild's private scratch.
+    # It shipped outside this freeze in its first epoch (I2) and joins here
+    # with NO exemption.
+    "five_hour_credit_boundaries",
     # #825/#832 epoch 1018 (spec 5.6 item 9): the outcome quarantine — the
     # trigger log, the whole-prefix envelope and the per-account
     # certificates. Ingest writes them inside `_run_cycle`'s BEGIN IMMEDIATE
     # and the rebuild into its private scratch, so they join the freeze from
     # their first epoch.
     "outcome_quarantine_triggers",
-    "outcome_quarantine_envelope",
-    "outcome_quarantine_certificates",
+    # #948 epoch 1023: the per-axis recovery barrier's tables replace the
+    # envelope and the certificates.
+    "outcome_quarantine_episodes",
+    "outcome_quarantine_bounds",
+    "outcome_quarantine_axis_state",
     # #825/#832 Task 4.0 (epoch 1018): the snapshot-suppression tombstone. Its
     # only writer is `trg_usage_snapshot_suppression`, so it is written inside
     # whatever DELETE fires the trigger — every one of which already runs in a
@@ -142,7 +156,11 @@ FROZEN_WRITE_SITES = {
         "budget_milestones": 1,
         "five_hour_block_models": 1,
         "five_hour_block_projects": 1,
+        # #956 class 2: the opening fact's CREATE TABLE.
+        "five_hour_block_openings": 1,
         "five_hour_blocks": 1,
+        # #943: the boundary companion's CREATE TABLE.
+        "five_hour_credit_boundaries": 1,
         # #825/#832 Task 4.0: the CREATE TABLE plus the
         # `trg_usage_snapshot_suppression` body's UPDATE, which points a
         # milestone at the 0 "no snapshot row" sentinel when the snapshot it
@@ -153,8 +171,9 @@ FROZEN_WRITE_SITES = {
         "five_hour_reset_events": 1,
         "journal_admission_summary": 1,
         "journal_cursor": 2,
-        "outcome_quarantine_certificates": 1,
-        "outcome_quarantine_envelope": 1,
+        "outcome_quarantine_axis_state": 1,
+        "outcome_quarantine_bounds": 1,
+        "outcome_quarantine_episodes": 1,
         "outcome_quarantine_triggers": 1,
         "journal_effective_events": 1,
         "journal_protocol_violations": 1,
@@ -230,10 +249,17 @@ FROZEN_WRITE_SITES = {
         "weekly_cost_snapshots": 2,
         "weekly_usage_snapshots": 2,
     },
+    # #956 class 1: `project_open_block_end` (one `UPDATE five_hour_blocks`
+    # and a replace-all DELETE + INSERT per child table) and the rebuild's
+    # `_materialize_open_candidate` INSERT join the legacy backfill's sites.
+    # The projection is reached from `maybe_update_five_hour_block` (moved out
+    # of `bin/_cctally_record.py`, which loses its child-table pair) inside
+    # `_run_cycle`'s ingest scope, and from `_backfill_five_hour_blocks` in a
+    # rebuild's or completion's private scratch under its maintenance scope.
     "_cctally_five_hour.py": {
-        "five_hour_block_models": 1,
-        "five_hour_block_projects": 1,
-        "five_hour_blocks": 1,
+        "five_hour_block_models": 3,
+        "five_hour_block_projects": 3,
+        "five_hour_blocks": 3,
         "schema_migrations": 1,
     },
     # #496 S5b: `_write_selector_state` replaced `_write_effective_metadata`
@@ -252,7 +278,18 @@ FROZEN_WRITE_SITES = {
     # rows.
     "_cctally_journal.py": {
         "accounts": 8,
-        "five_hour_blocks": 1,
+        # #956 class 2 adds three: `_materialize_opened_block`'s INSERT OR
+        # IGNORE of the open block an opening describes (reached only through
+        # the `five_hour_block_open` applier: live step 4a's crash replay in
+        # the ingest transaction, a rebuild's or a scratch replay's fold), and
+        # the opening's coupled convergence `UPDATE` and removal `DELETE`
+        # (`_converge_opened_block` from `_converge_row_from_effective`, live
+        # in the ingest transaction or on a completion scratch;
+        # `_remove_opened_block` from `_delete_scratch_row`, scratch only).
+        "five_hour_blocks": 4,
+        # #956 class 2: `_remove_opened_block` points the removed block's
+        # milestones at the `block_id = 0` sentinel, on a completion scratch.
+        "five_hour_milestones": 1,
         # #825/#832: `_write_admission_summary`'s INSERT OR REPLACE, reached
         # from the ingest cycle transaction and the rebuild scratch.
         "journal_admission_summary": 1,
@@ -275,7 +312,11 @@ FROZEN_WRITE_SITES = {
         # `_publish_generation_in_place`'s transaction — the same one that
         # installs the rows and writes `stats_publication_stamp`, so content
         # and identity commit together. The single-row table needs no removal.
-        "journal_selector_state": 4,
+        # #949 made it FIVE: `_stamp_replace_scratch` writes the same identity
+        # into a replace publication's closed scratch, in the one transaction
+        # that writes its `stats_publication_stamp`, before `os.replace` makes
+        # it live — under the publishing rebuild's own scope.
+        "journal_selector_state": 5,
         # Two, both #768 and both R1. `_insert_meter_rate_change`
         # contributes the `INSERT OR IGNORE` and
         # `_backfill_meter_rate_change_evidence` the COALESCE `UPDATE`,
@@ -302,7 +343,16 @@ FROZEN_WRITE_SITES = {
         # so a crash between them cannot leave a cleared flag over a projection
         # that was never rewritten.
         "stats_quota_projection_state": 2,
-        "weekly_credit_floors": 1,
+        # Two: the `weekly_credit_effects` applier's floor-suppression DELETE,
+        # and (#943 F-I1-1) `_apply_op_weekly_credit_floor`'s slot take-over
+        # UPDATE, which lets a `--force` op at the replaced floor's own second
+        # own that slot. Both are reached only through the fold appliers
+        # (`_apply_evt` and the op fold), so live they run on `ctx.conn`
+        # inside `_run_cycle`'s `BEGIN IMMEDIATE` under
+        # `stats_write_scope("ingest", ingest_lock=True)`, and on rebuild and
+        # rederive against their private scratch under the maintenance and
+        # rederive scopes.
+        "weekly_credit_floors": 2,
         # #825/#832 fix round K14b (spec 4.7 revision 6) added one; fix
         # round K15 made it TWO. `_apply_reset_with_suppression` applies a
         # five-hour credit's `suppression` list (the whole stale-replica
@@ -346,9 +396,12 @@ FROZEN_WRITE_SITES = {
         "claude_oauth_samples": 1,
         "claude_weekly_observation_decisions": 1,
     },
+    # #948: episodes upsert, bounds (scope, meta and control rows, and the
+    # control row's removal) and the current generation's axis state.
     "_cctally_quarantine.py": {
-        "outcome_quarantine_certificates": 1,
-        "outcome_quarantine_envelope": 1,
+        "outcome_quarantine_axis_state": 1,
+        "outcome_quarantine_bounds": 4,
+        "outcome_quarantine_episodes": 1,
         "outcome_quarantine_triggers": 1,
     },
     "_cctally_quota.py": {
@@ -360,10 +413,20 @@ FROZEN_WRITE_SITES = {
         "quota_window_blocks": 3,
     },
     "_cctally_record.py": {
-        "five_hour_block_models": 2,
-        "five_hour_block_projects": 2,
+        # #956 class 2: `_insert_five_hour_block_opening`, called by
+        # `maybe_update_five_hour_block` when it creates a block, on `ctx.conn`
+        # inside `_run_cycle`'s BEGIN IMMEDIATE (R1) or a scratch replay.
+        "five_hour_block_openings": 1,
         "five_hour_blocks": 5,
-        "five_hour_milestones": 2,
+        # #943: the boundary companion's `INSERT OR IGNORE` in
+        # `detect_reset_and_credit`'s five-hour confirm leg, run only when
+        # the credit INSERT took effect, on `ctx.conn` inside `_run_cycle`'s
+        # BEGIN IMMEDIATE (R1) or a scratch replay.
+        "five_hour_credit_boundaries": 1,
+        # #956 class 2 adds one: the creating cycle re-links the window's
+        # `block_id = 0` milestones to the block it just created, in the same
+        # regime as the opening above.
+        "five_hour_milestones": 3,
         "five_hour_reset_events": 1,
         "percent_milestones": 1,
         "project_budget_milestones": 1,
@@ -491,15 +554,25 @@ FROZEN_WRITE_SITES = {
 #: `_delete_scratch_row` removes a tombstoned row from a derivation-completion
 #: scratch projection (never the live index); its table is a journal family's
 #: own, from `_HARVEST_SPECS`/`_EVT_SPECS`.
+#: #956 class 2 raised it from 10 to 11: `_remove_opened_block` deletes a
+#: tombstoned opening's open block's child rows from each `_BLOCK_CHILDREN`
+#: table (the fixed `five_hour_block_models`/`five_hour_block_projects` pair
+#: declared in that module), reached only from `_delete_scratch_row` on a
+#: derivation-completion scratch projection.
 # #968 adds four cursor UPDATE sites (_mark, _adopt, and _apply's
 # unverified/accepted-EOF branches) and two fixed TEMP-view DROP/CREATE sites.
 # The real-store authorizer regression in test_codex_container_transitions
 # observes all six on both stores, restricts targets and proves zero stats-main
 # writes; docs/journal-gotchas.md records the negative reachability audit.
+# #970 adds one: `_adopt_codex_container_location`'s location-only
+# `UPDATE {table} SET container_path=?` over the same `_VERIFY_TABLES` pair
+# (any other table raises before SQL);
+# test_location_adoption_writes_only_its_cursor_table observes it on both
+# stores with an SQLite authorizer and proves zero stats-main writes.
 FROZEN_DYNAMIC_SITES = {
-    "_cctally_cache.py": 16,
+    "_cctally_cache.py": 17,
     "_cctally_db.py": 9,
-    "_cctally_journal.py": 10,
+    "_cctally_journal.py": 11,
     "_cctally_store.py": 1,
 }
 

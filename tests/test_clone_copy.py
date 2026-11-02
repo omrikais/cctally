@@ -300,3 +300,148 @@ def test_the_shared_corpus_copier_clones_under_its_shared_lock_and_restamps(
     assert restamped == [tmp_path / "copy"]
     assert os.stat(str(result / "stats.db")).st_ino != os.stat(str(data / "stats.db")).st_ino
 
+
+
+# --- clone_regular_file: the strict clone (#1000 spec 5.1, T2) ---------------
+#
+# The transcript probe must never write a byte copy of the store. Its clone is
+# therefore this strict variant: any failure raises, with the syscall errno, and
+# nothing is ever copied, hardlinked or overwritten in its place.
+
+
+def _as_darwin(monkeypatch):
+    """Make the strict clone reach its clone call on any host."""
+    monkeypatch.setattr(CC, "_PLATFORM", "darwin")
+    monkeypatch.setattr(CC, "_fclonefileat", lambda: (lambda *_a: 0))
+
+
+_STRICT_ERRNOS = ("ENOTSUP", "EOPNOTSUPP", "EXDEV", "EINVAL", "EPERM",
+                  "EEXIST", "EIO", "ENOSPC")
+
+
+@pytest.mark.parametrize("name", [n for n in _STRICT_ERRNOS if hasattr(errno, n)])
+def test_the_strict_clone_raises_every_clone_errno_and_copies_nothing(
+        tmp_path, monkeypatch, name):
+    """Stored-data safety: a clone the filesystem refuses (HFS+/exFAT ENOTSUP,
+    a cross-volume EXDEV) or fails (EIO, ENOSPC, ...) must raise that errno and
+    never fall back to a byte copy, which on a 4 GB transcript store fills the
+    volume (#1000)."""
+    code = getattr(errno, name)
+    _as_darwin(monkeypatch)
+    attempts = []
+
+    def refuse(fd, destination):
+        attempts.append(destination)
+        raise OSError(code, os.strerror(code), destination)
+
+    monkeypatch.setattr(CC, "_clone_fd", refuse)
+    src = tmp_path / "f"
+    src.write_bytes(b"store bytes")
+    with pytest.raises(OSError) as info:
+        CC.clone_regular_file(str(src), str(tmp_path / "g"), counts={})
+    assert info.value.errno == code
+    assert attempts, "the clone call was never attempted"
+    assert not (tmp_path / "g").exists(), "a refused clone created a destination"
+
+
+@pytest.mark.parametrize("case", ["no-symbol", "not-darwin"])
+def test_the_strict_clone_without_fclonefileat_is_unsupported(
+        tmp_path, monkeypatch, case):
+    """Machine safety: a host that cannot clone at all reports ENOTSUP, the
+    refusal the probe maps to "unavailable", rather than copying the store."""
+    if case == "no-symbol":
+        monkeypatch.setattr(CC, "_PLATFORM", "darwin")
+        monkeypatch.setattr(CC, "_fclonefileat", lambda: None)
+    else:
+        monkeypatch.setattr(CC, "_PLATFORM", "linux")
+    src = tmp_path / "f"
+    src.write_bytes(b"x")
+    with pytest.raises(OSError) as info:
+        CC.clone_regular_file(str(src), str(tmp_path / "g"))
+    assert info.value.errno == errno.ENOTSUP
+    assert not (tmp_path / "g").exists()
+
+
+def test_the_strict_clone_refuses_a_fifo_without_blocking(tmp_path, monkeypatch):
+    """Machine safety: a FIFO planted where the store should be must fail with
+    EINVAL at once; a blocking open would hang the rebuild under its locks."""
+    import threading
+
+    _as_darwin(monkeypatch)
+
+    def unexpected(fd, destination):
+        raise AssertionError("a non-regular source reached the clone call")
+
+    monkeypatch.setattr(CC, "_clone_fd", unexpected)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(str(fifo))
+    outcome = []
+
+    def run():
+        try:
+            CC.clone_regular_file(str(fifo), str(tmp_path / "g"))
+        except OSError as exc:
+            outcome.append(exc.errno)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive(), "opening a FIFO source blocked"
+    assert outcome == [errno.EINVAL]
+    assert not (tmp_path / "g").exists()
+
+
+def test_the_strict_clone_never_follows_a_symlinked_source(tmp_path, monkeypatch):
+    """Stored-data safety: a symlinked store member must fail (ELOOP) rather
+    than clone whatever the link points at."""
+    _as_darwin(monkeypatch)
+    monkeypatch.setattr(CC, "_clone_fd", lambda fd, destination: None)
+    target = tmp_path / "target"
+    target.write_bytes(b"elsewhere")
+    os.symlink(str(target), str(tmp_path / "link"))
+    with pytest.raises(OSError) as info:
+        CC.clone_regular_file(str(tmp_path / "link"), str(tmp_path / "g"))
+    assert info.value.errno == errno.ELOOP
+    assert not (tmp_path / "g").exists()
+
+
+def test_the_strict_clone_counts_one_clone_and_never_a_copy(tmp_path, monkeypatch):
+    """Measurement accuracy: a successful strict clone is reported as a clone,
+    so the counts can never hide a copy."""
+    _as_darwin(monkeypatch)
+
+    def clone(fd, destination):
+        with open(destination, "xb") as fh:
+            fh.write(os.pread(fd, 1 << 16, 0))
+
+    monkeypatch.setattr(CC, "_clone_fd", clone)
+    src = tmp_path / "f"
+    src.write_bytes(b"cloned")
+    counts = {}
+    dst = str(tmp_path / "g")
+    assert CC.clone_regular_file(str(src), dst, counts=counts) == dst
+    assert counts == {"clone": 1}
+    assert (tmp_path / "g").read_bytes() == b"cloned"
+
+
+def test_the_strict_clone_takes_a_real_apfs_clone(tmp_path):
+    """Stored-data accuracy: on the runner's APFS scratch, with no seam, the
+    strict clone produces a destination with the source's bytes on a new inode;
+    elsewhere it reports ENOTSUP and creates nothing."""
+    src = tmp_path / "f.bin"
+    src.write_bytes(os.urandom(1 << 16))
+    dst = tmp_path / "g.bin"
+    counts = {}
+    if not EXPECT_CLONE:
+        with pytest.raises(OSError) as info:
+            CC.clone_regular_file(str(src), str(dst), counts=counts)
+        assert info.value.errno == errno.ENOTSUP
+        assert not dst.exists() and counts == {}
+        return
+    CC.clone_regular_file(str(src), str(dst), counts=counts)
+    assert counts == {"clone": 1}
+    assert dst.read_bytes() == src.read_bytes()
+    assert os.stat(str(dst)).st_ino != os.stat(str(src)).st_ino
+    assert os.stat(str(dst)).st_nlink == 1

@@ -1062,7 +1062,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
     import _cctally_core
     import _cctally_journal as jr
 
-    assert _cctally_core.STATS_INDEX_EPOCH == 1019
+    assert _cctally_core.STATS_INDEX_EPOCH == 1023
     assert "stats_publication_stamp" in jr._REBUILD_REQUIRED_TABLES
 
     _seed_live_index()
@@ -1082,7 +1082,7 @@ def test_the_publication_stamp_table_is_part_of_the_epoch_contract(ns):
             )
         ]
         assert columns == ["record_path", "started_at_utc", "stamped_at_utc"]
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1019
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1023
     finally:
         conn.close()
 
@@ -1367,7 +1367,9 @@ def _seed_cli(env: dict) -> pathlib.Path:
     return db
 
 
-def _kill_rebuild_at(env: dict, tmp_path: pathlib.Path, point: str) -> None:
+def _kill_rebuild_at(
+    env: dict, tmp_path: pathlib.Path, point: str, *, argv=None
+) -> None:
     marker = tmp_path / f"{point}.pid"
     child_env = dict(env)
     child_env.update(
@@ -1377,7 +1379,7 @@ def _kill_rebuild_at(env: dict, tmp_path: pathlib.Path, point: str) -> None:
         }
     )
     rebuild = subprocess.Popen(
-        [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
+        argv or [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
         env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     try:
@@ -1635,6 +1637,214 @@ def test_a_kill_before_scratch_removal_reclaims_it_without_rebuilding(tmp_path):
         "a spent scratch beside a healthy index must not trigger a rebuild"
     )
     assert _stamp_rows(db) == stamped
+
+
+# ==========================================================================
+# #949 — a replace publication stamps its scratch before the swap
+# ==========================================================================
+
+def _remove_stats_family(db: pathlib.Path) -> None:
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        member = pathlib.Path(str(db) + suffix)
+        if member.exists():
+            member.unlink()
+
+
+def _wal_sidecars(db: pathlib.Path) -> list:
+    return sorted(
+        p.name for p in db.parent.iterdir()
+        if p.name.startswith(db.name)
+        and (p.name.endswith("-wal") or p.name.endswith("-shm"))
+    )
+
+
+def _identity_of(path) -> tuple:
+    """(stamp record paths, (stamp record, stamped_at), selector identity)."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        stamp = conn.execute(
+            "SELECT record_path, stamped_at_utc FROM stats_publication_stamp"
+        ).fetchall()
+        selector = conn.execute(
+            "SELECT generation_record_path, generation_stamped_at_utc "
+            "FROM journal_selector_state"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [tuple(r) for r in stamp], [tuple(r) for r in selector]
+
+
+#: A child that runs the live rebuild WITHOUT derivation completion. `db
+#: rebuild` completes derivation first, and with no trusted derivation state in
+#: front of it (the destination is missing) completion publishes its own
+#: predecessor scratch into a separate target by replacement, so the replace
+#: seams would stop that publication instead of the live one under test. The
+#: child holds what `db rebuild` holds: maintenance EXCLUSIVE and the
+#: `maintenance-rebuild` write scope.
+_LIVE_REBUILD_CHILD = (
+    "import fcntl, importlib.util, os, sys\n"
+    "from importlib.machinery import SourceFileLoader\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "loader = SourceFileLoader('cctally', sys.argv[2])\n"
+    "spec = importlib.util.spec_from_loader('cctally', loader)\n"
+    "module = importlib.util.module_from_spec(spec)\n"
+    "sys.modules['cctally'] = module\n"
+    "loader.exec_module(module)\n"
+    "import _cctally_core, _cctally_journal as jr, _cctally_store\n"
+    "fd = os.open(str(_cctally_core.STATS_LOCK_MAINTENANCE_PATH),\n"
+    "             os.O_RDWR | os.O_CREAT, 0o600)\n"
+    "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+    "_cctally_core.note_stats_maintenance_acquired()\n"
+    "with _cctally_store.stats_write_scope('maintenance-rebuild'):\n"
+    "    jr.rebuild_stats_index(\n"
+    "        context=jr.RebuildContext(trigger='db-rebuild'))\n"
+)
+_LIVE_REBUILD_ARGV = [
+    sys.executable, "-c", _LIVE_REBUILD_CHILD, str(BIN), str(CCTALLY)]
+
+
+def _db_rebuild(env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(CCTALLY), "db", "rebuild", "--db", "stats"],
+        env=env, capture_output=True, text=True, timeout=300,
+    )
+
+
+def test_a_kill_after_the_replace_stamp_before_the_swap_discards_the_marker(
+    tmp_path,
+):
+    """#949, crash point `replace_after_stamp_before_swap`.
+
+    Detects a replace publication whose stamp is not committed (or not
+    sidecar-free) in its scratch BEFORE `os.replace` makes that scratch live,
+    and a stamped-but-unswapped scratch being mistaken for a publication. The
+    scratch is present, so the `scratchPath` discriminator still proves no
+    replacement happened: the next open discards the marker, and the following
+    in-place rebuild succeeds.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _remove_stats_family(db)
+    _kill_rebuild_at(
+        env, tmp_path, "replace_after_stamp_before_swap", argv=_LIVE_REBUILD_ARGV)
+
+    publication = db.parent / "stats.db.publication"
+    state = json.loads(publication.read_text())
+    assert state["status"] == "pending"
+    assert state["mechanism"] == "replace"
+    scratch = pathlib.Path(state["scratchPath"])
+    assert scratch.exists(), "the kill precedes the swap"
+    assert not db.exists(), "nothing was swapped into the destination"
+    stamp, selector = _identity_of(scratch)
+    assert [row[0] for row in stamp] == [state["recordPath"]], (
+        "the scratch carries this publication's stamp before the swap"
+    )
+    assert selector == stamp
+    assert _wal_sidecars(db) == []
+
+    result = _record_usage(env)
+    assert result.returncode == 0, result.stderr
+    assert not publication.exists()
+    assert sorted(db.parent.glob("stats.db.rebuilding-*")) == []
+
+    rebuilt = _db_rebuild(env)
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    stamp, selector = _identity_of(db)
+    assert len(stamp) == 1 and selector == stamp
+    assert _wal_sidecars(db) == []
+
+
+def test_a_kill_after_the_replace_swap_owes_a_verdict_on_the_stamped_bytes(
+    tmp_path,
+):
+    """#949, crash point after the swap (`rebuild_after_publication_replace`
+    on the replace mechanism).
+
+    Detects a replace publication that leaves the live bytes without its own
+    identity: the scratch is consumed, so the destination's verdict is owed,
+    and the bytes now live already carry the stamp and the selector identity of
+    this record. The next open renders and clears the verdict; the following
+    in-place rebuild accepts the replace's stamp as its predecessor.
+    """
+    env = _isolated_env(tmp_path)
+    db = _seed_cli(env)
+    _remove_stats_family(db)
+    _kill_rebuild_at(
+        env, tmp_path, "rebuild_after_publication_replace", argv=_LIVE_REBUILD_ARGV)
+
+    publication = db.parent / "stats.db.publication"
+    state = json.loads(publication.read_text())
+    assert state["status"] == "pending"
+    assert state["mechanism"] == "replace"
+    assert not pathlib.Path(state["scratchPath"]).exists(), (
+        "os.replace consumed the scratch"
+    )
+    stamp, selector = _identity_of(db)
+    assert [row[0] for row in stamp] == [state["recordPath"]]
+    assert selector == stamp
+    assert _wal_sidecars(db) == []
+
+    result = _record_usage(env)
+    assert result.returncode == 0, result.stderr
+    assert not publication.exists()
+
+    rebuilt = _db_rebuild(env)
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    after, after_selector = _identity_of(db)
+    assert len(after) == 1 and after_selector == after
+    assert after[0][0] != state["recordPath"], "a new publication stamped it"
+    assert _wal_sidecars(db) == []
+
+
+def test_an_in_place_publication_accepts_a_replace_stamp_as_its_predecessor(ns):
+    """#949. Detects the in-place predecessor proof refusing a stamp written by
+    the replace path, which would condemn a healthy index the moment an in-place
+    publication into it crashed; and detects the statusline's publication
+    dependency token staying unchanged across replace publications, which kept
+    a receipt bound to the replaced generation alive.
+    """
+    import _cctally_core
+    import _cctally_journal as jr
+    import _cctally_statusline as sl
+
+    _seed_live_index()
+    db = pathlib.Path(_cctally_core.DB_PATH)
+
+    def token():
+        value = sl._tokens_from(sqlite3.connect(str(db)), "unattributed", None)
+        assert value != sl._TOKENS_UNAVAILABLE
+        return value
+
+    _remove_stats_family(db)
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    first = _stamp_rows(db)
+    first_token = token()
+    _remove_stats_family(db)
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    second = _stamp_rows(db)
+    assert _latest_record(_cctally_core.LOG_DIR)[
+        "publicationMechanism"] == "replace"
+    assert len(first) == 1 and len(second) == 1 and first != second
+    second_token = token()
+    assert second_token != first_token, (
+        "each replace publication must change the dependency token"
+    )
+
+    assert jr.in_place_publication_proven_predecessor(
+        db, {"recordPath": str(db.parent / "logs" / "a-later-record.json")}
+    ), "a replace stamp naming another record proves the predecessor"
+    assert not jr.in_place_publication_proven_predecessor(
+        db, {"recordPath": second[0]}
+    ), "the replace's own record still owes its verdict"
+
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    record = _latest_record(_cctally_core.LOG_DIR)
+    assert record["publicationMechanism"] == "in_place"
+    assert record["status"] == "ok"
+    third, selector = _identity_of(db)
+    assert len(third) == 1 and third[0][0] not in second
+    assert selector == third
+    assert token() != second_token
 
 
 # ==========================================================================

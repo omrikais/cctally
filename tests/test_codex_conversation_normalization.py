@@ -9162,8 +9162,8 @@ def test_850_a25_the_identity_only_readers_work_on_a_corrupted_thread(
         paths = q.codex_conversation_source_paths(conn, parent_key)
         assert paths, "the live-tail watch loop polls this file set"
 
-        walk_root = dconv._codex_walk_root_for_conversation(conn, parent_key)
-        assert walk_root == str(root / "sessions"), walk_root
+        locations = dconv._codex_walk_root_for_conversation(conn, parent_key)
+        assert str(locations.walk_root) == str(root / "sessions"), locations
         step = dconv._make_codex_discovery_step(
             None, conn, parent_key, q)
         assert step is not None

@@ -518,6 +518,82 @@ def test_direct_fallback_decodes_old_mtime_and_deduplicates(tmp_path, monkeypatc
     assert {entry.source_path for entry in entries} == {str(path)}
 
 
+def test_no_decoder_archived_rollout_is_reported_never_pruned(tmp_path, monkeypatch):
+    """#970 spec 5.9 with #968 5.6 fail-closed: without a decoder an archived
+    compressed rollout is unread history — its retained rows are never pruned,
+    the never-ingested one is reported, and the direct fallback refuses
+    rather than returning a smaller plain-only total."""
+    import datetime as dt
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    archive = provider / "archived_sessions"
+    day.mkdir(parents=True)
+    archive.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    keeper, retained, fresh = day / _name(9), day / _name(1), day / _name(2)
+    write_rollout(keeper, token_records(1, session_id="keep"))
+    write_rollout(retained, token_records(3, session_id="ret"))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert _entries(ns, retained) == 3
+    (archive / (retained.name + ".zst")).write_bytes(zstd_bytes(retained.read_bytes()))
+    retained.unlink()
+    write_rollout(fresh, token_records(2, session_id="new"))
+    (archive / (fresh.name + ".zst")).write_bytes(zstd_bytes(fresh.read_bytes()))
+    fresh.unlink()
+    monkeypatch.setattr(rc, "resolve_zstd_backend", lambda: rc.UNAVAILABLE)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    sys.modules["_cctally_cache"].run_codex_prune_drain(wait_for_requests=False)
+    assert _entries(ns, retained) == 3
+    assert _entries(ns, fresh) == 0
+    status = json.loads(_meta(ns, "codex_container_status") or "{}")
+    assert status.get("skipped", {}).get("decoder-unavailable", 0) >= 1
+    with pytest.raises(sys.modules["_cctally_cache"].CodexHistoryUnavailable):
+        ns["_collect_codex_entries_direct"](
+            dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc))
+
+
+def test_unmapped_archive_name_is_counted_partial(tmp_path, monkeypatch):
+    """#970 G4: an archive file whose name maps to no dated identity is never
+    ingested; the status record counts it under `archive-unmapped` and calls
+    the census partial, so doctor never claims every rollout was read."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    write_rollout(day / _name(9), token_records(1, session_id="keep"))
+    odd = provider / "archived_sessions" / "rollout-renamed-by-hand.jsonl"
+    write_rollout(odd, token_records(1, session_id="odd"))
+
+    def sync():
+        conn = ns["open_cache_db"]()
+        try:
+            ns["sync_codex_cache"](conn)
+        finally:
+            conn.close()
+        return json.loads(_meta(ns, "codex_container_status") or "{}")
+
+    status = sync()
+    assert status["skipped"].get("archive-unmapped") == 1
+    assert status["census"] == "partial"
+    odd.unlink()
+    status = sync()
+    assert "archive-unmapped" not in status["skipped"]
+    assert status["census"] == "complete"
+
+
 def test_doctor_census_is_live_read_only_and_records_pending_age(estate):
     import datetime as dt
     ns, retained, fresh, _mode = estate
@@ -695,7 +771,8 @@ def test_a_root_refusal_is_a_partial_status_observation(estate, monkeypatch):
         cache._set_cache_meta(conn, "codex_container_status", json.dumps({
             "version": 1, "skipped": {"decode-error": 9}, "decoder": "backports.zstd"}))
         conn.commit()
-        monkeypatch.setattr(cache, "_discover_codex_files_with_roots", lambda: [])
+        monkeypatch.setattr(cache, "_discover_codex_files_with_roots",
+                            lambda **_kwargs: [])
         stats = ns["sync_codex_cache"](conn)
         assert stats.prune_refused
         record = json.loads(conn.execute("SELECT value FROM cache_meta WHERE key=?",

@@ -19,6 +19,7 @@ later `accept` restores it. An unavailable or uncovered projection is never
 """
 from __future__ import annotations
 
+import argparse
 import collections
 import datetime as dt
 import json
@@ -39,6 +40,10 @@ EARLY = "1970-01-01T00:00:00.000000Z"
 COLUMNS = ("account_key, observation_id, requested_at_utc, captured_at_utc, "
            "weekly_percent, weekly_resets_at_utc, five_hour_percent, "
            "five_hour_resets_at_utc, five_hour_window_key")
+INDEX_SQL = ("SELECT observation_id, account_key, captured_at_utc"
+             " FROM claude_weekly_observation_index")
+HISTORY_SQL = ("SELECT decision_op_id, observation_id, disposition"
+               " FROM claude_weekly_correction_history")
 
 
 def _iso(epoch: float) -> str:
@@ -287,45 +292,98 @@ def test_live_rebuild_rederive_completion_and_correction_rebuild_agree_row_for_r
     live = _counter(_samples(app))
     assert sum(live.values()) == 10 and len(live) == 10
 
+    # #1015 spec 5.1: the observation index, one row per admitted reading.
+    live_index = _counter(_rows(app, INDEX_SQL))
+    assert sum(live_index.values()) == 10 and len(live_index) == 10
+    assert {r[1] for r in live_index} == {_key("A"), _key("B")}
+
     scratch: list = []
     original = _cctally_rederive.replay_scratch_records
 
     def capturing(conn, records, *args, **kwargs):
         events = original(conn, records, *args, **kwargs)
-        scratch.append(_counter(
-            tuple(r) for r in conn.execute(
-                f"SELECT {COLUMNS} FROM claude_oauth_samples")))
+        scratch.append({
+            "samples": _counter(tuple(r) for r in conn.execute(
+                f"SELECT {COLUMNS} FROM claude_oauth_samples")),
+            "index": _counter(tuple(r) for r in conn.execute(INDEX_SQL)),
+            "history": _counter(tuple(r) for r in conn.execute(HISTORY_SQL)),
+            "ops": conn.execute(
+                "SELECT COUNT(*) FROM claude_weekly_correction_ops"
+            ).fetchone()[0],
+        })
         return events
 
     monkeypatch.setattr(_cctally_rederive, "replay_scratch_records", capturing)
 
+    def published():
+        return {"samples": _counter(_samples(app)),
+                "index": _counter(_rows(app, INDEX_SQL)),
+                "history": _counter(_rows(app, HISTORY_SQL))}
+
+    def scratch_agrees(expected, label):
+        assert scratch, f"{label} replayed no scratch"
+        for found in scratch:
+            assert found["samples"] == expected["samples"], label
+            assert found["index"] == expected["index"], label
+            # A counterfactual baseline replay (the journal without a retained
+            # reviewed op, for the baseline plan) holds a subset; the replay
+            # of the journal itself holds exactly the published history.
+            assert not found["history"] - expected["history"], label
+            assert found["ops"] == 0, f"{label} wrote a journal coordinate"
+        assert any(found["history"] == expected["history"]
+                   for found in scratch), (
+            label, [found["history"] for found in scratch])
+
+    def drop_index():
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            path = core.DB_PATH.with_name(core.DB_PATH.name + suffix)
+            if path.exists():
+                path.unlink()
+
+    expected = {"samples": live, "index": live_index,
+                "history": collections.Counter()}
+    assert published() == expected
     T.rebuild(app)
-    assert _counter(_samples(app)) == live, "ordinary rebuild"
+    assert published() == expected, "ordinary rebuild"
 
     scratch.clear()
     T.rederive(app)
-    assert scratch, "plain rederive replayed no scratch"
-    assert all(found == live for found in scratch), "rederive scratch"
-    assert _counter(_samples(app)) == live, "after plain rederive"
+    scratch_agrees(expected, "rederive scratch")
+    assert published() == expected, "after plain rederive"
 
     # Completion: with no trusted predecessor the completing rebuild replays
     # every admitted input after the cutover through its scratch.
     scratch.clear()
-    for suffix in ("", "-journal", "-wal", "-shm"):
-        path = core.DB_PATH.with_name(core.DB_PATH.name + suffix)
-        if path.exists():
-            path.unlink()
+    drop_index()
     T.rebuild(app)
-    assert scratch, "the completion replayed no scratch"
-    assert all(found == live for found in scratch), "completion scratch"
-    assert _counter(_samples(app)) == live, "after the completing rebuild"
+    scratch_agrees(expected, "completion scratch")
+    assert published() == expected, "after the completing rebuild"
 
     # A correction rebuild: a reviewed hold journals a correction and
-    # republishes; the samples are untouched by it.
+    # republishes; the samples and the index are untouched by it, and the
+    # history gains the hold on every path.
     held = _obs_id(app, _iso(NOW + 600))
     _set_clock(monkeypatch, NOW + 4000)
     _reviewed(app, tmp_path, capsys, [(held, "hold")], name="hold")
-    assert _counter(_samples(app)) == live, "correction rebuild"
+    [op] = [r["id"] for r in T.journal_records() if r.get("t") == "op"
+            and (r.get("payload") or {}).get("kind", "").startswith(
+                "claude_weekly_observation_decision")]
+    expected["history"] = collections.Counter({(op, held, "hold"): 1})
+    assert published() == expected, "correction rebuild"
+    ops = _rows(app, "SELECT decision_op_id FROM claude_weekly_correction_ops")
+    assert ops == [(op,)]
+    T.rebuild(app)
+    assert published() == expected, "ordinary rebuild after the hold"
+    scratch.clear()
+    T.rederive(app)
+    scratch_agrees(expected, "rederive scratch after the hold")
+    scratch.clear()
+    drop_index()
+    T.rebuild(app)
+    scratch_agrees(expected, "completion scratch after the hold")
+    assert published() == expected, "completing rebuild after the hold"
+    assert _rows(app, "SELECT decision_op_id FROM claude_weekly_correction_ops"
+                 ) == ops
 
 
 # --------------------------------------------------------------------------
@@ -535,3 +593,106 @@ def test_sample_from_observation_rejects_what_carries_no_valid_key():
     assert sample(account_binding={"accountKey": "other"}) is None
     # A request instant after the capture is no lower bound at all.
     assert sample(**{KEY: _q(NOW + 5)}) is None
+
+
+# --------------------------------------------------------------------------
+# #1015 spec 5.1: the observation index's attribution
+# --------------------------------------------------------------------------
+
+_INDEX_RESETS = int(dt.datetime(2026, 1, 15, tzinfo=dt.timezone.utc).timestamp())
+
+
+def _legacy_reading(J, at, **extra):
+    """A pre-boundary Claude reading the previous writers produced."""
+    payload = {"weekly_percent": 1.0, "source": "statusline",
+               "resets_at": _INDEX_RESETS, "captured_at": at}
+    payload.update(extra.pop("payload", {}))
+    return J.make_obs(at=at, src="record-usage", provider="claude",
+                      payload=payload, writer_generation=None, **extra)
+
+
+def test_observation_index_attribution_is_live_ingests_on_every_path(
+        monkeypatch, tmp_path, capsys):
+    """#1015 (R2-P1-1, R3-P2-1), detects a correction attributed to the wrong
+    account because the index read an account live ingest does not: an
+    explicit stamp keeps it (an explicit `unattributed` included), an
+    account-aware stampless reading (current generation, or a validated
+    `unattributed` binding) is `unattributed`, and only an unstamped legacy
+    reading takes the cutover op's account — before or after the op, and
+    when a pinned rebuild finds the op only in the unvisited suffix. The
+    rebuild leaves no staging table behind."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    import _cctally_core as core
+    import _cctally_journal as jr
+    import _cctally_store
+    import _lib_account_binding
+    import _lib_accounts
+    import _lib_journal as J
+    account_a = _lib_accounts.account_key("claude", "index-a")
+    account_b = _lib_accounts.account_key("claude", "index-b")
+    ns["open_db"]().close()
+    binding = _lib_account_binding.capture({
+        "status": _lib_account_binding.STATUS_STABLY_ABSENT,
+        "account_key": _lib_accounts.UNATTRIBUTED, "natural_id": None})
+    before = _legacy_reading(J, "2026-01-04T09:00:00Z")
+    cutover = J.make_op(
+        at="2026-01-05T00:00:00Z", src="accounts-cutover",
+        payload={"kind": "accounts_cutover",
+                 "claude_legacy_account": account_a},
+        writer_generation=None)
+    cutover["id"] = jr.CUTOVER_OP_ID
+    after = _legacy_reading(J, "2026-01-06T09:00:00Z")
+    stamped = _legacy_reading(J, "2026-01-06T10:00:00Z", account=account_b)
+    explicit = _legacy_reading(J, "2026-01-06T11:00:00Z",
+                               account=_lib_accounts.UNATTRIBUTED)
+    bound = _legacy_reading(J, "2026-01-06T12:00:00Z", payload={
+        "account_binding": binding.document()})
+    core.JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    (core.JOURNAL_DIR / "observations-2026-01.jsonl").write_bytes(b"".join(
+        J.encode_line(r) for r in (before, cutover, after, stamped, explicit,
+                                   bound)))
+    current = J.prepare_record(J.make_obs(
+        at="2026-01-12T09:00:00Z", src="record-usage", provider="claude",
+        account=None, payload={
+            "weekly_percent": 2.0, "source": "statusline",
+            "resets_at": _INDEX_RESETS, "captured_at": "2026-01-12T09:00:00Z",
+            "account_binding": binding.document()}))
+    assert "account" not in current
+    jr.append_record(current)
+    jr.run_stats_ingest(mode="authoritative")
+
+    def index(path=None):
+        conn = sqlite3.connect(str(path or core.DB_PATH))
+        try:
+            rows = {r[0]: (r[1], r[2]) for r in conn.execute(INDEX_SQL)}
+            staging = conn.execute(
+                "SELECT name FROM sqlite_master WHERE name ="
+                " 'rebuild_weekly_observation_unstamped'").fetchall()
+        finally:
+            conn.close()
+        assert staging == [], "the staging table reached a published index"
+        return rows
+
+    unattributed = _lib_accounts.UNATTRIBUTED
+    live = index()
+    assert {k: v[0] for k, v in live.items()} == {
+        before["id"]: account_a, after["id"]: account_a,
+        stamped["id"]: account_b, explicit["id"]: unattributed,
+        bound["id"]: unattributed, current["id"]: unattributed}
+    assert live[before["id"]][1] == "2026-01-04T09:00:00.000000Z"
+    assert ns["cmd_db_rebuild"](argparse.Namespace(db="stats", json=True)) == 0
+    capsys.readouterr()
+    assert index() == live, "rebuild"
+
+    # A rebuild pinned before the op finds it only in the unvisited suffix.
+    lines = list(jr.iter_range(None, jr.journal_high_water()))
+    pinned = (lines[0][0], lines[0][1] + len(lines[0][2]) + 1)
+    dest = tmp_path / "pinned.db"
+    core.open_db(_target_path=str(dest)).close()
+    with _cctally_store.stats_write_scope("maintenance-rebuild"):
+        jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture"),
+            target_path=str(dest), high_water=pinned,
+            update_quota_cache=False)
+    assert index(dest) == {before["id"]: live[before["id"]]}

@@ -1,0 +1,301 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-20T18:00:00Z",
+  "status": "unsupported-model-mix",
+  "verdict": "withheld",
+  "exitCode": 3,
+  "scope": {
+    "accountKey": null,
+    "accountLabel": null,
+    "merged": true,
+    "analysisStart": "2026-09-22T00:00:00Z",
+    "invocation": "automatic"
+  },
+  "calibration": {
+    "recorded": null,
+    "fitted": {
+      "state": "withheld",
+      "value": null,
+      "interval": null,
+      "support": null,
+      "population": {
+        "days": 21,
+        "segments": 3,
+        "withheld": 0,
+        "considered": 21
+      },
+      "code": "unsupported-model-mix",
+      "qualifications": [
+        "forecast-family-unbounded"
+      ]
+    }
+  },
+  "analysis": {
+    "baseline": {
+      "fit": {
+        "state": "withheld",
+        "value": null,
+        "interval": null,
+        "support": null,
+        "population": {
+          "days": 0,
+          "segments": 0,
+          "withheld": 0,
+          "considered": 0
+        },
+        "code": "insufficient-history",
+        "qualifications": [
+          "no-confirmed-split"
+        ]
+      }
+    },
+    "watch": {
+      "fit": {
+        "state": "withheld",
+        "value": null,
+        "interval": null,
+        "support": null,
+        "population": {
+          "days": 21,
+          "segments": 3,
+          "withheld": 0,
+          "considered": 21
+        },
+        "code": "insufficient-history",
+        "qualifications": [
+          "no-confirmed-split"
+        ]
+      }
+    }
+  },
+  "currentWeek": {
+    "start": "2026-10-20T08:00:00Z",
+    "end": "2026-10-27T08:00:00Z",
+    "observedPercent": 7,
+    "observedMinusModelled": null,
+    "consumption": {
+      "state": "withheld",
+      "value": null,
+      "interval": null,
+      "support": null,
+      "population": {
+        "days": 21,
+        "segments": 3,
+        "withheld": 0,
+        "considered": 21
+      },
+      "code": "unsupported-model-mix",
+      "qualifications": [
+        "forecast-family-unbounded"
+      ]
+    },
+    "projection": {
+      "state": "withheld",
+      "value": null,
+      "interval": null,
+      "support": null,
+      "population": {
+        "days": 21,
+        "segments": 3,
+        "withheld": 0,
+        "considered": 21
+      },
+      "code": "unsupported-model-mix",
+      "qualifications": [
+        "forecast-family-unbounded"
+      ]
+    },
+    "headroom": {
+      "state": "withheld",
+      "value": null,
+      "interval": null,
+      "support": null,
+      "population": {
+        "days": 21,
+        "segments": 3,
+        "withheld": 0,
+        "considered": 21
+      },
+      "code": "unsupported-model-mix",
+      "qualifications": [
+        "forecast-family-unbounded"
+      ]
+    }
+  },
+  "composition": {
+    "baseline": {
+      "familyShares": {
+        "claude-haiku-5-5": 0.01,
+        "claude-opus-5-5": 0.99
+      },
+      "classShares": {
+        "cache_1h": 0.0019455252918287938,
+        "cache_read": 0.9727626459143969,
+        "fresh": 0.021400778210116732,
+        "output": 0.0038910505836575876
+      }
+    },
+    "current": {
+      "familyShares": {
+        "claude-haiku-5-5": 0.01,
+        "claude-opus-5-5": 0.99
+      },
+      "classShares": {
+        "cache_1h": 0.0019455252918287938,
+        "cache_read": 0.9727626459143969,
+        "fresh": 0.021400778210116732,
+        "output": 0.0038910505836575876
+      }
+    },
+    "familyRadiusEffective": 0.03,
+    "classRadiusEffective": 0.0020418931706769924,
+    "familyRadiusEmpirical": 0.0,
+    "classRadiusEmpirical": 0.0,
+    "radiusRule": "max(observed spread, materiality floor)",
+    "familyMateriality": {
+      "reference": "fit-weighted",
+      "fitFamilyShares": {
+        "claude-haiku-5-5": 0.010000000000000002,
+        "claude-opus-5-5": 0.99
+      },
+      "referenceFamily": "claude-opus-5-5",
+      "familyRateBounds": [
+        {
+          "family": "claude-sonnet-5-5",
+          "low": 0.09,
+          "high": 0.61,
+          "provenance": "991-meter-evidence-2026-10-23"
+        }
+      ],
+      "maxRelativeEffect": 0.05
+    },
+    "forecastProbe": {
+      "state": "probed",
+      "familyShares": {
+        "claude-haiku-5-5": 0.05,
+        "claude-opus-5-5": 0.95
+      },
+      "classShares": {
+        "cache_1h": 0.0019455252918287938,
+        "cache_read": 0.9727626459143969,
+        "fresh": 0.021400778210116732,
+        "output": 0.0038910505836575876
+      },
+      "familyDistance": 0.04000000000000002,
+      "familyDistanceReference": "baseline-family-shares",
+      "familyWithinRadius": false,
+      "familyEffectBound": null,
+      "familyEffectReference": "fit-family-shares",
+      "familyEffectUnavailable": {
+        "reason": "unevidenced-family-change",
+        "families": [
+          "claude-haiku-5-5"
+        ]
+      },
+      "familyAdmittedBy": null,
+      "classDistance": 0.0,
+      "classWithinRadius": true,
+      "supported": false
+    }
+  },
+  "health": {
+    "entriesThrough": "2026-10-20T12:01:00Z",
+    "snapshots": 44,
+    "segments": 4,
+    "credits": 0,
+    "eligibleDays": 21,
+    "withheldDays": 0,
+    "eligibilityFence": 1894667.8899649007,
+    "unattributedUnits": 5000424.0,
+    "unattributedEntries": 2,
+    "inProgressDayExcluded": [
+      "2026-10-20"
+    ],
+    "forecastPopulationEntries": 2,
+    "rejectedNumericInputs": [],
+    "unrecognisedSnapshotSources": {},
+    "legacyDateOnlyWeekAnchors": 0,
+    "fastModeEntriesExcluded": 0,
+    "storeCause": null,
+    "calibrationFileQuarantinedTo": null
+  },
+  "method": {
+    "algorithmRevision": 5,
+    "constantsFingerprint": "dfdd6a7de768802d3008d88bab453db6480812dc266187c593c3d4604554d42f",
+    "verifiedAt": "2026-10-30",
+    "supportedCompositionFrom": "2026-09-22",
+    "coefficientSupport": {
+      "supportedCompositionFrom": "2026-09-22",
+      "supportedCompositionUntil": null,
+      "coefficientEra": "opus-5-5",
+      "fastModeParticipation": "usage-credits-only-excluded"
+    },
+    "coefficientEras": [
+      {
+        "id": null,
+        "from": null,
+        "until": "2026-07-25",
+        "state": "unvalidated",
+        "provenance": "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 units per point against 2.4M for Opus 5, a budget difference the shared token-class coefficients do not absorb. The shipped estimator gives 1,265,184 to 1,479,027 over the same weeks, and spec section 6 declines to adjudicate between the two.",
+        "referenceFamily": null,
+        "familyRateBounds": []
+      },
+      {
+        "id": "opus-5",
+        "from": "2026-07-25",
+        "until": "2026-09-22",
+        "state": "validated",
+        "provenance": "The Opus 5 calibration, docs/quota-model.md \"The finding\"",
+        "tokenClassWeights": {
+          "fresh": 1.0,
+          "output": 4.73,
+          "cache_1h": 1.03,
+          "cache_read": 0.0031
+        },
+        "referenceFamily": "claude-opus-5",
+        "familyRateBounds": []
+      },
+      {
+        "id": "opus-5-5",
+        "from": "2026-09-22",
+        "until": null,
+        "state": "validated",
+        "provenance": "The 2026-10-18 Opus 5.5 refit; output weakly identified (95% CI 0.23\u20131.13), cache read sharp (0.0128\u20130.0168)",
+        "tokenClassWeights": {
+          "fresh": 1.0,
+          "output": 0.64,
+          "cache_1h": 1.0,
+          "cache_read": 0.0148
+        },
+        "referenceFamily": "claude-opus-5-5",
+        "familyRateBounds": [
+          {
+            "family": "claude-sonnet-5-5",
+            "low": 0.09,
+            "high": 0.61,
+            "provenance": "991-meter-evidence-2026-10-23"
+          }
+        ]
+      }
+    ],
+    "detector": {
+      "splitDate": null,
+      "rawP": null,
+      "holmP": null,
+      "holmFamilySize": 5,
+      "baselineDays": 0,
+      "watchDays": 0,
+      "longestRun": 0,
+      "qualified": false,
+      "inputEligibleDays": 21,
+      "scannedEligibleDays": 21,
+      "truncatedEligibleDays": 0,
+      "scanStartDate": "2026-09-29",
+      "maxAutoScanDays": 64,
+      "historyTruncated": false
+    },
+    "dedicatedPoolScope": "out-of-scope: claude-fable-5, claude-fable-5-1, claude-mythos-5, claude-mythos-5-1 and claude-mythos-preview also drain dedicated pools; only general-quota draining is modelled"
+  },
+  "blocking": []
+}
+exit: 3

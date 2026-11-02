@@ -172,10 +172,16 @@ def pytest_configure(config):
     `xdist_group` is registered here as well as by xdist: the marks
     `_assign_xdist_groups` adds would otherwise be unknown, and warn on every
     grouped item, in a run with `-p no:xdist` (review I3c F11).
+
+    `timeout` is registered for the same reason: pytest-timeout registers it
+    when importable, and a plugin-less run must not warn on the few slow
+    off-merge-path cases that carry their own budget (#948 T1).
     """
     config.addinivalue_line(
         "markers", "xdist_group(name): run under --dist loadgroup on one xdist worker "
         "with the other items of the same group (tests/conftest.py _assign_xdist_groups)")
+    config.addinivalue_line(
+        "markers", "timeout(seconds): per-test pytest-timeout budget overriding --timeout")
     _hyg.register(config)
 
 
@@ -972,17 +978,22 @@ def redirect_paths(ns, monkeypatch, tmp_path):
         "STATUSLINE_AUTHORITATIVE_5H_PATH": share / "statusline-authoritative-5h.json",
         # #825/#832 account-bound protocol root and its sidecars; since
         # #797/#823/#840 (spec 4.6 B4) the current root is v2 and v1 is the
-        # retired root whose coordination state is legacy spool input.
+        # retired root whose coordination state is legacy spool input; since
+        # #1019/#1014 (spec 4.7 C4) the current root is v3 and v2 is retired
+        # the same way.
         "STATUSLINE_ACCOUNT_BOUND_V1_DIR": share / "statusline-account-bound-v1",
-        "STATUSLINE_ACCOUNT_BOUND_DIR": share / "statusline-account-bound-v2",
+        "STATUSLINE_ACCOUNT_BOUND_V2_DIR": share / "statusline-account-bound-v2",
+        "STATUSLINE_ACCOUNT_BOUND_DIR": share / "statusline-account-bound-v3",
         "LEGACY_SPOOL_BASELINE_PATH": (
-            share / "statusline-account-bound-v2" / "legacy-spool-baseline.json"),
+            share / "statusline-account-bound-v3" / "legacy-spool-baseline.json"),
         "ACCOUNT_BOUND_CUTOVER_CACHE_PATH": (
-            share / "statusline-account-bound-v2" / "cutover-coordinate.json"),
+            share / "statusline-account-bound-v3" / "cutover-coordinate.json"),
         "ACCOUNT_BOUND_REVISION_CACHE_PATH": (
-            share / "statusline-account-bound-v2" / "revision-coordinate.json"),
+            share / "statusline-account-bound-v3" / "revision-coordinate.json"),
+        "ACCOUNT_BOUND_REVISION3_CACHE_PATH": (
+            share / "statusline-account-bound-v3" / "revision3-coordinate.json"),
         "LEGACY_WRITER_EVIDENCE_PATH": (
-            share / "statusline-account-bound-v2" / "legacy-writer-evidence.json"),
+            share / "statusline-account-bound-v3" / "legacy-writer-evidence.json"),
         # Host-global statusline cache (#529 S4). NOT under share/ — production
         # keeps it in /tmp because the real Claude Code statusline shares it, so
         # the fixture analogue is a per-test tmp file rather than an APP_DIR

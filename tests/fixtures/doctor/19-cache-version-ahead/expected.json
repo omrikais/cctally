@@ -189,12 +189,12 @@
                 {
                     "details": {
                         "path": "$HOME/.local/share/cctally/cache.db",
-                        "registry_size": 49,
+                        "registry_size": 51,
                         "user_version": 99
                     },
                     "id": "db.cache.file",
                     "severity": "ok",
-                    "summary": "version 99 / 49 known",
+                    "summary": "version 99 / 51 known",
                     "title": "cache.db"
                 },
                 {
@@ -212,11 +212,11 @@
                     "details": {
                         "cache.db": {
                             "ahead": true,
-                            "registry_size": 49,
+                            "registry_size": 51,
                             "user_version": 99
                         },
                         "stats.db": {
-                            "epoch": 1019,
+                            "epoch": 1023,
                             "legacy_head": 13,
                             "mismatch": false,
                             "user_version": 0
@@ -225,7 +225,7 @@
                     "id": "db.version_ahead",
                     "remediation": "Auto-heals on next command, or run `cctally db recover --db cache`",
                     "severity": "warn",
-                    "summary": "cache.db ahead (v99 > known v49) \u2014 auto-heals",
+                    "summary": "cache.db ahead (v99 > known v51) \u2014 auto-heals",
                     "title": "Version ahead"
                 },
                 {
@@ -329,7 +329,9 @@
                                     "046_codex_source_file_identity",
                                     "047_spill_free_read_paths",
                                     "048_codex_quota_physical_group_order",
-                                    "049_codex_rollout_containers"
+                                    "049_codex_rollout_containers",
+                                    "050_preserve_claude_cost_attribution",
+                                    "051_codex_retained_identities"
                                 ],
                                 "skipped": []
                             },
@@ -357,7 +359,7 @@
                     },
                     "id": "db.migrations.applied",
                     "severity": "ok",
-                    "summary": "0/62 applied",
+                    "summary": "0/64 applied",
                     "title": "Migrations"
                 },
                 {
@@ -610,13 +612,21 @@
                             [
                                 "cache.db",
                                 "049_codex_rollout_containers"
+                            ],
+                            [
+                                "cache.db",
+                                "050_preserve_claude_cost_attribution"
+                            ],
+                            [
+                                "cache.db",
+                                "051_codex_retained_identities"
                             ]
                         ]
                     },
                     "id": "db.migrations.pending",
                     "remediation": "Run any cctally command \u2014 opens the DB and applies pending migrations",
                     "severity": "warn",
-                    "summary": "62 pending",
+                    "summary": "64 pending",
                     "title": "Pending migrations"
                 },
                 {
@@ -1048,6 +1058,36 @@
                 },
                 {
                     "details": {
+                        "alignedRows": 0,
+                        "byReason": {},
+                        "decisionConflicts": 0,
+                        "fallbackRealAccountRows": 0,
+                        "fallbackRows": 0,
+                        "fallbackUnattributedRows": 0,
+                        "firstFallbackAt": null,
+                        "lastDeferral": null,
+                        "lastFallbackAt": null,
+                        "population": "deduplicatedClaudeCostRows",
+                        "preservation": {
+                            "lastError": null,
+                            "lastErrorAt": null,
+                            "saved": null,
+                            "state": null,
+                            "total": null
+                        },
+                        "preservedRows": 0,
+                        "totalRows": 0,
+                        "unlinkedRows": 0,
+                        "windowEnd": "2026-05-13T14:22:31.000000Z",
+                        "windowStart": "2026-05-06T14:22:31.000000Z"
+                    },
+                    "id": "accounts.claude_cost_attribution",
+                    "severity": "ok",
+                    "summary": "Claude cost decided in the last 7 days was attributed from write-time account evidence (0 rows)",
+                    "title": "Claude cost attribution"
+                },
+                {
+                    "details": {
                         "null_anchor_rows": 0
                     },
                     "id": "accounts.codex_reset_anchors",
@@ -1256,7 +1296,7 @@
     "overall": {
         "counts": {
             "fail": 0,
-            "ok": 65,
+            "ok": 66,
             "warn": 6
         },
         "severity": "warn"

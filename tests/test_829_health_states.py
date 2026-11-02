@@ -245,10 +245,16 @@ def test_829_the_source_schema_version_moved_for_the_meaning_change():
     assert lds.SOURCE_SCHEMA_VERSION == 12
 
 
+def _state_construction_sources():
+    """The files `_state_constructions` scans (#1025: the quick gate's
+    coverage check reads this list to keep the scan selected)."""
+    return sorted(BIN.glob("*.py"))
+
+
 def _state_constructions():
     """Every explicit `SourceDashboardState(...)` call site under `bin/`."""
     found = []
-    for path in sorted(BIN.glob("*.py")):
+    for path in _state_construction_sources():
         tree = ast.parse(path.read_text(), filename=str(path))
         parents = {}
         for node in ast.walk(tree):

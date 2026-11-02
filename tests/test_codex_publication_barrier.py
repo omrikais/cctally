@@ -995,13 +995,25 @@ def _unfixed_prune(ns, monkeypatch):
     leaf = sys.modules["_lib_codex_rollout_container"]
     real = leaf.select_container
 
-    def plain_only(logical):
-        selected = real(logical)
+    def plain_only(logical, **kwargs):  # #970: the wrapper may pass archive_dir
+        selected = real(logical, **kwargs)
         if selected is not None and selected.kind == leaf.PLAIN:
             return selected
         return None
 
+    real_probe = leaf.probe_containers
+
+    def plain_only_probe(logical, **kwargs):
+        # #970: the drains prove absence with the strict probe; v1.114.0's
+        # drain knew only the plain container, so a compressed one read as
+        # absent there too.
+        state, selected = real_probe(logical, **kwargs)
+        if selected is not None and selected.kind != leaf.PLAIN:
+            return "absent", None
+        return state, selected
+
     monkeypatch.setattr(leaf, "select_container", plain_only)
+    monkeypatch.setattr(leaf, "probe_containers", plain_only_probe)
     try:
         _sync(ns)
         _cache().run_codex_prune_drain(wait_for_requests=False)
@@ -1013,6 +1025,7 @@ def _unfixed_prune(ns, monkeypatch):
         _cache().run_codex_conversation_prune_drain(wait_for_requests=False)
     finally:
         monkeypatch.setattr(leaf, "select_container", real)
+        monkeypatch.setattr(leaf, "probe_containers", real_probe)
     # v1.114.0 never wrote the provenance marker (review P1-3), so the store an
     # upgrade meets is unsettled whatever this fixture's first walk recorded.
     # The literal is the durable cache_meta key, not an import, so the helper
@@ -1782,3 +1795,170 @@ def test_automatic_quota_heal_equals_same_input_rebuild(
     assert cc.run_codex_history_provenance_drain(wait_for_requests=False).outcome == "already-settled"
     assert command(False) == 0
     assert _all_quota_values(ns) == reference
+
+
+# ── #970 T6: census coverage of archive-resident rollouts ───────────────────
+
+def _archived_logical(provider, name: str, day: str) -> pathlib.Path:
+    return provider / "sessions" / "2026" / "07" / day / name
+
+
+def _drop_stores(ns) -> None:
+    """`rm cache.db conversations.db`: the journal is the only survivor."""
+    core = ns["_cctally_core"]
+    for db in (core.CACHE_DB_PATH, core.CONVERSATIONS_DB_PATH):
+        for suffix in ("", "-wal", "-shm"):
+            target = pathlib.Path(str(db) + suffix)
+            if target.exists():
+                target.unlink()
+
+
+def _entry_accounts(ns, path) -> list:
+    conn = ns["open_cache_db"]()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT account_key FROM codex_session_entries WHERE source_path=? "
+            "ORDER BY line_offset", (str(path),))]
+    finally:
+        conn.close()
+
+
+def _sync_conversations(ns):
+    conv = ns["open_conversations_db"]()
+    try:
+        return ns["sync_codex_conversations"](conv)
+    finally:
+        conv.close()
+
+
+def _conversation_rows(ns, path) -> int:
+    conv = ns["open_conversations_db"]()
+    try:
+        return conv.execute(
+            "SELECT COUNT(*) FROM codex_conversation_messages "
+            "WHERE source_path=?", (str(path),)).fetchone()[0]
+    finally:
+        conv.close()
+
+
+def test_journaled_decision_replays_for_archived_rollout(env):
+    """A rollout decided for account A, then archived and lost from the cache
+    (`rm cache.db`), is re-read from the archive under login B. Its journaled
+    decision must replay (A), never the live login: the census must cover a
+    PLAIN archive-resident rollout, which the compressed-only census skipped,
+    letting the first sight take B over retained truth."""
+    ns, provider, day, _ = env
+    rollout = day / _name(9, 70)
+    write_rollout(rollout, token_records(3, session_id="replayed-0070"))
+    write_rollout(day / _name(21, 71), token_records(1, session_id="keeper-0071",
+                                                     start_minute=50))
+    _sync(ns)
+    decided = set(_entry_accounts(ns, rollout))
+    assert len(decided) == 1 and None not in decided
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    os.rename(rollout, archive / rollout.name)
+    _drop_stores(ns)
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    stats = _sync(ns)
+    # BASE: the plain archived rollout was never held; it took login B.
+    assert _entry_accounts(ns, rollout) == []
+    assert stats.container_reads_held >= 1
+    result = _cache().run_codex_history_provenance_drain(wait_for_requests=False)
+    assert result.outcome == "settled"
+    _sync(ns)
+    assert set(_entry_accounts(ns, rollout)) == decided
+    assert len(_entry_accounts(ns, rollout)) == 3
+
+
+def test_old_settled_marker_holds_archive_candidates_until_covered(env):
+    """G12: a store settled before archives were discovered never traced
+    them, so an archive-resident rollout first seen after the upgrade would
+    take a first-ingest decision before its journal-retained provenance was
+    restored. It must be held, the census must cover it and rewrite the
+    marker with archive coverage (keeping the traced paths), while
+    sessions-resident rollouts keep settling exactly as before."""
+    ns, provider, day, _ = env
+    write_rollout(day / _name(21, 72), token_records(1, session_id="keeper-0072",
+                                                     start_minute=50))
+    _sync(ns)
+    legacy = {"journalHighWater": None, "traced": ["/retained/elsewhere.jsonl"]}
+    conn = ns["open_cache_db"]()
+    try:
+        conn.execute("INSERT OR REPLACE INTO cache_meta(key, value) VALUES "
+                     "('codex_history_provenance', ?)", (json.dumps(legacy),))
+        conn.commit()
+    finally:
+        conn.close()
+    sessions_new = day / _name(10, 73)
+    write_rollout(sessions_new, token_records(2, session_id="new-0073"))
+    _compress(sessions_new)
+    archive = provider / "archived_sessions"
+    archived = archive / _name(8, 74).replace("07-20", "07-19")
+    write_rollout(archived, token_records(3, session_id="arch-0074"))
+    _compress(archived)
+    logical = _archived_logical(provider, archived.name, "19")
+    stats = _sync(ns)
+    assert len(_entry_accounts(ns, sessions_new)) == 2      # settled as before
+    # BASE: the settled marker classified the archive rollout "new".
+    assert _entry_accounts(ns, logical) == []
+    assert stats.container_reads_held == 1
+    cc = _cache()
+    result = cc.run_codex_history_provenance_drain(wait_for_requests=False)
+    assert (result.outcome, result.candidates) == ("settled", 1)
+    marker = json.loads(_one(ns, "SELECT value FROM cache_meta "
+                                 "WHERE key='codex_history_provenance'")[0])
+    assert marker["archives"] == 1
+    assert "/retained/elsewhere.jsonl" in marker["traced"]
+    assert marker["journalHighWater"] is None
+    assert cc.run_codex_history_provenance_drain(
+        wait_for_requests=False).outcome == "already-settled"
+    _sync(ns)
+    assert _entry_accounts(ns, logical) == [None, None, None]   # P2
+
+
+def test_journal_first_recovery_without_dated_parent_precedes_publication(env):
+    """Journal-first recovery of an archived rollout whose dated directory is
+    gone: the census restores its quota facts before any raw read, and the
+    restored identity (now retained with no dated parent) must then be
+    ingested and published — the logical-parent witness protected it, so the
+    rollout stayed uncounted after its quota history came back."""
+    ns, provider, day, _ = env
+    rollout = day / _name(9, 75)
+    write_rollout(rollout, _with_quota(conversation_records(
+        2, session_id="recovered-0075", label="rec", cwd="/tmp/rec")))
+    keeper_day = provider / "sessions" / "2026" / "07" / "21"
+    keeper_day.mkdir(parents=True)
+    write_rollout(keeper_day / _name(9, 76).replace("07-20", "07-21"),
+                  token_records(1, session_id="keeper-0076"))
+    _sync(ns)
+    _sync_conversations(ns)
+    control = _entry_accounts(ns, rollout)
+    assert control and None not in control
+    quota_control = _one(ns, "SELECT COUNT(*) FROM quota_window_snapshots "
+                             "WHERE source='codex' AND source_path=?",
+                         (str(rollout),))[0]
+    assert quota_control > 0
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    os.rename(rollout, archive / rollout.name)
+    _compress(archive / rollout.name)
+    day.rmdir()                       # the dated directory is gone
+    _drop_stores(ns)
+    (provider / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    _sync(ns)
+    _sync_conversations(ns)
+    assert _entry_accounts(ns, rollout) == []          # held for the census
+    result = _cache().run_codex_history_provenance_drain(wait_for_requests=False)
+    assert result.outcome == "settled"
+    restored = _one(ns, "SELECT COUNT(*) FROM quota_window_snapshots "
+                        "WHERE source='codex' AND source_path=?",
+                    (str(rollout),))[0]
+    assert restored == quota_control                   # before any raw read
+    assert _entry_accounts(ns, rollout) == []
+    for _ in range(2):
+        _sync(ns)
+        _sync_conversations(ns)
+    # BASE: protected for the missing dated parent, never ingested.
+    assert _entry_accounts(ns, rollout) == control     # journaled A replayed
+    assert _conversation_rows(ns, rollout) > 0

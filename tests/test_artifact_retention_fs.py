@@ -679,16 +679,19 @@ def test_the_split_path_admits_one_request_and_coalesces_the_rest(
 
     # Worker active: coalesce even though the marker has aged past the retry
     # window, and REFRESH the stamp rather than launch a process that can only
-    # lose the worker flock and exit.
+    # lose the claim and exit. (#1012: the admission reads the worker's
+    # ownership from its records.)
     os.utime(marker, (0, 0))
-    monkeypatch.setattr(store, "_stats_heal_worker_active", lambda: True)
+    monkeypatch.setattr(store, "_rebuild_worker_ownership",
+                        lambda _worker: "owned")
     assert store.reserve_stats_corruption_heal(_request("h3")) == "pending"
     assert json.loads(marker.read_text())["healId"] == "h1"
     assert marker.stat().st_mtime > 0
 
     # Aged marker and no worker: admitted again, and the marker is replaced.
     os.utime(marker, (0, 0))
-    monkeypatch.setattr(store, "_stats_heal_worker_active", lambda: False)
+    monkeypatch.setattr(store, "_rebuild_worker_ownership",
+                        lambda _worker: "absent")
     assert store.reserve_stats_corruption_heal(_request("h4")) == "reserved"
     assert json.loads(marker.read_text())["healId"] == "h4"
 

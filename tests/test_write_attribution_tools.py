@@ -2,6 +2,7 @@
 operation and workload analyzers, the clone-only write guard, and the latency
 summary. The tools themselves run only on the maintainer's machine against
 copies; these cases pin the rules that decide what counts as evidence."""
+import collections
 import datetime as dt
 import os
 import importlib.util
@@ -1176,7 +1177,17 @@ def test_catchup_admits_a_drained_clone_and_refuses_an_expired_deadline(
     assert receipt["admitted"] is True
     assert receipt["watermarks"]["claude"]["files"] == 1
     assert receipt["watermarks"]["codex"]["files"] == 1
-    assert receipt["phases"]["verify"]["syncs"]["sync_cache"] is not None
+    # #939 D6: admitted on a stable pair of rounds over the judged frontier.
+    stability = receipt["stability"]
+    rounds = stability["rounds"]
+    assert stability["admitted"] is True and len(rounds) >= 2
+    assert stability["pair"] == [len(rounds) - 2, len(rounds) - 1]
+    assert rounds[-1]["syncs"]["sync_cache"] is not None
+    assert all(r["census"] == [] for r in rounds[-2:])
+    frontier = json.loads(pathlib.Path(stability["frontierPath"]).read_text())
+    assert frontier["counts"] == {"claude": 1, "codex": 1}
+    assert [r["counts"]["consumed"] for r in stability["receipts"]] == [2, 2]
+    assert stability["deferred"] == []
     assert receipt["footprintPeakBytes"] is None or receipt["footprintPeakBytes"] > 0
     expired = _sp.run([_sys.executable, str(TOOLS / "catchup.py"), "--tree",
                        str(TOOLS.parent.parent), "--out", str(out),
@@ -1186,341 +1197,12 @@ def test_catchup_admits_a_drained_clone_and_refuses_an_expired_deadline(
     assert "admission deadline" in json.loads(out.read_text())["problems"][-1]
 
 
-# ── E1: the stable Claude orphan residual (spec §6.3 revision 10, `dc8`) ──
-
 def _catchup(args, env, timeout=240):
     import subprocess as _sp
     import sys as _sys
 
     return _sp.run([_sys.executable, str(TOOLS / "catchup.py"), *args],
                    env=env, capture_output=True, text=True, timeout=timeout)
-
-
-def test_catchup_admits_a_stable_claude_residual_only_through_its_preparation(
-        tmp_path):
-    """The production shape: a tracked transcript that is gone from disk and
-    shares its session with a survivor, so `--prune-orphans` leaves it as a
-    residual and the Claude full walk never certifies. Revision 9 refuses the
-    clone; revision 10 admits it only through the source's preparation
-    receipt, and the product certificate stays unminted."""
-    root = tmp_path / "clone"
-    _seed_roots(root)
-    project = (root / "scratch" / "claude" / "projects"
-               / "-bench-write-attribution")
-    seed = json.loads((project / "bench901-seed.jsonl").read_text())
-    resumed = dict(seed, uuid="bench901-seed-resumed-0",
-                   requestId="req-bench901-seed-resumed-0",
-                   message=dict(seed["message"],
-                                id="msg-bench901-seed-resumed-0"))
-    gone = project / "bench901-seed-resumed.jsonl"
-    gone.write_text(json.dumps(resumed, separators=(",", ":")) + "\n")
-    env = {**os.environ, "HOME": str(tmp_path),
-           "CCTALLY_DATA_DIR": str(root / "data"),
-           "CLAUDE_CONFIG_DIR": str(root / "scratch" / "claude"),
-           "CODEX_HOME": str(root / "scratch" / "codex"),
-           "CCTALLY_DISABLE_DEV_AUTODETECT": "1"}
-    tree = str(TOOLS.parent.parent)
-    out = tmp_path / "catchup.json"
-    first = _catchup(["--tree", tree, "--out", str(out)], env)
-    assert first.returncode == 0, (first.stdout, first.stderr)
-    gone.unlink()
-
-    # Revision 9's refusal, reproduced: the residual is the only cause.
-    out.unlink()
-    plain = _catchup(["--tree", tree, "--out", str(out)], env)
-    receipt = json.loads(out.read_text())
-    assert plain.returncode == 2
-    assert receipt["problems"] == ["sync_cache is not certifiable as a full walk"]
-
-    # A source copy without a preparation receipt stays INVALID.
-    out.unlink()
-    unprepared = _catchup(["--tree", tree, "--out", str(out),
-                           "--source", str(root)], env)
-    assert unprepared.returncode == 2, (unprepared.stdout, unprepared.stderr)
-    receipt = json.loads(out.read_text())
-    assert receipt["problems"][0].startswith(
-        "sync_cache is not certifiable as a full walk")
-    assert "no preparation receipt" in receipt["problems"][0]
-    assert receipt["claudeAdmission"]["route"] == "refused"
-
-    data_files = sorted(p.name for p in (root / "data").iterdir())
-    prep = _catchup(["prep", "--source", str(root), "--tree", tree], env,
-                    timeout=60)
-    assert prep.returncode == 0, (prep.stdout, prep.stderr)
-    assert sorted(p.name for p in (root / "data").iterdir()) == data_files
-    prepared = json.loads((root / "prep-receipt.json").read_text())
-    assert prepared["valid"] is True, prepared["problems"]
-    assert len(prepared["residual"]) == 1
-    residual = prepared["residual"]
-    assert residual[0].endswith("bench901-seed-resumed.jsonl")
-    assert set(prepared["source"]["databases"]) == {
-        "cache.db", "conversations.db", "stats.db"}
-
-    out.unlink()
-    admitted = _catchup(["--tree", tree, "--out", str(out),
-                         "--source", str(root)], env)
-    receipt = json.loads(out.read_text())
-    assert admitted.returncode == 0, (admitted.stdout, receipt["problems"])
-    assert receipt["admitted"] is True
-    claude = receipt["claudeAdmission"]
-    assert claude["route"] == "stable-residual exception"
-    assert claude["exception"]["problems"] == []
-    assert all(c["ok"] for c in claude["exception"]["checks"])
-    assert receipt["preparation"]["receipt"]["residual"] == residual
-    for phase in ("catchUp", "verify"):
-        # The original certification result is kept, and stays a refusal.
-        assert receipt["certification"][phase]["sync_cache"] is False
-        assert receipt["certification"][phase]["sync_codex_cache"] is True
-        sync = receipt["phases"][phase]["syncs"]["sync_cache"]
-        assert sync["full_walk_complete"] is False
-        observed = receipt["phases"][phase]["claude"]
-        for name in ("walkMissingBefore", "walkMissingAfter",
-                     "confirmedAbsentBefore", "confirmedAbsentAfter"):
-            assert observed[name] == residual, name
-    assert receipt["phases"]["verify"]["syncs"]["sync_cache"][
-        "files_processed"] == 0
-    prune = receipt["prune"]
-    assert prune["ran"] is True and prune["exit"] == 0
-    assert prune["result"]["residual_paths"] == residual
-    assert (prune["result"]["pruned_files"], prune["result"]["pruned_entries"],
-            prune["result"]["pruned_messages"]) == (0, 0, 0)
-    assert receipt["pendingState"]["problems"] == []
-    conn = sqlite3.connect(root / "data" / "cache.db")
-    try:
-        # The exception never mints a product certificate.
-        assert conn.execute(
-            "SELECT 1 FROM cache_meta "
-            "WHERE key = 'claude_ingest_walk_complete'").fetchone() is None
-    finally:
-        conn.close()
-
-
-_R = "/u/.claude/projects/p/gone.jsonl"
-_R2 = "/u/.claude/projects/p/also-gone.jsonl"
-_SETS = ("walkMissingBefore", "walkMissingAfter", "confirmedAbsentBefore",
-         "confirmedAbsentAfter")
-
-
-def _residual_case():
-    def stats(processed):
-        return {"files_total": 6, "files_processed": processed,
-                "files_skipped_unchanged": 6 - processed,
-                "lock_contended": False, "files_failed": 0,
-                "files_deferred_torn": 0, "deferred_reason": None,
-                "maintenance_failed": False, "full_walk_complete": False}
-
-    def observed():
-        return {"dedupApplied": True,
-                "discovery": {"invocations": 1, "complete": True,
-                              "errors": [], "count": 6},
-                "absenceErrors": [], **{name: [_R] for name in _SETS}}
-
-    versions = {"cache.db": 47, "conversations.db": 5, "stats.db": 1017}
-    return {
-        "prep": {"kind": "catchup-prep", "valid": True, "problems": [],
-                 "residual": [_R],
-                 "source": {"root": "/src", "databases": {
-                     db: {"userVersion": v} for db, v in versions.items()}},
-                 "tree": {"path": "/tree", "gitRev": "a" * 40}},
-        "passes": {"catchUp": {"exit": 0, "error": None, "stats": stats(2),
-                               "claude": observed()},
-                   "verify": {"exit": 0, "error": None, "stats": stats(0),
-                              "claude": observed()}},
-        "prune": {"ran": True, "exit": 0, "error": None, "result": {
-            "pruned_files": 0, "pruned_entries": 0, "pruned_messages": 0,
-            "residual_paths": [_R], "contended": False,
-            "prune_refused": False, "prune_refused_files": 0,
-            "prune_refused_state": None}},
-        "identity": {"gitRev": "a" * 40, "sourceRoot": "/src",
-                     "userVersions": dict(versions)},
-    }
-
-
-def _judge(case):
-    catchup = _load("catchup")
-    return catchup.claude_residual_admission(
-        case["prep"], case["passes"], case["prune"],
-        identity=case["identity"])
-
-
-def test_the_residual_exception_admits_a_stable_prepared_residual():
-    assert _judge(_residual_case()) == []
-
-
-def _all_sets(case, value):
-    for phase in ("catchUp", "verify"):
-        for name in _SETS:
-            case["passes"][phase]["claude"][name] = list(value)
-    case["prune"]["result"]["residual_paths"] = list(value)
-
-
-def _set(path, value):
-    def mutate(case):
-        target = case
-        for key in path[:-1]:
-            target = target[key]
-        target[path[-1]] = value
-    return mutate
-
-
-_RESIDUAL_REFUSALS = [
-    ("added", lambda c: _all_sets(c, [_R2, _R]), "catchUp.residual"),
-    ("removed", lambda c: _all_sets(c, []), "verify.residual"),
-    ("replaced", lambda c: _all_sets(c, [_R2]), "catchUp.residual"),
-    ("changed-after-verify",
-     _set(("passes", "verify", "claude", "walkMissingAfter"), [_R, _R2]),
-     "verify.residual"),
-    ("wrong-tree", _set(("identity", "gitRev"), "b" * 40),
-     "preparation.tree"),
-    ("unknown-tree", _set(("prep", "tree", "gitRev"), None),
-     "preparation.tree"),
-    ("wrong-source", _set(("identity", "sourceRoot"), "/elsewhere"),
-     "preparation.source"),
-    ("unknown-source", _set(("identity", "sourceRoot"), None),
-     "preparation.source"),
-    ("wrong-version", _set(("identity", "userVersions", "cache.db"), 46),
-     "preparation.userVersions"),
-    ("no-identity", _set(("identity",), None), "preparation.tree"),
-    ("no-receipt", _set(("prep",), None), "preparation.present"),
-    ("invalid-receipt", _set(("prep", "valid"), False), "preparation.valid"),
-    ("empty-residual",
-     lambda c: (_all_sets(c, []), _set(("prep", "residual"), [])(c)),
-     "preparation.residual"),
-    ("catch-up-census",
-     _set(("passes", "catchUp", "stats", "files_skipped_unchanged"), 3),
-     "catchUp.census"),
-    ("verify-census",
-     _set(("passes", "verify", "stats", "files_total"), 7), "verify.census"),
-    ("verify-processed-one",
-     lambda c: c["passes"]["verify"]["stats"].update(
-         files_processed=1, files_skipped_unchanged=5),
-     "verify.claudeProcessed"),
-    ("missing-stats", _set(("passes", "verify", "stats"), None),
-     "verify.stats"),
-    ("missing-catch-up-stats", _set(("passes", "catchUp", "stats"), None),
-     "catchUp.stats"),
-    ("nonzero-exit", _set(("passes", "catchUp", "exit"), 1), "catchUp.exit"),
-    ("raised", _set(("passes", "verify", "exit"), None), "verify.exit"),
-    ("dedup-outstanding",
-     _set(("passes", "catchUp", "claude", "dedupApplied"), False),
-     "catchUp.dedupApplied"),
-    ("dedup-unknown",
-     _set(("passes", "verify", "claude", "dedupApplied"), None),
-     "verify.dedupApplied"),
-    ("discovery-disagrees",
-     _set(("passes", "catchUp", "claude", "walkMissingBefore"),
-          [_R, "/u/.claude/projects/p/unreadable-dir/present.jsonl"]),
-     "catchUp.residual"),
-    ("absence-error",
-     _set(("passes", "verify", "claude", "absenceErrors"),
-          [f"{_R2}: PermissionError"]), "verify.absence"),
-    ("discovery-incomplete",
-     _set(("passes", "catchUp", "claude", "discovery", "complete"), False),
-     "catchUp.discovery"),
-    ("discovery-error",
-     _set(("passes", "verify", "claude", "discovery", "errors"),
-          ["OSError(5)"]), "verify.discovery"),
-    ("discovery-missing", _set(("passes", "catchUp", "claude"), None),
-     "catchUp.discovery"),
-    ("prune-files", _set(("prune", "result", "pruned_files"), 1),
-     "prune.mutation"),
-    ("prune-entries", _set(("prune", "result", "pruned_entries"), 3),
-     "prune.mutation"),
-    ("prune-messages", _set(("prune", "result", "pruned_messages"), 2),
-     "prune.mutation"),
-    ("prune-contended", _set(("prune", "result", "contended"), True),
-     "prune.contention"),
-    ("prune-refused", _set(("prune", "result", "prune_refused"), True),
-     "prune.refusal"),
-    ("prune-exit", _set(("prune", "exit"), 3), "prune.exit"),
-    ("prune-residual", _set(("prune", "result", "residual_paths"), [_R2]),
-     "prune.residual"),
-    ("prune-missing", _set(("prune",), None), "prune.present"),
-    ("prune-not-run", _set(("prune", "result"), None), "prune.present"),
-]
-
-
-@pytest.mark.parametrize("mutate,check",
-                         [(m, c) for _n, m, c in _RESIDUAL_REFUSALS],
-                         ids=[n for n, _m, _c in _RESIDUAL_REFUSALS])
-def test_the_residual_exception_refuses_anything_but_the_stable_residual(
-        mutate, check):
-    case = _residual_case()
-    mutate(case)
-    problems = _judge(case)
-    assert any(p.startswith(check + ":") for p in problems), problems
-
-
-_DIRTY = {"lock_contended": True, "files_failed": 1, "files_deferred_torn": 1,
-          "deferred_reason": "identity_torn", "prune_refused": True,
-          "budget_exhausted": True, "maintenance_failed": True,
-          "barrier_retry": True, "files_deferred_reset": 1, "container_pending": 1}
-
-
-@pytest.mark.parametrize("phase", ["catchUp", "verify"])
-@pytest.mark.parametrize("field", sorted(_DIRTY))
-def test_the_residual_exception_refuses_each_dirty_common_clean_field(
-        field, phase):
-    case = _residual_case()
-    case["passes"][phase]["stats"][field] = _DIRTY[field]
-    problems = _judge(case)
-    assert any(p.startswith(f"{phase}.commonClean:") and field in p
-               for p in problems), problems
-
-
-def test_the_harness_common_clean_fields_are_the_product_predicates():
-    """The exception re-states `provider_sync_certifiable`'s common_clean
-    block over serialized statistics; pin the two lists together."""
-    import inspect
-    import re
-
-    import _lib_ingest_frontier as frontier
-
-    catchup = _load("catchup")
-    source = inspect.getsource(frontier.provider_sync_certifiable)
-    block = source.split("common_clean = not any((", 1)[1].split("))", 1)[0]
-    assert set(re.findall(r'getattr\(stats, "(\w+)"', block)) == set(
-        catchup.COMMON_CLEAN_FIELDS) == set(_DIRTY)
-
-
-def test_admission_keeps_codex_and_conversation_certification_unexcepted():
-    """The exception is ONLY the Claude alternative: a failed Codex walk or
-    conversation census is refused whatever it says."""
-    import types
-
-    import _lib_ingest_frontier as frontier
-
-    catchup = _load("catchup")
-    base = dict(_residual_case()["passes"]["verify"]["stats"])
-    walk = types.SimpleNamespace(**base)
-    clean = types.SimpleNamespace(**dict(base, full_walk_complete=True))
-    census = types.SimpleNamespace(files_total=2, files_processed=0,
-                                   files_skipped_unchanged=2)
-    final = {"sync_cache": walk, "sync_codex_cache": clean,
-             "sync_claude_conversations": census,
-             "sync_codex_conversations": census}
-    drained = {"ran": True, "consumed": 0, "error": None}
-    assert catchup.admission_problems(frontier, final, [], drained,
-                                      claude_exception=[]) == []
-    codex = dict(final, sync_codex_cache=walk)
-    assert catchup.admission_problems(frontier, codex, [], drained,
-                                      claude_exception=[]) == [
-        "sync_codex_cache is not certifiable as a full walk"]
-    short = types.SimpleNamespace(files_total=2, files_processed=0,
-                                  files_skipped_unchanged=1)
-    for name in ("sync_claude_conversations", "sync_codex_conversations"):
-        assert catchup.admission_problems(
-            frontier, dict(final, **{name: short}), [], drained,
-            claude_exception=[]) == [
-            f"{name} is not certifiable as a full census"]
-    assert catchup.admission_problems(frontier, final, [], drained) == [
-        "sync_cache is not certifiable as a full walk"]
-    refused = catchup.admission_problems(
-        frontier, final, [], drained,
-        claude_exception=["prune.mutation: 1 file(s) pruned"])
-    assert len(refused) == 1 and refused[0].startswith(
-        "sync_cache is not certifiable as a full walk")
-    assert "prune.mutation" in refused[0]
 
 
 def _store(path, *, version=0, applied=(), skipped=(), meta=(),
@@ -3599,6 +3281,7 @@ def _p2_run(tmp_path, monkeypatch, workload, dash_log):
     monkeypatch.setattr(workload, "_window", lambda _run: (1000.0, 1330.0))
     monkeypatch.setattr(workload, "admission_problems", lambda _run: [])
     monkeypatch.setattr(workload, "terminal_problems", lambda _run, _end: [])
+    monkeypatch.setattr(workload, "window_rule_problems", lambda _run: [])
     monkeypatch.setattr(workload, "subprocess", types.SimpleNamespace(
         run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")))
     monkeypatch.setattr(workload, "_load_limits", lambda _tree: types.SimpleNamespace(
@@ -4540,12 +4223,27 @@ def test_capture_records_absences_and_refuses_an_open_or_newer_store(tmp_path):
     fr = _load("frozen_roots")
     tree = _frozen_home(tmp_path)
     gone = tree["rollout"].parent / "gone.jsonl"
+    # A retained Codex rollout whose dated file is gone: the product (#970)
+    # then looks for it in archived_sessions/, in both spellings, so the freeze
+    # must answer those names too; an unmapped probe made #939's R9 runs'
+    # families invalid.
+    archive = tree["home"] / ".codex" / "archived_sessions"
+    archive.mkdir()
+    dated_gone = tree["rollout"].parent / (
+        "rollout-2026-10-05T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001.jsonl")
     store = _frozen_store(tmp_path / "store", rows=[
-        ("session_files", gone, 10, 10, None)])
+        ("session_files", gone, 10, 10, None),
+        ("codex_session_files", dated_gone, 10, 10, None)])
     manifest = _capture(fr, tmp_path, tree, store=store,
                         extras=[str(tree["home"] / ".codex" / "hooks.json")])
     absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
     assert absences[str(gone)] == "retained-missing"
+    assert absences[str(dated_gone)] == "retained-missing"
+    for spelling in (dated_gone.name, dated_gone.name + ".zst"):
+        assert absences[str(archive / spelling)] == "retained-archive-absent"
+    # A Claude row is never looked for in a Codex archive.
+    assert not any(k.startswith(str(archive)) and "gone.jsonl" in k
+                   for k in absences)
     assert absences[str(tree["home"] / ".codex" / "config.toml")] == "metadata-absent"
     assert absences[str(tree["home"] / ".codex" / "hooks.json")] == "extra-absent"
     assert absences[str(tree["home"] / ".config" / "claude" / "projects")] == "root-absent"
@@ -4981,6 +4679,78 @@ def test_qualify_covers_a_retained_plain_row_with_its_compressed_container(tmp_p
     assert result["problems"] == []
     assert result["retainedContainerCovered"] == 1
     assert result["retainedContainerShorter"] == 0
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+@pytest.mark.parametrize("spelling", ["plain", "zst"])
+def test_qualify_judges_a_retained_dated_row_by_its_archived_rollout(tmp_path, spelling):
+    # #970: Codex moved the rollout into archived_sessions/ (plain or
+    # compressed); the product keeps its dated identity and reads the archived
+    # file, so the freeze must judge the retained row against that file. #939's
+    # R6 copy was refused because the capture called such rows
+    # retained-missing.
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    archive = tree["home"] / ".codex" / "archived_sessions"
+    archive.mkdir()
+    name = "rollout-2026-10-05T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0002.jsonl"
+    dated = tree["rollout"].parent / name
+    data = b'{"z":1}\n{"z":2}\n'
+    if spelling == "plain":
+        (archive / name).write_bytes(data)
+        inode = os.stat(archive / name).st_ino
+    else:
+        _zst(archive / (name + ".zst"), data)
+        inode = None
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", dated, len(data), len(data), inode)])
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences[str(dated)] == "archived"
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["problems"] == []
+    assert result["retainedContainerCovered"] == (1 if spelling == "zst" else 0)
+    # A cursor past the archived bytes is judged, never waved through.
+    store2 = _frozen_store(tmp_path / "store2", rows=[
+        ("codex_session_files", dated, len(data) + 7, len(data) + 7, inode)])
+    (tmp_path / "second").mkdir()
+    _capture(fr, tmp_path / "second", tree, store=store2)
+    result2 = fr.qualify(store2, tmp_path / "second" / "freeze")
+    if spelling == "zst":
+        assert result2["retainedContainerShorter"] == 1
+    else:
+        assert any("beyond the frozen file" in p for p in result2["problems"])
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+@pytest.mark.parametrize("shape", ["wrong-day", "undated", "nested", "dotdot"])
+def test_qualify_never_serves_an_ineligible_row_from_the_archive(tmp_path, shape):
+    """Detects: a retained Codex row whose path the product never maps to the
+    archive (`archive_dir_for`: wrong day, undated, nested deeper, a `..`
+    component) recorded as
+    archived and qualified against an archived file that merely shares its
+    basename, hiding a row the product cannot serve (#939 R7-02)."""
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    archive = tree["home"] / ".codex" / "archived_sessions"
+    archive.mkdir()
+    name = "rollout-2026-10-05T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0002.jsonl"
+    data = b'{"z":1}\n{"z":2}\n'
+    (archive / name).write_bytes(data)
+    sessions = tree["home"] / ".codex" / "sessions"
+    retained = {"wrong-day": sessions / "2026" / "10" / "06" / name,
+                "undated": sessions / name,
+                "nested": tree["rollout"].parent / "extra" / name,
+                # The product compares path components lexically (R8-03).
+                "dotdot": tree["rollout"].parent / "extra" / ".." / name}[shape]
+    store = _frozen_store(tmp_path / "store", rows=[
+        ("codex_session_files", retained, len(data), len(data), None)])
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    assert absences[str(retained)] == "retained-missing"
+    assert str(archive / (name + ".zst")) not in absences
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert any(str(retained) in p for p in result["problems"])
 
 
 @pytest.mark.usefixtures("release_sealed_tmp_path")
@@ -6584,17 +6354,6 @@ def test_live_admission_admits_a_continuous_clean_append():
     problems, justified = catchup.frontier_problems(
         _frontier(), _live_rows(100, 80), _live_rows(160, 95), _now(160, 95))
     assert problems == [] and justified == {"codex": 1, "claude": 1}
-    case = _residual_case()
-    case["passes"]["verify"]["stats"].update(files_processed=1,
-                                            files_skipped_unchanged=5)
-    catchup_ = _load("catchup")
-    assert catchup_.claude_residual_admission(
-        case["prep"], case["passes"], case["prune"], identity=case["identity"],
-        justified_claude=1) == []
-    assert any(p.startswith("verify.claudeProcessed:") for p in
-               catchup_.claude_residual_admission(
-                   case["prep"], case["passes"], case["prune"],
-                   identity=case["identity"], justified_claude=0))
 
 
 def test_live_admission_admits_a_file_first_discovered_after_the_frontier():
@@ -6638,16 +6397,6 @@ def test_live_admission_refuses_a_replayed_or_pruned_frontier_file():
     problems, _ = catchup.frontier_problems(
         _frontier(), _live_rows(100, 80), pruned, _now())
     assert any("pruned" in p for p in problems), problems
-
-
-def test_the_live_residual_route_still_refuses_a_changed_residual():
-    catchup = _load("catchup")
-    case = _residual_case()
-    _all_sets(case, [_R2])
-    problems = catchup.claude_residual_admission(
-        case["prep"], case["passes"], case["prune"], identity=case["identity"],
-        justified_claude=5)
-    assert any(p.startswith("catchUp.residual:") for p in problems), problems
 
 
 def test_jsonl_bytes_reports_per_file_growth_against_its_baseline(tmp_path):
@@ -7756,6 +7505,27 @@ if name == "cctally" and first == "dashboard":
 if name == "catchup.py":
     pathlib.Path(value("--out")).write_text(json.dumps({"admitted": True}))
     raise SystemExit(0)
+if name == "frontier.py":
+    # #939 D6: admission waits (exit 1) until WA_TEST_WARM; judgements and
+    # the terminal wait answer at once.
+    out = value("--out")
+    now = time.time()
+    if first == "capture":
+        pathlib.Path(out).write_text(json.dumps({"version": 1, "entries": []}))
+    elif first == "judge" and out:
+        pathlib.Path(out).write_text(json.dumps({
+            "version": 1, "complete": True, "startedAt": now, "endedAt": now,
+            "counts": {}, "deferred": [], "unconsumed": []}))
+    elif first == "admit-step":
+        if os.environ.get("WA_TEST_WARM") != "1":
+            raise SystemExit(1)
+        pathlib.Path(out).write_text(json.dumps(
+            {"valid": True, "kind": "drained", "releasedBy": "drained"}))
+    elif first == "wait-bound":
+        print(1)
+    elif first == "pass-after":
+        print("{}")
+    raise SystemExit(0)
 if name == "maintenance_op.py" and "--normalize-only" not in argv:
     linger("op")
 if name == "projection_replay.py" and first in ("p1", "p2-replay"):
@@ -7784,7 +7554,8 @@ def _lifecycle_box(tmp_path):
         "__pycache__", "*.dylib", "*.pyc"))
     (tools / "_prep.sh").write_text(_LIFECYCLE_PREP_STUB)
     for name in ("catchup.py", "maintenance_op.py", "projection_replay.py",
-                 "sqlattr.py", "latency.py", "hook_runner.py", "workload.py"):
+                 "sqlattr.py", "latency.py", "hook_runner.py", "workload.py",
+                 "frontier.py"):
         (tools / name).write_text(_FAMILY_STUB)
     tree = base / "tree"
     (tree / "bin").mkdir(parents=True)
@@ -8051,9 +7822,10 @@ def test_a_killed_runner_is_cleaned_up_by_its_watchdog(tmp_path):
 
 def test_the_live_runner_writes_its_records_and_reaps_its_workers(tmp_path):
     """HR-17: run-live.sh writes a fresh run-live-TAG with the frontier,
-    admission, window and terminal records and the terminal drain, and
-    refuses an existing one; HR-7: the installed dashboard's setsid worker
-    is reaped by run token, recorded, before the copier runs."""
+    admission, window and terminal records, the D6 judgements and the
+    terminal drain, and refuses an existing one; HR-7: the installed
+    dashboard's setsid worker is reaped by run token, recorded, before the
+    copier runs."""
     box = _lifecycle_box(tmp_path)
     args = ["t1", "1", "9", str(box.tree)]
     proc = _start_runner(box, "run-live.sh", args, WA_TEST_WARM="1")
@@ -8065,11 +7837,15 @@ def test_the_live_runner_writes_its_records_and_reaps_its_workers(tmp_path):
         window = json.loads((run / "window.json").read_text())
         assert window["workload"] == "L-post"
         assert window["warm"] <= window["start"] < window["end"]
-        assert json.loads((run / "admission.json").read_text())["valid"] is True
+        admission = json.loads((run / "admission.json").read_text())
+        assert admission["valid"] is True and admission["kind"] == "drained"
         frontier = json.loads((run / "frontier.json").read_text())
-        assert frontier["mode"] == "live" and "files" in frontier
+        assert frontier["version"] == 1 and "entries" in frontier
         terminal = json.loads((run / "terminal.json").read_text())
         assert terminal["alive"] == 1 and "drain" in terminal
+        judged = terminal["judgements"]
+        assert all(json.loads((run / judged[k]).read_text())["complete"]
+                   for k in ("window", "terminal")), judged
         pids = _marked_pids(box)
         assert len(pids) == 3 and _survivors(pids) == []
         reaped = [json.loads(l) for l in
@@ -8366,8 +8142,38 @@ def _ab_run(tmp_path, name="ab", *, start=1000.0, end=1300.0, **evidence):
     (run / "catchup.json").write_text(json.dumps({"admitted": True,
                                                   "frontier": _FRONTIER}))
     (run / "terminal.json").write_text(json.dumps({"t": end + 6, "alive": 1}))
+    _d6_window(run)
     _steady_evidence(run, start, end, **evidence)
     return run
+
+
+_NO_PASS_KEY = object()
+
+
+def _d6_window(run, *, window_state=1, terminal_state=1, terminal=True,
+               terminal_pass=_NO_PASS_KEY):
+    """#939 D6 evidence of a workload run: catch-up's stable pair, the
+    frontier, and J_W/J_T named by terminal.json. ``terminal_pass`` writes
+    run-live.sh's ``terminalPass`` (run-workload.sh writes no such key)."""
+    run = pathlib.Path(run)
+    catchup = json.loads((run / "catchup.json").read_text())
+    catchup["stability"] = {"admitted": True, "receipts": [
+        _d6_receipt(10, state=1), _d6_receipt(20, state=1)]}
+    (run / "catchup.json").write_text(json.dumps(catchup))
+    (run / "frontier.json").write_text(json.dumps({"version": 1,
+                                                   "entries": []}))
+    (run / "judge-window.json").write_text(json.dumps(
+        _d6_receipt(30, state=window_state)))
+    names = {"window": "judge-window.json"}
+    if terminal:
+        (run / "judge-terminal.json").write_text(json.dumps(
+            _d6_receipt(40, state=terminal_state)))
+        names["terminal"] = "judge-terminal.json"
+    record = json.loads((run / "terminal.json").read_text())
+    record["judgements"] = names
+    if terminal_pass is not _NO_PASS_KEY:
+        record["terminalPass"] = terminal_pass
+    (run / "terminal.json").write_text(json.dumps(record))
 
 
 def _last_json(text):
@@ -8835,18 +8641,34 @@ def test_the_frozen_verification_pass_may_do_no_work():
         base, dict(base, incarnations={"k": 2})))
 
 
-def test_the_live_post_release_run_is_admitted_on_its_frontier(tmp_path):
-    """HR-17: run-live.sh's run (workload L-post) has no catch-up; it is
-    admitted on its warm admission and live frontier receipt."""
+def test_the_live_post_release_run_is_admitted_on_its_drained_frontier(
+        tmp_path):
+    """HR-17 and #939 D6: run-live.sh's run (workload L-post) has no
+    catch-up; it is admitted only on the product's release and a stable J1/J2
+    pair over its captured frontier, never on a warm tick."""
     workload = _load("workload")
     run = tmp_path / "live"
     run.mkdir()
     _live_inputs(run)
     (run / "window.json").write_text(json.dumps({"workload": "L-post"}))
-    (run / "admission.json").write_text(json.dumps({"valid": True}))
-    assert any("frontier.json" in p for p in workload.admission_problems(str(run)))
-    (run / "frontier.json").write_text(json.dumps({"mode": "live", "files": {}}))
+    (run / "admission.json").write_text(json.dumps({"valid": True,
+                                                    "kind": "warm"}))
+    problems = workload.admission_problems(str(run))
+    assert any("frontier.json" in p for p in problems)
+    assert any("drained" in p for p in problems)
+    (run / "frontier.json").write_text(json.dumps(
+        {"version": 1, "entries": []}))
+    j1, j2 = _d6_receipt(10, state=1), _d6_receipt(20, state=1)
+    record = {"valid": True, "kind": "drained", "releasedBy": "settled",
+              "passes": [{"seq": 1, "started": 1, "ended": 2},
+                         {"seq": 2, "started": 12, "ended": 13}],
+              "receipts": [j1, j2]}
+    (run / "admission.json").write_text(json.dumps(record))
     assert workload.admission_problems(str(run)) == []
+    moved = dict(record, receipts=[j1, _d6_receipt(20, state=2)])
+    (run / "admission.json").write_text(json.dumps(moved))
+    assert any("obligation state changed" in p
+               for p in workload.admission_problems(str(run)))
 
 
 # HR-4: the hook runner waits for its workers, and the D verdict re-reads them
@@ -9182,6 +9004,50 @@ def test_journal_only_sources_capture_metadata_union_aliases_and_explicit_absenc
     for store in (a, b):
         result = fr.qualify(store, tmp_path / "freeze")
         assert result["qualified"], result["problems"]
+
+
+@pytest.mark.usefixtures("release_sealed_tmp_path")
+@pytest.mark.parametrize("dated,searchable",
+                         [(True, True), (False, True), (True, False)])
+def test_a_journal_source_gone_from_its_dated_path_attests_its_archive_spellings(
+        tmp_path, dated, searchable):
+    """Detects: a journal-referenced dated rollout gone from sessions/, which
+    the product then looks for in archived_sessions/ in both spellings,
+    leaving those stats unmapped so every run's family is INVALID (#939 R9);
+    archive spellings attested for a path the product never maps there; and
+    a probe error (an archive that can be listed but not searched answers
+    EACCES) attested as absence, which the product reads as unknown and the
+    frozen namespace would then present as ENOENT (#939 R12-01)."""
+    fr = _load("frozen_roots")
+    tree = _frozen_home(tmp_path)
+    archive = tree["home"] / ".codex" / "archived_sessions"
+    archive.mkdir()
+    name = "rollout-2026-10-05T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0003.jsonl"
+    source = (tree["rollout"].parent if dated
+              else tree["home"] / ".codex" / "sessions") / name
+    store = _frozen_store(tmp_path / "store")
+    _quota_journal(store, [_journal_quota(source)])
+    if not searchable:
+        if os.geteuid() == 0:
+            pytest.skip("root searches a directory without its search bit")
+        os.chmod(archive, 0o444)
+        try:
+            with pytest.raises(fr.Refused, match="archive spelling cannot be stat'ed"):
+                _capture(fr, tmp_path, tree, store=store)
+        finally:
+            os.chmod(archive, 0o755)
+        return
+    manifest = _capture(fr, tmp_path, tree, store=store)
+    absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
+    spellings = [str(archive / name), str(archive / (name + ".zst"))]
+    coverage = set(manifest["journalCoverage"]["sources"][str(source)])
+    if dated:
+        assert all(absences.get(s) == "journal-archive-absent" for s in spellings)
+        assert set(spellings) <= coverage
+    else:
+        assert not any(s in absences or s in coverage for s in spellings)
+    result = fr.qualify(store, tmp_path / "freeze")
+    assert result["qualified"], result["problems"]
 
 
 @pytest.mark.usefixtures("release_sealed_tmp_path")
@@ -9657,3 +9523,1025 @@ def test_selftest_unloaded_stat_reports_structured_operation_outcome(tmp_path):
         assert json.loads(result.stdout) == expected
         assert "live content" not in result.stdout
         assert _selftest_predicate("bypass.unloadedLibraryKilled", killed=result) is denied
+
+
+# ── #939 D6: frontier capture, judgement, admission and verdicts ──────────
+#
+# Each case names the false steady-state verdict it guards against (spec 6.3):
+# a cursor certified against itself, a stale or undefined deferral counted as
+# evidence, a window opened while catch-up still progresses, or a change after
+# the window passed off as steady state.
+
+_D6_UUIDS = ["0199aaaa-bbbb-7ccc-8ddd-eeeeffff%04d" % i for i in range(10)]
+_D6_RECORD = (b'{"type":"session_meta","payload":{"id":"s"}}\n'
+              b'{"type":"event_msg","payload":{"type":"token_count"}}\n')
+
+
+def _d6_rollout(i, day="2026/07/20"):
+    y, m, d = day.split("/")
+    return f"rollout-{y}-{m}-{d}T10-00-00-{_D6_UUIDS[i]}.jsonl"
+
+
+def _d6_roots(tmp_path):
+    """A home with one Claude transcript and four Codex rollouts: dated plain
+    (with a torn tail), archived, compressed, and a plain/compressed twin."""
+    from _codex_zstd_fixtures import zstd_bytes
+
+    home = tmp_path / "home"
+    claude = home / ".claude" / "projects" / "p"
+    claude.mkdir(parents=True)
+    (claude / "c.jsonl").write_bytes(b'{"a":1}\n{"a":2}\n{"torn"')
+    day = home / ".codex" / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    archive = home / ".codex" / "archived_sessions"
+    archive.mkdir(parents=True)
+    (day / _d6_rollout(0)).write_bytes(_D6_RECORD + b'{"torn')
+    (archive / _d6_rollout(1)).write_bytes(_D6_RECORD)
+    (day / (_d6_rollout(2) + ".zst")).write_bytes(zstd_bytes(_D6_RECORD * 3))
+    (day / _d6_rollout(3)).write_bytes(_D6_RECORD)
+    (day / (_d6_rollout(3) + ".zst")).write_bytes(zstd_bytes(_D6_RECORD * 2))
+    return home, day, archive
+
+
+def _d6_capture(tmp_path, home):
+    fr = _load("frontier")
+    libs = fr.load_libs(TOOLS.parent.parent)
+    frontier = fr.capture(fr.env_roots({"HOME": str(home)}), libs)
+    return fr, libs, frontier
+
+
+def _d6_entry(frontier, suffix):
+    found = [e for e in frontier["entries"] if e["logical"].endswith(suffix)]
+    assert len(found) == 1, (suffix, [e["logical"] for e in frontier["entries"]])
+    return found[0]
+
+
+def test_d6_capture_canonicalizes_rollouts_and_ends_at_complete_records(
+        tmp_path, monkeypatch):
+    """A frontier that missed an archived or compressed rollout, counted a
+    twin twice, or ended at a torn tail would admit a store that never
+    consumed the input (R10)."""
+    home, day, archive = _d6_roots(tmp_path)
+
+    def no_store(*_a, **_k):
+        raise AssertionError("capture must never read a store")
+    monkeypatch.setattr(sqlite3, "connect", no_store)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    codex = [e for e in frontier["entries"] if e["provider"] == "codex"]
+    assert len(codex) == 4, [e["logical"] for e in codex]
+    claude = _d6_entry(frontier, "c.jsonl")
+    assert claude["completeEnd"] == 16 and claude["container"]["kind"] == "plain"
+    torn = _d6_entry(frontier, _d6_rollout(0))
+    assert torn["completeEnd"] == len(_D6_RECORD)
+    archived = _d6_entry(frontier, _d6_rollout(1))
+    # The archive maps to its dated identity through the product's function.
+    assert archived["logical"] == str(day / _d6_rollout(1))
+    assert archived["container"]["path"] == str(archive / _d6_rollout(1))
+    assert archived["location"] == "archive"
+    canonical_day = pathlib.Path(os.path.realpath(day))
+    assert archived["identityPath"] == str(canonical_day / _d6_rollout(1))
+    assert archived["fileIdentity"] == libs.ident.codex_file_key(
+        archived["sourceRootKey"], archived["identityPath"])
+    compressed = _d6_entry(frontier, _d6_rollout(2))
+    assert compressed["container"]["kind"] == "zstd"
+    # Decoded bytes, not the compressed file's size.
+    assert compressed["completeEnd"] == 3 * len(_D6_RECORD)
+    assert compressed["generation"].startswith("zstd:")
+    twin = _d6_entry(frontier, _d6_rollout(3))
+    assert twin["container"]["kind"] == "plain"
+    assert twin["completeEnd"] == len(_D6_RECORD)
+
+
+def _d6_stores(data):
+    data.mkdir(parents=True, exist_ok=True)
+    codex_cursor = (
+        "path TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, mtime_ns INTEGER "
+        "NOT NULL, last_byte_offset INTEGER NOT NULL, last_ingested_at TEXT "
+        "NOT NULL, device_id INTEGER, inode INTEGER, container_kind TEXT NOT "
+        "NULL DEFAULT 'plain', container_path TEXT, container_size_bytes "
+        "INTEGER, container_state TEXT NOT NULL DEFAULT 'accepted', "
+        "container_state_reason TEXT, pending_container_fingerprint TEXT")
+    conv = sqlite3.connect(data / "conversations.db")
+    conv.executescript(f"""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE conversation_source_files (path TEXT PRIMARY KEY,
+            size_bytes INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+            last_byte_offset INTEGER NOT NULL, last_ingested_at TEXT NOT NULL,
+            device_id INTEGER, inode INTEGER);
+        CREATE TABLE codex_conversation_source_files ({codex_cursor});
+        CREATE TABLE codex_conversation_publications (
+            conversation_key TEXT PRIMARY KEY,
+            required_revision INTEGER NOT NULL DEFAULT 0,
+            ready_certificate_revision INTEGER,
+            published_revision INTEGER NOT NULL DEFAULT 0,
+            legacy_uncertified INTEGER NOT NULL DEFAULT 0,
+            updated_at_utc TEXT NOT NULL);
+        CREATE TABLE conversation_messages (id INTEGER PRIMARY KEY, body TEXT);
+    """)
+    conv.close()
+    cache = sqlite3.connect(data / "cache.db")
+    cache.executescript(f"""
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE session_files (path TEXT PRIMARY KEY, size_bytes INTEGER
+            NOT NULL, mtime_ns INTEGER NOT NULL, last_byte_offset INTEGER NOT
+            NULL, last_ingested_at TEXT NOT NULL);
+        CREATE TABLE codex_session_files ({codex_cursor});
+        CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE codex_barrier_membership (file_identity TEXT NOT NULL,
+            generation_token TEXT NOT NULL, conversation_key TEXT NOT NULL,
+            source_path TEXT NOT NULL, metadata_json TEXT, metadata_offset
+            INTEGER, PRIMARY KEY (file_identity, generation_token,
+            conversation_key)) WITHOUT ROWID;
+        CREATE TABLE codex_barrier_targets (file_identity TEXT PRIMARY KEY,
+            source_path TEXT NOT NULL, source_root_key TEXT, generation_token
+            TEXT NOT NULL, scan_target INTEGER NOT NULL, complete_line_end
+            INTEGER, state TEXT NOT NULL CHECK (state IN
+            ('required','ready','suspended')), reason TEXT,
+            accepted_generation_token TEXT, accepted_complete_line_end INTEGER);
+        CREATE TABLE codex_barrier_population (conversation_key TEXT PRIMARY
+            KEY, required_revision INTEGER NOT NULL DEFAULT 1, entered_at_utc
+            TEXT NOT NULL);
+        CREATE TABLE codex_barrier_certificates (conversation_key TEXT NOT
+            NULL, revision INTEGER NOT NULL, certificate_json TEXT NOT NULL,
+            sealed_at_utc TEXT NOT NULL, PRIMARY KEY (conversation_key,
+            revision)) WITHOUT ROWID;
+    """)
+    cache.close()
+
+
+def _d6_cursor(data, entry, offset, *, container=None, store="both",
+               pending=None, mark=("pending", "verification-pending")):
+    """Write the entry's cursor rows naming `container` (default: captured)."""
+    c = container or entry["container"]
+    codex = entry["provider"] == "codex"
+    tables = ({"conversation": ("conversations.db",
+                                "codex_conversation_source_files" if codex
+                                else "conversation_source_files"),
+               "accounting": ("cache.db", "codex_session_files" if codex
+                              else "session_files")})
+    for label, (db, table) in tables.items():
+        if store not in ("both", label):
+            continue
+        conn = sqlite3.connect(data / db)
+        cols = {"path": entry["logical"], "size_bytes": c["size"],
+                "mtime_ns": c["mtimeNs"], "last_byte_offset": offset,
+                "last_ingested_at": "x"}
+        if table != "session_files":
+            cols.update(device_id=c["device"], inode=c["inode"])
+        if codex:
+            cols.update(container_kind=c["kind"],
+                        container_path=(None if c["path"] == entry["logical"]
+                                        else c["path"]),
+                        container_size_bytes=(c["size"] if c["kind"] == "zstd"
+                                              else None))
+            if pending is not None:
+                cols.update(container_state=mark[0],
+                            container_state_reason=mark[1],
+                            pending_container_fingerprint=pending)
+        conn.execute(f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) "
+                     f"VALUES ({', '.join('?' for _ in cols)})", list(cols.values()))
+        conn.commit()
+        conn.close()
+
+
+def _d6_target(data, entry, *, generation=None, state="suspended",
+               reason="verification-unverified", keys=("k1",), required=2,
+               scan=None, accepted=None):
+    conn = sqlite3.connect(data / "cache.db")
+    gen = generation or entry["generation"]
+    conn.execute("INSERT OR REPLACE INTO codex_barrier_targets VALUES "
+                 "(?,?,?,?,?,?,?,?,?,?)",
+                 (entry["fileIdentity"], entry["logical"],
+                  entry["sourceRootKey"], gen, scan or entry["completeEnd"],
+                  entry["completeEnd"], state, reason, accepted, None))
+    for key in keys:
+        conn.execute("INSERT OR IGNORE INTO codex_barrier_membership VALUES "
+                     "(?,?,?,?,NULL,NULL)",
+                     (entry["fileIdentity"], gen, key, entry["logical"]))
+        conn.execute("INSERT OR REPLACE INTO codex_barrier_population VALUES "
+                     "(?,?,'x')", (key, required))
+    conn.commit()
+    conn.close()
+
+
+def _d6_judge(fr, libs, frontier, data, reference=None):
+    conn = fr.open_judgement(data)
+    try:
+        return fr.judge(frontier, conn, libs, reference=reference)
+    finally:
+        conn.close()
+
+
+def _d6_classes(receipt):
+    out = {e["logical"]: "deferred" for e in receipt["deferred"]}
+    out.update({e["logical"]: "unconsumed" for e in receipt["unconsumed"]})
+    return out
+
+
+def _d6_consume_all_but(data, frontier, skip=()):
+    for entry in frontier["entries"]:
+        if entry["logical"] not in skip:
+            _d6_cursor(data, entry, entry["completeEnd"])
+
+
+def test_d6_judge_never_certifies_a_cursor_against_itself(tmp_path):
+    """R2-02: a cursor that names the captured container, with its size, but
+    stops short of the byte-derived end is unconsumed; reaching the end in
+    only one of the two stores is not consumption either."""
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    _d6_consume_all_but(data, frontier)
+    receipt = _d6_judge(fr, libs, frontier, data)
+    assert receipt["counts"]["consumed"] == len(frontier["entries"])
+    assert receipt["complete"] is True
+    claude = _d6_entry(frontier, "c.jsonl")
+    torn = _d6_entry(frontier, _d6_rollout(0))
+    _d6_cursor(data, claude, claude["completeEnd"] - 1)
+    _d6_cursor(data, torn, torn["completeEnd"], store="conversation")
+    _d6_cursor(data, torn, torn["completeEnd"] - 3, store="accounting")
+    receipt = _d6_judge(fr, libs, frontier, data)
+    assert _d6_classes(receipt) == {claude["logical"]: "unconsumed",
+                                    torn["logical"]: "unconsumed"}
+    # #814: st_dev is assigned at mount time, so a remount renumbers every
+    # stored device_id with no file changed, and the product decides on the
+    # inode alone (`source_identity_replaced`). #939's R6 drain refused 16,356
+    # consumed entries whose cursors carried the volume's previous device.
+    _d6_consume_all_but(data, frontier)
+    for entry in (claude, torn):
+        moved = {**entry["container"], "device": entry["container"]["device"] + 1}
+        _d6_cursor(data, entry, entry["completeEnd"], container=moved)
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {}
+    other = {**claude["container"], "inode": claude["container"]["inode"] + 1}
+    _d6_cursor(data, claude, claude["completeEnd"], container=other)
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {
+        claude["logical"]: "unconsumed"}
+
+
+def test_d6_judge_consumes_a_replaced_container_only_at_its_validated_end(
+        tmp_path):
+    """A container replaced after capture is consumed only when both cursors
+    name the container the product now selects and reach its own end; a
+    cursor that still names the captured container is judged on the
+    captured end (the captured input was consumed before the replacement)."""
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    entry = _d6_entry(frontier, _d6_rollout(0))
+    _d6_consume_all_but(data, frontier, skip={entry["logical"]})
+    path = pathlib.Path(entry["logical"])
+    os.unlink(path)
+    path.write_bytes(_D6_RECORD * 2)
+    replacement = fr.plain_facts(path)
+    assert replacement["generation"] != entry["generation"]
+    # Past the captured end, but short of the replacement's own end.
+    _d6_cursor(data, entry, len(_D6_RECORD) + 5,
+               container=replacement["container"])
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {
+        entry["logical"]: "unconsumed"}
+    # Naming neither container (another inode) is never consumption.
+    _d6_cursor(data, entry, replacement["completeEnd"],
+               container=dict(replacement["container"], inode=1))
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {
+        entry["logical"]: "unconsumed"}
+    _d6_cursor(data, entry, replacement["completeEnd"],
+               container=replacement["container"])
+    receipt = _d6_judge(fr, libs, frontier, data)
+    assert _d6_classes(receipt) == {}
+    _d6_cursor(data, entry, entry["completeEnd"])
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {}
+
+
+@pytest.mark.parametrize("target, pending, expected", [
+    (dict(), None, "deferred"),
+    (dict(state="ready", reason=None), None, "deferred"),
+    (dict(generation="plain:1"), None, "unconsumed"),
+    (dict(state="ready", reason="verification-pending"), None, "unconsumed"),
+    (None, "captured", "deferred"),
+    (None, "other", "unconsumed"),
+    (None, None, "unconsumed"),
+    # #984's legacy-inequivalent containers: the product marks the captured
+    # container `unverified` and will not advance it; #939's R6 copy has
+    # 2,329 of them beside a stale target, all refused before this case.
+    (dict(generation="zstd:stale"), "captured-unverified", "deferred"),
+    (None, "other-unverified", "unconsumed"),
+])
+def test_d6_deferral_needs_evidence_at_the_captured_generation(
+        tmp_path, target, pending, expected):
+    """A stale target (another generation) or an undefined state/reason pair
+    is not deferral evidence; a mark on another container is not either. A
+    pending or unverified container mark on the captured container is."""
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    entry = _d6_entry(frontier, _d6_rollout(0))
+    _d6_consume_all_but(data, frontier, skip={entry["logical"]})
+    captured = fr.fingerprint_json(entry["container"])
+    other = fr.fingerprint_json(dict(entry["container"], inode=1))
+    mark = {"captured": captured, "other": other, None: None,
+            "captured-unverified": captured, "other-unverified": other}[pending]
+    state = (("unverified", "legacy-inequivalent")
+             if pending and pending.endswith("-unverified")
+             else ("pending", "verification-pending"))
+    _d6_cursor(data, entry, 0, pending=mark, mark=state)
+    if target is not None:
+        _d6_target(data, entry, **target)
+    receipt = _d6_judge(fr, libs, frontier, data)
+    assert _d6_classes(receipt) == {entry["logical"]: expected}
+
+
+def test_d6_a_claude_entry_is_never_deferred(tmp_path):
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    claude = _d6_entry(frontier, "c.jsonl")
+    _d6_consume_all_but(data, frontier, skip={claude["logical"]})
+    _d6_cursor(data, claude, 0)
+    assert _d6_classes(_d6_judge(fr, libs, frontier, data)) == {
+        claude["logical"]: "unconsumed"}
+
+
+def test_d6_a_judgement_is_one_read_transaction(tmp_path):
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    _d6_consume_all_but(data, frontier)
+    statements = []
+    conn = fr.open_judgement(data)
+    conn.set_trace_callback(statements.append)
+    try:
+        fr.judge(frontier, conn, libs)
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("CREATE TABLE written (x)")   # mode=ro
+    finally:
+        conn.close()
+    heads = [s.split()[0].upper() for s in statements]
+    assert heads.count("BEGIN") == 1 and heads[0] == "BEGIN"
+    assert heads.index("COMMIT") == len(heads) - 2   # before the refused write
+    assert heads.count("COMMIT") == 1
+
+
+def _d6_deferred_store(tmp_path):
+    """A store whose only unconsumed entry is a suspended Codex rollout with
+    key k1 blocked at required revision 2 (certificate 1, published 1)."""
+    home, day, _archive = _d6_roots(tmp_path)
+    fr, libs, frontier = _d6_capture(tmp_path, home)
+    data = tmp_path / "data"
+    _d6_stores(data)
+    entry = _d6_entry(frontier, _d6_rollout(0))
+    _d6_consume_all_but(data, frontier, skip={entry["logical"]})
+    _d6_cursor(data, entry, 0, store="conversation")
+    _d6_cursor(data, entry, entry["completeEnd"], store="accounting")
+    _d6_target(data, entry, keys=("k1",), required=2)
+    _d6_sql(data / "cache.db",
+            "INSERT INTO codex_barrier_certificates VALUES ('k1',1,'{}','x')")
+    _d6_sql(data / "conversations.db",
+            "INSERT INTO codex_conversation_publications VALUES "
+            "('k1',2,1,1,0,'x')")
+    return fr, libs, frontier, data, entry
+
+
+def _d6_sql(db, *statements):
+    conn = sqlite3.connect(db)
+    for s in statements:
+        conn.execute(s)
+    conn.commit()
+    conn.close()
+
+
+def test_d6_obligation_states_ignore_activity_outside_the_frontier(tmp_path):
+    """Stability is judged on the captured entries' obligation states only:
+    a new conversation, a re-seal and an append beyond the deferred entry's
+    captured end (advancing its scan target, accepted offset, required
+    revision and accounting cursor) change nothing; certificate or
+    publication progress on its own key up to J1's requirement, a cursor move
+    inside the frontier or a target state change does (R4-06)."""
+    fr, libs, frontier, data, entry = _d6_deferred_store(tmp_path)
+    j1 = _d6_judge(fr, libs, frontier, data)
+    assert [e["logical"] for e in j1["deferred"]] == [entry["logical"]]
+    assert j1["deferred"][0]["required"] == {"k1": 2}
+    _d6_sql(data / "cache.db",
+            "INSERT INTO cache_meta VALUES ('codex_barrier_seal_seq','9')",
+            "INSERT INTO codex_barrier_certificates VALUES ('k9',4,'{}','x')",
+            "UPDATE codex_barrier_population SET required_revision=3",
+            f"UPDATE codex_barrier_targets SET scan_target="
+            f"{entry['completeEnd'] + 400}, accepted_complete_line_end="
+            f"{entry['completeEnd'] + 400}",
+            f"UPDATE codex_session_files SET last_byte_offset="
+            f"{entry['completeEnd'] + 400} WHERE path='{entry['logical']}'")
+    _d6_sql(data / "conversations.db",
+            "INSERT INTO codex_conversation_publications VALUES "
+            "('k9',4,4,4,0,'x')",
+            "INSERT INTO conversation_messages (body) VALUES ('new')")
+    j2 = _d6_judge(fr, libs, frontier, data, reference=j1)
+    assert fr.obligation_changes(j1, j1, j2) == []
+    assert fr.obligation_state(j2["deferred"][0], j1["deferred"][0])["keys"] \
+        == {"k1": [1, 1]}
+    previous = j2
+    for statement, db in (
+            ("INSERT INTO codex_barrier_certificates VALUES ('k1',3,'{}','x')",
+             "cache.db"),
+            ("UPDATE codex_conversation_publications SET published_revision=2 "
+             "WHERE conversation_key='k1'", "conversations.db"),
+            (f"UPDATE codex_conversation_source_files SET last_byte_offset=10 "
+             f"WHERE path='{entry['logical']}'", "conversations.db"),
+            ("UPDATE codex_barrier_targets SET state='required', "
+             "reason='membership-unproven'", "cache.db")):
+        _d6_sql(data / db, statement)
+        now = _d6_judge(fr, libs, frontier, data, reference=j1)
+        assert fr.obligation_changes(j1, previous, now), statement
+        previous = now
+    # Clipped to J1's requirement: a later revision past it is not progress.
+    _d6_sql(data / "conversations.db",
+            "UPDATE codex_conversation_publications SET published_revision=5 "
+            "WHERE conversation_key='k1'")
+    after = _d6_judge(fr, libs, frontier, data, reference=j1)
+    assert fr.obligation_changes(j1, previous, after) == []
+
+
+def _d6_perf(passes, released="settled", clock=(10_000_000_000, 1_000_000_000_000)):
+    mono, unix = clock
+    return {"status": "ok", "diagnostic": {
+        "writeIo": {"coldStartup": {"releasedBy": released}},
+        "tick": {"conversation_sync_clock": {"monotonic_ns": mono,
+                                             "unix_ns": unix},
+                 "conversation_sync": [
+                     {"seq": s, "status": st, "started_ns": int(a * 1e9),
+                      "ended_ns": int(b * 1e9), "period_ns": None}
+                     for s, st, a, b in passes]}}}
+
+
+def _d6_receipt(t, *, unconsumed=(), state=None, keys=("k1",)):
+    deferred = [] if state is None else [{
+        "logical": "/r", "completeEnd": 10, "keys": list(keys),
+        "required": {k: 2 for k in keys},
+        "facts": {k: {"required": 2, "certificate": state, "published": 1}
+                  for k in keys},
+        "cursor": {"conversation": {"naming": "identity", "offset": 0}},
+        "target": {"captured": True, "state": "suspended",
+                   "reason": "verification-unverified"}, "pending": None}]
+    return {"version": 1, "complete": True, "startedAt": t, "endedAt": t + 1,
+            "counts": {}, "deferred": deferred,
+            "unconsumed": [{"logical": u, "reason": "x"} for u in unconsumed]}
+
+
+def test_d6_admission_waits_for_a_stable_pair_after_the_release(tmp_path):
+    """R10: no J1 before the product released its hold; an unconsumed entry
+    refuses; a J2 pass must start after J1 ended; a changed obligation state
+    re-anchors instead of admitting; a stable pair admits with its deferred
+    entries listed."""
+    fr = _load("frontier")
+    anchor = 1000.0 - 10.0          # unix - monotonic, in seconds
+    judged = []
+
+    def judge_fn(receipts):
+        def fn(reference):
+            receipt = receipts.pop(0)
+            judged.append((receipt, reference))
+            return receipt
+        return fn
+
+    obs = fr.observe(_d6_perf([(1, "ok", 1, 2)], released=None))
+    state, record = fr.admission({}, obs, judge_fn([]))
+    assert record is None and "j1" not in state
+    obs = fr.observe(_d6_perf([(1, "ok", 1, 2)]))
+    assert obs["passes"][0]["started"] == pytest.approx(1 + anchor)
+    state, record = fr.admission({}, obs, judge_fn(
+        [_d6_receipt(2000, unconsumed=["/x"])]))
+    assert record is None and state.get("j1") is None and state["refusals"]
+    j1 = _d6_receipt(2000, state=1)
+    state, record = fr.admission(state, obs, judge_fn([j1]))
+    assert record is None and state["j1"] is j1
+    # A pass that started before J1 ended is not a J2 boundary.
+    early = fr.observe(_d6_perf([(2, "ok", 2000.5 - anchor, 2003 - anchor)]))
+    state, record = fr.admission(state, early, judge_fn([]))
+    assert record is None and state["j1"] is j1
+    later = fr.observe(_d6_perf([(3, "ok", 2002 - anchor, 2004 - anchor)]))
+    moved = _d6_receipt(2005, state=2)
+    state, record = fr.admission(state, later, judge_fn([moved]))
+    assert record is None and state["j1"] is moved
+    stable = _d6_receipt(2010, state=2)
+    last = fr.observe(_d6_perf([(4, "ok", 2007 - anchor, 2008 - anchor)]))
+    state, record = fr.admission(state, last, judge_fn([stable]))
+    assert record["kind"] == "drained" and record["releasedBy"] == "settled"
+    assert record["receipts"] == [moved, stable]
+    assert [p["seq"] for p in record["passes"]] == [3, 4]
+    assert judged[-1][1] is moved   # J2 is judged against J1's keys
+    assert fr.admission_record_problems(record) == []
+    bad = json.loads(json.dumps(record))
+    bad["passes"][1]["started"] = moved["endedAt"] - 0.5
+    assert "the J2 pass started before J1 ended" in \
+        fr.admission_record_problems(bad)
+    bad = json.loads(json.dumps(record))
+    bad["releasedBy"] = None
+    assert fr.admission_record_problems(bad)
+
+
+def test_d6_verdict_refuses_window_changes_and_invalidates_late_ones():
+    """A change by J_W is catch-up inside the window (refused); a change first
+    seen at J_T cannot be placed after the window (INVALID); a missing or
+    partial receipt is never a verdict."""
+    fr = _load("frontier")
+    j1, j2 = _d6_receipt(1, state=1), _d6_receipt(5, state=1)
+    same, moved = _d6_receipt(9, state=1), _d6_receipt(9, state=2)
+    assert fr.window_problems(j1, j2, same, _d6_receipt(12, state=1)) == {
+        "refused": [], "invalid": []}
+    out = fr.window_problems(j1, j2, moved, moved)
+    assert out["refused"] and not out["invalid"]
+    out = fr.window_problems(j1, j2, same, _d6_receipt(12, state=2))
+    assert out["invalid"] and not out["refused"]
+    assert fr.window_problems(j1, j2, None, same)["refused"] == [
+        "J_W: missing or partial judgement receipt"]
+    partial = dict(same, complete=False)
+    assert fr.window_problems(j1, j2, same, partial)["invalid"] == [
+        "J_T: missing or partial judgement receipt"]
+    assert fr.window_problems(j1, j2, _d6_receipt(9, state=1, unconsumed=["/y"]),
+                              same)["refused"]
+
+
+def _d6_round(catchup, *, state=1, leftovers=3, unconsumed=(), contended=False,
+              extra=None, exit_code=0):
+    """One catch-up round over statistics both trees carry (`extra` adds a
+    field only one tree emits)."""
+    stats = {"lock_contended": contended, "deferred_reason": None,
+             "budget_exhausted": False, "files_failed": leftovers,
+             "barrier_files_deferred": 1, "barrier_keys_deferred": 2,
+             "container_pending": 0}
+    stats.update(extra or {})
+    syncs = {name: dict(stats) for name in catchup.Capture.NAMES}
+    return catchup.round_record(
+        syncs, _d6_receipt(100, state=state, unconsumed=unconsumed),
+        exit_code=exit_code, error=None)
+
+
+def test_catchup_admits_on_a_stable_pair_using_only_common_fields():
+    """D6: a production copy whose Codex census never certifies is admitted
+    on two consecutive census-complete rounds with identical observations,
+    judged from fields main and the branch both carry: a branch-only residual
+    field that differs between the rounds does not decide."""
+    catchup = _load("catchup")
+    rounds = [_d6_round(catchup, state=1, leftovers=5),
+              _d6_round(catchup, state=2, extra={"failed_paths": ["a"]}),
+              _d6_round(catchup, state=2, extra={"failed_paths": ["b"]})]
+    out = catchup.stability(rounds)
+    assert out["admitted"] is True and out["pair"] == [1, 2], out
+    assert out["problems"] == []
+    assert [e["logical"] for e in out["deferred"]] == ["/r"]
+
+
+@pytest.mark.parametrize("second, fragment", [
+    (dict(contended=True), "census"),
+    (dict(exit_code=1), "census"),
+    (dict(leftovers=4), "leftover"),
+    (dict(state=3), "obligation"),
+])
+def test_catchup_needs_census_complete_rounds_with_identical_observations(
+        second, fragment):
+    catchup = _load("catchup")
+    pair = [_d6_round(catchup), _d6_round(catchup, **second)]
+    out = catchup.stability(pair, limit=2)
+    assert out["admitted"] is False
+    assert any(fragment in p for p in out["problems"]), out["problems"]
+
+
+def test_catchup_refuses_a_clone_that_never_stabilizes_or_stays_unconsumed():
+    catchup = _load("catchup")
+    churn = [_d6_round(catchup, leftovers=n) for n in range(12)]
+    out = catchup.stability(churn)
+    assert out["admitted"] is False and "within 12 rounds" in out["problems"][-1]
+    stuck = [_d6_round(catchup, unconsumed=["/c.jsonl"]) for _ in range(2)]
+    out = catchup.stability(stuck)
+    assert out["admitted"] is False and out["final"] is True
+    assert any("unconsumed" in p for p in out["problems"])
+
+
+def test_the_ab_verdict_applies_the_d6_window_rule(tmp_path, capsys, _no_drain):
+    """An obligation state that moved by J_W is catch-up inside the window;
+    one first seen at J_T cannot be placed after it; a run without its
+    terminal judgement has no verdict."""
+    workload = _load("workload")
+    _no_drain(workload)
+    for name, kw, fragment in (
+            ("moved", dict(window_state=2, terminal_state=2), "by J_W"),
+            ("late", dict(terminal_state=2), "first seen at J_T"),
+            ("missing", dict(terminal=False), "J_T: missing"),
+            # run-live.sh's terminal wait expired with no new pass: its J_T
+            # observed nothing after the window, so it proves nothing.
+            ("no-pass", dict(terminal_pass=None), "no terminal pass")):
+        run = _ab_run(tmp_path, name)
+        _d6_window(run, **kw)
+        assert workload.ab_verdict(str(run), "tree") == 2, name
+        out, word = _verdict_out(capsys)
+        assert word == "INVALID" and any(fragment in p for p in out["problems"]), \
+            (name, out["problems"])
+    # A run whose terminal wait saw a pass, and an A/B/C run (no key at all),
+    # keep their window rule.
+    for name, kw in (("passed", dict(terminal_pass=7)), ("workload", {})):
+        run = _ab_run(tmp_path, name)
+        _d6_window(run, **kw)
+        assert workload.window_rule_problems(str(run)) == [], name
+
+
+# ── #939 spec 2.2: per-occurrence ownership (ownership.py, catchup_attrib) ──
+
+_PAGE = 4096
+_ROWS = ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n "
+         "WHERE i < {n}) INSERT INTO {t} SELECT randomblob({size}) FROM n")
+
+
+class _FileInterposer:
+    """A stand-in for wtrace.c in tests: after each step it diffs the store's
+    files and emits the records the interposer would have logged. A frame
+    header whose page or salt changed is a new frame write (header and page
+    data); a page that changed under an unchanged header is an in-place
+    overwrite; a header whose checksum alone changed is a checksum rewrite; a
+    changed main-file page is a checkpoint write."""
+
+    def __init__(self, db):
+        self.db, self.wal = str(db), str(db) + "-wal"
+        self.wal_snap, self.db_snap = self._read(self.wal), self._read(self.db)
+        self.frames, self.dbpages = [], []
+
+    @staticmethod
+    def _read(path):
+        try:
+            return pathlib.Path(path).read_bytes()
+        except FileNotFoundError:
+            return b""
+
+    def step(self):
+        import time as _time
+        t = _time.time()
+        wal, old, size = self._read(self.wal), self.wal_snap, 24 + _PAGE
+        out = []
+        if len(wal) >= 32 and wal[:32] != old[:32]:
+            out.append({"t": t, "path": self.wal, "frame": 0, "pgno": _PAGE,
+                        "commit": 0, "salt": 0})
+        for k in range(max(0, (len(wal) - 32) // size)):
+            off = 32 + k * size
+            head, was = wal[off:off + 24], old[off:off + 24]
+            header = {"t": t, "path": self.wal, "frame": k + 1,
+                      "pgno": int.from_bytes(head[:4], "big"),
+                      "commit": int.from_bytes(head[4:8], "big"),
+                      "salt": int.from_bytes(head[8:12], "big")}
+            data = {"t": t, "path": self.wal, "frame": k + 1, "data": 1}
+            if head[:16] != was[:16]:
+                out += [header, data]
+            else:
+                if wal[off + 24:off + size] != old[off + 24:off + size]:
+                    out.append(data)
+                if head != was:
+                    out.append(header)
+        self.frames += out
+        db = self._read(self.db)
+        pages = [{"t": t, "path": self.db, "pgno": k + 1, "n": _PAGE}
+                 for k in range(len(db) // _PAGE)
+                 if db[k * _PAGE:(k + 1) * _PAGE]
+                 != self.db_snap[k * _PAGE:(k + 1) * _PAGE]]
+        self.dbpages += pages
+        self.wal_snap, self.db_snap = wal, db
+        _time.sleep(0.002)          # the next observation reads strictly later
+        return out, pages
+
+
+def _occ_bytes(records, *, wal_headers=True):
+    return sum(32 * wal_headers if r["frame"] == 0 and not r.get("data")
+               else _PAGE if r.get("data") else 24 for r in records)
+
+
+def _occ_store(path, *, auto_vacuum="INCREMENTAL"):
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.execute(f"PRAGMA auto_vacuum={auto_vacuum}")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    return conn
+
+
+def _occ_run(tmp_path, ip, db="conversations.db"):
+    """A run directory with the stand-in's records and its exit totals."""
+    run = tmp_path / "run"
+    run.mkdir(exist_ok=True)
+    (run / "driver.json").write_text(json.dumps({"windows": {}, "pid": 1}))
+    (run / "w.1.frames").write_text("".join(json.dumps(r) + "\n" for r in ip.frames))
+    (run / "w.1.dbpages").write_text("".join(json.dumps(r) + "\n" for r in ip.dbpages))
+    (run / "w.1.exit").write_text(json.dumps({"paths": {
+        ip.wal: [_occ_bytes(ip.frames), len(ip.frames)],
+        ip.db: [_PAGE * len(ip.dbpages), len(ip.dbpages)]}}) + "\n")
+    return run
+
+
+def _occ_setup(tmp_path, *tables, rows=200):
+    db = tmp_path / "conversations.db"
+    w = _occ_store(db)
+    for t in tables:
+        w.execute(f"CREATE TABLE {t}(x)")
+    w.execute(_ROWS.format(n=rows, t=tables[0], size=1000))
+    w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    run = tmp_path / "run"
+    run.mkdir()
+    return db, w, run
+
+
+def _occ_objects(report):
+    return {o["object"]: o for o in report["objects"]}
+
+
+def test_ownership_charges_each_frame_to_its_owner_at_its_commit(tmp_path):
+    """A run that frees and reuses pages (a -> free -> b -> free -> a) charges
+    every frame to the page's owner after its own commit (dbstat at that
+    commit is the oracle) and every checkpoint copy to its latest committed
+    frame's owner, with nothing unresolved, totals reconciled; the endpoint
+    view would charge b nothing (it ends empty)."""
+    own, attrib = _load("ownership"), _load("catchup_attrib")
+    db, w, run = _occ_setup(tmp_path, "a", "b")
+    ip = _FileInterposer(db)
+    tr = own.Tracker({"conversations.db": str(db)}, str(run / "ownership.jsonl"))
+    steps = []
+    for sql in ("DELETE FROM a", _ROWS.format(n=200, t="b", size=1000),
+                "DELETE FROM b", _ROWS.format(n=200, t="a", size=1000)):
+        w.execute(sql)
+        recs, _pages = ip.step()
+        owners = dict(w.execute("SELECT pageno, name FROM dbstat"))
+        tr.observe()
+        steps.append((recs, owners))
+    w.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    _recs, copied = ip.step()
+    tr.observe()
+    tr.close()
+    assert copied, "the checkpoint copied nothing"
+    expected, last = collections.Counter(), {}
+    for recs, owners in steps:
+        slot = {}
+        for r in recs:
+            if r["frame"] == 0 and not r.get("data"):
+                continue
+            pgno = slot[r["frame"]] if r.get("data") else r["pgno"]
+            slot[r["frame"]] = pgno
+            expected[owners.get(pgno)] += _PAGE if r.get("data") else 24
+            last[pgno] = owners.get(pgno)
+    ckpt = collections.Counter(last.get(p["pgno"]) for p in copied)
+    b_pages = {r["pgno"] for r in steps[1][0] if "pgno" in r and r["frame"]
+               and steps[1][1].get(r["pgno"]) == "b"}
+    a_pages = {r["pgno"] for r in steps[3][0] if "pgno" in r and r["frame"]
+               and steps[3][1].get(r["pgno"]) == "a"}
+    assert b_pages & a_pages, "the scenario reused no page"
+    report = attrib.attribute(str(_occ_run(tmp_path, ip)), "conversations.db")
+    assert report["ownership"] == "per-occurrence"
+    assert report["unresolvedBytes"]["total"] == 0, report["unresolvedBytes"]
+    objects = _occ_objects(report)
+    for name in ("a", "b"):
+        assert objects[name]["walBytes"] == expected[name], name
+        assert objects[name]["ckptBytes"] == ckpt[name] * _PAGE, name
+    assert report["reconciled"] == {"wal": 1.0, "db": 1.0}
+    # The driver's trace callback observes only outside a transaction.
+    seen = []
+    fake = type("T", (), {"observe": lambda self: seen.append(w.in_transaction)})()
+    w.set_trace_callback(own.observer(w, fake))
+    w.execute("BEGIN")
+    w.execute("INSERT INTO a VALUES (1)")
+    w.execute("COMMIT")
+    w.execute("SELECT 1")
+    w.set_trace_callback(None)
+    w.close()
+    assert seen == [False, False]
+
+
+def test_ownership_counts_every_abandoned_occurrence_as_unresolved(tmp_path):
+    """A spilling transaction that rolls back, then one that reuses its frame
+    positions in the same WAL generation: every occurrence the rollback
+    abandoned is unresolved, the later commit's occurrences are charged."""
+    own, attrib = _load("ownership"), _load("catchup_attrib")
+    db, w, run = _occ_setup(tmp_path, "c", rows=20)
+    ip = _FileInterposer(db)
+    tr = own.Tracker({"conversations.db": str(db)}, str(run / "ownership.jsonl"))
+    w.execute("INSERT INTO c VALUES (randomblob(100))")
+    first, _ = ip.step()
+    tr.observe()
+    w.execute("PRAGMA cache_size=10")
+    w.execute("BEGIN")
+    w.execute(_ROWS.format(n=400, t="c", size=1500))
+    abandoned, _ = ip.step()
+    w.execute("ROLLBACK")
+    tr.observe()
+    assert any(r.get("data") for r in abandoned), "the transaction never spilled"
+    assert not any(r["frame"] == 0 for r in abandoned)       # same generation
+    w.execute("INSERT INTO c VALUES (randomblob(100))")
+    later, _ = ip.step()
+    tr.observe()
+    tr.close()
+    w.close()
+    reused = ({r["frame"] for r in later if not r.get("data")}
+              & {r["frame"] for r in abandoned if not r.get("data")})
+    assert reused, "the later commit reused no abandoned position"
+    report = attrib.attribute(str(_occ_run(tmp_path, ip)), "conversations.db")
+    un = report["unresolvedBytes"]
+    assert un["wal"] == _occ_bytes(abandoned), un
+    assert set(un["reasons"]["wal"]) <= {"superseded", "never-committed"}
+    charged = sum(o["walBytes"] for o in report["objects"])
+    assert charged == (_occ_bytes(first, wal_headers=False)
+                       + _occ_bytes(later, wal_headers=False))
+    assert report["reconciled"]["wal"] == 1.0
+
+
+def test_ownership_leaves_a_spilled_page_s_earlier_occurrences_unresolved():
+    """A page that moves A -> B -> A inside one committed transaction while it
+    spills (written, overwritten in place twice, its header rewritten at
+    commit): its last occurrence is charged to A, every earlier one is
+    unresolved (no page images are recorded)."""
+    attrib = _load("catchup_attrib")
+    wal = "/s/conversations.db-wal"
+    records = [{"t": 1.0, "path": wal, "frame": 0, "pgno": _PAGE, "commit": 0, "salt": 0},
+               {"t": 2.0, "path": wal, "frame": 5, "pgno": 7, "commit": 0, "salt": 0}]
+    records += [{"t": 2.0 + k / 10, "path": wal, "frame": 5, "data": 1}
+                for k in (1, 2, 3)]
+    records.append({"t": 2.5, "path": wal, "frame": 5, "pgno": 7, "commit": 9,
+                    "salt": 11})
+    store = {"names": {"0": ["A", "table", "A"], "1": ["B", "table", "B"]},
+             "observations": [{"kind": "obs", "t0": 3.0, "salt": [11, 12],
+                               "mxFrame": 5, "nBackfill": 0, "restart": True,
+                               "walPresent": True, "frames": [[5, 7, 0]]}]}
+    got = attrib.per_occurrence(records, [], store, _PAGE, lambda _t: "x", True)
+    assert dict(got["wal"]) == {"A": 24 + _PAGE}
+    assert got["unresolved"]["wal"] == {"superseded": 24 + 2 * _PAGE}
+    assert got["walOver"]["A"] == 2 and got["walRck"]["A"] == 1
+    # The commit frame's header, rewritten by walRewriteChecksums, is one
+    # commit: the per-occurrence report once counted every header write (a
+    # 2,754 against 2,500 commit count on the #939 catch-up).
+    rewritten = [records[0],
+                 {"t": 2.0, "path": wal, "frame": 5, "pgno": 7, "commit": 9, "salt": 11},
+                 {"t": 2.1, "path": wal, "frame": 5, "pgno": 7, "commit": 9, "salt": 11}]
+    assert attrib.per_occurrence(rewritten, [], store, _PAGE, lambda _t: "x",
+                                 True)["commits"] == 1
+
+
+def test_ownership_counts_a_reader_limited_checkpoint_as_unresolved(tmp_path):
+    """A checkpoint an open reader stops short of the committed frames
+    (nBackfill below mxFrame after it) has its page writes unresolved; the
+    complete checkpoint after the reader leaves charges them."""
+    own, attrib = _load("ownership"), _load("catchup_attrib")
+    db, w, run = _occ_setup(tmp_path, "d", rows=20)
+    ip = _FileInterposer(db)
+    log = run / "ownership.jsonl"
+    tr = own.Tracker({"conversations.db": str(db)}, str(log))
+    w.execute(_ROWS.format(n=50, t="d", size=1000))
+    ip.step()
+    tr.observe()
+    reader = sqlite3.connect(str(db), isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM d").fetchone()
+    w.execute(_ROWS.format(n=50, t="d", size=1000))
+    ip.step()
+    tr.observe()
+    w.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    _r, limited = ip.step()
+    tr.observe()
+    reader.execute("COMMIT")
+    reader.close()
+    w.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    _r, complete = ip.step()
+    tr.observe()
+    tr.close()
+    w.close()
+    obs = [json.loads(l) for l in log.read_text().splitlines()
+           if json.loads(l)["kind"] == "obs"]
+    assert limited and obs[2]["nBackfill"] < obs[2]["mxFrame"], obs[2]
+    assert complete and obs[3]["nBackfill"] == obs[3]["mxFrame"]
+    report = attrib.attribute(str(_occ_run(tmp_path, ip)), "conversations.db")
+    un = report["unresolvedBytes"]
+    assert un["reasons"]["db"] == {"reader-limited": _PAGE * len(limited)}, un
+    charged = sum(o["ckptBytes"] for o in report["objects"])
+    assert charged == _PAGE * len(complete)
+    assert report["reconciled"]["db"] == 1.0
+
+
+def _endpoint_maps(run, db, pre, post, names=("<unowned>", "A", "B")):
+    import array
+    for side, owners in (("pre", pre), ("post", post)):
+        pages = array.array("H", [0] * 8)
+        for pgno, oid in owners.items():
+            pages[pgno] = oid
+        (run / f"{side}-{db}.u16").write_bytes(pages.tobytes())
+        (run / f"{side}-{db}.json").write_text(json.dumps({
+            "pageSize": _PAGE, "pageCount": 7, "names": list(names),
+            "types": {"A": "table", "B": "table"}, "tables": {},
+            "pages": {}}))
+
+
+def test_endpoint_attribution_classifies_pages_and_labels_its_fallback(tmp_path):
+    """Without an ownership log, or for a store without pointer maps, the
+    attribution is the endpoint one, labelled so, with each page's bytes by
+    endpoint stability (stable, changed, allocated, unowned) and the
+    changed-or-allocated bytes as a lower bound on reassignment."""
+    attrib = _load("catchup_attrib")
+    run = tmp_path / "run"
+    run.mkdir()
+    wal, dbp = "/s/conversations.db-wal", "/s/conversations.db"
+    _endpoint_maps(run, "conversations.db", pre={2: 1, 3: 1},
+                   post={2: 1, 3: 2, 4: 1})
+    frames = [{"t": 1.0, "path": wal, "frame": 0, "pgno": _PAGE, "commit": 0, "salt": 0}]
+    for k, pgno in enumerate((2, 3, 4, 5), start=1):
+        frames += [{"t": 1.0, "path": wal, "frame": k, "pgno": pgno,
+                    "commit": 0, "salt": 1},
+                   {"t": 1.0, "path": wal, "frame": k, "data": 1}]
+    (run / "driver.json").write_text(json.dumps({"windows": {}}))
+    (run / "w.1.frames").write_text("".join(json.dumps(r) + "\n" for r in frames))
+    (run / "w.1.dbpages").write_text("")
+    (run / "w.1.exit").write_text(json.dumps({"paths": {
+        wal: [32 + 4 * (24 + _PAGE), 9], dbp: [0, 0]}}) + "\n")
+    report = attrib.attribute(str(run), "conversations.db")
+    frame = 24 + _PAGE
+    assert report["ownership"] == "endpoint"
+    assert report["ownershipFallback"] == "no ownership log"
+    assert report["endpointStability"] == {"stable": frame, "changed": frame,
+                                           "allocated": frame, "unowned": frame}
+    assert report["endpointOwnerChanged"]["bytes"] == 2 * frame
+    assert report["reconciled"]["wal"] == 1.0
+    # A store whose log says it has no pointer maps falls back the same way.
+    (run / "ownership.jsonl").write_text(json.dumps(
+        {"kind": "seed", "db": "conversations.db", "t": 0, "ptrmap": False,
+         "pageSize": _PAGE}) + "\n")
+    report = attrib.attribute(str(run), "conversations.db")
+    assert report["ownership"] == "endpoint"
+    assert report["ownershipFallback"] == "the store has no pointer maps"
+
+
+def test_the_tracker_reports_a_store_without_pointer_maps(tmp_path):
+    own = _load("ownership")
+    db = tmp_path / "conversations.db"
+    w = _occ_store(db, auto_vacuum="NONE")
+    w.execute("CREATE TABLE a(x)")
+    log = tmp_path / "ownership.jsonl"
+    tr = own.Tracker({"conversations.db": str(db)}, str(log))
+    w.execute("INSERT INTO a VALUES (1)")
+    tr.observe()
+    tr.close()
+    w.close()
+    records = [json.loads(l) for l in log.read_text().splitlines()]
+    assert records[0] == {**records[0], "kind": "seed", "ptrmap": False}
+    assert [r["kind"] for r in records if r["kind"] == "obs"] == []
+
+
+# ── accounting_digest.py compare (#939 R3-06, R3-07) ───────────────────────
+
+
+def _digest_file(path, tables, *, integrity="ok"):
+    store = dict(tables)
+    if integrity is not None:
+        store["(fts integrity-check)"] = {"m_fts": integrity}
+    path.write_text(json.dumps({"stores": {"conversations.db": store}}))
+    return str(path)
+
+
+@pytest.mark.parametrize("integrity, require, code", [
+    ("corrupt", False, 3),       # two equal failures never compare equal
+    (None, True, 3),             # a required result is missing
+    (None, False, 0),
+    ("ok", True, 0),
+])
+def test_digest_compare_refuses_failed_or_missing_integrity(
+        tmp_path, capsys, integrity, require, code):
+    digest = _load("accounting_digest")
+    table = {"t": {"rows": 1, "hash": "h", "columns": ["x"]}}
+    a = _digest_file(tmp_path / "a.json", table, integrity=integrity)
+    b = _digest_file(tmp_path / "b.json", table, integrity=integrity)
+    argv = ["compare", a, b] + (["--require-integrity"] if require else [])
+    assert digest.main(argv) == code, capsys.readouterr().out
+
+
+@pytest.mark.parametrize("after_a, after_b, fragment", [
+    ("10", "10", None),                       # integers, never lexical ("10" > "9")
+    ("8", "8", "regressed"),
+    ("x", "x", "unparsable"),
+    ("10", "9", "advanced differently"),      # a global counter: both or neither
+])
+def test_digest_compare_judges_counters_as_integers(
+        tmp_path, capsys, after_a, after_b, fragment):
+    digest = _load("accounting_digest")
+
+    def meta(value):
+        return {"cache_meta": {"rows": 1, "hash": "h", "columns": ["key", "value"],
+                               "counters": {"conversation_render_revision": value}}}
+    pre = _digest_file(tmp_path / "pre.json", meta("9"))
+    a = _digest_file(tmp_path / "a.json", meta(after_a))
+    b = _digest_file(tmp_path / "b.json", meta(after_b))
+    code = digest.main(["compare", a, b, "--pre", pre])
+    out = capsys.readouterr().out
+    if fragment is None:
+        assert code == 0, out
+    else:
+        assert code == 1 and fragment in out, out
+
+
+def test_digest_compare_reports_a_vanished_counter(tmp_path, capsys):
+    digest = _load("accounting_digest")
+    rows = {"rows": 1, "hash": "h", "columns": ["key", "value"]}
+    pre = _digest_file(tmp_path / "pre.json", {"cache_meta": {
+        **rows, "counters": {"conversation_render_revision": "9"}}})
+    a = _digest_file(tmp_path / "a.json", {"cache_meta": rows})
+    assert digest.main(["compare", a, a, "--pre", pre]) == 1
+    assert "vanished" in capsys.readouterr().out

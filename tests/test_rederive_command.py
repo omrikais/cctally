@@ -579,6 +579,118 @@ def test_reviewed_weekly_completed_op_recovers_with_plain_rederive(
     assert _journal_bytes(mod) == stable
 
 
+def test_884_reviewed_retry_after_restoring_upgrade_refuses_drifted_pins(
+    tmp_path, monkeypatch, capsys,
+):
+    """#884 spec §7 test 11 (§5.7 plan hash): a reviewed retry across the
+    upgrade that starts restoring a milestone.
+
+    Detects: an upgrade silently applying a plan the operator did not
+    review. The decision's pins were computed by a planner without the
+    lineage (an older binary) and journaled before its batch; once the
+    planner restores the repriced crossing, the retry is refused with
+    ``plan hash drifted`` and the journal is untouched.
+    """
+    from tests.test_cost_repricing_869 import _seed_repriced_block_884
+
+    mod = _isolated(tmp_path, monkeypatch)
+    import _cctally_journal as runtime
+    import _cctally_rederive as rederive
+    import _lib_rederive as lib_rederive
+
+    _closed_key, _close_id, lower, _upper = _seed_repriced_block_884(
+        mod, divergent=False)
+    [held] = [record for record in mod.read_rederive_journal_prefix()[0]
+              if record.get("t") == "obs"
+              and record["payload"]["captured_at"] == "2026-07-25T16:05:00Z"]
+    upgraded = lib_rederive.build_five_hour_lineage
+    monkeypatch.setattr(lib_rederive, "build_five_hour_lineage",
+                        lambda *args, **kwargs: None)
+    high_water = runtime.journal_high_water()
+    manifest = {
+        "schemaVersion": 2,
+        "journalHighWater": {
+            "segment": high_water[0], "offset": high_water[1],
+        },
+        "journalPrefixHash": runtime.journal_prefix_hash(high_water),
+        "reviewedAt": "2026-08-02T00:00:00Z",
+        "reason": "Reviewed one capture",
+        "weeklyAxisDecisions": [{
+            "observationId": held["id"], "disposition": "hold",
+        }],
+        "snapshotIdentityDecisions": [],
+    }
+    path = tmp_path / "884-review.json"
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+    pinned = rederive.preview_db_rederive("claude-usage", reviewed_op=op)
+    assert lower["id"] not in {
+        action.event_id for action in pinned.baseline_plan.actions}
+    manifest.update({
+        "expectedBaselinePlanHash": pinned.baseline_plan.plan_hash,
+        "expectedDecisionPlanHash": pinned.plan.plan_hash,
+    })
+    path.write_text(json.dumps(manifest))
+    op = rederive._reviewed_weekly_op_from_manifest(path)
+
+    def crash(stage):
+        if stage == "after-reviewed-decision-op":
+            raise RuntimeError("simulated crash after durable op")
+
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", crash)
+    with pytest.raises(RuntimeError, match="durable op"):
+        rederive.apply_db_rederive(
+            "claude-usage", reviewed_op=op,
+            expected_plan_hashes=(pinned.baseline_plan.plan_hash,
+                                  pinned.plan.plan_hash),
+        )
+    monkeypatch.setattr(rederive, "_REDERIVE_CRASH_HOOK", None)
+    # Control: the older planner still verifies its own pins.
+    assert rederive.preview_db_rederive("claude-usage").baseline_plan \
+        .plan_hash == pinned.baseline_plan.plan_hash
+    monkeypatch.setattr(lib_rederive, "build_five_hour_lineage", upgraded)
+
+    journal_before = _journal_bytes(mod)
+    assert mod.cmd_db_rederive(_args(yes=True)) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert "plan hash drifted" in refused["conflicts"][0], refused
+    assert _journal_bytes(mod) == journal_before
+
+
+@pytest.mark.parametrize("status,extra", [
+    ("preview", {"actionCounts": {"supersede": 1, "tombstone": 0, "add": 0}}),
+    ("applied", {}),
+    ("recovered", {}),
+    ("no-op", {}),
+])
+@pytest.mark.parametrize("withheld", [True, False])
+def test_884_o2_line_follows_every_status_line(cctally_module, capsys,
+                                               status, extra, withheld):
+    """#884 spec §5.7, operator decision O2: the text-mode disclosure.
+
+    Detects: a withheld milestone repair the operator never sees in text
+    mode. The line follows the status line for a preview, an applied, a
+    recovered and a no-op run, with N the number of withheld blocks, and
+    is absent when the payload has no ``withheldMilestoneRepairs``.
+    """
+    import _cctally_rederive as rederive
+
+    payload = {"status": status, "family": "claude-usage",
+               "batchId": "rederive:claude-usage:884", **extra}
+    if withheld:
+        payload["withheldMilestoneRepairs"] = [{}, {}]
+    rederive._emit_command_payload(payload, as_json=False)
+    lines = capsys.readouterr().out.splitlines()
+    o2 = ("Milestone repair withheld for 2 five-hour block(s) with "
+          "ambiguous history; rerun with --json and see "
+          "withheldMilestoneRepairs.")
+    assert lines[0].startswith("cctally: "), lines
+    if withheld:
+        assert lines[1:] == [o2], lines
+    else:
+        assert lines[1:] == [], lines
+
+
 def test_reviewed_weekly_retry_refuses_new_observations_after_decision(
     tmp_path, monkeypatch,
 ):
@@ -2449,7 +2561,10 @@ def _r5_drive_held_sequence_unattributed(mod):
 
 
 def _r5_credit_args(*, week, **over):
-    args = dict(to=30.0, from_pct=63.0, at="2026-07-25T12:02:00Z", week=week,
+    # `--at` is the first reading's own second: since #943 (O1) the credit takes
+    # effect at the exact `--at` second rather than its hour, and both seeded
+    # readings (12:00, 12:05) must stay inside the stale-replica band.
+    args = dict(to=30.0, from_pct=63.0, at="2026-07-25T12:00:00Z", week=week,
                 dry_run=False, yes=True, json=False, force=False)
     args.update(over)
     return argparse.Namespace(**args)

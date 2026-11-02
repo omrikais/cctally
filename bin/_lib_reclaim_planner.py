@@ -11,7 +11,8 @@ The bound (`dc5`, `dc6`, audited against SQLite `btree.c`, `pager.c` and
 `sqlite3BtreeIncrVacuum`, `allocateBtreePage`, `setChildPtrmaps`,
 `ptrmapPutOvflPtr`, `ptrmapPageno`, `btreeGetUnusedPage` and
 `autoVacuumCommit` are identical and `incrVacuumStep` / `modifyPagePointer`
-differ only by corruption checks):
+differ only by corruption checks; 3.54.1's three files are byte-identical to
+3.54.0's, #1023):
 
 * Each step removes the file's last page, skipping pointer-map and
   pending-byte pages, exactly as `incrVacuumStep` does.
@@ -65,10 +66,11 @@ import time
 
 PLANNER_VERSION = 1
 #: The SQLite releases whose incremental-vacuum sources were audited (spec
-#: §1.4, G3q). A runtime outside the range refuses reclaim until G3q passes on
-#: that version and a source review widens it.
+#: §1.4, G3q; 3.54.1 in docs/superpowers/specs/2026-10-30-1023-sqlite-3541-
+#: reclaim-audit.md). A runtime outside the range refuses reclaim until G3q
+#: passes on that version and a source review widens it.
 AUDITED_SQLITE_MIN = (3, 37, 2)
-AUDITED_SQLITE_MAX = (3, 54, 0)
+AUDITED_SQLITE_MAX = (3, 54, 1)
 
 WAL_INDEX_VERSION = 3007000
 WAL_FORMAT_VERSION = 3007000

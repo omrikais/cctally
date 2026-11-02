@@ -482,3 +482,70 @@ def test_identity_and_cursor_commit_atomically(root):
         first["device_id"], first["inode"])
     assert after["last_byte_offset"] == first["last_byte_offset"]
     assert after["size_bytes"] == first["size_bytes"]
+
+
+# ── #970 spec 5.4: one identity rule for every producer ──────────────────
+_ARCH_NAME = "rollout-2026-07-20T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff00a1.jsonl"
+
+
+@pytest.mark.parametrize("link", [False, True], ids=["regular", "symlink"])
+@pytest.mark.parametrize("location", ["sessions", "archive"])
+@pytest.mark.parametrize("compressed", [False, True], ids=["plain", "zstd"])
+def test_identity_agrees_across_all_producers(root, tmp_path, compressed,
+                                              location, link):
+    """#970 G5: discovery, targeted qualification, stored-path reconstruction
+    and the journal's attribution oracle must derive ONE identity for a
+    rollout, equal to its sessions-era identity. Any disagreement re-keys an
+    archived rollout: a fresh attribution decision, a lost journaled one, or a
+    double count until the prune drain runs."""
+    import _cctally_journal
+    from _codex_zstd_fixtures import compress_in_place
+    from _lib_source_identity import codex_file_key
+    _ns, provider, _rollout = root
+    cc = sys.modules["_cctally_cache"]
+    day = provider / "sessions" / "2026" / "07" / "20"
+    archive = provider / "archived_sessions"
+    day.mkdir(parents=True, exist_ok=True)
+    archive.mkdir(parents=True, exist_ok=True)
+    logical = day / _ARCH_NAME
+    home = archive if location == "archive" else day
+    if link:
+        target = tmp_path / "outside" / _ARCH_NAME
+        _write_rollout(target, _records(2))
+        if compressed:
+            target = compress_in_place(target)
+        container = home / target.name
+        container.symlink_to(target)
+        expected = pathlib.Path(str(target.resolve()).removesuffix(".zst"))
+    else:
+        container = home / _ARCH_NAME
+        _write_rollout(container, _records(2))
+        if compressed:
+            container = compress_in_place(container)
+        expected = day.resolve() / _ARCH_NAME
+    found = cc._discover_codex_files_with_roots()
+    assert [f.source_path for f in found] == [logical]
+    assert found[0].physical_path == expected
+    assert found[0].container_location == (
+        "archive" if location == "archive" else "dated")
+    root_key = found[0].source_root_key
+    assert cc._codex_stored_identity_path(str(logical)) == expected
+    qualified = cc._qualify_codex_targets({str(logical), str(container)})
+    if link:
+        # A7: targeted qualification refuses a container escaping the union
+        # of the sessions tree and the archive directory.
+        assert qualified == []
+    else:
+        assert [q.physical_path for q in qualified] == [expected]
+    identity = codex_file_key(root_key, str(expected))
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE codex_file_accounts(file_identity TEXT, "
+                     "incarnation INTEGER, from_offset INTEGER, account_key TEXT)")
+        conn.execute("INSERT INTO codex_file_accounts VALUES (?,0,0,'acct-a')",
+                     (identity,))
+        oracle = _cctally_journal._CodexAttributionOracle(conn)
+        assert oracle._ensure_loaded()
+        assert oracle._ranges_for(root_key, str(logical)) == [(0, "acct-a")]
+    finally:
+        conn.close()

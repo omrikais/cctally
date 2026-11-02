@@ -52,11 +52,11 @@ REQUIRED_SITES = (
      r"codex_session_entries"),
     ("W3a spend adoption on the dashboard ingest",
      ("dashboard-full-cold", "dashboard-full-delta"),
-     "_cctally_cache.apply_codex_window_spend_adoption",
+     "_cctally_cache.apply_codex_window_spend_adoption_unit",
      r"FROM quota_window_snapshots"),
     ("W3a spend adoption on the foreground Codex hook (I3)",
      ("hook-codex",),
-     "_cctally_cache.apply_codex_window_spend_adoption",
+     "_cctally_cache.apply_codex_window_spend_adoption_unit",
      r"FROM quota_window_snapshots"),
     ("W3b quota breakdown evidence",
      DASHBOARD_PHASES,
@@ -74,6 +74,14 @@ REQUIRED_SITES = (
      DASHBOARD_PHASES + ("doctor-cli",),
      "_cctally_pricing_check._pricing_observed_models",
      r"GROUP BY model"),
+    ("#1046 calibration-basis relations read in Python order",
+     ("dashboard-full-cold",),
+     "_lib_dashboard_sources._stats_relation_rows",
+     r"FROM correction_batch_lineage\b"),
+    ("#1046 cursorless archive-spelled source pairs",
+     ("conversation-sync",),
+     "_cctally_cache._codex_archive_spelled_source_pairs",
+     r"FROM codex_conversation_messages\b"),
     ("retention visit",
      ("conversation-sync", "retention-visit"),
      "_lib_conversation_retention._maybe_prune_conversation_retention",
@@ -605,6 +613,9 @@ def test_historical_quota_natural_key_lookup_uses_its_complete_unique_index(
     A lookup missing its path predicate, a sorter, an automatic index, or a
     table scan must fail here. The production heal fixture supplies multiple files,
     two quota slots and multiple observations; no substitute SQL is explained.
+    Since #970 F1 the lookup is ``_codex_retained_quota_readings``: the
+    retained-reading dedup reads the reading-key columns too, so the seek on the
+    natural UNIQUE index is no longer covering, and covering is not required.
     """
     from test_codex_publication_barrier import _seed_production_heal, _sync
 
@@ -620,10 +631,12 @@ def test_historical_quota_natural_key_lookup_uses_its_complete_unique_index(
         stats = _sync(ns, quota_reconcile="defer")
     assert stats.files_processed >= 3
     reads = [s for s in recorder.statements
-             if s.call_sites and s.call_sites[0] == "_cctally_cache._sync_codex_cache_locked"
-             and s.sql.startswith("SELECT line_offset, logical_limit_key ")
+             if s.call_sites
+             and s.call_sites[0] == "_cctally_cache._codex_retained_quota_readings"
              and "FROM quota_window_snapshots " in s.sql]
-    assert len(reads) == 3  # one covering range seek per historical identity
+    # One natural-index range seek per historical identity; not covering since
+    # #970 F1 (the retained-reading dedup reads the reading-key columns).
+    assert len(reads) == 3
     assert len(control["quota"]) == 4
     conn = ns["open_cache_db"]()
     try:
@@ -636,15 +649,19 @@ def test_historical_quota_natural_key_lookup_uses_its_complete_unique_index(
     finally:
         conn.close()
     assert natural_indexes
+    plan_shape = re.compile(
+        r"^SEARCH quota_window_snapshots USING (COVERING )?INDEX (?:"
+        + "|".join(re.escape(index) for index in sorted(natural_indexes))
+        + r") \(source=\? AND source_path=\?\)$")
     for statement in reads:
         assert statement.sql == (
-            "SELECT line_offset, logical_limit_key FROM quota_window_snapshots "
+            "SELECT line_offset, logical_limit_key, captured_at_utc, "
+            "observed_slot, window_minutes, used_percent, resets_at_utc "
+            "FROM quota_window_snapshots "
             "WHERE source='codex' AND source_path=?")
         assert statement.temp_store == TEMP_STORE_CODE[temp_store]
         assert len(statement.plan) == 1
-        assert statement.plan[0].startswith("SEARCH quota_window_snapshots USING COVERING INDEX ")
-        assert any(index in statement.plan[0] for index in natural_indexes)
-        assert "(source=? AND source_path=?)" in statement.plan[0]
+        assert plan_shape.fullmatch(statement.plan[0]), statement.plan[0]
     assert guard.classify(reads, allowlist=(), pending=()) == ([], [])
     print(json.dumps({"tempStore": temp_store, "population": len(control["quota"]),
                       "actualLookups": len(reads), "sql": reads[0].sql,

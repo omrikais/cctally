@@ -149,6 +149,37 @@ def _retention(effective):
     return _cctally_journal.ScratchRetention(effective)
 
 
+@pytest.mark.parametrize("legacy_input", [False, True])
+@pytest.mark.parametrize("reference", ["none", "lacks", "holds"])
+def test_companion_withholding_agrees_with_decide_for_a_tombstoned_id(
+        ns, legacy_input, reference):
+    """#943 review R-4. The five-hour confirm leg asks `withholds` whether a
+    credit's boundary companion will materialize before the companion's
+    content exists. A disagreement with `decide` makes the stale-replica
+    cleanup band from the wrong instant: from the slot for a companion that
+    materializes, or from the exact boundary for a credit read from its slot.
+    For a companion tombstoned in the effective set, both agree with no
+    reference, with a with-gap reference that lacks the id (affected: the
+    fresh candidate) and with one holding its unchanged content (the
+    tombstone stands), on a current and on a previous-release input."""
+    import _cctally_journal
+    import _lib_journal as J
+    evt = {"t": "evt", "v": 1, "src": "ingest", "rev": 0,
+           "id": "fhcb:acct:1792633200:2026-10-22T00:20:00+00:00",
+           "at": "2026-10-22T00:33:05Z",
+           "payload": {"kind": "five_hour_credit_boundary",
+                       "boundary_at_utc": "2026-10-22T00:29:51+00:00"}}
+    references = {"none": None, "lacks": {},
+                  "holds": {evt["id"]: J.event_content_hash(evt)}}
+    retention = _cctally_journal.ScratchRetention(
+        {evt["id"]: None}, reference=references[reference],
+        retained_only=frozenset({6}) if legacy_input else frozenset())
+    retention.current_input = 6
+    predicted = retention.withholds(evt["id"])
+    chosen, _fresh = retention.decide(copy.deepcopy(evt))
+    assert predicted == (chosen is None), (reference, legacy_input, chosen)
+
+
 # --------------------------------------------------------------------------
 # T1 — the scratch policy reaches exactly the replay scratches
 # --------------------------------------------------------------------------

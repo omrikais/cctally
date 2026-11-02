@@ -22,10 +22,12 @@ SCHEMA_VERSION = 1
 #: The control document, versioned independently (#755).  It is written by
 #: whichever session holds the persist lock and read by the next tick, so a
 #: shape change here must not invalidate the spool documents peers are writing.
-CONTROL_SCHEMA_VERSION = 2
+CONTROL_SCHEMA_VERSION = 3
 #: Control documents this binary can read.  Version 1 predates the pending
-#: drop's deadline and retained evidence; see `_pending_drop`.
-CONTROL_SCHEMA_VERSIONS_READ = (1, 2)
+#: drop's deadline and retained evidence; see `_pending_drop`.  Version 2
+#: predates the retained observation's witness (#1019/#1014 spec 4.2): its
+#: observations read with ``witness`` None.
+CONTROL_SCHEMA_VERSIONS_READ = (1, 2, 3)
 #: #825/#832: the account-bound protocol generation. Every current document,
 #: retry namespace and plan names it; the legacy spool never carries it.
 PROTOCOL_GENERATION = "account-bound-v1"
@@ -202,6 +204,11 @@ class SupportingObservation:
     percent: float
     raw_resets_at: int
     received_at: int
+    #: #1019/#1014 (spec 4.2): the provider-activity witness the
+    #: contributor's candidate carried when this observation was retained
+    #: (`_lib_provider_activity.ActivityWitness`), or None when it carried
+    #: none (or the record predates control schema 3).
+    witness: object | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -507,11 +514,14 @@ def _retry_signature(value: object) -> RetrySignature | None:
     )
 
 
-def _supporting_observation(value: object, *, now_epoch: int) -> SupportingObservation:
+def _supporting_observation(
+    value: object, *, now_epoch: int, control_version: int = CONTROL_SCHEMA_VERSION
+) -> SupportingObservation:
     doc = _require_object(value, "supporting observation")
-    _require_exact_keys(
-        doc, {"observationId", "token", "percent", "rawResetsAt", "receivedAt"}
-    )
+    required = {"observationId", "token", "percent", "rawResetsAt", "receivedAt"}
+    if control_version >= 3:
+        required |= {"witness"}
+    _require_exact_keys(doc, required)
     if not isinstance(doc["observationId"], str) or not OBSERVATION_ID_RE.fullmatch(
         doc["observationId"]
     ):
@@ -523,16 +533,20 @@ def _supporting_observation(value: object, *, now_epoch: int) -> SupportingObser
     received = doc["receivedAt"]
     if not _is_int(received) or not 0 <= received <= now_epoch + 5:
         raise StateValidationError("invalid supporting receivedAt")
+    witness = doc.get("witness")
     return SupportingObservation(
         observation_id=doc["observationId"],
         token=doc["token"],
         percent=_percent(doc["percent"]),
         raw_resets_at=doc["rawResetsAt"],
         received_at=received,
+        witness=None if witness is None else validate_activity(witness),
     )
 
 
-def _retained_low(value: object, *, now_epoch: int) -> RetainedLow | None:
+def _retained_low(
+    value: object, *, now_epoch: int, control_version: int = CONTROL_SCHEMA_VERSION
+) -> RetainedLow | None:
     if value is None:
         return None
     doc = _require_object(value, "retained low")
@@ -548,7 +562,9 @@ def _retained_low(value: object, *, now_epoch: int) -> RetainedLow | None:
         raw_resets_at=doc["rawResetsAt"],
         canonical_key=doc["canonicalKey"],
         observations=tuple(
-            _supporting_observation(item, now_epoch=now_epoch) for item in observations
+            _supporting_observation(
+                item, now_epoch=now_epoch, control_version=control_version)
+            for item in observations
         ),
     )
 
@@ -611,7 +627,8 @@ def _pending_drop(
     deadline_at = doc["deadlineAt"]
     if not _is_int(deadline_at) or deadline_at < doc["firstSeenAt"]:
         raise StateValidationError("invalid deadlineAt")
-    retained = _retained_low(doc["retained"], now_epoch=now_epoch)
+    retained = _retained_low(doc["retained"], now_epoch=now_epoch,
+                             control_version=control_version)
     return PendingDrop(
         canonical_key=doc["canonicalKey"],
         reduced_percent=reduced_percent,
@@ -890,8 +907,48 @@ def _supporting_observations(
                 percent=value.percent,
                 raw_resets_at=value.raw_resets_at,
                 received_at=candidate.received_at,
+                witness=candidate.activity,
             )
     return tuple(sorted(seen.values(), key=lambda item: item.observation_id))
+
+
+def _witness_json(witness) -> str:
+    """The canonical JSON of a retained observation's witness (``null`` for
+    none): the tie-break of every ordering of supports (#1019/#1014 spec
+    4.3) and the digest input of `support_identity`."""
+    document = (None if witness is None
+                else _lib_provider_activity.witness_to_json(witness))
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def support_identity(obs: SupportingObservation) -> tuple[str, str]:
+    """The proof-support identity of one retained observation (#1019/#1014
+    spec 4.2, risk K3): its confirmation identity ``observation_id`` plus
+    the SHA-256 of its frozen witness's canonical JSON, or ``""`` for no
+    witness. Two captures sharing token, value and window but carrying
+    different witnesses are separate supports, each refuted on its own
+    bound; the confirmation identity alone still decides what is the same
+    upstream reading."""
+    if obs.witness is None:
+        return obs.observation_id, ""
+    return obs.observation_id, hashlib.sha256(
+        _witness_json(obs.witness).encode("utf-8")).hexdigest()
+
+
+def _support_order(item: SupportingObservation) -> tuple[str, str]:
+    return item.observation_id, _witness_json(item.witness)
+
+
+def _support_bound_end(item: SupportingObservation) -> float:
+    """The end of a retained support's drop-bound interval in nanoseconds
+    (#1019 spec 4.1: its witness's supported instant, else its own
+    ``received_at``); infinite when it has no usable bound, which no sample
+    can refute."""
+    import _lib_stale_proof
+
+    end = _lib_stale_proof.bound_end(
+        _lib_stale_proof.witness_bound(item.witness, item.received_at))
+    return math.inf if end is None else float(end)
 
 
 def _merged_retained(
@@ -908,22 +965,84 @@ def _merged_retained(
     second confirmation.  A different low replaces the record outright, which
     is how an upward correction moves the target without restarting anything
     else.
+
+    #1019/#1014 (spec 4.2, K3): "already retained" is decided on the
+    proof-support identity (`support_identity`). A repeated observation
+    identity carrying a different witness is a separate support, judged on
+    its own bound, so a fresh same-value capture is never discarded in
+    favour of an older one a sample can refute. Of the supports sharing one
+    observation identity only the one with the LATEST drop bound
+    (`_lib_stale_proof.witness_bound`) is kept: identity fixes token, value
+    and raw reset, so every sample refuting it refutes the others too, and
+    keeping them would change no decision while growing the record by one
+    support per response at an unchanged reading (risk K3; the control
+    caps would refuse, not bound, the document). Equal bounds keep the
+    support already retained.
     """
     merged: dict[str, SupportingObservation] = {}
+
+    def offer(item: SupportingObservation) -> None:
+        current = merged.get(item.observation_id)
+        if current is None or (support_identity(current) != support_identity(item)
+                               and _support_bound_end(item) > _support_bound_end(current)):
+            merged[item.observation_id] = item
+
     if previous is not None and previous.canonical_key == canonical_key and previous.percent == low:
-        merged.update({item.observation_id: item for item in previous.observations})
+        for item in previous.observations:
+            offer(item)
     for item in observations:
-        # `setdefault`, not assignment: an identity already retained is the same
-        # upstream reading seen again, and rewriting its receipt time would make
+        # An identity already retained with the same witness is the same
+        # upstream reading seen again: rewriting its receipt time would make
         # the control document differ on every tick while nothing was confirmed.
-        merged.setdefault(item.observation_id, item)
-    ordered = tuple(sorted(merged.values(), key=lambda item: item.observation_id))
+        offer(item)
+    ordered = tuple(sorted(merged.values(), key=_support_order))
     return RetainedLow(
         percent=low,
         raw_resets_at=min(item.raw_resets_at for item in ordered),
         canonical_key=canonical_key,
         observations=ordered,
     )
+
+
+def _prune_retained(pending: PendingDrop | None,
+                    refuted: "frozenset | None") -> PendingDrop | None:
+    """``pending`` without the retained supports the current samples refute
+    (#1019/#1014 spec 4.2), whether their contributors are present or
+    absent. ``refuted`` holds `support_identity` values. A low that keeps
+    some support keeps its value, its deadline and every other field; one
+    left with none supports nothing (`_has_evidence`), which every reader of
+    a pending record already treats as cancelled."""
+    if pending is None or pending.retained is None or not refuted:
+        return pending
+    kept = tuple(item for item in pending.retained.observations
+                 if support_identity(item) not in refuted)
+    if len(kept) == len(pending.retained.observations):
+        return pending
+    raw = (min(item.raw_resets_at for item in kept) if kept
+           else pending.retained.raw_resets_at)
+    return dataclasses.replace(pending, retained=dataclasses.replace(
+        pending.retained, raw_resets_at=raw, observations=kept))
+
+
+def _drop_side(
+    reduced: AxisValue,
+    in_window: tuple[tuple[Candidate, AxisValue], ...],
+    drop_window: tuple[tuple[Candidate, AxisValue], ...],
+    db_axis: AxisProjection | None,
+) -> AxisValue | None:
+    """The drop-side maximum (#1019 spec 4.2): the same-window maximum over
+    the drop-eligible members, or None when there are none. Without a
+    drop-refused member it is ``reduced`` itself."""
+    if len(drop_window) == len(in_window):
+        return reduced
+    if not drop_window:
+        return None
+    maximum = max(value.percent for _, value in drop_window)
+    if db_axis is not None and db_axis.canonical_key == reduced.canonical_key:
+        raw = db_axis.raw_resets_at
+    else:
+        raw = min(value.raw_resets_at for _, value in drop_window if value.percent == maximum)
+    return AxisValue(maximum, raw, canonical_key=reduced.canonical_key)
 
 
 def _retained_axis_value(retained: RetainedLow, db_axis: AxisProjection | None) -> AxisValue:
@@ -1136,13 +1255,44 @@ def _reduce_axis(
     drop_allowed: bool = True,
     evidence: AxisEvidence | None = None,
     member_facts: Mapping[str, object] | None = None,
+    refuted_supports: "frozenset | None" = None,
+) -> _AxisDecision:
+    # #1019/#1014 (spec 4.2): retained support the current samples refute is
+    # pruned observation by observation BEFORE the reduction and before
+    # `_hold_pending`, so no branch can publish it. A pruned record that the
+    # reduction would otherwise leave untouched is still a control change.
+    pruned = _prune_retained(pending, refuted_supports)
+    decided = _reduce_pruned_axis(
+        axis, candidates, db_axis, pruned, tombstone, now_epoch, scope=scope,
+        drop_allowed=drop_allowed, evidence=evidence, member_facts=member_facts)
+    if (pruned is not pending and decided.action == "NOOP"
+            and decided.pending != pending):
+        return dataclasses.replace(decided, action="WRITE_CONTROL")
+    return decided
+
+
+def _reduce_pruned_axis(
+    axis: str,
+    candidates: tuple[Candidate, ...],
+    db_axis: AxisProjection | None,
+    pending: PendingDrop | None,
+    tombstone: Tombstone | None,
+    now_epoch: int,
+    *,
+    scope=None,
+    drop_allowed: bool = True,
+    evidence: AxisEvidence | None = None,
+    member_facts: Mapping[str, object] | None = None,
 ) -> _AxisDecision:
     # #797 spec 4.4 (Q3): the per-member refusal facts
     # (`_lib_stale_proof.MemberFacts`, keyed by contributor token) are
     # resolved before the kernel. None, or no refused member, reduces
     # exactly as before.
-    refused = frozenset(
-        token for token, facts in (member_facts or {}).items() if facts.refused)
+    # #1019 (spec 4.2, P-R2): the drop-refused members, decided
+    # independently, are ineligible in BOTH directions; ``refused`` is the
+    # rise-ineligible set (receipt-refused or drop-refused).
+    drop_refused = drop_refused_tokens(member_facts)
+    refused = rise_ineligible_tokens(member_facts)
     reduced_data = _reduced_candidate(
         candidates, axis=axis, tombstone=tombstone, db_axis=db_axis
     )
@@ -1162,7 +1312,9 @@ def _reduce_axis(
             # stale and is never relabelled as post-floor. The reading opens
             # no consensus and spends no attempt, under either gate.
             # #797 spec 4.4: a refused member is excluded from the post-floor
-            # set; every other member keeps the receipt-floor test.
+            # set; every other member keeps the receipt-floor test. #1019
+            # (P-R4): so is a drop-refused one — ``refused`` is the
+            # rise-ineligible set.
             post = tuple((candidate, value) for candidate, value in in_window
                          if candidate.token not in refused
                          and candidate.received_at >= int(evidence.floor_epoch))
@@ -1212,13 +1364,20 @@ def _reduce_axis(
     # evidence that a drop is pending, which is why the low is read separately
     # here and why a rise is a publication rather than a branch of its own.
     # #797 spec 4.4 (Q3): `rising` and the published value come from the
-    # members that are not refused; low evidence, supporter retraction,
-    # unanimity, pending membership, `reduced_percent`, deadlines and attempt
-    # accounting keep the unfiltered set. The eligible value applies at every
-    # rising return (plain, armed, cancelled and reconciled).
+    # members that are not refused; supporter retraction, deadlines and
+    # attempt accounting keep the unfiltered set. The eligible value applies
+    # at every rising return (plain, armed, cancelled and reconciled).
+    # #1019 (spec 4.2): the drop side — the low that arms, its supporters,
+    # pending membership, `reduced_percent`, unanimity and the unanimous
+    # path's published maximum — uses the drop-eligible members only. An
+    # empty drop-eligible set arms nothing and is never unanimous.
     rise = _eligible_rise(reduced, in_window, refused, db_axis)
     rising = rise is not None and rise.percent > db_axis.percent
-    low = min(value.percent for _, value in in_window)
+    drop_window = (in_window if not drop_refused else tuple(
+        (candidate, value) for candidate, value in in_window
+        if candidate.token not in drop_refused))
+    drop_reduced = _drop_side(reduced, in_window, drop_window, db_axis)
+    low = min((value.percent for _, value in drop_window), default=None)
     armed = (
         pending is not None
         and pending.canonical_key == key
@@ -1230,16 +1389,17 @@ def _reduce_axis(
             # The rise moves the baseline and no drop is pending against the old
             # one, so there is nothing to preserve.
             return _AxisDecision("PUBLISH_DB", rise, None)
-        if low >= db_axis.percent:
+        if low is None or low >= db_axis.percent:
             return _AxisDecision(
                 "WRITE_CONTROL" if pending is not None else "NOOP", None, None
             )
-        supporters = _supporting_observations(in_window, axis, low)
+        supporters = _supporting_observations(drop_window, axis, low)
         retained = _merged_retained(
             None, canonical_key=key, low=low, observations=supporters
         )
         return _AxisDecision(
-            "WRITE_CONTROL", None, _new_pending(reduced, in_window, now_epoch, retained=retained)
+            "WRITE_CONTROL", None,
+            _new_pending(drop_reduced, drop_window, now_epoch, retained=retained)
         )
 
     # A cancelled or already-recorded drop stops being pending, and a rise still
@@ -1252,9 +1412,9 @@ def _reduce_axis(
     if db_axis.percent <= pending.retained.percent:
         return cancelled
 
-    reconciled = _reconcile_pending(pending, in_window)
-    if low < db_axis.percent:
-        supporters = _supporting_observations(in_window, axis, low)
+    reconciled = _reconcile_pending(pending, drop_window)
+    if low is not None and low < db_axis.percent:
+        supporters = _supporting_observations(drop_window, axis, low)
         retained = _merged_retained(
             pending.retained, canonical_key=key, low=low, observations=supporters
         )
@@ -1267,7 +1427,10 @@ def _reduce_axis(
     # never restarts the generation: `first_seen_at`, `deadline_at` and every
     # other contributor's progress are carried through unchanged.
     updated = dataclasses.replace(
-        reconciled, reduced_percent=reduced.percent, retained=retained
+        reconciled,
+        reduced_percent=(reconciled.reduced_percent if drop_reduced is None
+                         else drop_reduced.percent),
+        retained=retained,
     )
 
     if rising:
@@ -1280,8 +1443,16 @@ def _reduce_axis(
         # a low armed below the old baseline is still a drop below the new one.
         return _AxisDecision("PUBLISH_DB", rise, updated)
 
+    # #1019 (spec 4.2 *Dissent is kept*, P-R1, P-R2): an active,
+    # same-window rise-eligible member at or above the baseline dissents
+    # from the drop; an empty rise-eligible set dissents from nothing. With
+    # no refused member this is today's ``reduced < baseline`` test.
+    dissent = any(value.percent >= db_axis.percent
+                  for candidate, value in in_window if candidate.token not in refused)
     unanimous = (
-        reduced.percent < db_axis.percent
+        drop_reduced is not None
+        and drop_reduced.percent < db_axis.percent
+        and not dissent
         and bool(updated.contributors)
         and all(item.satisfied for item in updated.contributors.values())
     )
@@ -1291,9 +1462,9 @@ def _reduce_axis(
         # is spent; the record stays pending with its evidence.
         pass
     elif unanimous:
-        attempted = _pending_kernel_attempt(updated, reduced, db_axis, scope=scope)
+        attempted = _pending_kernel_attempt(updated, drop_reduced, db_axis, scope=scope)
         if attempted is not None:
-            return _AxisDecision("PUBLISH_DB", reduced, attempted)
+            return _AxisDecision("PUBLISH_DB", drop_reduced, attempted)
     elif now_epoch >= updated.deadline_at:
         # D5: the first eligible evaluation after expiry publishes the retained
         # supported low despite unsatisfied contributors.  Never the
@@ -1320,6 +1491,23 @@ def _reduce_axis(
         None,
         updated,
     )
+
+
+def drop_refused_tokens(member_facts: Mapping[str, object] | None) -> frozenset:
+    """The contributor tokens whose LOW the facts refuse (#1019 spec 4.2)."""
+    return frozenset(token for token, facts in (member_facts or {}).items()
+                     if getattr(facts, "drop_refused", False))
+
+
+def rise_ineligible_tokens(member_facts: Mapping[str, object] | None) -> frozenset:
+    """The contributor tokens that may not RISE (#797 spec 4.4, #1019 spec
+    4.2 P-R2): receipt-refused (``refused``) or drop-refused. A drop-refused
+    member's reading predates an accounted provider sample reading more than
+    1 pp higher, so its rise would re-raise a credited account to a
+    pre-credit reading. The reducer, plan construction and frozen-plan
+    recovery all read rise eligibility here."""
+    return frozenset(token for token, facts in (member_facts or {}).items()
+                     if facts.refused or getattr(facts, "drop_refused", False))
 
 
 def _eligible_rise(
@@ -1349,8 +1537,9 @@ def reduce_candidates(
     tombstones: Mapping[str, Tombstone | None],
     now_epoch: int,
     account_key: str | None = None,
-    drop_consensus_allowed: bool = True,
+    drop_consensus_allowed: "bool | Mapping[str, bool]" = True,
     member_facts: Mapping[str, Mapping[str, object]] | None = None,
+    refuted_supports: "Mapping[str, frozenset[tuple[str, str]]] | None" = None,
 ) -> ReductionDecision:
     """Reduce active candidates independently for 5h and 7d axes.
 
@@ -1362,11 +1551,12 @@ def reduce_candidates(
     ``(PROTOCOL_GENERATION, account_key, axis)``. The caller passes only that
     partition's candidates, control and tombstones.
 
-    ``drop_consensus_allowed`` is the outcome-quarantine control gate
-    (#825/#832 spec 5.6 item 7). False while the account lacks either recovery
-    certificate: a pending drop below the database baseline is then published
-    neither by consensus nor at its deadline, and stays pending; rises and new
-    windows publish as always. An axis with no projected baseline publishes
+    ``drop_consensus_allowed`` is the outcome-quarantine drop gate
+    (#825/#832 spec 5.6 item 7), one boolean for both axes or, since #948
+    spec 6.8, a mapping ``{axis: bool}`` (a missing axis is withheld). False
+    while the axis is paused: a pending drop below the database baseline is
+    then published neither by consensus nor at its deadline, and stays
+    pending; rises and new windows publish as always. An axis with no projected baseline publishes
     under either gate only when ``db`` carries classification evidence for
     it (`classify_absent_axis`: a first reading, a new window or the first
     reading after a retiring floor); a stale reading takes the older-window
@@ -1375,9 +1565,21 @@ def reduce_candidates(
 
     ``member_facts`` maps an axis to its per-member refusal facts (#797 spec
     4.4, `_lib_stale_proof.MemberFacts` by contributor token). None, or an
-    axis without facts, means every member is eligible.
+    axis without facts, means every member is eligible, in both directions.
+
+    ``refuted_supports`` maps an axis (``"sevenDay"``, ``"fiveHour"``) to the
+    `support_identity` values of the retained supports the current samples
+    refute (#1019/#1014 spec 4.2); they are pruned before the axis is
+    reduced. None, or an axis without an entry, refutes nothing.
     """
     facts = member_facts or {}
+    refuted = refuted_supports or {}
+    if isinstance(drop_consensus_allowed, bool):
+        drop_gate = {"fiveHour": drop_consensus_allowed,
+                     "sevenDay": drop_consensus_allowed}
+    else:
+        drop_gate = {axis: drop_consensus_allowed.get(axis) is True
+                     for axis in ("fiveHour", "sevenDay")}
     active = tuple(
         candidate
         for candidate in candidates
@@ -1391,9 +1593,10 @@ def reduce_candidates(
         tombstones.get("fiveHour"),
         now_epoch,
         scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "fiveHour"),
-        drop_allowed=drop_consensus_allowed,
+        drop_allowed=drop_gate["fiveHour"],
         evidence=axis_evidence(db, "fiveHour"),
         member_facts=facts.get("fiveHour"),
+        refuted_supports=refuted.get("fiveHour"),
     )
     seven = _reduce_axis(
         "sevenDay",
@@ -1403,9 +1606,10 @@ def reduce_candidates(
         tombstones.get("sevenDay"),
         now_epoch,
         scope=None if account_key is None else (PROTOCOL_GENERATION, account_key, "sevenDay"),
-        drop_allowed=drop_consensus_allowed,
+        drop_allowed=drop_gate["sevenDay"],
         evidence=axis_evidence(db, "sevenDay"),
         member_facts=facts.get("sevenDay"),
+        refuted_supports=refuted.get("sevenDay"),
     )
     next_control = ControlState(
         db_projection=db,

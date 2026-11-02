@@ -495,3 +495,76 @@ def test_a_container_hold_never_acknowledges_a_failed_plain_publication(
     assert _message_count(ns, key) == before + 2
     assert ingests == [sorted([str(parent), str(child)])] * 2
     assert handler.frames("tail") == 1
+
+
+# ── #970: archive moves (spec 5.8, A8) ───────────────────────────────────────
+
+@pytest.mark.parametrize("kind,scoped", [
+    ("plain", False), ("plain", True), ("zstd", False)])
+def test_a_move_after_connect_is_observed_once(env, monkeypatch, kind, scoped):
+    """#970 A8: an archive move of a watched contributor is observed (not read
+    as a vanished file), adopted by one targeted ingest, and quiet afterwards.
+    Detects a missed change — a probe that cannot see the archive reads the
+    moved rollout as unstatable and skips it, so the move (and any later
+    append in the archive) is never ingested — and the perpetual loop in
+    which a committed signature without the location re-ingests it on every
+    poll for the life of the stream."""
+    ns, provider, day, _ = env
+    a = day / _name(11, 1)
+    write_rollout(a, conversation_records(3, session_id=SESSION, label="a"))
+    container = _compress(a) if kind == "zstd" else a
+    _sync(ns)
+    _conv(ns)
+    key = _key(ns, a)
+    before = _message_count(ns, key)
+    archive = provider / "archived_sessions"
+
+    def move():
+        archive.mkdir(exist_ok=True)
+        container.rename(archive / container.name)
+
+    handler, ingests = _run_codex_stream(
+        ns, monkeypatch, key, account=_accounts(ns)[0] if scoped else None,
+        actions={2: move})
+    assert ingests == [[str(a)]]
+    assert handler.accounting_ingests == [[str(a)]]
+    assert handler.frames("tail") == (0 if scoped else 1)
+    assert _message_count(ns, key) == before
+
+
+def test_committed_signatures_carry_location(env):
+    """#970 A8: after an archive move is adopted, both committed-signature
+    helpers and the live probe agree on the archived container's
+    location-bearing signature (plain and zstd), and a dated container keeps
+    today's signature. Detects a committed signature that never matches the
+    observation, which re-ingests the rollout on every poll."""
+    ns, provider, day, _ = env
+    rc = sys.modules["_lib_codex_rollout_container"]
+    a, b, c = day / _name(11, 1), day / _name(12, 2), day / _name(13, 3)
+    write_rollout(a, conversation_records(2, session_id=SESSION, label="a"))
+    twin = _compress(a)
+    write_rollout(b, conversation_records(1, session_id=SESSION, label="b"))
+    write_rollout(c, conversation_records(1, session_id=SESSION, label="c"))
+    _sync(ns)
+    _conv(ns)
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    twin.rename(archive / twin.name)
+    b.rename(archive / b.name)
+    _sync(ns)
+    _conv(ns)
+    conv = _conversation_module(ns)
+    conn = ns["open_conversations_db"]()
+    try:
+        every = conv._codex_all_committed_sizes(conn)
+        cached = conv._codex_cached_file_sigs(conn, [str(a), str(b), str(c)])
+        stat_fn, _committed, _settle = conv._codex_watch_probes(conn)
+        for path in (a, b):
+            observed = rc.observe_watch_sig(str(path), archive_dir=archive)
+            assert observed[-1] == "archive"
+            assert every[str(path)] == cached[str(path)] == observed
+            assert stat_fn(str(path)) == observed
+        assert every[str(c)] == cached[str(c)] == stat_fn(str(c)) == (
+            "plain", c.stat().st_size)
+    finally:
+        conn.close()

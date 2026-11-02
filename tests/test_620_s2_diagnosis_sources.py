@@ -1836,3 +1836,174 @@ def test_a_block_extending_past_the_window_says_so(tmp_path, monkeypatch):
              if "2026-08-09T22:00:00Z" in s.subject_key]
     assert early, [s.subject_key for s in facts.subjects]
     assert "block_precedes_window" in early[0].qualifications
+
+
+# --- #1000 T8: the conversations reader inside the exclusion ---------------
+
+import fcntl  # noqa: E402
+import json  # noqa: E402
+import pathlib  # noqa: E402
+
+import _conversation_hold_harness as H  # noqa: E402
+
+
+@pytest.fixture
+def held(tmp_path):
+    harness = H.Harness(tmp_path, H.child_env(tmp_path))
+    yield harness
+    harness.close()
+
+
+_UNAVAILABLE = "conversations store could not be opened read-only: "
+
+
+def test_the_explain_reader_declines_during_the_held_probe_read(
+        tmp_path, held):
+    """Stored-data safety (#1000 T8): the `explain` reader opened
+    conversations.db `mode=ro` with no admission, which creates `-wal` and
+    `-shm` beside a store the probe is reading in place. While the read is
+    held it must decline with STORE_UNAVAILABLE and leave the family
+    byte-identical; once released it opens."""
+    store = pathlib.Path(held.run("create", "create")["path"])
+    hold = held.workdir / "probe-hold"
+    holder = held.start(
+        "holder", "cli", "cache-sync", "--source", "all", "--rebuild",
+        env=dict(held.env,
+                 CCTALLY_TEST_CONVERSATION_PROBE_CLONE_ERRNO="ENOTSUP",
+                 CCTALLY_TEST_CONVERSATION_PROBE_HOLD=str(hold)),
+    )
+
+    outcome = H.held_stage(
+        held, store=store,
+        reached=lambda: pathlib.Path(f"{hold}.reached").exists(),
+        release=lambda: pathlib.Path(f"{hold}.release").write_text("1"),
+        holder=holder, blocking=[], declining=["explain"],
+        start_children=lambda: held.start("explain", "explain"),
+    )
+
+    assert outcome["done"]["explain"] == {
+        "opened": False, "code": "store_unavailable",
+        "message": _UNAVAILABLE + "conversations.db maintenance is in progress",
+    }
+    holder.wait(timeout=H.HOLDER_EXIT_SECONDS)
+    assert held.done("holder")["returncode"] == 0, held.done("holder")
+    assert held.run("explain-2", "explain") == {"opened": True}
+
+
+def test_the_explain_reader_declines_during_the_held_recovery(
+        tmp_path, held):
+    """Stored-data safety (#1000 T8): while recovery holds a confirmed store
+    before quarantining it, the `explain` reader declines with the recovery
+    text rather than open sidecars across the quarantine's renames; after
+    the quarantine and rebuild it opens the new store."""
+    store = pathlib.Path(held.run("create", "create")["path"])
+    H.corrupt_second_page(store)
+    release = held.workdir / "recovery-release"
+    recovery = store.with_name("conversations.db.recovery.json")
+    holder = held.start(
+        "holder", "cli", "cache-sync", "--source", "all", "--rebuild",
+        env=dict(held.env,
+                 CCTALLY_TEST_CONVERSATION_PROBE_CLONE_ERRNO="ENOTSUP",
+                 CCTALLY_TEST_CONVERSATION_RECOVERY_STALL="confirmed",
+                 CCTALLY_TEST_CONVERSATION_RECOVERY_RELEASE=str(release)),
+    )
+
+    def reached() -> bool:
+        try:
+            return json.loads(recovery.read_text()).get("phase") == "confirmed"
+        except (FileNotFoundError, ValueError):
+            return False
+
+    outcome = H.held_stage(
+        held, store=store, reached=reached,
+        release=lambda: release.write_text("1"),
+        holder=holder, blocking=[], declining=["explain"],
+        start_children=lambda: held.start("explain", "explain"),
+    )
+
+    assert outcome["done"]["explain"] == {
+        "opened": False, "code": "store_unavailable",
+        "message": _UNAVAILABLE + "conversations.db recovery is incomplete; "
+        "run `cctally cache-sync --rebuild`",
+    }
+    holder.wait(timeout=H.HOLDER_EXIT_SECONDS)
+    assert held.done("holder")["returncode"] == 0, held.done("holder")
+    assert list((store.parent / "quarantine").glob("conversations.db-*"))
+    assert held.run("explain-2", "explain") == {"opened": True}
+
+
+def _maintenance_free(core) -> bool:
+    with open(core.CONVERSATIONS_LOCK_MAINTENANCE_PATH, "a+") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        return True
+
+
+def test_the_bundle_holds_the_conversations_admission_until_close(
+        tmp_path, monkeypatch):
+    """Machine safety (#1000 T8): the bundle's maintenance-shared admission
+    lives exactly as long as its conversations connection, so a probe or
+    recovery cannot start under an open reader, and `close()` releases it
+    even after a failed query, so a crashed diagnosis cannot wedge every
+    later rebuild."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    conn = ns["open_conversations_db"](attach_cache=False)
+    conn.close()
+    core = ns["_cctally_core"]
+    scope = _scope()
+    bundle = _sources().StoreBundle(scope, _plan(scope))
+    reader = bundle.connection("conversations")
+    assert reader.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    with pytest.raises(sqlite3.OperationalError):
+        reader.execute("SELECT * FROM no_such_table_1000")
+    assert not _maintenance_free(core), "the reader holds no admission"
+    bundle.close()
+    assert _maintenance_free(core), "close() left the admission held"
+
+
+def test_an_absent_conversations_store_is_reported_as_not_present(
+        tmp_path, monkeypatch):
+    """Accuracy (#1000 spec 5.10): with no conversations store the reader
+    reports the existing "not present" cause and creates no store."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    core = ns["_cctally_core"]
+    scope = _scope()
+    bundle = _sources().StoreBundle(scope, _plan(scope))
+    try:
+        with pytest.raises(_sources().EstablishmentFailure) as raised:
+            bundle.connection("conversations")
+    finally:
+        bundle.close()
+    assert raised.value.code == "store_unavailable"
+    assert raised.value.message == "conversations store is not present"
+    assert not pathlib.Path(core.CONVERSATIONS_DB_PATH).exists()
+
+
+def test_an_unopenable_admission_is_reported_as_store_unavailable(
+        tmp_path, monkeypatch):
+    """Diagnostic robustness (#1000 spec 5.10, review finding 8): a
+    maintenance lock file that cannot be opened (an unwritable data folder,
+    here a directory in its place) makes the reader report
+    `store_unavailable`, the cause the explain worker renders, rather than an
+    unexpected error."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    ns["open_conversations_db"](attach_cache=False).close()
+    lock = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_LOCK_MAINTENANCE_PATH)
+    lock.unlink(missing_ok=True)
+    lock.mkdir()
+    scope = _scope()
+    bundle = _sources().StoreBundle(scope, _plan(scope))
+    try:
+        with pytest.raises(_sources().EstablishmentFailure) as raised:
+            bundle.connection("conversations")
+    finally:
+        bundle.close()
+    assert raised.value.code == "store_unavailable"
+    assert raised.value.message.startswith(
+        "conversations store could not be opened read-only: ")

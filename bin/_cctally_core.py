@@ -79,6 +79,7 @@ def _init_paths_from_env() -> None:
     global STATUSLINE_ACCOUNT_BOUND_DIR, LEGACY_SPOOL_BASELINE_PATH
     global ACCOUNT_BOUND_CUTOVER_CACHE_PATH, LEGACY_WRITER_EVIDENCE_PATH
     global STATUSLINE_ACCOUNT_BOUND_V1_DIR, ACCOUNT_BOUND_REVISION_CACHE_PATH
+    global STATUSLINE_ACCOUNT_BOUND_V2_DIR, ACCOUNT_BOUND_REVISION3_CACHE_PATH
     global OAUTH_BACKOFF_MARKER_PATH, OAUTH_BACKOFF_COUNT_PATH
     global UPDATE_STATE_PATH, UPDATE_SUPPRESS_PATH
     global UPDATE_LOCK_PATH, UPDATE_LOG_PATH, UPDATE_LOG_ROTATED_PATH
@@ -202,8 +203,15 @@ def _init_paths_from_env() -> None:
     # `accounts/` tree and `transport.last` join the legacy spool inventory
     # (`_cctally_journal._legacy_spool_paths`), and this binary never writes,
     # prunes or deletes anything under it.
+    #
+    # #1019/#1014 (spec 4.7 C4): revision 3 moves every current coordination
+    # file again, to the v3 root, for the same reason; no v2 state is
+    # imported, the v2 root's `accounts/` tree and `transport.last` join the
+    # legacy spool inventory, and this binary never writes, prunes or deletes
+    # anything under v2 (or v1).
     STATUSLINE_ACCOUNT_BOUND_V1_DIR = APP_DIR / "statusline-account-bound-v1"
-    STATUSLINE_ACCOUNT_BOUND_DIR = APP_DIR / "statusline-account-bound-v2"
+    STATUSLINE_ACCOUNT_BOUND_V2_DIR = APP_DIR / "statusline-account-bound-v2"
+    STATUSLINE_ACCOUNT_BOUND_DIR = APP_DIR / "statusline-account-bound-v3"
     LEGACY_SPOOL_BASELINE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-spool-baseline.json")
     ACCOUNT_BOUND_CUTOVER_CACHE_PATH = (
@@ -212,6 +220,10 @@ def _init_paths_from_env() -> None:
     #: accelerates the lookup and never confers authority.
     ACCOUNT_BOUND_REVISION_CACHE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "revision-coordinate.json")
+    #: The revision-3 boundary's coordinate cache (#1019/#1014), likewise an
+    #: accelerator only.
+    ACCOUNT_BOUND_REVISION3_CACHE_PATH = (
+        STATUSLINE_ACCOUNT_BOUND_DIR / "revision3-coordinate.json")
     LEGACY_WRITER_EVIDENCE_PATH = (
         STATUSLINE_ACCOUNT_BOUND_DIR / "legacy-writer-evidence.json")
     OAUTH_BACKOFF_MARKER_PATH = APP_DIR / "oauth-backoff.until"
@@ -554,7 +566,40 @@ _init_paths_from_env()
 # `baseline_generation`, `pending_generation`, `pending_position`) that the
 # five-hour credit generation (Task 5) writes. Both projections are rebuilt
 # from the journal; the confirmation state stays disposable.
-STATS_INDEX_EPOCH = 1019
+# 1019 -> 1020 (#1019/#1014 spec 4.7 C6): revision 3 of the fence changes the
+# authoritative interpretation once more — after the
+# `account_bound_revision_v3` boundary a Claude-scoped record without
+# `wpx == 3` is excluded — so an index, a derivation-completeness proof or a
+# selector continuation produced under revision 2 is not current. No
+# numbered migration and no accounting column; the rebuild runs under #997's
+# bounded profile.
+# 1020 -> 1021 (#943/#956 spec 4.7): a five-hour credit's exact boundary.
+# `five_hour_credit_confirmation_state` gains `pending_captured_at_utc` (the
+# arming observation's capture second, recorded by both detectors) and the
+# new harvest family `five_hour_credit_boundaries` (`fhcb`, order 29) retains
+# that second beside the credit, whose floored slot stays its identity. Every
+# post-credit read compares against the resolved boundary, so an index
+# materialized under the floored band is not current. No numbered migration;
+# `DERIVATION_FRONTIER_EPOCH` is unchanged.
+# The same epoch also covers #956 class 2 (spec 4.6): every five-hour block
+# creation retains an opening fact in `five_hour_block_openings` (`fhbo`,
+# order 35), whose fold materializes the open block, and open-block end
+# columns come from one capture-order projection.
+# 1021 -> 1022 (#1015 spec 5.1, 5.7): correction-to-fit lineage. New
+# journal-truth projections `claude_weekly_observation_index`,
+# `claude_weekly_correction_history`, `claude_weekly_correction_ops`,
+# `correction_batch_lineage` and `correction_batch_footprint`, the
+# `meter_rate_change_supersessions` table and the NULLABLE
+# `meter_rate_change_events.fit_lineage` column, so an index built without
+# them is not current. No numbered migration; `DERIVATION_FRONTIER_EPOCH` is
+# unchanged.
+# 1022 -> 1023 (#948 spec 6.11): per-axis automatic recovery from the
+# outcome quarantine. `outcome_quarantine_envelope` and
+# `outcome_quarantine_certificates` are replaced by
+# `outcome_quarantine_episodes`, `outcome_quarantine_bounds` and
+# `outcome_quarantine_axis_state`, so an index built without them is not
+# current. No numbered migration; `DERIVATION_FRONTIER_EPOCH` is unchanged.
+STATS_INDEX_EPOCH = 1023
 LEGACY_STATS_HEAD = 13
 
 
@@ -1870,10 +1915,28 @@ def _apply_quota_projection_schema(conn: sqlite3.Connection) -> None:
             detector_input_causes    TEXT,
             composition_provenance   TEXT,
             baseline_withheld_days   INTEGER,
+            fit_lineage              TEXT,
             UNIQUE(provider, account_key, effective_from)
         );
         CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key
             ON meter_rate_change_events(provider, account_key, effective_from);
+
+        -- #1015 epoch 1022 (spec 5.7). `fit_lineage` above is the canonical
+        -- JSON lineage of the fits a transition compared, NULL on a row
+        -- detected before #1015. `meter_rate_change_supersessions` is the
+        -- terminal, idempotent projection of the journalled
+        -- `meter_rate_change_supersession` event: one row per superseded
+        -- transition identity, `corrections` the canonical JSON op ids.
+        CREATE TABLE IF NOT EXISTS meter_rate_change_supersessions (
+            provider          TEXT NOT NULL,
+            account_key       TEXT NOT NULL,
+            effective_from    TEXT NOT NULL,
+            reason            TEXT NOT NULL,
+            corrections       TEXT NOT NULL,
+            superseded_at_utc TEXT NOT NULL,
+            created_at_utc    TEXT NOT NULL,
+            PRIMARY KEY (provider, account_key, effective_from)
+        );
 
         CREATE TABLE IF NOT EXISTS quota_alert_arming (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2747,6 +2810,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
                 baseline_generation     TEXT,
                 pending_generation      TEXT,
                 pending_position        TEXT,
+                pending_captured_at_utc TEXT,
                 PRIMARY KEY (account_key, five_hour_window_key, source)
             )
             """
@@ -2802,6 +2866,78 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             )
             """
         )
+        # #1015 epoch 1022 (spec 5.1): correction-to-fit lineage facts, all
+        # journal-truth projections filled identically by live ingest, the
+        # scratch replays and both apply-only rebuilds.
+        #
+        # `claude_weekly_observation_index`: one row per admitted Claude usage
+        # observation carrying a weekly reading, projected before snapshot
+        # deduplication, the five-hour adjustment, weekly suppression and
+        # credit detection, never pruned. `account_key` is the account live
+        # ingest reads after the cutover-aware legacy normalization;
+        # `captured_at_utc` is canonical full-precision UTC.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_weekly_observation_index (
+                observation_id  TEXT PRIMARY KEY,
+                account_key     TEXT NOT NULL,
+                captured_at_utc TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claude_weekly_observation_index_window "
+            "ON claude_weekly_observation_index (account_key, captured_at_utc)"
+        )
+        # Every decision of every reviewed weekly op (not only the latest),
+        # with the DECODED disposition: a `weekly_axis_retractions` member is
+        # `retract`. Idempotent under the primary key.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_weekly_correction_history (
+                decision_op_id TEXT NOT NULL,
+                observation_id TEXT NOT NULL,
+                disposition    TEXT NOT NULL CHECK(disposition IN ('hold','retract','accept')),
+                PRIMARY KEY (decision_op_id, observation_id)
+            )
+            """
+        )
+        # Where each reviewed op sits in the journal: the END coordinate of
+        # its line, comparable through `journal_coordinate_key`. Scratch
+        # replays never write it.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claude_weekly_correction_ops (
+                decision_op_id TEXT PRIMARY KEY,
+                op_segment     TEXT NOT NULL,
+                op_offset      INTEGER NOT NULL
+            )
+            """
+        )
+        # Completed correction batches (a row means completed), at the END
+        # coordinate of the commit marker, and the `(provider, account_key)`
+        # pairs each one touched (`_lib_quota_lineage.batch_footprint`); an
+        # empty batch has no footprint rows, `('*', '*')` only when ownership
+        # is genuinely unknowable. Owned by lineage, never by the selector.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS correction_batch_lineage (
+                batch_id       TEXT PRIMARY KEY,
+                commit_segment TEXT NOT NULL,
+                commit_offset  INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS correction_batch_footprint (
+                batch_id    TEXT NOT NULL,
+                provider    TEXT NOT NULL,
+                account_key TEXT NOT NULL,
+                PRIMARY KEY (batch_id, provider, account_key)
+            )
+            """
+        )
         _backfill_week_reset_events(conn)
 
         # ── five_hour_reset_events (Anthropic-issued in-place 5h credits) ──
@@ -2844,6 +2980,64 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         add_column_if_missing(
             conn, "five_hour_reset_events", "account_key",
             "TEXT NOT NULL DEFAULT 'unattributed'")
+
+        # ── five_hour_credit_boundaries (#943 spec 4.2.2, epoch 1021) ──
+        # The exact boundary of one five-hour credit: the arming
+        # observation's capture second. A companion of the credit keyed by
+        # its natural key (`effective_reset_at_utc` is the credit's floored
+        # slot, a link without a formal FK) and bound to its content through
+        # `credit_revision`; the boundary resolver
+        # (`_cctally_record.resolve_five_hour_reset_event`) uses it only when
+        # that revision matches the credit row's. Harvested as
+        # `five_hour_credit_boundary` (`fhcb`, order 29), before its credit.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_credit_boundaries (
+                id                     INTEGER PRIMARY KEY,
+                account_key            TEXT    NOT NULL,
+                five_hour_window_key   INTEGER NOT NULL,
+                effective_reset_at_utc TEXT    NOT NULL,
+                boundary_at_utc        TEXT    NOT NULL,
+                arming_observation_id  TEXT    NOT NULL,
+                credit_revision        TEXT    NOT NULL,
+                detected_at_utc        TEXT    NOT NULL,
+                journal_id             TEXT,
+                UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
+            )
+            """
+        )
+
+        # ── five_hour_block_openings (#956 spec 4.6.1, epoch 1021) ──
+        # The opening fact of one five-hour block: the values the creating
+        # upsert wrote (start columns, the fold-effective opening five-hour and
+        # weekly readings with their held provenance, `created_at_utc` as
+        # written) and the journal id of the observation or op that created
+        # it. One row per block, inserted only by the live writer at creation
+        # (`_cctally_record.maybe_update_five_hour_block`) and immutable.
+        # Harvested as `five_hour_block_open` (`fhbo`, order 35); its fold
+        # materializes the open block, so an apply-only replay reproduces a
+        # block no surviving snapshot names.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS five_hour_block_openings (
+                id                            INTEGER PRIMARY KEY,
+                account_key                   TEXT    NOT NULL,
+                five_hour_window_key          INTEGER NOT NULL,
+                five_hour_resets_at           TEXT    NOT NULL,
+                block_start_at                TEXT    NOT NULL,
+                first_observed_at_utc         TEXT    NOT NULL,
+                created_at_utc                TEXT    NOT NULL,
+                opening_record_id             TEXT    NOT NULL,
+                creation_kind                 TEXT    NOT NULL,
+                five_hour_percent             REAL    NOT NULL,
+                seven_day_pct_at_block_start  REAL,
+                weekly_observation_held       INTEGER NOT NULL DEFAULT 0,
+                weekly_basis_captured_at_utc  TEXT,
+                journal_id                    TEXT,
+                UNIQUE(account_key, five_hour_window_key)
+            )
+            """
+        )
 
         # ── five_hour_blocks (rollup, one row per API-anchored 5h block) ──
         conn.execute(
@@ -3312,6 +3506,7 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "five_hour_reset_events", "five_hour_blocks", "weekly_credit_floors",
             "percent_milestones", "five_hour_milestones", "budget_milestones",
             "projected_milestones", "project_budget_milestones",
+            "five_hour_credit_boundaries", "five_hour_block_openings",
         ):
             add_column_if_missing(conn, _jtable, "journal_id", "TEXT")
             conn.execute(
@@ -3323,13 +3518,14 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
         # inserted this cycle (`WHERE journal_id IS NULL`). A partial index over
         # exactly those un-stamped rows keeps that scan O(this-cycle inserts), not
         # O(table) — at the 10x envelope the stamped rows are ~all of the table, so
-        # a full scan would be pathological. Only the 8 HARVEST families need it
+        # a full scan would be pathological. Only the 10 HARVEST families need it
         # (the Model-A / op-fold tables — weekly_usage_snapshots, weekly_cost_
         # snapshots, weekly_credit_floors — are never harvest-scanned).
         for _htable in (
             "week_reset_events", "five_hour_reset_events", "five_hour_blocks",
             "percent_milestones", "five_hour_milestones", "budget_milestones",
             "projected_milestones", "project_budget_milestones",
+            "five_hour_credit_boundaries", "five_hour_block_openings",
         ):
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{_htable}_journal_id_null "
@@ -3531,18 +3727,45 @@ def open_db(*, _target_path=None) -> sqlite3.Connection:
             "reason TEXT NOT NULL, "
             "at TEXT)"
         )
+        # #948 epoch 1023 (spec 6.11): the per-axis recovery barrier replaces
+        # the envelope and the certificates. Incomplete-inventory episodes by
+        # the coordinate of their opener; the per-scope, per-axis bounds
+        # summaries (plus the generation's cohort and expiry under scope "*",
+        # axis "meta", and each account's latest control witness under axis
+        # "control"); and each (generation, account, axis)'s recovery state.
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS outcome_quarantine_envelope ("
-            "scope TEXT PRIMARY KEY, "
-            "envelope_json TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_episodes ("
+            "opener_segment TEXT, "
+            "opener_offset INTEGER, "
+            "opened_at TEXT, "
+            "closer_segment TEXT, "
+            "closer_offset INTEGER, "
+            "closed_at TEXT, "
+            "PRIMARY KEY (opener_segment, opener_offset))"
         )
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS outcome_quarantine_certificates ("
-            "account_key TEXT PRIMARY KEY, "
-            "accounting_certificate_json TEXT, "
-            "accounting_trigger_seq INTEGER, "
-            "control_certificate_json TEXT, "
-            "control_trigger_seq INTEGER)"
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_bounds ("
+            "scope TEXT NOT NULL, "
+            "axis TEXT NOT NULL, "
+            "bounds_json TEXT NOT NULL, "
+            "PRIMARY KEY (scope, axis))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outcome_quarantine_axis_state ("
+            "generation INTEGER NOT NULL, "
+            "account_key TEXT NOT NULL, "
+            "axis TEXT NOT NULL, "
+            "state TEXT NOT NULL, "
+            "waiting_for TEXT, "
+            "coverage_id TEXT, "
+            "witness_id TEXT, "
+            "release_id TEXT, "
+            "revocation TEXT, "
+            "since TEXT, "
+            "recovered_at TEXT, "
+            "not_before INTEGER, "
+            "witness_key TEXT, "
+            "PRIMARY KEY (generation, account_key, axis))"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS journal_selector_batches ("

@@ -10,6 +10,7 @@ for the full design.
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 import re
 import sys
@@ -88,6 +89,12 @@ class StatuslineInput:
     rate_limits_7d_pct: Optional[float] = None
     rate_limits_7d_resets_at: Optional[int] = None  # unix epoch
     raw: dict = field(default_factory=dict)  # full parsed JSON for diagnostics
+    # #1002. Claude Code's own `context_window`, already validated (see
+    # `_to_count`): the session's window and the last request's input-side
+    # token sum (input + cache_read + cache_creation). `None` when absent or
+    # malformed; the `context_pct` port then falls back per value.
+    context_window_size: Optional[int] = None
+    context_tokens: Optional[int] = None
 
 
 # ---- CLI args (post-config-resolution) -------------------------------------
@@ -143,8 +150,13 @@ class StatuslineInjections:
         [],
         "Optional[tuple[Optional[float], Optional[int], Optional[float], Optional[int]]]",
     ]
-    # transcript_path → context % (0.0..100.0) or None if unreadable/unknown.
-    context_pct: Callable[[Optional[str], Optional[str]], Optional[float]]
+    # (transcript_path, model_id, window_size, context_tokens) → context %
+    # or None if unavailable. The two payload values win when not None; the
+    # port falls back to the model table / transcript tail independently.
+    context_pct: Callable[
+        [Optional[str], Optional[str], Optional[int], Optional[int]],
+        Optional[float],
+    ]
     # Emits one-shot stderr warnings (deduped by message — caller maintains set).
     warn_once: Callable[[str], None]
     # #661 S2 §9. The stored metering regimes for this install, oldest
@@ -230,6 +242,13 @@ def parse_statusline_stdin(raw: "bytes | str") -> "StatuslineInput | ParseError"
     def _to_str(v) -> Optional[str]:
         return v if isinstance(v, str) and v else None
 
+    context_window = parsed.get("context_window")
+    if not isinstance(context_window, dict):
+        context_window = {}
+    window_size = _to_count(context_window.get("context_window_size"))
+    if window_size is not None and window_size <= 0:
+        window_size = None
+
     return StatuslineInput(
         session_id=_to_str(parsed.get("session_id")),
         model_id=_to_str(_get(parsed, "model", "id")),
@@ -250,7 +269,54 @@ def parse_statusline_stdin(raw: "bytes | str") -> "StatuslineInput | ParseError"
             _get(parsed, "rate_limits", "seven_day", "resets_at")
         ),
         raw=parsed,
+        context_window_size=window_size,
+        context_tokens=_context_tokens(context_window.get("current_usage")),
     )
+
+
+# The input-side `current_usage` fields that occupy the context window.
+# `output_tokens` is deliberately excluded (#1002 spec §5.1).
+_CONTEXT_USAGE_FIELDS = (
+    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+)
+
+
+def _to_count(v) -> Optional[int]:
+    """A token count: a finite, integer-valued, non-negative JSON number.
+
+    Never a bool (an int subclass) or a string; an integral float such as
+    ``1000000.0`` normalizes to ``int``. Anything else → ``None``.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float):
+        if not math.isfinite(v) or not v.is_integer():
+            return None
+        v = int(v)
+    return v if v >= 0 else None
+
+
+def _context_tokens(usage) -> Optional[int]:
+    """Sum of the input-side ``current_usage`` fields, or ``None``.
+
+    A missing or null field contributes zero, but at least one must be
+    present and non-null; an explicit zero is a valid observation. Any
+    invalid present field voids the whole sum rather than being skipped.
+    """
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    observed = False
+    for key in _CONTEXT_USAGE_FIELDS:
+        value = usage.get(key)
+        if value is None:
+            continue
+        count = _to_count(value)
+        if count is None:
+            return None
+        total += count
+        observed = True
+    return total if observed else None
 
 
 # ---- Segment 1: model -----------------------------------------------------
@@ -407,7 +473,10 @@ def resolve_context_pct(
     this function only returns the plain `🧠 X%` form. ``render_statusline``
     wraps the result in ANSI color codes per ``args.color``.
     """
-    pct = inj.context_pct(inp.transcript_path, inp.model_id)
+    pct = inj.context_pct(
+        inp.transcript_path, inp.model_id,
+        inp.context_window_size, inp.context_tokens,
+    )
     if pct is None:
         return "🧠 N/A"
     return f"🧠 {int(round(pct))}%"

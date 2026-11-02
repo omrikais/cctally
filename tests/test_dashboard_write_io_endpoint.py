@@ -103,6 +103,12 @@ def test_debug_backend_publishes_the_golden_write_io(monkeypatch, tmp_path):
         payload = json.loads(body)
         assert status == 200 and payload["schemaVersion"] == 1
         assert payload["writeIo"] == _golden()
+        # #939 D5: the conversation records' monotonic clock, anchored to wall
+        # time in the same response, so a harness can place its own wall-clock
+        # judgements before or after a pass without a field per record.
+        clock = payload["tick"]["conversation_sync_clock"]
+        assert set(clock) == {"monotonic_ns", "unix_ns"}
+        assert all(isinstance(v, int) and v > 0 for v in clock.values())
     finally:
         wio.reset_for_tests()
         stop(srv, srv._test_thread)

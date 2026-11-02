@@ -1522,5 +1522,552 @@ def test_the_budget_key_is_settable_and_unsettable(root):
         cfg.CODEX_HOOK_INGEST_BUDGET_DEFAULT_SECONDS)
 
 
+# ── #980 F3: the canonical-anchor seed read is bounded by the walk deadline ──
+
+#: The anchor resolver's group seed (`_components_for`): one statement over the
+#: whole weekly group, measured 9.71-10.74 s on a cold production-shaped copy.
+_ANCHOR_SEED_READ = "SELECT source_path, line_offset, id, resets_at_utc"
+_ANCHOR_RESET = dt.datetime(2026, 7, 27, tzinfo=dt.timezone.utc)
+_ANCHOR_GROUP_ROWS = 1_600
+
+
+def _quota_event(minute: int, reset: dt.datetime) -> dict:
+    return {
+        "timestamp": f"2026-07-20T11:{minute:02d}:00.000Z",
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"rate_limits": {
+            "limit_id": "codex", "limit_name": None, "plan_type": "pro",
+            "primary": {"used_percent": 10.0 + minute, "window_minutes": 10080,
+                        "resets_at": int(reset.timestamp())},
+        }}}}
+
+
+def _large_anchor_group(ns, rollout) -> int:
+    """One real quota observation ingested unbudgeted, its weekly group grown
+    to ``_ANCHOR_GROUP_ROWS`` rows (clones at later offsets of the same
+    rollout, so they are retained history rather than prune orphans), then a
+    new observation 30 s later appended. Returns the committed offset."""
+    records = _records(1)
+    records.append(_quota_event(0, _ANCHOR_RESET))
+    _write_rollout(rollout, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        conn.row_factory = sqlite3.Row
+        (original,) = conn.execute(
+            "SELECT * FROM quota_window_snapshots WHERE source='codex'"
+        ).fetchall()
+        conn.row_factory = None
+        columns = [c for c in original.keys() if c != "id"]
+        clones = []
+        for index in range(_ANCHOR_GROUP_ROWS - 1):
+            row = dict(original)
+            row["line_offset"] = 10_000_000 + index
+            clones.append(tuple(row[c] for c in columns))
+        conn.executemany(
+            f"INSERT INTO quota_window_snapshots ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})", clones)
+        conn.commit()
+        offset = int(conn.execute(
+            "SELECT last_byte_offset FROM codex_session_files").fetchone()[0])
+    finally:
+        conn.close()
+    records.append(_quota_event(1, _ANCHOR_RESET + dt.timedelta(seconds=30)))
+    _write_rollout(rollout, records)
+    return offset
+
+
+def _new_observation_anchor(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute(
+            "SELECT canonical_resets_at_utc FROM quota_window_snapshots "
+            "WHERE source='codex' AND line_offset < 10000000 "
+            "ORDER BY line_offset DESC LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("schedule", ["read_overruns", "slice_overruns"])
+def test_the_anchor_seed_read_is_bounded_by_the_walk_deadline(
+        root, monkeypatch, schedule):
+    """Detects the measured 10.67-10.74 s nested hook: on the first appended
+    hook after a cold page cache the canonical-anchor group seed read ran to
+    completion past the 5 s budget, because nothing bounded it.
+
+    ``read_overruns``: the seed SELECT itself takes "10 s" (the walk clock
+    reads 10.0 from the moment it starts); a real SQLite progress-handler
+    interrupt must stop it. ``slice_overruns``: the SELECT finishes in time and
+    the deadline passes while its rows are folded; the 500-row check must stop
+    within one slice. Either way the budgeted call ends as budget exhaustion
+    before the file committed (offsets unchanged, backlog, not certified),
+    never as the silent per-sync-anchor degrade (`_seed_failed`), and a later
+    call stores the anchor an unbudgeted control stores."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    import _lib_quota
+    committed = _large_anchor_group(ns, rollout)
+    # The deferred file is owed to the executor (#980 F4); never spawn it.
+    monkeypatch.setattr(cc, "_request_codex_drain_worker",
+                        lambda command: "throttled")
+
+    resolvers: list = []
+    seen_txn: list = []
+
+    class _Spy(cc.CodexResetAnchorResolver):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            resolvers.append(self)
+
+        def _components_for(self, group, logical_limit_key):
+            seen_txn.append(self._conn.in_transaction)
+            try:
+                return super()._components_for(group, logical_limit_key)
+            finally:
+                seen_txn.append(self._conn.in_transaction)
+
+    monkeypatch.setattr(cc, "CodexResetAnchorResolver", _Spy)
+    state = {"late": False, "folded": 0}
+    real_add = _lib_quota.ResetAnchorComponents.add
+
+    def add(self, *args, **kwargs):
+        state["folded"] += 1
+        if schedule == "slice_overruns":
+            state["late"] = True
+        return real_add(self, *args, **kwargs)
+
+    monkeypatch.setattr(_lib_quota.ResetAnchorComponents, "add", add)
+    monkeypatch.setattr(cc, "_walk_clock",
+                        lambda: 10.0 if state["late"] else 0.0)
+    conn = ns["open_cache_db"]()
+    try:
+        if schedule == "read_overruns":
+            def trace(sql):
+                if _ANCHOR_SEED_READ in sql:
+                    state["late"] = True
+            conn.set_trace_callback(trace)
+        stats = ns["sync_codex_cache"](conn, budget_seconds=5.0)
+        conn.set_trace_callback(None)
+    finally:
+        conn.close()
+    assert resolvers, "non-vacuity: the walk resolved an anchor"
+    assert state["late"], "non-vacuity: the deadline passed inside the seed"
+    if schedule == "read_overruns":
+        assert state["folded"] == 0, "the seed read ran to completion"
+    else:
+        assert state["folded"] <= 500, (
+            f"{state['folded']} rows folded past the deadline (one slice is "
+            f"500 of {_ANCHOR_GROUP_ROWS})")
+    assert stats.budget_exhausted is True
+    assert stats.backlog_files >= 1
+    assert stats.walk_certified is False
+    assert resolvers[-1]._seed_failed is False, (
+        "the interrupt degraded to per-sync anchors")
+    assert resolvers[-1]._groups == {}, "a partially read group was cached"
+    assert len(set(seen_txn)) == 1, "the interrupted read changed the txn"
+    assert int(_file_row(ns)["last_byte_offset"]) == committed
+
+    monkeypatch.setattr(cc, "_walk_clock", lambda: 0.0)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    assert int(_file_row(ns)["last_byte_offset"]) > committed
+    # The unbudgeted control: the observation 30 s later joins the group's
+    # established anchor (a per-sync degrade would mint its own instead).
+    assert _new_observation_anchor(ns) == "2026-07-27T00:00:00Z"
+
+
+
+def _catch_up_state(ns) -> dict:
+    """What a catch-up must converge to: the rollout's cursor, its accounting
+    totals and every real observation's canonical anchor."""
+    conn = ns["open_cache_db"]()
+    try:
+        file_row = conn.execute(
+            "SELECT last_byte_offset, size_bytes FROM codex_session_files"
+        ).fetchone()
+        totals = conn.execute(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(cached_input_tokens), "
+            "SUM(output_tokens), SUM(total_tokens) FROM codex_session_entries"
+        ).fetchone()
+        anchors = conn.execute(
+            "SELECT line_offset, resets_at_utc, canonical_resets_at_utc "
+            "FROM quota_window_snapshots WHERE source='codex' "
+            "AND line_offset < 10000000 ORDER BY line_offset").fetchall()
+    finally:
+        conn.close()
+    return {"file": tuple(file_row), "totals": tuple(totals),
+            "anchors": [tuple(row) for row in anchors]}
+
+
+def test_a_repeated_seed_deadline_is_caught_up_by_the_executor(
+        root, tmp_path, monkeypatch):
+    """Detects hook-only ingestion stranded behind the bounded anchor seed
+    (#980 F4): measured on a production-shaped copy, three consecutive
+    appended hooks each hit the walk deadline inside the cold group seed,
+    logged success with a backlog, committed nothing and spawned nothing; the
+    file only committed when page-cache warming happened to win. Under
+    memory pressure it need not converge at all.
+
+    Every budgeted call here overruns inside the seed (the cache never warms).
+    The first one must record the deferred file as owed catch-up and request
+    the executor; the executor -- run in process, no manual unbudgeted sync --
+    must ingest it to exactly the state an unbudgeted control reaches, clear
+    the catch-up only on success (a yield and a failure leave it owed), and a
+    later budgeted call must then certify."""
+    ns, provider_root, rollout = root
+    import _cctally_cache as cc
+    committed = _large_anchor_group(ns, rollout)
+    deferred = _file_row(ns)["path"]
+    requested: list[str] = []
+    monkeypatch.setattr(cc, "_request_codex_drain_worker",
+                        lambda command: requested.append(command) or "x")
+    state = {"late": False}
+    monkeypatch.setattr(cc, "_walk_clock",
+                        lambda: 10.0 if state["late"] else 0.0)
+
+    def overrun(sql):
+        if _ANCHOR_SEED_READ in sql:
+            state["late"] = True
+
+    for attempt in range(3):
+        state["late"] = False
+        requested.clear()
+        conn = ns["open_cache_db"]()
+        try:
+            conn.set_trace_callback(overrun)
+            stats = ns["sync_codex_cache"](conn, budget_seconds=5.0)
+            conn.set_trace_callback(None)
+        finally:
+            conn.close()
+        assert state["late"], "non-vacuity: the deadline passed in the seed"
+        assert stats.budget_exhausted is True
+        assert stats.walk_certified is False
+        assert int(_file_row(ns)["last_byte_offset"]) == committed
+        assert cc.CODEX_PRUNE_DRAIN_COMMAND in requested, (
+            f"budgeted call {attempt + 1} requested no executor: {requested}")
+        conn = ns["open_cache_db"]()
+        try:
+            whole_tree, owed = cc.load_codex_owed_catch_up(conn)
+        finally:
+            conn.close()
+        assert (whole_tree, owed) == (False, (deferred,)), owed
+
+    def owed_now():
+        conn = ns["open_cache_db"]()
+        try:
+            return cc.load_codex_owed_catch_up(conn)
+        finally:
+            conn.close()
+
+    # The executor ignores the walk clock: its catch-up is unbudgeted.
+    state["late"] = True
+    monkeypatch.setattr(cc, "_walk_clock", lambda: 10.0)
+    # A yield (a contended hook's waiting request) leaves the catch-up owed.
+    import _lib_codex_drain_admission as adm
+    app_dir = ns["_cctally_core"].APP_DIR
+    assert adm.publish_waiting_request(app_dir, root_keys=["any"])
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    for request in (app_dir / adm.REQUEST_DIR_NAME).glob("req-*.json"):
+        request.unlink()
+    assert result.yielded >= 1
+    assert owed_now() == (False, (deferred,))
+    assert int(_file_row(ns)["last_byte_offset"]) == committed
+    # A failure inside the catch-up leaves it owed too.
+    real_components = cc.CodexResetAnchorResolver._components_for
+
+    broken_calls: list[int] = []
+
+    def broken(self, *args, **kwargs):
+        broken_calls.append(1)
+        raise RuntimeError("seed failed")
+
+    monkeypatch.setattr(cc.CodexResetAnchorResolver, "_components_for",
+                        broken)
+    try:
+        cc.run_codex_prune_drain(wait_for_requests=False)
+    except RuntimeError:
+        pass
+    assert broken_calls, "non-vacuity: the catch-up reached the seed"
+    monkeypatch.setattr(cc.CodexResetAnchorResolver, "_components_for",
+                        real_components)
+    assert owed_now() == (False, (deferred,))
+    assert int(_file_row(ns)["last_byte_offset"]) == committed
+
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert result.owed_units >= 1 and result.yielded == 0
+    assert owed_now() == (False, ())
+    caught_up = _catch_up_state(ns)
+    assert caught_up["file"][0] > committed
+
+    # The next budgeted call (warm) certifies and owes nothing.
+    monkeypatch.setattr(cc, "_walk_clock", lambda: 0.0)
+    requested.clear()
+    conn = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](conn, budget_seconds=5.0)
+    finally:
+        conn.close()
+    assert stats.walk_certified is True
+    assert stats.budget_exhausted is False and stats.backlog_files == 0
+    assert owed_now() == (False, ())
+    assert _catch_up_state(ns) == caught_up
+
+    # The unbudgeted control on a fresh store over the same rollout bytes.
+    redirect_paths(ns, monkeypatch, tmp_path / "control-data")
+    _large_anchor_group(ns, rollout)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    control = _catch_up_state(ns)
+    assert caught_up == control
+    assert control["anchors"][-1][2] == "2026-07-27T00:00:00Z"
+
+
+
+# ── #980/#981 fix round 3: liveness of owed work ───────────────────────────
+
+def _capture_drain_requests(monkeypatch, cc) -> list:
+    requested: list = []
+    monkeypatch.setattr(cc, "_request_codex_drain_worker",
+                        lambda command: requested.append(command) or "x")
+    return requested
+
+
+def _budgeted_sync(ns):
+    conn = ns["open_cache_db"]()
+    try:
+        return ns["sync_codex_cache"](conn, budget_seconds=5.0)
+    finally:
+        conn.close()
+
+
+def _debt(ns):
+    import _cctally_cache as cc
+    conn = ns["open_cache_db"]()
+    try:
+        return cc.load_codex_finalization_debt(conn)
+    finally:
+        conn.close()
+
+
+def _owed_catch_up(ns):
+    import _cctally_cache as cc
+    conn = ns["open_cache_db"]()
+    try:
+        return cc.load_codex_owed_catch_up(conn)
+    finally:
+        conn.close()
+
+
+def test_a_cancelled_standing_reconcile_is_owed_and_reaches_the_executor(
+        root, monkeypatch):
+    """Detects (#980, review R1): a budgeted call's standing attribution
+    reconciliation ran with nothing owed, reached the deadline, and was
+    cancelled without persisting anything -- its strike landed on otherwise
+    empty debt and was deleted with it, no executor was requested, yet
+    ``finalization_deferred`` withheld ``full_walk_complete``. A store with
+    `account attribute` records whose reconcile exceeds the post-walk
+    remainder then deferred every per-account ladder on every hook, forever,
+    on a hook-only install that never runs the reconcile unbudgeted.
+
+    The cancellation must leave ``attribution`` owed with the strike on it,
+    request the executor, stop being attempted by budgeted calls at the
+    strike limit, and the executor must settle it so a later budgeted call
+    certifies."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    _write_rollout(rollout, _records(3))
+    jr.append_records([jl.make_codex_window_attribution(
+        "2026-07-20T10:30:00Z", account_key="a" * 32,
+        source_root_key="rk-synthetic", logical_limit_key="limit-weekly",
+        observed_slot="primary", window_minutes=10080,
+        raw_resets_at_utc=["2026-07-27T00:00:00Z"],
+        canonical_resets_at_utc="2026-07-27T00:00:00Z")])
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM codex_window_attributions").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert _debt(ns).empty, "nothing is owed before the budgeted call"
+
+    requested = _capture_drain_requests(monkeypatch, cc)
+    state = {"late": False, "expire": True, "calls": 0}
+    monkeypatch.setattr(cc, "_walk_clock",
+                        lambda: 100.0 if state["late"] else 0.0)
+    real_reconcile = cc.reconcile_codex_window_attribution_spend
+
+    def expiring_reconcile(conn, *args, **kwargs):
+        state["calls"] += 1
+        state["late"] = state["expire"]
+        try:
+            return real_reconcile(conn, *args, **kwargs)
+        finally:
+            state["late"] = False
+
+    monkeypatch.setattr(cc, "reconcile_codex_window_attribution_spend",
+                        expiring_reconcile)
+    for strike in (1, 2):
+        requested.clear()
+        stats = _budgeted_sync(ns)
+        assert state["calls"] == strike, "non-vacuity: the reconcile ran"
+        assert stats.walk_certified is True
+        assert stats.finalization_deferred is True
+        assert stats.full_walk_complete is False
+        debt = _debt(ns)
+        assert debt.attribution is True, "the cancelled reconcile is not owed"
+        assert debt.strikes == strike
+        assert cc.CODEX_PRUNE_DRAIN_COMMAND in requested, requested
+    # At the strike limit a budgeted call no longer attempts it.
+    stats = _budgeted_sync(ns)
+    assert state["calls"] == 2, "a struck reconcile was attempted again"
+    assert stats.full_walk_complete is False
+    assert _debt(ns).attribution is True
+
+    state["expire"] = False
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert result.finalization_units >= 1
+    assert _debt(ns).empty
+    stats = _budgeted_sync(ns)
+    assert stats.full_walk_complete is True
+    assert _debt(ns).empty
+
+
+def test_a_catch_up_recorded_between_the_executor_reads_is_dispatched(
+        root, monkeypatch):
+    """Detects (#981, review R2): the executor's admitted re-read returned
+    ``ingest_catch_up`` (a hook recorded a catch-up after the unlocked read),
+    and ``_run_codex_executor_unit`` raised "unknown executor unit" -- caught
+    in the detached worker, but a traceback out of the inline drain of an
+    explicit `cctally cache-sync`."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    _write_rollout(rollout, _records(3))
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+        path = conn.execute(
+            "SELECT path FROM codex_session_files").fetchone()[0]
+        cc.record_codex_owed_maintenance(conn, wal_truncate=True)
+        conn.commit()
+    finally:
+        conn.close()
+    real_next = cc._codex_executor_next_unit
+    reads = {"n": 0}
+
+    def interleaved(conn, blocked):
+        reads["n"] += 1
+        if reads["n"] == 2:
+            # Between the unlocked read and the admitted re-read, a hook
+            # records a catch-up on its own connection.
+            other = ns["open_cache_db"]()
+            try:
+                cc.record_codex_owed_maintenance(other, catch_up_paths=[path])
+                other.commit()
+            finally:
+                other.close()
+        return real_next(conn, blocked)
+
+    monkeypatch.setattr(cc, "_codex_executor_next_unit", interleaved)
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert reads["n"] >= 3, "non-vacuity: the admitted re-read happened"
+    assert result.owed_units >= 2
+    conn = ns["open_cache_db"]()
+    try:
+        assert cc.load_codex_owed_catch_up(conn) == (False, ())
+        assert not any(cc.load_codex_owed_maintenance(conn).values())
+    finally:
+        conn.close()
+
+
+def test_a_refused_identity_probe_overrun_owes_a_whole_tree_catch_up(
+        root, monkeypatch):
+    """Detects (#927, review R3): a budgeted walk whose refused-identity probe
+    ran past the deadline deferred with ``inventory_pending`` though the
+    inventory was ready, and handed nothing off: with many refused identities
+    and a cold page cache every hook deferred its whole walk and only page
+    warming could converge. The overrun must owe a whole-tree catch-up and
+    request the executor, whose unbudgeted sync converges so the next
+    budgeted call certifies."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    records = _records(2)
+    _write_rollout(rollout, records)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    committed = int(_file_row(ns)["last_byte_offset"])
+    _write_rollout(rollout, _records(5))
+    requested = _capture_drain_requests(monkeypatch, cc)
+    real_plan = cc._plan_ordinary_codex_prune
+    overruns: list = []
+
+    def plan(conn, *args, deadline=None, **kwargs):
+        if deadline is not None and not overruns:
+            overruns.append(deadline)
+            raise cc._CodexInventoryProbeDeadline()
+        return real_plan(conn, *args, deadline=deadline, **kwargs)
+
+    monkeypatch.setattr(cc, "_plan_ordinary_codex_prune", plan)
+    stats = _budgeted_sync(ns)
+    assert overruns, "non-vacuity: the probe overran in the budgeted walk"
+    assert stats.deferred_reason == "inventory_pending"
+    assert int(_file_row(ns)["last_byte_offset"]) == committed
+    assert _owed_catch_up(ns) == (True, ())
+    assert cc.CODEX_PRUNE_DRAIN_COMMAND in requested, requested
+
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert result.owed_units >= 1
+    assert _owed_catch_up(ns) == (False, ())
+    assert int(_file_row(ns)["last_byte_offset"]) > committed
+    stats = _budgeted_sync(ns)
+    assert stats.deferred_reason is None
+    assert stats.walk_certified is True and stats.full_walk_complete is True
+
+
+def test_an_unexpected_pin_failure_still_releases_the_writer_flocks(
+        root, monkeypatch):
+    """Detects (#981, review R4): ``pin`` caught only ``sqlite3.Error`` and
+    ``OSError``; any other exception escaped the sync's ``finally`` before
+    the cache writer flocks were released, holding them -- and so every
+    other writer's sync -- until the process exited."""
+    ns, _provider_root, rollout = root
+    import _cctally_cache as cc
+    import _cctally_core as core
+    from _lib_cache_writer_lock import (acquire_cache_writer_flocks,
+                                        release_cache_writer_flocks)
+    _write_rollout(rollout, _records(3))
+    _capture_drain_requests(monkeypatch, cc)
+
+    def broken_connect(_db_path):
+        raise RuntimeError("unexpected pin failure")
+
+    monkeypatch.setattr(cc, "_hook_snapshot_connect", broken_connect)
+    with cc.hook_codex_read_policy() as policy:
+        conn = ns["open_cache_db"]()
+        try:
+            with pytest.raises(RuntimeError):
+                ns["sync_codex_cache"](conn, budget_seconds=5.0)
+        finally:
+            conn.close()
+        assert policy.eligible is False and policy.account_eligible is False
+        assert policy.reason == "cache_unavailable"
+        assert policy.snapshot is None
+        held = acquire_cache_writer_flocks(
+            core.CACHE_LOCK_PATH, core.CACHE_LOCK_CODEX_PATH)
+        assert held is not None, "the writer flocks were leaked"
+        release_cache_writer_flocks(held)
+
+
 if __name__ == "__main__":  # pragma: no cover - convenience
     raise SystemExit(pytest.main([__file__, "-v"]))

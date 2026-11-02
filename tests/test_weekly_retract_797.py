@@ -994,16 +994,38 @@ def test_a_store_stuck_on_an_empty_decision_recovers_by_a_fresh_manifest(
     """D4, detects a store an earlier binary left stuck staying stuck: the
     empty decision was applied without its batch and a reading followed, so
     the plain rederive refuses; a fresh reviewed manifest (the conflict's own
-    remedy) then writes its empty batch, and the plain rederive works."""
+    remedy) then writes its empty batch, and the plain rederive works.
+
+    #1015 spec 7 (A10, R1-P1-2), detects a recovered store whose forecast
+    never calibrates again: a fit made while the store was stuck stays
+    clean across the recovery's empty batch, and through a qualifying refit
+    and a rebuild the forecast is calibrated from the new fit. Every sweep
+    is the production `sweep_account` over a real `load_population`; only
+    the analyses are constructed."""
+    import test_derived_consumers_retract_797 as D
+    import _cctally_quota_model as qmg
+    qm = qmg.qm
     app = _app(monkeypatch, tmp_path)
+    account = T.identity("A")
+    D._seed_entries(app, account)
     decisions, _op_id = _empty_decision_without_batch(
         app, monkeypatch, tmp_path, capsys)
     _record(app, monkeypatch, LATER)
     rc, refused = _rederive(app, capsys)
     assert rc == 2 and _UNFINISHED in refused["conflicts"][0], refused
+    D._sweep(account, D._analysis(fitted=D._evidence(qm, D.X_OLD)))
+    assert D._forecast(account) == D._expected_forecast(D.X_OLD)
     _p, fresh = _apply(app, capsys,
                        _manifest(tmp_path, decisions, name="fresh.json"))
     _assert_empty_batch(_after_op(fresh["reviewedWeeklyDecisionId"]))
+    # #1015: the fresh manifest's empty batch is completed and touches no
+    # account, so it can invalidate no fit; its op is ordered by coordinate.
+    fresh_op = fresh["reviewedWeeklyDecisionId"]
+    [empty] = _batches_after(fresh_op)
+    facts = _lineage(app)
+    assert facts["batches"][empty] == (_commit_end(empty), frozenset())
+    assert facts["ops"][fresh_op] == _line_end(lambda r: r.get("id") == fresh_op)
+    assert _materializing(facts, fresh_op, T.identity("A")) == set()
     live = _logical(app)
     rc, plain = _rederive(app, capsys, yes=True)
     assert rc == 0 and plain["status"] == "no-op", plain
@@ -1012,6 +1034,17 @@ def test_a_store_stuck_on_an_empty_decision_recovers_by_a_fresh_manifest(
     assert rc == 0 and plain["status"] == "no-op", plain
     T.rebuild(app)
     assert _logical(app)["resets"] == live["resets"]
+    _agree_across_rebuilds(app)
+    # The empty batch touches no account: the stuck-era fit still steers.
+    assert D._forecast(account) == D._expected_forecast(D.X_OLD)
+    # A qualifying refit after the recovery, then a rebuild: the forecast is
+    # calibrated from the new fit, whose basis is every completed batch.
+    D._sweep(account, D._analysis(fitted=D._evidence(qm, D.X_NEW)))
+    T.rebuild(app)
+    assert D._open_regime(account)["fitLineage"]["basis"] == sorted(
+        D._basis(app))
+    assert D._assessments(app, account) == ("clean",)
+    assert D._forecast(account) == D._expected_forecast(D.X_NEW)
 
 
 def test_plain_rederive_with_an_empty_plan_writes_no_batch(
@@ -1025,3 +1058,505 @@ def test_plain_rederive_with_an_empty_plan_writes_no_batch(
     rc, plain = _rederive(app, capsys, yes=True)
     assert rc == 0 and plain["status"] == "no-op", plain
     assert T.journal_records() == before
+
+
+# --- #1015 T0: the R8 probe (spec section 7, R8) ---------------------------------
+#
+# An interrupted NONEMPTY reviewed hold (its durable op, no batch), then an
+# ordinary reading (so the plain path refuses the unfinished decision), then a
+# fresh manifest repeating the hold on the unchanged source. The fresh
+# manifest's baseline used to replay the earlier, never-completed op, so the
+# delta dropped every hold action and the fresh batch materialized nothing:
+# the held observations' inputs stayed uncorrected until a later plain
+# rederive.
+
+_HELD = ("A1", "A2", "A3")
+
+
+def _interrupted_hold(app, monkeypatch, tmp_path, capsys) -> dict:
+    import _cctally_rederive as R    # the module the loaded app uses
+    ids = _storm(app, monkeypatch)
+    path = _manifest(tmp_path, [(ids[n], "hold") for n in _HELD], version=2,
+                     name="interrupted.json")
+    rc, preview = _rederive(app, capsys, path)
+    assert rc == 0 and not _no_actions(preview), preview["actionCounts"]
+    body = json.loads(path.read_text())
+    body.update(expectedBaselinePlanHash=preview["baselinePlanHash"],
+                expectedDecisionPlanHash=preview["decisionPlanHash"])
+    path.write_text(json.dumps(body))
+
+    def crash(stage):
+        if stage == "after-reviewed-decision-op":
+            raise RuntimeError("simulated crash after durable op")
+
+    monkeypatch.setattr(R, "_REDERIVE_CRASH_HOOK", crash)
+    op = R._reviewed_weekly_op_from_manifest(path)
+    with pytest.raises(RuntimeError, match="durable op"):
+        R.apply_db_rederive(
+            "claude-usage", reviewed_op=op,
+            expected_plan_hashes=(preview["baselinePlanHash"],
+                                  preview["decisionPlanHash"]))
+    monkeypatch.setattr(R, "_REDERIVE_CRASH_HOOK", None)
+    assert not any(r.get("t") == "correction_batch" for r in T.journal_records()
+                   if r.get("family") == "claude-usage")
+    _record(app, monkeypatch, LATER)
+    rc, refused = _rederive(app, capsys)
+    assert rc == 2 and _UNFINISHED in refused["conflicts"][0], refused
+    return ids
+
+
+def _reference_after_hold(monkeypatch, tmp_path, capsys) -> dict:
+    """The corrected inputs: an uninterrupted reviewed hold of the replays
+    over the same observations, in its own store."""
+    root = tmp_path / "reference"
+    root.mkdir()
+    app = _app(monkeypatch, root)
+    ids = _storm(app, monkeypatch)
+    _record(app, monkeypatch, LATER)
+    _apply(app, capsys, _manifest(root, [(ids[n], "hold") for n in _HELD],
+                                  version=2))
+    return _logical(app)
+
+
+def test_r8_fresh_manifest_after_an_interrupted_hold_corrects_the_inputs(
+        monkeypatch, tmp_path, capsys):
+    """#1015 R8, detects a reviewed hold whose fresh-manifest recovery leaves
+    the stats inputs uncorrected (the index, and every fit over it, stays
+    poisoned until an unrelated plain rederive): right after the fresh
+    manifest the store equals an uninterrupted hold's (snapshots, resets,
+    milestones), the fake reset the hold retires is gone, and a plain
+    rederive afterwards has no remaining correction."""
+    reference = _reference_after_hold(monkeypatch, tmp_path, capsys)
+    root = tmp_path / "probe"
+    root.mkdir()
+    app = _app(monkeypatch, root)
+    import _cctally_rederive as R    # the module the loaded app uses
+    ids = _interrupted_hold(app, monkeypatch, root, capsys)
+    fresh = _manifest(root, [(ids[n], "hold") for n in _HELD], version=2,
+                      name="fresh.json")
+    # The reviewed plan hashes that move: the baseline plan (the abandoned op
+    # left the baseline) and with it the decision (delta) plan, which now
+    # carries the hold's actions. A manifest previewed before the fix must be
+    # re-previewed.
+    with monkeypatch.context() as m:
+        m.setattr(R, "_fresh_manifest_baseline",
+                  lambda records, _completed, _family, exclude_index=None: [
+                      r for i, r in enumerate(records) if i != exclude_index])
+        rc, before_fix = _rederive(app, capsys, fresh)
+    assert rc == 0 and _no_actions(before_fix), before_fix["actionCounts"]
+    rc, fixed = _rederive(app, capsys, fresh)
+    assert rc == 0 and not _no_actions(fixed), fixed["actionCounts"]
+    assert fixed["baselinePlanHash"] != before_fix["baselinePlanHash"]
+    assert fixed["decisionPlanHash"] != before_fix["decisionPlanHash"]
+    preview, applied = _apply(app, capsys, fresh)
+    assert _resets() == sorted([ids["L0"], ids["L1"], ids["L2"]]), (
+        "fresh manifest left the hold's corrections unapplied",
+        preview["actionCounts"], applied["actionCounts"])
+    assert _logical(app) == reference
+    rc, plain = _rederive(app, capsys)
+    assert rc == 0 and _no_actions(plain), plain["actionCounts"]
+
+
+# --- #1015 T1: correction ordering is materialization (spec 5.1, section 7) -----
+#
+# A reviewed decision changes the population only when a completed correction
+# batch materializes it, whatever produced the batch. The published lineage
+# facts — each reviewed op's journal coordinate, each completed batch's commit
+# coordinate and footprint, each decision's decoded disposition — must be
+# identical on live ingest, an ordinary rebuild, a correction rebuild and a
+# completing rebuild, or a fit's assessment would depend on the path that
+# published its inputs.
+
+
+def _lineage(app) -> dict:
+    """The published lineage facts."""
+    ops = {op: (seg, off) for op, seg, off in _stats(
+        app, "SELECT decision_op_id, op_segment, op_offset "
+             "FROM claude_weekly_correction_ops")}
+    footprints = collections.defaultdict(set)
+    for batch_id, provider, account in _stats(
+            app, "SELECT batch_id, provider, account_key "
+                 "FROM correction_batch_footprint"):
+        footprints[batch_id].add((provider, account))
+    batches = {batch_id: ((seg, off), frozenset(footprints.get(batch_id, ())))
+               for batch_id, seg, off in _stats(
+                   app, "SELECT batch_id, commit_segment, commit_offset "
+                        "FROM correction_batch_lineage")}
+    assert set(footprints) <= set(batches), "a footprint without its batch"
+    history = collections.Counter(_stats(
+        app, "SELECT decision_op_id, observation_id, disposition "
+             "FROM claude_weekly_correction_history"))
+    return {"ops": ops, "batches": batches, "history": history}
+
+
+def _materializing(facts, op_id, account) -> set:
+    """The batches that may materialize a correction of ``op_id`` for an
+    observation of ``account`` (spec 5.1): committed after the op, and
+    touching that account, every Claude account, or an unknowable owner."""
+    import _cctally_journal as jr
+    op_at = jr.journal_coordinate_key(facts["ops"][op_id])
+    owners = {("claude", account), ("claude", "*"), ("*", "*")}
+    return {batch_id for batch_id, (commit, footprint)
+            in facts["batches"].items()
+            if jr.journal_coordinate_key(commit) > op_at and footprint & owners}
+
+
+def _line_end(match) -> tuple:
+    """The END coordinate of the first journal line ``match`` accepts."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    for segment, offset, raw in jr.iter_range(None, jr.journal_high_water()):
+        record = J.decode_line(raw)
+        if record is not None and match(record):
+            return (segment, offset + len(raw) + 1)
+    raise AssertionError("no such journal line")
+
+
+def _commit_end(batch_id) -> tuple:
+    return _line_end(lambda r: r.get("t") == "correction_batch"
+                     and r.get("phase") == "commit" and r.get("id") == batch_id)
+
+
+def _batches_after(op_id) -> list:
+    return [r["id"] for r in _after_op(op_id)
+            if r.get("t") == "correction_batch" and r.get("phase") == "commit"]
+
+
+def _agree_across_rebuilds(app) -> dict:
+    """The facts as published now, which an ordinary rebuild and a completing
+    rebuild (no predecessor index) must reproduce exactly."""
+    import _cctally_core as core
+    facts = _lineage(app)
+    T.rebuild(app)
+    assert _lineage(app) == facts, "ordinary rebuild"
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        path = core.DB_PATH.with_name(core.DB_PATH.name + suffix)
+        if path.exists():
+            path.unlink()
+    T.rebuild(app)
+    assert _lineage(app) == facts, "completing rebuild"
+    return facts
+
+
+def test_lineage_an_op_and_its_completed_batch(monkeypatch, tmp_path, capsys):
+    """#1015, detects a reviewed hold whose correction is not recorded
+    against its account (a fit over the held inputs would stay steering):
+    the op's coordinate is the end of its line, its nonempty batch commits
+    after it and touches account A, the history carries the decoded
+    dispositions, and live ingest and every rebuild publish the same facts."""
+    app = _app(monkeypatch, tmp_path)
+    ids = _storm(app, monkeypatch)
+    _p, applied = _apply(app, capsys, _manifest(
+        tmp_path, [(ids["A1"], "hold"), (ids["A2"], "retract")]))
+    op = applied["reviewedWeeklyDecisionId"]
+    [batch] = _batches_after(op)
+    facts = _lineage(app)
+    assert facts["ops"] == {op: _line_end(lambda r: r.get("id") == op)}
+    assert facts["batches"][batch][0] == _commit_end(batch)
+    assert ("claude", T.identity("A")) in facts["batches"][batch][1]
+    assert _materializing(facts, op, T.identity("A")) == {batch}
+    assert facts["history"] == collections.Counter(
+        {(op, ids["A1"], "hold"): 1, (op, ids["A2"], "retract"): 1})
+    _assert_reader_sees(facts, T.identity("A"))
+    _record(app, monkeypatch, LATER)
+    assert _lineage(app) == facts, "a later live ingest"
+    _agree_across_rebuilds(app)
+    _assert_reader_sees(facts, T.identity("A"))
+
+
+def _assert_reader_sees(facts, account) -> None:
+    """The fail-fast reader returns exactly the published facts: the scoped
+    rows carry their index account and op coordinate, another account's
+    scope sees none of them, and every batch arrives with its footprint."""
+    import _cctally_quota_calibration as qcg
+    read = qcg.read_correction_facts(account_scope=account)
+    assert read is not None, "the published index must be readable"
+    assert collections.Counter(
+        (r.op_id, r.observation_id, r.disposition) for r in read.corrections
+    ) == facts["history"]
+    assert {r.account_key for r in read.corrections} == {account}
+    assert all(r.op_coord == facts["ops"][r.op_id] and r.captured_at
+               for r in read.corrections)
+    assert {b.batch_id: (b.commit_coord, b.footprint)
+            for b in read.batches} == facts["batches"]
+    assert read.basis == frozenset(facts["batches"])
+    other = qcg.read_correction_facts(account_scope=T.identity("B"))
+    assert other is not None and other.corrections == ()
+
+
+def test_lineage_an_empty_batch_completed_by_live_ingest_touches_nothing(
+        monkeypatch, tmp_path, capsys):
+    """#1015, detects an empty decision batch that invalidates fits (or is
+    missing) when only live ingest completed it: batch commit, crash before
+    the rebuild, live ingest, then a no-op plain rederive. The batch is
+    completed with no footprint, and the facts survive every rebuild."""
+    app = _app(monkeypatch, tmp_path)
+    import _cctally_rederive as R    # the module the loaded app uses
+    ids = _storm(app, monkeypatch)
+    decisions = [(ids[n], "retract") for n in _HELD]
+    _apply(app, capsys, _manifest(tmp_path, decisions))
+    path = _manifest(tmp_path, decisions, name="again.json")
+    rc, preview = _rederive(app, capsys, path)
+    assert rc == 0 and _no_actions(preview), preview["actionCounts"]
+    body = json.loads(path.read_text())
+    body.update(expectedBaselinePlanHash=preview["baselinePlanHash"],
+                expectedDecisionPlanHash=preview["decisionPlanHash"])
+    path.write_text(json.dumps(body))
+
+    def crash(stage):
+        if stage == "after-batch-commit":
+            raise RuntimeError("simulated crash after the batch commit")
+
+    monkeypatch.setattr(R, "_REDERIVE_CRASH_HOOK", crash)
+    with pytest.raises(RuntimeError, match="batch commit"):
+        R.apply_db_rederive(
+            "claude-usage",
+            reviewed_op=R._reviewed_weekly_op_from_manifest(path),
+            expected_plan_hashes=(preview["baselinePlanHash"],
+                                  preview["decisionPlanHash"]))
+    monkeypatch.setattr(R, "_REDERIVE_CRASH_HOOK", None)
+    [op] = [r["id"] for r in T.journal_records() if r.get("t") == "op"
+            and (r.get("payload") or {}).get("kind", "").startswith(
+                "claude_weekly_observation_decision")][-1:]
+    [batch] = _batches_after(op)
+    assert batch not in _lineage(app)["batches"], "nothing ingested it yet"
+    T.ingest(app)
+    facts = _lineage(app)
+    assert facts["batches"][batch] == (_commit_end(batch), frozenset())
+    assert facts["ops"][op] == _line_end(lambda r: r.get("id") == op)
+    assert _materializing(facts, op, T.identity("A")) == set()
+    rc, plain = _rederive(app, capsys, yes=True)
+    assert rc == 0 and plain["status"] == "no-op", plain
+    assert _lineage(app) == facts
+    _agree_across_rebuilds(app)
+
+
+def test_lineage_an_op_whose_batch_never_completes_has_nothing_to_order(
+        monkeypatch, tmp_path, capsys):
+    """#1015, detects an interrupted decision that taints fits although it
+    changed nothing: its op is recorded (live ingest read it) and no batch
+    follows it."""
+    app = _app(monkeypatch, tmp_path)
+    _interrupted_hold(app, monkeypatch, tmp_path, capsys)
+    [op] = [r["id"] for r in T.journal_records() if r.get("t") == "op"
+            and (r.get("payload") or {}).get("kind", "").startswith(
+                "claude_weekly_observation_decision")]
+    facts = _lineage(app)
+    assert op in facts["ops"]
+    assert _materializing(facts, op, T.identity("A")) == set()
+    assert _agree_across_rebuilds(app) == facts
+
+
+def test_lineage_a_historical_r8_journal_orders_by_the_plain_batch(
+        monkeypatch, tmp_path, capsys):
+    """#1015 R8 history (R4-P3-1), detects a journal an affected release
+    already wrote staying wrong after the fix: an interrupted hold, a reading,
+    a fresh manifest applied as the unchanged binary did (an empty batch),
+    then a reading and a plain rederive batch that corrects the held inputs.
+    The empty batch touches nothing; the plain batch materializes both ops'
+    corrections for account A."""
+    app = _app(monkeypatch, tmp_path)
+    import _cctally_rederive as R    # the module the loaded app uses
+    ids = _interrupted_hold(app, monkeypatch, tmp_path, capsys)
+    fresh = _manifest(tmp_path, [(ids[n], "hold") for n in _HELD], version=2,
+                      name="fresh.json")
+    with monkeypatch.context() as m:
+        m.setattr(R, "_fresh_manifest_baseline",
+                  lambda records, _completed, _family, exclude_index=None: [
+                      r for i, r in enumerate(records) if i != exclude_index])
+        preview, applied = _apply(app, capsys, fresh)
+    assert _no_actions(preview), preview["actionCounts"]
+    fresh_op = applied["reviewedWeeklyDecisionId"]
+    [empty] = _batches_after(fresh_op)
+    _record(app, monkeypatch, (("I", "api", "09:50:00", 5, 19),))
+    rc, plain = _rederive(app, capsys, yes=True)
+    assert rc == 0 and plain["status"] == "applied", plain
+    [first_op] = [r["id"] for r in T.journal_records() if r.get("t") == "op"
+                  and r["id"] != fresh_op
+                  and (r.get("payload") or {}).get("kind", "").startswith(
+                      "claude_weekly_observation_decision")]
+    plain_batches = [b for b in _batches_after(fresh_op) if b != empty]
+    assert len(plain_batches) == 1, plain_batches
+    facts = _lineage(app)
+    assert facts["batches"][empty][1] == frozenset()
+    account = T.identity("A")
+    assert _materializing(facts, first_op, account) == set(plain_batches)
+    assert _materializing(facts, fresh_op, account) == set(plain_batches)
+    _agree_across_rebuilds(app)
+
+
+def _effective_rev(event_id) -> int:
+    import _lib_journal as J
+    return J.resolve_effective_events(T.journal_records()).by_id[event_id].rev
+
+
+def _append_batch(name, actions) -> str:
+    """Append one completed correction batch the way every producer does,
+    then ingest it: a batch that changes a winner is healed by live ingest's
+    correction rebuild (one per cycle)."""
+    import _cctally_journal as jr
+    import _lib_journal as J
+    batch_id = f"test-1015:{name}"
+    jr.append_records(J.make_correction_batch(
+        batch_id=batch_id, family="test-1015", at="2026-10-23T13:00:00Z",
+        actions=actions))
+    T.ingest(None)
+    return batch_id
+
+
+def test_lineage_footprints_follow_the_owner_the_fold_stores(
+        monkeypatch, tmp_path, capsys):
+    """#1015 (R5-P1-2, R5-P2-1), detects a correction attributed to the wrong
+    account — a missed taint, or one on an unrelated account: a replacement
+    moving an event from A to B touches both; a tombstone touches its removed
+    owner; a payload without an account is owned by the fold's default; a
+    later move touching only B, and a Codex-only batch, never materialize a
+    correction for A; and no batch committed before an op counts for it."""
+    app = _app(monkeypatch, tmp_path)
+    ids = _storm(app, monkeypatch)
+    _p, applied = _apply(app, capsys, _manifest(
+        tmp_path, [(ids[n], "hold") for n in _HELD], version=2))
+    op = applied["reviewedWeeklyDecisionId"]
+    [reviewed_batch] = _batches_after(op)
+    account_a, account_b = T.identity("A"), T.identity("B")
+    T.identity("A")
+    active = _active()
+    m1, m2, m3 = sorted(_milestones(active))[:3]
+
+    def replace(event_id, payload, bump=1):
+        return {"action": "replace", "id": event_id,
+                "rev": _effective_rev(event_id) + bump,
+                "at": "2026-10-23T13:00:00Z", "payload": payload}
+
+    moved = _append_batch("move", [replace(
+        m1, dict(active[m1], account_key=account_b))])
+    removed = _append_batch("tomb", [{
+        "action": "tombstone", "id": m2, "rev": _effective_rev(m2) + 1,
+        "at": "2026-10-23T13:00:00Z", "payload": None}])
+    defaulted = _append_batch("default", [replace(
+        m3, {k: v for k, v in active[m3].items() if k != "account_key"})])
+    only_b = _append_batch("only-b", [replace(
+        m1, dict(active[m1], account_key=account_b))])
+    codex = _append_batch("codex", [{
+        "action": "replace", "id": "qaa:test-1015", "rev": 1,
+        "at": "2026-10-23T13:00:00Z",
+        "payload": {"kind": "quota_alert_arming", "state": "disarmed",
+                    "source": "codex", "source_root_key": "root",
+                    "logical_limit_key": "weekly", "observed_slot": "slot",
+                    "window_minutes": 10080,
+                    "account_key": "unattributed"}}])
+    facts = _lineage(app)
+    footprint = {b: facts["batches"][b][1] for b in
+                 (moved, removed, defaulted, only_b, codex)}
+    assert footprint == {
+        moved: {("claude", account_a), ("claude", account_b)},
+        removed: {("claude", account_a)},
+        defaulted: {("claude", account_a), ("claude", "unattributed")},
+        only_b: {("claude", account_b)},
+        codex: {("codex", "unattributed")},
+    }
+    for batch_id in footprint:
+        assert facts["batches"][batch_id][0] == _commit_end(batch_id)
+    assert _materializing(facts, op, account_a) == {
+        reviewed_batch, moved, removed, defaulted}
+    assert {moved, only_b} <= _materializing(facts, op, account_b)
+    # A later reviewed decision: every batch above committed before its op.
+    _p, later = _apply(app, capsys, _manifest(
+        tmp_path, [(ids["A1"], "accept")], version=2, name="later.json"))
+    later_op = later["reviewedWeeklyDecisionId"]
+    facts = _lineage(app)
+    assert _materializing(facts, later_op, account_a) == set(
+        _batches_after(later_op))
+    assert not _materializing(facts, later_op, account_a) & set(footprint)
+    _agree_across_rebuilds(app)
+
+
+def test_lineage_a_derivation_completion_over_a_held_snapshot_taints_by_window(
+        monkeypatch, tmp_path, capsys):
+    """#1015 spec 7 (A10, F3), detects a derivation-completion batch that
+    replaces a held observation's retained snapshot without invalidating the
+    fits over it: the batch touches the observation's account, so a stamped
+    fit whose window holds the capture — clean before the batch — is tainted
+    by it, and a fit whose window does not hold it stays clean."""
+    import _cctally_journal as jr
+    import _cctally_quota_calibration as qcg
+    import _lib_journal as J
+    import _lib_quota_lineage as L
+    app = _app(monkeypatch, tmp_path)
+    ids = _storm(app, monkeypatch)
+    _p, applied = _apply(app, capsys, _manifest(
+        tmp_path, [(ids[n], "hold") for n in _HELD], version=2))
+    op = applied["reviewedWeeklyDecisionId"]
+    account = T.identity("A")
+    basis = sorted(_lineage(app)["batches"])
+
+    def fit(start, until):
+        return L.fit_lineage(
+            scope=account, basis=basis,
+            windows=(L.window(start, until, until_inclusive=True),),
+            estimator=None, regime={"asOf": until})
+
+    overlapping = fit("2026-10-10T00:00:00+00:00", "2026-10-23T00:00:00+00:00")
+    elsewhere = fit("2026-09-22T00:00:00+00:00", "2026-10-10T00:00:00+00:00")
+
+    def assessed(lineage):
+        return L.assess(lineage, qcg.read_correction_facts(
+            account_scope=account), coord_key=qcg._coordinate_order).state
+
+    assert assessed(overlapping) == "clean", "the reviewed batch is in basis"
+    event_id = "sa:" + ids["A1"]
+    assert event_id in _active(), "the held observation keeps its snapshot"
+    batch = f"{jr.DERIVATION_COMPLETION_FAMILY}:test-1015-held"
+    jr.append_records(J.make_correction_batch(
+        batch_id=batch, family=jr.DERIVATION_COMPLETION_FAMILY,
+        at="2026-10-23T13:00:00Z", actions=[{
+            "action": "replace", "id": event_id,
+            "rev": _effective_rev(event_id) + 1,
+            "at": "2026-10-23T13:00:00Z",
+            "payload": dict(_active()[event_id])}]))
+    T.ingest(None)
+    facts = _lineage(app)
+    assert facts["batches"][batch][0] == _commit_end(batch)
+    assert ("claude", account) in facts["batches"][batch][1]
+    assert batch in _materializing(facts, op, account)
+    assert assessed(overlapping) == "tainted"
+    assert assessed(elsewhere) == "clean"
+    _agree_across_rebuilds(app)
+    assert assessed(overlapping) == "tainted"
+
+
+@pytest.mark.parametrize("actions, predecessors, expected", [
+    # replacement A -> B, then a later action on the same id sees B
+    ([("e", 1, "replace", ("claude", "B")), ("e", 2, "replace", ("claude", "C"))],
+     {"e": ("active", ("claude", "A"))},
+     {("claude", "A"), ("claude", "B"), ("claude", "C")}),
+    # tombstone of a tombstoned id removes nothing; its re-creation adds only
+    # its own payload
+    ([("e", 2, "tombstone", None), ("e", 3, "replace", ("claude", "B"))],
+     {"e": ("tombstone", None)}, {("claude", "B")}),
+    # a tombstone over nothing touches nothing
+    ([("e", 0, "tombstone", None)], {}, set()),
+    # a new event (explicit, or a replacement with no predecessor)
+    ([("e", 0, "new", ("codex", "unattributed")),
+      ("f", 1, "replace", ("claude", "*"))],
+     {}, {("codex", "unattributed"), ("claude", "*")}),
+    # an unresolvable owner is genuinely unknowable
+    ([("e", 1, "replace", None)], {"e": ("active", None)}, {("*", "*")}),
+    # a completed empty batch
+    ([], {}, set()),
+])
+def test_batch_footprint_kernel(actions, predecessors, expected):
+    """#1015 spec 5.1, detects a footprint computed from the wrong revision
+    (a later final winner instead of the one effective at the action)."""
+    import _lib_quota_lineage as L
+    seen = []
+
+    def predecessor_of(event_id, rev):
+        seen.append((event_id, rev))
+        found = predecessors.get(event_id)
+        return None if found is None else L.Revision(*found)
+
+    got = L.batch_footprint([L.Action(*a) for a in actions], predecessor_of)
+    assert got == frozenset(expected)
+    assert len(seen) == len({a[0] for a in actions if a[2] != "new"}), (
+        "only the first action on an id consults the caller")

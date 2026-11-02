@@ -278,6 +278,7 @@ import secrets
 import shutil
 import signal as _signal
 import socket
+import socketserver
 import select
 import sqlite3
 import sys
@@ -337,6 +338,21 @@ class _QuietThreadingHTTPServer(ThreadingHTTPServer):
         self._reject_start_lock = threading.Lock()
         self._reject_workers: list[threading.Thread] = []
         super().__init__(*args, **kwargs)
+
+    def server_bind(self) -> None:
+        """Bind and record the bound address without a reverse-DNS lookup.
+
+        Replaces `http.server.HTTPServer.server_bind`, which sets `server_name`
+        to `socket.getfqdn(host)`: a PTR lookup that blocks for the resolver's
+        whole timeout where the resolver never answers it (35s measured on a
+        LAN runner), before the dashboard can print its URL or serve (#1021).
+        Nothing here reads `server_name` as a hostname, so it records the bound
+        address as `getsockname()` reports it.
+        """
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def _reject_request(self, request: socket.socket) -> None:
         try:
@@ -741,7 +757,7 @@ from _cctally_cache import (
     get_entries, iter_entries, iter_entries_with_id,
     open_cache_db as _raw_open_cache_db,
     open_conversations_db, sync_cache, sync_claude_conversations,
-    sync_codex_conversations,
+    sync_codex_conversations, read_codex_startup_deferral_facts,
     # #780 read-route admission. Imported here so the conversation route module
     # reaches them the same way it reaches `open_conversations_db` — through
     # `sys.modules["_cctally_dashboard"]`, which is the seam its tests patch.
@@ -2615,7 +2631,9 @@ def _conversation_frontier_context():
     frontier_mod = _cctally()._load_sibling("_lib_ingest_frontier")
     claude_roots = tuple(_cctally_core._resolve_claude_projects_dirs())
     codex_homes = tuple(_cctally()._codex_home_roots())
-    codex_roots = tuple(root / "sessions" for root in codex_homes)
+    # #970: native-home recognition, never a hard-coded `<home>/sessions`, so
+    # an archive directory is certified evidence and a permitted location.
+    codex_roots = frontier_mod.codex_frontier_roots(codex_homes)
     claude_guards = (_cctally_core.CLAUDE_SETTINGS_PATH,)
 
     try:
@@ -2689,13 +2707,119 @@ def _conversation_frontier_plans(conn):
 
 
 class _ConversationPassStatus(str):
-    """Validated status string carrying fixed-size pass diagnostics."""
+    """Validated status string carrying fixed-size pass diagnostics.
 
-    def __new__(cls, status, *, modes=None, files=None):
+    ``drain`` is the pass's evidence for writeIo's startup admission hold
+    (#939 D5, `_conversation_drain_info`), or ``None``."""
+
+    def __new__(cls, status, *, modes=None, files=None, drain=None):
         obj = str.__new__(cls, status)
         obj.modes = dict(modes or {})
         obj.files = dict(files or {})
+        obj.drain = drain
         return obj
+
+
+def _conversation_drain_info(conn, status, modes, plans, results,
+                             certifiable) -> dict:
+    """What one ``ok`` pass tells writeIo's admission hold (#939 D5).
+
+    Per provider: its census and residual (``None`` for ``caught_up``, which
+    carries the previous one forward), plus an empty ``"pass"`` status entry
+    (an error pass's is non-empty: `_conversation_failed_drain`). For Codex,
+    its unpublished deferrals and, while the hold is placed, the stored facts
+    of every deferral the evaluator tracks, read at the pass's end. The pass
+    is census-complete only when its status is ``ok``, both censuses are
+    complete, the facts could be read and no detached Codex worker is in
+    progress at its end.
+    """
+    import _lib_ingest_frontier as frontier_lib
+    providers = {"pass": {"mode": "full", "residual": ()}}
+    census = status == "ok"
+    for provider in ("claude", "codex"):
+        mode = modes.get(provider, "not_observed")
+        stats = results.get(provider)
+        plan = plans.get(provider) if plans else None
+        expected = len(plan.paths) if plan is not None else 0
+        census = census and frontier_lib.conversation_census_complete(
+            mode, stats, expected_paths=expected)
+        providers[provider] = {
+            "mode": mode,
+            "residual": (None if mode == "caught_up"
+                         else _lib_write_io.conversation_residual(stats)),
+        }
+    codex_mode = modes.get("codex")
+    deferrals = (None if codex_mode == "caught_up" or "codex" not in results
+                 else _lib_write_io.unpublished_deferrals(results.get("codex")))
+    facts = {}
+    if conn is not None and _lib_write_io.admission_held():
+        entries = dict(_lib_write_io.startup_watch())
+        for path, (identity, _covered, keys) in (deferrals or {}).items():
+            prior = entries.get(path)
+            entries[path] = (identity,
+                             frozenset(keys) | (prior[1] if prior else frozenset()))
+        entries = {path: entry for path, entry in entries.items()
+                   if entry[0] is not None}
+        if entries:
+            try:
+                facts = read_codex_startup_deferral_facts(conn, entries)
+            except Exception as exc:  # noqa: BLE001 — missing facts keep the hold
+                eprint(f"[conversations] startup facts unavailable: {exc}")
+                census = False
+    if census:
+        census = not _codex_worker_in_progress()
+    return {"census_complete": bool(census), "certifiable": bool(certifiable),
+            "providers": providers, "deferrals": deferrals, "facts": facts}
+
+
+def _codex_worker_in_progress() -> bool:
+    """Whether a detached Codex worker is requested or running (#939 D5); an
+    unknown worker state counts as one (it keeps the hold)."""
+    import _lib_codex_worker_lifecycle as lifecycle
+    try:
+        return bool(lifecycle.any_in_progress(
+            _cctally_core.APP_DIR, now=time.time()))
+    except Exception:  # noqa: BLE001 — unknown worker state: keep the hold
+        return True
+
+
+def _connection_changes(conn) -> "int | None":
+    """``conn.total_changes``: rows changed on the connection since it was
+    created, including the store open's own migrations, imports and replays
+    (#939 R9-01) and changes later rolled back; None when it cannot be read
+    (unknown reads as changed). A double without the attribute changes
+    nothing."""
+    try:
+        return int(getattr(conn, "total_changes", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _conversation_failed_drain(status: str, error_name: str, *,
+                               changed_rows: bool) -> dict:
+    """What a pass that ended in ``error`` or ``store_unavailable`` tells
+    writeIo's admission hold (#939 D5).
+
+    A failure can commit work before it propagates (D1's prepared prefix, a
+    Codex publication unit), and no residual can prove that work was not
+    catch-up progress (#939 R7-01, R8-01). So a failing pass that changed any
+    row on its own connection since its creation, the open's migrations
+    included (``changed_rows``, R9-01), and a failed open, which leaves no
+    connection to ask (R10-01), are incomplete censuses: they never anchor a
+    settle. A pass that opened and changed nothing can repeat for the dashboard's whole life, so it is
+    census-complete (unless a detached Codex worker is in progress) with its
+    status and exception class as its residual: an identical failure settles,
+    and a later ``ok`` pass, whose status entry is empty, changes the digest.
+    It is never certifiable, so it never releases as drained. The provider
+    residuals and deferrals carry forward."""
+    return {"census_complete": (not changed_rows
+                                and not _codex_worker_in_progress()),
+            "certifiable": False,
+            "providers": {"pass": {
+                "mode": "full",
+                "residual": (("status", status),
+                             ("exception", error_name))}},
+            "deferrals": None, "facts": {}}
 
 
 def _conversation_sync_pass() -> str:
@@ -2742,17 +2866,37 @@ def _conversation_sync_pass() -> str:
         conn = open_conversations_db()
     except (OSError, sqlite3.DatabaseError) as exc:
         eprint(f"[conversations] background sync unavailable: {exc}")
-        return _ConversationPassStatus("store_unavailable")
+        # The open can commit work before it fails (a resumable migration's
+        # chunks), and with no connection to ask nothing proves it did not:
+        # file metadata cannot (a reused WAL keeps its size, mtimes are
+        # coarse), so a failed open is inconclusive, read as changed
+        # (#939 R9-01, R10-01).
+        return _ConversationPassStatus(
+            "store_unavailable",
+            drain=_conversation_failed_drain(
+                "store_unavailable", type(exc).__name__, changed_rows=True))
     status = "ok"
+    error_name = None
+    # Rows changed on this pass's connection, from its creation (#939 R8-01,
+    # R9-01): the open's migrations and imports run on it too.
+    changed_rows = True
     modes = {"claude": "not_observed", "codex": "not_observed"}
     files = {"claude": 0, "codex": 0}
+    results = {}
+    plans = None
+    certifiable = False
+    drain = None
     try:
         planned = _conversation_frontier_plans(conn)
-        results = {}
         if planned is None:
             modes = {"claude": "full", "codex": "full"}
             results["claude"] = sync_claude_conversations(conn)
             results["codex"] = sync_codex_conversations(conn)
+            import _lib_ingest_frontier as frontier_lib
+            certifiable = all(
+                frontier_lib.conversation_sync_certifiable(
+                    "full", results.get(provider))
+                for provider in ("claude", "codex"))
         else:
             frontier_mod, frontier, cutoff, context, plans = planned
             modes = {
@@ -2801,9 +2945,18 @@ def _conversation_sync_pass() -> str:
                         frontier.commit_provider(
                             plan, conn, roots=roots, guard_paths=guards,
                             trusted=trusted, cutoff=cutoff)
+        try:
+            drain = _conversation_drain_info(
+                conn, status, modes, plans, results, certifiable)
+        except Exception as exc:  # noqa: BLE001 — the hold's evidence is
+            # diagnostic: it must never fail a pass that ingested. A missing
+            # record is read as a pass that did not cover its census.
+            eprint(f"[conversations] startup drain evidence unavailable: {exc}")
+            drain = None
     except (OSError, sqlite3.DatabaseError) as exc:
         eprint(f"[conversations] background sync unavailable: {exc}")
         status = "store_unavailable"
+        error_name = type(exc).__name__
     except Exception as exc:  # noqa: BLE001
         # Transcript parsing/normalization is deliberately outside the core
         # freshness loop. Keep this worker alive so a later clean tick can
@@ -2814,7 +2967,10 @@ def _conversation_sync_pass() -> str:
             f"{type(exc).__name__}: {exc}"
         )
         status = "error"
+        error_name = type(exc).__name__
     finally:
+        changes = _connection_changes(conn)
+        changed_rows = changes is None or changes > 0
         try:
             conn.close()
         except Exception:  # noqa: BLE001
@@ -2824,7 +2980,18 @@ def _conversation_sync_pass() -> str:
         if provider in results:
             files[provider] = int(
                 getattr(results.get(provider), "files_total", 0) or 0)
-    return _ConversationPassStatus(status, modes=modes, files=files)
+    if status != "ok":
+        # An error or an unavailable store ended the pass: its status is its
+        # residual, so a failure that repeats identically settles (#939 D5).
+        # An error pass is never drained.
+        drain = _conversation_failed_drain(status, error_name or "Exception",
+                                           changed_rows=changed_rows)
+    elif drain is None:
+        # An ok pass whose evidence could not be built: not census-complete.
+        drain = {"census_complete": False, "certifiable": False,
+                 "providers": {}, "deferrals": None, "facts": {}}
+    return _ConversationPassStatus(status, modes=modes, files=files,
+                                   drain=drain)
 
 
 def _conversation_sync_loop(
@@ -2847,12 +3014,31 @@ def _conversation_sync_loop(
     The previous fixed `wait(interval)` prevented literal 100% duty for finite
     work but provided no scale-independent ceiling below it: a 30 s pass ran
     30-on/5-off, about 86% duty, and nothing bounded that as the store grew.
+
+    #939 D5: every completed pass is fed to writeIo's startup admission hold,
+    whose verdict ("drained" or "settled") releases it; the loop's end
+    releases it in a ``finally`` ("loopExit"), so a dead loop never holds
+    admission. An exception from the evaluator is logged once and read as no
+    verdict (the hold stays), never as the end of ingest.
     """
+    try:
+        _conversation_sync_loop_body(
+            stop=stop, interval=interval, run_iteration=run_iteration,
+            monotonic=monotonic, thread_time_ns=thread_time_ns, wait=wait,
+            record=record)
+    finally:
+        _lib_write_io.release_admission("loopExit")
+
+
+def _conversation_sync_loop_body(
+    *, stop, interval, run_iteration, monotonic, thread_time_ns, wait, record,
+) -> None:
     if thread_time_ns is None:
         thread_time_ns = time.thread_time_ns
     if wait is None:
         wait = stop.wait
     seq = 0
+    evaluator_failed = False
     while not stop.is_set():
         t0 = monotonic()
         cpu0 = thread_time_ns()
@@ -2866,6 +3052,20 @@ def _conversation_sync_loop(
         work = max(0.0, monotonic() - t0)
         cpu_ns = max(0, thread_time_ns() - cpu0)
         seq += 1
+        try:
+            verdict = _lib_write_io.observe_conversation_pass(
+                getattr(status, "drain", None), started_ns=int(t0 * 1e9),
+                seq=seq)
+            if verdict is not None:
+                _lib_write_io.release_admission(verdict)
+        except Exception as exc:  # noqa: BLE001 — an evaluator bug must not
+            # stop ingest: the verdict is read as None (the hold stays, fail
+            # closed like every other missing-evidence path) and the loop
+            # keeps running. Logged once per loop.
+            if not evaluator_failed:
+                evaluator_failed = True
+                eprint("[conversations] writeIo startup evaluator failed: "
+                       f"{type(exc).__name__}: {exc}")
         if record is not None:
             record(
                 seq=seq,
@@ -9236,6 +9436,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 "conversation_sync": [
                     r.as_wire() for r in tick_state.conversation_records
                 ],
+                # #939 D5: the records' `started_ns`/`ended_ns` clock (the
+                # process monotonic clock) anchored to wall time in this
+                # response, so a harness can place its own judgements before
+                # or after a pass. One pair, not a field per record: the ring
+                # sits at the frozen 65,536-byte state budget.
+                "conversation_sync_clock": {
+                    "monotonic_ns": time.monotonic_ns(),
+                    "unix_ns": time.time_ns(),
+                },
                 # #780: the maintenance phases, published beside the sync ring
                 # rather than inside it. A reclaim that ran for its whole budget
                 # used to be indistinguishable from a fast one, because both
@@ -12539,6 +12748,11 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     _lib_write_io.register_local_instance(
         instance_id=write_instance_id, host=args.host,
         port=_resolve_dashboard_port(args.port))
+    # #939 D5: hold warm admission through the startup catch-up. Placed before
+    # the main sync thread can publish a non-cold snapshot, and only when the
+    # conversation loop (which releases it) will run.
+    if not args.no_sync:
+        _lib_write_io.hold_admission()
     sync_thread = (
         None if args.no_sync
         else _DashboardSyncThread(
@@ -12689,6 +12903,9 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         conversation_sync_stop.set()
         if conversation_sync_thread is not None:
             conversation_sync_thread.join(timeout=2)
+        # #939 D5: the loop's own `finally` releases the hold; a loop still
+        # finishing a pass after the bounded join must not leave it placed.
+        _lib_write_io.release_admission("loopExit")
         update_check_stop.set()
         memory_shutdown_errors = []
         try:

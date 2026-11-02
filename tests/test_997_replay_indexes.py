@@ -48,11 +48,14 @@ def _plan(conn, sql, params=None) -> str:
     return " | ".join(str(row[3]) for row in rows)
 
 
-#: `detect_reset_and_credit`'s prior weekly row (`_cctally_record`).
+#: `detect_reset_and_credit`'s prior weekly row (`_cctally_record`). #943:
+#: both prior-row lookups exclude the observation's own `sa:` row, and must
+#: stay on their replay indexes with that predicate.
 PRIOR_WEEKLY = (
     "SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots "
     "WHERE week_end_at IS NOT NULL AND account_key = ? "
     "  AND weekly_observation_held = 0 "
+    "  AND (? IS NULL OR journal_id IS NOT ?) "
     "ORDER BY captured_at_utc DESC, id DESC LIMIT 1")
 #: Its prior five-hour row.
 PRIOR_FIVE_HOUR = (
@@ -61,6 +64,7 @@ PRIOR_FIVE_HOUR = (
     " WHERE five_hour_window_key IS NOT NULL "
     "   AND five_hour_percent IS NOT NULL "
     "   AND account_key = ? "
+    "   AND (? IS NULL OR journal_id IS NOT ?) "
     " ORDER BY captured_at_utc DESC, id DESC LIMIT 1")
 #: The reset-crossing sweep (`_flag_blocks_spanning_week_resets`).
 SWEEP = (
@@ -103,19 +107,30 @@ def test_replay_index_plans(ns, tmp_path):
     import _cctally_core
     assert _source_has("_cctally_record", "WHERE week_end_at IS NOT NULL "
                        "AND account_key = ? AND weekly_observation_held = 0 "
+                       "AND (? IS NULL OR journal_id IS NOT ?) "
+                       "ORDER BY captured_at_utc DESC, id DESC LIMIT 1")
+    assert _source_has("_cctally_record", "AND account_key = ? "
+                       "AND (? IS NULL OR journal_id IS NOT ?) "
                        "ORDER BY captured_at_utc DESC, id DESC LIMIT 1")
     assert _source_has("_cctally_record", "WHERE ws.week_start_at IS NOT NULL")
     conn = _scratch(tmp_path)
+    own = "sa:o:0000000000000000"
     try:
         weekly = _plan(conn, PRIOR_WEEKLY)
         five = _plan(conn, PRIOR_FIVE_HOUR)
+        # A replay binds the observation's own `sa:` id; the plan must not
+        # change with it.
+        weekly_own = _plan(conn, PRIOR_WEEKLY, ["acct-a", own, own])
+        five_own = _plan(conn, PRIOR_FIVE_HOUR, ["acct-a", own, own])
         sweep = _plan(conn, SWEEP)
     finally:
         conn.close()
-    assert "USING INDEX replay_usage_latest_weekly" in weekly, weekly
-    assert "TEMP B-TREE" not in weekly, weekly
-    assert "USING INDEX replay_usage_latest_five_hour" in five, five
-    assert "TEMP B-TREE" not in five, five
+    for plan in (weekly, weekly_own):
+        assert "USING INDEX replay_usage_latest_weekly" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    for plan in (five, five_own):
+        assert "USING INDEX replay_usage_latest_five_hour" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
     assert "USING INDEX replay_usage_week_start" in sweep, sweep
 
     control = _cctally_core.open_db(_target_path=str(tmp_path / "plain.db"))
@@ -173,12 +188,15 @@ def _readings(J):
 
 #: A statement whose result cannot depend on visit order: a total order
 #: ending in the unique `id` (with or without `LIMIT 1`), an aggregate, an
-#: existence probe, or the sweep's per-row flag write.
+#: existence probe (also the open-block projection's cross-flag
+#: `SELECT EXISTS (…) OR EXISTS (…)`, #956 class 1), or the sweep's per-row
+#: flag write.
 _ORDER_INSENSITIVE = (
     re.compile(r"ORDER BY [^;]*\bid\s+(ASC|DESC)(\s+LIMIT\s+1)?\s*$",
                re.S | re.I),
     re.compile(r"^\s*SELECT\s+(MAX|MIN)\(", re.I),
     re.compile(r"^\s*SELECT\s+1\s+FROM\b.*\bLIMIT\s+1\s*$", re.S | re.I),
+    re.compile(r"^\s*SELECT\s+EXISTS\s*\(", re.I),
     re.compile(r"^\s*UPDATE\s+five_hour_blocks\s+SET\s+"
                r"crossed_seven_day_reset\b", re.I),
 )

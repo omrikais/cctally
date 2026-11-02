@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+import typing
 
 import pytest
 
@@ -26,8 +27,8 @@ NOW = 1791417600
 #: The compared families and, per family, the columns that make up its
 #: logical outcome (None = every column but `id`, the physical row id).
 #: #825/#832 fix round O3 (825-832-CD4-V01): every family, five-hour blocks
-#: included, is compared on every column but `id`; the only other columns
-#: left out are `_OPEN_BLOCK_UNCOMPARED`'s, on an OPEN block only.
+#: included, is compared on every column but `id`; the only other column
+#: left out is `_BLOCK_UNCOMPARED`'s (#956).
 #:
 #: The milestone tables joined in #825/#832 Task 4.0. A rebuild used to drop
 #: every milestone whose snapshot a five-hour credit's stale-replica removal
@@ -55,33 +56,17 @@ _FAMILIES = {
     "five_hour_milestones": None,
 }
 
-#: #825/#832 fix round O3 (825-832-CD4-V01): the columns of an OPEN
-#: five-hour block (`is_closed = 0`) the comparison leaves out, each with its
-#: reason. A closed block is a journaled `five_hour_block_close` fact and is
-#: compared on every column. The open block is the re-materialized projection
-#: (`docs/journal-gotchas.md`, "The open 5h block is a re-materialized
-#: PROJECTION"): live upserts it per observation, a rebuild re-derives it
-#: from the journal.
-#:
-#: Only row-write bookkeeping is left out, observed to differ and documented
-#: as a projection convention, never rendered as accounting (the five-hour
-#: CLI and dashboard render `last_observed_at_utc`, not these):
-#:
-#: * `created_at_utc`: the capture clock of the write that inserted the row;
-#:   the rebuild projection sets it to `first_observed_at_utc`.
-#: * `last_updated_at_utc`: the capture clock of the row's last write (an
-#:   upsert or a close sweep); the rebuild projection sets it to
-#:   `last_observed_at_utc`. Observed: old-recorder-weekly live 22:15:00Z vs
-#:   rebuild 22:00:00Z, `last_observed_at_utc` equal.
-#:
-#: #825/#832 fix round J4 (825-832-CD4-V01, #954): `first_observed_at_utc`
-#: and `pricing_provenance_json` are accounting content — the block's weekly
-#: start instant (`_block_weekly_start_instant`) and the computation-time
-#: pricing the `five_hour_block_close` harvest copies into the durable close
-#: — and are compared on the open block too.
-_OPEN_BLOCK_UNCOMPARED = frozenset({
-    "created_at_utc", "last_updated_at_utc",
-})
+#: #956 (spec 4.5.5): the only five-hour block column the comparison leaves
+#: out besides `id`, on an open and a closed block alike. It is row-write
+#: bookkeeping (the clock of the row's last write, an upsert, a projection
+#: refresh or a close sweep), never rendered as accounting. Every other
+#: column is compared: the end columns and totals come from one capture-order
+#: projection on every path (`_cctally_five_hour.project_open_block_end`), so
+#: `created_at_utc`, `last_observed_at_utc`, `final_five_hour_percent`,
+#: `seven_day_pct_at_block_end`, the totals and `pricing_provenance_json` are
+#: compared too. Before #956 the open block also left out `created_at_utc`,
+#: and the out-of-order trace needed a settling reading to agree.
+_BLOCK_UNCOMPARED = frozenset({"last_updated_at_utc"})
 
 #: Rowid foreign keys, per family, and how each resolves to a logical identity:
 #: a journaled table by its `journal_id`, the open block by its natural key.
@@ -136,9 +121,14 @@ def _identity(name):
     return _lib_accounts.account_key("claude", name)
 
 
-def _retain_session_input(app, name, account_key):
+#: The one model every retained entry is priced as, and its token shape.
+_ENTRY_MODEL = "claude-3-5-sonnet-20241022"
+_ENTRY_INPUT, _ENTRY_OUTPUT = 100, 10
+
+
+def _retain_session_input(app, name, account_key, offsets=(-10,)):
     """`db rederive` re-derives from retained session input; give each
-    observed account one priced entry."""
+    observed account one priced entry per offset (seconds from NOW)."""
     cache = app.open_cache_db()
     try:
         source = f"/retained/{name}/session.jsonl"
@@ -146,13 +136,14 @@ def _retain_session_input(app, name, account_key):
             "INSERT INTO session_files (path, size_bytes, mtime_ns, last_byte_offset,"
             " last_ingested_at, session_id, project_path) VALUES (?,?,?,?,?,?,?)",
             (source, 100, 1, 100, _iso(NOW), name, f"/retained/{name}"))
-        cache.execute(
-            "INSERT INTO session_entries (source_path, line_offset, timestamp_utc,"
-            " model, input_tokens, output_tokens, cache_create_tokens,"
-            " cache_read_tokens, cache_create_1h_tokens, account_key)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (source, 0, _iso(NOW - 10), "claude-3-5-sonnet-20241022", 100, 10,
-             0, 0, 0, account_key))
+        for line, offset in enumerate(offsets):
+            cache.execute(
+                "INSERT INTO session_entries (source_path, line_offset,"
+                " timestamp_utc, model, input_tokens, output_tokens,"
+                " cache_create_tokens, cache_read_tokens, cache_create_1h_tokens,"
+                " account_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (source, line, _iso(NOW + offset), _ENTRY_MODEL, _ENTRY_INPUT,
+                 _ENTRY_OUTPUT, 0, 0, 0, account_key))
         cache.commit()
     finally:
         cache.close()
@@ -160,7 +151,10 @@ def _retain_session_input(app, name, account_key):
 
 def _spool_and_reduce(app, name, session, weekly, five, at, five_reset):
     import _cctally_statusline as sl
-    _identity(name)
+    if name is None:
+        _unattributed()
+    else:
+        _identity(name)
     candidate = sl._candidate_from_input(app._lib_statusline.parse_statusline_stdin(
         json.dumps({"session_id": session, "rate_limits": {
             "seven_day": {"used_percentage": weekly, "resets_at": _iso(NOW + 3 * 86400)},
@@ -214,8 +208,8 @@ def _logical_state(app):
                     column: value for column, value in zip(columns, row)
                     if column != "id" and (keep is None or column in keep)
                 }
-                if table == "five_hour_blocks" and logical.get("is_closed") == 0:
-                    for column in _OPEN_BLOCK_UNCOMPARED:
+                if table == "five_hour_blocks":
+                    for column in _BLOCK_UNCOMPARED:
                         logical.pop(column, None)
                 for column, (ref_table, identity) in fks.items():
                     logical[column] = _logical_fk(
@@ -330,10 +324,13 @@ def test_m19_live_rebuild_and_rederive_yield_the_same_account_local_outcomes(
     _spool_and_reduce(app, "A", "a-high", 30, 70, 0, boundary)
     _spool_and_reduce(app, "B", "b-1", 40, 60, 0, resets["B"])
     # Bound recordings with a same-source five-hour descent and confirmation
-    # in each account: an account-local five-hour credit.
+    # in each account: an account-local five-hour credit. A's descent also
+    # crosses weekly 31, so a weekly milestone names the arming snapshot,
+    # which its credit's stale-replica band reaches (#943: the band starts
+    # at the arming capture, so the t=0 readings stay out of it).
     for at, (a_five, b_five) in ((2, (20, 15)), (4, (20, 15))):
         _tick(monkeypatch, at)
-        _record(app, "A", 30, a_five, resets["A"])
+        _record(app, "A", 31, a_five, resets["A"])
         _record(app, "B", 40, b_five, resets["B"])
     # A real calibration transition (Codex fix-round-2 Q3, P3-10): listing an
     # empty family compares nothing.
@@ -354,7 +351,8 @@ def test_m19_live_rebuild_and_rederive_yield_the_same_account_local_outcomes(
     assert accounts == set(keys.values())
     # Non-vacuity for the milestone families: the trace crosses weekly and
     # five-hour thresholds in both accounts, and at least one milestone names
-    # a snapshot a credit's stale-replica cleanup reached. Under either fold
+    # a snapshot a credit's stale-replica cleanup reached (A's arming
+    # snapshot, named by its weekly 31 milestone). Under either fold
     # policy that unheld snapshot is retired in place, its weekly evidence
     # kept, so the milestone keeps naming it (fix round K15; before it the
     # historical policy deleted the row and the milestone named 0).
@@ -566,8 +564,10 @@ _SUCCESSOR_RESET = _CLOSE_RESET + 5 * 3600
 def _block_close_trace(ns, monkeypatch, tmp_path, *, rebuild):
     """One account's five-hour window observed at 60% (t=0), then a
     same-source descent to 15% (t=2, armed) and its confirmation (t=4): an
-    in-place five-hour credit whose stale-replica removal deletes the
-    window's FIRST snapshot (the band starts at floor10 of the arming tick).
+    in-place five-hour credit. Before #943 its stale-replica removal deleted
+    the window's FIRST snapshot (the band started at floor10 of the arming
+    tick); since #943 the band starts at the arming capture, so that genuine
+    earlier reading survives.
     ``rebuild`` runs a real `db rebuild` there. A reading of the successor
     window (t=6) then closes the block. Returns the open block before the
     successor, the surviving snapshots' first capture, the closed row and
@@ -635,7 +635,7 @@ def test_m19_a_rebuilt_open_block_closes_with_its_live_observation_and_pricing(
     """#954: a real rebuild re-materializes the open block, and a successor
     window then closes it. The re-materialized block, the closed row and the
     durable `five_hour_block_close` record carry the live first observation
-    — although the credit's stale-replica removal deleted that snapshot —
+    — which, before #943, the credit's stale-replica removal deleted —
     and the live computation-time pricing provenance."""
     ns = load_script()
     monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
@@ -643,11 +643,14 @@ def test_m19_a_rebuilt_open_block_closes_with_its_live_observation_and_pricing(
                         lambda: None)
     live_open, surviving, live_closed, live_close = _block_close_trace(
         ns, monkeypatch, tmp_path / "live", rebuild=False)
-    # Non-vacuity: the live first observation is the t=0 reading, whose
-    # snapshot the stale-replica removal deleted, and live stamped pricing.
+    # Non-vacuity: the live first observation is the t=0 reading, and live
+    # stamped pricing. #943 (accuracy: a credit deleting a genuine reading
+    # captured before its descent armed): the t=0 snapshot precedes the
+    # arming capture, so the stale-replica band no longer reaches it and it
+    # survives; before #943 it was deleted (`surviving` was the t=2 row).
     assert live_open["first_observed_at_utc"].startswith(
         _iso(NOW).replace("Z", "")), live_open
-    assert surviving > live_open["first_observed_at_utc"], (
+    assert surviving.startswith(_iso(NOW).replace("Z", "")), (
         surviving, live_open)
     assert live_open["pricing_provenance_json"], live_open
 
@@ -659,22 +662,6 @@ def test_m19_a_rebuilt_open_block_closes_with_its_live_observation_and_pricing(
         assert close.get(column) == live_close.get(column), (column, close)
     assert closed == live_closed
     assert close == live_close
-
-
-# --------------------------------------------------------------------------
-# #825/#832 fix round J5 (825-832-CD4-V01, #954): the FIRST WRITER, not the
-# earliest capture, owns the open block's start columns. Two recorders of
-# one account race: A captures first but appends last, so live ingest
-# materializes the block from B's later reading and keeps B's start columns
-# when A's earlier-captured reading is accepted after it.
-# --------------------------------------------------------------------------
-
-#: The block columns the first materializing writer owns (none is in the
-#: live upsert's `DO UPDATE`).
-_BLOCK_START_COLUMNS = (
-    "first_observed_at_utc", "five_hour_resets_at", "block_start_at",
-    "seven_day_pct_at_block_start",
-)
 
 
 def _drive_replay(app, monkeypatch, replay):
@@ -714,126 +701,539 @@ def _drive_replay(app, monkeypatch, replay):
     assert args.func(args) == 0
 
 
-def _out_of_order_trace(ns, monkeypatch, tmp_path, *, replay):
-    """Recorder A captures 40% / 50% at t=0 and pauses before appending;
-    recorder B captures 40% / 35% at t=2, appends and ingests first,
-    materializing the block; A then appends and ingests its t=0 reading,
-    which is accepted (its five-hour value is new). A later reading at t=4
-    updates the block's mutable columns. ``replay`` (None for live) then
-    runs there, and a reading of the successor window (t=6) closes the
-    block. Returns the open block before the successor, the window's
-    earliest surviving capture, the closed row and the durable close
-    payload."""
+# --------------------------------------------------------------------------
+# #956 class 1 (spec 4.5, test 6.6): the open five-hour block's END columns,
+# totals, children and pricing come from ONE capture-order projection on
+# live ingest, derivation completion, rebuild, epoch transition, corruption
+# heal and rederive. Each schedule below is replayed and compared on every
+# compared family (five-hour blocks on every column but `id` and
+# `last_updated_at_utc`), on the later closed row and on its durable
+# `five_hour_block_close` payload; and live is checked against independent
+# expected values (the end reading each schedule names, and token and cost
+# totals summed from the fixture's own retained entries), because identical
+# wrong selectors or zeroed totals would also agree.
+# --------------------------------------------------------------------------
+
+#: A window whose reset lies one hour after `_CLOSE_RESET`, so the two
+#: canonical windows overlap for four hours ([`_OVERLAP_RESET` - 5h,
+#: `_CLOSE_RESET`)), where the earlier-reset window owns an entry.
+_OVERLAP_RESET = _CLOSE_RESET + 3600
+_OVERLAP_SUCCESSOR_RESET = _OVERLAP_RESET + 5 * 3600
+
+#: The replay legs a schedule is run through (spec 4.5.3): `rederive` runs
+#: the live pipeline; `rebuilds` chains `db rebuild`, the account epoch
+#: transition and the corrupt-index heal, comparing after each; `completion`
+#: leaves the stage's last recording underived (its ingest never ran) and
+#: lets the rebuild's derivation completion derive it.
+_LEGS = ("rederive", "rebuilds", "completion")
+_LEG_REPLAYS = {
+    "rederive": ("rederive",),
+    "rebuilds": ("rebuild", "epoch-transition", "corruption-heal"),
+    "completion": ("rebuild",),
+}
+
+def _entry_cost():
+    """One retained entry's USD cost, from the embedded price card (never
+    from a block row)."""
+    import _lib_pricing
+    card = _lib_pricing.CLAUDE_MODEL_PRICING[_ENTRY_MODEL]
+    return (_ENTRY_INPUT * card["input_cost_per_token"]
+            + _ENTRY_OUTPUT * card["output_cost_per_token"])
+
+
+def _epoch(stamp):
+    return int(dt.datetime.fromisoformat(
+        stamp.replace("Z", "+00:00")).timestamp())
+
+
+class _Recorder:
+    """The recorders a schedule drives, each through its real entry point:
+    `bound` (`record_usage_bound`, the status-line source), `cli` (the manual
+    `cctally record-usage` handler), `publication` (the status-line spool and
+    reducer, which journals a planned window key) and `credit` (`cctally
+    record-credit`).
+
+    ``during`` runs before this recording's observation reaches the journal,
+    so an earlier capture is appended (and derived) after a later one.
+    ``owed`` (the completion leg only) skips this recording's own ingest, so
+    the observation is in the journal but underived. ``batched`` always skips
+    it: the next recording's ingest derives both in one cycle."""
+
+    def __init__(self, app, monkeypatch, *, owe):
+        self.app = app
+        self.monkeypatch = monkeypatch
+        self.owe = owe
+        self.owed = []
+        self.obs = {}
+
+    def _run(self, label, at, call, *, during, skip_ingest):
+        import types
+        import _cctally_journal as jr
+        real_append = jr.append_record
+        real_ingest = jr.run_stats_ingest
+        state = {"done": False, "skip": False}
+
+        def append(record, *args, **kwargs):
+            if not state["done"] and record.get("t") == "obs":
+                state["done"] = True
+                if during is not None:
+                    during()
+                result = real_append(record, *args, **kwargs)
+                self.obs[label] = record
+                state["skip"] = skip_ingest
+                return result
+            return real_append(record, *args, **kwargs)
+
+        def ingest(*args, **kwargs):
+            if state["skip"]:
+                state["skip"] = False
+                return types.SimpleNamespace(ran=False, error=None,
+                                             events_emitted=0)
+            return real_ingest(*args, **kwargs)
+
+        _tick(self.monkeypatch, at)
+        with self.monkeypatch.context() as patch:
+            patch.setattr(jr, "append_record", append)
+            patch.setattr(jr, "run_stats_ingest", ingest)
+            assert call() == 0, label
+        assert state["done"], f"non-vacuity: {label} appended an observation"
+
+    def _skip(self, owed, batched):
+        if owed and self.owe:
+            self.owed.append(owed)
+        return batched or (owed is not None and self.owe)
+
+    def bound(self, label, at, weekly, five, reset, *, during=None, owed=None,
+              batched=False, planned=None):
+        import _cctally_statusline as sl
+        args = argparse.Namespace(
+            percent=weekly, resets_at=str(NOW + 3 * 86400),
+            five_hour_percent=five, five_hour_resets_at=str(reset),
+            source="statusline")
+        if planned is not None:
+            args.five_hour_window_key = planned
+        self._run(label, at, lambda: self.app.record_usage_bound(
+            args, binding=sl._capture_binding(), nudge_dashboard=False),
+            during=during, skip_ingest=self._skip(owed, batched))
+
+    def cli(self, label, at, weekly, five, reset, *, owed=None, batched=False):
+        import _cctally_record as rec
+        args = argparse.Namespace(
+            percent=weekly, resets_at=str(NOW + 3 * 86400),
+            five_hour_percent=five, five_hour_resets_at=str(reset))
+        self._run(label, at, lambda: rec.cmd_record_usage(
+            args, nudge_dashboard=False), during=None,
+            skip_ingest=self._skip(owed, batched))
+
+    def publication(self, name, at, weekly, five, reset):
+        _tick(self.monkeypatch, at)
+        _spool_and_reduce(self.app, name, "b-1", weekly, five, at, reset)
+
+    def credit(self, at, to, credit_at, *, force=False):
+        _tick(self.monkeypatch, at)
+        argv = ["record-credit", "--to", str(to), "--at",
+                _iso(NOW + credit_at), "--yes", "--json"]
+        if force:
+            argv.append("--force")
+        args = self.app.build_parser().parse_args(argv)
+        assert args.func(args) == 0, argv
+
+
+def _unattributed():
+    """No active Claude identity: readings bind to `unattributed`."""
+    import _cctally_core as core
+    import _lib_accounts
+    if core.CLAUDE_JSON_PATH.exists():
+        core.CLAUDE_JSON_PATH.unlink()
+    core._ACTIVE_CLAUDE_ACCOUNT_CACHE.update(sig=None, identity=None)
+    return _lib_accounts.UNATTRIBUTED
+
+
+def _journal_records():
     import _cctally_journal as jr
-    import _cctally_statusline as sl
     import _lib_journal as J
-    redirect_paths(ns, monkeypatch, tmp_path)
-    app = sys.modules["cctally"]
-    app.open_db().close()
-    key = _identity("B")
-    _retain_session_input(app, "B", key)
-    real_append = jr.append_record
-    paused = {"A": True}
-
-    def append_after_b(record, *args, **kwargs):
-        # A's usage observation reaches the journal only after B's
-        # recording has appended and ingested in full.
-        if paused["A"] and record.get("t") == "obs":
-            paused["A"] = False
-            _tick(monkeypatch, 2)
-            _record(app, "B", 40, 35, _CLOSE_RESET)
-        return real_append(record, *args, **kwargs)
-
-    _tick(monkeypatch, 0)
-    _identity("B")
-    args = argparse.Namespace(
-        percent=40, resets_at=str(NOW + 3 * 86400), five_hour_percent=50,
-        five_hour_resets_at=str(_CLOSE_RESET), source="statusline")
-    with monkeypatch.context() as patch:
-        patch.setattr(jr, "append_record", append_after_b)
-        assert app.record_usage_bound(args, binding=sl._capture_binding(),
-                                      nudge_dashboard=False) == 0
-    assert not paused["A"], "non-vacuity: B ran inside A's pause"
-    _tick(monkeypatch, 4)
-    _record(app, "B", 40, 55, _CLOSE_RESET)
-    if replay is not None:
-        _drive_replay(app, monkeypatch, replay)
-    conn = app.open_db()
-    try:
-        columns = [row[1] for row in conn.execute(
-            "PRAGMA table_info(five_hour_blocks)") if row[1] != "id"]
-        [opened] = conn.execute(
-            f"SELECT {', '.join(columns)} FROM five_hour_blocks"
-            " WHERE is_closed = 0").fetchall()
-        opened = dict(zip(columns, opened))
-        surviving = conn.execute(
-            "SELECT MIN(captured_at_utc) FROM weekly_usage_snapshots"
-            " WHERE account_key = ? AND five_hour_window_key = ?",
-            (key, opened["five_hour_window_key"])).fetchone()[0]
-    finally:
-        conn.close()
-    _tick(monkeypatch, 6)
-    _record(app, "B", 40, 20, _SUCCESSOR_RESET)
-    conn = app.open_db()
-    try:
-        closed = conn.execute(
-            f"SELECT {', '.join(columns)} FROM five_hour_blocks"
-            " WHERE is_closed = 1 AND five_hour_window_key = ?",
-            (opened["five_hour_window_key"],)).fetchall()
-    finally:
-        conn.close()
-    assert len(closed) == 1, closed
-    closes = []
+    out = []
     for segment in jr.list_segments():
         for line in (jr._cctally_core.JOURNAL_DIR / segment).read_bytes(
                 ).splitlines():
             record = J.decode_line(line)
-            payload = (record or {}).get("payload") or {}
-            if (payload.get("kind") == "five_hour_block_close"
-                    and payload.get("five_hour_window_key")
-                    == opened["five_hour_window_key"]):
-                closes.append(payload)
-    assert len(closes) == 1, closes
-    return opened, surviving, dict(zip(columns, closed[0])), closes[0]
+            if record is not None:
+                out.append(record)
+    return out
 
 
-@pytest.mark.parametrize(
-    "replay", ["rebuild", "rederive", "epoch-transition", "corruption-heal"])
-def test_m19_a_replayed_open_block_keeps_its_first_writer_under_out_of_order_capture(
-        monkeypatch, tmp_path, replay):
-    """825-832-CD4-V01: recorder A captures first and appends last. Live
-    ingest materializes the block from B's later reading, and its upsert
-    keeps B's start columns when A's earlier-captured reading is accepted
-    after it. A replay re-materializes the open block with the same first
-    writer, so the open row, the row a successor then closes and the
-    durable `five_hour_block_close` match live, although a snapshot captured
-    before the first writer survives."""
+def _close_payloads():
+    """Every durable `five_hour_block_close` payload, keyed by window, with
+    `last_updated_at_utc` (row-write bookkeeping) left out."""
+    closes = {}
+    for record in _journal_records():
+        payload = record.get("payload") or {}
+        if payload.get("kind") == "five_hour_block_close":
+            kept = {k: v for k, v in payload.items()
+                    if k not in _BLOCK_UNCOMPARED}
+            closes.setdefault(
+                (payload["account_key"], payload["five_hour_window_key"]),
+                []).append(json.dumps(kept, sort_keys=True, default=str))
+    return closes
+
+
+def _blocks(state):
+    """The compared five-hour block rows of one logical state, in window
+    order."""
+    return sorted((json.loads(row) for row in state["five_hour_blocks"]),
+                  key=lambda row: row["five_hour_window_key"])
+
+
+def _expect_block(block, *, end_at, final, weekly_end, entries,
+                  first_at=None, is_closed=None):
+    """Assert one block's end reading and totals against independent values:
+    the capture (seconds from NOW) and readings of the reading that must be
+    its end, and how many retained entries it owns."""
+    assert _epoch(block["last_observed_at_utc"]) == NOW + end_at, block
+    assert block["final_five_hour_percent"] == final, block
+    assert block["seven_day_pct_at_block_end"] == weekly_end, block
+    assert block["total_input_tokens"] == entries * _ENTRY_INPUT, block
+    assert block["total_output_tokens"] == entries * _ENTRY_OUTPUT, block
+    assert block["total_cost_usd"] == pytest.approx(
+        entries * _entry_cost(), abs=1e-12), block
+    if first_at is not None:
+        assert _epoch(block["first_observed_at_utc"]) == NOW + first_at, block
+    if is_closed is not None:
+        assert block["is_closed"] == is_closed, block
+
+
+def _window_of(state, reset):
+    [block] = [row for row in _blocks(state)
+               if _epoch(row["five_hour_resets_at"]) == reset]
+    return block
+
+
+# -- schedules ---------------------------------------------------------------
+# Each schedule: `offsets` of its retained entries, `stages` (each a callable
+# over a `_Recorder`), an optional `close` stage (a successor reading after
+# the replays), and `expect(live_states)` over the live state after each stage
+# and after the close.
+
+def _ooo_window_stages(r):
+    # Recorder A captures 40/50 at t=0 and pauses; recorder B captures 40/35
+    # at t=2, appends and ingests first, materializing the block; A then
+    # appends its t=0 reading, accepted (its five-hour value is new). No
+    # later reading settles the end.
+    r.bound("A", 0, 40, 50, _CLOSE_RESET, owed="A", during=lambda: r.bound(
+        "B", 2, 40, 35, _CLOSE_RESET))
+
+
+def _ooo_window_expect(states):
+    # The end is the latest CAPTURE's (B, t=2, 35%), never the journal-last
+    # older reading's (A, t=0, 50%), and the totals run to it: the entry at
+    # t=1 lies after A's capture. B is the block's first writer.
+    opened, closed = states
+    _expect_block(_window_of(opened, _CLOSE_RESET), end_at=2, final=35.0,
+                  weekly_end=40.0, entries=2, first_at=2, is_closed=0)
+    _expect_block(_window_of(closed, _CLOSE_RESET), end_at=2, final=35.0,
+                  weekly_end=40.0, entries=2, first_at=2, is_closed=1)
+
+
+def _ooo_across_stages(r):
+    # A newer window is recorded first (B, t=1000); then A's earlier-captured
+    # reading of the OLDER, overlapping window is appended and creates its
+    # block late. Both blocks stay open. The entry at t=-10 lies in the
+    # overlap and belongs to the earlier-reset window (#751a), so A's late
+    # creation must take it from B's open block.
+    r.bound("A", 0, 40, 30, _CLOSE_RESET, owed="A", during=lambda: r.bound(
+        "B", 1000, 40, 50, _OVERLAP_RESET))
+
+
+def _ooo_across_close(r):
+    r.bound("C", 1200, 40, 20, _OVERLAP_SUCCESSOR_RESET)
+
+
+def _ooo_across_expect(states):
+    opened, closed = states
+    _expect_block(_window_of(opened, _CLOSE_RESET), end_at=0, final=30.0,
+                  weekly_end=40.0, entries=1, is_closed=0)
+    _expect_block(_window_of(opened, _OVERLAP_RESET), end_at=1000, final=50.0,
+                  weekly_end=40.0, entries=1, is_closed=0)
+    _expect_block(_window_of(closed, _CLOSE_RESET), end_at=0, final=30.0,
+                  weekly_end=40.0, entries=1, is_closed=1)
+    _expect_block(_window_of(closed, _OVERLAP_RESET), end_at=1000,
+                  final=50.0, weekly_end=40.0, entries=1, is_closed=1)
+
+
+#: The equal-second tie's two five-hour readings: B (appended first) and A
+#: (appended last). A is the larger, so the fold clamps neither, and at these
+#: values A's observation id sorts BELOW B's (the non-vacuity assertion in
+#: `_tie_expect` pins that), so identity order and journal order disagree.
+_TIE_B, _TIE_A = 38.0, 44.0
+
+
+def _tie_stages(r):
+    # Two recorders capture the SAME second; B appends first, A last.
+    r.bound("A", 2, 40, _TIE_A, _CLOSE_RESET, owed="A", during=lambda: r.bound(
+        "B", 2, 40, _TIE_B, _CLOSE_RESET))
+
+
+def _tie_expect(states, recorder):
+    # The tie breaks on logical identity (`journal_id DESC`), never on
+    # journal or rowid order: non-vacuity requires that the journal-last
+    # reading (A) is NOT the one the identity order selects.
+    winner = max(("A", "B"), key=lambda label: "sa:" + recorder.obs[label]["id"])
+    assert winner == "B", (
+        "non-vacuity: the journal-last reading must lose the identity tie",
+        {k: "sa:" + v["id"] for k, v in recorder.obs.items()})
+    opened, closed = states
+    for state, is_closed in ((opened, 0), (closed, 1)):
+        _expect_block(_window_of(state, _CLOSE_RESET), end_at=2,
+                      final=_TIE_B, weekly_end=40.0, entries=1,
+                      is_closed=is_closed)
+
+
+def _credit_stages(r):
+    # J6-E01 / #954. Within one window and source, weekly 40 steady: 70 is
+    # captured and appended at t=120 (the window's first snapshot and first
+    # writer); a delayed 20 captured at t=0 is appended after it (a descent:
+    # it arms a five-hour credit at its own capture); a distinct delayed 25
+    # captured at t=60 confirms. The credit's stale-replica band starts at
+    # the arming capture (t=0), so it retires the first writer's 70 — the
+    # latest-captured snapshot and the block's end until then.
+    r.bound("A20", 0, 40, 20, _CLOSE_RESET, during=lambda: r.bound(
+        "X70", 120, 40, 70, _CLOSE_RESET))
+    # Not owed on the completion leg: the source-local confirmation state is
+    # disposable (`docs/five-hour-gotchas.md`, the admitted cold-start gap),
+    # so a confirmation derived after a rebuild has no armed descent to
+    # confirm, and that leg is a plain rebuild here.
+    r.bound("C25", 60, 40, 25, _CLOSE_RESET)
+
+
+def _credit_close(r):
+    r.bound("S", 300, 40, 20, _SUCCESSOR_RESET)
+
+
+def _credit_expect(states, recorder):
+    [credit] = [record["payload"] for record in _journal_records()
+                if (record.get("payload") or {}).get("kind")
+                == "five_hour_credit"]
+    assert "sa:" + recorder.obs["X70"]["id"] in (credit.get("suppression")
+                                                 or []), (
+        "non-vacuity: the credit's suppression names the window's first "
+        "snapshot (#954)", credit)
+    # The suppression moved the end backward to the latest SURVIVING reading
+    # (C25, t=60), and the first writer (X70, t=120) keeps the start.
+    opened, closed = states
+    for state, is_closed in ((opened, 0), (closed, 1)):
+        _expect_block(_window_of(state, _CLOSE_RESET), end_at=60, final=25.0,
+                      weekly_end=40.0, entries=1, first_at=120,
+                      is_closed=is_closed)
+
+
+def _force_stages_credit(r):
+    r.bound("T0", 0, 40, 30, _CLOSE_RESET)
+    r.bound("T2", 2, 41, 34, _CLOSE_RESET)
+    # The synthetic of `record-credit --at t=3` is the window's latest
+    # capture: it carries the window's five-hour reading and the credited 5.
+    r.credit(4, 5, 3)
+
+
+def _force_stages_force(r):
+    # `--force` removes that synthetic; its replacement is captured at t=1,
+    # so the end moves back to the latest surviving reading (t=2).
+    r.credit(5, 6, 1, force=True)
+
+
+def _force_close(r):
+    r.bound("S", 8, 6, 20, _SUCCESSOR_RESET)
+
+
+def _force_expect(states):
+    synthetic, forced, closed = states
+    _expect_block(_window_of(synthetic, _CLOSE_RESET), end_at=3, final=34.0,
+                  weekly_end=5.0, entries=1, is_closed=0)
+    [t2] = [json.loads(row) for row in forced["weekly_usage_snapshots"]
+            if _epoch(json.loads(row)["captured_at_utc"]) == NOW + 2]
+    for state, is_closed in ((forced, 0), (closed, 1)):
+        _expect_block(_window_of(state, _CLOSE_RESET), end_at=2, final=34.0,
+                      weekly_end=t2["weekly_percent"], entries=1,
+                      is_closed=is_closed)
+
+
+def _held_rollover_stages(r):
+    # CD4-V01. The weekly basis is 63; a new window is then read at a raw
+    # weekly 60, which the fold holds at 63. An unplanned reading (the manual
+    # CLI) and a planned one (an explicit account-local key) of the new
+    # window are ingested in ONE cycle; the unplanned one is appended first
+    # and is the new block's first writer.
+    r.bound("W0", 0, 63, 30, _CLOSE_RESET)
+    r.cli("U", 2, 60, 30, _SUCCESSOR_RESET, batched=True)
+    r.bound("P", 4, 60, 32, _SUCCESSOR_RESET, planned=_SUCCESSOR_RESET,
+            owed="P")
+
+
+def _held_rollover_expect(states):
+    [state] = states
+    _expect_block(_window_of(state, _CLOSE_RESET), end_at=0, final=30.0,
+                  weekly_end=63.0, entries=1, is_closed=1)
+    successor = _window_of(state, _SUCCESSOR_RESET)
+    # The fold-effective weekly value (63), never the raw reading (60).
+    assert successor["seven_day_pct_at_block_start"] == 63.0, successor
+    _expect_block(successor, end_at=4, final=32.0, weekly_end=63.0,
+                  entries=0, first_at=2, is_closed=0)
+
+
+def _cli_heal_stages(r):
+    # J6-E02 (manual CLI), recorded under the historical fold policy (every
+    # observation before #825/#832; the current policy writes a new window's
+    # first reading as a snapshot): the successor-window reading repeats the
+    # last snapshot's weekly and five-hour values, so it is a dedup skip and
+    # the rollover heal opens its block without a snapshot.
+    # Not owed on the completion leg: a dedup skip writes no snapshot
+    # decision, so a completion has no reading of its own to derive here.
+    r.cli("W0", 0, 40, 30, _CLOSE_RESET)
+    r.cli("W1", 2, 40, 30, _SUCCESSOR_RESET)
+
+
+def _publication_heal_stages(r):
+    # J6-E02 (unattributed, planned): the same rollover through the
+    # status-line reducer with no active Claude identity.
+    _unattributed()
+    r.publication(None, 0, 40, 30, _CLOSE_RESET)
+    r.publication(None, 2, 40, 30, _SUCCESSOR_RESET)
+
+
+def _heal_expect(states):
+    [state] = states
+    _expect_block(_window_of(state, _CLOSE_RESET), end_at=0, final=30.0,
+                  weekly_end=40.0, entries=1, is_closed=1)
+    healed = _window_of(state, _SUCCESSOR_RESET)
+    # Non-vacuity: the heal opened the block with no snapshot of its window,
+    # so its end is the opening reading (the selection is empty).
+    assert not [row for row in state["weekly_usage_snapshots"]
+                if json.loads(row)["five_hour_window_key"]
+                == healed["five_hour_window_key"]], state
+    _expect_block(healed, end_at=2, final=30.0, weekly_end=40.0, entries=0,
+                  first_at=2, is_closed=0)
+
+
+class _Schedule(typing.NamedTuple):
+    offsets: tuple                 # retained entries, seconds from NOW
+    stages: tuple                  # each a callable over a `_Recorder`
+    close: object                  # a successor stage after the replays
+    expect: object                 # expect(live_states, recorder)
+    unattributed: bool = False     # recorded with no active identity
+    historical: bool = False       # observations carry no fold policy
+
+
+_SCHEDULES = {
+    "ooo-window": _Schedule(
+        (-10, 1), (_ooo_window_stages,), _credit_close,
+        lambda s, r: _ooo_window_expect(s)),
+    "ooo-across-overlap": _Schedule(
+        (-10, 800), (_ooo_across_stages,), _ooo_across_close,
+        lambda s, r: _ooo_across_expect(s)),
+    "equal-second-tie": _Schedule(
+        (-10,), (_tie_stages,), _credit_close, _tie_expect),
+    "credit-suppressed-end": _Schedule(
+        (-10,), (_credit_stages,), _credit_close, _credit_expect),
+    "record-credit-force": _Schedule(
+        (-10,), (_force_stages_credit, _force_stages_force), _force_close,
+        lambda s, r: _force_expect(s)),
+    "held-rollover-mixed-cycle": _Schedule(
+        (-10,), (_held_rollover_stages,), None,
+        lambda s, r: _held_rollover_expect(s)),
+    "manual-cli-heal": _Schedule(
+        (-10,), (_cli_heal_stages,), None, lambda s, r: _heal_expect(s),
+        historical=True),
+    "unattributed-planned-heal": _Schedule(
+        (-10,), (_publication_heal_stages,), None,
+        lambda s, r: _heal_expect(s),
+        unattributed=True, historical=True),
+}
+
+
+def _run_schedule(ns, monkeypatch, tmp_path, name, *, leg):
+    """One run of a schedule: live (``leg`` None) or through a replay leg.
+    Returns the logical state after each stage (after each of its replays on
+    a replay leg), the state after the close, the close payloads and the
+    recorder."""
+    schedule = _SCHEDULES[name]
+    redirect_paths(ns, monkeypatch, tmp_path)
+    app = sys.modules["cctally"]
+    app.open_db().close()
+    if schedule.historical:
+        _record_historical_policy(monkeypatch)
+    if schedule.unattributed:
+        _retain_session_input(app, "unattributed", _unattributed(),
+                              schedule.offsets)
+    else:
+        _retain_session_input(app, "B", _identity("B"), schedule.offsets)
+    recorder = _Recorder(app, monkeypatch, owe=(leg == "completion"))
+    states = []
+    for stage in schedule.stages:
+        recorder.owed.clear()
+        stage(recorder)
+        if leg is None:
+            states.append({"live": _logical_state(app)})
+            continue
+        replayed = {}
+        for replay in _LEG_REPLAYS[leg]:
+            _drive_replay(app, monkeypatch, replay)
+            replayed[replay] = _logical_state(app)
+        if recorder.owed:
+            # Non-vacuity: the completion derived the reading whose ingest
+            # never ran — its snapshot decision is now journaled.
+            accepted = {record["id"] for record in _journal_records()
+                        if record.get("t") == "evt"}
+            for label in recorder.owed:
+                assert "sa:" + recorder.obs[label]["id"] in accepted, (
+                    "the completion left an owed reading underived", label)
+        states.append(replayed)
+    if schedule.close is not None:
+        schedule.close(recorder)
+        states.append({"close": _logical_state(app)})
+    return states, _close_payloads(), recorder
+
+
+def _schedule_params():
+    return [pytest.param(name, leg, id=f"{name}-{leg}")
+            for name in _SCHEDULES for leg in _LEGS]
+
+
+@pytest.mark.parametrize("name,leg", _schedule_params())
+def test_m19_the_open_block_end_is_one_capture_order_projection_on_every_path(
+        monkeypatch, tmp_path, name, leg):
+    """#956 (spec 4.5, 4.6): detects live and replay disagreeing on the
+    open block's end columns, totals, children, pricing or open population,
+    and an end that is not the window's latest surviving capture. Live ingest
+    left the end of the journal-last reading (an earlier capture appended
+    later kept `last_observed < first_observed`, its totals cut at the older
+    capture), never refreshed an open block whose ownership a late-created
+    predecessor changed, ignored a `record-credit` synthetic, and broke an
+    equal-second tie by journal order, while the rebuild projected the
+    latest capture. And an apply-only replay re-materialized only each
+    account's latest-captured window, so a second open window and a block a
+    snapshotless rollover heal opened were lost; every creation now retains
+    an opening fact (`five_hour_block_open`) whose fold materializes the
+    block. Each schedule is compared after each stage's replays, through its
+    later close and the durable close payload, against live and against its
+    independent expected values."""
     ns = load_script()
     monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
     monkeypatch.setattr(sys.modules["cctally"], "_nudge_dashboard_repaint",
                         lambda: None)
-    live_open, surviving, live_closed, live_close = _out_of_order_trace(
-        ns, monkeypatch, tmp_path / "live", replay=None)
-    # Non-vacuity: B (t=2) is the first writer, and A's accepted t=0
-    # snapshot survives, captured before it.
-    assert live_open["first_observed_at_utc"].startswith(
-        _iso(NOW + 2).replace("Z", "")), live_open
-    assert surviving.startswith(_iso(NOW).replace("Z", "")), surviving
-    assert surviving < live_open["first_observed_at_utc"]
-
-    replayed_open, _surviving, closed, close = _out_of_order_trace(
-        ns, monkeypatch, tmp_path / "replayed", replay=replay)
-    for column in _BLOCK_START_COLUMNS:
-        assert replayed_open[column] == live_open[column], (
-            column, replayed_open, live_open)
-        assert closed[column] == live_closed[column], (column, closed)
-        assert close.get(column) == live_close.get(column), (column, close)
-    for column in _OPEN_BLOCK_UNCOMPARED:
-        replayed_open.pop(column)
-        live_open.pop(column)
-    assert replayed_open == live_open
-    assert closed == live_closed
-    assert close == live_close
+    schedule = _SCHEDULES[name]
+    live, live_closes, live_recorder = _run_schedule(
+        ns, monkeypatch, tmp_path / "live", name, leg=None)
+    schedule.expect([next(iter(stage.values())) for stage in live],
+                    live_recorder)
+    replayed, closes, _recorder = _run_schedule(
+        ns, monkeypatch, tmp_path / "replayed", name, leg=leg)
+    for live_stage, replayed_stage in zip(live, replayed):
+        [expected] = live_stage.values()
+        for replay, state in replayed_stage.items():
+            diff = _state_diff(expected, state)
+            if diff:
+                pytest.fail(f"{name}: {replay} changed logical state:\n"
+                            + json.dumps(diff, indent=1), pytrace=False)
+    assert closes == live_closes
 
 
 def _accept(J, event_id, captured, weekly, window=1791421200, account="acct"):

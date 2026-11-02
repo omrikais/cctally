@@ -149,9 +149,10 @@ def test_a_looping_trunk_chain_refuses():
 def test_the_audited_range_is_a_constant_beside_g3q():
     planner = _planner()
     assert (planner.AUDITED_SQLITE_MIN, planner.AUDITED_SQLITE_MAX) == (
-        (3, 37, 2), (3, 54, 0))
+        (3, 37, 2), (3, 54, 1))
     assert planner.sqlite_audited((3, 53, 4))
-    assert not planner.sqlite_audited((3, 54, 1))
+    assert planner.sqlite_audited((3, 54, 1))
+    assert not planner.sqlite_audited((3, 54, 2))
     assert not planner.sqlite_audited((3, 37, 1))
 
 

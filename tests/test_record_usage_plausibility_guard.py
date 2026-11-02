@@ -200,12 +200,15 @@ def test_a6_ms_epoch_on_5h_drops_5h_keeps_weekly(ns, capsys):
 
 # --- A7: refresh-layer boundary maps reject to record_failed ----------------
 
-def test_a7_refresh_layer_maps_reject_to_record_failed(ns, monkeypatch):
+def test_a7_refresh_layer_maps_reject_to_record_failed(ns, monkeypatch, capsys):
     """_refresh_usage_inproc invoked with an OAuth payload that
     produces an out-of-band epoch must surface as
     status='record_failed' (reason='exit 2'), not status='ok'.
     Protects the dashboard / CLI refresh contract from silently
-    reporting success on a dropped payload."""
+    reporting success on a dropped payload. #948 spec 6.4 checks the
+    ingress bands before any fence is installed; the user-visible
+    rejection (reason and stderr notice) is unchanged (review finding
+    F16)."""
     # Build a fake OAuth payload whose resets_at is a year in the past.
     phantom_iso = dt.datetime.fromtimestamp(
         _PHANTOM_YEAR_EPOCH, tz=dt.timezone.utc
@@ -232,6 +235,33 @@ def test_a7_refresh_layer_maps_reject_to_record_failed(ns, monkeypatch):
         f"expected reason='exit 2', got {result.reason!r}"
     )
     assert _snapshot_row_count(ns) == 0
+    assert "[record-usage] rejecting --resets-at=" in capsys.readouterr().err
+
+
+def test_a7_refresh_layer_drops_an_out_of_band_five_hour_reset_with_notice(
+        ns, monkeypatch, capsys):
+    """An OAuth payload whose five-hour reset is out of band records the
+    weekly reading without it and prints the record step's notice, as before
+    #948 moved the band check ahead of the fences (review finding F16)."""
+    week = dt.datetime.fromtimestamp(
+        _GOOD_WEEK_RESETS_EPOCH, tz=dt.timezone.utc).isoformat()
+
+    def _fake_fetch(token: str, timeout_seconds: float) -> dict:
+        return {
+            "seven_day": {"utilization": 42.0, "resets_at": week},
+            "five_hour": {"utilization": 10.0, "resets_at": dt.datetime.fromtimestamp(
+                _PHANTOM_YEAR_EPOCH, tz=dt.timezone.utc).isoformat()},
+        }
+
+    monkeypatch.setitem(ns, "_fetch_oauth_usage", _fake_fetch)
+    monkeypatch.setitem(ns, "_resolve_oauth_token", lambda: "fake-token")
+    monkeypatch.setitem(ns, "_bust_statusline_cache", lambda: "ok")
+
+    result = ns["_refresh_usage_inproc"](timeout_seconds=5.0)
+    assert result.status == "ok", result
+    assert _snapshot_row_count(ns) == 1
+    assert "[record-usage] dropping --five-hour-resets-at=" in (
+        capsys.readouterr().err)
 
 
 # --- A8: band-edge accepts (boundary tests) ----------------------------------

@@ -50,7 +50,15 @@ current decision can be appended concurrently). It
    identical decision → nothing; only an excluded legacy decision, or an
    admitted decision the gap changes → one completed correction batch whose
    action is above every retained revision of the id; an admitted decision the
-   gap removes → a tombstone in that batch;
+   gap removes → a tombstone in that batch. Closed five-hour money stays
+   frozen (#1040): for every block the gap touches that holds a closed close,
+   `_lib_rederive.plan_completion_five_hour` decides the close and milestone
+   records instead. A close keeps its recorded money group unless the gap
+   changes the block's entry population (or a recorded missing card is
+   corrected), and such a change lands only paired with its milestones in the
+   same batch; every candidate is checked against the #884 milestone lineage,
+   and none that makes a milestone's decision worse than the gap's required
+   additions alone is appended;
 5. rebuilds the live index over the result. The consumed-input frontier stays
    distinct from output positions: inputs another process appended between
    the window and the appended outputs are completed in a further round, and
@@ -893,6 +901,9 @@ def _apply_owed_outputs(base, start, output_end, boundary) -> frozenset:
                     backfill(conn, only_missing=True,
                              journaled_first=(
                                  _journal.journaled_block_first_observations(
+                                     prefix.slots, selection.by_id)),
+                             retired_openings=(
+                                 _journal.retired_block_openings(
                                      prefix.slots, selection.by_id)))
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1246,8 +1257,16 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
         if record is not None:
             _journal._normalize_legacy_account_stamp(
                 record, prefix.cutover_claude)
+    accumulators: dict = {}
     selection = _lib_journal.resolve_effective_events(
-        prefix.slots, protocol_prefix_evidence=tuple(prefix.evidence))
+        prefix.slots, protocol_prefix_evidence=tuple(prefix.evidence),
+        accumulators=accumulators)
+    # #1040 (spec §5.1): the #884 lineage, built exactly as `db rederive`
+    # builds it; the fold is released before the replays.
+    lineage = _lib_rederive.build_five_hour_lineage(
+        accumulators.pop("fold"), selection=selection,
+        physical_revisions=prefix.excluded_revisions)
+    del accumulators
     # Inert (incomplete or tainted) batch actions of OTHER families still
     # occupy their revision: a later retry of that batch must not collide.
     for record in prefix.slots:
@@ -1288,45 +1307,94 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
     with_gap = _owned_by_id(events_b)
     without_gap = _owned_by_id(events_a)
 
-    plain: list = []
-    actions: list = []
-    for event_id in sorted(set(with_gap) | set(without_gap)):
-        desired = with_gap.get(event_id)
-        reference = without_gap.get(event_id)
-        if (desired is not None and reference is not None
-                and _lib_rederive._semantic_event(desired)
-                == _lib_rederive._semantic_event(reference)):
-            # Not caused by the gap: an unrelated difference against the
-            # journal (a repricing, a previous release's input the current
-            # pipeline extends) is never acted on.
-            continue
+    def physical_of(event_id):
         selected = selection.by_id.get(event_id)
-        current = (selected.record if selected is not None
-                   and selected.status == "active" else None)
-        physical = [rev for rev in (
+        return [rev for rev in (
             prefix.excluded_revisions.get(event_id),
             prefix.inert_revisions.get(event_id),
             None if selected is None else selected.rev,
         ) if rev is not None]
+
+    def current_of(event_id):
+        selected = selection.by_id.get(event_id)
+        return (selected.record if selected is not None
+                and selected.status == "active" else None)
+
+    acted = frozenset(
+        event_id for event_id in set(with_gap) | set(without_gap)
+        if not (event_id in with_gap and event_id in without_gap
+                and _lib_rederive._semantic_event(with_gap[event_id])
+                == _lib_rederive._semantic_event(without_gap[event_id])))
+    retirements = []
+    for event_id in sorted(acted):
+        current = current_of(event_id)
+        if (event_id not in with_gap and current is not None
+                and (current.get("payload") or {}).get("kind")
+                in _lib_rederive._LINEAGE_KINDS):
+            retirements.append({"action": "tombstone", "id": event_id,
+                                "rev": max(physical_of(event_id)) + 1,
+                                "at": str(current["at"]), "payload": None})
+    five_hour_current = {
+        event_id: item.record for event_id, item in selection.by_id.items()
+        if item.status == "active" and item.record is not None
+        and (item.record.get("payload") or {}).get("kind")
+        in _lib_rederive._LINEAGE_KINDS}
+    physical = {}
+    for event_id in set(five_hour_current) | set(with_gap) | set(without_gap):
+        revisions = physical_of(event_id)
+        if revisions:
+            physical[event_id] = max(revisions)
+    # #1040 (spec §5): closed five-hour money stays frozen. The planner owns
+    # every five-hour id of a touched non-OPEN block; today's per-id path
+    # keeps every other id, retirements included.
+    plan = _lib_rederive.plan_completion_five_hour(
+        current=five_hour_current, with_gap=with_gap,
+        without_gap=without_gap, acted=acted, physical=physical,
+        selection=selection, lineage=lineage, retirements=retirements)
+    del lineage, five_hour_current
+
+    plain: list = []
+    actions: list = []
+
+    def append_desired(event_id, desired):
+        """The binding append policy for one desired record (spec §5.5)."""
+        current = current_of(event_id)
+        if (current is not None and _lib_rederive._semantic_event(current)
+                == _lib_rederive._semantic_event(desired)):
+            return  # an admitted identical decision: nothing
+        physical = physical_of(event_id)
+        if not physical:
+            plain.append(desired)
+            return
+        actions.append({"action": "replace", "id": event_id,
+                        "rev": max(physical) + 1,
+                        "at": str(desired["at"]),
+                        "payload": dict(desired.get("payload") or {})})
+
+    for event_id in sorted(set(with_gap) | set(without_gap)
+                           | set(plan.targets)):
+        if event_id in plan.targets:
+            append_desired(event_id, plan.targets[event_id])
+            continue
+        if event_id in plan.handled:
+            continue
+        desired = with_gap.get(event_id)
+        if event_id not in acted:
+            # Not caused by the gap: an unrelated difference against the
+            # journal (a repricing, a previous release's input the current
+            # pipeline extends) is never acted on.
+            continue
+        current = current_of(event_id)
         if desired is None:
             if current is not None:
                 actions.append({"action": "tombstone", "id": event_id,
-                                "rev": max(physical) + 1,
+                                "rev": max(physical_of(event_id)) + 1,
                                 "at": str(current["at"]), "payload": None})
             continue
         if current is not None:
             desired = _lib_rederive._preserve_non_derivable_state(
                 current, desired)
-            if (_lib_rederive._semantic_event(current)
-                    == _lib_rederive._semantic_event(desired)):
-                continue  # an admitted identical decision: nothing
-        if not physical:
-            plain.append(desired)
-            continue
-        actions.append({"action": "replace", "id": event_id,
-                        "rev": max(physical) + 1,
-                        "at": str(desired["at"]),
-                        "payload": dict(desired.get("payload") or {})})
+        append_desired(event_id, desired)
 
     records: list = []
     if actions:
@@ -1344,8 +1412,13 @@ def _complete_window(base, tmp, start, target, boundary, round_index, *,
                 # are byte-identical and the selector keeps each once.
                 at=str(prefix.begin_at.get(batch_id) or _iso_now()),
                 actions=actions))
-    order = {id(event): index for index, event in enumerate(events_b)}
-    plain.sort(key=lambda event: order.get(id(event), 0))
+    # Derivation order of each id's first with-gap candidate (the one
+    # `_owned_by_id` keeps), so a planner target sorts where its id was
+    # derived, exactly like the candidate it stands for.
+    order: dict = {}
+    for index, event in enumerate(events_b):
+        order.setdefault(event.get("id"), index)
+    plain.sort(key=lambda event: order.get(event.get("id"), 0))
     records.extend(plain)
     if not records:
         return False

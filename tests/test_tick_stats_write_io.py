@@ -209,6 +209,23 @@ def test_every_ring_and_the_write_state_stay_inside_the_frozen_budget():
          "charged": 10 ** 9 + h, "largest": 10 ** 8 + h} for h in range(25)]})
     wio.register_local_instance(instance_id="abcdefabcdefabcd",
                                 host="127.0.0.1", port=8789)
+    # #939 D5: the hold's fixed published state at its largest (the
+    # evaluator itself is dropped at release and is not fixed-size state).
+    wio.hold_admission()
+    wio.observe_accounting_tick(ended_ns=1, census_complete=True,
+                                residuals={"claude": (), "codex": ()})
+    wio.observe_conversation_pass({
+        "census_complete": True, "certifiable": False,
+        "providers": {"claude": {"mode": "full", "residual": (
+            ("failed_paths", tuple(f"/p/{i}" for i in range(10 ** 3))),)},
+                      "codex": {"mode": "full", "residual": (
+                          ("container_pending", 10 ** 9 + 1),
+                          ("barrier_keys_deferred", 10 ** 9 + 2))}},
+        "deferrals": {f"/d/{i}": (f"id-{i}", True, frozenset({f"k{i}"}))
+                      for i in range(10 ** 3)},
+        "facts": {}}, started_ns=2, seq=10 ** 9 + 3)
+    wio.release_admission("settled")
+    assert wio.write_io_payload()["coldStartup"]["residual"]["failed"] == 10 ** 3
     snap = ts.snapshot()
     assert len(snap.records) == ts.RING_CAPACITY
     assert len(snap.conversation_records) == ts.RING_CAPACITY

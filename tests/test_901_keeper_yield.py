@@ -24,6 +24,7 @@ refuse "still open in process(es)". The rest are correctness guards.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -33,12 +34,13 @@ import sqlite3
 import subprocess
 import sys
 import time
+import types
 import uuid
 
 import pytest
 
 from conftest import load_script, redirect_paths
-from test_901_sync_transactions import _wal_salt
+from test_901_sync_transactions import _shm_backfill, _wal_salt
 from test_901_wal_keeper import (  # noqa: F401 — `w9` is a fixture
     PassiveSpy,
     Product,
@@ -486,8 +488,13 @@ def test_m_own_retention_prune_and_reclaim_keep_the_keeper(
 ):
     """The process's own retention visit and reclaim attempt hold the
     maintenance lock exclusively; neither publishes a request, so the keeper
-    stays, nothing checkpoints and the WAL keeps its generation."""
-    wal, _clock = w9
+    stays, nothing checkpoints and the WAL keeps its generation.
+
+    The first cycle leaves the conversations WAL close to SQLite's 1000-frame
+    automatic checkpoint, so the keeper's own timer settles it before the
+    measured window; otherwise the setup INSERT's auto-checkpoint, not the
+    maintenance under test, would restart the log (#1026)."""
+    wal, clock = w9
     import datetime as dt
 
     import _cctally_core
@@ -499,6 +506,9 @@ def test_m_own_retention_prune_and_reclaim_keep_the_keeper(
     kept = wal.kept_stores()
     assert os.path.realpath(path) in kept
     keeper = wal._KEEPERS[os.path.realpath(path)].conn
+    pre_settle = _wal_salt(path)
+    clock.advance(61)
+    wal._timer_round()
     conn = product.ns["open_conversations_db"]()
     try:
         conn.execute(
@@ -507,6 +517,10 @@ def test_m_own_retention_prune_and_reclaim_keep_the_keeper(
             "VALUES ('g10-m-old', 'g10-m-u1', 'old.jsonl', 1, "
             "'2025-08-01T12:00:00.000Z', 'human', 'expired')")
         conn.commit()
+        assert _wal_salt(path) != pre_settle, (
+            "the measured window must start in a fresh WAL generation")
+        assert _shm_backfill(path)[1] == 0, (
+            "the measured window must start in a fresh WAL generation")
         passive = PassiveSpy(wal, monkeypatch)
         salt = _wal_salt(path)
         now = dt.datetime(2026, 7, 17, 12, tzinfo=dt.timezone.utc)
@@ -989,7 +1003,7 @@ def test_m_cross_process_recovery_proceeds_once_the_keeper_yields(
         _hash_at(monkeypatch, stores.cache._cctally_db_sib,
                  "write_corruption_forensics", path, gate)
     else:
-        _hash_at(monkeypatch, stores.cache, "_conversation_probe_snapshot",
+        _hash_at(monkeypatch, stores.cache, "_conversation_probe_source",
                  path, gate)
     try:
         recovered = _recover(stores, store)
@@ -1001,6 +1015,83 @@ def test_m_cross_process_recovery_proceeds_once_the_keeper_yields(
     assert _wait(keeper.reopened, seconds=20.0), keeper.events()
 
 
+def _without_hard_links(monkeypatch, db_mod) -> None:
+    """#1020: rebind ``db_mod``'s ``os`` to a copy whose ``link`` fails as on
+    a volume without hard links (exFAT), so owner records publish in their
+    directory form."""
+    iso = types.SimpleNamespace(**vars(db_mod.os))
+
+    def link(src, dst, *args, **kwargs):
+        raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), str(src))
+
+    iso.link = link
+    monkeypatch.setattr(db_mod, "os", iso)
+
+
+def test_m_a_directory_form_request_or_marker_is_a_live_fence(
+    tmp_path, monkeypatch,
+):
+    """#1020 T5 (in process). Detects: a keeper-yield request or repair
+    marker published without hard links that the keeper fence does not see,
+    so no keeper ever yields on exFAT."""
+    import _lib_wal_checkpoint as wal
+
+    db_mod = sys.modules["_cctally_db"]
+    _without_hard_links(monkeypatch, db_mod)
+    db = tmp_path / "store.db"
+    sqlite3.connect(db).close()
+    request = _request_path(db)
+    marker = db_mod._repair_marker_path(db)
+
+    with db_mod._keeper_yield_request(db):
+        assert request.is_dir() and (request / "owner").is_file()
+        assert not os.path.lexists(marker)
+        assert wal.live_fence(db) == wal.FENCE_REQUEST
+
+    assert not os.path.lexists(request)
+    assert wal.live_fence(db) is None
+    claim, reason = db_mod._claim_repair_marker(db)
+    assert claim is not None, reason
+    try:
+        assert marker.is_dir()
+        assert wal.live_fence(db) == wal.FENCE_REPAIR
+    finally:
+        db_mod._release_repair_marker(db, claim)
+    assert wal.live_fence(db) is None
+
+
+@pytest.mark.parametrize("store", STORES)
+def test_m_a_keeper_yields_to_a_directory_form_request_alone(
+    stores, monkeypatch, store,
+):
+    """#1020 T5 (across processes). Detects: the exFAT keeper-held drain
+    refusal, where another process's idle keeper never sees a request that
+    could only be published in the directory form."""
+    path = stores.path(store)
+    keeper = stores.keeper(store)
+    assert _retained(path), "the keeper's frames must still be in the WAL"
+    before = _family(path)
+    _without_hard_links(monkeypatch, stores.db)
+    request = _request_path(path)
+
+    with stores.db._keeper_yield_request(path) as deadline:
+        assert request.is_dir(), "the request did not publish as a directory"
+        assert not os.path.lexists(stores.db._repair_marker_path(path))
+        open_pids = stores.db._await_family_drained(path, deadline)
+        during = _family(path)
+
+    assert open_pids == set(), (
+        "the keeper did not yield to the directory-form request",
+        open_pids, keeper.events())
+    assert during == before, "the yield ran a checkpoint"
+    assert not os.path.lexists(request)
+    assert _wait(keeper.reopened, seconds=20.0), keeper.events()
+    keeper.stop()
+    lines = _yield_lines(keeper.stderr)
+    assert len(lines) == 1, keeper.stderr[-4000:]
+    assert store in lines[0] and "keeper-yield request" in lines[0], lines
+
+
 def test_m_the_conversation_rebuild_probe_proceeds_once_the_keeper_yields(
     stores, monkeypatch,
 ):
@@ -1008,7 +1099,7 @@ def test_m_the_conversation_rebuild_probe_proceeds_once_the_keeper_yields(
     keeper = stores.keeper("conversations.db")
     before = _family(path)
     gate: list = []
-    _hash_at(monkeypatch, stores.cache, "_conversation_probe_snapshot", path,
+    _hash_at(monkeypatch, stores.cache, "_conversation_probe_source", path,
              gate)
     try:
         trigger = stores.cache._probe_conversation_rebuild(

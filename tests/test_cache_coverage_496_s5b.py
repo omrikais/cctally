@@ -1112,19 +1112,25 @@ def test_the_whole_scan_propagates_an_unreadable_candidate(core, monkeypatch):
 #: fixed pair this module chooses — the live title/rollup table or its staging
 #: twin — so a rebuild can build its replacement generation without touching
 #: what readers are reading (#752). None substitutes a caller-supplied string.
+#: #939 D1 moved the per-file truncation's title DELETE out of
+#: `sync_claude_conversations` into `_write_claude_prepared_file`, with the
+#: same fixed live/staging title pair.
 #: #968's three container writers accept only the fixed cache/conversation
 #: cursor pair. The boundary tests below exercise pending marks, adoption,
 #: unverified and target reconciliation in both stores, reject covered table
 #: names, and distinguish reset's literal quota deletion/invalidation from
 #: these metadata-only computed writes. The scanner remains fail-closed.
+#: #970's same-volume move adoption writes only ``container_path`` and, like
+#: them, refuses any table outside the fixed ``_VERIFY_TABLES`` cursor pair.
 _COMPUTED_TABLE_SITES = frozenset({
     "_cctally_cache._adopt_codex_container",
+    "_cctally_cache._adopt_codex_container_location",
     "_cctally_cache._ai_title_upsert_sql",
     "_cctally_cache._apply_codex_verdict",
     "_cctally_cache._fill_conversation_sessions_filter_columns",
     "_cctally_cache._mark_codex_containers_pending",
     "_cctally_cache._recompute_conversation_sessions",
-    "_cctally_cache.sync_claude_conversations",
+    "_cctally_cache._write_claude_prepared_file",
     "_cctally_db._migration_budget_milestone_period_keys",
     "_cctally_db._migration_merge_5h_block_duplicates_v1",
     "_cctally_db._recover_version_ahead",
@@ -1137,6 +1143,10 @@ _COMPUTED_TABLE_SITES = frozenset({
     "_cctally_journal._delete_scratch_row",
     "_cctally_journal._emit_harvest_row",
     "_cctally_journal._insert_or_ignore",
+    # #956 class 2: a tombstoned opening's open block loses its child rows,
+    # from the fixed `_BLOCK_CHILDREN` five-hour child-table pair, on a
+    # derivation-completion scratch projection only.
+    "_cctally_journal._remove_opened_block",
     "_cctally_journal._replace_block_children",
     "_cctally_journal.run_cutover",
 })

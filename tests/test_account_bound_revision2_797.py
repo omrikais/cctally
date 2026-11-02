@@ -9,6 +9,12 @@ record without `wpr == 2` is excluded and quarantines automatic outcomes. B4:
 the v2 spool namespace; the v1 coordination state is legacy spool input. B5:
 the v3 repair acknowledgement and revision-specific calibration provenance.
 B6: epoch 1019. Q8's counterexample is the acceptance trace.
+
+#1019/#1014 (spec 4.7, C1-C8) extends this module with revision 3: the
+`wpx: 3` successor stamp, the `account_bound_revision_v3` boundary op
+established after revision 2, the composed `revision-3-unstamped` admission
+rule, the v3 spool namespace, the v4 acknowledgement, the revision-3 regime
+digest, the revision-3 batch retry identity and epoch 1020.
 """
 from __future__ import annotations
 
@@ -93,9 +99,10 @@ def _without_revision(record: dict) -> dict:
     """``record`` as a revision-1 writer (the previous release, which stamps
     `wpg` but not `wpr`) wrote it: the stamp dropped and a content id
     recomputed over the remaining core. Built by hand so the RED run against
-    the previous code exercises the same bytes."""
+    the previous code exercises the same bytes. #1019/#1014: the successor
+    revision goes with it (a revision-1 writer never wrote `wpx`)."""
     import _lib_journal as J
-    out = {k: v for k, v in record.items() if k != "wpr"}
+    out = {k: v for k, v in record.items() if k not in ("wpr", "wpx")}
     rid = record.get("id")
     if isinstance(rid, str) and rid.startswith("o:"):
         core = {k: v for k, v in out.items() if k not in ("v", "id")}
@@ -116,6 +123,32 @@ def _revision_ops():
     import _lib_account_protocol as P
     kind = getattr(P, "REVISION_OP_KIND", "account_bound_revision")
     return [(s, o, r) for s, o, r in _lines() if _kind(r) == kind]
+
+
+def _revision2_shape(record: dict) -> dict:
+    """``record`` as 1.116.1 (revision 2: `wpg` and `wpr: 2`, no `wpx`)
+    wrote it, a content id recomputed over the remaining core. Built by hand
+    so the RED run against the parent exercises the same bytes."""
+    import _lib_journal as J
+    out = {k: v for k, v in record.items() if k != "wpx"}
+    rid = record.get("id")
+    if isinstance(rid, str) and rid.startswith("o:"):
+        out["id"] = J.content_id(
+            {k: v for k, v in out.items() if k not in ("v", "id")})
+    return out
+
+
+def _revision2_store():
+    """A store 1.116.1 left: the original cutover and the revision-2 op,
+    no revision-3 op yet. Returns the boundary carrying revision 2."""
+    import _cctally_journal
+    original = _cctally_journal._ensure_original_cutover()
+    return _cctally_journal._establish_account_bound_revision(original)
+
+
+def _revision3_ops():
+    return [(s, o, r) for s, o, r in _lines()
+            if _kind(r) == "account_bound_revision_v3"]
 
 
 # ── B1: the revision stamp ─────────────────────────────────────────────────
@@ -361,7 +394,7 @@ def test_fresh_install_appends_revision_op_after_cutover_op(app):
     lines = _lines()
     assert [_kind(r) for _s, _o, r in lines] == [
         "account_bound_cutover", "account_bound_revision",
-        "account_label", "account_label"]
+        "account_bound_revision_v3", "account_label", "account_label"]
     (c_seg, c_off, cutover), (r_seg, r_off, revision) = lines[0], lines[1]
     assert revision["id"] == P.REVISION_OP_ID
     assert P.is_stamped(revision) and P.has_current_revision(revision)
@@ -402,20 +435,26 @@ def test_crash_at_each_durability_step_recovers_one_boundary(
         if name == step:
             raise _Crash(name)
 
+    # #1019/#1014: ensure now also establishes revision 3, which installs a
+    # baseline of its own; this test owns the revision-2 sequence, so it
+    # drives that establishment alone.
+    def establish():
+        return _cctally_journal._establish_account_bound_revision(
+            _cctally_journal._ensure_original_cutover())
+
     monkeypatch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", seam)
     with pytest.raises(_Crash):
-        _cctally_journal.ensure_account_bound_cutover()
+        establish()
     monkeypatch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", None)
 
-    boundary = _cctally_journal.ensure_account_bound_cutover()
-    again = _cctally_journal.ensure_account_bound_cutover()
+    boundary = establish()
+    again = establish()
     assert boundary.revision is not None
     assert again.revision == boundary.revision
     assert len(_revision_ops()) == 1
     assert len([1 for _s, _o, r in _lines()
                 if _kind(r) == "account_bound_cutover"]) == 1
-    assert _cctally_journal.find_account_bound_cutover().revision == (
-        boundary.revision)
+    assert _cctally_journal.find_account_bound_revision() == boundary.revision
     baseline = _cctally_journal.read_anchored_legacy_spool_baseline()
     if step in ("revision-after-append", "revision-after-fsync"):
         # The install was lost with the crashed producer: the reducer reports
@@ -649,7 +688,8 @@ def test_v1_coordination_state_joins_legacy_inventory(app):
     import _cctally_core as core
     import _cctally_journal
     import _cctally_statusline as sl
-    assert core.STATUSLINE_ACCOUNT_BOUND_DIR.name == "statusline-account-bound-v2"
+    # #1019/#1014 (spec 4.7 C4): the current namespace moved on to v3.
+    assert core.STATUSLINE_ACCOUNT_BOUND_DIR.name == "statusline-account-bound-v3"
     assert core.STATUSLINE_ACCOUNT_BOUND_V1_DIR.name == (
         "statusline-account-bound-v1")
     v1 = core.STATUSLINE_ACCOUNT_BOUND_V1_DIR
@@ -702,7 +742,10 @@ def test_v1_coordination_state_joins_legacy_inventory(app):
 # ── B5: version-checked administrative shapes ──────────────────────────────
 
 
-def test_resolution_ack_uses_v3_kind(app):
+def test_resolution_ack_uses_v4_kind(app):
+    """#1019/#1014 (spec 4.7 C5): 1.116.1's v3 validator has an exact key
+    set and an identity core without `wpx`, so the current acknowledgement
+    is the v4 successor; every earlier kind still validates."""
     import _lib_account_protocol as P
     import _lib_journal as J
     violation = J._protocol_violation("b:x", "marker_conflict", phase="begin",
@@ -712,12 +755,19 @@ def test_resolution_ack_uses_v3_kind(app):
         at=_iso(NOW), violations=[violation],
         journal_high_water=("observations-2026-10.jsonl", 10),
         journal_prefix_hash="sha256:" + "a" * 64)
-    assert J.PROTOCOL_RESOLUTION_V3_KIND == "journal_protocol_resolution_v3"
-    assert P.PROTOCOL_RESOLUTION_V3_KIND == J.PROTOCOL_RESOLUTION_V3_KIND
-    assert ack["payload"]["kind"] == "journal_protocol_resolution_v3"
+    assert J.PROTOCOL_RESOLUTION_V4_KIND == "journal_protocol_resolution_v4"
+    assert P.PROTOCOL_RESOLUTION_V4_KIND == J.PROTOCOL_RESOLUTION_V4_KIND
+    assert ack["payload"]["kind"] == "journal_protocol_resolution_v4"
     assert ack["wpg"] == "account-bound-v1" and ack["wpr"] == 2
-    assert J.PROTOCOL_RESOLUTION_V3_KIND in J.PROTOCOL_RESOLUTION_KINDS
+    assert ack["wpx"] == 3 and type(ack["wpx"]) is int
+    assert J.PROTOCOL_RESOLUTION_V4_KIND in J.PROTOCOL_RESOLUTION_KINDS
     J._validate_protocol_resolution(ack)
+    # A retained 1.116.1 v3 acknowledgement still validates.
+    v3 = _revision2_shape({**ack, "payload": {
+        **ack["payload"], "kind": "journal_protocol_resolution_v3"}})
+    v3 = {**v3, "id": J.content_id(
+        {k: v for k, v in v3.items() if k not in ("v", "id")})}
+    J._validate_protocol_resolution(v3)
     # A retained revision-1 v2 acknowledgement still validates.
     v2 = _without_revision({**ack, "payload": {
         **ack["payload"], "kind": "journal_protocol_resolution_v2"}})
@@ -766,17 +816,27 @@ def _stamp_epoch(path, epoch):
         conn.close()
 
 
-def test_epoch_1019_rejects_1018_completion_proofs(app, monkeypatch):
+def test_epoch_1020_rejects_1019_completion_and_selector_proofs(
+        app, monkeypatch):
+    """#1019/#1014 (spec 4.7 C6): the revision-3 fence changes which records
+    are accounting input, so a 1019 index's completion proof, publication
+    stamp and the selector proof read through it are not proofs at 1020."""
     import _cctally_core as core
     import _cctally_journal
-    assert core.STATS_INDEX_EPOCH == 1019
-    assert _cctally_journal.DERIVATION_FRONTIER_EPOCH == 1019
+    # #943 moved the index epoch on to 1021 and #1015 to 1022 and #948 to 1023; the derivation
+    # frontier epoch stays at the revision-3 fence's 1020.
+    assert core.STATS_INDEX_EPOCH == 1023
+    assert _cctally_journal.DERIVATION_FRONTIER_EPOCH == 1020
     T.current(app, monkeypatch, at="2026-10-08T10:00:00Z", weekly=5,
               week_end=WEEK_END)
     T.rebuild(app)
     assert _cctally_journal.read_trusted_derivation_state(core.DB_PATH) is not None
-    _stamp_epoch(core.DB_PATH, 1018)
+    assert _cctally_journal.read_publication_stamp(core.DB_PATH) is not None
+    _stamp_epoch(core.DB_PATH, 1019)
     assert _cctally_journal.read_trusted_derivation_state(core.DB_PATH) is None
+    # The publication stamp the selector's generation proof reads answers
+    # "no publication" at another epoch: full selection, never a reuse.
+    assert _cctally_journal.read_publication_stamp(core.DB_PATH) is None
 
 
 def test_validate_stats_identity_covers_owned_supplied_and_reused_connections(app):
@@ -811,7 +871,7 @@ def test_validate_stats_identity_covers_owned_supplied_and_reused_connections(ap
             owned.close()
     finally:
         reused.close()
-    _stamp_epoch(path, 1019)
+    _stamp_epoch(path, core.STATS_INDEX_EPOCH)
     fresh = sqlite3.connect(str(path))
     try:
         with _cctally_store.current_stats_snapshot(fresh):
@@ -819,3 +879,600 @@ def test_validate_stats_identity_covers_owned_supplied_and_reused_connections(ap
     finally:
         fresh.close()
     assert os.path.exists(path)
+
+
+# ══ #1019/#1014 (spec 4.7, C1-C8): revision 3 of the fence ════════════════
+
+
+def test_new_records_carry_wpx_3_beside_wpr_2_and_wpg_v1(app):
+    """C1: every newly authored record carries `wpx: 3` (exact int) beside
+    the unchanged `wpg` and `wpr`, inside the content-id core of an obs/op,
+    so 1.116.1 re-derives the same id (detects a stamp outside the identity
+    core, which would make 1.116.1 see a foreign id)."""
+    import _cctally_journal
+    import _lib_account_protocol as P
+    import _lib_journal as J
+    assert P.SUCCESSOR_REVISION_KEY == "wpx"
+    assert P.SUCCESSOR_REVISION == 3
+    assert P.REVISION3_OP_KIND == "account_bound_revision_v3"
+    assert P.REVISION3_OP_ID == "account-bound-revision-3"
+    assert (P.PROTOCOL_GENERATION, P.PROTOCOL_REVISION) == (
+        "account-bound-v1", 2)
+
+    obs = J.make_obs(at=_iso(NOW), src="test", provider="claude",
+                     payload={"weekly_percent": 1.0})
+    op = J.make_op(at=_iso(NOW), src="test", payload={
+        "kind": "account_label", "provider": "claude",
+        "account_key": "a" * 32, "label": "work"})
+    evt = J.make_evt(kind="percent_milestone", id="e:x", at=_iso(NOW),
+                     payload={"n": 1})
+    batch = J.make_correction_batch(batch_id="b:x", family="f", at=_iso(NOW),
+                                    actions=[])
+    for record in (obs, op, evt, *batch):
+        assert record["wpg"] == "account-bound-v1" and record["wpr"] == 2
+        assert record["wpx"] == 3 and type(record["wpx"]) is int
+        assert P.has_successor_revision(record)
+    for record in (obs, op):
+        core = {k: v for k, v in record.items() if k not in ("v", "id")}
+        assert "wpx" in core and record["id"] == J.content_id(core)
+    # The shared preparation completes a revision-2 shape, re-identifying a
+    # verifying content id over the fully stamped core.
+    revision2 = _revision2_shape(obs)
+    assert "wpx" not in revision2 and revision2["id"] != obs["id"]
+    assert J.revision2_record(obs) == revision2
+    assert J.prepare_record(revision2) == obs
+    assert J.prepare_record(obs) is obs
+    _cctally_journal.append_record(op)
+    appended = [r for _s, _o, r in _lines() if _kind(r) == "account_label"]
+    assert len(appended) == 1 and appended[0]["wpx"] == 3
+
+
+def test_successor_check_accepts_exactly_int_3(app):
+    import _lib_account_protocol as P
+    assert P.has_successor_revision({"wpx": 3})
+    for value in (2, 4, "3", 3.0, True, None, [3]):
+        assert not P.has_successor_revision({"wpx": value}), value
+    assert not P.has_successor_revision({})
+    assert not P.has_successor_revision(None)
+    stamped = P.stamp({"t": "obs"})
+    assert (stamped["wpg"], stamped["wpr"], stamped["wpx"]) == (
+        "account-bound-v1", 2, 3)
+    assert P.strip_stamp(stamped) == {"t": "obs"}
+    assert P.stamp(stamped) == stamped
+    with pytest.raises(ValueError):
+        P.stamp({"t": "obs", "wpx": 4})
+
+
+def test_has_current_revision_still_qualifies_wpr_2_carriers(app):
+    """C1: `has_current_revision` keeps qualifying 1.116.1's records (the
+    OAuth carriers and every historical revision-2 record); only
+    `has_successor_revision` is the writer-authority check."""
+    import _lib_account_protocol as P
+    import _lib_journal as J
+    current = J.make_obs(at=_iso(NOW), src="record-usage", provider="claude",
+                         payload={"weekly_percent": 1.0, "source": "api"})
+    revision2 = _revision2_shape(current)
+    for record in (current, revision2):
+        assert P.is_stamped(record) and P.has_current_revision(record)
+    assert P.has_successor_revision(current)
+    assert not P.has_successor_revision(revision2)
+
+
+def test_retained_records_are_never_restamped_with_wpx(app):
+    import _cctally_journal
+    import _lib_journal as J
+    _identity("A")
+    _revision2_store()
+    retained = _revision2_shape(J.make_obs(
+        at=_iso(NOW - 3600), src="record-usage", provider="claude",
+        payload={"weekly_percent": 6.0, "resets_at": T.epoch(WEEK_END),
+                 "source": "api", "captured_at": _iso(NOW - 3600)}))
+    T.raw_append([retained])
+    before = _journal_bytes()
+
+    _cctally_journal.ensure_account_bound_cutover()
+    T.ingest(app)
+    T.rebuild(app)
+
+    after = _journal_bytes()
+    for name, data in before.items():
+        assert after[name][:len(data)] == data, "a retained line was rewritten"
+    ids = [r.get("id") for _s, _o, r in _lines()]
+    assert ids.count(retained["id"]) == 1
+    assert J.prepare_record(retained)["id"] not in ids
+    conn = app.open_db()
+    try:
+        weekly = [row[0] for row in conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots")]
+    finally:
+        conn.close()
+    # Historical for revision 3: the pre-boundary record stays admitted.
+    assert 6.0 in weekly
+
+
+def test_metadata_only_duplicate_guard_ignores_wpx(app):
+    import _cctally_journal
+    import _lib_account_protocol as P
+    import _lib_journal as J
+    current = J.make_evt(kind="percent_milestone", id="e:dup", at=_iso(NOW),
+                         payload={"n": 7})
+    retained = _revision2_shape(current)
+    assert "wpx" not in retained and retained["wpr"] == 2
+    assert P.strip_stamp(current) == P.strip_stamp(retained)
+    assert "wpx" not in P.strip_stamp(current)
+    assert J.event_content_hash(current) == J.event_content_hash(retained)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE journal_effective_events "
+                 "(event_id TEXT PRIMARY KEY, event_json TEXT)")
+    conn.execute("INSERT INTO journal_effective_events VALUES (?, ?)",
+                 ("e:dup", J.encode_line(retained).decode("utf-8").strip()))
+    assert _cctally_journal._is_metadata_only_duplicate(conn, current)
+    conn.close()
+
+
+@pytest.mark.parametrize("entry", sorted(ENTRY_POINTS))
+def test_revision3_boundary_precedes_every_authoritative_decision(
+        app, monkeypatch, entry):
+    """C2: a store 1.116.1 left (cutover and revision 2, no revision 3) gets
+    the revision-3 op from whichever authoritative producer runs first,
+    before anything that producer journals; a render appends nothing."""
+    import _cctally_journal
+    import _cctally_statusline as sl
+    _identity("A")
+    _revision2_store()
+    assert _revision3_ops() == []
+    rendered = _journal_bytes()
+    with monkeypatch.context() as render:
+        render.setattr(sl, "_fork_persist", lambda fd, reservation:
+                       sl._release_reservation(reservation))
+        sl._statusline_persist(app._lib_statusline.parse_statusline_stdin(
+            json.dumps({"session_id": "peer", "rate_limits": {"seven_day": {
+                "used_percentage": 25,
+                "resets_at": _iso(NOW + 3 * 86400)}}}).encode()))
+    assert _journal_bytes() == rendered and _revision3_ops() == []
+    before = len(_lines())
+
+    ENTRY_POINTS[entry](app, monkeypatch)
+
+    lines = _lines()
+    found = [i for i, (_s, _o, r) in enumerate(lines)
+             if _kind(r) == "account_bound_revision_v3"]
+    assert len(found) == 1, f"{entry} did not establish revision 3"
+    revision2 = next(i for i, (_s, _o, r) in enumerate(lines)
+                     if _kind(r) == "account_bound_revision")
+    assert revision2 < found[0]
+    for _s, _o, record in lines[before:found[0]]:
+        assert _kind(record) == "legacy_spool_activity"
+    boundary = _cctally_journal.find_account_bound_cutover()
+    assert boundary.revision is not None and boundary.revision3 is not None
+
+
+def test_fresh_install_appends_cutover_revision2_revision3_in_order(app):
+    import _cctally_journal
+    import _lib_account_protocol as P
+    import _lib_journal as J
+    _cctally_journal.append_records([J.make_op(
+        at=_iso(NOW), src="test", payload={
+            "kind": "account_label", "provider": "claude",
+            "account_key": "y" * 32, "label": f"l{i}"}) for i in range(2)])
+    lines = _lines()
+    assert [_kind(r) for _s, _o, r in lines][:3] == [
+        "account_bound_cutover", "account_bound_revision",
+        "account_bound_revision_v3"]
+    (c_seg, c_off, _c), (r_seg, r_off, _r), (x_seg, x_off, op) = lines[:3]
+    assert op["id"] == P.REVISION3_OP_ID
+    assert P.is_stamped(op) and P.has_current_revision(op)
+    assert P.has_successor_revision(op)
+    decoded = P.revision3_boundary_from_op(op)
+    assert (decoded.cutover_segment, decoded.cutover_offset) == (c_seg, c_off)
+    assert (decoded.revision2_segment, decoded.revision2_offset) == (
+        r_seg, r_off)
+    assert (decoded.segment, decoded.end_offset) == (x_seg, x_off)
+    assert decoded.frozen_extents == {c_seg: x_off}
+    assert P.revision3_boundary_payload(decoded) == {
+        k: v for k, v in op["payload"].items() if k != "kind"}
+    boundary = _cctally_journal.find_account_bound_cutover()
+    assert boundary.revision3 == decoded
+    assert boundary.revision.end_offset == r_off
+    _cctally_journal.ensure_account_bound_cutover()
+    assert len(_revision3_ops()) == 1 and len(_revision_ops()) == 1
+
+
+def test_competing_revision3_initializers_append_one_op(app, monkeypatch):
+    """Two producers race to establish revision 3: the one that loses the
+    locked recheck appends nothing and returns the winner's boundary."""
+    import _cctally_journal
+    _revision2_store()
+    inner = []
+
+    def seam(name):
+        if name == "revision3-after-scan" and not inner:
+            monkeypatch.setattr(_cctally_journal,
+                                "_ACCOUNT_BOUND_CUTOVER_SEAM", None)
+            inner.append(_cctally_journal.ensure_account_bound_cutover())
+
+    monkeypatch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", seam)
+    outer = _cctally_journal.ensure_account_bound_cutover()
+    assert inner and inner[0].revision3 is not None
+    assert outer.revision3 == inner[0].revision3
+    assert len(_revision3_ops()) == 1
+
+
+@pytest.mark.parametrize("step", [
+    "revision3-after-scan", "revision3-after-baseline-capture",
+    "revision3-after-append", "revision3-after-fsync",
+    "revision3-after-baseline-install",
+])
+def test_revision3_establishment_crash_at_each_durability_step_recovers_one_boundary(
+        app, monkeypatch, step):
+    import _cctally_core as core
+    import _cctally_journal
+    _revision2_store()
+    v2 = core.STATUSLINE_ACCOUNT_BOUND_V2_DIR
+    (v2 / "accounts" / "k" / "candidates").mkdir(parents=True)
+    (v2 / "accounts" / "k" / "candidates" / "c.json").write_text("{}")
+
+    def seam(name):
+        if name == step:
+            raise _Crash(name)
+
+    monkeypatch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", seam)
+    with pytest.raises(_Crash):
+        _cctally_journal.ensure_account_bound_cutover()
+    monkeypatch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", None)
+
+    boundary = _cctally_journal.ensure_account_bound_cutover()
+    again = _cctally_journal.ensure_account_bound_cutover()
+    assert boundary.revision3 is not None
+    assert again.revision3 == boundary.revision3
+    assert len(_revision3_ops()) == 1 and len(_revision_ops()) == 1
+    assert _cctally_journal.find_account_bound_cutover().revision3 == (
+        boundary.revision3)
+    baseline = _cctally_journal.read_anchored_legacy_spool_baseline()
+    if step in ("revision3-after-append", "revision3-after-fsync"):
+        assert baseline is None
+    else:
+        assert baseline is not None
+        assert baseline.digest() == (
+            boundary.revision3.legacy_spool_baseline_digest)
+        assert any("statusline-account-bound-v2/accounts" in entry[0]
+                   for entry in baseline.entries)
+
+
+@pytest.mark.parametrize("variant", [
+    "missing-caches", "corrupt-caches", "incomplete-inventory",
+    "segment-rollover", "old-writes",
+])
+def test_revision3_establishment_preserves_earlier_boundaries_and_unresolved_markers(
+        app, monkeypatch, variant):
+    """C2/C4: establishment keeps the original and revision-2 boundaries and
+    every unresolved spool marker exactly, through missing or corrupt
+    caches, an incomplete inventory and a segment rollover; an old write
+    before boundary capture is history, one after it is excluded, and a v2
+    spool change after capture is a trigger at the next rescan."""
+    import _cctally_core as core
+    import _cctally_journal
+    import _cctally_statusline as sl
+    import _lib_accounts
+    import _lib_journal as J
+    for name in ("A", "B", "unattributed"):
+        T.retain_session_input(app, name)
+    _identity("A")
+    earlier = _revision2_store()
+    # An unresolved marker from before revision 3: a v1 change after the
+    # revision-2 boundary, recorded and ingested while the store is still
+    # one 1.116.1 left (no producer may establish revision 3 yet).
+    v1 = core.STATUSLINE_ACCOUNT_BOUND_V1_DIR
+    v1.mkdir(parents=True, exist_ok=True)
+    (v1 / "transport.last").write_text("1")
+    with monkeypatch.context() as before_revision3:
+        before_revision3.setattr(
+            _cctally_journal, "_establish_account_bound_revision3",
+            lambda boundary, **kw: boundary, raising=False)
+        assert sl._rescan_legacy_spool()
+        T.ingest(app)
+    assert _revision3_ops() == []
+    assert T.account_quarantined(app, "A")
+    prefix = _journal_bytes()
+    account = _lib_accounts.account_key("claude", "A")
+
+    def old(weekly, at):
+        return _revision2_shape(J.make_obs(
+            at=at, src="record-usage", provider="claude", account=account,
+            payload={"weekly_percent": float(weekly),
+                     "resets_at": T.epoch(WEEK_END), "source": "api",
+                     "captured_at": at}))
+
+    v2 = core.STATUSLINE_ACCOUNT_BOUND_V2_DIR
+    establishment = monkeypatch.context()
+    patch = establishment.__enter__()
+    if variant in ("missing-caches", "corrupt-caches"):
+        for path in (core.ACCOUNT_BOUND_CUTOVER_CACHE_PATH,
+                     core.ACCOUNT_BOUND_REVISION_CACHE_PATH,
+                     core.ACCOUNT_BOUND_REVISION3_CACHE_PATH):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if variant == "missing-caches":
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text("{not json")
+    elif variant == "incomplete-inventory":
+        blocked = v2 / "accounts" / "k"
+        blocked.mkdir(parents=True)
+        (blocked / "c.json").write_text("{}")
+        real = _cctally_journal.capture_legacy_spool_state
+
+        def failing(**kw):
+            if kw.get("include_v2", True):
+                raise _cctally_journal._legacy_inventory_incomplete(
+                    blocked, PermissionError(13, "denied"), "list")
+            return real(**kw)
+
+        patch.setattr(_cctally_journal, "capture_legacy_spool_state", failing)
+    elif variant == "segment-rollover":
+        import datetime as _dt
+        # The month rolls over before revision 3 and stays rolled over. The
+        # earlier boundaries are written at the real clock, so revision 3
+        # lands on the 2nd of the month after the real current one; a fixed
+        # 2026-11-02 stopped rolling over once the clock reached November.
+        real = _dt.datetime.now(_dt.timezone.utc)
+        later = (real.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                 + _dt.timedelta(days=32)).replace(day=2)
+        monkeypatch.setattr(_cctally_journal, "_utc_now", lambda: later)
+    elif variant == "old-writes":
+        (v2 / "accounts" / "k").mkdir(parents=True)
+        (v2 / "accounts" / "k" / "quiet.json").write_text("{}")
+
+        def seam(name):
+            if name == "revision3-after-scan":
+                T.raw_append([old(41, _iso(NOW - 50))])
+            elif name == "revision3-after-baseline-capture":
+                T.raw_append([old(42, _iso(NOW - 40))])
+                (v2 / "accounts" / "k" / "late.json").write_text("{}")
+
+        patch.setattr(_cctally_journal, "_ACCOUNT_BOUND_CUTOVER_SEAM", seam)
+
+    try:
+        boundary = _cctally_journal.ensure_account_bound_cutover()
+    finally:
+        establishment.__exit__(None, None, None)
+    revision3 = boundary.revision3
+    assert revision3 is not None
+    after = _journal_bytes()
+    for name, data in prefix.items():
+        assert after[name][:len(data)] == data
+    assert boundary == earlier
+    assert boundary.revision == earlier.revision
+    assert (revision3.cutover_segment, revision3.cutover_offset) == (
+        earlier.segment, earlier.end_offset)
+    assert (revision3.revision2_segment, revision3.revision2_offset) == (
+        earlier.revision.segment, earlier.revision.end_offset)
+    assert len(_revision3_ops()) == 1
+    if variant == "incomplete-inventory":
+        assert revision3.legacy_spool_baseline_digest is None
+        assert revision3.legacy_spool_inventory_failure is not None
+    if variant == "segment-rollover":
+        assert revision3.segment != earlier.revision.segment
+        assert earlier.revision.segment in revision3.frozen_extents
+    T.ingest(app)
+    # Nothing here clears a marker: the earlier trigger still withholds.
+    assert T.account_quarantined(app, "A")
+    assert T.account_quarantined(app, "B")
+    if variant == "old-writes":
+        T.raw_append([old(43, _iso(NOW - 30))])
+        assert sl._rescan_legacy_spool(), "a post-capture v2 change is a trigger"
+        activity = [r for _s, _o, r in _lines()
+                    if _kind(r) == "legacy_spool_activity"]
+        assert any("statusline-account-bound-v2/accounts/k/late.json"
+                   in (r["payload"].get("changed") or []) for r in activity)
+        T.ingest(app)
+        conn = app.open_db()
+        try:
+            weekly = [row[0] for row in conn.execute(
+                "SELECT weekly_percent FROM weekly_usage_snapshots")]
+        finally:
+            conn.close()
+        assert 41.0 in weekly and 42.0 in weekly, "pre-boundary writes are history"
+        assert 43.0 not in weekly, "a post-boundary write without wpx was admitted"
+
+
+def test_post_revision3_record_without_wpx_is_excluded_and_quarantines(
+        app, monkeypatch):
+    """C3: after the revision-3 boundary a Claude record carrying `wpg` and
+    `wpr: 2` but no `wpx` (1.116.1's reducer publishing a stale 30) is
+    excluded as `revision-3-unstamped`, quarantines every Claude account,
+    and mints no reset; Codex-only records stay admitted."""
+    import _cctally_journal
+    import _lib_account_protocol as P
+    import _lib_accounts
+    import _lib_journal as J
+    for name in ("A", "B", "unattributed"):
+        T.retain_session_input(app, name)
+    T.current(app, monkeypatch, at="2026-10-08T10:00:00Z", weekly=0,
+              week_end=WEEK_END)
+    stale = _revision2_shape(J.make_obs(
+        at="2026-10-08T10:05:00Z", src="record-usage", provider="claude",
+        account=_lib_accounts.account_key("claude", "A"),
+        payload={"weekly_percent": 30.0, "resets_at": T.epoch(WEEK_END),
+                 "source": "api", "captured_at": "2026-10-08T10:05:00Z"}))
+    T.raw_append([stale])
+    T.current(app, monkeypatch, at="2026-10-08T10:10:00Z", weekly=20,
+              week_end=WEEK_END)
+    T.current(app, monkeypatch, at="2026-10-08T10:15:00Z", weekly=0,
+              week_end=WEEK_END)
+    assert T.outcome_count(T.outcomes(app)) == 0, T.outcomes(app)
+    for name in ("A", "B", "unattributed"):
+        assert T.account_quarantined(app, name), name
+    conn = app.open_db()
+    try:
+        weekly = [row[0] for row in conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots")]
+    finally:
+        conn.close()
+    assert 30.0 not in weekly and 20.0 in weekly
+    T.rebuild(app)
+    assert T.outcome_count(T.outcomes(app)) == 0
+    assert T.account_quarantined(app, "A")
+
+    boundary = _cctally_journal.find_account_bound_cutover()
+    revision3 = boundary.revision3
+    after = P.Coordinate(revision3.segment, revision3.end_offset + 10_000)
+    verdict = P.classify_admission(stale, after, boundary)
+    assert (verdict.admitted, verdict.reason) == (False, "revision-3-unstamped")
+    assert "revision-3-unstamped" in P.ADMISSION_REASONS
+    assert "revision-3-unstamped" in P.EXCLUDED_REASONS
+    codex = _revision2_shape(J.make_obs(
+        at=_iso(NOW), src="codex", provider="codex",
+        payload={"kind": "quota_window_snapshot"}))
+    assert P.classify_admission(codex, after, boundary).reason == "codex-only"
+    # No boundary re-admits what an earlier rule excludes.
+    assert P.classify_admission(
+        _without_revision(stale), after, boundary).reason == "revision-unstamped"
+    assert P.classify_admission(
+        J.unstamped_record(stale), after, boundary).reason == "excluded"
+    current = J.prepare_record(stale)
+    assert P.classify_admission(current, after, boundary).reason == "stamped"
+
+
+def test_ingest_admission_boundary_notices_new_revision3_op(app, monkeypatch):
+    import _cctally_journal
+    import _lib_account_protocol as P
+    import _lib_accounts
+    import _lib_journal as J
+    _revision2_store()
+    monkeypatch.setattr(_cctally_journal, "establish_revision_before_decision",
+                        lambda **kw: None)
+    T.ingest(app)
+    conn = app.open_db()
+    try:
+        summary = _cctally_journal._read_admission_summary(conn)
+    finally:
+        conn.close()
+    assert summary.revision_id == P.REVISION_OP_ID
+    assert summary.revision3_id is None
+    assert summary.boundary.revision is not None
+    assert summary.boundary.revision3 is None
+
+    _cctally_journal.ensure_account_bound_cutover()
+    T.raw_append([_revision2_shape(J.make_obs(
+        at=_iso(NOW - 60), src="record-usage", provider="claude",
+        account=_lib_accounts.account_key("claude", "A"),
+        payload={"weekly_percent": 44.0, "resets_at": T.epoch(WEEK_END),
+                 "source": "api", "captured_at": _iso(NOW - 60)}))])
+    T.ingest(app)
+    conn = app.open_db()
+    try:
+        summary = _cctally_journal._read_admission_summary(conn)
+        weekly = [row[0] for row in conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots")]
+    finally:
+        conn.close()
+    assert summary.revision3_id == P.REVISION3_OP_ID
+    assert summary.boundary.revision3 is not None
+    assert summary.excluded_total == 1
+    assert 44.0 not in weekly
+
+
+def test_admission_caches_bind_all_three_boundaries(app):
+    """The admission summary and the coordinate caches bind the cutover,
+    revision 2 and revision 3: a summary round-trips all three, and a
+    revision-3 cache naming a different revision-2 op is never trusted."""
+    import _cctally_core as core
+    import _cctally_journal
+    import _lib_account_protocol as P
+    boundary = _cctally_journal.ensure_account_bound_cutover()
+    T.ingest(app)
+    conn = app.open_db()
+    try:
+        summary = _cctally_journal._read_admission_summary(conn)
+    finally:
+        conn.close()
+    assert summary.boundary.revision == boundary.revision
+    assert summary.boundary.revision3 == boundary.revision3
+    assert (summary.revision_id, summary.revision3_id) == (
+        P.REVISION_OP_ID, P.REVISION3_OP_ID)
+    doc = _cctally_journal._summary_boundary_document(summary.boundary)
+    assert doc["revision3"] == P.revision3_boundary_payload(boundary.revision3)
+    without = _cctally_journal.AdmissionSummary(**{
+        **summary.__dict__, "revision3_id": None})
+    assert without != summary
+
+    cache = json.loads(core.ACCOUNT_BOUND_REVISION3_CACHE_PATH.read_text())
+    assert cache["revision2"] == {"segment": boundary.revision.segment,
+                                  "offset": boundary.revision.end_offset}
+    cache["revision2"] = {"segment": boundary.revision.segment,
+                          "offset": boundary.revision.end_offset + 1}
+    core.ACCOUNT_BOUND_REVISION3_CACHE_PATH.write_text(json.dumps(cache))
+    assert _cctally_journal.find_account_bound_cutover().revision3 == (
+        boundary.revision3)
+    with pytest.raises(ValueError):
+        P.with_revision3(P.with_revision(P.original_boundary(boundary), None),
+                         boundary.revision3)
+
+
+def test_reviewed_weekly_decision_keeps_v2_kind_and_carries_wpx(
+        monkeypatch, tmp_path, capsys):
+    """C5: a reviewed weekly decision keeps the known
+    `claude_weekly_observation_decision_v2` kind, carries `wpx`, and the
+    strict decoder of the next rederive accepts it (detects a current
+    decision a later rederive refuses as malformed)."""
+    import test_weekly_retract_797 as WR
+    import _lib_account_protocol as P
+    app = WR._app(monkeypatch, tmp_path)
+    ids = WR._storm(app, monkeypatch)
+    WR._apply(app, capsys, WR._manifest(tmp_path, [(ids["A1"], "hold")]))
+    [decision] = [r for r in T.journal_records()
+                  if _kind(r) == P.WEEKLY_OBSERVATION_DECISION_V2_KIND]
+    assert decision["wpx"] == 3 and decision["wpr"] == 2
+    assert P.has_successor_revision(decision)
+    rc, payload = WR._rederive(app, capsys)
+    assert rc == 0, payload
+
+
+def test_calibration_recovery_requires_revision3_digest(app):
+    """C5 bullet 3: a regime this binary writes carries `wpx` and a
+    revision-3 digest; a regime 1.116.1 created (no `wpx`) or edited in
+    place (stale `wpxDigest`) is never recovered as current-writer state,
+    while 1.116.1 still verifies this binary's `wpr` and `wpg` digests."""
+    import _cctally_quota_model as Q
+    regime = {"start": "2026-10-01T00:00:00Z", "rate": 0.0148}
+    stamped = Q.stamp_regime(regime)
+    assert stamped["wpx"] == 3 and "wpxDigest" in stamped
+    assert Q.regime_writer_is_current(stamped)
+    assert stamped["wprDigest"] == Q._regime_revision_digest(stamped)
+    assert stamped["wpgDigest"] == Q._regime_content_digest(stamped)
+
+    def old_stamp(value):
+        # 1.116.1's `stamp_regime`: strips its four writer keys only.
+        out = {k: v for k, v in value.items()
+               if k not in ("wpg", "wpgDigest", "wpr", "wprDigest")}
+        out["wpr"] = 2
+        out["wprDigest"] = Q._regime_revision_digest(out)
+        out["wpg"] = "account-bound-v1"
+        out["wpgDigest"] = Q._regime_content_digest(out)
+        return out
+
+    assert not Q.regime_writer_is_current(old_stamp(regime))
+    assert not Q.regime_writer_is_current(old_stamp({**stamped, "rate": 0.02}))
+    for value in (True, "3", 2, 4):
+        assert not Q.regime_writer_is_current({**stamped, "wpx": value})
+
+
+def test_batch_retry_identity_revision3(app):
+    import _lib_journal as J
+    original = J.make_correction_batch(batch_id="b:x", family="f",
+                                       at=_iso(NOW), actions=[])
+    begin = original[0]
+    revision2_begin = _revision2_shape(begin)
+    revision1_begin = _without_revision(begin)
+    assert J.revision_batch_id("b:x", []) == "b:x"
+    assert J.revision_batch_id("b:x", [begin]) == "b:x"
+    assert J.revision_batch_id("b:x", [revision2_begin]) == "b:x:wpx3"
+    assert J.revision_batch_id("b:x", [revision1_begin]) == "b:x:wpx3"
+    assert J.revision_batch_id("b:x:wpr2", [revision2_begin]) == "b:x:wpx3"
+    assert J.revision_batch_id("b:x", [revision2_begin, begin]) == "b:x"
+    # Nothing is restamped: the retained begin is unchanged by the retry.
+    assert "wpx" not in revision2_begin
+    # A completed earlier-revision batch stays completed under its own id.
+    done = [_revision2_shape(r) for r in original]
+    selection = J.resolve_effective_events(done)
+    assert "b:x" in selection.completed_batches

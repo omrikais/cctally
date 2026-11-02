@@ -117,7 +117,7 @@ The additive keys, which would not on their own have required the bump:
 - `forecast.right_censored` — which state the nulls above mean.
 - `forecast.projection_basis` — `"calibrated"`, `"corrected-meter"` or `"withheld"`.
 - `forecast.projection_code` — the typed cause of a withheld projection, a member of the quota model's closed evidence vocabulary.
-- `forecast.calibration_code` — why the calibrated basis was **not** reached, `null` when it was. Distinct from `projection_code`: falling back to the corrected meter is not a withholding.
+- `forecast.calibration_code` — why the calibrated basis was **not** reached, `null` when it was. Distinct from `projection_code`: falling back to the corrected meter is not a withholding. `recalibration-needed` (shown as "recalibration needed") means a reviewed correction changed the inputs of the stored calibration: it was fitted before a correction to its inputs; run `cctally quota` to recalibrate. When that run was itself withheld, its status is stated instead. `unavailable` also covers a store whose correction facts cannot be read at that moment (a rebuild or repair in progress), because an unverified calibration is never applied.
 
 `rates.week_average_pct_per_hour` is `null` at a right-censored reading for the same reason the projections are.
 

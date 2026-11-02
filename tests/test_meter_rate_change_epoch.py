@@ -80,8 +80,8 @@ def test_c1_the_epoch_is_bumped_and_the_legacy_registry_is_untouched():
     would never run on an upgraded install, because an epoch-current open
     returns before any schema work."""
     # #901 added read indexes at 1017; #825/#832 moved it to 1018;
-    # #797/#823/#840 to 1019.
-    assert _cctally_core.STATS_INDEX_EPOCH == 1019
+    # #797/#823/#840 to 1019, then #1019/#1014 to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023.
+    assert _cctally_core.STATS_INDEX_EPOCH == 1023
     assert _cctally_core.LEGACY_STATS_HEAD == 13
     import _cctally_db
     assert len(_cctally_db._STATS_MIGRATIONS) == 13, "the registry is FROZEN"
@@ -304,7 +304,7 @@ def test_690_an_1011_shaped_store_gains_the_disclosure_columns_on_rebuild(ns):
         conn.close()
 
     assert epoch == _cctally_core.STATS_INDEX_EPOCH
-    assert epoch == 1019
+    assert epoch == 1023
     assert epoch != PREVIOUS_EPOCH_1011, (
         "the epoch was not bumped, so nothing forced the rebuild")
     assert set(DISCLOSURE_COLUMNS) <= cols, (

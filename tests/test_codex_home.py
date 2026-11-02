@@ -115,6 +115,16 @@ def test_session_roots_direct_jsonl_dir(cc, tmp_path, monkeypatch):
     assert cc._codex_session_roots() == [tmp_path / "logs"]
 
 
+def test_session_roots_archive_only_home_reports_its_sessions_dir(
+        cc, tmp_path, monkeypatch):
+    """#970 G1: an archive-only native home reports `<home>/sessions` even
+    before it exists, so dated logical paths of archived rollouts render the
+    same session ids before and after the first unarchive creates it."""
+    (tmp_path / "h" / "archived_sessions").mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "h"))
+    assert cc._codex_session_roots() == [tmp_path / "h" / "sessions"]
+
+
 def test_session_roots_nonexistent_skipped(cc, tmp_path, monkeypatch):
     (tmp_path / "h" / "sessions").mkdir(parents=True)
     monkeypatch.setenv("CODEX_HOME", f"{tmp_path}/missing,{tmp_path}/h")

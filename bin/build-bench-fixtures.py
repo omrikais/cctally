@@ -1003,7 +1003,10 @@ PRODUCER_SOURCE_EXCLUSIONS = (
 #: outcome-quarantine modules and its derivation-completion step, brought it
 #: to 155, and further work, ending with #997's three rebuild-worker modules,
 #: to 161, and #797/#823/#840's provider-sample pair and its provider-activity
-#: and staleness-proof kernels to 165. The cost is
+#: and staleness-proof kernels to 165, and #944's Claude cost attribution
+#: kernel and glue to 167, and #1015's correction-lineage kernel to 168, and
+#: #939's Codex worker attempt records to 169.
+#: The cost is
 #: independent of corpus scale. Roughly a quarter of recent commits
 #: touch one of these files, and each such change rebuilds any corpus root
 #: whose marker was written by the previous tree -- for `large` that is the
@@ -1013,6 +1016,7 @@ PRODUCER_SOURCES = (
     "bin/_cctally_alerts.py",
     "bin/_cctally_cache.py",
     "bin/_cctally_cache_report.py",
+    "bin/_cctally_claude_attribution.py",
     "bin/_cctally_codex.py",
     "bin/_cctally_completion.py",
     "bin/_cctally_config.py",
@@ -1077,6 +1081,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_cache_report_wire.py",
     "bin/_lib_cache_writer_lock.py",
     "bin/_lib_changelog.py",
+    "bin/_lib_claude_attribution.py",
     "bin/_lib_clone_copy.py",
     "bin/_lib_codex_account_adoption.py",
     "bin/_lib_codex_drain_admission.py",
@@ -1097,6 +1102,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_codex_segments.py",
     "bin/_lib_codex_title_clean.py",
     "bin/_lib_codex_window_attribution.py",
+    "bin/_lib_codex_worker_lifecycle.py",
     "bin/_lib_conversation.py",
     "bin/_lib_conversation_anon.py",
     "bin/_lib_conversation_dispatch.py",
@@ -1140,6 +1146,7 @@ PRODUCER_SOURCES = (
     "bin/_lib_quota_calibration.py",
     "bin/_lib_quota_copy.py",
     "bin/_lib_quota_ledger.py",
+    "bin/_lib_quota_lineage.py",
     "bin/_lib_quota_model.py",
     "bin/_lib_rate_change_delivery.py",
     "bin/_lib_rebuild_progress.py",

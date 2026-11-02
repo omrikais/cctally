@@ -1300,6 +1300,9 @@ def test_e_re_observing_an_unchanged_identity_writes_no_incarnation_row(env):
 def test_f_a_failing_maintenance_stage_keeps_the_earlier_stages(
     env, monkeypatch, capsys,
 ):
+    """A failing adoption unit rolls back alone: resolution's effects stay,
+    reconciliation is skipped while the unit's item remains (recorded owed,
+    #980 D4), and the item is still owed, so the next clean sync settles it."""
     store = CacheStore(env, "store")
     try:
         _accounting_rollout(env, "01", "main")
@@ -1308,7 +1311,7 @@ def test_f_a_failing_maintenance_stage_keeps_the_earlier_stages(
         db = env.cache._cctally_db_sib
         real_resolution = db.backfill_codex_quota_observed_model
         real_reconcile = env.cache.reconcile_codex_window_attribution_spend
-        real_adoption = env.cache.apply_codex_window_spend_adoption
+        real_adoption = env.cache.apply_codex_window_spend_adoption_unit
 
         def resolution(conn):
             stages.append("resolution")
@@ -1316,34 +1319,37 @@ def test_f_a_failing_maintenance_stage_keeps_the_earlier_stages(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES('g10_stage_1','1')")
             return real_resolution(conn)
 
-        def adoption(conn, *, touched):
+        def adoption(conn, **kwargs):
             stages.append("adoption")
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES('g10_stage_2','1')")
             raise sqlite3.OperationalError("g10 injected adoption failure")
 
-        def reconcile(conn):
+        def reconcile(conn, **kwargs):
             stages.append("reconcile")
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta(key,value) VALUES('g10_stage_3','1')")
-            return real_reconcile(conn)
+            return real_reconcile(conn, **kwargs)
 
         monkeypatch.setattr(db, "backfill_codex_quota_observed_model", resolution)
-        monkeypatch.setattr(env.cache, "apply_codex_window_spend_adoption", adoption)
+        monkeypatch.setattr(
+            env.cache, "apply_codex_window_spend_adoption_unit", adoption)
         monkeypatch.setattr(
             env.cache, "reconcile_codex_window_attribution_spend", reconcile)
         env.append("01")
         capsys.readouterr()
         stats = store.sync()
         err = capsys.readouterr().err
-        assert stages == ["resolution", "adoption", "reconcile"]
+        assert stages == ["resolution", "adoption"]
         assert stats.maintenance_failed is True
         assert stats.full_walk_complete is False
         assert "[cache-sync] could not adopt Codex window spend: " \
                "g10 injected adoption failure" in err
         meta = dict(store.conn.execute(
             "SELECT key, value FROM cache_meta WHERE key LIKE 'g10_stage_%'"))
-        assert meta == {"g10_stage_1": "1", "g10_stage_3": "1"}
+        assert meta == {"g10_stage_1": "1"}
+        debt = env.cache.load_codex_finalization_debt(store.conn)
+        assert debt.first_item() is not None and debt.attribution
         assert store.conn.execute(
             "SELECT 1 FROM cache_meta "
             "WHERE key='dashboard_codex_full_walk_complete'").fetchone() is None
@@ -1352,12 +1358,14 @@ def test_f_a_failing_maintenance_stage_keeps_the_earlier_stages(
         ).fetchone() is None
         assert not store.conn.in_transaction
 
-        # Recovery: the next clean sync completes the walk again.
+        # Recovery: the next clean sync settles the owed item and completes.
         monkeypatch.setattr(
-            env.cache, "apply_codex_window_spend_adoption", real_adoption)
+            env.cache, "apply_codex_window_spend_adoption_unit", real_adoption)
         stats = store.sync()
         assert stats.maintenance_failed is False
         assert stats.full_walk_complete is True
+        assert stages[-1] == "reconcile"
+        assert env.cache.load_codex_finalization_debt(store.conn).empty
         assert store.conn.execute(
             "SELECT 1 FROM cache_meta "
             "WHERE key='dashboard_codex_full_walk_complete'").fetchone() is not None
@@ -3126,3 +3134,340 @@ def test_g_the_shrink_still_truncates_and_a_failed_shrink_waits_60_seconds(
     finally:
         reader.close()
         writer.close()
+
+
+# ── #980 Part D: durable, cancellable finalization (spec §4.4, T-D1/T-D2) ───
+
+
+class _StepClock:
+    """A hand-advanced monotonic clock for the walk and finalization."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _historic_spend_then_identified_window(env: Env, store: CacheStore,
+                                           monkeypatch) -> Rollout:
+    """Historic spend ingested while the root had no identity (NULL), then
+    the root identified; returns the historic rollout. A later rollout with
+    weekly evidence lets window adoption attribute the historic spend."""
+    historic = env.rollout("d-historic", "conv-d-historic", 2, start=-_DAY)
+    _settle(store)
+    assert {row[2] for row in _attribution(store)
+            if row[0] == str(historic.path)} == {None}
+    _identify_codex_roots(env, monkeypatch, {"key": _ACCOUNT_A})
+    return historic
+
+
+def _evidence_rollout(env: Env, name: str) -> Rollout:
+    rollout = env.rollout(name, f"conv-{name}", 1, start=0)
+    with rollout.path.open("a", encoding="utf-8") as fh:
+        fh.write(_lines([_quota_record(rollout.clock, 20.0)]))
+    rollout.clock += 1
+    return rollout
+
+
+def test_budgeted_finalization_starts_no_stage_past_the_deadline(
+    env, monkeypatch,
+):
+    """#980 RED: a budgeted (5 s) sync ran its whole finalization whatever
+    the clock said. The walk now leaves a reserve, a unit is admitted only
+    above the settlement floor, and planning that crosses the deadline stops
+    the unit; no finalization helper starts past the deadline, and the work
+    stays owed for a later call."""
+    store = CacheStore(env, "store")
+    try:
+        rollouts = [_accounting_rollout(env, f"o{index}", f"conv-o{index}")
+                    for index in range(4)]
+        _settle(store)
+        for rollout in rollouts:
+            _append_turn_and_quota(env, rollout, 30.0)
+        clock = _StepClock()
+        timed = pytest.MonkeyPatch()
+        timed.setattr(env.cache, "_walk_clock", clock)
+        real_write = env.cache._write_codex_file_batch
+
+        def write(conn, **kwargs):
+            result = real_write(conn, **kwargs)
+            clock.now += 1.125                  # four files: the walk ends at 4.5
+            return result
+
+        timed.setattr(env.cache, "_write_codex_file_batch", write)
+        adoption = env.cache._lib_codex_account_adoption
+        real_plan = adoption.build_spend_adoption_plan
+        planned: list[float] = []
+
+        def expensive_plan(*args, **kwargs):
+            planned.append(clock.now)
+            plan = real_plan(*args, **kwargs)
+            clock.now += 0.6
+            return plan
+
+        timed.setattr(adoption, "build_spend_adoption_plan", expensive_plan)
+        entered: list[tuple[str, float]] = []
+        for name in ("apply_codex_window_spend_adoption",
+                     "apply_codex_window_spend_adoption_unit",
+                     "reconcile_codex_window_attribution_spend"):
+            real = getattr(env.cache, name, None)
+            if real is None:
+                continue
+
+            def wrapped(*args, _name=name, _real=real, **kwargs):
+                entered.append((_name, clock.now))
+                return _real(*args, **kwargs)
+
+            timed.setattr(env.cache, name, wrapped)
+        try:
+            stats = store.sync(budget_seconds=5.0)
+        finally:
+            timed.undo()
+        assert planned, "non-vacuity: the finalization planned adoption"
+        late = [(name, at) for name, at in entered if at >= 5.0]
+        assert late == [], f"finalization stages started past the deadline: {late}"
+        assert clock.now < 5.0 + 0.6 + 1e-9
+        assert stats.finalization_deferred and not stats.full_walk_complete
+        assert not env.cache.load_codex_finalization_debt(store.conn).empty
+        store.sync()
+        assert env.cache.load_codex_finalization_debt(store.conn).empty
+    finally:
+        store.close()
+
+
+def test_a_failed_adoption_is_revisited_for_its_spans(env, monkeypatch):
+    """#980 RED: an adoption that failed was never revisited, because the next
+    sync's bounded pass only reached the spans that sync wrote. The failed
+    unit's debt stays persisted, so a sync with no new data settles it."""
+    store = CacheStore(env, "store")
+    try:
+        historic = _historic_spend_then_identified_window(
+            env, store, monkeypatch)
+        _evidence_rollout(env, "d-evidence")
+        adoption = env.cache._lib_codex_account_adoption
+
+        def failing_plan(*_args, **_kwargs):
+            raise sqlite3.OperationalError("injected adoption failure")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(adoption, "build_spend_adoption_plan", failing_plan)
+            store.sync()
+        assert {row[2] for row in _attribution(store)
+                if row[0] == str(historic.path)} == {None}
+        store.sync()                            # no new data
+        assert {row[2] for row in _attribution(store)
+                if row[0] == str(historic.path)} == {_ACCOUNT_A}
+        assert _full_walk_marker(store)
+    finally:
+        store.close()
+
+
+def test_w11_loss_keeps_committed_batch_debt(env, monkeypatch):
+    """A W11 withdrawal of the last batch takes that batch's debt with it
+    (it lives in the finalization transaction), while the debt of a batch
+    that already committed survives into the rerun finalization."""
+    store = CacheStore(env, "store")
+    try:
+        _settle(store)
+        monkeypatch.setattr(env.cache, "CODEX_ACCOUNTING_BATCH_FILES", 1)
+        first = _evidence_rollout(env, "w-first")
+        tail = env.rollout("w-tail", "conv-w-tail", 1, start=22 * _DAY)
+        seen: list[dict] = []
+        real_settle = env.cache._codex_settle_finalization
+
+        def settle(conn, **kwargs):
+            debt = env.cache.load_codex_finalization_debt(conn)
+            seen.append({root: [item.span for item in entries]
+                         for root, entries in debt.items.items()})
+            return real_settle(conn, **kwargs)
+
+        monkeypatch.setattr(env.cache, "_codex_settle_finalization", settle)
+        store.conn.execute(
+            "DELETE FROM cache_meta WHERE key='parse_health_codex'")
+        store.conn.commit()
+        with pytest.MonkeyPatch.context() as patch:
+            losses = _inject_parse_health_transaction_loss(env, patch)
+            store.activate()
+            env.cache.sync_codex_cache(store.conn)
+        assert losses == [True]
+        assert store.file_row(tail) is None, "the tail was not withdrawn"
+        assert len(seen) >= 2, "non-vacuity: the finalization was rerun"
+        rerun = seen[-1]
+        spans = [span for entries in rerun.values() for span in entries]
+        first_at = BASE + dt.timedelta(minutes=1)   # the first batch's turns
+        tail_at = BASE + dt.timedelta(seconds=22 * _DAY)
+        assert any(low <= first_at <= high for low, high in spans), rerun
+        assert not any(high >= tail_at for _low, high in spans), rerun
+    finally:
+        store.close()
+
+
+def test_full_walk_complete_withheld_while_debt_remains_walk_certified_unaffected(
+    env, monkeypatch,
+):
+    """A clean walk whose finalization could not be admitted is certified
+    (``walk_certified``) but not complete while its debt remains."""
+    store = CacheStore(env, "store")
+    try:
+        rollouts = [_accounting_rollout(env, f"c{index}", f"conv-c{index}")
+                    for index in range(4)]
+        _settle(store)
+        for rollout in rollouts:
+            _append_turn_and_quota(env, rollout, 30.0)
+        clock = _StepClock()
+        real_write = env.cache._write_codex_file_batch
+
+        def write(conn, **kwargs):
+            result = real_write(conn, **kwargs)
+            clock.now += 1.2                    # the walk ends at 4.8
+            return result
+
+        with pytest.MonkeyPatch.context() as timed:
+            timed.setattr(env.cache, "_walk_clock", clock)
+            timed.setattr(env.cache, "_write_codex_file_batch", write)
+            stats = store.sync(budget_seconds=5.0)
+        assert stats.files_processed == 4
+        assert stats.walk_certified is True
+        assert stats.finalization_deferred is True
+        assert stats.full_walk_complete is False
+        assert stats.full_walk_debt_only is False
+        assert not env.cache.load_codex_finalization_debt(store.conn).empty
+        assert not _full_walk_marker(store)
+        stats = store.sync()
+        assert stats.full_walk_complete and _full_walk_marker(store)
+    finally:
+        store.close()
+
+
+def _cache_db_path(store: CacheStore) -> pathlib.Path:
+    store.activate()
+    return pathlib.Path(store.env.ns["_cctally_core"].CACHE_DB_PATH)
+
+
+def _grow_cache_wal(store: CacheStore) -> None:
+    """Push cache.db's ``-wal`` past the REAL truncate trigger (64 MiB)."""
+    trigger = store.env.cache.CACHE_WAL_CHECKPOINT_TRIGGER_BYTES
+    store.conn.execute("PRAGMA wal_autocheckpoint=0")
+    store.conn.execute("CREATE TABLE IF NOT EXISTS d5_pad(b BLOB)")
+    store.conn.executemany(
+        "INSERT INTO d5_pad VALUES (zeroblob(?))",
+        [(1024 * 1024,)] * (trigger // (1024 * 1024) + 8))
+    store.conn.commit()
+    assert store.env.cache._wal_file_size(_cache_db_path(store)) > trigger
+
+
+def _owed_store(env: Env, monkeypatch) -> CacheStore:
+    """A store whose budgeted sync met both owed-maintenance gates."""
+    store = CacheStore(env, "store")
+    rollouts = _three_changed_files(env)
+    _settle(store)
+    assert store.change_log(), "non-vacuity: prunable change-log rows"
+    # Past the retained tail: every existing row is at or below the cutoff.
+    store.conn.execute(
+        "UPDATE cache_meta SET value='60000' "
+        "WHERE key='codex_accounting_mutation_seq'")
+    store.conn.commit()
+    _grow_cache_wal(store)
+    for rollout in rollouts:
+        _append_turn_and_quota(env, rollout, 30.0)
+    return store
+
+
+def test_budgeted_sync_records_owed_wal_and_prune(env, monkeypatch):
+    """#980 T-D2 RED: the budgeted (hook) call ran the WAL TRUNCATE and the
+    change-log prune inline. It now records both as owed maintenance and
+    requests the executor."""
+    store = _owed_store(env, monkeypatch)
+    try:
+        calls: list[str] = []
+        requested: list[str] = []
+        real_truncate = env.cache._run_wal_truncate
+        real_prune = env.cache._prune_codex_accounting_change_log
+
+        def truncate(*args, **kwargs):
+            calls.append("truncate")
+            return real_truncate(*args, **kwargs)
+
+        def prune(*args, **kwargs):
+            calls.append("prune")
+            return real_prune(*args, **kwargs)
+
+        monkeypatch.setattr(env.cache, "_run_wal_truncate", truncate)
+        monkeypatch.setattr(
+            env.cache, "_prune_codex_accounting_change_log", prune)
+        monkeypatch.setattr(env.cache, "_request_codex_drain_worker",
+                            lambda command: requested.append(command) or "x")
+        stats = store.sync(budget_seconds=5.0)
+        assert stats.files_processed == 3
+        assert calls == [], calls
+        assert env.cache.load_codex_owed_maintenance(store.conn) == {
+            "wal_truncate": True, "change_log_prune": True}
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM codex_accounting_change_log "
+            "WHERE mutation_seq <= 10000").fetchone()[0] > 0
+        assert env.cache.CODEX_PRUNE_DRAIN_COMMAND in requested
+    finally:
+        store.close()
+
+
+def test_executor_runs_owed_units_with_admission_and_clear_on_success(
+    env, monkeypatch,
+):
+    """#980 T-D2: the executor runs each owed unit after its own admission,
+    yields to a waiting request between units, retries a busy checkpoint and
+    clears a flag only on success."""
+    import _lib_codex_drain_admission as adm
+
+    store = _owed_store(env, monkeypatch)
+    try:
+        store.sync(budget_seconds=5.0)
+        cache = env.cache
+        assert cache.load_codex_owed_maintenance(store.conn) == {
+            "wal_truncate": True, "change_log_prune": True}
+        app_dir = env.ns["_cctally_core"].APP_DIR
+        published: list[str] = []
+
+        def request_after_first_unit():
+            if not published:
+                published.append(adm.publish_waiting_request(
+                    app_dir, root_keys=["any"]))
+
+        monkeypatch.setattr(adm, "_after_finish", request_after_first_unit)
+        result = cache.run_codex_prune_drain(wait_for_requests=False)
+        assert published and result.yielded == 1 and result.owed_units == 1
+        assert cache.load_codex_owed_maintenance(store.conn) == {
+            "wal_truncate": True, "change_log_prune": False}
+        assert store.conn.execute(
+            "SELECT COUNT(*) FROM codex_accounting_change_log "
+            "WHERE mutation_seq <= 10000").fetchone()[0] == 0
+        assert cache._wal_file_size(_cache_db_path(store)) > (
+            cache.CACHE_WAL_CHECKPOINT_TRIGGER_BYTES)
+
+        # The waiting request is served; a reader pins the WAL so the first
+        # TRUNCATE is busy, and the retry (after the poll step) succeeds.
+        monkeypatch.setattr(adm, "_after_finish", None)
+        for request in (app_dir / adm.REQUEST_DIR_NAME).glob("req-*.json"):
+            request.unlink()
+        reader = sqlite3.connect(str(_cache_db_path(store)))
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM cache_meta").fetchone()
+        sleeps: list[float] = []
+
+        def release_reader(seconds):
+            sleeps.append(seconds)
+            reader.rollback()
+
+        monkeypatch.setattr(adm, "_sleep", release_reader)
+        try:
+            result = cache.run_codex_prune_drain(wait_for_requests=False)
+        finally:
+            reader.close()
+        assert sleeps, "non-vacuity: the first TRUNCATE was busy"
+        assert result.owed_units == 1 and result.yielded == 0
+        assert cache.load_codex_owed_maintenance(store.conn) == {
+            "wal_truncate": False, "change_log_prune": False}
+        assert cache._wal_file_size(_cache_db_path(store)) < (
+            cache.CACHE_WAL_CHECKPOINT_TRIGGER_BYTES)
+    finally:
+        store.close()

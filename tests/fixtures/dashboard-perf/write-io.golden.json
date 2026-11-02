@@ -11,8 +11,13 @@
   "bytesPerMinute": 6041600,
   "bytesWritten": 30208000,
   "coldStartup": {
+    "accountingCaughtUp": false,
     "admitted": true,
-    "bytes": 512000
+    "bytes": 512000,
+    "held": false,
+    "lastPass": null,
+    "releasedBy": null,
+    "residual": null
   },
   "excludedDeletions": {
     "bytes": 5754880,

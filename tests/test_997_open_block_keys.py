@@ -26,7 +26,10 @@ import pytest
 from conftest import load_script, redirect_paths
 
 
-# The pre-#997-D19 `only_missing` key query, verbatim (HEAD 0bfc75475).
+# The pre-#997-D19 `only_missing` key query (HEAD 0bfc75475), with one
+# deliberate edit: #956 class 1 (spec 4.6.3) breaks an equal-instant tie by
+# `journal_id` (logical identity, a NULL one lowest) instead of the rowid,
+# which a journal correction can reorder.
 OLD_KEYS_SQL = (
     """
                 SELECT DISTINCT snapshots.five_hour_window_key,
@@ -42,7 +45,7 @@ OLD_KEYS_SQL = (
     "          AND latest.five_hour_window_key IS NOT NULL"
     "          AND latest.five_hour_percent IS NOT NULL"
     "        ORDER BY unixepoch(latest.captured_at_utc) DESC,"
-    "                 latest.id DESC"
+    "                 latest.journal_id DESC"
     "        LIMIT 1"
     "   )"
     "   AND NOT EXISTS ("
@@ -72,8 +75,8 @@ WRONG_REWRITES = {
         "WHERE latest.account_key = snapshots.account_key",
     ),
     "lowest_id_ties": _wrong(
-        "latest.id DESC",
-        "latest.id ASC",
+        "latest.journal_id DESC",
+        "latest.journal_id ASC",
     ),
 }
 
@@ -192,7 +195,11 @@ def test_open_block_keys_plan_has_no_correlated_snapshot_scan(
 A, B = "acct-a", "acct-b"
 
 # rows: (id, captured_at_utc, five_hour_window_key, five_hour_percent,
-#        account_key); blocks: (five_hour_window_key, account_key).
+#        account_key); blocks: (five_hour_window_key, account_key). Each row's
+# `journal_id` sorts in the same order as its rowid (`_scratch`), so every
+# case keeps its pre-#956 meaning; the tie-break's own semantics (logical
+# identity, not journal order or rowid) are pinned end to end by
+# `tests/test_account_bound_replay_m19.py`'s equal-second-tie schedule.
 CASES = {
     # Two real accounts plus several NULL-account snapshots, each in its own
     # window. acct-b's latest capture has the lower id.
@@ -210,9 +217,9 @@ CASES = {
         expected={(101, A), (200, B), (300, None)},
     ),
     # One account, two captures in the same second, in different windows.
-    # unixepoch() truncates the fraction, so they tie and the higher id (the
-    # +00:00 row) wins. As text, `.` sorts after `+`, so the text-order
-    # winner is the lower id.
+    # unixepoch() truncates the fraction, so they tie and the higher
+    # journal_id (the +00:00 row) wins. As text, `.` sorts after `+`, so the
+    # text-order winner is the lower one.
     "same_second_text_winner_is_not_highest_id": dict(
         rows=[
             (1, "2026-01-01T10:00:00.500Z", 110, 1.0, A),
@@ -233,7 +240,7 @@ CASES = {
     ),
     # acct-a's newest-id row is unparseable beside an older valid row: a
     # NULL unixepoch sorts last under DESC. acct-b's rows are all
-    # unparseable, so the id alone decides.
+    # unparseable, so the journal_id alone decides.
     "unparseable_captures": dict(
         rows=[
             (1, "2026-01-03T00:00:00Z", 131, 1.0, A),
@@ -283,15 +290,15 @@ def _scratch(case) -> sqlite3.Connection:
         "CREATE TABLE weekly_usage_snapshots ("
         " id INTEGER PRIMARY KEY, captured_at_utc TEXT,"
         " five_hour_window_key INTEGER, five_hour_percent REAL,"
-        " account_key TEXT)"
+        " account_key TEXT, journal_id TEXT)"
     )
     conn.execute(
         "CREATE TABLE five_hour_blocks ("
         " five_hour_window_key INTEGER, account_key TEXT)"
     )
     conn.executemany(
-        "INSERT INTO weekly_usage_snapshots VALUES (?, ?, ?, ?, ?)",
-        case["rows"],
+        "INSERT INTO weekly_usage_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+        [(*row, f"sa:o:{100 + row[0]}") for row in case["rows"]],
     )
     conn.executemany(
         "INSERT INTO five_hour_blocks VALUES (?, ?)", case["blocks"],

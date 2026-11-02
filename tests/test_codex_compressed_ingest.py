@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -105,6 +107,45 @@ def test_compressed_only_rollout_ingests_exactly_like_its_plain_twin(
                                    end_offset=len(decoded))
     assert bytes(cursor.get("content_anchor") or b"") == anchor
     assert cursor.get("content_anchor_offset") == len(decoded)
+
+
+def test_archive_only_rollout_is_counted_once(tmp_path, monkeypatch):
+    """#970 R2 (AC1/AC4): a rollout Codex already archived when cctally first
+    looks was never discovered, so its usage, cost and quota history were
+    silently missing. It must ingest exactly once, under its dated logical
+    identity, and never under an archive-spelled path."""
+    import _lib_jsonl
+    ns, day = _store(tmp_path, monkeypatch, "archive")
+    provider = day.parents[3]
+    archived = provider / "archived_sessions" / NAME
+    records = token_records(5, session_id="s-arch")
+    records[-1]["payload"]["rate_limits"] = {
+        "limit_id": "codex", "primary": {"used_percent": 12.0,
+        "window_minutes": 10080, "resets_at": 1784966699}}
+    write_rollout(archived, records)
+    with open(archived, "rb") as fh:
+        parsed = list(_lib_jsonl._iter_codex_jsonl_entries_with_offsets(
+            fh, str(archived)))
+    assert len(parsed) == 5            # the fixture really carries usage
+    compress_in_place(archived)
+    _sync(ns)
+    logical = day / NAME
+    conn = ns["open_cache_db"]()
+    try:
+        by_path = dict(conn.execute(
+            "SELECT source_path, COUNT(*) FROM codex_session_entries "
+            "GROUP BY source_path").fetchall())
+        quota = dict(conn.execute(
+            "SELECT source_path, COUNT(*) FROM quota_window_snapshots "
+            "WHERE source='codex' GROUP BY source_path").fetchall())
+        cursors = [r[0] for r in conn.execute(
+            "SELECT path FROM codex_session_files")]
+    finally:
+        conn.close()
+    # 16b055cae globs only `sessions/`, so nothing is ingested: 0 rows.
+    assert by_path == {str(logical): len(parsed)}
+    assert set(quota) == {str(logical)} and quota[str(logical)] >= 1
+    assert cursors == [str(logical)]
 
 
 def test_compressed_conversation_events_match_the_plain_twin(
@@ -597,3 +638,457 @@ def test_held_transition_keeps_the_final_changed_file_in_its_w11_transaction(tmp
             (str(logical),)).fetchone() == ("pending",)
     finally:
         conn.close()
+
+
+# ── #970 T6: P2 — an archive first sight guesses no account ─────────────────
+
+from test_codex_bounded_ingest import _auth_json  # noqa: E402
+
+ARCH_UUID = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0970"
+ARCH_NAME = f"rollout-2026-07-19T10-00-00-{ARCH_UUID}.jsonl"
+FRESH_NAME = "rollout-2026-07-20T12-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0971.jsonl"
+ACCOUNTS = (("acct-a", "a@example.com"), ("acct-b", "b@example.com"))
+#: An account-level weekly window, [2026-07-20T11:00Z, 2026-07-27T11:00Z).
+WEEKLY = {"limit_id": "codex", "limit_name": "codex",
+          "primary": {"used_percent": 30.0, "window_minutes": 10080,
+                      "resets_at": 1785150000}}
+
+
+def _p2_env(tmp_path, monkeypatch, login):
+    ns, day = _store(tmp_path, monkeypatch, "p2")
+    provider = day.parents[3]
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    (provider / "auth.json").write_text(_auth_json(*login))
+    return ns, provider, day
+
+
+def _login(provider, login):
+    (provider / "auth.json").write_text(_auth_json(*login))
+
+
+def _file_account_ops(ns) -> list:
+    import json
+    out = []
+    for segment in sorted(ns["_cctally_core"].JOURNAL_DIR.glob("*.jsonl")):
+        for line in segment.read_text().splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if (record.get("payload") or {}).get("kind") == "codex_file_account":
+                    out.append(record)
+    return out
+
+
+def _accounts(ns, path) -> dict:
+    """``{line_offset: account_key}`` of one identity's accounting rows."""
+    conn = ns["open_cache_db"]()
+    try:
+        return dict(conn.execute(
+            "SELECT line_offset, account_key FROM codex_session_entries "
+            "WHERE source_path=?", (str(path),)).fetchall())
+    finally:
+        conn.close()
+
+
+def _archive_only(provider, records, *, compressed=True):
+    archived = provider / "archived_sessions" / ARCH_NAME
+    write_rollout(archived, records)
+    if compressed:
+        archived = compress_in_place(archived)
+    return archived, provider / "sessions" / "2026" / "07" / "19" / ARCH_NAME
+
+
+def _with_rate_limits(records):
+    for record in records:
+        payload = record.get("payload") or {}
+        if payload.get("type") == "token_count":
+            payload["info"]["rate_limits"] = WEEKLY
+    return records
+
+
+@pytest.mark.parametrize("order", ["a-then-b", "b-then-a"])
+def test_archive_first_sight_journals_no_decision(tmp_path, monkeypatch, order):
+    """P2 (A6): usage cctally first reads in the archive was credited to
+    whoever happened to be logged in — a durable, journaled misattribution
+    that every rebuild replays. With two real accounts in either order, the
+    archive first sight must journal no `codex_file_account` op and stay
+    unattributed, while a sessions first sight still takes the live login."""
+    first, second = ACCOUNTS if order == "a-then-b" else ACCOUNTS[::-1]
+    ns, provider, day = _p2_env(tmp_path, monkeypatch, first)
+    seeded = day / NAME
+    write_rollout(seeded, token_records(3, session_id="seeded"))
+    _sync(ns)
+    seeded_accounts = set(_accounts(ns, seeded).values())
+    assert len(seeded_accounts) == 1 and None not in seeded_accounts
+    ops_before = len(_file_account_ops(ns))
+    assert ops_before >= 1
+    _login(provider, second)
+    _archived, logical = _archive_only(
+        provider, token_records(4, session_id="archived", start_minute=30))
+    _sync(ns)
+    assert len(_accounts(ns, logical)) == 4
+    # BASE: the live login of the second account was decided and journaled.
+    assert len(_file_account_ops(ns)) == ops_before
+    assert set(_accounts(ns, logical).values()) == {None}
+    fresh = day / FRESH_NAME
+    write_rollout(fresh, token_records(2, session_id="fresh", start_minute=40))
+    _sync(ns)
+    fresh_accounts = set(_accounts(ns, fresh).values())
+    assert len(fresh_accounts) == 1 and None not in fresh_accounts
+    assert fresh_accounts != seeded_accounts       # two real accounts
+    assert len(_file_account_ops(ns)) == ops_before + 1
+
+
+def test_window_adoption_stamps_archived_spend(tmp_path, monkeypatch):
+    """P2 leaves an archive first sight to the existing window adoption: when
+    one account's weekly quota window claims its timestamps, its spend must
+    be credited to that account (not left unattributed, not given to the
+    current login) without any per-file decision."""
+    ns, provider, day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[0])
+    seeded = day / NAME
+    write_rollout(seeded, _with_rate_limits(
+        token_records(3, session_id="seeded", start_minute=70)))
+    _sync(ns)
+    claimed = set(_accounts(ns, seeded).values())
+    assert len(claimed) == 1 and None not in claimed
+    ops_before = len(_file_account_ops(ns))
+    _login(provider, ACCOUNTS[1])
+    _archived, logical = _archive_only(
+        provider, token_records(4, session_id="archived", start_minute=90))
+    _sync(ns)
+    # BASE: the current login (B) was decided; P2 + adoption gives A.
+    assert set(_accounts(ns, logical).values()) == claimed
+    assert len(_file_account_ops(ns)) == ops_before
+
+
+def test_delta_after_unarchive_takes_live_login_for_new_bytes_only(
+        tmp_path, monkeypatch):
+    """A resumed thread after an unarchive appends genuinely new bytes: those
+    take the live login from the first offset beyond the cursor, while the
+    archived history read first in the archive stays unattributed — never
+    re-decided wholesale for the login of the day."""
+    ns, provider, day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[1])
+    archived, logical = _archive_only(
+        provider, token_records(3, session_id="resumed"), compressed=False)
+    _sync(ns)
+    old_size = archived.stat().st_size
+    assert set(_accounts(ns, logical).values()) == {None}
+    ops_before = len(_file_account_ops(ns))
+    logical.parent.mkdir(parents=True)
+    os.rename(archived, logical)
+    _sync(ns)                     # the unarchive: a location-only adoption
+    assert set(_accounts(ns, logical).values()) == {None}
+    assert len(_file_account_ops(ns)) == ops_before
+    grown = token_records(5, session_id="resumed")
+    with open(logical, "ab") as fh:
+        for record in grown[len(token_records(3, session_id="resumed")):]:
+            fh.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+    _sync(ns)
+    accounts = _accounts(ns, logical)
+    assert len(accounts) == 5
+    old = {k for off, k in accounts.items() if off < old_size}
+    new = {k for off, k in accounts.items() if off >= old_size}
+    # BASE: the first sight already took the live login for every byte.
+    assert old == {None}
+    assert len(new) == 1 and None not in new
+    ops = _file_account_ops(ns)
+    assert len(ops) == ops_before + 1
+
+
+def test_rebuild_with_archived_identities_mints_no_decision(tmp_path, monkeypatch):
+    """`cache-sync --source codex --rebuild` re-reads archived history; it
+    must never mint a live-login decision for it (A6), or one rebuild would
+    durably credit months of archived usage to the current login."""
+    import argparse
+    ns, provider, day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[0])
+    seeded = day / NAME
+    write_rollout(seeded, token_records(3, session_id="seeded"))
+    _archived, logical = _archive_only(
+        provider, token_records(4, session_id="archived", start_minute=30))
+    _sync(ns)
+    ops_before = len(_file_account_ops(ns))
+    _login(provider, ACCOUNTS[1])
+    cc = sys.modules["_cctally_cache"]
+    assert cc.cmd_cache_sync(argparse.Namespace(
+        source="codex", rebuild=True, prune_orphans=False,
+        prune_conversations=False)) == 0
+    assert len(_accounts(ns, logical)) == 4
+    assert set(_accounts(ns, logical).values()) == {None}
+    # BASE: the first sight journaled a decision before the rebuild.
+    assert len(_file_account_ops(ns)) == ops_before == 1
+
+
+def _quota_rows(ns, path) -> list:
+    """One identity's quota observations, by their physical identity."""
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute(
+            "SELECT line_offset, captured_at_utc, observed_slot, "
+            "logical_limit_key, window_minutes, used_percent, resets_at_utc "
+            "FROM quota_window_snapshots WHERE source='codex' "
+            "AND source_path=? ORDER BY line_offset", (str(path),)).fetchall()
+    finally:
+        conn.close()
+
+
+def _quota_obs_ops(ns, path) -> int:
+    """Journal quota observation ops keyed by ``path`` (the cutover's
+    bootstrap segment, which copies the first cache rows, excluded)."""
+    count = 0
+    for segment in sorted(ns["_cctally_core"].JOURNAL_DIR.glob("*.jsonl")):
+        if segment.name.startswith("bootstrap-"):
+            continue
+        for line in segment.read_text().splitlines():
+            if line.strip():
+                payload = json.loads(line).get("payload") or {}
+                if (payload.get("kind") == "quota_window_snapshot"
+                        and payload.get("source_path") == str(path)):
+                    count += 1
+    return count
+
+
+def test_a_rewritten_archive_adds_no_duplicate_of_a_retained_quota_reading(
+        tmp_path, monkeypatch):
+    """#970 F1 (AC5 A1): durable duplicate quota observations. A rollout read
+    from `sessions/` and later pruned keeps its quota observations, which the
+    journal retains. Codex rewrites the rollout when it archives it, so every
+    line offset drifts, and the first sight of the archive re-emitted every
+    retained reading under a new offset. The cache key and the journal natural
+    key both carry the offset, so neither caught it: 15 semantic duplicates
+    landed in cache.db and the journal on the operator's store, and the
+    journal replays them on every rebuild. Only the genuinely new reading may
+    be added; the accounting rows are the archived file's own entries."""
+    ns, provider, day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[0])
+    cc = sys.modules["_cctally_cache"]
+    logical = provider / "sessions" / "2026" / "07" / "19" / ARCH_NAME
+    original_ends = write_rollout(
+        logical, _with_rate_limits(token_records(3, session_id="drifted")))
+    keeper = day / NAME          # keeps the root recognizable once it goes
+    write_rollout(keeper, token_records(1, session_id="keeper", start_minute=50))
+    _sync(ns)
+    assert len(_quota_rows(ns, logical)) == 3
+    ops_before = _quota_obs_ops(ns, logical)
+    assert ops_before == 3
+    logical.unlink()
+    _sync(ns)
+    cc.run_codex_prune_drain(wait_for_requests=False)
+    assert _accounts(ns, logical) == {}
+    # The journal re-materializes the pruned readings: they are retained.
+    sys.modules["_cctally_journal"].recover_quota_cache_from_journal(quiet=True)
+    retained = _quota_rows(ns, logical)
+    assert len(retained) == 3
+    # The archive rewrite: the same records with one more field each, so
+    # every offset drifts, and one genuinely new reading at the end.
+    rewritten = _with_rate_limits(token_records(4, session_id="drifted"))
+    for record in rewritten:
+        record["archived"] = True
+    archived = provider / "archived_sessions" / ARCH_NAME
+    archived_ends = write_rollout(archived, rewritten)
+    compress_in_place(archived)
+    starts = [0] + archived_ends[:-1]
+    token_starts = starts[2:]
+    assert token_starts[:3] != ([0] + original_ends[:-1])[2:]   # drifted
+    for _ in range(2):
+        _sync(ns)
+        cc.run_codex_history_provenance_drain(wait_for_requests=False)
+    _sync(ns)
+    after = _quota_rows(ns, logical)
+    # BASE: the three retained readings came back under drifted offsets.
+    assert len(after) == 4, after
+    assert set(retained) <= set(after)
+    (new,) = set(after) - set(retained)
+    assert new[0] == token_starts[3]
+    assert _quota_obs_ops(ns, logical) == ops_before + 1
+    assert sorted(_accounts(ns, logical)) == token_starts
+
+
+def _entry_rows(ns, path) -> list:
+    """One identity's accounting rows, ids and attribution included."""
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute(
+            "SELECT id, line_offset, timestamp_utc, total_tokens, account_key "
+            "FROM codex_session_entries WHERE source_path=? ORDER BY line_offset",
+            (str(path),)).fetchall()
+    finally:
+        conn.close()
+
+
+def test_a_rewritten_archive_adds_no_duplicate_of_a_retained_accounting_entry(
+        tmp_path, monkeypatch):
+    """#970 N1: accounting double count. Accounting rows are keyed by
+    (source_path, line_offset) only. A cursorless identity (its cursor row
+    gone, its accounting entries retained) whose rollout Codex rewrote when
+    it archived it is read from byte zero, every offset has drifted, and
+    every retained entry was inserted a second time: the rollout's usage and
+    cost counted twice. Only the genuinely new entry may be added, the
+    retained rows keep their ids and attribution, and a later delta append
+    to the now cursor-bearing identity never pays the retained-entry load."""
+    ns, provider, _day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[0])
+    logical = provider / "sessions" / "2026" / "07" / "19" / ARCH_NAME
+    write_rollout(logical, token_records(3, session_id="drifted"))
+    keeper = provider / "sessions" / "2026" / "07" / "20" / NAME
+    write_rollout(keeper, token_records(1, session_id="keeper", start_minute=50))
+    _sync(ns)
+    retained = _entry_rows(ns, logical)
+    assert len(retained) == 3 and None not in {r[4] for r in retained}
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute("DELETE FROM codex_session_files WHERE path=?",
+                            (str(logical),)).rowcount == 1
+        conn.commit()
+    finally:
+        conn.close()
+    logical.unlink()
+    ops_before = len(_file_account_ops(ns))
+    # The archive rewrite: one more field per line (every offset drifts) and
+    # one genuinely new entry at the end.
+    rewritten = token_records(4, session_id="drifted")
+    for record in rewritten:
+        record["archived"] = True
+    archived = provider / "archived_sessions" / ARCH_NAME
+    archived_ends = write_rollout(archived, rewritten)
+    token_starts = ([0] + archived_ends[:-1])[2:]
+    assert not {r[1] for r in retained} & set(token_starts)   # drifted
+    cc = sys.modules["_cctally_cache"]
+    for _ in range(2):
+        _sync(ns)
+        cc.run_codex_history_provenance_drain(wait_for_requests=False)
+    _sync(ns)
+    after = _entry_rows(ns, logical)
+    # BASE: 7 rows, the three retained entries again at drifted offsets.
+    assert len(after) == 4, after
+    assert set(retained) <= set(after)
+    (new,) = set(after) - set(retained)
+    assert new[1] == token_starts[3]
+    assert sum(r[3] for r in after) == 400
+    assert len(_file_account_ops(ns)) == ops_before   # nothing journaled
+    # A cursor-bearing delta append reads only its new bytes, never the load.
+    loads = []
+    real_open = ns["open_cache_db"]
+
+    def opened():
+        conn = real_open()
+        conn.set_trace_callback(lambda sql: loads.append(sql) if (
+            " ".join(sql.split()).lower().startswith("select timestamp_utc")
+            and "from codex_session_entries" in sql.lower()) else None)
+        return conn
+
+    monkeypatch.setitem(ns, "open_cache_db", opened)
+    monkeypatch.setattr(cc, "open_cache_db", opened)
+    grown = token_records(5, session_id="drifted")
+    grown[-1]["archived"] = True
+    with open(archived, "ab") as fh:
+        fh.write(json.dumps(grown[-1], separators=(",", ":")).encode() + b"\n")
+    _sync(ns)
+    assert loads == []
+    assert len(_entry_rows(ns, logical)) == 5
+
+
+def test_a_rewritten_archive_cut_short_on_its_first_read_adds_no_duplicate(
+        tmp_path, monkeypatch):
+    """#970 V1: the twin of F1 and N1 across a budget stop. A cursorless
+    identity (cursor row gone, quota readings and accounting entries
+    retained) whose rollout Codex rewrote when it archived it is read from
+    byte zero, and the walk deadline stops that first read after one entry.
+    The stop writes a cursor, so the continuation is cursor-bearing, and the
+    retained-row filters covered only the byte-zero read: every retained
+    reading and entry later in the file came back at its drifted offset, a
+    duplicate quota observation journaled for good and the rollout's usage
+    counted twice. Only the genuinely new reading and entry may be added,
+    the retained rows keep their ids and attribution, and nothing is
+    journaled as a file account decision."""
+    ns, provider, _day = _p2_env(tmp_path, monkeypatch, ACCOUNTS[0])
+    cc = sys.modules["_cctally_cache"]
+    logical = provider / "sessions" / "2026" / "07" / "19" / ARCH_NAME
+    write_rollout(logical, _with_rate_limits(token_records(3, session_id="drifted")))
+    keeper = provider / "sessions" / "2026" / "07" / "20" / NAME
+    write_rollout(keeper, token_records(1, session_id="keeper", start_minute=50))
+    _sync(ns)
+    retained_entries = _entry_rows(ns, logical)
+    retained_quota = _quota_rows(ns, logical)
+    assert len(retained_entries) == 3 and None not in {r[4] for r in retained_entries}
+    assert len(retained_quota) == 3
+    quota_ops_before = _quota_obs_ops(ns, logical)
+    conn = ns["open_cache_db"]()
+    try:
+        assert conn.execute("DELETE FROM codex_session_files WHERE path=?",
+                            (str(logical),)).rowcount == 1
+        conn.commit()
+    finally:
+        conn.close()
+    logical.unlink()
+    ops_before = len(_file_account_ops(ns))
+    rewritten = _with_rate_limits(token_records(4, session_id="drifted"))
+    for record in rewritten:
+        record["archived"] = True
+    archived = provider / "archived_sessions" / ARCH_NAME
+    archived_ends = write_rollout(archived, rewritten)
+    token_starts = ([0] + archived_ends[:-1])[2:]
+    assert not {r[1] for r in retained_entries} & set(token_starts)   # drifted
+
+    # The first read of the archive stops on the walk deadline right after
+    # its first accounting entry; later reads run to the end.
+    real_iter = cc._iter_codex_fused_records_with_offsets
+    cut = {"armed": True, "walking": False, "now": 0.0, "fired": False}
+
+    def iterate(fh, path, *args, **kwargs):
+        for emission in real_iter(fh, path, *args, **kwargs):
+            yield emission
+            if (cut["armed"] and cut["walking"] and path == str(logical)
+                    and emission.accounting is not None):
+                cut.update(armed=False, now=10_000.0, fired=True)
+
+    monkeypatch.setattr(cc, "_iter_codex_fused_records_with_offsets", iterate)
+    monkeypatch.setattr(cc, "_walk_clock", lambda: cut["now"])
+    partial_seen = []
+    entry_loads = []      # per walk: retained-entry range loads
+
+    def budgeted_sync():
+        fired_before = cut["fired"]
+        cut["walking"] = True
+        conn = ns["open_cache_db"]()
+        loads = []
+        conn.set_trace_callback(lambda sql: loads.append(sql) if (
+            " ".join(sql.split()).lower().startswith("select timestamp_utc")
+            and "from codex_session_entries" in sql.lower()) else None)
+        try:
+            ns["sync_codex_cache"](conn, budget_seconds=60.0)
+            entry_loads.append(len(loads))
+            if cut["fired"] and not fired_before:
+                partial_seen.append(conn.execute(
+                    "SELECT ingest_complete, last_byte_offset "
+                    "FROM codex_session_files WHERE path=?",
+                    (str(logical),)).fetchone())
+        finally:
+            conn.close()
+            cut.update(walking=False, now=0.0)
+
+    for _ in range(2):
+        budgeted_sync()
+        cc.run_codex_history_provenance_drain(wait_for_requests=False)
+    budgeted_sync()
+    _sync(ns)
+    # The fixture really stopped the cursorless first read mid-file.
+    assert len(partial_seen) == 1, partial_seen
+    complete, reached = partial_seen[0]
+    assert complete == 0 and 0 < reached < archived_ends[-1], partial_seen
+    # Every walk that reads the identity (its first read, then each attempt
+    # at the continuation) loads the retained entries once, never once per
+    # emitted entry.
+    assert max(entry_loads) == 1, entry_loads
+    after_entries = _entry_rows(ns, logical)
+    after_quota = _quota_rows(ns, logical)
+    # BASE: the continuation re-inserted the retained entries and readings
+    # beyond the stop at their drifted offsets.
+    assert len(after_entries) == 4, after_entries
+    assert set(retained_entries) <= set(after_entries)
+    (new_entry,) = set(after_entries) - set(retained_entries)
+    assert new_entry[1] == token_starts[3]
+    assert sum(r[3] for r in after_entries) == 400
+    assert len(after_quota) == 4, after_quota
+    assert set(retained_quota) <= set(after_quota)
+    (new_reading,) = set(after_quota) - set(retained_quota)
+    assert new_reading[0] == token_starts[3]
+    assert _quota_obs_ops(ns, logical) == quota_ops_before + 1
+    assert len(_file_account_ops(ns)) == ops_before   # nothing journaled

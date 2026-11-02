@@ -198,6 +198,9 @@ class Store:
             _current_allowing_rejection(self.app, self.monkeypatch, **values)
         elif kind == "legacy":
             T.legacy(self.app, self.monkeypatch, **values)
+        elif kind == "oauth":
+            # #948: the automatic OAuth reconciliation (authority coverage).
+            T.oauth(self.app, self.monkeypatch, **values)
         elif kind == "rebuild":
             self._command(T.REBUILD_ARGV)
         elif kind == "rederive":
@@ -327,6 +330,10 @@ def reference_horizon(steps, mixed) -> int:
     and rederives — most of an F17 trace's cost — run exactly where some
     mixed outcome is compared with them. The worlds' readings before that
     point always run."""
+    if any(kind == "oauth" for kind, _values in steps):
+        # #948 (spec 10): a trace with an authority reconciliation carries a
+        # recovery endpoint; the shortcut never skips one.
+        return len(steps)
     first = trigger_index(steps)
     for position in range(first, len(steps)):
         if steps[position][0] in MAINTENANCE:
@@ -476,6 +483,25 @@ def value_pairs(count: int = 4) -> tuple:
     return GATE_PAIRS
 
 
+def coverage_step(steps, variant):
+    """#948 (spec 6.4): the automatic OAuth reconciliation that covers the
+    primary account after the family's excluded readings — one minute after
+    the family's last step, with the primary's last current values (both
+    axes: a weekly-only family's reading gets a one-percent five-hour value
+    in a window four hours ahead). Every reference world performs it too."""
+    primary = "A" if variant.order == 0 else "B"
+    last = max(T.epoch(values["at"]) for _kind, values in steps
+               if values and values.get("at"))
+    base = next(values for kind, values in reversed(steps)
+                if kind == "current" and values["account"] == primary)
+    values = {key: base[key] for key in ("weekly", "week_end", "five", "five_end")
+              if base.get(key) is not None}
+    if "five" not in values:
+        values.update(five=1, five_end=T.iso(last - last % 3600 + 4 * 3600))
+    values.update(at=T.iso(last + 60), account=primary)
+    return ("oauth", values)
+
+
 def mixed_traces(skel: Skeleton, variant: Variant, *, recovery=False,
                  maintenance=True, pairs=None) -> dict:
     """The skeleton's mixed traces for one variant, one per value pair in the
@@ -488,6 +514,7 @@ def mixed_traces(skel: Skeleton, variant: Variant, *, recovery=False,
             steps.append(_concrete(role, values, variant,
                                    next(picks) if role == "X" else None))
         if recovery:
+            steps.append(coverage_step(steps, variant))
             steps += [_concrete(role, values, variant)
                       for role, values in RECOVERY]
         further = RECOVERY_FURTHER if recovery else skel.further
@@ -498,3 +525,486 @@ def mixed_traces(skel: Skeleton, variant: Variant, *, recovery=False,
             steps += tail
         out[f"{skel.name}/{variant}/{first}{second}{'/rec' if recovery else ''}"] = steps
     return out
+
+
+# ==========================================================================
+# #948: the real-reducer oracle (spec 10, oracle contract; operator decision
+# D4, C5-V)
+# ==========================================================================
+#
+# Each world — the mixed schedule and every reference interpretation — runs
+# the REAL statusline reducer with its own journal, stats database,
+# candidate spool and selected state (one scratch store, restored from the
+# empty template before every run; nothing is copied between worlds). A
+# ``render`` step is a real render (`_statusline_persist`, its file-only fork
+# decision and render acknowledgement, then the synchronous detached worker
+# when the decision forks); a ``tick`` is one detached reducer pass; an
+# ``oauth`` step is the authoritative OAuth writer (`_authoritative_record_
+# usage`); ``current`` is a direct `record-usage`.
+#
+# A ``legacy_render`` is a frozen render: in the mixed world it writes a file
+# the previous release's format leaves in the candidate spool (which the
+# current reducer never reads but journals as `legacy_spool_activity` at its
+# next rescan); in a reference world it is absent, or the same values as a
+# current candidate captured under A, B, `unattributed` or C — an account no
+# earlier step has seen. A ``legacy`` step is an excluded observation, as in
+# the F17 families above.
+#
+# Outcomes are compared by the D4 (2) value keys, with `Counter`
+# multiplicity: a weekly in-place credit by (account, week date key,
+# normalized week end, pre-credit percent, post-credit percent — read from
+# its retained origin observation — effective instant); a five-hour credit by
+# (account, canonical window key, pre-, post-percent, effective slot, the
+# boundary its validated companion gives, `_cctally_record.
+# _five_hour_credit_companion`); a provider-moved transition by (account, old
+# end, new end); a drop-consensus publication by (account, axis, period key,
+# published percent). An outcome the mixed world mints before the release of
+# its (account, axis) is also compared by its complete payload (exact C5).
+
+#: A legacy render's or excluded observation's interpretations.
+RENDER_INTERPRETATIONS = (None, "A", "B", "unattributed", "C")
+LEGACY_KINDS = ("legacy", "legacy_render")
+WEEKLY, FIVE = "sevenDay", "fiveHour"
+
+
+def reducer_world_steps(steps, interpretation) -> list:
+    """The uniform-current trace one world assigns: the i-th legacy step
+    (render or excluded observation) is dropped (``skip``) or performed by
+    the current binary under ``interpretation[i]``; every other step is kept
+    at its position."""
+    out, index = [], 0
+    for kind, values in steps:
+        if kind not in LEGACY_KINDS:
+            out.append((kind, values))
+            continue
+        account = interpretation[index]
+        index += 1
+        if account is None:
+            out.append(("skip", {}))
+            continue
+        values = dict(values)
+        values["account"] = account
+        if kind == "legacy":
+            captured = values.pop("captured", None)
+            if captured is not None:
+                values["at"] = captured
+            out.append(("current_x", values))
+        else:
+            out.append(("capture", values))
+    return out
+
+
+def reducer_worlds(steps) -> list:
+    count = sum(1 for kind, _ in steps if kind in LEGACY_KINDS)
+    return list(itertools.product(RENDER_INTERPRETATIONS, repeat=count))
+
+
+def legacy_index(steps) -> int:
+    for index, (kind, _values) in enumerate(steps):
+        if kind in LEGACY_KINDS:
+            return index
+    return len(steps)
+
+
+def render_payload(*, session, weekly, week_end, five=None, five_end=None,
+                   **_ignored) -> str:
+    limits = {"seven_day": {"used_percentage": weekly, "resets_at": week_end}}
+    if five is not None:
+        limits["five_hour"] = {"used_percentage": five, "resets_at": five_end}
+    return json.dumps({"session_id": session, "rate_limits": limits})
+
+
+class _JournalTracker:
+    """Incremental journal reader for one run: the retained Claude
+    observations (for origin post-percents), drop-consensus publications,
+    and the recovery ops with the step that appended them."""
+
+    def __init__(self):
+        self.offsets: dict = {}
+        self.payloads: dict = {}
+        self.last: dict = {}
+        self.drops = collections.Counter()
+        self.events: list = []
+
+    def advance(self, step) -> bool:
+        import _cctally_core as core
+        import _cctally_journal as jr
+        import _lib_journal as J
+        grew = False
+        for seg in jr.list_segments():
+            path = core.JOURNAL_DIR / seg
+            start = self.offsets.get(seg, 0)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size <= start:
+                continue
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                data = fh.read(size - start)
+            cut = data.rfind(b"\n") + 1
+            if cut == 0:
+                continue
+            self.offsets[seg] = start + cut
+            for line in data[:cut].splitlines():
+                rec = J.decode_line(line)
+                if rec is not None:
+                    grew = True
+                    self._record(step, rec)
+        return grew
+
+    def _record(self, step, rec) -> None:
+        import _cctally_quarantine as G
+        import _lib_account_protocol as P
+        import _lib_accounts
+        payload = rec.get("payload") or {}
+        if rec.get("t") == "op":
+            kind = payload.get("kind")
+            if kind in ("outcome_axis_release", "outcome_authority_completion",
+                        "legacy_spool_activity",
+                        "legacy_spool_inventory_completion"):
+                self.events.append((step, kind, dict(payload)))
+            return
+        if not G.is_claude_reading(rec) or not P.is_stamped(rec):
+            return
+        self.payloads[rec.get("id")] = payload
+        account = rec.get("account") or _lib_accounts.UNATTRIBUTED
+        kinds = G._publication_kinds(payload)
+        publication = "publication_id" in payload
+        if publication:
+            self.events.append((step, "publication", {
+                "account": account, "kinds": kinds,
+                "source": payload.get("source"),
+                "id": payload.get("publication_id"),
+                "weekly": payload.get("weekly_percent"),
+                "five": payload.get("five_hour_percent")}))
+        for axis, key, percent in _axis_values(payload):
+            before = self.last.get((account, axis))
+            if (publication and kinds.get(axis) in ("candidate", "retained_low")
+                    and before is not None and before[0] == key
+                    and percent < before[1]):
+                self.drops[(account, axis, key, percent)] += 1
+            self.last[(account, axis)] = (key, percent)
+
+    def of_kind(self, kind) -> list:
+        return [(step, payload) for step, k, payload in self.events if k == kind]
+
+
+def _axis_values(payload) -> list:
+    """``[(axis, period key, percent)]`` of one Claude reading: the weekly
+    normalized end and the five-hour canonical key (the planned key the
+    reading carries, else the pure ten-minute floor)."""
+    import _cctally_quarantine as G
+    out = []
+    try:
+        out.append((WEEKLY, G.normalize_week_end(int(payload["resets_at"])),
+                    float(payload["weekly_percent"])))
+    except (KeyError, TypeError, ValueError):
+        pass
+    five = payload.get("five_hour_percent")
+    raw = G._epoch(payload.get("five_hour_resets_at"))
+    if five is not None and raw is not None:
+        key = payload.get("five_hour_window_key")
+        if type(key) is not int:
+            key = raw - raw % 600
+        out.append((FIVE, key, float(five)))
+    return out
+
+
+def _date_key(end_text) -> "str | None":
+    import datetime as _dt
+    try:
+        end = _dt.datetime.fromisoformat(str(end_text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (end - _dt.timedelta(days=7)).date().isoformat()
+
+
+def value_keys(snapshot) -> collections.Counter:
+    """The D4 (2) value-key multiset of one snapshot."""
+    out = collections.Counter()
+    for (_axis, _account, _exact, value), count in snapshot.items():
+        out[value] += count
+    return out
+
+
+def exact_keys(snapshot) -> collections.Counter:
+    out = collections.Counter()
+    for (_axis, _account, exact, _value), count in snapshot.items():
+        out[exact] += count
+    return out
+
+
+class ReducerStore(Store):
+    """`Store` for real-reducer worlds: a pinned statusline clock and the
+    render, capture, legacy-render, tick and OAuth steps."""
+
+    def __init__(self, monkeypatch, tmp_path):
+        super().__init__(monkeypatch, tmp_path)
+        import types
+        import _cctally_statusline as sl
+        self._now = [0]
+        pinned = types.SimpleNamespace(**vars(sl.time))
+        pinned.time = lambda: self._now[0]
+        monkeypatch.setattr(sl, "time", pinned)
+
+    def _clock(self, at) -> int:
+        moment = T.epoch(at)
+        self._now[0] = moment
+        T.set_clock(self.monkeypatch, at)
+        return moment
+
+    def _parsed(self, values):
+        return self.app._lib_statusline.parse_statusline_stdin(
+            render_payload(**values).encode())
+
+    def apply(self, step) -> None:
+        import _cctally_core as core
+        import _cctally_statusline as sl
+        kind, values = step
+        if values.get("at") is not None and kind != "current_x":
+            self._clock(values["at"])
+        if kind == "render":
+            self.executed += 1
+            T.identity(values["account"])
+            sl._statusline_persist(self._parsed(values), sync_for_test=True)
+        elif kind == "capture":
+            self.executed += 1
+            T.identity(values["account"])
+            sl._write_candidate(sl._candidate_from_input(
+                self._parsed(values), received_at=self._now[0]))
+        elif kind == "legacy_render":
+            self.executed += 1
+            core.STATUSLINE_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+            doc = {"sevenDay": values["weekly"], "fiveHour": values.get("five")}
+            (core.STATUSLINE_CANDIDATE_DIR / f"legacy-{values['session']}.json"
+             ).write_text(json.dumps(doc))
+        elif kind == "tick":
+            self.executed += 1
+            sl._statusline_reduce_and_publish(nudge_sink=lambda: None)
+        elif kind == "oauth":
+            self.executed += 1
+            T.identity(values["account"])
+            five = values.get("five")
+            args = argparse_namespace(
+                percent=values["weekly"],
+                resets_at=str(T.epoch(values["week_end"])),
+                five_hour_percent=five,
+                five_hour_resets_at=(None if five is None
+                                     else str(T.epoch(values["five_end"]))),
+                source="api")
+            observed = (WEEKLY, FIVE) if five is not None else (WEEKLY,)
+            sl._authoritative_record_usage(
+                args, observed,
+                binding=sl._capture_binding(
+                    credential=f"token-{values['account']}"),
+                nudge_dashboard=False)
+        elif kind == "lose_selected":
+            # #948 spec 10 T2/T6 (BV1): every local selected-state document
+            # is lost — the global selected file and every account's
+            # transition (control state, checkpoint, render cache) — with
+            # the same fault in every world. The journal and the index stay.
+            self.executed += 1
+            core.STATUSLINE_SELECTED_PATH.unlink(missing_ok=True)
+            for path in core.STATUSLINE_ACCOUNT_BOUND_DIR.rglob("transition.json"):
+                path.unlink()
+        elif kind == "current_x" and values.get("at") is not None:
+            self._now[0] = T.epoch(values["at"])
+            super().apply(step)
+        else:
+            super().apply(step)
+
+    def _db_signature(self):
+        import _cctally_core as core
+        out = []
+        for path in (core.DB_PATH, core.DB_PATH.with_name(core.DB_PATH.name + "-wal")):
+            try:
+                st = path.stat()
+                out.append((st.st_size, st.st_mtime_ns))
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    def reducer_outcomes(self, tracker) -> collections.Counter:
+        """The snapshot: ``Counter`` of ``(axis, account, exact key, value
+        key)`` over every credit, transition and drop publication."""
+        import _cctally_record as R
+        out = collections.Counter()
+        conn = self.app.open_db()
+        try:
+            for row in _dict_rows(conn, "SELECT * FROM week_reset_events"):
+                account = row["account_key"]
+                if row["observed_pre_credit_pct"] is None:
+                    key = json.dumps(["transition", account,
+                                      row["old_week_end_at"],
+                                      row["new_week_end_at"]])
+                    out[(WEEKLY, account, key, key)] += 1
+                    continue
+                origin = tracker.payloads.get(row.get("origin_observation_id"))
+                post = None if origin is None else origin.get("weekly_percent")
+                exact = json.dumps(T.credit_payload(row), sort_keys=True)
+                value = json.dumps([
+                    "weekly-credit", account, _date_key(row["new_week_end_at"]),
+                    row["new_week_end_at"], row["observed_pre_credit_pct"],
+                    post, row["effective_reset_at_utc"]])
+                out[(WEEKLY, account, exact, value)] += 1
+            for row in _dict_rows(conn, "SELECT * FROM five_hour_reset_events"):
+                account = row["account_key"]
+                companion = R._five_hour_credit_companion(
+                    conn, account_key=account,
+                    canonical_window_key=row["five_hour_window_key"],
+                    effective_reset_at_utc=row["effective_reset_at_utc"])
+                boundary = row["effective_reset_at_utc"]
+                if companion is not None and str(companion[1]) == (
+                        R._five_hour_credit_revision((
+                            row["detected_at_utc"], row["prior_percent"],
+                            row["post_percent"], row["effective_reset_at_utc"]))):
+                    boundary = str(companion[0])
+                exact = json.dumps(T.credit_payload(row), sort_keys=True)
+                value = json.dumps([
+                    "five-hour-credit", account, row["five_hour_window_key"],
+                    row["prior_percent"], row["post_percent"],
+                    row["effective_reset_at_utc"], boundary])
+                out[(FIVE, account, exact, value)] += 1
+        finally:
+            conn.close()
+        for (account, axis, key, percent), count in tracker.drops.items():
+            text = json.dumps(["drop", account, axis, key, percent])
+            out[(axis, account, text, text)] += count
+        return out
+
+    def run_reducer(self, seq, *, classify=False, observe=None) -> "ReducerRun":
+        """Run one step sequence from the empty store; snapshot after every
+        step. With ``classify`` (the mixed world) each new outcome is
+        classified, when it first appears, as minted after the release of
+        its (account, axis) or not (`account_status` right after the
+        step). ``observe`` maps a step index to a probe run right after that
+        step; its result lands in ``run.observed``."""
+        self.restore(self.template)
+        tracker = _JournalTracker()
+        run = ReducerRun(seq=list(seq), tracker=tracker)
+        have = collections.Counter()
+        post = collections.Counter()
+        signature = None
+        for index, step in enumerate(seq):
+            self.apply(step)
+            grew = tracker.advance(index)
+            sig = self._db_signature()
+            if grew or sig != signature:
+                signature = sig
+                now = self.reducer_outcomes(tracker)
+                fresh = now - have
+                if classify and fresh:
+                    for item in fresh:
+                        axis, account = item[0], item[1]
+                        status = T.account_status_key(self.app, account)
+                        if status["triggered"] and status["axes"][axis]["allowed"]:
+                            post[item] += fresh[item]
+                        run.minted.append((index, item))
+                have = now
+            run.snapshots.append(collections.Counter(have))
+            run.post.append(collections.Counter(post))
+            if observe and index in observe:
+                run.observed[index] = observe[index](self)
+        return run
+
+
+@dataclasses.dataclass
+class ReducerRun:
+    seq: list
+    tracker: _JournalTracker
+    snapshots: list = dataclasses.field(default_factory=list)
+    post: list = dataclasses.field(default_factory=list)
+    minted: list = dataclasses.field(default_factory=list)
+    observed: dict = dataclasses.field(default_factory=dict)
+
+    def releases(self) -> list:
+        """``[(step, account, axis)]`` of every `outcome_axis_release`."""
+        return [(step, p["account"], p["axis"])
+                for step, p in self.tracker.of_kind("outcome_axis_release")]
+
+    def release_positions(self) -> dict:
+        out: dict = {}
+        for step, account, axis in self.releases():
+            out.setdefault((account, axis), step)
+        return out
+
+
+def argparse_namespace(**kwargs):
+    import argparse
+    return argparse.Namespace(**kwargs)
+
+
+def _dict_rows(conn, sql) -> list:
+    cursor = conn.execute(sql)
+    columns = [d[0] for d in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def check_c5v(steps, mixed: ReducerRun, worlds: dict, *, label="",
+              permitted=None) -> None:
+    """Exact C5 before each (account, axis) release, C5-V after it.
+
+    At every position: before the first legacy step every world holds
+    exactly the mixed world's outcomes; from it on, the complete payloads of
+    the mixed outcomes minted while their axis was paused are a sub-multiset
+    of every world's, and the value keys of ALL mixed outcomes are a
+    sub-multiset of every world's value keys. Pre-trigger outcomes must
+    survive to the end. Raises `OracleViolation`."""
+    permitted = permitted or {}
+    first = legacy_index(steps)
+    for position, have in enumerate(mixed.snapshots):
+        pre = have - mixed.post[position]
+        for world, result in worlds.items():
+            other = result.snapshots[position]
+            if position < first:
+                if exact_keys(other) != exact_keys(have):
+                    raise OracleViolation(
+                        f"{label}: pre-trigger outcomes differ at step "
+                        f"{position} in world {world}: {sorted(have)} vs "
+                        f"{sorted(other)}")
+                continue
+            missing = exact_keys(pre) - exact_keys(other)
+            if missing:
+                raise OracleViolation(
+                    f"{label}: step {position} ({steps[position][0]}) mints "
+                    f"{sorted(missing)} before its release, absent from world "
+                    f"{world}")
+            missing = (value_keys(have) - value_keys(other)
+                       - permitted.get(world, collections.Counter()))
+            if missing:
+                violation = OracleViolation(
+                    f"{label}: step {position} ({steps[position][0]}) value "
+                    f"keys {sorted(missing)} absent from world {world}")
+                violation.world, violation.missing = world, dict(missing)
+                violation.position = position
+                raise violation
+    if 0 < first <= len(mixed.snapshots):
+        lost = exact_keys(mixed.snapshots[first - 1]) - exact_keys(
+            mixed.snapshots[-1])
+        if lost:
+            raise OracleViolation(
+                f"{label}: pre-trigger outcomes {sorted(lost)} lost by the end")
+
+
+def run_reducer_oracle(store: ReducerStore, steps, *, label="",
+                       check=True, interpretations=None, observe=None,
+                       world_observe=None):
+    """Run the mixed schedule and every reference world through the real
+    reducer; check C5/C5-V; return ``(mixed, {world: run})``. ``observe``
+    probes the mixed run, ``world_observe`` every reference world's (both
+    map a step index to a probe, `ReducerStore.run_reducer`)."""
+    mixed = store.run_reducer(steps, classify=True, observe=observe)
+    worlds = {}
+    for world in (interpretations or reducer_worlds(steps)):
+        worlds[world] = store.run_reducer(reducer_world_steps(steps, world),
+                                          observe=world_observe)
+    if check:
+        check_c5v(steps, mixed, worlds, label=label)
+    return mixed, worlds
+
+
+def residual_difference(mixed: ReducerRun, world: ReducerRun) -> collections.Counter:
+    """The mixed value keys absent from ``world`` at the end of the trace."""
+    return value_keys(mixed.snapshots[-1]) - value_keys(world.snapshots[-1])

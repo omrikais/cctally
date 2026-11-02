@@ -1,50 +1,46 @@
-"""Pure outcome quarantine and certified account recovery (#825/#832, spec 5.6).
+"""Pure outcome quarantine and per-axis automatic recovery (#825/#832 spec
+5.6; #948).
 
 After the account-bound cutover, an older cctally process can still write.
-Its records are excluded from current accounting (spec 5.3), but excluding a
-reading changes what the detectors see: even an excluded reading that would
-not itself have produced an outcome can change a LATER detection. So every
-excluded record and every legacy spool change is an uncertainty TRIGGER that
-quarantines every Claude account: automatic in-place credits, five-hour
-credits, provider-moved week-end transitions and drop consensus are withheld
-until the account holds a recovery certificate.
+Its records are excluded from current accounting, but excluding a reading
+changes what the detectors see, and an older process's status-line render can
+drive a publication nobody journals. So every excluded record and every legacy
+spool change is an uncertainty TRIGGER that pauses automatic in-place credits,
+early resets, five-hour credits and status-line drop publications for every
+Claude account.
 
-This module is the pure half:
+#948 ends that pause on its own, per account and per axis (weekly
+``sevenDay``, five-hour ``fiveHour``), through a journaled barrier (spec 6.1):
 
-* `Reading` — one Claude rate-limit observation as the detectors see it.
-* `Envelope` — monotone running bounds over the WHOLE journal prefix (never
-  truncated at a trigger or a revocation): the greatest week-start date key,
-  five-hour key, raw five-hour reset, weekly end, stored capture ordering and
-  effective instant any reading or effect in that prefix could have stored.
-* `certify` — the seven clauses of spec 5.6 item 4, every one evaluated, so a
-  refusal names ALL failed clauses.
-* `Certificate` / `continuing_validity` — a certificate is revocable: backward
-  input, a clock or ordering regression, or a fallback read that reaches the
-  uncertain prefix through a cross-period access not registered inert revokes
-  it before any automatic outcome.
-* `QuarantineState` — the deterministic fold over journal order that live
-  ingest, `db rebuild --db stats` and the `db rederive` scratch replay all run,
-  so triggers, envelopes and certificates are a function of the journal alone.
-* The unresolved spool marker (spec revision 3, section 5.6 item 1(b); Codex
-  design-fix-round-4 Q6). A `legacy_spool_activity` op records only digests,
-  never a legacy value, so the candidate it stands for contributes no bound to
-  any envelope, and a fresh-looking reading cannot certify against the bounds
-  the envelope does hold. Every such trigger therefore persists a marker keyed
-  by its journal coordinate and `at`, and while any marker exists no account —
-  one first seen later included — holds an accounting certificate. Nothing
-  clears a marker in this outcome (automatic recovery is follow-up #948);
-  the control certificate still reconciles on its own.
+1. every incomplete-inventory EPISODE closed by a journaled complete scan;
+2. the unknown candidate COHORT's expiry, from retained clock instants;
+3. a completed automatic OAuth reconciliation for the account after expiry
+   and after the trigger, covering the axis (`outcome_authority_completion`);
+4. a genuinely observed first entry into a fresh period of the axis — the
+   WITNESS — checked against bounds over the prefix before it;
+5. one `outcome_axis_release` record, appended immediately after the witness,
+   that opens the axis's outcomes and its drop consensus together.
 
-Deliberately absent (the design consultation rejected each): a taint map, a
-timer, and an irrevocable clean flag. Diagnostic quiet time never decides
-recovery.
+This module is the pure half: `Reading`, `Cohort`, the per-axis bounds
+(`WeeklyBounds`, `FiveHourBounds`), the witness predicates and
+`QuarantineState`, the deterministic fold over journal order that live
+ingest, `db rebuild --db stats`, the `db rederive` scratch replay and the
+derivation-completion scratch replay all run, so every recovery fact is a
+function of the journal alone. Nothing here uses a TTL, quiet time, spool
+absence or an OAuth reading alone as a release condition.
 
-Pure: no I/O, no clock.
+Pure: no I/O, no clock, no SQLite.
 """
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import json
+from typing import Callable
+
+WEEKLY = "sevenDay"
+FIVE_HOUR = "fiveHour"
+AXES = (WEEKLY, FIVE_HOUR)
 
 #: `bin/_cctally_record.py` `_derive_5h_window_key`: the nearest
 #: `five_hour_blocks` raw reset within 1,800 s anchors the window.
@@ -52,32 +48,52 @@ TOLERANCE_BLOCK_SEARCH_S = 1800
 #: `bin/_lib_five_hour.py` `_FIVE_HOUR_JITTER_FLOOR_SECONDS`: the rolling
 #: canonicalizer's jitter tolerance.
 TOLERANCE_CANONICAL_S = 600
+#: Anchor separation beyond both tolerances (spec 6.5, 6.6).
+FIVE_HOUR_SEPARATION_S = TOLERANCE_BLOCK_SEARCH_S + TOLERANCE_CANONICAL_S
 
-#: The envelope scope whose bounds apply to EVERY account: excluded readings
-#: and effects under every reference interpretation (absent, or any Claude
-#: account including `unattributed` and accounts first seen later), plus
-#: admitted historical readings that carry no account at all.
+#: The clock model's receipt skew between a legacy write and its detection
+#: (D4 (3)), and the candidate activity window of the reducer: a candidate
+#: received at R is inactive at every evaluation from R + 90 s on.
+RECEIPT_SKEW_S = 5
+CANDIDATE_ACTIVE_S = 90
+#: A cohort's bounds (spec 6.3).
+COHORT_WEEKLY_OFFSET_S = 8 * 86400
+COHORT_FIVE_HOUR_OFFSET_S = 6 * 3600
+
+#: The bounds scope whose summaries apply to EVERY account: excluded records
+#: under every reference interpretation, plus admitted historical records that
+#: carry no account.
 EXCLUDED_SCOPE = "excluded"
+#: The bounds scope of every spool cohort (applies to every account).
+COHORT_SCOPE = "cohorts"
 
-INELIGIBLE_REASONS = (
-    "projection-fill", "retained-low", "reviewed-hold", "manual-synthetic",
-)
-#: A witness that is not eligible at all (spec 5.6 item 4 preamble).
-INELIGIBLE_SINGLE_AXIS = "single-axis"
-INELIGIBLE_UNBOUND = "unbound"
+STATE_PAUSED = "paused"
+STATE_RELEASED = "recovered"
 
-REVOCATION_REASONS = (
-    "backward-key", "clock-regression", "order-regression",
-    "non-inert-fallback",
-)
+WAIT_INVENTORY = "inventory"
+WAIT_EXPIRY = "expiry"
+WAIT_USAGE_REFRESH = "usage-refresh"
+WAIT_FRESH_PERIOD = "fresh-period"
+WAITING_FOR = (WAIT_INVENTORY, WAIT_EXPIRY, WAIT_USAGE_REFRESH,
+               WAIT_FRESH_PERIOD)
 
-CLAUSES = (1, 2, 3, 4, 5, 6, 7)
+CAUSE_LEGACY_ACTIVITY = "legacy-spool-activity"
+CAUSE_INVENTORY_INCOMPLETE = "inventory-incomplete"
+CAUSE_EXCLUDED_WRITE = "excluded-write"
 
-#: The trigger kind of a current `legacy_spool_activity` op. Each one leaves
-#: an unresolved spool marker (spec revision 3, section 5.6 item 1(b)).
+#: Why a released axis returned to paused (spec 6.9).
+REVOKE_BACKWARD_KEY = "backward-key"
+REVOKE_ORDER_REGRESSION = "order-regression"
+REVOKE_NON_INERT_FALLBACK = "non-inert-fallback"
+REVOKE_ADMINISTRATIVE = "administrative"
+REVOKE_MANUAL_CREDIT = "manual-credit"
+REVOCATION_REASONS = (REVOKE_BACKWARD_KEY, REVOKE_ORDER_REGRESSION,
+                      REVOKE_NON_INERT_FALLBACK, REVOKE_ADMINISTRATIVE,
+                      REVOKE_MANUAL_CREDIT)
+
+#: Trigger kinds (the `outcome_quarantine_triggers.kind` column).
+TRIGGER_KIND_EXCLUDED = "excluded"
 TRIGGER_KIND_LEGACY_SPOOL = "legacy-spool-activity"
-#: The gate reason while a spool marker is unresolved.
-GATE_REASON_SPOOL_MARKER = "unresolved-spool-marker"
 
 
 def _max(a, b):
@@ -88,20 +104,32 @@ def _max(a, b):
     return a if a >= b else b
 
 
+def _date_of(epoch: int) -> str:
+    return _dt.datetime.fromtimestamp(int(epoch), tz=_dt.timezone.utc).date(
+    ).isoformat()
+
+
 @dataclasses.dataclass(frozen=True)
 class Reading:
-    """One observation as the detector sees it.
+    """One Claude rate-limit observation as the detectors and the witness
+    predicates see it.
 
-    ``captured_at_utc`` is the value the snapshot row stores in
+    ``capture_text`` is the value the snapshot row stores in
     ``captured_at_utc`` (the payload's capture stamp verbatim), because the
-    cross-period reads order on that TEXT column lexically.
-    ``detection_epoch`` is the record's ``at`` (the detection clock).
-    ``five_hour_key`` is the planned account-local key a current producer
-    journaled, else the pure canonical floor of the raw reset."""
+    cross-period reads order on that TEXT column lexically; ``capture_epoch``
+    its instant (the frozen evaluation instant of a reducer publication, the
+    fetch instant of an OAuth reading). ``detection_epoch`` is the record's
+    ``at`` (the detection clock). ``five_hour_key`` is the planned
+    account-local key a current producer journaled, else the pure canonical
+    floor of the raw reset.
+
+    ``observed_axes`` are the axes the detector mask treats as a reading of
+    their source; ``eligible_axes`` those `witness_eligible` accepts (spec
+    6.6); ``projection_axes`` those a publication filled from the store."""
 
     observation_id: str
     account_key: "str | None"
-    captured_at_utc: str
+    capture_text: str
     capture_epoch: int
     detection_epoch: int
     week_start_date: "str | None"
@@ -109,318 +137,347 @@ class Reading:
     weekly_end_epoch: "int | None"
     five_hour_key: "int | None"
     raw_five_hour_reset: "int | None"
-    two_axis: bool
-    ineligible_reason: "str | None" = None
+    observed_axes: frozenset = frozenset(AXES)
+    eligible_axes: frozenset = frozenset()
+    projection_axes: frozenset = frozenset()
     stamped: bool = True
 
+    @property
+    def captured_at_utc(self) -> str:
+        return self.capture_text
+
+    def bears(self, axis: str) -> bool:
+        if axis == WEEKLY:
+            return self.week_start_date is not None
+        return self.five_hour_key is not None
+
 
 @dataclasses.dataclass(frozen=True)
-class Envelope:
-    """Monotone running bounds over the WHOLE prefix (never truncated)."""
+class Cohort:
+    """The unknown candidates' bounds at uncertainty position P (spec 6.3)."""
 
-    max_week_start_date: "str | None" = None
-    max_five_hour_key: "int | None" = None
-    max_raw_five_hour_reset: "int | None" = None
-    max_weekly_end_epoch: "int | None" = None
-    #: Lexical, as stored in `captured_at_utc`.
-    max_capture_at_utc: "str | None" = None
-    #: Reset/credit effective instants AND every capture and detection
-    #: instant: an automatic credit's effective instant is at or before its
-    #: arming tick, so absorbing every reading's instants bounds them
-    #: conservatively, including effects no surviving row records.
-    max_effective_instant_epoch: "int | None" = None
-
-    def absorb_reading(self, r: Reading) -> "Envelope":
-        return Envelope(
-            max_week_start_date=_max(self.max_week_start_date, r.week_start_date),
-            max_five_hour_key=_max(self.max_five_hour_key, r.five_hour_key),
-            max_raw_five_hour_reset=_max(
-                self.max_raw_five_hour_reset, r.raw_five_hour_reset),
-            max_weekly_end_epoch=_max(self.max_weekly_end_epoch, r.weekly_end_epoch),
-            max_capture_at_utc=_max(self.max_capture_at_utc, r.captured_at_utc),
-            max_effective_instant_epoch=_max(
-                self.max_effective_instant_epoch,
-                _max(r.capture_epoch, r.detection_epoch)),
-        )
-
-    def absorb_effect(self, *, effective_epoch: "int | None",
-                      week_start_date: "str | None" = None,
-                      five_hour_key: "int | None" = None,
-                      captured_at_utc: "str | None" = None,
-                      weekly_end_epoch: "int | None" = None,
-                      raw_five_hour_reset: "int | None" = None) -> "Envelope":
-        """An effect any reference could hold: an event's effective instant, a
-        manual floor's date key, a synthetic or exported snapshot's keys."""
-        return Envelope(
-            max_week_start_date=_max(self.max_week_start_date, week_start_date),
-            max_five_hour_key=_max(self.max_five_hour_key, five_hour_key),
-            max_raw_five_hour_reset=_max(
-                self.max_raw_five_hour_reset, raw_five_hour_reset),
-            max_weekly_end_epoch=_max(self.max_weekly_end_epoch, weekly_end_epoch),
-            max_capture_at_utc=_max(self.max_capture_at_utc, captured_at_utc),
-            max_effective_instant_epoch=_max(
-                self.max_effective_instant_epoch, effective_epoch),
-        )
+    h: int
+    r: int
+    e: int
+    u7_end: int
+    u7_date: str
+    u5_raw: int
+    u5_key: int
 
     @staticmethod
-    def merge(a: "Envelope", b: "Envelope") -> "Envelope":
-        return Envelope(
-            max_week_start_date=_max(a.max_week_start_date, b.max_week_start_date),
-            max_five_hour_key=_max(a.max_five_hour_key, b.max_five_hour_key),
-            max_raw_five_hour_reset=_max(
-                a.max_raw_five_hour_reset, b.max_raw_five_hour_reset),
-            max_weekly_end_epoch=_max(a.max_weekly_end_epoch, b.max_weekly_end_epoch),
-            max_capture_at_utc=_max(a.max_capture_at_utc, b.max_capture_at_utc),
-            max_effective_instant_epoch=_max(
-                a.max_effective_instant_epoch, b.max_effective_instant_epoch),
-        )
+    def from_h(h_epoch: int, *,
+               normalize_week_end: "Callable[[int], int]") -> "Cohort":
+        h = int(h_epoch)
+        r = h + RECEIPT_SKEW_S
+        e = r + CANDIDATE_ACTIVE_S
+        u7_end = int(normalize_week_end(e + COHORT_WEEKLY_OFFSET_S))
+        u5_raw = e + COHORT_FIVE_HOUR_OFFSET_S
+        return Cohort(h=h, r=r, e=e, u7_end=u7_end,
+                      u7_date=_date_of(u7_end - 7 * 86400),
+                      u5_raw=u5_raw, u5_key=u5_raw + TOLERANCE_BLOCK_SEARCH_S)
 
     def to_document(self) -> dict:
-        return {
-            "maxWeekStartDate": self.max_week_start_date,
-            "maxFiveHourKey": self.max_five_hour_key,
-            "maxRawFiveHourReset": self.max_raw_five_hour_reset,
-            "maxWeeklyEndEpoch": self.max_weekly_end_epoch,
-            "maxCaptureAtUtc": self.max_capture_at_utc,
-            "maxEffectiveInstantEpoch": self.max_effective_instant_epoch,
-        }
+        return dataclasses.asdict(self)
 
     @staticmethod
-    def from_document(doc) -> "Envelope | None":
-        """The envelope a document describes, or None when it is not a valid
-        envelope document. An unverifiable envelope must never read as an
-        empty (permissive) one, so callers treat None as quarantined."""
-        if not isinstance(doc, dict):
-            return None
-        keys = {"maxWeekStartDate", "maxFiveHourKey", "maxRawFiveHourReset",
-                "maxWeeklyEndEpoch", "maxCaptureAtUtc",
-                "maxEffectiveInstantEpoch"}
-        if set(doc) != keys:
-            return None
-        for key in ("maxWeekStartDate", "maxCaptureAtUtc"):
-            if doc[key] is not None and not isinstance(doc[key], str):
-                return None
-        for key in ("maxFiveHourKey", "maxRawFiveHourReset",
-                    "maxWeeklyEndEpoch", "maxEffectiveInstantEpoch"):
-            if doc[key] is not None and type(doc[key]) is not int:
-                return None
-        return Envelope(
-            max_week_start_date=doc["maxWeekStartDate"],
-            max_five_hour_key=doc["maxFiveHourKey"],
-            max_raw_five_hour_reset=doc["maxRawFiveHourReset"],
-            max_weekly_end_epoch=doc["maxWeeklyEndEpoch"],
-            max_capture_at_utc=doc["maxCaptureAtUtc"],
-            max_effective_instant_epoch=doc["maxEffectiveInstantEpoch"],
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class CertificateDecision:
-    certified: bool
-    #: Subset of 1..7, empty when certified or when the witness is ineligible.
-    failed_clauses: "tuple[int, ...]"
-    ineligible: "str | None" = None
-
-
-def witness_ineligibility(witness: Reading) -> "str | None":
-    """Why ``witness`` can never certify, or None (spec 5.6 item 4)."""
-    if witness.ineligible_reason is not None:
-        return witness.ineligible_reason
-    if (not witness.stamped or witness.account_key is None):
-        return INELIGIBLE_UNBOUND
-    if (not witness.two_axis or witness.week_start_date is None
-            or witness.five_hour_key is None
-            or witness.raw_five_hour_reset is None
-            or witness.week_start_at_epoch is None):
-        return INELIGIBLE_SINGLE_AXIS
-    return None
-
-
-def _debounce_could_match(witness: Reading, envelope: Envelope) -> bool:
-    """Clause 6, by the comparisons the detector performs.
-
-    The weekly debounce state is ONE row per account; the detector treats it
-    as armed for a reading iff the stored `week_start_date` equals the
-    reading's and the stored end equals its end (`detect_reset_and_credit`).
-    Every state the prefix could have armed carries a date key the prefix
-    produced, so it is bounded by `max_week_start_date`; a witness date beyond
-    that bound can match none of them, whatever its end. The five-hour
-    confirmation state is keyed `(account, window key, source)`, so a witness
-    key beyond `max_five_hour_key` reads no prefix row."""
-    if (envelope.max_week_start_date is not None
-            and witness.week_start_date <= envelope.max_week_start_date):
-        return True
-    if (envelope.max_five_hour_key is not None
-            and witness.five_hour_key <= envelope.max_five_hour_key):
-        return True
-    return False
-
-
-def certify(witness: Reading, envelope: Envelope, *,
-            seen_identities=frozenset()) -> CertificateDecision:
-    """Evaluate every clause of spec 5.6 item 4 against ``envelope`` (the
-    merge of the account's and the excluded scope's bounds) and return ALL
-    failed clauses, never just the first."""
-    ineligible = witness_ineligibility(witness)
-    if ineligible is not None:
-        return CertificateDecision(False, (), ineligible)
-    failed = []
-    env = envelope
-    # 1. Period-keyed freshness: the date key and the five-hour key lie
-    #    beyond every possible prefix key. Comparing normalized ends is not
-    #    enough, because distinct ends share one date key.
-    if ((env.max_week_start_date is not None
-         and witness.week_start_date <= env.max_week_start_date)
-            or (env.max_five_hour_key is not None
-                and witness.five_hour_key <= env.max_five_hour_key)):
-        failed.append(1)
-    # 2. Anchor selection: no prefix raw reset inside either tolerance of the
-    #    witness's, so every possible prefix anchor yields the witness's own
-    #    fresh key (conservatively the SUM of both tolerances).
-    if (env.max_raw_five_hour_reset is not None
-            and witness.raw_five_hour_reset - env.max_raw_five_hour_reset
-            <= TOLERANCE_BLOCK_SEARCH_S + TOLERANCE_CANONICAL_S):
-        failed.append(2)
-    # 3. Range-keyed reads: no prefix effective instant inside the witness's
-    #    weekly interval (the sufficient check: its start exceeds them all).
-    if (env.max_effective_instant_epoch is not None
-            and witness.week_start_at_epoch <= env.max_effective_instant_epoch):
-        failed.append(3)
-    # 4. Cross-period ordering under the actual SQL ordering
-    #    (`captured_at_utc DESC, id DESC`, lexical TEXT comparison).
-    if (env.max_capture_at_utc is not None
-            and witness.captured_at_utc <= env.max_capture_at_utc):
-        failed.append(4)
-    # 5. Detection clock later than every predecessor's weekly end and raw
-    #    five-hour reset — separate from capture ordering.
-    latest_end = _max(env.max_weekly_end_epoch, env.max_raw_five_hour_reset)
-    if latest_end is not None and witness.detection_epoch <= latest_end:
-        failed.append(5)
-    # 6. Singletons: the weekly debounce row and the five-hour confirmation
-    #    state cannot match the witness.
-    if _debounce_could_match(witness, env):
-        failed.append(6)
-    # 7. Logical identity: the witness is not a replay of a seen observation.
-    if witness.observation_id in seen_identities:
-        failed.append(7)
-    return CertificateDecision(not failed, tuple(failed), None)
-
-
-@dataclasses.dataclass(frozen=True)
-class Certificate:
-    witness_observation_id: str
-    witness_week_start_date: str
-    witness_five_hour_key: int
-    witness_captured_at_utc: str
-    last_capture_at_utc: str
-    last_detection_epoch: int
-
-    @staticmethod
-    def from_witness(r: Reading) -> "Certificate":
-        return Certificate(
-            witness_observation_id=r.observation_id,
-            witness_week_start_date=r.week_start_date,
-            witness_five_hour_key=r.five_hour_key,
-            witness_captured_at_utc=r.captured_at_utc,
-            last_capture_at_utc=r.captured_at_utc,
-            last_detection_epoch=r.detection_epoch,
-        )
-
-    def advance(self, r: Reading) -> "Certificate":
-        return dataclasses.replace(
-            self,
-            last_capture_at_utc=_max(self.last_capture_at_utc, r.captured_at_utc),
-            last_detection_epoch=_max(self.last_detection_epoch, r.detection_epoch),
-        )
-
-    def to_document(self) -> dict:
-        return {
-            "witnessObservationId": self.witness_observation_id,
-            "witnessWeekStartDate": self.witness_week_start_date,
-            "witnessFiveHourKey": self.witness_five_hour_key,
-            "witnessCapturedAtUtc": self.witness_captured_at_utc,
-            "lastCaptureAtUtc": self.last_capture_at_utc,
-            "lastDetectionEpoch": self.last_detection_epoch,
-        }
-
-    @staticmethod
-    def from_document(doc) -> "Certificate | None":
+    def from_document(doc) -> "Cohort | None":
         if not isinstance(doc, dict) or set(doc) != {
-                "witnessObservationId", "witnessWeekStartDate",
-                "witnessFiveHourKey", "witnessCapturedAtUtc",
-                "lastCaptureAtUtc", "lastDetectionEpoch"}:
+                "h", "r", "e", "u7_end", "u7_date", "u5_raw", "u5_key"}:
             return None
-        for key in ("witnessObservationId", "witnessWeekStartDate",
-                    "witnessCapturedAtUtc", "lastCaptureAtUtc"):
-            if not isinstance(doc[key], str) or not doc[key]:
-                return None
-        for key in ("witnessFiveHourKey", "lastDetectionEpoch"):
+        for key in ("h", "r", "e", "u7_end", "u5_raw", "u5_key"):
             if type(doc[key]) is not int:
                 return None
-        return Certificate(
-            witness_observation_id=doc["witnessObservationId"],
-            witness_week_start_date=doc["witnessWeekStartDate"],
-            witness_five_hour_key=doc["witnessFiveHourKey"],
-            witness_captured_at_utc=doc["witnessCapturedAtUtc"],
-            last_capture_at_utc=doc["lastCaptureAtUtc"],
-            last_detection_epoch=doc["lastDetectionEpoch"],
-        )
+        if not isinstance(doc["u7_date"], str):
+            return None
+        return Cohort(**doc)
 
 
-def continuing_validity(cert: Certificate, r: Reading, *,
-                        fallback_rows_captured_at=()) -> "str | None":
-    """None while ``r`` stays inside the certified forward domain, else the
-    revocation reason (spec 5.6 item 5).
-
-    ``fallback_rows_captured_at`` are the capture instants of the rows the
-    decision's NON-INERT cross-period reads returned (the access registry
-    decides which reads are inert); a row from before the witness means the
-    read fell back into the uncertain prefix."""
-    if r.week_start_date is None or r.week_start_date < cert.witness_week_start_date:
-        return "backward-key"
-    if r.five_hour_key is not None and r.five_hour_key < cert.witness_five_hour_key:
-        return "backward-key"
-    if r.detection_epoch < cert.last_detection_epoch:
-        return "clock-regression"
-    if r.captured_at_utc < cert.last_capture_at_utc:
-        return "order-regression"
-    for captured in fallback_rows_captured_at:
-        if captured is not None and captured < cert.witness_captured_at_utc:
-            return "non-inert-fallback"
-    return None
+def _check_doc(doc, ints, strs):
+    if not isinstance(doc, dict) or set(doc) != set(ints) | set(strs):
+        return False
+    for key in ints:
+        if doc[key] is not None and type(doc[key]) is not int:
+            return False
+    for key in strs:
+        if doc[key] is not None and not isinstance(doc[key], str):
+            return False
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
-class ControlCertificate:
-    """A bound two-axis authoritative OAuth publication for one account
-    (spec 5.6 item 7): the journal observation that witnesses it."""
+class WeeklyBounds:
+    """The weekly summaries of one scope over the WHOLE retained prefix
+    (spec 6.5): structural ``s7_date``/``s7_end``, capture order
+    ``k7``/``t7``, the closed effect bound ``c7`` and the exclusive effect
+    bound ``x7`` (strict-before: a witness's week start may EQUAL it)."""
 
-    observation_id: str
-    captured_at_utc: str
+    s7_date: "str | None" = None
+    s7_end: "int | None" = None
+    k7: "int | None" = None
+    t7: "str | None" = None
+    c7: "int | None" = None
+    x7: "int | None" = None
 
-    def to_document(self) -> dict:
-        return {"observationId": self.observation_id,
-                "capturedAtUtc": self.captured_at_utc}
+    def absorb_reading(self, r: Reading, *, possible_effect: bool) -> "WeeklyBounds":
+        if r.week_start_date is None:
+            return self
+        return WeeklyBounds(
+            s7_date=_max(self.s7_date, r.week_start_date),
+            s7_end=_max(self.s7_end, r.weekly_end_epoch),
+            k7=_max(self.k7, r.capture_epoch),
+            t7=_max(self.t7, r.capture_text),
+            c7=_max(self.c7, r.capture_epoch) if possible_effect else self.c7,
+            x7=self.x7,
+        )
+
+    def absorb_effect(self, *, effective_epoch=None, week_start_date=None,
+                      week_end_epoch=None, capture_epoch=None,
+                      capture_text=None, exclusive_end=None) -> "WeeklyBounds":
+        return WeeklyBounds(
+            s7_date=_max(self.s7_date, week_start_date),
+            s7_end=_max(self.s7_end, week_end_epoch),
+            k7=_max(self.k7, capture_epoch),
+            t7=_max(self.t7, capture_text),
+            c7=_max(self.c7, effective_epoch),
+            x7=_max(self.x7, exclusive_end),
+        )
+
+    def absorb_cohort(self, c: Cohort) -> "WeeklyBounds":
+        return WeeklyBounds(
+            s7_date=_max(self.s7_date, c.u7_date),
+            s7_end=_max(self.s7_end, c.u7_end),
+            k7=self.k7, t7=self.t7,
+            c7=_max(self.c7, c.e),
+            x7=_max(self.x7, c.u7_end),
+        )
 
     @staticmethod
-    def from_document(doc) -> "ControlCertificate | None":
-        if (not isinstance(doc, dict)
-                or set(doc) != {"observationId", "capturedAtUtc"}
-                or not isinstance(doc["observationId"], str)
-                or not isinstance(doc["capturedAtUtc"], str)):
+    def merge(*items: "WeeklyBounds") -> "WeeklyBounds":
+        out = WeeklyBounds()
+        for b in items:
+            out = WeeklyBounds(
+                s7_date=_max(out.s7_date, b.s7_date),
+                s7_end=_max(out.s7_end, b.s7_end),
+                k7=_max(out.k7, b.k7), t7=_max(out.t7, b.t7),
+                c7=_max(out.c7, b.c7), x7=_max(out.x7, b.x7))
+        return out
+
+    def to_document(self) -> dict:
+        return {"s7Date": self.s7_date, "s7End": self.s7_end, "k7": self.k7,
+                "t7": self.t7, "c7": self.c7, "x7": self.x7}
+
+    @staticmethod
+    def from_document(doc) -> "WeeklyBounds | None":
+        if not _check_doc(doc, ("s7End", "k7", "c7", "x7"), ("s7Date", "t7")):
             return None
-        return ControlCertificate(doc["observationId"], doc["capturedAtUtc"])
+        return WeeklyBounds(s7_date=doc["s7Date"], s7_end=doc["s7End"],
+                            k7=doc["k7"], t7=doc["t7"], c7=doc["c7"],
+                            x7=doc["x7"])
+
+
+@dataclasses.dataclass(frozen=True)
+class FiveHourBounds:
+    """The five-hour summaries of one scope (spec 6.5): the maximum canonical
+    key ``k5``; ``raw_upper5`` = max(every raw reset, every cohort U5.raw,
+    every key + 2,400 s); capture order ``k5c``/``t5``; and ``detect_floor``,
+    the maximum of every cohort's U5.raw and every excluded record's raw
+    reset, which a witness's detection must exceed. Effects are key-scoped
+    (old-key confirmation state is inert by key mismatch), so there is no
+    effect bound."""
+
+    k5: "int | None" = None
+    raw_upper5: "int | None" = None
+    k5c: "int | None" = None
+    t5: "str | None" = None
+    detect_floor: "int | None" = None
+
+    def absorb_reading(self, r: Reading, *, excluded: bool = False) -> "FiveHourBounds":
+        if r.five_hour_key is None:
+            return self
+        upper = _max(r.raw_five_hour_reset, r.five_hour_key + FIVE_HOUR_SEPARATION_S)
+        return FiveHourBounds(
+            k5=_max(self.k5, r.five_hour_key),
+            raw_upper5=_max(self.raw_upper5, upper),
+            k5c=_max(self.k5c, r.capture_epoch),
+            t5=_max(self.t5, r.capture_text),
+            detect_floor=(_max(self.detect_floor, r.raw_five_hour_reset)
+                          if excluded else self.detect_floor),
+        )
+
+    def absorb_effect(self, *, five_hour_key=None, raw_reset=None,
+                      capture_epoch=None, capture_text=None) -> "FiveHourBounds":
+        upper = raw_reset
+        if five_hour_key is not None:
+            upper = _max(upper, five_hour_key + FIVE_HOUR_SEPARATION_S)
+        return FiveHourBounds(
+            k5=_max(self.k5, five_hour_key),
+            raw_upper5=_max(self.raw_upper5, upper),
+            k5c=_max(self.k5c, capture_epoch),
+            t5=_max(self.t5, capture_text),
+            detect_floor=self.detect_floor,
+        )
+
+    def absorb_cohort(self, c: Cohort) -> "FiveHourBounds":
+        return FiveHourBounds(
+            k5=_max(self.k5, c.u5_key),
+            raw_upper5=_max(self.raw_upper5,
+                            max(c.u5_raw, c.u5_key + FIVE_HOUR_SEPARATION_S)),
+            k5c=self.k5c, t5=self.t5,
+            detect_floor=_max(self.detect_floor, c.u5_raw),
+        )
+
+    @staticmethod
+    def merge(*items: "FiveHourBounds") -> "FiveHourBounds":
+        out = FiveHourBounds()
+        for b in items:
+            out = FiveHourBounds(
+                k5=_max(out.k5, b.k5),
+                raw_upper5=_max(out.raw_upper5, b.raw_upper5),
+                k5c=_max(out.k5c, b.k5c), t5=_max(out.t5, b.t5),
+                detect_floor=_max(out.detect_floor, b.detect_floor))
+        return out
+
+    def to_document(self) -> dict:
+        return {"k5": self.k5, "rawUpper5": self.raw_upper5, "k5c": self.k5c,
+                "t5": self.t5, "detectFloor": self.detect_floor}
+
+    @staticmethod
+    def from_document(doc) -> "FiveHourBounds | None":
+        if not _check_doc(doc, ("k5", "rawUpper5", "k5c", "detectFloor"),
+                          ("t5",)):
+            return None
+        return FiveHourBounds(k5=doc["k5"], raw_upper5=doc["rawUpper5"],
+                              k5c=doc["k5c"], t5=doc["t5"],
+                              detect_floor=doc["detectFloor"])
+
+
+def _capture_order_ok(r: Reading, k, t) -> bool:
+    """Spec 6.6 *Capture order and ties*: the capture is at least the
+    maximum instant AND its stored text at least the lexical maximum. Derived
+    rows of a later journal record always carry a larger id, so an equal
+    capture (instant and text) sorts the witness first under
+    `ORDER BY captured_at_utc DESC, id DESC`; a chronologically later or
+    equal but lexically earlier text would let predecessor reads select an
+    older row, and never qualifies."""
+    if k is not None and r.capture_epoch < k:
+        return False
+    if t is not None and r.capture_text < t:
+        return False
+    return True
+
+
+def weekly_witness_qualifies(r: Reading, b: WeeklyBounds) -> bool:
+    """Spec 6.6 *Weekly*, against summaries over the prefix strictly before
+    ``r``. The first-entry condition and "no pending debounce matches r's
+    week" are implied: every prefix weekly row, and so every armed debounce
+    state, carries a date key at most ``s7_date``, and ``r``'s is greater."""
+    if (r.week_start_date is None or r.weekly_end_epoch is None
+            or r.week_start_at_epoch is None):
+        return False
+    if b.s7_date is not None and not r.week_start_date > b.s7_date:
+        return False
+    if b.s7_end is not None and not r.weekly_end_epoch > b.s7_end:
+        return False
+    if b.c7 is not None and not r.week_start_at_epoch > b.c7:
+        return False
+    if b.x7 is not None and not r.week_start_at_epoch >= b.x7:
+        return False
+    if not _capture_order_ok(r, b.k7, b.t7):
+        return False
+    if b.s7_end is not None and not r.detection_epoch > b.s7_end:
+        return False
+    return True
+
+
+def five_hour_witness_qualifies(r: Reading, b: FiveHourBounds, *,
+                                detection_floor: "int | None") -> bool:
+    """Spec 6.6 *Five-hour*. ``detection_floor`` is the maximum of every
+    cohort's U5.raw and every excluded record's raw reset (None when none
+    exists). "No confirmation state for (Y, r.key)" is implied by the key
+    freshness: confirmation state is keyed by window key, and every prefix
+    key is at most ``k5``."""
+    if r.five_hour_key is None or r.raw_five_hour_reset is None:
+        return False
+    if b.k5 is not None and not r.five_hour_key > b.k5:
+        return False
+    if (b.raw_upper5 is not None
+            and not r.raw_five_hour_reset > b.raw_upper5 + FIVE_HOUR_SEPARATION_S):
+        return False
+    if not _capture_order_ok(r, b.k5c, b.t5):
+        return False
+    if detection_floor is not None and not r.detection_epoch > detection_floor:
+        return False
+    return True
+
+
+@dataclasses.dataclass(frozen=True)
+class GateDecision:
+    """Whether automatic outcomes may be minted (or a drop published) for
+    one axis."""
+
+    allowed: bool
+    reason: str
+
+
+GATE_NO_TRIGGER = GateDecision(True, "no-trigger")
+GATE_RELEASED = GateDecision(True, "released")
+
+
+def all_axes(decision: GateDecision) -> dict:
+    return {axis: decision for axis in AXES}
 
 
 @dataclasses.dataclass
-class AccountRecovery:
-    """One account's certificates and the trigger sequence each was granted
-    against. A certificate granted against an older sequence is void."""
+class AxisRecovery:
+    """One (generation, account, axis): paused or released, what it waits
+    for, the completion covering it, its witness (pending or released), its
+    release, the reason of its last revocation and the times doctor shows.
+    ``not_before`` is the detection lower bound snapshotted over the prefix
+    strictly before a pending witness (spec 7.1); None otherwise."""
 
-    accounting: "Certificate | None" = None
-    accounting_trigger_seq: "int | None" = None
-    control: "ControlCertificate | None" = None
-    control_trigger_seq: "int | None" = None
+    state: str = STATE_PAUSED
+    waiting_for: "str | None" = None
+    coverage_id: "str | None" = None
+    witness_id: "str | None" = None
+    release_id: "str | None" = None
+    revocation: "str | None" = None
+    since: "str | None" = None
+    recovered_at: "str | None" = None
+    not_before: "int | None" = None
+    #: The witness's period key and capture order, kept for revocation.
+    witness_key: "str | int | None" = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ControlWitness:
+    """The latest control-witness observation of an account in the current
+    generation: what an authority completion must name."""
+
+    observation_id: str
+    capture_epoch: int
+    axes: frozenset
+    weekly_end_epoch: "int | None" = None
+
+    def to_document(self) -> dict:
+        return {"observationId": self.observation_id,
+                "captureEpoch": self.capture_epoch,
+                "axes": sorted(self.axes),
+                "weeklyEndEpoch": self.weekly_end_epoch}
+
+    @staticmethod
+    def from_document(doc) -> "ControlWitness | None":
+        if (not isinstance(doc, dict)
+                or set(doc) != {"observationId", "captureEpoch", "axes",
+                                "weeklyEndEpoch"}
+                or not isinstance(doc["observationId"], str)
+                or type(doc["captureEpoch"]) is not int
+                or not isinstance(doc["axes"], list)
+                or not set(doc["axes"]) <= set(AXES)
+                or (doc["weeklyEndEpoch"] is not None
+                    and type(doc["weeklyEndEpoch"]) is not int)):
+            return None
+        return ControlWitness(doc["observationId"], doc["captureEpoch"],
+                              frozenset(doc["axes"]), doc["weeklyEndEpoch"])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -433,258 +490,564 @@ class Trigger:
     at: "str | None"
 
 
-def spool_marker(trigger: Trigger) -> dict:
-    """The unresolved structural-envelope marker a spool trigger leaves: its
-    journal coordinate and `at` (spec revision 3), and its reason — spec
-    revision 5 words the marker of an incomplete inventory differently."""
-    return {"seq": trigger.seq, "segment": trigger.segment,
-            "offset": trigger.offset, "at": trigger.at,
-            "reason": trigger.reason}
+@dataclasses.dataclass
+class Episode:
+    """An incomplete-inventory episode, identified by the coordinate of the
+    record that opened it (spec 6.3)."""
+
+    opener_segment: "str | None"
+    opener_offset: "int | None"
+    opened_at: "str | None"
+    closer_segment: "str | None" = None
+    closer_offset: "int | None" = None
+    closed_at: "str | None" = None
+
+    @property
+    def key(self) -> tuple:
+        return (self.opener_segment, self.opener_offset)
+
+    @property
+    def open(self) -> bool:
+        return self.closed_at is None and self.closer_segment is None
 
 
-@dataclasses.dataclass(frozen=True)
-class GateDecision:
-    """Whether automatic outcomes may be minted for one reading."""
-
-    allowed: bool
-    reason: str
+@dataclasses.dataclass
+class ScopeBounds:
+    weekly: WeeklyBounds = dataclasses.field(default_factory=WeeklyBounds)
+    five_hour: FiveHourBounds = dataclasses.field(default_factory=FiveHourBounds)
 
 
-GATE_NO_TRIGGER = GateDecision(True, "no-trigger")
-GATE_CERTIFIED = GateDecision(True, "certified")
+def cause_of(trigger: "Trigger | None", inventory_reasons=()) -> "str | None":
+    """The doctor cause of the pause a trigger started."""
+    if trigger is None:
+        return None
+    if trigger.kind == TRIGGER_KIND_EXCLUDED:
+        return CAUSE_EXCLUDED_WRITE
+    if trigger.reason in inventory_reasons:
+        return CAUSE_INVENTORY_INCOMPLETE
+    return CAUSE_LEGACY_ACTIVITY
 
 
 class QuarantineState:
     """The deterministic quarantine fold over journal order.
 
-    Every consumer — live ingest, rebuild, the rederive scratch replay — feeds
-    the same events in journal order, so the persisted state is a function of
-    the journal alone. Methods mutate in place and record which rows changed
-    so a caller persists only those."""
+    Every consumer feeds the same events in journal order, so the persisted
+    state is a function of the journal alone. Methods mutate in place and
+    record which rows changed so a caller persists only those. The glue
+    (`_cctally_quarantine.QuarantineFold`) maps records to these events."""
 
-    def __init__(self, *, latest_trigger_seq: int = 0, envelopes=None,
-                 accounts=None, non_inert_cross_period: bool = False,
-                 spool_markers=()):
-        self.latest_trigger_seq = int(latest_trigger_seq)
-        self.envelopes: dict = dict(envelopes or {})
-        self.accounts: dict = dict(accounts or {})
-        self.new_triggers: list = []
-        self.dirty_envelopes: set = set()
-        self.dirty_accounts: set = set()
-        #: Every spool trigger's unresolved marker, in journal order. None is
-        #: ever removed: a later trigger adds a generation and keeps the
-        #: earlier uncertainty (spec revision 3).
-        self.spool_markers: list = [dict(m) for m in spool_markers]
-        if self.spool_markers:
-            # A certificate persisted while a marker exists was issued
-            # without the marker check (the rule before spec revision 3), so
-            # it is invalidated here, never honored or advanced; a rebuild
-            # likewise grants none while the retained triggers hold a marker.
-            self.revoke_all_accounting()
-        #: Session-local seen observation identities per scope (clause 7).
-        #: Not persisted: a replayed identity always fails clause 1 as well,
-        #: because its own first copy is inside the envelope.
-        self.seen: dict = {}
-        #: True when some registered cross-period access has no inert rule;
-        #: then a deletion outcome revokes the account at its journal position.
+    def __init__(self, *, generation: int = 0,
+                 latest_trigger: "Trigger | None" = None,
+                 episodes=(), cohort: "Cohort | None" = None,
+                 expired: bool = False, max_admitted_at: "int | None" = None,
+                 bounds=None, accounts=None, control=None,
+                 non_inert_cross_period: bool = False):
+        self.generation = int(generation)
+        self.latest_trigger = latest_trigger
+        self.episodes: list = list(episodes)
+        #: The LATEST spool cohort (set at P), and whether its expiry has
+        #: been established after P.
+        self.cohort = cohort
+        self.expired = bool(expired)
+        self.max_admitted_at = max_admitted_at
+        self.bounds: dict = dict(bounds or {})
+        self.accounts: dict = {k: dict(v) for k, v in (accounts or {}).items()}
+        self.control: dict = dict(control or {})
         self.non_inert_cross_period = bool(non_inert_cross_period)
+        self.new_triggers: list = []
+        self.dirty_episodes: set = set()
+        self.dirty_bounds: set = set()
+        self.dirty_accounts: set = set()
+        self.dirty_meta = False
+        self.dirty_control: set = set()
 
     # -- queries ---------------------------------------------------------
     def has_trigger(self) -> bool:
-        return self.latest_trigger_seq > 0
+        return self.generation > 0
 
-    def has_unresolved_spool_marker(self) -> bool:
-        return bool(self.spool_markers)
+    @property
+    def latest_trigger_seq(self) -> int:
+        return self.generation
 
-    def accounting_certified(self, account_key: str) -> bool:
-        """Whether ``account_key`` holds a current accounting certificate.
-        Never while a spool marker is unresolved, whatever a persisted row
-        says (spec revision 3)."""
-        if self.spool_markers:
+    def open_episode(self) -> "Episode | None":
+        for episode in reversed(self.episodes):
+            if episode.open:
+                return episode
+        return None
+
+    def scope(self, name: str) -> ScopeBounds:
+        found = self.bounds.get(name)
+        return found if found is not None else ScopeBounds()
+
+    def merged(self, account_key: "str | None") -> ScopeBounds:
+        """The summaries a witness of ``account_key`` is judged against: its
+        own, the excluded scope's and every cohort's."""
+        names = [EXCLUDED_SCOPE, COHORT_SCOPE]
+        if account_key is not None:
+            names.append(account_key)
+        parts = [self.scope(n) for n in names]
+        return ScopeBounds(
+            weekly=WeeklyBounds.merge(*(p.weekly for p in parts)),
+            five_hour=FiveHourBounds.merge(*(p.five_hour for p in parts)))
+
+    def axis(self, account_key: str, axis: str) -> AxisRecovery:
+        found = self.accounts.get(account_key, {}).get(axis)
+        if found is not None:
+            return found
+        since = None if self.latest_trigger is None else self.latest_trigger.at
+        return AxisRecovery(since=since)
+
+    def _axis_mut(self, account_key: str, axis: str) -> AxisRecovery:
+        per = self.accounts.setdefault(account_key, {})
+        rec = per.get(axis)
+        if rec is None:
+            rec = self.axis(account_key, axis)
+            per[axis] = rec
+        self.dirty_accounts.add(account_key)
+        return rec
+
+    def released(self, account_key: str, axis: str) -> bool:
+        return self.axis(account_key, axis).state == STATE_RELEASED
+
+    def barrier_open(self) -> bool:
+        """Steps 1–2 of the barrier: no episode open, and the latest spool
+        cohort (when one exists) has expired."""
+        if self.open_episode() is not None:
             return False
-        rec = self.accounts.get(account_key)
-        return (rec is not None and rec.accounting is not None
-                and rec.accounting_trigger_seq == self.latest_trigger_seq)
+        return self.cohort is None or self.expired
 
-    def control_certified(self, account_key: str) -> bool:
-        rec = self.accounts.get(account_key)
-        return (rec is not None and rec.control is not None
-                and rec.control_trigger_seq == self.latest_trigger_seq)
+    def waiting_for(self, account_key: str, axis: str) -> "str | None":
+        if not self.has_trigger() or self.released(account_key, axis):
+            return None
+        if self.open_episode() is not None:
+            return WAIT_INVENTORY
+        if self.cohort is not None and not self.expired:
+            return WAIT_EXPIRY
+        if self.axis(account_key, axis).coverage_id is None:
+            return WAIT_USAGE_REFRESH
+        return WAIT_FRESH_PERIOD
 
-    def accounting_quarantined(self, account_key: str) -> bool:
-        return self.has_trigger() and not self.accounting_certified(account_key)
+    def axis_gate(self, account_key: "str | None", axis: str) -> GateDecision:
+        if not self.has_trigger():
+            return GATE_NO_TRIGGER
+        if account_key is not None and self.released(account_key, axis):
+            return GATE_RELEASED
+        reason = (self.waiting_for(account_key, axis)
+                  if account_key is not None else None)
+        return GateDecision(False, f"paused:{reason or 'unbound'}")
 
-    def control_quarantined(self, account_key: str) -> bool:
-        return self.has_trigger() and not self.control_certified(account_key)
+    def gates(self, account_key: "str | None") -> dict:
+        return {axis: self.axis_gate(account_key, axis) for axis in AXES}
 
-    def envelope(self, scope: str) -> Envelope:
-        return self.envelopes.get(scope) or Envelope()
+    def pending_witness(self, account_key: str, axis: str) -> "str | None":
+        rec = self.axis(account_key, axis)
+        if (rec.state == STATE_PAUSED and rec.witness_id is not None
+                and rec.release_id is None):
+            return rec.witness_id
+        return None
+
+    def not_before(self, account_key: str, axis: str) -> "int | None":
+        """A guaranteed lower bound on the axis's release instant from the
+        detection clauses of spec 6.6 (spec 7.1): weekly ``S7.end``; five-hour
+        the detection floor. Computed over the prefix strictly before a
+        pending witness."""
+        if not self.has_trigger() or self.released(account_key, axis):
+            return None
+        rec = self.axis(account_key, axis)
+        if self.pending_witness(account_key, axis) is not None:
+            return rec.not_before
+        merged = self.merged(account_key)
+        if axis == WEEKLY:
+            return merged.weekly.s7_end
+        return merged.five_hour.detect_floor
+
+    def coverable_axes(self, account_key: str, observation_id: str) -> tuple:
+        """The axes an `outcome_authority_completion` naming
+        ``observation_id`` would newly cover now: paused, uncovered, observed
+        by that observation (the account's latest control witness of the
+        current generation), with the barrier's first two steps done and the
+        fetch at or after the latest spool cohort's E (spec 6.4)."""
+        if not self.has_trigger() or self.open_episode() is not None:
+            return ()
+        witness = self.control.get(account_key)
+        if witness is None or witness.observation_id != observation_id:
+            return ()
+        if self.cohort is not None and witness.capture_epoch < self.cohort.e:
+            return ()
+        return tuple(
+            axis for axis in AXES
+            if axis in witness.axes and not self.released(account_key, axis)
+            and self.axis(account_key, axis).coverage_id is None)
 
     # -- transitions -----------------------------------------------------
-    def _set_envelope(self, scope: str, value: Envelope) -> None:
-        if self.envelopes.get(scope) != value:
-            self.envelopes[scope] = value
-            self.dirty_envelopes.add(scope)
+    def _set_scope(self, name: str, value: ScopeBounds) -> None:
+        if self.bounds.get(name) != value:
+            self.bounds[name] = value
+            self.dirty_bounds.add(name)
 
-    def _account(self, account_key: str) -> AccountRecovery:
-        rec = self.accounts.get(account_key)
-        if rec is None:
-            rec = AccountRecovery()
-            self.accounts[account_key] = rec
-        return rec
+    def _touch_all_accounts(self) -> None:
+        self.dirty_accounts.update(self.accounts)
+
+    def note_admitted(self, at_epoch: "int | None") -> None:
+        """Every admitted record's `at` (H tracks the greatest)."""
+        if at_epoch is not None and (self.max_admitted_at is None
+                                     or at_epoch > self.max_admitted_at):
+            self.max_admitted_at = at_epoch
+            self.dirty_meta = True
+
+    def note_clock(self, clock_epoch: "int | None") -> None:
+        """An admitted record after P whose clock instant is at or after E
+        establishes expiry (spec 6.3). The caller passes the clock instant
+        of observations and ops only, and only for records after P."""
+        if (self.cohort is not None and not self.expired
+                and self.open_episode() is None
+                and clock_epoch is not None and clock_epoch >= self.cohort.e):
+            self.expired = True
+            self.dirty_meta = True
+            self._touch_all_accounts()
 
     def on_trigger(self, *, kind: str, reason: str, segment=None, offset=None,
                    at=None) -> Trigger:
-        """A trigger quarantines EVERY account and voids every certificate
-        (its sequence moves past them). The account a record names never
-        narrows it."""
-        self.latest_trigger_seq += 1
-        trig = Trigger(self.latest_trigger_seq, segment, offset, kind, reason, at)
+        """A trigger starts a new generation: every release and every
+        coverage of every account becomes void (spec 6.9)."""
+        self.generation += 1
+        trig = Trigger(self.generation, segment, offset, kind, reason, at)
+        self.latest_trigger = trig
         self.new_triggers.append(trig)
-        if kind == TRIGGER_KIND_LEGACY_SPOOL:
-            self.spool_markers.append(spool_marker(trig))
+        # The new generation's rows replace every account's.
+        known = set(self.accounts)
+        self.accounts = {key: {} for key in known}
+        self.control = {}
+        self.dirty_control.update(known)
+        self.dirty_accounts.update(known)
+        self.dirty_meta = True
         return trig
 
-    def absorb_excluded_reading(self, r: Reading) -> None:
-        self._set_envelope(
-            EXCLUDED_SCOPE, self.envelope(EXCLUDED_SCOPE).absorb_reading(r))
-        self.seen.setdefault(EXCLUDED_SCOPE, set()).add(r.observation_id)
+    def set_position(self, normalize_week_end, *, include_at=None) -> Cohort:
+        """P is here: the latest spool cohort is computed from H (which the
+        caller already advanced over the record at P) and absorbed into the
+        cohort scope's summaries; its expiry is not yet established."""
+        h = _max(self.max_admitted_at, include_at)
+        if h is None:
+            h = 0
+        cohort = Cohort.from_h(h, normalize_week_end=normalize_week_end)
+        self.cohort = cohort
+        self.expired = False
+        scope = self.scope(COHORT_SCOPE)
+        self._set_scope(COHORT_SCOPE, ScopeBounds(
+            weekly=scope.weekly.absorb_cohort(cohort),
+            five_hour=scope.five_hour.absorb_cohort(cohort)))
+        self.dirty_meta = True
+        self._touch_all_accounts()
+        return cohort
 
-    def absorb_effect(self, scope: str, **effect) -> None:
-        self._set_envelope(scope, self.envelope(scope).absorb_effect(**effect))
+    def on_episode_open(self, *, segment, offset, at) -> Episode:
+        """An episode opener. A later opener while one is open supersedes it
+        (the journal's inventory pass names only the latest)."""
+        current = self.open_episode()
+        if current is not None:
+            current.closer_segment, current.closer_offset = segment, offset
+            current.closed_at = at
+            self.dirty_episodes.add(current.key)
+        for existing in self.episodes:
+            if existing.key == (segment, offset):
+                existing.closer_segment = existing.closer_offset = None
+                existing.closed_at = None
+                self.dirty_episodes.add(existing.key)
+                self.cohort = None
+                self.expired = False
+                self.dirty_meta = True
+                self._touch_all_accounts()
+                return existing
+        episode = Episode(segment, offset, at)
+        self.episodes.append(episode)
+        self.dirty_episodes.add(episode.key)
+        self.cohort = None
+        self.expired = False
+        self.dirty_meta = True
+        self._touch_all_accounts()
+        return episode
 
-    def revoke_accounting(self, account_key: str) -> None:
-        """Drop the accounting certificate. The sequence it was granted
-        against is kept, so `doctor` can say since when the account has been
-        paused; without a certificate it never certifies anything."""
-        rec = self.accounts.get(account_key)
-        if rec is not None and rec.accounting is not None:
-            rec.accounting = None
-            self.dirty_accounts.add(account_key)
+    def on_episode_continue(self, *, segment, offset) -> bool:
+        """A revision op naming an open episode: no trigger, no episode."""
+        current = self.open_episode()
+        return current is not None and current.key == (segment, offset)
 
-    def revoke_control(self, account_key: str) -> None:
-        rec = self.accounts.get(account_key)
-        if rec is not None and rec.control is not None:
-            rec.control = None
-            self.dirty_accounts.add(account_key)
+    def on_episode_close(self, *, segment, offset, at, episode=None) -> bool:
+        """Close the open episode at a journaled complete scan. ``episode``
+        is the coordinate an inventory-completion op names; it closes only
+        that episode. Closing never erases a trigger or a cohort."""
+        current = self.open_episode()
+        if current is None:
+            return False
+        if (episode is not None and current.opener_segment is not None
+                and tuple(episode) != current.key):
+            return False
+        current.closer_segment, current.closer_offset = segment, offset
+        current.closed_at = at
+        self.dirty_episodes.add(current.key)
+        self._touch_all_accounts()
+        return True
 
-    def revoke_all_accounting(self) -> None:
-        for account_key in sorted(self.accounts):
-            self.revoke_accounting(account_key)
+    def absorb_reading(self, scope_name: str, r: Reading, *,
+                       possible_effect: bool, excluded: bool = False) -> None:
+        scope = self.scope(scope_name)
+        self._set_scope(scope_name, ScopeBounds(
+            weekly=scope.weekly.absorb_reading(r, possible_effect=possible_effect),
+            five_hour=scope.five_hour.absorb_reading(r, excluded=excluded)))
 
-    def on_reading(self, account_key: "str | None", r: Reading, *,
-                   fallback_rows_captured_at=()) -> GateDecision:
-        """Fold one admitted reading. Certification is evaluated BEFORE the
-        reading is absorbed, against the whole prefix; continuing validity is
-        checked before any outcome; the reading is then absorbed into its
-        account's envelope. Returns the gate for the reading's outcomes."""
-        if account_key is None:
-            # An admitted historical reading with no account: its bounds
-            # apply to every account.
-            self._set_envelope(
-                EXCLUDED_SCOPE, self.envelope(EXCLUDED_SCOPE).absorb_reading(r))
-            self.seen.setdefault(EXCLUDED_SCOPE, set()).add(r.observation_id)
-            return GATE_NO_TRIGGER if not self.has_trigger() else GateDecision(
-                False, "quarantined")
-        gate = GATE_NO_TRIGGER
-        if self.has_trigger():
-            if self.accounting_certified(account_key):
-                rec = self.accounts[account_key]
-                reason = continuing_validity(
-                    rec.accounting, r,
-                    fallback_rows_captured_at=fallback_rows_captured_at)
-                if reason is not None:
-                    self.revoke_accounting(account_key)
-                    gate = GateDecision(False, f"revoked:{reason}")
-                else:
-                    advanced = rec.accounting.advance(r)
-                    if advanced != rec.accounting:
-                        rec.accounting = advanced
-                        self.dirty_accounts.add(account_key)
-                    gate = GATE_CERTIFIED
-            elif self.spool_markers:
-                # The omitted spool contributor bounds nothing, so no reading
-                # certifies against the envelope while a marker is unresolved.
-                gate = GateDecision(False, GATE_REASON_SPOOL_MARKER)
-            else:
-                merged = Envelope.merge(self.envelope(account_key),
-                                        self.envelope(EXCLUDED_SCOPE))
-                seen = (self.seen.get(account_key, set())
-                        | self.seen.get(EXCLUDED_SCOPE, set()))
-                decision = certify(r, merged, seen_identities=seen)
-                if decision.certified:
-                    rec = self._account(account_key)
-                    rec.accounting = Certificate.from_witness(r)
-                    rec.accounting_trigger_seq = self.latest_trigger_seq
-                    self.dirty_accounts.add(account_key)
-                    gate = GateDecision(True, "witness")
-                else:
-                    gate = GateDecision(False, "quarantined")
-        self._set_envelope(account_key, self.envelope(account_key).absorb_reading(r))
-        self.seen.setdefault(account_key, set()).add(r.observation_id)
-        return gate
+    def absorb_weekly_effect(self, scope_name: str, **effect) -> None:
+        scope = self.scope(scope_name)
+        self._set_scope(scope_name, ScopeBounds(
+            weekly=scope.weekly.absorb_effect(**effect),
+            five_hour=scope.five_hour))
 
-    def on_control_witness(self, account_key: str, *, observation_id: str,
-                           captured_at_utc: str) -> None:
-        """A bound two-axis authoritative OAuth publication for one account,
-        positioned after the latest trigger. Its control transition must ALSO
-        record the commit before drop consensus resumes (checked by the
-        statusline reducer)."""
+    def absorb_five_hour_effect(self, scope_name: str, **effect) -> None:
+        scope = self.scope(scope_name)
+        self._set_scope(scope_name, ScopeBounds(
+            weekly=scope.weekly,
+            five_hour=scope.five_hour.absorb_effect(**effect)))
+
+    def weekly_possible_effect(self, account_key: "str | None",
+                               r: Reading) -> bool:
+        """Spec 6.5 C7 (b): a reading whose weekly axis is a genuine reading
+        contributes its capture when some permitted predecessor end is later
+        than its detection (the detector's live-end condition)."""
+        if WEEKLY not in r.observed_axes or r.week_start_date is None:
+            return False
+        end = self.merged(account_key).weekly.s7_end
+        return end is not None and end > r.detection_epoch
+
+    def on_control_witness(self, account_key: str, witness: ControlWitness) -> None:
         if not self.has_trigger():
             return
-        rec = self._account(account_key)
-        cert = ControlCertificate(observation_id, captured_at_utc)
-        if rec.control != cert or rec.control_trigger_seq != self.latest_trigger_seq:
-            rec.control = cert
-            rec.control_trigger_seq = self.latest_trigger_seq
-            self.dirty_accounts.add(account_key)
+        if self.control.get(account_key) != witness:
+            self.control[account_key] = witness
+            self.dirty_control.add(account_key)
 
-    def on_deletion_outcome(self, account_key: "str | None") -> None:
+    def on_authority_completion(self, account_key: str, completion_id: str, *,
+                                generation: int, observation_id: str,
+                                axes) -> bool:
+        """Validate a completion op (spec 6.4 *Validity*) and cover each
+        listed axis it newly covers. Returns whether it was valid."""
+        if generation != self.generation or not self.has_trigger():
+            return False
+        axes = tuple(axes)
+        if not axes or not set(axes) <= set(AXES):
+            return False
+        coverable = set(self.coverable_axes(account_key, observation_id))
+        witness = self.control.get(account_key)
+        if witness is None or not set(axes) <= witness.axes:
+            return False
+        newly = [axis for axis in axes if axis in coverable]
+        if not newly:
+            return False
+        for axis in newly:
+            rec = self._axis_mut(account_key, axis)
+            rec.coverage_id = completion_id
+        if WEEKLY in newly and witness.weekly_end_epoch is not None:
+            # Spec 6.5 X7: reference-only drop publications continue in the
+            # covered week until its end.
+            self.absorb_weekly_effect(account_key,
+                                      exclusive_end=witness.weekly_end_epoch)
+        return True
+
+    def evaluate_reading(self, account_key: "str | None", r: Reading, *,
+                         normalize_week_end=None) -> dict:
+        """Fold one admitted reading (spec 6.6, 6.7, 6.9): revoke a released
+        axis on backward input, forfeit a pending witness on a later
+        X-bearing record, evaluate the gate, evaluate each paused covered
+        axis's witness against the prefix strictly before ``r``, then absorb
+        ``r``. Returns the per-axis gate for ``r``'s own outcomes — evaluated
+        before any witness, so a witness's own derivation runs closed."""
+        if account_key is None:
+            self.absorb_reading(EXCLUDED_SCOPE, r,
+                                possible_effect=self.weekly_possible_effect(None, r))
+            return {axis: self.axis_gate(None, axis) for axis in AXES}
+        own = self.scope(account_key)
+        if self.has_trigger():
+            for axis in AXES:
+                if not r.bears(axis):
+                    continue
+                rec = self.axis(account_key, axis)
+                if rec.state == STATE_RELEASED:
+                    reason = self._revocation(own, axis, r, rec)
+                    if reason is not None:
+                        self.revoke_axis(account_key, axis, reason,
+                                         at=_iso(r.detection_epoch))
+                elif self.pending_witness(account_key, axis) is not None:
+                    # Spec 6.7: an X-bearing record between witness and
+                    # release forfeits the period.
+                    rec = self._axis_mut(account_key, axis)
+                    rec.witness_id = None
+                    rec.witness_key = None
+                    rec.not_before = None
+        gates = self.gates(account_key)
+        if self.has_trigger() and self.barrier_open():
+            merged = self.merged(account_key)
+            for axis in AXES:
+                rec = self.axis(account_key, axis)
+                if (rec.state != STATE_PAUSED or rec.coverage_id is None
+                        or rec.witness_id is not None
+                        or axis not in r.eligible_axes):
+                    continue
+                if axis == WEEKLY:
+                    ok = weekly_witness_qualifies(r, merged.weekly)
+                    snapshot = merged.weekly.s7_end
+                    key = r.week_start_date
+                else:
+                    floor = merged.five_hour.detect_floor
+                    ok = five_hour_witness_qualifies(
+                        r, merged.five_hour, detection_floor=floor)
+                    snapshot = floor
+                    key = r.five_hour_key
+                if ok:
+                    rec = self._axis_mut(account_key, axis)
+                    rec.witness_id = r.observation_id
+                    rec.witness_key = key
+                    rec.not_before = snapshot
+        self.absorb_reading(account_key, r,
+                            possible_effect=self.weekly_possible_effect(account_key, r))
+        return gates
+
+    @staticmethod
+    def _revocation(own: ScopeBounds, axis: str, r: Reading,
+                    rec: AxisRecovery) -> "str | None":
+        if axis == WEEKLY:
+            if rec.witness_key is not None and r.week_start_date < rec.witness_key:
+                return REVOKE_BACKWARD_KEY
+            k, t = own.weekly.k7, own.weekly.t7
+        else:
+            if rec.witness_key is not None and r.five_hour_key < rec.witness_key:
+                return REVOKE_BACKWARD_KEY
+            k, t = own.five_hour.k5c, own.five_hour.t5
+        if (k is not None and r.capture_epoch < k) or (
+                t is not None and r.capture_text < t):
+            return REVOKE_ORDER_REGRESSION
+        return None
+
+    def on_release(self, account_key: str, axis: str, *, generation: int,
+                   witness_id: str, completion_id: str, release_id: str,
+                   at: "str | None") -> bool:
+        """Validate an `outcome_axis_release` (spec 6.7 *Validity*): current
+        generation, the completion that covers the axis, the axis's pending
+        witness (no X-bearing record of the account since). Invalid → ignored."""
+        if (generation != self.generation or axis not in AXES
+                or not self.has_trigger()):
+            return False
+        rec = self.axis(account_key, axis)
+        if (rec.state != STATE_PAUSED or rec.coverage_id is None
+                or rec.coverage_id != completion_id
+                or self.pending_witness(account_key, axis) != witness_id):
+            return False
+        rec = self._axis_mut(account_key, axis)
+        rec.state = STATE_RELEASED
+        rec.release_id = release_id
+        rec.recovered_at = at
+        rec.revocation = None
+        rec.not_before = None
+        return True
+
+    def revoke_axis(self, account_key: str, axis: str, reason: str, *,
+                    at: "str | None" = None, void_coverage: bool = False) -> None:
+        """A released axis returns to paused with its reason and needs a new
+        witness in a later period; a pending witness is dropped. Coverage
+        stays valid unless ``void_coverage`` (an administrative op)."""
+        rec = self.axis(account_key, axis)
+        if (rec.state != STATE_RELEASED and rec.witness_id is None
+                and not (void_coverage and rec.coverage_id is not None)):
+            return
+        rec = self._axis_mut(account_key, axis)
+        if rec.state == STATE_RELEASED:
+            rec.revocation = reason
+            rec.since = at or rec.since
+        rec.state = STATE_PAUSED
+        rec.witness_id = None
+        rec.witness_key = None
+        rec.release_id = None
+        rec.recovered_at = None
+        rec.not_before = None
+        if void_coverage:
+            rec.coverage_id = None
+
+    def revoke_all(self, reason: str, *, at=None, axes=AXES,
+                   void_coverage: bool = False) -> None:
+        for account_key in sorted(self.accounts):
+            for axis in axes:
+                self.revoke_axis(account_key, axis, reason, at=at,
+                                 void_coverage=void_coverage)
+
+    def on_deletion_outcome(self, account_key: "str | None", axis: str, *,
+                            at=None) -> None:
         """A journaled automatic outcome that deleted snapshot rows. While
         every registered cross-period fallback read is inert this revokes
-        nothing (spec 5.6 item 5: the certificate survives where the fallback
-        read is registered inert); otherwise the affected account — every
-        account when the event names none — is revoked at the event's journal
-        position."""
+        nothing; otherwise BOTH axes — of every account when the event names
+        none — are revoked (spec 6.9). ``axis`` is the outcome's own axis,
+        but the rows it deletes are shared snapshot rows: a five-hour credit
+        that deletes the common latest row sends the weekly detector's
+        moved-end predecessor lookup or debounce singleton back into the
+        paused prefix, so the reads that can fall back are either axis's."""
+        del axis
         if not self.non_inert_cross_period:
             return
         if account_key is None:
-            self.revoke_all_accounting()
+            self.revoke_all(REVOKE_NON_INERT_FALLBACK, at=at)
         else:
-            self.revoke_accounting(account_key)
+            for each in AXES:
+                self.revoke_axis(account_key, each, REVOKE_NON_INERT_FALLBACK,
+                                 at=at)
+
+    def ensure_account(self, account_key: str) -> None:
+        """Materialize an account's rows in the current generation."""
+        if account_key not in self.accounts:
+            self.accounts[account_key] = {}
+            self.dirty_accounts.add(account_key)
 
 
-def certificate_row(rec: AccountRecovery) -> tuple:
-    """The persisted columns of one account's recovery state."""
-    return (
-        None if rec.accounting is None else json.dumps(
-            rec.accounting.to_document(), sort_keys=True, separators=(",", ":")),
-        rec.accounting_trigger_seq,
-        None if rec.control is None else json.dumps(
-            rec.control.to_document(), sort_keys=True, separators=(",", ":")),
-        rec.control_trigger_seq,
-    )
+def _iso(epoch: "int | None") -> "str | None":
+    if epoch is None:
+        return None
+    return _dt.datetime.fromtimestamp(int(epoch), tz=_dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
 
 
-def account_from_row(accounting_json, accounting_seq, control_json,
-                     control_seq) -> AccountRecovery:
-    """The recovery state a persisted row describes. Missing or unverifiable
-    certificate evidence reads as NO certificate (quarantined)."""
-    def _load(text, loader):
-        if not text:
-            return None
-        try:
-            return loader(json.loads(text))
-        except (TypeError, ValueError):
-            return None
+def iso(epoch: "int | None") -> "str | None":
+    return _iso(epoch)
 
-    accounting = _load(accounting_json, Certificate.from_document)
-    control = _load(control_json, ControlCertificate.from_document)
-    return AccountRecovery(
-        accounting=accounting,
-        accounting_trigger_seq=(
-            accounting_seq if type(accounting_seq) is int else None),
-        control=control,
-        control_trigger_seq=(
-            control_seq if type(control_seq) is int else None),
-    )
+
+def axis_row(state: QuarantineState, account_key: str, axis: str) -> tuple:
+    """The persisted columns of one (account, axis) in the current
+    generation, in `outcome_quarantine_axis_state` column order after
+    ``(generation, account_key, axis)``."""
+    rec = state.axis(account_key, axis)
+    return (rec.state, state.waiting_for(account_key, axis), rec.coverage_id,
+            rec.witness_id, rec.release_id, rec.revocation, rec.since,
+            rec.recovered_at, rec.not_before,
+            None if rec.witness_key is None else json.dumps(rec.witness_key))
+
+
+def axis_from_row(row) -> "AxisRecovery | None":
+    """The `AxisRecovery` a persisted row describes, or None when the row is
+    unverifiable (the caller then reads the axis as paused)."""
+    (state, waiting, coverage, witness, release, revocation, since,
+     recovered, not_before, witness_key) = row
+    if state not in (STATE_PAUSED, STATE_RELEASED):
+        return None
+    if waiting is not None and waiting not in WAITING_FOR:
+        return None
+    if not_before is not None and type(not_before) is not int:
+        return None
+    try:
+        key = None if witness_key is None else json.loads(witness_key)
+    except (TypeError, ValueError):
+        return None
+    if key is not None and not isinstance(key, (str, int)):
+        return None
+    if state == STATE_RELEASED and (release is None or witness is None
+                                    or coverage is None):
+        return None
+    return AxisRecovery(state=state, waiting_for=waiting, coverage_id=coverage,
+                        witness_id=witness, release_id=release,
+                        revocation=revocation, since=since,
+                        recovered_at=recovered, not_before=not_before,
+                        witness_key=key)

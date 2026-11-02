@@ -48,6 +48,11 @@ _UNCOVERED_ACCOUNTING_FAMILIES = (
     "codex_barrier_certificates",
     "codex_barrier_repairs",
     "codex_barrier_entry_threads",
+    # #944: write-time Claude cost attribution is cache.db state only.
+    "claude_account_timeline",
+    "claude_cost_decisions",
+    # #927: the retained-identity inventory is cache.db prune state only.
+    "codex_retained_identities",
 )
 
 

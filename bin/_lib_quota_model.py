@@ -207,11 +207,39 @@ MIX_SUPPORT: dict[str, object] = {
     "effective_radius": "max(empirical, floor)",
     "family_tv_floor": 0.03,
     "token_class_max_relative_effect": 0.05,
+    # #991: a forecast family shift outside the family radius is still
+    # admitted when the era's meter-evidence rate bounds keep its worst-case
+    # effect on the forecast within this fraction (equality admits). A
+    # separate key from the token-class threshold above, so moving one never
+    # silently moves the other.
+    "family_max_relative_effect": 0.05,
 }
+
+#: The composition-support rule's revision. 1 is the two-radius
+#: total-variation rule alone; 2 adds the evidence-bounded family test for
+#: forecasts (#991). Fingerprinted, so a calibration fitted under another
+#: rule is `stale`.
+MIX_SUPPORT_POLICY_REVISION: int = 2
 
 #: The fast-mode policy every validated era applies: fast-mode requests are
 #: billed to usage credits only and never reach the weekly meter.
 FAST_MODE_PARTICIPATION: str = "usage-credits-only-excluded"
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyRateBound:
+    """Meter evidence for one family's general-weekly rate per kernel unit.
+
+    `low` and `high` bound the family's metering rate relative to its era's
+    reference family (#991 spec 4.1). They decide composition SUPPORT only:
+    no weighting path reads them and no multiplier built from them is ever
+    applied to units, so the public blended-weekly contract is unchanged.
+    """
+
+    family: str
+    low: float
+    high: float
+    provenance: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -230,10 +258,23 @@ class CoefficientEra:
     weights: tuple
     fast_mode_participation: str
     provenance: str
+    #: The canonical family every rate bound is relative to (#991). Its own
+    #: rate is 1 by definition, so it never carries a bound.
+    reference_family: str
+    #: Meter-evidence rate bounds, in table order, for the families whose
+    #: rate the evidence identifies. A family without one is unbounded.
+    family_rate_bounds: tuple
 
     def weight_map(self) -> dict[str, float]:
         """The weights as a fresh `{class: weight}` dict the caller may own."""
         return {name: float(weight) for name, weight in self.weights}
+
+    def rate_bound(self, family: str) -> "FamilyRateBound | None":
+        """The era's bound for `family`, or None when it carries none."""
+        for bound in self.family_rate_bounds:
+            if bound.family == family:
+                return bound
+        return None
 
 
 #: The ordered, immutable table of validated coefficient eras (spec 4.2).
@@ -244,6 +285,8 @@ COEFFICIENT_ERAS: tuple = (
     CoefficientEra(
         id="opus-5",
         start=dt.date(2026, 7, 25),
+        reference_family="claude-opus-5",
+        family_rate_bounds=(),
         end=dt.date(2026, 9, 22),
         weights=(("fresh", 1.0), ("output", 4.73), ("cache_1h", 1.03),
                  ("cache_read", 0.0031)),
@@ -253,6 +296,15 @@ COEFFICIENT_ERAS: tuple = (
     CoefficientEra(
         id="opus-5-5",
         start=dt.date(2026, 9, 22),
+        reference_family="claude-opus-5-5",
+        # #991 spec 2.2 and 4.10: the k = 2 (nominal simultaneous 95%) exact
+        # segment-bootstrap envelope over both frozen captures and the three
+        # variants, rounded outward to hundredths. Haiku 5.5 and the legacy
+        # families stay unbounded: their rates are not identified.
+        family_rate_bounds=(
+            FamilyRateBound("claude-sonnet-5-5", 0.09, 0.61,
+                            "991-meter-evidence-2026-10-23"),
+        ),
         end=None,
         weights=(("fresh", 1.0), ("output", 0.64), ("cache_1h", 1.0),
                  ("cache_read", 0.0148)),
@@ -264,6 +316,58 @@ COEFFICIENT_ERAS: tuple = (
 )
 
 
+def validate_coefficient_eras(eras) -> None:
+    """Raise `ValueError` naming the first violated era-table invariant.
+
+    Called at import over `COEFFICIENT_ERAS` (#991 spec 4.1), so a malformed
+    table fails loudly rather than letting the materiality test admit on
+    evidence that does not exist.
+    """
+    for era in eras:
+        reference = era.reference_family
+        if FAMILY_PARTICIPATION.get(reference) != "general":
+            raise ValueError(
+                f"era {era.id!r}: reference family {reference!r} is not a "
+                f"canonical general family")
+        seen = set()
+        for bound in era.family_rate_bounds:
+            if bound.family == reference:
+                raise ValueError(
+                    f"era {era.id!r}: a rate bound names the reference "
+                    f"family {reference!r}")
+            if FAMILY_PARTICIPATION.get(bound.family) != "general":
+                raise ValueError(
+                    f"era {era.id!r}: bound family {bound.family!r} is not "
+                    f"a canonical general family")
+            if bound.family in seen:
+                raise ValueError(
+                    f"era {era.id!r}: bound family {bound.family!r} is not "
+                    f"unique")
+            seen.add(bound.family)
+            if not (_finite_number(bound.low) and _finite_number(bound.high)):
+                raise ValueError(
+                    f"era {era.id!r}: bound for {bound.family!r} is not "
+                    f"finite")
+            if not 0.0 <= bound.low <= bound.high:
+                raise ValueError(
+                    f"era {era.id!r}: bound for {bound.family!r} violates "
+                    f"0 <= low <= high")
+            if not isinstance(bound.provenance, str) \
+                    or not bound.provenance.strip():
+                raise ValueError(
+                    f"era {era.id!r}: bound for {bound.family!r} has no "
+                    f"provenance")
+
+
+def _finite_number(value) -> bool:
+    """A real, finite int or float, never a bool or a string."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+validate_coefficient_eras(COEFFICIENT_ERAS)
+
+
 def _era_payload(era: CoefficientEra) -> dict:
     return {
         "id": era.id,
@@ -272,6 +376,11 @@ def _era_payload(era: CoefficientEra) -> dict:
         "tokenClassWeights": era.weight_map(),
         "fastModeParticipation": era.fast_mode_participation,
         "provenance": era.provenance,
+        "referenceFamily": era.reference_family,
+        "familyRateBounds": [
+            {"family": b.family, "low": b.low, "high": b.high,
+             "provenance": b.provenance}
+            for b in era.family_rate_bounds],
     }
 
 #: The reading-to-interval rule of section 4. Bumped when that rule changes.
@@ -301,8 +410,8 @@ DEDICATED_POOL_SCOPE_NOTE: str = (
     "only general-quota draining is modelled"
 )
 
-QUOTA_MODEL_ALGORITHM_REVISION: int = 4
-QUOTA_MODEL_VERIFIED_AT: str = "2026-10-20"
+QUOTA_MODEL_ALGORITHM_REVISION: int = 5
+QUOTA_MODEL_VERIFIED_AT: str = "2026-10-30"
 
 
 def constants_payload() -> dict:
@@ -323,6 +432,7 @@ def constants_payload() -> dict:
         "detector": dict(DETECTOR),
         "trust": dict(TRUST),
         "mixSupport": dict(MIX_SUPPORT),
+        "mixSupportPolicyRevision": MIX_SUPPORT_POLICY_REVISION,
         "coefficientEras": [_era_payload(era) for era in COEFFICIENT_ERAS],
     }
 
@@ -339,7 +449,7 @@ def constants_fingerprint() -> str:
 #: constant above without re-pinning this line is caught rather than silently
 #: invalidating every persisted calibration.
 QUOTA_MODEL_CONSTANTS_FINGERPRINT: str = (
-    "5835b430978b2fc556c577d44c9e62d5d7807e62533b32819ed63d37e3af671a"
+    "dfdd6a7de768802d3008d88bab453db6480812dc266187c593c3d4604554d42f"
 )
 
 
@@ -619,9 +729,17 @@ def worst_status(statuses) -> CalibrationStatus:
 #: member. An observation-level defect uses a cause; a calibration-level
 #: trust failure uses the corresponding status, so an immature successor
 #: carries `insufficient-history`. No seventh `WithholdingCause` is added.
+#:
+#: #1015 spec 5.4 adds one stored-calibration refusal, `recalibration-needed`:
+#: the open regime was fitted before a correction to its inputs. It is neither
+#: a `CalibrationStatus` (no precedence or exit-code change) nor a
+#: `WithholdingCause`, so the union has sixteen members.
+RECALIBRATION_NEEDED: str = "recalibration-needed"
+
 EVIDENCE_CODES: frozenset = frozenset(
     [c.value for c in WithholdingCause]
     + [s.value for s in CalibrationStatus if s is not CalibrationStatus.OK]
+    + [RECALIBRATION_NEEDED]
 )
 
 
@@ -1596,7 +1714,14 @@ def tv_distance(p, centre) -> float:
     order and on every supported interpreter.
     """
     keys = set(p) | set(centre)
-    return 0.5 * math.fsum(abs(p.get(k, 0.0) - centre.get(k, 0.0)) for k in keys)
+    try:
+        return 0.5 * math.fsum(abs(p.get(k, 0.0) - centre.get(k, 0.0))
+                               for k in keys)
+    except OverflowError:
+        # A stored centre of finite shares whose differences leave the float
+        # range (#991 review): the distance is unmeasurable, so it lies
+        # outside every radius rather than raising into the consumers.
+        return math.inf
 
 
 def support_radius(vectors, centre) -> float | None:
@@ -1729,6 +1854,169 @@ def is_supported(family_shares, class_shares, family_centre, family_radius,
         if tv_distance(dict(shares), centre) > radius:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# The evidence-bounded family test for predictions (#991 spec 4.2 and 4.3).
+# ---------------------------------------------------------------------------
+class FamilyEffectUnavailable(str, enum.Enum):
+    """Why `family_effect_bound` computed no number. A closed set."""
+
+    UNEVIDENCED_FAMILY_CHANGE = "unevidenced-family-change"
+    NO_FIT_REFERENCE = "no-fit-reference"
+    MALFORMED_INPUT = "malformed-input"
+    NONPOSITIVE_DENOMINATOR = "nonpositive-denominator"
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyEffect:
+    """A bound on the family-induced relative forecast error, or its absence.
+
+    `families` lists, sorted, the non-reference families without a rate
+    bound whose share changed; it is empty for every other outcome.
+    """
+
+    bound: "float | None"
+    unavailable: "FamilyEffectUnavailable | None"
+    families: tuple = ()
+
+
+def _share_distribution(value) -> "dict | None":
+    """`value` when it is a dict of finite non-negative shares summing to one
+    within 1e-9 by `math.fsum`, otherwise None. Never renormalized."""
+    if not isinstance(value, dict):
+        return None
+    for share in value.values():
+        if not _finite_number(share) or share < 0.0:
+            return None
+    try:
+        total = math.fsum(value[k] for k in sorted(value))
+    except OverflowError:
+        # Finite shares whose sum leaves the float range: malformed input,
+        # never an exception out of the evaluator.
+        return None
+    if abs(total - 1.0) > 1e-9:
+        return None
+    return value
+
+
+def family_effect_bound(p, q, *, era: CoefficientEra) -> FamilyEffect:
+    """`E(p, q) = fsum(|p_f - q_f| d_f) / fsum(q_f lo_f)` (spec 4.2).
+
+    `p` is the forecast population's family shares and `q` the fit-weighted
+    family composition of the days the applicable fit was taken over. E
+    bounds the family-induced error of the forecast relative to the fitted
+    blend, conditional on the era's evidence box and a common metering scale;
+    it does not bound total forecast error.
+
+    Per family: the reference has `lo = 1, d = 0`; a bounded family has
+    `lo = low, d = max(|low - 1|, |high - 1|)`; an unbounded family whose
+    share is unchanged contributes nothing to the numerator and `lo = 0`, and
+    one whose share changed makes the bound unavailable. "Changed" is exact
+    float inequality, with no tolerance: a tolerance would admit an
+    unevidenced family that moved by less than it.
+
+    Every sum is `math.fsum` over a sorted key set, so the result cannot
+    depend on dict or hash order.
+    """
+    if _share_distribution(p) is None:
+        return FamilyEffect(None, FamilyEffectUnavailable.MALFORMED_INPUT)
+    if q is None:
+        return FamilyEffect(None, FamilyEffectUnavailable.NO_FIT_REFERENCE)
+    if _share_distribution(q) is None:
+        return FamilyEffect(None, FamilyEffectUnavailable.MALFORMED_INPUT)
+    _require_era(era)
+    bounds = {}
+    for bound in era.family_rate_bounds:
+        if not (_finite_number(bound.low) and _finite_number(bound.high)) \
+                or not 0.0 <= bound.low <= bound.high:
+            return FamilyEffect(None, FamilyEffectUnavailable.MALFORMED_INPUT)
+        bounds[bound.family] = bound
+    numerator, denominator, unevidenced = [], [], []
+    for family in sorted(set(p) | set(q)):
+        p_f, q_f = p.get(family, 0.0), q.get(family, 0.0)
+        if family == era.reference_family:
+            lo, d = 1.0, 0.0
+        elif family in bounds:
+            bound = bounds[family]
+            lo = bound.low
+            d = max(abs(bound.low - 1.0), abs(bound.high - 1.0))
+        elif p_f != q_f:
+            unevidenced.append(family)
+            continue
+        else:
+            lo, d = 0.0, 0.0
+        numerator.append(abs(p_f - q_f) * d)
+        denominator.append(q_f * lo)
+    if unevidenced:
+        return FamilyEffect(None,
+                            FamilyEffectUnavailable.UNEVIDENCED_FAMILY_CHANGE,
+                            tuple(sorted(unevidenced)))
+    den = math.fsum(denominator)
+    if not math.isfinite(den) or den <= 0.0:
+        return FamilyEffect(None,
+                            FamilyEffectUnavailable.NONPOSITIVE_DENOMINATOR)
+    return FamilyEffect(math.fsum(numerator) / den, None)
+
+
+@dataclasses.dataclass(frozen=True)
+class PredictionSupport:
+    """One prediction-support decision and its diagnostics (spec 4.3)."""
+
+    supported: bool
+    family_distance: "float | None"
+    family_within_radius: "bool | None"
+    family_effect: FamilyEffect
+    family_admitted_by: "str | None"
+    class_distance: "float | None"
+    class_within_radius: "bool | None"
+
+
+def evaluate_prediction_support(family_shares, class_shares, *,
+                                family_centre, family_radius, class_centre,
+                                class_radius, fit_family_shares,
+                                era) -> PredictionSupport:
+    """Whether a population a PREDICTION is made for is supported (#991).
+
+    The forecast-aggregate probe and `apply_regime` call this; the decisive
+    watch days keep `is_supported`, the two-axis total-variation rule, because
+    they guard detection rather than projection.
+
+    The class axis is mandatory. The family axis admits by the unchanged
+    radius rule, or else when `family_effect_bound` against the fit's own
+    fit-weighted composition is a number at most
+    `MIX_SUPPORT["family_max_relative_effect"]` (equality admits). An
+    undefined centre or radius is unsupported, exactly as in `is_supported`.
+    The family effect is always computed, as a diagnostic.
+    """
+    effect = family_effect_bound(
+        None if family_shares is None else dict(family_shares),
+        fit_family_shares, era=era)
+    if family_centre is None or family_radius is None \
+            or class_centre is None or class_radius is None:
+        return PredictionSupport(
+            supported=False, family_distance=None, family_within_radius=None,
+            family_effect=effect, family_admitted_by=None,
+            class_distance=None, class_within_radius=None)
+    family_distance = tv_distance(dict(family_shares), family_centre)
+    family_within = family_distance <= family_radius
+    class_distance = tv_distance(dict(class_shares), class_centre)
+    class_within = class_distance <= class_radius
+    if family_within:
+        admitted_by = "radius"
+    elif effect.bound is not None and effect.bound <= float(
+            MIX_SUPPORT["family_max_relative_effect"]):
+        admitted_by = "materiality"
+    else:
+        admitted_by = None
+    return PredictionSupport(
+        supported=bool(class_within and admitted_by is not None),
+        family_distance=family_distance,
+        family_within_radius=family_within,
+        family_effect=effect,
+        family_admitted_by=admitted_by,
+        class_distance=class_distance,
+        class_within_radius=class_within)
 
 
 # ---------------------------------------------------------------------------
@@ -2306,6 +2594,59 @@ class QuotaAnalysis:
     #: harmful direction on this axis is permitting.
     detector_input_causes: frozenset | None = None
     composition_provenance: frozenset | None = None
+    #: #991 spec 4.4. The fit-weighted family composition of exactly the days
+    #: each fit was taken over: `fit_family_shares` for the published fit
+    #: (the successor after a confirmed change) and
+    #: `baseline_fit_family_shares` for the baseline fit. They are the
+    #: references the evidence-bounded family test measures a forecast
+    #: against, never a median centre.
+    fit_family_shares: dict | None = None
+    baseline_fit_family_shares: dict | None = None
+    #: The exact `aggregate_composition` vectors of the probed forecast
+    #: entries, or None when nothing was probed or it could not be
+    #: aggregated. Not the `current_*` centres.
+    forecast_family_shares: dict | None = None
+    forecast_class_shares: dict | None = None
+    #: `not-probed`, `unaggregatable`, `no-reference` or `probed`: a
+    #: diagnostic of the forecast aggregation and the evaluator. It never
+    #: decides `composition_provenance`.
+    forecast_probe_state: str = "not-probed"
+    forecast_support: "PredictionSupport | None" = None
+    #: False exactly when the provenance holds `FORECAST_AGGREGATE`,
+    #: `UNAGGREGATABLE_FORECAST` or `UNDEFINED_REFERENCE`.
+    forecast_supported: bool = True
+    #: #1015 spec 5.2. `(first, last)` date of the days the published fit
+    #: (the successor after a confirmed change) and the baseline fit were
+    #: computed over, or None when a fit had no days or the analysis was
+    #: constructed by a path that does not publish them. Informational: a
+    #: regime's `fitLineage.estimator` records them, and the lineage
+    #: predicate uses only its dependency windows.
+    published_day_bounds: "tuple | None" = None
+    baseline_day_bounds: "tuple | None" = None
+
+
+#: The qualifications a withheld `fitted`, `consumption`, `headroom` and
+#: `projection` carry when the forecast probe's FAMILY axis withheld them
+#: (#991 spec 4.4): a computed bound above the limit, or no bound at all.
+FORECAST_FAMILY_EFFECT_OVER_LIMIT: str = "forecast-family-effect-over-limit"
+FORECAST_FAMILY_UNBOUNDED: str = "forecast-family-unbounded"
+
+def fit_family_shares(days) -> "dict[str, float] | None":
+    """The unit-weighted family composition of `days` (#991 spec 4.4).
+
+    `q_f = sum(day.units * day.family_shares[f]) / sum(day.units)` over the
+    days handed in, which must be exactly the days a fit was computed over.
+    Every sum is `math.fsum` over sorted keys. None for no days, or when the
+    days carry no positive finite units.
+    """
+    days = list(days)
+    total = math.fsum(o.units for o in days)
+    if not days or not math.isfinite(total) or total <= 0.0:
+        return None
+    keys = sorted({k for o in days for k in o.family_shares})
+    return {k: math.fsum(o.units * o.family_shares.get(k, 0.0)
+                         for o in days) / total
+            for k in keys}
 
 
 def overlay_status(analysis: QuotaAnalysis,
@@ -2408,10 +2749,21 @@ def transition_persistence_permitted(analysis) -> bool:
     return provenance == frozenset({CompositionProvenance.FORECAST_AGGREGATE})
 
 
-def _composition_provenance(*, confirmed, reference_days, decisive_days,
-                            forecast_probed=False,
-                            forecast_shares, family_centre, family_radius,
-                            class_centre, class_radius) -> frozenset:
+def _composition_provenance(**kwargs) -> frozenset:
+    """The provenance alone; see `_composition_provenance_with_support`.
+
+    Keeps its keyword signature and its frozenset return for every existing
+    caller. Called without `fit_family_shares` the forecast probe has no fit
+    reference, so its materiality branch is unavailable and it decides by the
+    radius rule alone.
+    """
+    return _composition_provenance_with_support(**kwargs)[0]
+
+
+def _composition_provenance_with_support(
+        *, confirmed, reference_days, decisive_days, forecast_probed=False,
+        forecast_shares, family_centre, family_radius, class_centre,
+        class_radius, fit_family_shares=None, era=None) -> tuple:
     """Apply section 18's two-radius test, which section 25 requires.
 
     Two probes, because section 18 names two populations:
@@ -2442,13 +2794,21 @@ def _composition_provenance(*, confirmed, reference_days, decisive_days,
     branches on truthiness, but a boolean discarded the one distinction the
     persistence permit needs: the decisive-day probe guards DETECTION and the
     forecast probe guards PROJECTION, and they must be answered differently.
+
+    #991: the forecast probe goes through `evaluate_prediction_support` with
+    the published fit's own fit-weighted family composition, so a family
+    shift the era's meter evidence bounds within 5% is admitted; the
+    decisive-day probe keeps `is_supported`. The return is the provenance and
+    the forecast `PredictionSupport` (None whenever an early return decided
+    before the evaluator ran). The early returns and their order are
+    unchanged.
     """
     if not reference_days:
-        return frozenset()
+        return frozenset(), None
     if family_centre is None or class_centre is None:
-        return frozenset({CompositionProvenance.UNDEFINED_REFERENCE})
+        return frozenset({CompositionProvenance.UNDEFINED_REFERENCE}), None
     if family_radius is None or class_radius is None:
-        return frozenset()
+        return frozenset(), None
     # A population that WAS probed but could not be aggregated is unsupported,
     # not exempt. Every entry from an unrecognised family contributes no
     # units, so `aggregate_composition` returns None and the probe list would
@@ -2456,20 +2816,24 @@ def _composition_provenance(*, confirmed, reference_days, decisive_days,
     # omitted `forecast_population` would, which is what section 40 made that
     # parameter required to prevent.
     if forecast_probed and forecast_shares is None:
-        return frozenset({CompositionProvenance.UNAGGREGATABLE_FORECAST})
+        return frozenset({CompositionProvenance.UNAGGREGATABLE_FORECAST}), None
     found = set()
     for o in (decisive_days if confirmed else ()):
         if not is_supported(o.family_shares, o.class_shares, family_centre,
                             family_radius, class_centre, class_radius):
             found.add(CompositionProvenance.DECISIVE_DAY)
             break
+    support = None
     if forecast_shares is not None:
         forecast_family_shares, forecast_class_shares = forecast_shares
-        if not is_supported(forecast_family_shares, forecast_class_shares,
-                            family_centre, family_radius, class_centre,
-                            class_radius):
+        support = evaluate_prediction_support(
+            forecast_family_shares, forecast_class_shares,
+            family_centre=family_centre, family_radius=family_radius,
+            class_centre=class_centre, class_radius=class_radius,
+            fit_family_shares=fit_family_shares, era=era)
+        if not support.supported:
             found.add(CompositionProvenance.FORECAST_AGGREGATE)
-    return frozenset(found)
+    return frozenset(found), support
 
 
 def analyse(series, *, now, newest_at, forecast_population,
@@ -2577,6 +2941,10 @@ def analyse(series, *, now, newest_at, forecast_population,
         published_days = eligible[-max_fit_population_days():]
     baseline_raw = jackknife_fit(baseline_days)
     fit = jackknife_fit(published_days)
+    # #991: the materiality references come from exactly the days each fit
+    # above was computed over.
+    published_q = fit_family_shares(published_days)
+    baseline_q = fit_family_shares(baseline_days)
     # The reference centres and radii come from the regime that ESTABLISHED
     # the composition, so a successor is measured against what preceded it.
     # With no confirmed change the bounded fit population is the reference,
@@ -2618,14 +2986,38 @@ def analyse(series, *, now, newest_at, forecast_population,
                        if probed_entries else None)
 
     contributed = list(extra_statuses)
-    composition_provenance = _composition_provenance(
-        confirmed=confirmed, reference_days=reference_days,
-        decisive_days=published_days, forecast_shares=forecast_shares,
-        forecast_probed=bool(probed_entries),
-        family_centre=family_centre, family_radius=family_radius,
-        class_centre=class_centre, class_radius=class_radius)
+    composition_provenance, forecast_support = \
+        _composition_provenance_with_support(
+            confirmed=confirmed, reference_days=reference_days,
+            decisive_days=published_days, forecast_shares=forecast_shares,
+            forecast_probed=bool(probed_entries),
+            family_centre=family_centre, family_radius=family_radius,
+            class_centre=class_centre, class_radius=class_radius,
+            fit_family_shares=published_q, era=era)
     if composition_provenance:
         contributed.append(CalibrationStatus.UNSUPPORTED_MODEL_MIX)
+    if not probed_entries:
+        forecast_probe_state = "not-probed"
+    elif forecast_shares is None:
+        forecast_probe_state = "unaggregatable"
+    elif forecast_support is None:
+        forecast_probe_state = "no-reference"
+    else:
+        forecast_probe_state = "probed"
+    forecast_supported = not (composition_provenance & frozenset({
+        CompositionProvenance.FORECAST_AGGREGATE,
+        CompositionProvenance.UNAGGREGATABLE_FORECAST,
+        CompositionProvenance.UNDEFINED_REFERENCE}))
+    # The forecast-family qualifier: only when the forecast aggregate fired
+    # AND its family axis failed, never for a class-axis-only failure.
+    family_qualifier = None
+    if CompositionProvenance.FORECAST_AGGREGATE in composition_provenance \
+            and forecast_support is not None \
+            and forecast_support.family_admitted_by is None:
+        family_qualifier = (
+            FORECAST_FAMILY_EFFECT_OVER_LIMIT
+            if forecast_support.family_effect.bound is not None
+            else FORECAST_FAMILY_UNBOUNDED)
     if confirmed:
         window_start = detector.split_date
     elif published_days:
@@ -2699,6 +3091,10 @@ def analyse(series, *, now, newest_at, forecast_population,
 
     published_qualifications = (("successor-regime",) if confirmed else ()) \
         + tuple(reason.value for reason in blocking)
+    # The forecast probe firing contributes `unsupported-model-mix`, so every
+    # value carrying these qualifications is withheld whenever it is set.
+    if family_qualifier is not None:
+        published_qualifications += (family_qualifier,)
     if status is not CalibrationStatus.OK or fit is None:
         withheld_code = status.value if status is not CalibrationStatus.OK \
             else CalibrationStatus.INSUFFICIENT_HISTORY.value
@@ -2806,7 +3202,24 @@ def analyse(series, *, now, newest_at, forecast_population,
         detector_input_causes=frozenset(
             o.cause for o in window if o.cause is not None),
         composition_provenance=composition_provenance,
+        fit_family_shares=published_q,
+        baseline_fit_family_shares=baseline_q,
+        forecast_family_shares=(None if forecast_shares is None
+                                else dict(forecast_shares[0])),
+        forecast_class_shares=(None if forecast_shares is None
+                               else dict(forecast_shares[1])),
+        forecast_probe_state=forecast_probe_state,
+        forecast_support=forecast_support,
+        forecast_supported=forecast_supported,
+        published_day_bounds=_day_bounds(published_days),
+        baseline_day_bounds=_day_bounds(baseline_days),
     )
+
+
+def _day_bounds(days) -> "tuple | None":
+    """`(first date, last date)` of the days a fit was taken over (#1015)."""
+    dates = [o.date for o in days]
+    return (min(dates), max(dates)) if dates else None
 
 
 def _usable_quantity(value) -> bool:

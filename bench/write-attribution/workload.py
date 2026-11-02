@@ -890,8 +890,10 @@ def admission_problems(run) -> "list[str]":
     15) the run's input-mode evidence must hold (`input_problems`).
     Amendment 19: a run its runner did not finish is INVALID; a frozen
     catch-up must carry its verification comparison (HR-12); the
-    post-release `run-live.sh` run (workload L-post) has no catch-up and is
-    admitted on its warm admission and its live frontier (HR-17)."""
+    post-release `run-live.sh` run (workload L-post) has no catch-up (HR-17)
+    and, since #939 D6, is admitted only on the product's released hold and
+    a stable J1/J2 pair over its captured logical-identity frontier
+    (`frontier.admission_record_problems`), never on a warm tick."""
     unfinished = runner_problems(run)
     path = os.path.join(run, "admission.json")
     if not os.path.exists(path):
@@ -900,10 +902,11 @@ def admission_problems(run) -> "list[str]":
     if not admission.get("valid"):
         return unfinished + [f"admission refused: {admission.get('reason')}"]
     if workload_kind(run)[0] == "L-post":
-        frontier = _read_json(os.path.join(run, "frontier.json")) or {}
-        if frontier.get("mode") != "live" or not isinstance(
-                frontier.get("files"), dict):
-            unfinished.append("no live finite-frontier receipt (frontier.json)")
+        fr = _frontier_lib()
+        unfinished += [f"{p} (frontier.json)" for p in fr.frontier_problems(
+            _read_json(os.path.join(run, "frontier.json")))]
+        unfinished += [f"{p} (admission.json)"
+                       for p in fr.admission_record_problems(admission)]
         return unfinished + input_problems(run)
     catchup = os.path.join(run, "catchup.json")
     receipt = _read_json(catchup) or {}
@@ -917,6 +920,53 @@ def admission_problems(run) -> "list[str]":
                           "pass with its catch-up (catchup.json frontier has no "
                           "verification; Amendment 19 HR-12)")
     return unfinished + input_problems(run)
+
+
+def _frontier_lib():
+    """The harness's logical-identity frontier (#939 D6)."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import frontier
+    return frontier
+
+
+def window_rule_problems(run) -> "list[str]":
+    """#939 spec D6's verdict rule over a run's judgements: the stable pair
+    that admitted it (J1/J2: the L-post admission record, or the catch-up's
+    `stability.receipts`), J_W at the window's end and J_T after the
+    terminal wait, named by terminal.json `judgements`. An obligation state
+    that changed by J_W, an unconsumed entry at J_W or a missing receipt
+    refuses the run; a change first seen at J_T (no record proves it fell
+    after the window), a missing J_T, or a J_T taken after run-live.sh's
+    terminal wait expired with no new pass (terminal.json `terminalPass` is
+    null: J_T then observed nothing after the window) makes it INVALID.
+    run-workload.sh writes no `terminalPass`, so A/B/C runs are unaffected.
+    Every input is a store observation both trees provide."""
+    fr = _frontier_lib()
+    source = "admission.json" if workload_kind(run)[0] == "L-post" \
+        else "catchup.json"
+    try:
+        reference = fr.load_reference(os.path.join(run, source))
+        base = fr.base_receipt(os.path.join(run, source))
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
+        return [f"window rule: no stable-pair receipts in {source} "
+                f"({type(exc).__name__}: {exc})"]
+    terminal = _read_json(os.path.join(run, "terminal.json")) or {}
+    names = terminal.get("judgements") or {}
+
+    def receipt(label):
+        name = names.get(label)
+        return None if not name else _read_json(os.path.join(run, name))
+
+    rule = fr.window_problems(reference, base, receipt("window"),
+                              receipt("terminal"))
+    invalid = list(rule["invalid"])
+    if "terminalPass" in terminal and terminal["terminalPass"] is None:
+        invalid.append("J_T: no terminal pass was observed after J_W (the "
+                       "terminal wait expired), so J_T proves nothing about "
+                       "the window")
+    return ([f"window rule (refused): {p}" for p in rule["refused"]]
+            + [f"window rule (INVALID): {p}" for p in invalid])
 
 
 def terminal_problems(run, end: float) -> "list[str]":
@@ -1241,7 +1291,8 @@ def run_analyzer(run, start: float, end: float) -> "str | None":
 
 def ab_verdict(run, tree) -> int:
     start, end = _window(run)
-    invalid = admission_problems(run) + terminal_problems(run, end)
+    invalid = (admission_problems(run) + terminal_problems(run, end)
+               + window_rule_problems(run))
     yields = keeper_yield_lines(run)
     if yields is None:
         invalid.append("no dashboard log (dash.log) to check for keeper-yield "

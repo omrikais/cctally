@@ -22,7 +22,7 @@ GOLDEN = (pathlib.Path(__file__).resolve().parent / "fixtures"
 WALL = 1_791_030_600            # 2026-10-03T12:30:00Z
 
 
-def scenario():
+def scenario(*, hold=False):
     """Deterministic writer: 100 KiB/s of steady writes, one 5 MiB deletion
     operation of 1,000 rows in [1200 s, 1205 s], a publication every 5 s,
     one maintenance ledger bucket and a registered local instance."""
@@ -37,6 +37,8 @@ def scenario():
         counter=wio.ProcessWriteCounter(platform="darwin",
                                         darwin_reader=counter_value),
         clock_ns=lambda: clock["ns"], wall_s=lambda: WALL)
+    if hold:
+        wio.hold_admission()
     wio.register_local_instance(instance_id="0123456789abcdef",
                                 host="127.0.0.1", port=8789, pid=4242)
     wio.set_maintenance_record({"ledger": [
@@ -70,6 +72,23 @@ def test_the_write_io_object_matches_its_golden():
         "windowSeconds", "bytesWritten", "bytesPerMinute", "tickCount",
         "meanBytesPerTick", "excludedDeletions", "coldStartup",
         "maintenance", "reclaimRefusal", "budget"]
+
+
+def test_a_held_startup_keeps_the_warming_phrase_and_publishes_the_hold():
+    """#939 D5. Detects: the admission hold changing rendered text (doctor and
+    dashboard-perf must keep saying "no samples yet (needs 5 minutes)"), or
+    the hold's state missing from the published object."""
+    import _cctally_dashboard_perf as perf
+
+    scenario(hold=True)
+    payload = wio.write_io_payload()
+    cold = payload["coldStartup"]
+    assert (cold["admitted"], cold["held"], cold["releasedBy"],
+            cold["accountingCaughtUp"]) == (False, True, None, False)
+    assert cold["residual"] is None and cold["lastPass"] is None
+    rows = perf.render_write_io_rows(payload, None,
+                                     display_tz=ZoneInfo("Etc/UTC"))
+    assert rows[0] == "Disk writes  no samples yet (needs 5 minutes)"
 
 
 def test_a_reclaim_refusal_is_published_in_memory_and_cleared():

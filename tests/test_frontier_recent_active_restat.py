@@ -189,9 +189,11 @@ def test_the_ingest_planner_restats_the_table_its_provider_names(
     observed = []
     original = frontier.plan_recent_active_restat
 
-    def record(conn_arg, *, table="codex_session_files", extra_paths=()):
+    def record(conn_arg, *, table="codex_session_files", extra_paths=(),
+               roots=()):
         observed.append(table)
-        return original(conn_arg, table=table, extra_paths=extra_paths)
+        return original(conn_arg, table=table, extra_paths=extra_paths,
+                        roots=roots)
 
     monkeypatch.setattr(frontier, "plan_recent_active_restat", record)
     state.plan_provider("codex", conn, roots=roots)

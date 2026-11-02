@@ -14,8 +14,10 @@ the ccusage line shape is honored byte-for-byte for the segments cctally
 emits, plus two intentional improvements over upstream:
 
 1. **Context % is computed, not `N/A`.** ccusage defaults `🧠 N/A`;
-   cctally tail-reads the most recent assistant `message.usage` block in
-   the transcript JSONL and divides into the model's context window.
+   cctally divides the last request's context tokens by the session's
+   context window, from Claude Code's `context_window` payload when it
+   is present and otherwise from the transcript and the model id (see
+   [Context %](#context-)).
 2. **`5h X% · 7d Y%` extension** (default-on). Appended after the
    ccusage-shape segments when stdin carries `rate_limits` or cctally's
    snapshot DB has a recent row. Opt out with `--no-cctally-extensions`.
@@ -67,7 +69,7 @@ Five `|`-delimited segments, left to right:
 | 1 | `🤖 <model>` | stdin `model.display_name`; falls back to `model.id`, then `Unknown model`. |
 | 2 | `💰 $X.XX session / $Y.YY today / $Z.ZZ block (Hh Mm left)` | session per `--cost-source`; today bucketed in `display.tz`; block = active 5h block; `time-left = block_end − now`, clamped `≥ 0m`. |
 | 3 | `🔥 $X.XX/hr` (+ optional visual indicator) | active 5h block cost ÷ elapsed hours. `-B` controls the visual. |
-| 4 | `🧠 X%` (or `🧠 N/A`) | tail-read last assistant `message.usage`, divided by `CLAUDE_MODEL_CONTEXT_WINDOWS[<model_id>]`. |
+| 4 | `🧠 X%` (or `🧠 N/A`) | the payload's `context_window.current_usage` input-side tokens (else the transcript's last assistant `message.usage`), divided by the payload's `context_window.context_window_size` (else the model fallback). See [Context %](#context-). |
 | 5 | `5h X% (Hh Mm) · 7d Y% (Dd Hh) → Z% meter · Δrate` — **cctally extension, default-on** | stdin `rate_limits` → DB HWM clamp → DB-latest-row fallback → suppress. The projection and the marker are #661 S2 additions, described below. |
 
 ### The 7d projection and the metering-rate marker (#661 S2 §9)
@@ -203,23 +205,26 @@ Burn-rate bands (mirror ccusage at the time of writing):
 
 ## Context %
 
-Segment 4 reads the last assistant turn's `message.usage` from the
-transcript JSONL pointed to by stdin `transcript_path`, then divides:
+Segment 4 divides the tokens the last request put into the context window by the session's context window. Each of the two values comes from Claude Code's status-line payload when it carries a valid one, and each falls back independently:
 
 ```
-context_tokens = usage.input_tokens
-                + usage.cache_read_input_tokens
-                + usage.cache_creation_input_tokens
-context_pct = context_tokens / CLAUDE_MODEL_CONTEXT_WINDOWS[model_id] * 100
+context_tokens = context_window.current_usage.input_tokens
+               + context_window.current_usage.cache_read_input_tokens
+               + context_window.current_usage.cache_creation_input_tokens
+                 (else the same three fields of the transcript's last
+                  assistant message.usage, tail-read from transcript_path)
+window         = context_window.context_window_size
+                 (else the model fallback below)
+context_pct    = context_tokens / window * 100
 ```
 
-The table is keyed by `model_id` first; falls back to a family-substring
-match (`sonnet`/`opus`/`haiku` → 200_000) if the exact id is unknown.
-The `[1m]` variants (Sonnet 4.5 / Opus 4.7) carry an explicit 1_000_000
-entry.
+A payload value counts only when it is a finite, whole, non-negative number (never a string or a boolean), and the window must be greater than zero; a missing or `null` usage field counts as zero as long as at least one of the three is present and non-null, but any other malformed usage field discards the payload's token count, and the two payload values are validated independently. When the payload supplies the token count, the transcript is not read; when it supplies the window, the model id is not consulted. Claude Code's pre-rounded `used_percentage` / `remaining_percentage` and its `total_input_tokens` are not used.
 
-Unknown model id → `🧠 N/A` plus a one-shot stderr warning per process.
-Missing `transcript_path` (or unreadable file) → `🧠 N/A` silently.
+The model fallback resolves the window from `model.id`, case-insensitively and in this order: any id ending in `[1m]` reads as 1,000,000; then, ignoring a trailing `-YYYYMMDD` snapshot date, the verified current-generation defaults `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`, `claude-fable-5` and `claude-mythos-5-1` read as 1,000,000; then any other id containing `sonnet`, `opus` or `haiku` reads as 200,000. That 200K default covers the prior generations (Opus 5 and 4.x, Sonnet 5 and 4.x, Haiku 4.5, Claude 3); where one of them offered a 1M window (Opus 5, Opus 4.8, Opus 4.7, Sonnet 4.5), it was an explicit `[1m]` opt-in that a bare id does not record. Any other id renders `🧠 N/A` plus a one-shot stderr warning per process (`cctally statusline: unknown model '<id>'; context % unavailable`).
+
+No payload token count and no `transcript_path`, or no payload window and no model id, renders `🧠 N/A` silently, as does a transcript that cannot be read once the window has resolved. An unknown model id without a payload window warns (as above) before any transcript is read.
+
+The rendered value is `int(round(context_pct))`, and the color band is chosen from that rendered integer.
 
 Color bands (defaults — overridable via `--context-low-threshold` /
 `--context-medium-threshold`):
@@ -374,6 +379,8 @@ to update on the configured status-line cadence; the bounded OAuth confirmation
 closes any gap when Claude Code replays an older top-level observation.
 Model-scoped limits such as Fable's separate weekly quota are distinct fields
 and are never inferred from the active model ID.
+
+For the context segment, any id ending in `[1m]` reads as a 1,000,000-token window under the generic rule in [Context %](#context-), whether or not the model is otherwise known; a payload `context_window_size` takes precedence over it.
 
 ## Examples
 

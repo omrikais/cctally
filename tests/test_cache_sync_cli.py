@@ -158,17 +158,51 @@ def test_transcript_lock_contention_names_phase_and_retry(env, monkeypatch, caps
     assert "Re-run `cctally cache-sync --rebuild`." in stderr
 
 
-def test_rebuild_on_a_filesystem_without_clones_skips_the_probe(env, capfd):
+def _leave_pending_wal(path: pathlib.Path) -> None:
+    """Leave committed frames in `path`'s WAL, as a crashed writer does."""
+    actor = (
+        "import sqlite3,sys,time\n"
+        "c=sqlite3.connect(sys.argv[1])\n"
+        "c.execute('PRAGMA wal_autocheckpoint=0')\n"
+        "c.execute(\"INSERT OR REPLACE INTO cache_meta(key,value) "
+        "VALUES('issue_1000_wal_evidence','pending')\")\n"
+        "c.commit()\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", actor, str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "ready"
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+        process.stdout.close()
+    assert pathlib.Path(f"{path}-wal").stat().st_size > 0
+
+
+@pytest.mark.parametrize("wal", ["wal-less", "wal-pending"])
+def test_rebuild_on_a_filesystem_without_clones_checks_the_store_in_place(
+        env, capfd, wal):
     """A store whose filesystem cannot clone must still rebuild its transcripts.
 
-    ext4 rejects `cp --reflink=always`. The pre-rebuild quick-check needs a
-    clone and never falls back to a byte copy, so it cannot run there; the
-    rebuild must say so and continue instead of failing on every invocation.
-    The fake `cp` refuses the clone the way GNU coreutils does on hosted
-    Linux, without the pytest copy seam.
+    Stored-data accuracy (#1000 T7, D1): ext4 rejects `cp --reflink=always`.
+    The probe never falls back to a byte copy; with no pending WAL it checks
+    the live file in place (no skip line), and with a pending WAL it skips
+    with cp's own refusal and the exact WAL clause. Either way the rebuild
+    continues instead of failing on every invocation. The fake `cp` refuses
+    the clone the way GNU coreutils does on hosted Linux, without the pytest
+    copy seam, and Linux is selected on the importer's own `sys`.
     """
     ns, tmp_path, monkeypatch = env
     monkeypatch.delenv("CCTALLY_TEST_CONVERSATION_PROBE_COPY")
+    cache_mod = ns["_cctally_cache"]
+    iso_sys = type(sys)("sys")
+    iso_sys.__dict__.update(vars(cache_mod.sys))
+    iso_sys.platform = "linux"
+    monkeypatch.setattr(cache_mod, "sys", iso_sys)
     fake_bin = tmp_path / "no-clone-bin"
     fake_bin.mkdir()
     invoked = tmp_path / "fake-cp-invoked"
@@ -185,6 +219,10 @@ def test_rebuild_on_a_filesystem_without_clones_skips_the_probe(env, capfd):
     _write_claude_entry(tmp_path)
     bootstrap = ns["open_conversations_db"](attach_cache=False)
     bootstrap.close()
+    conversations_path = pathlib.Path(
+        ns["_cctally_core"].CONVERSATIONS_DB_PATH)
+    if wal == "wal-pending":
+        _leave_pending_wal(conversations_path)
     args = argparse.Namespace(
         source="claude",
         rebuild=True,
@@ -196,8 +234,24 @@ def test_rebuild_on_a_filesystem_without_clones_skips_the_probe(env, capfd):
     stderr = capfd.readouterr().err
     assert invoked.exists(), "the probe never reached the clone"
     assert "transcript rebuild failed" not in stderr
-    assert "integrity check skipped" in stderr
-    assert "Operation not supported" in stderr
+    skipped = [line for line in stderr.splitlines()
+               if "integrity check skipped" in line]
+    if wal == "wal-less":
+        assert not skipped, stderr
+    else:
+        prefix = (
+            "[cache-sync] conversations.db integrity check skipped before the "
+            "transcript rebuild (copy-on-write transcript probe unavailable "
+            "for conversations.db: cp: failed to clone '"
+        )
+        suffix = (
+            "': Operation not supported; conversations.db-wal is not empty, "
+            "so the live file cannot be checked on its own); continuing "
+            "without automatic corruption recovery"
+        )
+        assert len(skipped) == 1, stderr
+        assert skipped[0].startswith(prefix) and skipped[0].endswith(suffix)
+        assert "'" not in skipped[0][len(prefix):-len(suffix)]
     assert "claude transcripts done: 1 processed" in stderr
     conversations = ns["open_conversations_db"](attach_cache=False)
     try:
@@ -207,7 +261,7 @@ def test_rebuild_on_a_filesystem_without_clones_skips_the_probe(env, capfd):
         ).fetchone()[0] == 0
     finally:
         conversations.close()
-    data_dir = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_DB_PATH).parent
+    data_dir = conversations_path.parent
     assert not list(data_dir.glob(".conversations-probe-*"))
     assert not list((data_dir / "quarantine").glob("conversations.db-*"))
 

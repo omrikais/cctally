@@ -605,10 +605,12 @@ def test_the_alias_map_finds_the_local_module_bindings():
     # Four since #661 S2: `_mrc` and `_qg` bind the metering-rate kernel and
     # the quota glue for section 6.6's marker read, inside the
     # `build.meter_rate_changes` phase. Their presence is what lets the audit
-    # attribute those calls to a module at all.
+    # attribute those calls to a module at all. #1015 replaced `_mrc` with
+    # `_qcal`: the marker is assessed over clean regimes by the calibration
+    # glue rather than read from the raw pair.
     assert aliases == {"_sc": "_lib_snapshot_cache",
                        "cache_mod": "_cctally_cache",
-                       "_mrc": "_lib_meter_rate_change",
+                       "_qcal": "_cctally_quota_calibration",
                        "_qg": "_cctally_quota_model"}, aliases
 
 

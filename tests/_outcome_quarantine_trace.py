@@ -48,6 +48,17 @@ def set_clock(monkeypatch, at: str) -> None:
     moment = epoch(at)
     monkeypatch.setattr(time, "time", lambda: float(moment))
     monkeypatch.setenv("CCTALLY_AS_OF", iso(moment))
+    pin_journal_clock(monkeypatch, moment)
+
+
+def pin_journal_clock(monkeypatch, moment: int) -> None:
+    """#948: stamp the `at` of journal ops the writers append from the wall
+    clock (the cutover, `legacy_spool_activity`) at the pinned instant too.
+    The recovery barrier's cohort H is the greatest admitted `at`, ops
+    included, so a wall-clock op among pinned readings would move H (and
+    every expiry bound) to the real date the test runs on."""
+    import _cctally_journal
+    monkeypatch.setattr(_cctally_journal, "_now_iso", lambda: iso(moment))
 
 
 def identity(name: str) -> str:
@@ -132,6 +143,38 @@ def legacy(app, monkeypatch, *, at, weekly, week_end, five=None, five_end=None,
                               captured=captured, source=source)])
 
 
+def oauth(app, monkeypatch, *, at, weekly, week_end, five=None, five_end=None,
+          account="A", credential=None, axes=None, expect="ok"):
+    """One authoritative OAuth publication through
+    `_authoritative_record_usage` (#948 spec 6.4: plausibility before fences,
+    then the reading, its fences, the selected-state reconciliation and —
+    when it newly covers a paused axis — one `outcome_authority_completion`).
+    Returns the result; asserts its status is ``expect``."""
+    import _cctally_statusline as sl
+    set_clock(monkeypatch, at)
+    identity(account)
+    args = argparse.Namespace(
+        percent=weekly, resets_at=str(epoch(week_end)),
+        five_hour_percent=five,
+        five_hour_resets_at=None if five_end is None else str(epoch(five_end)),
+        source="api")
+    observed = tuple(axes) if axes is not None else (
+        ("sevenDay", "fiveHour") if five is not None else ("sevenDay",))
+    result = sl._authoritative_record_usage(
+        args, observed,
+        binding=sl._capture_binding(credential=credential or f"token-{account}"),
+        nudge_dashboard=False)
+    assert result.status == expect, result
+    return result
+
+
+def ops_of_kind(kind: str) -> list:
+    """Every journal op of payload ``kind``, in journal order (#948)."""
+    return [rec for rec in journal_records()
+            if rec.get("t") == "op"
+            and (rec.get("payload") or {}).get("kind") == kind]
+
+
 def ingest(app) -> None:
     import _cctally_journal as jr
     jr.run_stats_ingest(mode="authoritative")
@@ -143,6 +186,8 @@ def run_steps(app, monkeypatch, steps) -> None:
             current(app, monkeypatch, **values)
         elif kind == "legacy":
             legacy(app, monkeypatch, **values)
+        elif kind == "oauth":
+            oauth(app, monkeypatch, **values)
         else:  # pragma: no cover - a trace typo
             raise ValueError(kind)
 
@@ -209,28 +254,66 @@ def outcome_count(result: dict) -> int:
 
 def quarantine_state(app) -> dict:
     """The persisted quarantine tables, row ids included (they are the
-    trigger sequence)."""
+    trigger sequence). #948: the per-axis recovery barrier's episodes,
+    bounds and axis state replaced the envelope and certificates."""
     return {
         "triggers": _rows(app, "SELECT seq, segment, byte_offset, kind, reason, "
                                "at FROM outcome_quarantine_triggers ORDER BY seq"),
-        "envelope": _rows(app, "SELECT scope, envelope_json FROM "
-                               "outcome_quarantine_envelope ORDER BY scope"),
-        "certificates": _rows(app, "SELECT * FROM outcome_quarantine_certificates "
-                                   "ORDER BY account_key"),
+        "episodes": _rows(app, "SELECT * FROM outcome_quarantine_episodes "
+                               "ORDER BY opener_segment, opener_offset"),
+        "bounds": _rows(app, "SELECT scope, axis, bounds_json FROM "
+                             "outcome_quarantine_bounds ORDER BY scope, axis"),
+        "axis_state": _rows(app, "SELECT * FROM outcome_quarantine_axis_state "
+                                 "ORDER BY generation, account_key, axis"),
     }
 
 
-def account_quarantined(app, name: str) -> bool:
-    import _cctally_quarantine
+def account_key_of(name: str) -> str:
     import _lib_accounts
-    key = (_lib_accounts.UNATTRIBUTED if name == "unattributed"
-           else _lib_accounts.account_key("claude", name))
+    return (_lib_accounts.UNATTRIBUTED if name == "unattributed"
+            else _lib_accounts.account_key("claude", name))
+
+
+def account_status(app, name: str) -> dict:
+    """`_cctally_quarantine.account_status` for ``name`` (#948: per axis)."""
+    import _cctally_quarantine
     conn = app.open_db()
     try:
-        status = _cctally_quarantine.account_status(conn, key)
+        return _cctally_quarantine.account_status(conn, account_key_of(name))
     finally:
         conn.close()
-    return not status["accounting"]
+
+
+def account_status_key(app, account_key: str) -> dict:
+    """`account_status` for an exact account key (the oracle's mixed-world
+    classification of each new outcome)."""
+    import _cctally_quarantine
+    conn = app.open_db()
+    try:
+        return _cctally_quarantine.account_status(conn, account_key)
+    finally:
+        conn.close()
+
+
+def axis_allowed(app, name: str) -> dict:
+    """``{axis: allowed}`` for ``name``'s drop/outcome gate (#948)."""
+    return {axis: doc["allowed"]
+            for axis, doc in account_status(app, name)["axes"].items()}
+
+
+def account_quarantined(app, name: str) -> bool:
+    """Whether any axis of ``name`` is paused (#948: per axis)."""
+    return not all(axis_allowed(app, name).values())
+
+
+def quarantine_report(app) -> dict:
+    """`_cctally_quarantine.report` over the index (#948)."""
+    import _cctally_quarantine
+    conn = app.open_db()
+    try:
+        return _cctally_quarantine.report(conn)
+    finally:
+        conn.close()
 
 
 def retain_session_input(app, name: str) -> None:

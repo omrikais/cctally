@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+import textwrap
 
 import _cctally_core
 import _cctally_store
@@ -90,7 +91,12 @@ def published_coefficient_eras() -> list:
     every call, so the published table can never drift from the one the
     kernel weights with.
     """
-    out = [dict(UNVALIDATED_ERA_RECORD)]
+    # #991: each era also names the reference family its meter-evidence
+    # rate bounds are relative to, and the bounds; the unvalidated history
+    # has neither.
+    unvalidated = dict(UNVALIDATED_ERA_RECORD)
+    unvalidated.update(referenceFamily=None, familyRateBounds=[])
+    out = [unvalidated]
     for era in qm.COEFFICIENT_ERAS:
         out.append({
             "id": era.id,
@@ -99,8 +105,18 @@ def published_coefficient_eras() -> list:
             "state": "validated",
             "provenance": era.provenance,
             "tokenClassWeights": era.weight_map(),
+            "referenceFamily": era.reference_family,
+            "familyRateBounds": _rate_bounds_json(era),
         })
     return out
+
+
+def _rate_bounds_json(era) -> list:
+    """An era's family rate bounds on the wire, in table order."""
+    if era is None:
+        return []
+    return [{"family": b.family, "low": b.low, "high": b.high,
+             "provenance": b.provenance} for b in era.family_rate_bounds]
 
 
 def select_era(now: "dt.datetime") -> "qm.CoefficientEra | None":
@@ -202,6 +218,12 @@ class LoadResult:
     #: through `analyse(extra_statuses=...)` otherwise.
     status: "CalibrationStatus | None" = None
     cause: "str | None" = None
+    #: #1015 spec 5.2/5.5: the correction facts and the completed batch ids
+    #: (the fit's `basis`), read inside the same coherence bracket, on the
+    #: same stats connection and generation as the fit inputs. None facts
+    #: mean "not read" (an unusable load).
+    correction_facts: object = None
+    correction_basis: frozenset = frozenset()
 
 
 def _account_clause(column: str, account_key):
@@ -532,6 +554,7 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
                     stats_conn, account_key, start)
                 entries, newest, fast_excluded = _read_cache_component(
                     cache_conn, account_key, start, era_end)
+                facts = _read_lineage_facts(stats_conn, account_key)
             except sqlite3.Error:
                 return LoadResult(analysis_start=start,
                                   status=CalibrationStatus.UNAVAILABLE,
@@ -554,8 +577,15 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
                     return LoadResult(analysis_start=start,
                                       status=CalibrationStatus.UNAVAILABLE,
                                       cause="index-not-current")
+                if facts is None:
+                    # A current index whose correction projections cannot be
+                    # read (a damaged index): a fit published now could not
+                    # name the corrections its inputs reflect (#1015).
+                    return LoadResult(analysis_start=start,
+                                      status=CalibrationStatus.UNAVAILABLE,
+                                      cause="store-unavailable")
                 payload = (earliest, snapshots, credits, diagnostics,
-                           entries, newest, fast_excluded)
+                           entries, newest, fast_excluded, facts)
                 break
         if payload is None:
             # A store that moves twice while we read it is under active
@@ -574,7 +604,7 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
                     pass
 
     earliest, snapshots, credits, diagnostics, entries, newest, \
-        fast_excluded = payload
+        fast_excluded, facts = payload
     snapshots = _confine(snapshots, era_end)
     credits = _confine(credits, era_end)
     entries = _confine(entries, era_end)
@@ -591,11 +621,21 @@ def load_population(account_key, *, since, now, era) -> LoadResult:
             analysis_start=start, newest_entry_at=newest,
             diagnostics=diagnostics,
             status=CalibrationStatus.UNVALIDATED_COEFFICIENT_ERA,
-            cause="history-predates-supported-composition")
+            cause="history-predates-supported-composition",
+            correction_facts=facts, correction_basis=facts.basis)
     return LoadResult(
         entries=tuple(entries), snapshots=tuple(snapshots),
         credits=tuple(credits), newest_entry_at=newest,
-        analysis_start=start, diagnostics=diagnostics)
+        analysis_start=start, diagnostics=diagnostics,
+        correction_facts=facts, correction_basis=facts.basis)
+
+
+def _read_lineage_facts(stats_conn, account_key):
+    """The correction facts for one account's scope, on the bracket's own
+    stats connection (#1015 spec 5.2), or None when they cannot be read."""
+    import _cctally_quota_calibration
+    return _cctally_quota_calibration.read_correction_facts(
+        stats_conn, account_scope=_state_key(account_key))
 
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1102,28 @@ def claim_delivery(identity) -> str:
         return d.CLAIM_WON
 
 
+def release_delivery_claim(identity) -> bool:
+    """Hand back this run's own won claim for `identity`, whose notification
+    was NOT handed off (#1015 spec 5.7: the supersession recheck could not
+    take the stats maintenance read guard). The identity is owed again, so
+    the owed sweep of a later run retries it. False when the ledger could
+    not be rewritten; the claim then stands, exactly as a crash after the
+    mark would leave it."""
+    d = _rate_change_delivery()
+    with delivery_lock():
+        loaded = load_delivery_state()
+        if not loaded.usable:
+            return False
+        if tuple(identity) not in d.decided_set(loaded.state):
+            return True
+        try:
+            save_delivery_state(d.without_decided(loaded.state,
+                                                  [tuple(identity)]))
+        except OSError:
+            return False
+        return True
+
+
 def seed_delivery_state() -> LoadedDelivery:
     """Mark every currently recorded identity as decided, once (#695 sec 4).
 
@@ -1124,6 +1186,28 @@ class PersistMode:
     #: every regime. None when the clock precedes every validated era, which
     #: makes the run persist nothing.
     coefficient_era: "str | None"
+    #: #1015 spec 5.5: the correction facts read inside `load_population`'s
+    #: coherence bracket, which `reduce_state` assesses every stored regime
+    #: against, and the completed batch ids a fit written by this run
+    #: records as its `basis`. None facts mean "not assessed": a constructed
+    #: mode keeps the pre-#1015 reduction (lineage is still written).
+    correction_facts: object = None
+    correction_basis: frozenset = frozenset()
+
+
+def persist_mode(result, *, now) -> PersistMode:
+    """The `PersistMode` one account's sweep reduces under (#1015 spec 5.5).
+
+    The correction facts and the basis come from the account's own
+    `LoadResult`, so they describe the generation the fit was computed from
+    and are never read again after fitting."""
+    return PersistMode(
+        kind=result.mode_kind, account_key=result.account_key, now=now,
+        fingerprint=qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
+        regime_start=result.load.analysis_start,
+        coefficient_era=None if result.era is None else result.era.id,
+        correction_facts=result.load.correction_facts,
+        correction_basis=frozenset(result.load.correction_basis or ()))
 
 
 def _interval_json(interval):
@@ -1151,12 +1235,20 @@ def _regime_from(evidence, *, effective_from, mode, status):
     }
 
 
-def _decorate(regime, analysis):
-    """Attach the composition the regime was fitted under."""
+def _decorate(regime, analysis, *, fit_family_shares):
+    """Attach the composition the regime was fitted under.
+
+    `fit_family_shares` is the fit-weighted family composition of the fit
+    THIS regime records (#991 spec 4.5): the baseline q for a baseline
+    regime, the published q for a successor or a no-split regime. A
+    predecessor is never decorated again, so it keeps what it stored.
+    """
     regime["familyShares"] = dict(analysis.family_shares)
     regime["classShares"] = dict(analysis.class_shares)
     regime["familyRadius"] = analysis.family_radius
     regime["classRadius"] = analysis.class_radius
+    regime["fitFamilyShares"] = (None if fit_family_shares is None
+                                 else dict(fit_family_shares))
     return regime
 
 
@@ -1222,6 +1314,18 @@ _REGIME_REVISION_KEY = "wpr"
 _REGIME_REVISION_DIGEST_KEY = "wprDigest"
 _REGIME_WRITER_KEYS = (_REGIME_WRITER_KEY, _REGIME_WRITER_DIGEST_KEY,
                        _REGIME_REVISION_KEY, _REGIME_REVISION_DIGEST_KEY)
+# #1019/#1014 spec 4.7 C5: and revision-3 provenance. 1.116.1 writes a regime
+# whose `wpg` and `wpr` digests verify, so every regime this binary writes
+# also carries `wpx` and a revision-3 digest over its content without any of
+# the six writer keys. 1.116.1 strips only its four keys when it stamps, so
+# its in-place `update()` keeps a stale `wpxDigest`, and a regime it created
+# has none; neither is recovered as current-writer state. The `wpr` and `wpg`
+# digests are computed as before (over the `wpx` keys too), so 1.116.1 still
+# verifies this binary's stamps.
+_REGIME_SUCCESSOR_KEY = "wpx"
+_REGIME_SUCCESSOR_DIGEST_KEY = "wpxDigest"
+_REGIME_ALL_WRITER_KEYS = _REGIME_WRITER_KEYS + (
+    _REGIME_SUCCESSOR_KEY, _REGIME_SUCCESSOR_DIGEST_KEY)
 
 
 def _regime_content_digest(regime: dict) -> str:
@@ -1245,11 +1349,26 @@ def _regime_revision_digest(regime: dict) -> str:
     return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
-def stamp_regime(regime: dict) -> dict:
-    """``regime`` stamped as written by the current protocol generation and
-    revision."""
+def _regime_successor_digest(regime: dict) -> str:
     import _lib_account_protocol
-    out = {k: v for k, v in regime.items() if k not in _REGIME_WRITER_KEYS}
+    core = {k: v for k, v in regime.items()
+            if k not in _REGIME_ALL_WRITER_KEYS}
+    data = json.dumps(
+        {"revision": _lib_account_protocol.SUCCESSOR_REVISION,
+         "regime": core},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        default=str)
+    return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def stamp_regime(regime: dict) -> dict:
+    """``regime`` stamped as written by the current protocol generation,
+    revision and successor revision."""
+    import _lib_account_protocol
+    out = {k: v for k, v in regime.items()
+           if k not in _REGIME_ALL_WRITER_KEYS}
+    out[_REGIME_SUCCESSOR_KEY] = _lib_account_protocol.SUCCESSOR_REVISION
+    out[_REGIME_SUCCESSOR_DIGEST_KEY] = _regime_successor_digest(out)
     out[_REGIME_REVISION_KEY] = _lib_account_protocol.PROTOCOL_REVISION
     out[_REGIME_REVISION_DIGEST_KEY] = _regime_revision_digest(out)
     out[_REGIME_WRITER_KEY] = _lib_account_protocol.PROTOCOL_GENERATION
@@ -1268,7 +1387,12 @@ def regime_writer_is_current(regime) -> bool:
                 {_lib_account_protocol.REVISION_KEY:
                  regime.get(_REGIME_REVISION_KEY)})
             and regime.get(_REGIME_REVISION_DIGEST_KEY)
-            == _regime_revision_digest(regime))
+            == _regime_revision_digest(regime)
+            and _lib_account_protocol.has_successor_revision(
+                {_lib_account_protocol.SUCCESSOR_REVISION_KEY:
+                 regime.get(_REGIME_SUCCESSOR_KEY)})
+            and regime.get(_REGIME_SUCCESSOR_DIGEST_KEY)
+            == _regime_successor_digest(regime))
 
 
 def stamp_current_writes(stored: dict, reduced: dict, account_key) -> dict:
@@ -1293,25 +1417,100 @@ def stamp_current_writes(stored: dict, reduced: dict, account_key) -> dict:
     return out
 
 
-def recovery_candidates(state: dict, account_key, *, detected_at) -> tuple:
-    """The persisted transitions #689 recovery may journal: every qualified
-    pair whose SUCCESSOR — the regime that constitutes the transition — carries
-    a verifying current-writer stamp. A transition a previous-release process
-    persisted (or edited in place) is withheld. The predecessor is ordinary
-    history: every regime from before the upgrade is legacy-written, and the
-    first current change after it must still be recoverable."""
+def recovery_candidates(state: dict, account_key, *, detected_at,
+                        facts=None) -> tuple:
+    """The persisted transitions #689 recovery may journal.
+
+    Every qualified pair of CLEAN regimes (#1015 spec 5.6) whose SUCCESSOR —
+    the regime that constitutes the transition — carries a verifying
+    current-writer stamp AND a verifying frozen `transitionLineage`. A
+    transition a previous-release process persisted (or edited in place) is
+    withheld. The predecessor is ordinary history: every regime from before
+    the upgrade is legacy-written, and the first current change after it must
+    still be recoverable.
+
+    #1015 spec 5.6/5.7: recovery trusts the transition's own lineage, never
+    the successor's `fitLineage` (a later no-change refit replaces that). An
+    identity that lineage finds superseded under `facts` is not recovered,
+    so a refit's newer basis can never rehabilitate an earlier detection.
+    What is returned is the frozen DESCRIPTOR, so the recovered event's
+    numbers (rates, severity, evidence), windows and basis are the
+    detection's own. A writer-verified successor with NO `transitionLineage`
+    (written by a release before #1015) is recovered as a legacy transition
+    instead: from the regime pair, unless a correction up to this run's clock
+    supersedes it. `detected_at` is still the recovery clock, as #689's
+    contract states for a recovered row; the detection's own clock stays in
+    the frozen lineage the event journals.
+    """
     mrc = _cctally()._load_sibling("_lib_meter_rate_change")
-    regimes = stored_regimes(state, account_key)
-    current_starts = set()
-    for start, (_predecessor, successor) in mrc._adjacent_pairs(regimes).items():
-        if regime_writer_is_current(successor):
-            current_starts.add(start)
-    return tuple(
-        t for t in mrc.enumerate_transitions(
-            regimes, provider="claude",
-            account_key=_alert_account_key(account_key),
-            detected_at=detected_at)
-        if mrc._instant(t.effective_from) in current_starts)
+    ql = _lineage_kernel()
+    import _cctally_quota_calibration as qcg
+    import _lib_accounts
+    scope = _state_key(account_key)
+    alert_key = _alert_account_key(account_key)
+    regimes = clean_regimes(stored_regimes(state, account_key), facts, scope)
+    out = []
+    legacy_starts = set()
+    pairs = mrc._adjacent_pairs(regimes)
+    for start in sorted(pairs):
+        _predecessor, successor = pairs[start]
+        if not regime_writer_is_current(successor):
+            continue
+        lineage = successor.get(ql.TRANSITION_LINEAGE_KEY)
+        if lineage is None:
+            # F8: a writer-verified successor a release before #1015 wrote
+            # (#1019 stamps, no frozen lineage) recovers as a legacy
+            # transition (spec 5.7): basis [] and a window ending at this
+            # recovery run's clock, so any earlier correction in its scope
+            # supersedes it; its values come from the regime pair, exactly
+            # as recovery read them before #1015.
+            legacy = ql.legacy_transition_lineage(
+                account_key=alert_key, detected_at=detected_at,
+                unattributed=_lib_accounts.UNATTRIBUTED)
+            if facts is None or ql.assess(
+                    legacy, facts,
+                    coord_key=qcg._coordinate_order).state == "clean":
+                legacy_starts.add(start)
+            continue
+        if not ql.transition_lineage_verifies(lineage):
+            continue
+        if facts is not None and ql.assess(
+                lineage, facts,
+                coord_key=qcg._coordinate_order).state != "clean":
+            continue
+        transition = _transition_from_descriptor(lineage, detected_at)
+        if transition is not None:
+            out.append(transition)
+    if legacy_starts:
+        out.extend(
+            t for t in mrc.enumerate_transitions(
+                regimes, provider="claude", account_key=alert_key,
+                detected_at=detected_at)
+            if mrc._instant(t.effective_from) in legacy_starts)
+        out.sort(key=lambda t: mrc._instant(t.effective_from))
+    return tuple(out)
+
+
+def _transition_from_descriptor(lineage, detected_at):
+    """The `RateChangeTransition` a frozen `transitionLineage` describes,
+    stamped at `detected_at`, or None when its descriptor cannot be read."""
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    d = lineage.get("descriptor") or {}
+    try:
+        days = d.get("baseline_withheld_days")
+        return mrc.RateChangeTransition(
+            provider=str(d["provider"]), account_key=str(d["account_key"]),
+            effective_from=str(d["effective_from"]),
+            previous_units_per_point=float(d["previous_units_per_point"]),
+            new_units_per_point=float(d["new_units_per_point"]),
+            severity=str(d["severity"]), detected_at=str(detected_at),
+            withholding_status=d.get("withholding_status"),
+            detector_input_causes=d.get("detector_input_causes"),
+            composition_provenance=d.get("composition_provenance"),
+            baseline_withheld_days=None if days is None else int(days),
+            fit_lineage=dict(lineage))
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def recorded_regime(state: dict, account_key) -> "dict | None":
@@ -1442,6 +1641,35 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
         return stored
     key = _state_key(mode.account_key)
     regimes = stored_regimes(stored, mode.account_key)
+    stored_bucket = (stored.get("accounts") or {}).get(key)
+    bucket = dict(stored_bucket) if isinstance(stored_bucket, dict) else {}
+    archive = [dict(a) for a in bucket.get(_ARCHIVE_KEY) or ()
+               if isinstance(a, dict)]
+    now_iso = mode.now.astimezone(UTC).isoformat()
+    facts = mode.correction_facts
+    # #1015 spec 5.5 item 1: every stored regime is assessed against the
+    # facts, over the state this reducer was handed (the locked re-read), and
+    # a tainted one is annotated whatever else this run does.
+    assessments = _assess_regimes(regimes, facts, key)
+    annotated = _annotate(regimes, assessments, now_iso)
+    tainted = {id(r) for r, a in zip(regimes, assessments)
+               if not _is_clean(r, a)}
+    before_clean = [dict(r) for r in regimes if id(r) not in tainted]
+
+    def finish(changed: bool) -> dict:
+        if not changed:
+            return stored
+        out_bucket = dict(bucket)
+        out_bucket["regimes"] = regimes
+        if archive:
+            out_bucket[_ARCHIVE_KEY] = archive
+        if out_bucket == stored_bucket:
+            return stored
+        accounts = dict(stored.get("accounts") or {})
+        accounts[key] = out_bucket
+        return {"schemaVersion": CALIBRATION_STATE_SCHEMA_VERSION,
+                "accounts": accounts}
+
     confirmed = (analysis.verdict is Verdict.RATE_CHANGE_DETECTED
                  and analysis.detector.split_date is not None)
     fitted_ok = (analysis.status is CalibrationStatus.OK
@@ -1455,21 +1683,27 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
     permitted = _transition_persistence_admitted(analysis)
     confirmed = confirmed or permitted
     successor_ok = successor_ok or permitted
+    open_regime = _open_regime(regimes)
     if not fitted_ok and not successor_ok:
-        return stored
+        # #1015 spec 5.5 item 2: a withheld analysis over a tainted open
+        # regime does not close it; it records the attempt, so the refusal
+        # can state why no recalibration happened.
+        attempted = (facts is not None and open_regime is not None
+                     and id(open_regime) in tainted
+                     and _record_attempt(open_regime, analysis, mode))
+        return finish(annotated or attempted)
     mode_era = qm.era_by_id(mode.coefficient_era)
     if mode_era is None:
         # No validated era: nothing this run fitted could name one.
-        return stored
+        return finish(annotated)
 
-    open_regime = _open_regime(regimes)
     # #978 spec 4.5: a run whose clock selects an EARLIER era than the open
     # regime's — a `CCTALLY_AS_OF` inside the Opus 5 era against a stored
     # Opus 5.5 calibration — never replaces the present with the past.
     open_era = (qm.era_by_id(open_regime.get("coefficientEra"))
                 if open_regime is not None else None)
     if open_era is not None and open_era.start > mode_era.start:
-        return stored
+        return finish(annotated)
     # A stored regime fitted under different constants, or in a different
     # coefficient era (#978), is marked stale and left otherwise untouched.
     # It is marked HERE, together with the append below, because section 20
@@ -1496,28 +1730,36 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
                      if open_regime is not None else None)
         predecessor = (open_regime if open_from is not None
                        and open_from < boundary else None)
-        if predecessor is not None:
+        baseline_available = analysis.baseline_fit.state == "available"
+        if predecessor is not None and id(predecessor) in tainted:
+            # #1015 spec 5.5 item 4: a tainted open regime is closed at the
+            # boundary with its status unchanged and is never a comparison
+            # predecessor. This run's own clean baseline is persisted beside
+            # it, so the successor's predecessor is a current-run fit.
+            predecessor["effectiveUntil"] = boundary_iso
+            if baseline_available:
+                regimes.append(_baseline_regime(analysis, mode, boundary))
+        elif predecessor is not None:
             predecessor["effectiveUntil"] = boundary_iso
             predecessor["status"] = CalibrationStatus.OK.value
-        elif open_regime is None and analysis.baseline_fit.state == "available":
+        elif open_regime is None and baseline_available:
             # The first run that discovers a split persists both sides, so a
             # store with no prior regime still records what the rate WAS.
-            baseline = _decorate(_regime_from(
-                analysis.baseline_fit, effective_from=mode.regime_start,
-                mode=mode, status=CalibrationStatus.OK.value), analysis)
-            baseline["effectiveUntil"] = boundary_iso
-            regimes.append(baseline)
+            regimes.append(_baseline_regime(analysis, mode, boundary))
         if successor_ok:
             successor = _decorate(_regime_from(
                 analysis.watch_fit, effective_from=boundary, mode=mode,
-                status=analysis.status.value), analysis)
+                status=analysis.status.value), analysis,
+                fit_family_shares=analysis.fit_family_shares)
             existing = next((r for r in regimes
                              if r.get("effectiveFrom") == boundary_iso
                              and r.get("effectiveUntil") is None), None)
-            if existing is None:
-                regimes.append(successor)
-            else:
-                existing.update(successor)
+            target = _place_fit(regimes, existing, successor, tainted,
+                                archive, now_iso)
+            _attach_fit_lineage(
+                target, mode, "successor", s=boundary,
+                estimator=_estimator(
+                    getattr(analysis, "published_day_bounds", None)))
     elif fitted_ok:
         fresh = _decorate(_regime_from(
             analysis.fitted,
@@ -1525,18 +1767,236 @@ def reduce_state(stored: dict, analysis, mode: PersistMode) -> dict:
                 parse_instant(open_regime["effectiveFrom"])
                 if open_regime is not None
                 and open_regime.get("effectiveFrom") else mode.regime_start),
-            mode=mode, status=CalibrationStatus.OK.value), analysis)
-        if open_regime is None:
-            regimes.append(fresh)
-        else:
-            open_regime.update(fresh)
+            mode=mode, status=CalibrationStatus.OK.value), analysis,
+            fit_family_shares=analysis.fit_family_shares)
+        target = _place_fit(regimes, open_regime, fresh, tainted, archive,
+                            now_iso)
+        _attach_fit_lineage(
+            target, mode, "nosplit",
+            estimator=_estimator(
+                getattr(analysis, "published_day_bounds", None)))
     else:
-        return stored
+        return finish(annotated)
 
-    accounts = dict(stored.get("accounts") or {})
-    accounts[key] = {"regimes": regimes}
-    return {"schemaVersion": CALIBRATION_STATE_SCHEMA_VERSION,
-            "accounts": accounts}
+    _attach_transition_lineage(before_clean, regimes, analysis, mode)
+    return finish(True)
+
+
+# ---------------------------------------------------------------------------
+# #1015: correction-to-fit lineage in the reducer (spec 5.2, 5.5, 5.6).
+# ---------------------------------------------------------------------------
+_ANNOTATION_KEY = "supersededByCorrection"
+_ATTEMPT_KEY = "recalibrationAttempt"
+_ARCHIVE_KEY = "archivedFits"
+
+
+def _lineage_kernel():
+    import _lib_quota_lineage
+    return _lib_quota_lineage
+
+
+def _assess_regimes(regimes, facts, scope) -> list:
+    """One assessment per regime, or None for each when `facts` is None
+    (a constructed mode that does not assess)."""
+    if facts is None:
+        return [None] * len(regimes)
+    import _cctally_quota_calibration as qcg
+    return [qcg.assess_regime(r, facts, scope=scope) for r in regimes]
+
+
+def _is_clean(regime, assessment) -> bool:
+    """Spec 5.6: only a regime assessed `clean` and never annotated takes
+    part in pairing, detection, recovery and the marker. The annotation is
+    terminal: a fit's basis never grows, so a tainted fit stays tainted."""
+    if isinstance(regime.get(_ANNOTATION_KEY), dict):
+        return False
+    return assessment is None or assessment.state == "clean"
+
+
+def clean_regimes(regimes, facts, scope) -> list:
+    """`regimes` without every tainted, unavailable or annotated regime."""
+    return [r for r, a in zip(regimes, _assess_regimes(regimes, facts, scope))
+            if _is_clean(r, a)]
+
+
+def _correction_json(corrections) -> list:
+    return [{"opId": str(op), "observations": int(count)}
+            for op, count in corrections]
+
+
+def _annotate(regimes, assessments, now_iso) -> bool:
+    """Spec 5.5 item 1. True when an annotation was added."""
+    changed = False
+    for regime, assessment in zip(regimes, assessments):
+        if assessment is None or assessment.state != "tainted":
+            continue
+        if isinstance(regime.get(_ANNOTATION_KEY), dict):
+            continue
+        lineage = regime.get(_lineage_kernel().FIT_LINEAGE_KEY)
+        fit_id = (lineage.get("fitId") if isinstance(lineage, dict)
+                  and _lineage_kernel().fit_lineage_verifies(regime)
+                  else _legacy_fit_id(regime))
+        regime[_ANNOTATION_KEY] = {
+            "fitId": fit_id,
+            "corrections": _correction_json(assessment.corrections),
+            "assessedAt": now_iso}
+        changed = True
+    return changed
+
+
+def _legacy_fit_id(regime) -> str:
+    ql = _lineage_kernel()
+    return ql.legacy_lineage(regime, None)["fitId"]
+
+
+def _record_attempt(regime, analysis, mode) -> bool:
+    """Spec 5.5 item 2. True when the attempt record changed. An attempt
+    with the same status over the same basis is the same attempt, so a
+    repeated withheld sweep leaves the record (and the file) unchanged."""
+    status = getattr(getattr(analysis, "status", None), "value", None)
+    basis = sorted(str(b) for b in mode.correction_basis)
+    prior = regime.get(_ATTEMPT_KEY)
+    if isinstance(prior, dict) and prior.get("status") == status \
+            and prior.get("basis") == basis:
+        return False
+    regime[_ATTEMPT_KEY] = {"status": status, "basis": basis,
+                            "asOf": mode.now.astimezone(UTC).isoformat()}
+    return True
+
+
+def _place_fit(regimes, target, fresh, tainted, archive, now_iso) -> dict:
+    """Write one fresh fit over `target` (or append it) and return the
+    record that now holds it.
+
+    A clean target is updated in place, as before #1015. A tainted one is
+    first archived whole, with its annotation, outside `regimes` so it can
+    never form an adjacent pair, and is then REPLACED at the same
+    `effectiveFrom` with no annotation and no attempt (spec 5.5 item 3).
+    `transitionLineage` is immutable and survives either way (spec 5.7).
+    """
+    if target is None:
+        regimes.append(fresh)
+        return fresh
+    if id(target) in tainted:
+        archive.append({"regime": dict(target), "archivedAt": now_iso})
+        frozen = target.get(_lineage_kernel().TRANSITION_LINEAGE_KEY)
+        target.clear()
+        target.update(fresh)
+        if frozen is not None:
+            target[_lineage_kernel().TRANSITION_LINEAGE_KEY] = frozen
+        return target
+    target.update(fresh)
+    return target
+
+
+def _baseline_regime(analysis, mode, boundary) -> dict:
+    baseline = _decorate(_regime_from(
+        analysis.baseline_fit, effective_from=mode.regime_start,
+        mode=mode, status=CalibrationStatus.OK.value), analysis,
+        fit_family_shares=analysis.baseline_fit_family_shares)
+    baseline["effectiveUntil"] = boundary.isoformat()
+    _attach_fit_lineage(
+        baseline, mode, "baseline", s=boundary,
+        estimator=_estimator(getattr(analysis, "baseline_day_bounds", None)))
+    return baseline
+
+
+def _estimator(bounds) -> "dict | None":
+    """`fitLineage.estimator`: the half-open UTC span of the fit's days."""
+    if not bounds:
+        return None
+    first, last = bounds
+    start = dt.datetime.combine(first, dt.time(0, 0), tzinfo=UTC)
+    until = dt.datetime.combine(last, dt.time(0, 0), tzinfo=UTC) \
+        + dt.timedelta(days=1)
+    return {"from": start.isoformat(), "until": until.isoformat()}
+
+
+def _attach_fit_lineage(regime, mode, kind, *, s=None, estimator) -> None:
+    """Spec 5.2: the immutable `fitLineage` of the fit `regime` now holds,
+    computed over its final content."""
+    ql = _lineage_kernel()
+    regime.pop(ql.FIT_LINEAGE_KEY, None)
+    windows = ql.dependency_windows(kind, a=mode.regime_start, s=s,
+                                    t=mode.now)
+    regime[ql.FIT_LINEAGE_KEY] = ql.fit_lineage(
+        scope=_state_key(mode.account_key), basis=mode.correction_basis,
+        windows=windows, estimator=estimator, regime=regime)
+
+
+def _transition_descriptor(transition) -> dict:
+    """Every value the `meter_rate_change` event journals other than the
+    lineage itself, exactly as detected (spec 5.7)."""
+    return {
+        "provider": transition.provider,
+        "account_key": transition.account_key,
+        "effective_from": transition.effective_from,
+        "previous_units_per_point": transition.previous_units_per_point,
+        "new_units_per_point": transition.new_units_per_point,
+        "severity": transition.severity,
+        "detected_at": transition.detected_at,
+        "withholding_status": transition.withholding_status,
+        "detector_input_causes": transition.detector_input_causes,
+        "composition_provenance": transition.composition_provenance,
+        "baseline_withheld_days": transition.baseline_withheld_days,
+    }
+
+
+def _stamp_disclosure(transitions, analysis) -> tuple:
+    """The detection-time disclosure stamped onto fresh transitions (#688,
+    #690, #692), computed once from the analysis."""
+    withheld = (analysis.status.value
+                if _transition_persistence_admitted(analysis) else None)
+    causes, provenance, baseline_days = _analysis_evidence(analysis)
+    return tuple(
+        dataclasses.replace(
+            t, withholding_status=withheld, detector_input_causes=causes,
+            composition_provenance=provenance,
+            baseline_withheld_days=baseline_days)
+        for t in transitions)
+
+
+def _fresh_transitions(before_clean, after_regimes, analysis, mode,
+                       scope) -> tuple:
+    """The transitions this reduction creates over CLEAN regimes only."""
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    after_clean = clean_regimes(after_regimes, mode.correction_facts, scope)
+    return _stamp_disclosure(mrc.detect_transitions(
+        before_clean, after_clean, provider="claude",
+        account_key=_alert_account_key(mode.account_key),
+        detected_at=mode.now.astimezone(UTC).isoformat()), analysis), \
+        after_clean
+
+
+def _attach_transition_lineage(before_clean, regimes, analysis, mode) -> None:
+    """Spec 5.7: the successor of every transition this reduction creates
+    receives its frozen `transitionLineage` in the same reduction: the union
+    of both sides' dependency windows and the detector coverage `[A, T]`,
+    the detecting analysis's scope and basis, and the descriptor."""
+    ql = _lineage_kernel()
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    import _cctally_quota_calibration as qcg
+    scope = _state_key(mode.account_key)
+    fresh, after_clean = _fresh_transitions(
+        before_clean, regimes, analysis, mode, scope)
+    if not fresh:
+        return
+    pairs = mrc._adjacent_pairs(after_clean)
+    coverage = ql.window(mode.regime_start, mode.now, until_inclusive=True)
+    for transition in fresh:
+        predecessor, successor = pairs[mrc._instant(transition.effective_from)]
+        if ql.TRANSITION_LINEAGE_KEY in successor:
+            continue
+        windows = list(ql.regime_lineage(
+            predecessor, scope=scope,
+            era_start=qcg._era_start(predecessor))["dependencyWindows"])
+        windows += list(ql.regime_lineage(
+            successor, scope=scope,
+            era_start=qcg._era_start(successor))["dependencyWindows"])
+        windows.append(coverage)
+        successor[ql.TRANSITION_LINEAGE_KEY] = ql.transition_lineage(
+            windows=windows, scope=scope, basis=mode.correction_basis,
+            descriptor=_transition_descriptor(transition))
 
 
 def reset_calibration(account_key, *, now=None) -> bool:
@@ -1614,10 +2074,12 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
             # elements, for the same reason: `cmd_quota` iterates the third
             # as well.
             return None, (), ()
-        before = stored_regimes(loaded.state, mode.account_key)
+        scope = _state_key(mode.account_key)
+        # #1015 spec 5.6: the before and after states are filtered to their
+        # CLEAN regimes identically, so a tainted regime never pairs.
+        before = clean_regimes(stored_regimes(loaded.state, mode.account_key),
+                               mode.correction_facts, scope)
         reduced = reduce_state(loaded.state, analysis, mode)
-        mrc = _cctally()._load_sibling("_lib_meter_rate_change")
-        account_key = _alert_account_key(mode.account_key)
         detected_at = mode.now.astimezone(UTC).isoformat()
         transitions: tuple = ()
         if reduced is not loaded.state:
@@ -1626,39 +2088,45 @@ def persist_and_detect(analysis, mode: PersistMode) -> tuple:
             save_calibrations(reduced)
             # #688: `detect_transitions` compares two stored states and does
             # not know WHY this run was admitted, so the disclosure is
-            # stamped onto what it returns rather than passed into it. The
-            # value is computed once, from the analysis, before the call.
-            withheld = (analysis.status.value
-                        if _transition_persistence_admitted(analysis)
-                        else None)
-            # #690 / #692: the rest of the disclosure, captured from the SAME
-            # analysis and at the same moment. `withholding_status` stays
-            # gated on admission, because it names the status a run was
-            # withheld under and an ordinary confirmed change was not
-            # withheld at all. The other three are stamped whenever the
-            # analysis publishes them, on both paths: they are measurements
-            # of the evidence this detection stood on, and
-            # `baseline_fit.population` is carried on EVERY branch, withheld
-            # and available alike.
-            causes, provenance, baseline_days = _analysis_evidence(analysis)
-            transitions = tuple(
-                dataclasses.replace(
-                    t, withholding_status=withheld,
-                    detector_input_causes=causes,
-                    composition_provenance=provenance,
-                    baseline_withheld_days=baseline_days)
-                for t in mrc.detect_transitions(
-                    before, stored_regimes(reduced, mode.account_key),
-                    provider="claude", account_key=account_key,
-                    detected_at=detected_at))
+            # stamped onto what it returns rather than passed into it
+            # (`_stamp_disclosure`). #690 / #692: the rest of the disclosure,
+            # captured from the SAME analysis and at the same moment.
+            # `withholding_status` stays gated on admission, because it names
+            # the status a run was withheld under and an ordinary confirmed
+            # change was not withheld at all. The other three are stamped
+            # whenever the analysis publishes them, on both paths.
+            #
+            # #1015 spec 5.7: each fresh transition carries the frozen
+            # `transitionLineage` the reducer wrote on its successor, which
+            # the v2 payload journals as `fit_lineage`.
+            fresh, after_clean = _fresh_transitions(
+                before, stored_regimes(reduced, mode.account_key), analysis,
+                mode, scope)
+            transitions = _with_transition_lineage(fresh, after_clean)
         # #689: enumerated UNCONDITIONALLY, and that is the whole point. The
         # run that lost its recording already wrote the regimes, so every
         # later run finds the state unchanged and takes neither branch above.
         # Recovery therefore cannot be derived from freshness; it comes from
         # what is persisted right now.
         candidates = recovery_candidates(
-            reduced, mode.account_key, detected_at=detected_at)
+            reduced, mode.account_key, detected_at=detected_at,
+            facts=mode.correction_facts)
         return loaded.quarantined, transitions, candidates
+
+
+def _with_transition_lineage(transitions, regimes) -> tuple:
+    """Each transition with its successor's frozen `transitionLineage`."""
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    ql = _lineage_kernel()
+    pairs = mrc._adjacent_pairs(regimes)
+    out = []
+    for transition in transitions:
+        pair = pairs.get(mrc._instant(transition.effective_from))
+        lineage = (pair[1].get(ql.TRANSITION_LINEAGE_KEY)
+                   if pair is not None else None)
+        out.append(dataclasses.replace(transition, fit_lineage=lineage)
+                   if isinstance(lineage, dict) else transition)
+    return tuple(out)
 
 
 #: Keys per presence query. Three bind parameters each, so this stays far
@@ -1765,6 +2233,25 @@ def unrecorded_rate_change_transitions(transitions) -> tuple:
                 if (str(status) != "active" or int(rev) != 0
                         or event_json is None):
                     recorded.add(by_id[str(event_id)])
+        # #1015 spec 5.7: a superseded identity is terminally recorded.
+        # R6: one snapshot, and only the rows each candidate's lineage needs.
+        import _cctally_quota_calibration as qcg
+        began = not conn.in_transaction
+        if began:
+            conn.execute("BEGIN")
+        try:
+            facts = qcg.correction_facts_source(conn)
+            if facts is not None:
+                for t in candidates:
+                    if t.identity() not in recorded and \
+                            qcg.rate_change_supersession(
+                                conn, t.identity(), lineage=t.fit_lineage,
+                                detected_at=t.detected_at,
+                                facts=facts) is not None:
+                        recorded.add(t.identity())
+        finally:
+            if began and conn.in_transaction:
+                conn.execute("ROLLBACK")
         return tuple(t for t in candidates if t.identity() not in recorded)
     except (Exception, StatsRebuildDeferred):   # noqa: BLE001
         return ()
@@ -1886,15 +2373,59 @@ def _settle_rate_change(transition, outcome, status) -> "str | None":
     if result is None or not result.notification_decided:
         return
     if not status.usable:
-        if deferred:
+        # An unusable ledger records nothing, so a deferred handoff leaves
+        # the identity owed for the sweep once the ledger is usable again.
+        if deferred and _superseded_at_handoff(transition) is False:
             (jr.ALERT_DISPATCHER or jr._dispatch_pending_alerts)(deferred)
         return
     claim = claim_delivery(transition.identity())
     if claim != d.CLAIM_WON:
         return claim
+    # #1015 spec 5.7: the ledger is claimed and its leaf lock released
+    # (`claim_delivery` returns from its `with` block), and only then is
+    # supersession rechecked under the stats maintenance read guard. A
+    # superseded identity is settled — the decision stays recorded and is
+    # never cleared to enable a refire — with no notification. A recheck
+    # that cannot take the read guard (a maintenance owner holds it) defers
+    # the handoff: nothing is dispatched, this run's own claim is handed
+    # back, and the identity stays owed for a later run's sweep.
     if deferred:
-        (jr.ALERT_DISPATCHER or jr._dispatch_pending_alerts)(deferred)
+        superseded = _superseded_at_handoff(transition)
+        if superseded is None:
+            release_delivery_claim(transition.identity())
+            return HANDOFF_DEFERRED
+        if not superseded:
+            (jr.ALERT_DISPATCHER or jr._dispatch_pending_alerts)(deferred)
     return claim
+
+
+#: `_settle_rate_change`'s outcome when the won claim was handed back
+#: because the supersession recheck could not take its read guard.
+HANDOFF_DEFERRED = "handoff_deferred"
+
+
+def _superseded_at_handoff(transition) -> "bool | None":
+    """Spec 5.7's last check before a notification is handed off.
+
+    The fail-fast reader takes the stats maintenance flock SHARED and
+    non-blocking, which is the read guard: a destructive maintenance owner
+    is not raced. When that guard (or a published index) is unavailable the
+    answer is None, and the caller defers the handoff rather than
+    dispatching unchecked. Correction facts that cannot be read on an open
+    index answer False — the emitter already refused a superseded identity
+    inside the recording cycle, so this only narrows the window between
+    that commit and the handoff."""
+    import _cctally_quota_calibration as qcg
+    import _cctally_store
+    conn = _cctally_store.stats_open_readonly_failfast()
+    if conn is None:
+        return None
+    try:
+        return qcg.rate_change_supersession(
+            conn, transition.identity(), lineage=transition.fit_lineage,
+            detected_at=transition.detected_at) is not None
+    finally:
+        conn.close()
 
 
 def _owed_rate_change_transitions(account_keys, status, *, now,
@@ -1927,6 +2458,9 @@ def _owed_rate_change_transitions(account_keys, status, *, now,
         recorded = recorded_rate_change_identities(account_keys)
     except (Exception, StatsRebuildDeferred):          # noqa: BLE001
         return ()
+    # #1015 spec 5.7: a superseded identity is never owed a notification.
+    superseded = _superseded_identities(account_keys)
+    recorded = tuple(i for i in recorded if tuple(i) not in superseded)
     detected_at = now.astimezone(UTC).isoformat()
     return tuple(
         mrc.RateChangeTransition(
@@ -1936,6 +2470,98 @@ def _owed_rate_change_transitions(account_keys, status, *, now,
         for provider, account, effective in d.owed(
             recorded,
             d.decided_set(status.state) | {tuple(i) for i in settled}))
+
+
+def _superseded_identities(account_keys) -> frozenset:
+    """Every effectively superseded identity of `account_keys`, read on a
+    guarded connection, or the empty set when it cannot be read."""
+    import _cctally_quota_calibration as qcg
+    from _cctally_db import StatsRebuildDeferred
+    conn = None
+    try:
+        conn = _cctally_core.open_db()
+        state = qcg.read_rate_change_supersessions(
+            conn, account_keys=account_keys)
+        return frozenset(state.by_identity)
+    except (Exception, StatsRebuildDeferred):          # noqa: BLE001
+        return frozenset()
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def reconcile_rate_change_supersessions(account_keys, *, now) -> int:
+    """Journal the explicit supersession of every effectively superseded
+    transition identity of `account_keys` that has none (#1015 spec 5.7).
+
+    It runs after `persist_and_detect` released the calibration lock and
+    before any transition is recorded, on every automatic invocation,
+    withheld analyses included, and it reads the durable rows rather than
+    the calibration file, so an identity whose account was reset is
+    reconciled too. Through the sole stats writer, as
+    `record_rate_change_transition` is; a crash between the sidecar write and
+    the journal append is repaired by the next invocation. Returns how many
+    supersessions were offered. A store that cannot be read or written is
+    not an error here: the command reports what it found.
+    """
+    import _cctally_journal as jr
+    import _cctally_quota_calibration as qcg
+    import _lib_journal
+    from _cctally_db import StatsRebuildDeferred
+    mrc = _cctally()._load_sibling("_lib_meter_rate_change")
+    conn = None
+    try:
+        conn = _cctally_core.open_db()
+        state = qcg.read_rate_change_supersessions(
+            conn, account_keys=account_keys)
+        pending = []
+        for identity, supersession in sorted(state.by_identity.items()):
+            if supersession.explicit:
+                continue
+            row = conn.execute(
+                "SELECT detected_at_utc, fit_lineage FROM "
+                "meter_rate_change_events WHERE provider = ? AND "
+                "account_key = ? AND effective_from = ?", identity).fetchone()
+            if row is None:
+                continue
+            lineage = qcg.transition_lineage_for(identity[1], row[0], row[1])
+            if lineage.get("legacy"):
+                lineage = {"legacy": True,
+                           "window": lineage["dependencyWindows"][0]}
+            target = None
+            for prefix in (mrc.EVT_ID_PREFIX_V2, mrc.EVT_ID_PREFIX):
+                eid = _lib_journal.evt_id(prefix, *identity)
+                if conn.execute(
+                        "SELECT 1 FROM journal_effective_events "
+                        "WHERE event_id = ?", (eid,)).fetchone() is not None:
+                    target = eid
+                    break
+            pending.append({
+                "provider": identity[0], "account_key": identity[1],
+                "effective_from": identity[2], "target_event_id": target,
+                "fit_lineage": lineage,
+                "corrections": [{"opId": op, "observations": n}
+                                for op, n in supersession.observations],
+                "superseded_at_utc": now.astimezone(UTC).isoformat()})
+    except (Exception, StatsRebuildDeferred) as exc:   # noqa: BLE001
+        eprint(f"quota: could not read metering-rate supersessions: {exc}")
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
+    if not pending:
+        return 0
+    try:
+        jr.run_stats_ingest(
+            mode="authoritative",
+            meter_rate_change={
+                "supersessions": pending,
+                "created_at": now.astimezone(UTC).isoformat()})
+    except (Exception, StatsRebuildDeferred) as exc:   # noqa: BLE001
+        eprint("quota: could not record the metering-rate supersession: "
+               f"{exc}")
+        return 0
+    return len(pending)
 
 
 def persist(analysis, mode: PersistMode) -> "str | None":
@@ -2024,6 +2650,31 @@ class AccountResult:
     #: The coefficient era the clock selected, or None before every
     #: validated era (#978). The method metadata names it.
     era: "qm.CoefficientEra | None" = None
+    #: #1015 spec 5.6: the recorded prior's lineage assessment,
+    #: `{"state": "clean"|"recalibration-needed"|"unavailable",
+    #: "corrections": [...]}`, or None when nothing is recorded.
+    recorded_lineage: "dict | None" = None
+
+
+def recorded_prior_lineage(recorded, facts, account_key) -> "dict | None":
+    """The recorded prior presented with its assessment (spec 5.6)."""
+    if recorded is None:
+        return None
+    annotation = recorded.get(_ANNOTATION_KEY)
+    if isinstance(annotation, dict):
+        corrections = annotation.get("corrections")
+        return {"state": qm.RECALIBRATION_NEEDED,
+                "corrections": list(corrections)
+                if isinstance(corrections, list) else []}
+    if facts is None:
+        return {"state": "unavailable", "corrections": []}
+    import _cctally_quota_calibration as qcg
+    assessment = qcg.assess_regime(recorded, facts,
+                                   scope=_state_key(account_key))
+    if assessment.state == "tainted":
+        return {"state": qm.RECALIBRATION_NEEDED,
+                "corrections": _correction_json(assessment.corrections)}
+    return {"state": assessment.state, "corrections": []}
 
 
 def recorded_prior_is_stale(recorded, era) -> bool:
@@ -2122,7 +2773,9 @@ def analyse_account(account_key, *, now, since, watch_from,
         account_key=account_key,
         label=account_display_label(account_key),
         analysis=reported, load=load, week=week, recorded=recorded,
-        stale_prior=stale_prior, mode_kind=mode_kind, clean=clean, era=era)
+        stale_prior=stale_prior, mode_kind=mode_kind, clean=clean, era=era,
+        recorded_lineage=recorded_prior_lineage(
+            recorded, load.correction_facts, account_key))
 
 
 # ---------------------------------------------------------------------------
@@ -2159,7 +2812,7 @@ def _evidence_json(evidence) -> dict:
     }
 
 
-def _recorded_json(recorded, stale_prior) -> "dict | None":
+def _recorded_json(recorded, stale_prior, lineage=None) -> "dict | None":
     if recorded is None:
         return None
     out = dict(recorded)
@@ -2167,7 +2820,64 @@ def _recorded_json(recorded, stale_prior) -> "dict | None":
         if out.get(key) is not None:
             out[key] = _iso(parse_instant(out[key], key))
     out["fingerprintMatchesCurrent"] = not stale_prior
+    if lineage is not None:
+        # #1015 spec 5.6: additive; the analysis status and exit code are
+        # unchanged.
+        out["lineage"] = lineage
     return out
+
+
+def _sorted_shares(shares) -> "dict | None":
+    if shares is None:
+        return None
+    return {k: shares[k] for k in sorted(shares)}
+
+
+def _family_materiality_json(analysis, era) -> dict:
+    """`composition.familyMateriality` (#991 spec 4.8): the reference the
+    evidence-bounded family test measures against, and the evidence."""
+    return {
+        "reference": "fit-weighted",
+        "fitFamilyShares": _sorted_shares(analysis.fit_family_shares),
+        "referenceFamily": None if era is None else era.reference_family,
+        "familyRateBounds": _rate_bounds_json(era),
+        "maxRelativeEffect": qm.MIX_SUPPORT["family_max_relative_effect"],
+    }
+
+
+def _forecast_probe_json(analysis) -> dict:
+    """`composition.forecastProbe` (#991 spec 4.8).
+
+    The vectors are the exact forecast aggregate, published for the
+    `no-reference` and `probed` states. Every measurement is the evaluator's
+    and is null unless the state is `probed`; `supported` is the analysis'
+    `forecast_supported` in every state.
+    """
+    support = (analysis.forecast_support
+               if analysis.forecast_probe_state == "probed" else None)
+    effect = None if support is None else support.family_effect
+    unavailable = None
+    if effect is not None and effect.unavailable is not None:
+        unavailable = {"reason": effect.unavailable.value,
+                       "families": sorted(effect.families)}
+    return {
+        "state": analysis.forecast_probe_state,
+        "familyShares": _sorted_shares(analysis.forecast_family_shares),
+        "classShares": _sorted_shares(analysis.forecast_class_shares),
+        "familyDistance": None if support is None else support.family_distance,
+        "familyDistanceReference": "baseline-family-shares",
+        "familyWithinRadius": (None if support is None
+                               else support.family_within_radius),
+        "familyEffectBound": None if effect is None else effect.bound,
+        "familyEffectReference": "fit-family-shares",
+        "familyEffectUnavailable": unavailable,
+        "familyAdmittedBy": (None if support is None
+                             else support.family_admitted_by),
+        "classDistance": None if support is None else support.class_distance,
+        "classWithinRadius": (None if support is None
+                              else support.class_within_radius),
+        "supported": analysis.forecast_supported,
+    }
 
 
 def account_payload(result: AccountResult) -> dict:
@@ -2197,7 +2907,8 @@ def account_payload(result: AccountResult) -> dict:
             "invocation": result.mode_kind,
         },
         "calibration": {
-            "recorded": _recorded_json(result.recorded, result.stale_prior),
+            "recorded": _recorded_json(result.recorded, result.stale_prior,
+                                       result.recorded_lineage),
             "fitted": _evidence_json(analysis.fitted),
         },
         "analysis": {
@@ -2223,6 +2934,8 @@ def account_payload(result: AccountResult) -> dict:
             "familyRadiusEmpirical": diagnostics.get("familyRadiusEmpirical"),
             "classRadiusEmpirical": diagnostics.get("classRadiusEmpirical"),
             "radiusRule": "max(observed spread, materiality floor)",
+            "familyMateriality": _family_materiality_json(analysis, era),
+            "forecastProbe": _forecast_probe_json(analysis),
         },
         "health": {
             "entriesThrough": _iso(load.newest_entry_at),
@@ -2357,6 +3070,12 @@ def render_text(results, *, now, decorated) -> list:
             recorded_value = result.recorded.get("unitsPerPoint")
             stale = "  (stale — fitted under different constants)" \
                 if result.stale_prior else ""
+            if (result.recorded_lineage or {}).get("state") \
+                    == qm.RECALIBRATION_NEEDED:
+                # #1015 spec 5.6: U3's sentence on a tainted prior.
+                import _lib_quota_copy
+                stale += ("  — " + _lib_quota_copy._LONG_FORM[
+                    qm.RECALIBRATION_NEEDED])
             out.append(f"  {'recorded prior':26} "
                        f"{_fmt_units(recorded_value)}{stale}")
         out.append("  The fitted value is not a provider budget. It is one "
@@ -2395,6 +3114,7 @@ def render_text(results, *, now, decorated) -> list:
                    f"{_fmt_radius(analysis.class_radius)}"
                    f"   (observed "
                    f"{_fmt_radius(analysis.diagnostics.get('classRadiusEmpirical'))})")
+        out.extend(_forecast_family_lines(analysis))
         out.append(f"  {qm.DEDICATED_POOL_SCOPE_NOTE}")
         out.append("")
         out.append("DETECTOR")
@@ -2444,6 +3164,59 @@ def _fmt_radius(value) -> str:
     return "-" if value is None else f"{value:.4f}"
 
 
+#: The width the COMPOSITION SUPPORT lines were approved at (#991 spec 4.9):
+#: the `not bounded:` line wraps onto a continuation line indented to the
+#: value column when it would run past it.
+_COMPOSITION_TEXT_WIDTH = 80
+#: The value column of every `  <label:26> value` line.
+_VALUE_COLUMN = 2 + 26 + 1
+
+#: The distance line for each probe state the evaluator did not reach.
+_UNPROBED_DISTANCE = {
+    "not-probed": "-   (no forecast population)",
+    "unaggregatable": "-   (forecast population not aggregatable)",
+    "no-reference": "-   (no reference composition)",
+}
+
+
+def _forecast_family_lines(analysis) -> list:
+    """The two forecast-family lines of COMPOSITION SUPPORT (#991 spec 4.9)."""
+    support = (analysis.forecast_support
+               if analysis.forecast_probe_state == "probed" else None)
+    if support is None:
+        return [f"  {'forecast family distance':26} "
+                f"{_UNPROBED_DISTANCE.get(analysis.forecast_probe_state, '-')}",
+                f"  {'forecast family effect':26} -"]
+    side = "inside" if support.family_within_radius else "outside"
+    lines = [f"  {'forecast family distance':26} "
+             f"{_fmt_radius(support.family_distance)}"
+             f"   ({side} the family radius)"]
+    effect = support.family_effect
+    limit = f"{float(qm.MIX_SUPPORT['family_max_relative_effect']) * 100:.2f}%"
+    label = f"  {'forecast family effect':26} "
+    if support.family_within_radius:
+        lines.append(f"{label}-   (not needed: inside the family radius)")
+    elif support.family_admitted_by == "materiality":
+        lines.append(f"{label}{effect.bound * 100:.2f}%   (within {limit}: "
+                     f"admitted by family rate bounds)")
+    elif effect.bound is not None:
+        lines.append(f"{label}{effect.bound * 100:.2f}%   (above {limit})")
+    elif effect.unavailable is \
+            qm.FamilyEffectUnavailable.UNEVIDENCED_FAMILY_CHANGE:
+        text = (f"not bounded: {', '.join(sorted(effect.families))} "
+                f"changed share without rate bounds")
+        wrapped = textwrap.wrap(
+            text, width=_COMPOSITION_TEXT_WIDTH - _VALUE_COLUMN,
+            break_long_words=False, break_on_hyphens=False)
+        lines.append(f"{label}{wrapped[0]}")
+        lines.extend(" " * _VALUE_COLUMN + rest for rest in wrapped[1:])
+    else:
+        reason = (effect.unavailable.value if effect.unavailable is not None
+                  else "-")
+        lines.append(f"{label}-   (not evaluated: {reason})")
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # The command (spec sections 8, 17, 23, 24).
 # ---------------------------------------------------------------------------
@@ -2463,6 +3236,68 @@ def _reset(args, keys, *, now) -> int:
     else:
         print(f"quota: nothing was stored for {label}")
     return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class SweepOutcome:
+    """What one account's sweep did (#1015 spec 5.5)."""
+
+    #: The quarantine path `persist_and_detect` reported, or None.
+    quarantined: "str | None"
+    #: The fresh transitions this sweep's persistence created.
+    transitions: tuple
+    #: Every identity this sweep offered to `_settle_rate_change`.
+    settled: frozenset
+
+
+def sweep_account(result: AccountResult, *, now, delivery) -> SweepOutcome:
+    """One account's automatic sweep, in `cmd_quota`'s order (spec 5.5):
+    build `PersistMode`, `persist_and_detect`, supersession reconciliation
+    (5.7), fresh recording, #689 recovery, settlement.
+
+    Persistence runs AFTER the stores are closed, because the calibration
+    lock is a leaf in the lock order and takes nothing else. #661 S2 §6.5
+    steps 1-2: the descriptor is decided under the calibration file's leaf
+    lock, and that lock is released before any stats lock is taken —
+    `persist_and_detect` returns from its `with` block first.
+    """
+    import _lib_accounts
+    mode = persist_mode(result, now=now)
+    quarantined, transitions, candidates = persist_and_detect(
+        result.clean, mode)
+    # #1015 spec 5.7: every effectively superseded transition identity of
+    # this account (and of the `unattributed` sentinel a merged fit records
+    # under) gets its explicit supersession event BEFORE anything is
+    # recorded, on every automatic invocation, withheld analyses included.
+    if mode.kind == "automatic":
+        reconcile_rate_change_supersessions(
+            (_alert_account_key(result.account_key),
+             _lib_accounts.UNATTRIBUTED), now=now)
+    settled: set = set()
+    for transition in transitions:
+        # §6.5 steps 3-6: through the sole stats writer, so the append, the
+        # row and the cursor commit together and the notification dispatches
+        # only after that commit. One write can create more than one adjacent
+        # pair, and each is recorded: the row's UNIQUE key dedups, so a pair
+        # a prior run already recorded folds to a no-op rather than a second
+        # alert.
+        settled.add(transition.identity())
+        _settle_rate_change(
+            transition, record_rate_change_transition(transition, now=now),
+            delivery)
+    # #689: a transition an EARLIER run persisted and then failed to record.
+    # It can never be fresh again, so it is recovered from the persisted
+    # state instead. Fresh descriptors are excluded because they were just
+    # recorded above, and only the remainder pays for the presence lookup.
+    fresh = {t.identity() for t in transitions}
+    for transition in unrecorded_rate_change_transitions(
+            tuple(c for c in candidates if c.identity() not in fresh)):
+        settled.add(transition.identity())
+        _settle_rate_change(
+            transition, record_rate_change_transition(transition, now=now),
+            delivery)
+    return SweepOutcome(quarantined=quarantined, transitions=transitions,
+                        settled=frozenset(settled))
 
 
 def cmd_quota(args) -> int:
@@ -2517,46 +3352,11 @@ def cmd_quota(args) -> int:
         result = analyse_account(
             account_key, now=now, since=since, watch_from=watch_from,
             stored_state=loaded.state)
-        # Persistence runs AFTER the stores are closed, because the
-        # calibration lock is a leaf in the lock order and takes nothing else.
-        mode = PersistMode(
-            kind=result.mode_kind, account_key=account_key, now=now,
-            fingerprint=qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT,
-            regime_start=result.load.analysis_start,
-            coefficient_era=None if result.era is None else result.era.id)
-        # §6.5 step 1-2: the descriptor is decided under the calibration
-        # file's leaf lock, and that lock is released before any stats lock is
-        # taken — `persist_and_detect` returns from its `with` block first.
-        quarantined, transitions, candidates = persist_and_detect(
-            result.clean, mode)
-        quarantined = quarantined or loaded.quarantined
+        outcome = sweep_account(result, now=now, delivery=delivery)
+        quarantined = outcome.quarantined or loaded.quarantined
         results.append(dataclasses.replace(result, quarantined=quarantined))
         swept_keys.append(_alert_account_key(account_key))
-        for transition in transitions:
-            # §6.5 steps 3-6: through the sole stats writer, so the append,
-            # the row and the cursor commit together and the notification
-            # dispatches only after that commit. One write can create more
-            # than one adjacent pair, and each is recorded: the row's UNIQUE
-            # key dedups, so a pair a prior run already recorded folds to a
-            # no-op rather than a second alert.
-            settled.add(transition.identity())
-            _settle_rate_change(
-                transition,
-                record_rate_change_transition(transition, now=now),
-                delivery)
-        # #689: a transition an EARLIER run persisted and then failed to
-        # record. It can never be fresh again, so it is recovered from the
-        # persisted state instead. Fresh descriptors are excluded because
-        # they were just recorded above, and only the remainder pays for the
-        # presence lookup.
-        fresh = {t.identity() for t in transitions}
-        for transition in unrecorded_rate_change_transitions(
-                tuple(c for c in candidates if c.identity() not in fresh)):
-            settled.add(transition.identity())
-            _settle_rate_change(
-                transition,
-                record_rate_change_transition(transition, now=now),
-                delivery)
+        settled |= outcome.settled
 
     # #696: the `unattributed` sentinel joins `swept_keys` on every
     # successful analysis, bare or filtered, whatever accounts this run

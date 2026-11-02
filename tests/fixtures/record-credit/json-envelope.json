@@ -12,7 +12,7 @@
         "fromPct": 46.0,
         "toPct": 31.0,
         "fromSource": "hwm",
-        "effectiveAtUtc": "2026-06-19T14:00:00Z"
+        "effectiveAtUtc": "2026-06-19T14:05:00Z"
     },
     "actions": {
         "creditFloorInserted": true,

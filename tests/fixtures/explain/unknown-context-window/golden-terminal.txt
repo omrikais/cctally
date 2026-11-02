@@ -11,30 +11,29 @@ Rules in force, by class:
   Turn definition: main-thread human messages only — non-sidechain, non-subagent, after command and meta normalisation; assistant replies associate with the nearest preceding human.
 
 == claude · all accounts ==
-Denominator totalExplainedRetainedCost: $9.51 of locally retained cost
+Denominator totalExplainedRetainedCost: $11.91 of locally retained cost
 
 Reported contributors, ranked by observed cost:
-  1. [Expensive model mix] claude-opus-4-20250514 — $7.90, 83.1% of the denominator (confidence high)
+  1. [Expensive model mix] claude-opus-4-20250514 — $7.90, 66.4% of the denominator (confidence high)
        baseline: withheld (baseline_insufficient)
        coverage: support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%
        -> Run cctally claude daily -m calculate --since 2026-08-10 --until 2026-08-17
-  2. [Short conversations carrying large context] Short conversations carrying large context — $7.21, 75.9% of the denominator (confidence medium)
+  2. [Short conversations carrying large context] Short conversations carrying large context — $7.21, 60.6% of the denominator (confidence low)
        baseline: withheld (baseline_insufficient)
-       coverage: support 24 units, cost coverage 83%, identity coverage 100%, priced without fallback 100%, window retained 100%, decidable 86%, undecided: unknown_context_window
+       coverage: support 24 units, cost coverage 66%, identity coverage 100%, priced without fallback 100%, window retained 100%, decidable 86%, undecided: unknown_context_window
        evidence: qualifying conversations 4, largest request as a share of its context window 85.0%, median human turns 2
        -> Run cctally explain --source claude --start-at 2026-08-10T00:00:00Z --end-at 2026-08-17T00:00:00Z --json
-  3. [One project dominating] project-1 — $3.95, 41.6% of the denominator (confidence high)
+  3. [One project dominating] project-1 — $4.01, 33.6% of the denominator (confidence high)
        baseline: withheld (baseline_insufficient)
        coverage: support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%
        -> Run cctally project --source claude
-  4. [One project dominating] project-2 — $3.95, 41.6% of the denominator (confidence high)
+  4. [One session dominating] session-1 — $4.01, 33.6% of the denominator (confidence high)
        baseline: withheld (baseline_insufficient)
        coverage: support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%
-       -> Run cctally project --source claude
+       -> Run cctally claude session -m calculate --since 2026-08-10 --until 2026-08-17
 
 Classes reporting no contributor:
-  One session dominating (support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%, confidence high)
-  Concentrated 5-hour bursts (support 24 units, cost coverage 83%, identity coverage 100%, priced without fallback 100%, window retained 100%, confidence medium)
+  Concentrated 5-hour bursts (support 24 units, cost coverage 66%, identity coverage 100%, priced without fallback 100%, window retained 100%, confidence low)
   Prompt-cache churn (support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%, decidable 100%, confidence high)
   Subagent fan-out (support 28 units, cost coverage 100%, identity coverage 100%, priced without fallback 100%, window retained 100%, decidable 100%, confidence high)
 

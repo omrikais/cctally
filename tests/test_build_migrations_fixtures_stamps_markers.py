@@ -11,33 +11,37 @@ regen wrote markerless ``post.sqlite`` goldens and silently broke
 ``test_migration_002`` / ``test_migration_008``. The ``test_builder_*_carries_marker``
 tests below exercise the builder itself to catch that.
 
-#197 — byte idempotency. The conversation cache goldens build ``pre.sqlite`` via
-``_cctally_db._apply_cache_schema``, which always emits the CURRENT full cache
-schema — so as later migrations add tables / reshape the FTS5 index, the
-committed goldens silently fell behind, and a full regen rewrote them with a
-different on-disk schema. Combined with cache 001's wall-clock self-stamp (the
-#140 carve-out) and builder schema evolution (e.g. the #181 ``speed`` column),
-a full regen dirtied ~24 committed goldens that the maintainer then had to
-hand-revert. The ``test_*_byte_idempotent`` tests below rebuild every
-builder-produced golden into a throwaway dir and assert it matches the
-committed fixture, in two tiers. On the SQLite version that produced the
-goldens (the maintainer's machine, where they are regenerated) it is a STRICT
-byte compare — writer-version header bytes 96-99 normalized — the full #197
-guarantee that a regen will not dirty the committed file. On any OTHER SQLite
-version the on-disk PAGE layout legitimately differs (page allocation /
-freelist / B-tree balancing are not portable across library versions), so the
-byte tier falls back to a version-independent SEMANTIC compare: the canonical
-SQL dump plus the header pragmas iterdump omits. That keeps the guard green on
-the public Linux CI matrix — which runs a different libsqlite3 than the macOS
-self-hosted gate — while still catching real builder/data drift (issue #199).
-They fail LOUDLY at the commit that introduces drift, instead of letting it
-accumulate.
+#197 — content idempotency (contract corrected by #1030). The conversation
+cache goldens build ``pre.sqlite`` via ``_cctally_db._apply_cache_schema``,
+which always emits the CURRENT full cache schema — so as later migrations add
+tables / reshape the FTS5 index, the committed goldens silently fell behind,
+and a full regen rewrote them with a different schema. Combined with cache
+001's wall-clock self-stamp (the #140 carve-out) and builder schema evolution
+(e.g. the #181 ``speed`` column), a full regen dirtied ~24 committed goldens
+that the maintainer then had to hand-revert. The ``test_*_content_idempotent``
+tests below rebuild every builder-produced golden into a throwaway dir and
+assert that it has the same CONTENT as the committed fixture. Content is
+exactly what ``_semantic_content`` fingerprints: ``user_version``,
+``application_id``, the FTS5 ``CREATE VIRTUAL TABLE`` statements, and the
+``iterdump`` of an in-memory copy with the FTS5 virtual tables dropped (every
+real table's schema and rows, then the index, trigger and view definitions in
+``sqlite_master`` order). FTS5's physical index
+encoding (its shadow-table segments) and the page layout are deliberately
+outside it: neither is portable across SQLite library versions, and neither
+is logical content. Writer-version-normalized byte equality (header bytes
+96-99 zeroed) is kept only as a fast path — it implies content equality — and
+is never a tier and never required. The guard therefore does NOT prove that a
+regeneration leaves the committed bytes unchanged; that raw claim is measured
+separately (#1030). The module is broad-run-only (``BROAD_RUN_ONLY`` in
+``bin/_lib_quick_gate.py``), so content drift fails the nightly broad run, not
+the merge gate; that is how #1015's schema change reached ``main`` (#1039).
+The verdict is the same on any SQLite version (issue #199).
 
 Coverage note: 005/006 per-migration goldens have NO builder script (frozen
 artifacts hand-built once; their tests only READ them) and are not in the
 ``_apply_cache_schema`` drift class (tiny explicit stats schemas), so they are
-intentionally out of the byte-idempotency guard — there is nothing to rebuild
-them against.
+intentionally out of the content-idempotency guard — there is nothing to
+rebuild them against.
 """
 from __future__ import annotations
 
@@ -47,6 +51,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from _fts5_gate import requires_fts5  # the ONE FTS5 capability gate (#630 S6)
 
 # Every HOME-derived path constant resolves under a per-test directory
 # (#529 S4). The sibling modules this file loads at import do not re-derive the
@@ -190,7 +196,7 @@ def _semantic_content(path: Path):
 def _discover_per_migration_builders(mod) -> dict:
     """Map ``<scenario-dir-name> -> build fn`` for every
     ``build_per_migration_*`` callable in *mod*. Auto-discovery means a future
-    builder is byte-guarded the moment it lands (no test edit), and the
+    builder is content-guarded the moment it lands (no test edit), and the
     scenario name is derived from the function name (the two are kept identical
     by convention)."""
     out = {}
@@ -201,19 +207,20 @@ def _discover_per_migration_builders(mod) -> dict:
     return out
 
 
-def _assert_dir_byte_idempotent(committed_dir: Path, rebuilt_dir: Path) -> None:
-    """Every committed ``*.sqlite`` in *committed_dir* must rebuild to its
-    committed counterpart in *rebuilt_dir*, in two tiers (issues #197, #199):
+def _assert_dir_content_idempotent(committed_dir: Path, rebuilt_dir: Path) -> None:
+    """Every committed ``*.sqlite`` in *committed_dir* must rebuild, in
+    *rebuilt_dir*, to the same CONTENT as its committed counterpart (issues
+    #197, #199; contract corrected by #1030).
 
-    * STRICT byte idempotency (writer-version-normalized) when the running
-      SQLite library is the version that produced the committed goldens — the
-      maintainer's machine, where the goldens are regenerated. The full #197
-      guarantee: a regen will not dirty the committed file.
-    * SEMANTIC idempotency when the SQLite version differs (e.g. the public
-      Linux CI matrix, #199). The raw page layout legitimately differs across
-      library versions, so the byte tier cannot hold; fall back to the
-      version-independent content fingerprint (SQL dump + header pragmas). This
-      still catches real builder/data drift, tolerating only layout churn."""
+    Content equality is ``_semantic_content`` equality: ``user_version``,
+    ``application_id``, the FTS5 ``CREATE VIRTUAL TABLE`` statements, and the
+    ``iterdump`` of an in-memory copy with the FTS5 virtual tables dropped
+    (every real table's schema and rows, then the index, trigger and view
+    definitions in ``sqlite_master`` order). FTS5's physical index
+    encoding and the page layout are outside it. Writer-version-normalized
+    byte equality is a fast path that implies content equality; it is not a
+    tier and is never required. This guard does not prove that a regeneration
+    leaves the committed bytes unchanged."""
     committed = sorted(committed_dir.glob("*.sqlite"))
     assert committed, f"no committed *.sqlite in {committed_dir}"
     for golden in committed:
@@ -223,10 +230,10 @@ def _assert_dir_byte_idempotent(committed_dir: Path, rebuilt_dir: Path) -> None:
             f"{committed_dir.name} (committed golden has no rebuilt counterpart)"
         )
         if _normalized_bytes(rebuilt) == _normalized_bytes(golden):
-            continue  # strict byte-idempotent (goldens' origin SQLite version)
-        # Raw bytes differ: a real builder/data change OR merely a different
-        # SQLite version's page layout. The content fingerprint discriminates —
-        # equal ⇒ pure layout churn (tolerated); unequal ⇒ genuine drift.
+            continue  # fast path: equal normalized bytes imply equal content
+        # Normalized bytes differ: a real builder/data change OR merely a
+        # different page layout. The content fingerprint decides — equal ⇒
+        # layout churn only (tolerated); unequal ⇒ genuine content drift.
         assert _semantic_content(rebuilt) == _semantic_content(golden), (
             f"{committed_dir.name}/{golden.name} is NOT idempotent — a full "
             f"builder regen would change the committed golden's CONTENT (SQL "
@@ -243,15 +250,18 @@ _BUILDERS = _discover_per_migration_builders(
 
 
 @pytest.mark.parametrize("scenario", sorted(_BUILDERS))
-def test_per_migration_golden_byte_idempotent(
+def test_per_migration_golden_content_idempotent(
     builder_module, scenario, tmp_path
 ):
     """Each ``build-migrations-fixtures.py`` per-migration builder must rebuild
-    its committed goldens byte-for-byte (issue #197)."""
+    its committed goldens to the same content — ``_semantic_content``:
+    ``user_version``, ``application_id``, the FTS5 ``CREATE VIRTUAL TABLE``
+    statements, and the ``iterdump`` of the real tables, indexes, triggers
+    and views — not necessarily the same bytes (issues #197, #1030)."""
     build_fn = getattr(builder_module, f"build_per_migration_{scenario}")
     out_dir = tmp_path / scenario
     build_fn(out_dir)
-    _assert_dir_byte_idempotent(PER_MIGRATION_ROOT / scenario, out_dir)
+    _assert_dir_content_idempotent(PER_MIGRATION_ROOT / scenario, out_dir)
 
 
 @pytest.mark.parametrize(
@@ -261,15 +271,105 @@ def test_per_migration_golden_byte_idempotent(
         ("010_recompute_percent_milestones_dedup_fix", "build_010"),
     ],
 )
-def test_009_010_recompute_golden_byte_idempotent(
+def test_009_010_recompute_golden_content_idempotent(
     builder_009_010_module, scenario, build_fn_name, tmp_path, monkeypatch
 ):
     """The second builder (``build-migration-009-010-fixtures.py``) must also
-    rebuild its committed goldens byte-for-byte. It writes to a module-global
-    ``FIX_BASE``, so redirect that at a tmp dir and compare (issue #197)."""
+    rebuild its committed goldens to the same content (``_semantic_content``,
+    as in ``_assert_dir_content_idempotent``), not necessarily the same bytes.
+    It writes to a module-global ``FIX_BASE``, so redirect that at a tmp dir
+    and compare (issues #197, #1030)."""
     monkeypatch.setattr(builder_009_010_module, "FIX_BASE", tmp_path)
     getattr(builder_009_010_module, build_fn_name)()
-    _assert_dir_byte_idempotent(PER_MIGRATION_ROOT / scenario, tmp_path / scenario)
+    _assert_dir_content_idempotent(
+        PER_MIGRATION_ROOT / scenario, tmp_path / scenario
+    )
+
+
+def _write_guard_db(path: Path, *mutations) -> None:
+    """Write a tiny rollback-journal SQLite DB (rowid table, no AUTOINCREMENT)
+    at *path*; each of *mutations* then runs, in order, on the open connection."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.executemany(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            [(1, "alpha"), (2, "beta"), (3, "gamma")],
+        )
+        conn.commit()
+        for mutate in mutations:
+            mutate(conn)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _freelist_pages(path: Path) -> int:
+    # SQLite header bytes 36-39: the total number of freelist pages.
+    return int.from_bytes(path.read_bytes()[36:40], "big")
+
+
+def _churn_layout(conn) -> None:
+    # Large rows spill onto overflow pages; deleting them leaves freelist
+    # pages behind, so the file differs while the logical rows do not.
+    conn.executemany(
+        "INSERT INTO t(id, v) VALUES (?, ?)",
+        [(100 + i, "x" * 4096) for i in range(8)],
+    )
+    conn.commit()
+    conn.execute("DELETE FROM t WHERE id >= 100")
+
+
+def _widen_fts5(conn) -> None:
+    conn.execute("DROP TABLE f")
+    conn.execute("CREATE VIRTUAL TABLE f USING fts5(a, b)")
+
+
+_GUARD_CASES = {
+    "row-value": lambda c: c.execute("UPDATE t SET v = 'BETA' WHERE id = 2"),
+    "added-column": lambda c: c.execute("ALTER TABLE t ADD COLUMN w TEXT"),
+    "user-version": lambda c: c.execute("PRAGMA user_version = 7"),
+    "application-id": lambda c: c.execute("PRAGMA application_id = 4242"),
+    "fts5-schema": _widen_fts5,
+    "layout-only": _churn_layout,
+}
+# Applied to BOTH copies before the case's own mutation: the FTS5 case needs an
+# FTS5 table on each side, so that only its declaration differs.
+_GUARD_BASES = {
+    "fts5-schema": lambda c: c.execute("CREATE VIRTUAL TABLE f USING fts5(a)"),
+}
+
+
+@pytest.mark.parametrize("case", [
+    pytest.param(case, marks=requires_fts5) if case in _GUARD_BASES else case
+    for case in _GUARD_CASES
+])
+def test_content_guard_discriminates(case, tmp_path):
+    """``_assert_dir_content_idempotent`` must reject a changed row value, an
+    added column, a changed ``user_version``, a changed ``application_id`` and
+    a changed FTS5 table declaration, and must accept the same logical content
+    in a different page layout (#1030). Detects a guard that stops catching content, schema or pragma
+    drift in a regenerated golden — so a stale committed migration fixture
+    passes — or one that fails on harmless layout churn from a different
+    SQLite library. The layout-only case also proves its normalized bytes
+    differ (its churn leaves freelist pages the committed copy lacks), so the
+    semantic comparison, not the byte fast path, decided."""
+    committed_dir = tmp_path / "committed"
+    rebuilt_dir = tmp_path / "rebuilt"
+    committed = committed_dir / "golden.sqlite"
+    rebuilt = rebuilt_dir / "golden.sqlite"
+    base = (_GUARD_BASES[case],) if case in _GUARD_BASES else ()
+    _write_guard_db(committed, *base)
+    _write_guard_db(rebuilt, *base, _GUARD_CASES[case])
+
+    if case == "layout-only":
+        assert _freelist_pages(rebuilt) > _freelist_pages(committed)
+        assert _normalized_bytes(rebuilt) != _normalized_bytes(committed)
+        _assert_dir_content_idempotent(committed_dir, rebuilt_dir)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_dir_content_idempotent(committed_dir, rebuilt_dir)
 
 
 def test_builder_002_post_carries_marker(builder_module, tmp_path):

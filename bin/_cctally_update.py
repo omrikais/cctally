@@ -1442,7 +1442,74 @@ def _do_update_check() -> None:
         c._save_update_state(state)
 
 
-def _spawn_detached(command: str) -> bool:
+#: The environment the next `_spawn_detached` call on this thread merges into
+#: its child's (#939 D5): the detached Codex workers' attempt id travels this
+#: way, so the spawn sites keep calling `_spawn_detached(command)` and every
+#: one-argument test double of it keeps working.
+_DETACHED_ENV = threading.local()
+
+
+class detached_env:
+    """Scope ``mapping`` onto every `_spawn_detached` call this thread makes
+    inside the ``with`` block (#939 D5)."""
+
+    def __init__(self, mapping):
+        self.mapping = dict(mapping or {})
+        self.previous = None
+
+    def __enter__(self):
+        self.previous = getattr(_DETACHED_ENV, "mapping", None)
+        _DETACHED_ENV.mapping = {**(self.previous or {}), **self.mapping}
+        return self.mapping
+
+    def __exit__(self, *_exc):
+        _DETACHED_ENV.mapping = self.previous
+        return False
+
+
+def detached_env_current() -> dict:
+    """The mapping `_spawn_detached` would merge on this thread right now."""
+    return dict(getattr(_DETACHED_ENV, "mapping", None) or {})
+
+
+def take_detached_pid() -> "int | None":
+    """The pid of the child the last `_spawn_detached` call on this thread
+    launched, cleared as it is read (#939 D5: the Codex worker spawner records
+    it as the attempt's ``spawnPid``). ``None`` after a failed spawn, or when
+    a test double replaced `_spawn_detached`."""
+    pid = getattr(_DETACHED_ENV, "pid", None)
+    _DETACHED_ENV.pid = None
+    return pid
+
+
+def _spawn_detached_pid(command: str, *, env: "dict | None" = None) -> "int | None":
+    """`_spawn_detached`'s launch with its environment merge, returning the
+    child's pid (``None`` when the spawn raised)."""
+    extra = {**detached_env_current(), **(env or {})}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.realpath(sys.argv[0]), command],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=({**os.environ, **extra} if extra else None),
+        )
+    except Exception:
+        # Fire-and-forget: never let a spawn failure propagate.
+        return None
+    try:
+        # #939 R8-04: keep the handle, so a worker-liveness probe can see
+        # that this child exited without `os.waitid` (macOS Python < 3.13).
+        import _lib_codex_worker_lifecycle as lifecycle
+        lifecycle.remember_launch(proc, attempt=extra.get(lifecycle.ATTEMPT_ENV))
+    except Exception:  # noqa: BLE001 — bookkeeping never fails a spawn
+        pass
+    return proc.pid
+
+
+def _spawn_detached(command: str, *, env: "dict | None" = None) -> bool:
     """Fire-and-forget a hidden self-subcommand as a detached worker.
 
     Returns whether the spawn was issued. The two update/telemetry callers
@@ -1459,20 +1526,16 @@ def _spawn_detached(command: str) -> bool:
     background workers below — `_update-check` and `_telemetry-beat` stay
     deliberately separate spawns (spec review finding #1) and share only
     this Popen shape.
+
+    ``env`` (and any `detached_env` scope on this thread) is merged into a copy
+    of this process's environment; with neither, the child inherits it as
+    before (#939 D5). The child's pid is kept for `take_detached_pid`, so the
+    spawn sites keep calling this one-argument form and its test doubles keep
+    working.
     """
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.realpath(sys.argv[0]), command],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        return True
-    except Exception:
-        # Fire-and-forget: never let a spawn failure propagate.
-        return False
+    pid = _spawn_detached_pid(command, env=env)
+    _DETACHED_ENV.pid = pid
+    return pid is not None
 
 
 def _spawn_detached_with_pid(

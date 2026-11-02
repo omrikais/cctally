@@ -749,9 +749,9 @@ def test_a_replayed_observation_is_not_a_second_confirmation():
 
 def test_the_control_document_version_is_separate_from_the_spool_version():
     """Bumping the control shape must not invalidate peer spool documents."""
-    assert lib.CONTROL_SCHEMA_VERSION == 2
+    assert lib.CONTROL_SCHEMA_VERSION == 3
     assert lib.SCHEMA_VERSION == 1
-    assert lib.CONTROL_SCHEMA_VERSIONS_READ == (1, 2)
+    assert lib.CONTROL_SCHEMA_VERSIONS_READ == (1, 2, 3)
 
     base = {
         "canonicalKey": 500_000,

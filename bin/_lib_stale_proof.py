@@ -20,6 +20,14 @@ Both axes are decided here. The weekly axis earns by (i) or (ii); the
 five-hour axis earns by (i) only, against the `statusline` source's detector
 baseline under the current five-hour credit generation (D11), and its
 validity follows the five-hour rows of the section 4.4 table.
+
+#1019/#1014 (spec 4.1) adds the receipt-free DROP proof beside it: a
+member's LOW is proven stale by an admitted provider sample in its exact
+account and window, requested after the member's bound (its frozen supported
+``t_m``, else its ``received_at`` second), reading more than `TOLERANCE_PP`
+ABOVE it and captured before the member's advertised reset
+(`proven_stale_low`). Its facts are independent of the rise facts: a member
+may be eligible for one direction and refused for the other.
 """
 from __future__ import annotations
 
@@ -124,12 +132,34 @@ class Member:
 
 @dataclasses.dataclass(frozen=True)
 class MemberFacts:
+    """One member's refusal facts. ``refused``, ``proof_observation_id`` and
+    ``receipt_valid`` decide its RISE (#797 spec 4.4); ``drop_refused`` and
+    ``drop_proof_observation_id`` decide its DROP (#1019 spec 4.1),
+    independently and without a receipt."""
+
     refused: bool
     proof_observation_id: str | None
     receipt_valid: bool
+    drop_refused: bool = False
+    drop_proof_observation_id: str | None = None
 
 
+#: Eligible in both directions.
 ALL_ELIGIBLE = MemberFacts(False, None, False)
+
+
+@dataclasses.dataclass(frozen=True)
+class DropMember:
+    """A member's reading as the drop proof sees it (#1019 spec 4.1): its
+    contributor token, its bound (`drop_bound`), its axis value, its window
+    and the raw reset it advertised."""
+
+    token: str
+    bound_utc: str
+    axis: str
+    percent: float
+    window: int
+    advertised_reset_epoch: int | None = None
 
 
 def sample_identity(token: str, witness, *, axis: str, percent: float,
@@ -145,6 +175,45 @@ def sample_identity(token: str, witness, *, axis: str, percent: float,
         return None
     return SampleIdentity(token, witness.instant_utc, axis, float(percent), int(window),
                           witness.evidence_revision, witness.parser_revision)
+
+
+def drop_bound(token: str, witness, received_at_epoch: int | None, *, axis: str,
+               percent: float, window: int) -> str | None:
+    """The bound a member's LOW is proven stale after (#1019 spec 4.1): the
+    frozen, supported ``t_m`` when `sample_identity` accepts its witness;
+    otherwise its ``received_at`` as a whole-second UTC instant, an
+    assumption-free upper bound on when its already-composed reading
+    existed; otherwise None (always eligible). The fallback is used for this
+    proof alone: it is never a σ, a receipt or a provenance field."""
+    sigma = sample_identity(token, witness, axis=axis, percent=percent, window=window)
+    if sigma is not None:
+        return sigma.activity_at_utc
+    return _received_bound(received_at_epoch)
+
+
+def _received_bound(received_at_epoch) -> str | None:
+    if (isinstance(received_at_epoch, bool) or not isinstance(received_at_epoch, int)
+            or received_at_epoch < 0):
+        return None
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(received_at_epoch, tz=_dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def witness_bound(witness, received_at_epoch: int | None) -> str | None:
+    """`drop_bound` of a retained support: whether `sample_identity` accepts
+    a witness depends on the witness alone, so the bound needs neither the
+    member's token nor its axis, value or window."""
+    if sample_identity("", witness, axis=WEEKLY, percent=0.0, window=0) is not None:
+        return witness.instant_utc
+    return _received_bound(received_at_epoch)
+
+
+def bound_end(bound_utc: str | None) -> int | None:
+    """The end of a bound's precision interval in nanoseconds: a sample
+    follows the bound when its request starts at or after it (`after`)."""
+    interval = _interval(bound_utc)
+    return None if interval is None else interval[1]
 
 
 def _window_text(window: int) -> str:
@@ -212,6 +281,31 @@ def proven_stale(sigma: SampleIdentity, samples: Iterable, *, after_utc: str,
         if _axis_value(s, sigma.axis) < sigma.percent - TOLERANCE_PP
         and after(s.requested_at_utc, sigma.activity_at_utc)
         and after(s.requested_at_utc, after_utc)
+        and _before_epoch(s.captured_at_utc, reset)
+    ]
+    return _latest(proving)
+
+
+def proven_stale_low(bound_utc: str, samples: Iterable, *, axis: str, window: int,
+                     percent: float, advertised_reset_epoch: int | None = None):
+    """The latest provider sample proving a member's LOW stale, or None
+    (#1019 spec 4.1, Q1).
+
+    A sample proves it when it is in the member's exact window (weekly: the
+    normalized reset; five-hour: the canonical key; the caller passes only
+    the member's own account's samples), its request instant ``q`` follows
+    ``bound_utc`` (`drop_bound`) under the precision intervals, its raw axis
+    value is strictly more than `TOLERANCE_PP` ABOVE ``percent``, and its
+    response was captured before the member's advertised reset (the
+    window's reset when it advertised none). No receipt, no ``e_σ``, and no
+    baseline or threshold cutoff."""
+    if axis not in AXES or _interval(bound_utc) is None:
+        return None
+    reset = int(window) if advertised_reset_epoch is None else int(advertised_reset_epoch)
+    proving = [
+        s for s in _axis_window(samples, axis, window)
+        if _axis_value(s, axis) > float(percent) + TOLERANCE_PP
+        and after(s.requested_at_utc, bound_utc)
         and _before_epoch(s.captured_at_utc, reset)
     ]
     return _latest(proving)
@@ -392,7 +486,8 @@ def receipt_valid(receipt: Receipt, transitions: Iterable[CreditTransition], *,
 
 def refusal_facts(axis: str, members: Sequence[Member], samples: Iterable,
                   receipts: Iterable[Receipt], transitions: Iterable[CreditTransition], *,
-                  index_identity: str, supports: Collection[str] | None = None
+                  index_identity: str, supports: Collection[str] | None = None,
+                  drop_members: Sequence[DropMember] = ()
                   ) -> dict[str, MemberFacts]:
     """Per-member facts for one axis, keyed by contributor token.
 
@@ -400,7 +495,12 @@ def refusal_facts(axis: str, members: Sequence[Member], samples: Iterable,
     and a sample requested after both ``t_m`` and ``e_σ`` proves it stale.
     A member without a receipt is eligible with no proof reported; one whose
     receipt is invalid is eligible with its proof reported. Each axis is
-    decided on its own members, samples and credits."""
+    decided on its own members, samples and credits.
+
+    #1019 (spec 4.1): every ``drop_members`` entry gets its drop facts from
+    `proven_stale_low`, independently of ``receipts``, so one call per axis
+    yields complete facts; a token with drop facts only keeps the rise
+    fields of `ALL_ELIGIBLE`."""
     if axis not in AXES:
         return {}
     samples = list(samples)
@@ -433,6 +533,15 @@ def refusal_facts(axis: str, members: Sequence[Member], samples: Iterable,
             refused=bool(valid) and strict is not None,
             proof_observation_id=None if proof is None else proof.observation_id,
             receipt_valid=bool(valid))
+    for d in drop_members:
+        if d.axis != axis:
+            continue
+        low = proven_stale_low(d.bound_utc, samples, axis=axis, window=d.window,
+                               percent=d.percent,
+                               advertised_reset_epoch=d.advertised_reset_epoch)
+        facts[d.token] = dataclasses.replace(
+            facts.get(d.token, ALL_ELIGIBLE), drop_refused=low is not None,
+            drop_proof_observation_id=None if low is None else low.observation_id)
     return facts
 
 
@@ -535,8 +644,8 @@ def floor_microsecond(text: str) -> str | None:
 
 def compact_samples(samples: Iterable, *, window: int,
                     floor_epoch: int | None, axis: str = WEEKLY) -> tuple:
-    """A subset of the window's samples that yields the same `proven_stale`
-    and `earn_receipts` answers for every member (both pick the latest
+    """A subset of the window's samples that yields the same `proven_stale`,
+    `proven_stale_low` and `earn_receipts` answers for every member (all pick the latest
     qualifying sample, and qualification is monotone in ``q`` within one
     value): per weekly value, the latest sample and the latest captured at
     or after the floor, plus every sample captured within an hour of the

@@ -353,11 +353,12 @@ class DoctorState:
     # summary (a deep run substitutes its own whole-journal recomputation).
     # None / available=False is reported as unavailable, never as zero.
     legacy_writer: Optional[dict] = None
-    # #825/#832 (spec section 8, F16): the outcome quarantine, read from the
-    # validated index. `{"available": bool, "triggered": bool, "accounts":
-    # [{"account", "accountLabel", "accountingPaused", "controlPaused",
-    # "accountingSince", "controlSince"}]}`. None / available=False is
-    # reported as unavailable, never as OK.
+    # #948 (spec 7.1): the per-account, per-limit outcome quarantine, read
+    # from the validated index. `{"available": bool, "triggered": bool,
+    # "generation", "cause", "inventoryEpisode", "inventoryPath"?, "accounts":
+    # [{"account", "accountLabel", "cause", "paused", "axes": {axis: {"state",
+    # "waitingFor", "notBefore", "since", "recoveredAt", "revocation"}}}]}`.
+    # None / available=False is reported as unavailable, never as OK.
     outcome_quarantine: Optional[dict] = None
     # Beta-channel (spec 2026-07-21 §3): the configured RELEASE channel
     # (stable|beta) that `cctally update` tracks — DISTINCT from the preview
@@ -494,6 +495,10 @@ class CheckResult:
     summary: str
     remediation: Optional[str]
     details: dict
+    # An OK result's remediation is a text-only hint unless the check opts in
+    # here: #948's seven-day recovered note must also reach `--json` and the
+    # dashboard modal (spec 7.2), while every other OK hint stays text-only.
+    remediation_on_ok: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1054,7 +1059,7 @@ def _check_db_version_ahead(s: DoctorState) -> CheckResult:
             # current index as a mismatch; keep this in lockstep with core
             # (#496 S5b §6.1). It stays a literal because this kernel is pure and
             # must not import `_cctally_core`.
-            epoch = 1019
+            epoch = 1023
         mismatch = uv > legacy_head and uv != epoch
         return {"user_version": uv, "legacy_head": legacy_head, "epoch": epoch,
                 "mismatch": mismatch}
@@ -4212,91 +4217,179 @@ def _legacy_writer_verdict_result(verdict, *, count: int,
 
 
 #: Spec revision 5 (section 8), operator-owned wording, verbatim: an
-#: incomplete legacy spool inventory, and the sentence added when the
-#: validated index holds its durable `inventory-incomplete` marker.
+#: incomplete legacy spool inventory. #948 (spec 7.3, operator-approved
+#: 2026-11-01): the sentence added while the validated index shows the
+#: inventory episode open.
 LEGACY_SPOOL_INVENTORY_TEXT = (
     "cctally cannot read {path} ({operation}: {error}), one of the "
     "status-line files an older cctally release used. Until it can, cctally "
     "cannot tell whether an older process changed it. Check the file's "
     "permissions and the disk.")
 LEGACY_SPOOL_INVENTORY_PAUSED_TEXT = (
-    "Automatic credit and reset detection is paused because of this, and "
-    "making the file readable again does not end the pause (see "
+    "Automatic credit and reset detection is paused because of this. Once "
+    "the file is readable again it resumes on its own (see "
     "`accounting.outcome_quarantine`); usage recording continues.")
 
 
-#: Operator-approved wording (#825/#832 spec section 8), verbatim.
-OUTCOME_QUARANTINE_ACCOUNTING_TEXT = (
-    "Automatic credit and reset detection is paused for {account} since "
-    "{time} because an older cctally process wrote data after the upgrade. It "
-    "resumes only after cctally verifies a clean reading for this account, "
-    "typically the first one after an idle period spanning a weekly reset; "
-    "there is no guaranteed time. If your usage was reset in place meanwhile, "
-    "record it with `cctally record-credit`.")
-OUTCOME_QUARANTINE_CONTROL_TEXT = (
-    "Status-line drop detection also waits for a successful usage refresh for "
-    "this account.")
-#: Spec revision 3 (section 8; operator decision dec-2b5bcf910816), verbatim:
-#: an account paused by an unresolved spool marker. It replaces the "resumes
-#: only after..." sentence and already names drop detection, so no control
-#: sentence is appended.
-OUTCOME_QUARANTINE_SPOOL_MARKER_TEXT = (
-    "Automatic credit, reset and status-line drop detection is paused for "
-    "{account} since {time} because an older cctally process wrote "
-    "status-line data after the upgrade. This version of cctally cannot yet "
-    "confirm a safe point to resume, so the pause does not end on its own; "
-    "usage recording continues. If your usage was reset in place meanwhile, "
-    "record it with `cctally record-credit`.")
-#: Spec revision 5 (section 8), operator-owned wording, verbatim: an account
-#: paused by a marker an incomplete legacy spool inventory left.
-OUTCOME_QUARANTINE_INVENTORY_MARKER_TEXT = (
-    "Automatic credit, reset and status-line drop detection is paused for "
-    "{account} since {time} because cctally could not read the status-line "
-    "files an older cctally release used, so it cannot rule out that an "
-    "older process changed them. This version of cctally cannot yet confirm "
-    "a safe point to resume, so the pause does not end on its own; usage "
-    "recording continues. If your usage was reset in place meanwhile, record "
-    "it with `cctally record-credit`.")
-#: Operator decision dec-5d2a9c2b004a (escalation esc-8a386c207966): the
-#: standalone sentence for an account missing only its control certificate.
-#: The approved control sentence above opens with "also", so it reads only as
-#: an addendum to the accounting one.
-OUTCOME_QUARANTINE_CONTROL_ONLY_TEXT = (
-    "Status-line drop detection is paused for {account} since {time}. It "
-    "resumes after a successful usage refresh for this account.")
+#: #948 (spec 7.3; operator decision D6, 2026-11-01: "Per-limit detail",
+#: "Note for 7 days"), verbatim. One paused account: the sentence, with the
+#: cause clause of its trigger, then one line per limit.
+OUTCOME_QUARANTINE_PAUSED_TEXT = (
+    "Automatic credit, early-reset and status-line drop detection is paused "
+    "for {account} since {time} because {reason}. It resumes on its own, "
+    "separately for each limit. Usage recording continues; no command is "
+    "needed. If your usage was reset in place meanwhile, you can record it "
+    "with `cctally record-credit`.")
+OUTCOME_QUARANTINE_PAUSE_REASONS = {
+    "legacy-spool-activity": (
+        "an older cctally process wrote status-line data after the upgrade"),
+    "inventory-incomplete": (
+        "cctally could not read the status-line files an older cctally "
+        "release used"),
+    "excluded-write": "an older cctally process wrote data after the upgrade",
+}
+#: The OK note for seven days after an account's last limit recovered.
+OUTCOME_QUARANTINE_RECOVERED_TEXT = (
+    "Automatic detection resumed for {account} on {time} after a pause "
+    "{reason}.")
+OUTCOME_QUARANTINE_RECOVERED_REASONS = {
+    "inventory-incomplete": (
+        "while cctally could not read the status-line files an older cctally "
+        "release used"),
+}
+OUTCOME_QUARANTINE_RECOVERED_REASON = "caused by an older cctally process"
+#: The per-limit lines: limit name, then its state.
+OUTCOME_QUARANTINE_LIMITS = (("fiveHour", "five-hour"), ("sevenDay", "weekly"))
+OUTCOME_QUARANTINE_RESUMED_LINE = "{limit}: resumed {time}"
+OUTCOME_QUARANTINE_WAITING_LINES = {
+    "inventory": "{limit}: paused - waiting until cctally can read {path}",
+    "expiry": "{limit}: paused - waiting for an automatic usage refresh",
+    "usage-refresh": "{limit}: paused - waiting for an automatic usage refresh",
+}
+OUTCOME_QUARANTINE_FRESH_PERIOD_LINES = {
+    "fiveHour": "{limit}: paused - waiting for the next five-hour window",
+    "sevenDay": "{limit}: paused - waiting for the next weekly period",
+}
+OUTCOME_QUARANTINE_NOT_BEFORE = {
+    "fiveHour": " (not before {time})",
+    "sevenDay": " (not before {date})",
+}
+#: How long an account's recovered note stays on the OK result (spec 7.2).
+OUTCOME_QUARANTINE_NOTE_DAYS = 7
 
 
-def _outcome_quarantine_message(row: dict) -> str:
-    """One account's paused outcome classes, in the approved wording. A
-    missing control certificate appends its sentence to the accounting one;
-    alone, it gets its own operator-approved standalone sentence."""
+def _quarantine_instant(text) -> "Optional[dt.datetime]":
+    if not text:
+        return None
+    try:
+        value = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+
+
+def _quarantine_time(text) -> str:
+    value = _quarantine_instant(text)
+    return _iso_z(value) if value is not None else "an unknown time"
+
+
+def _outcome_quarantine_limit_line(axis: str, limit: str, doc: dict, *,
+                                   now: dt.datetime,
+                                   inventory_path: "Optional[str]") -> str:
+    if doc.get("state") != "paused":
+        return OUTCOME_QUARANTINE_RESUMED_LINE.format(
+            limit=limit, time=_quarantine_time(doc.get("recoveredAt")))
+    waiting = doc.get("waitingFor")
+    if waiting in OUTCOME_QUARANTINE_WAITING_LINES:
+        return OUTCOME_QUARANTINE_WAITING_LINES[waiting].format(
+            limit=limit, path=inventory_path or "the status-line files")
+    line = OUTCOME_QUARANTINE_FRESH_PERIOD_LINES[axis].format(limit=limit)
+    bound = _quarantine_instant(doc.get("notBefore"))
+    if bound is not None and bound > now:
+        # Spec 7.1: never an estimate, omitted when null or already past.
+        line += OUTCOME_QUARANTINE_NOT_BEFORE[axis].format(
+            time=_iso_z(bound), date=bound.astimezone(dt.timezone.utc).date().isoformat())
+    return line
+
+
+def _outcome_quarantine_paused(row: dict) -> bool:
+    return any((row.get("axes") or {}).get(axis, {}).get("state") == "paused"
+               for axis, _limit in OUTCOME_QUARANTINE_LIMITS)
+
+
+def _outcome_quarantine_recovered_at(row: dict) -> "Optional[dt.datetime]":
+    """When the account's last limit recovered, or None while one is paused
+    or none recovered."""
+    if _outcome_quarantine_paused(row):
+        return None
+    instants = [_quarantine_instant(doc.get("recoveredAt"))
+                for doc in (row.get("axes") or {}).values()]
+    instants = [value for value in instants if value is not None]
+    return max(instants) if instants else None
+
+
+def _outcome_quarantine_message(row: dict, *, now: dt.datetime,
+                                inventory_path: "Optional[str]" = None
+                                ) -> "Optional[str]":
+    """One account's operator-approved text (spec 7.3): the paused sentence
+    and its per-limit lines while any limit is paused; the recovered note
+    for seven days after its last limit recovered; else None."""
     label = row.get("accountLabel") or row.get("account")
-    if row.get("unresolvedSpoolMarker"):
-        text = (OUTCOME_QUARANTINE_INVENTORY_MARKER_TEXT
-                if row.get("spoolMarkerCause") == "inventory-incomplete"
-                else OUTCOME_QUARANTINE_SPOOL_MARKER_TEXT)
-        return text.format(
-            account=label, time=row.get("accountingSince") or "an unknown time")
-    if row.get("accountingPaused"):
-        text = OUTCOME_QUARANTINE_ACCOUNTING_TEXT.format(
-            account=label, time=row.get("accountingSince") or "an unknown time")
-        if row.get("controlPaused"):
-            text += " " + OUTCOME_QUARANTINE_CONTROL_TEXT
-        return text
-    return OUTCOME_QUARANTINE_CONTROL_ONLY_TEXT.format(
-        account=label, time=row.get("controlSince") or "an unknown time")
+    cause = row.get("cause")
+    axes = row.get("axes") or {}
+    if _outcome_quarantine_paused(row):
+        since = [doc.get("since") for doc in axes.values()
+                 if doc.get("state") == "paused" and doc.get("since")]
+        since_at = min((v for v in (_quarantine_instant(t) for t in since)
+                        if v is not None), default=None)
+        text = OUTCOME_QUARANTINE_PAUSED_TEXT.format(
+            account=label,
+            time=_iso_z(since_at) if since_at is not None else "an unknown time",
+            reason=OUTCOME_QUARANTINE_PAUSE_REASONS.get(
+                cause, OUTCOME_QUARANTINE_PAUSE_REASONS["legacy-spool-activity"]))
+        lines = [_outcome_quarantine_limit_line(
+                     axis, limit, axes.get(axis) or {}, now=now,
+                     inventory_path=inventory_path)
+                 for axis, limit in OUTCOME_QUARANTINE_LIMITS]
+        return "\n".join([text] + lines)
+    recovered = _outcome_quarantine_recovered_at(row)
+    if recovered is None or now - recovered >= dt.timedelta(
+            days=OUTCOME_QUARANTINE_NOTE_DAYS):
+        return None
+    return OUTCOME_QUARANTINE_RECOVERED_TEXT.format(
+        account=label, time=_iso_z(recovered),
+        reason=OUTCOME_QUARANTINE_RECOVERED_REASONS.get(
+            cause, OUTCOME_QUARANTINE_RECOVERED_REASON))
+
+
+#: #948 review F7: doctor lists an outcome-quarantine account only when it
+#: was seen in use (a reading or a registry observation) within this many
+#: days (operator decision 2026-11-02).
+_OUTCOME_QUARANTINE_ACTIVE_DAYS = 7
+
+
+def _parse_iso_utc(text: "str | None") -> "dt.datetime | None":
+    if not text:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
 
 
 def _check_accounting_outcome_quarantine(s: DoctorState) -> CheckResult:
-    """#825/#832 (spec section 8, F16, operator Q9): after a post-cutover
-    legacy write or legacy spool change, automatic outcomes are withheld per
-    account until certified recovery. OK when no account is quarantined; WARN
-    naming per account what is paused and since when; unavailable — WARN,
-    never OK — on an unavailable or unvalidated index. Separate from
-    `journal.legacy_writer`: seven quiet days do not mean outcomes resumed.
-    Never claims when recovery will happen. While a spool marker is
-    unresolved (spec revision 3) every row uses the marker wording and the
-    details carry the markers."""
+    """#948 (spec 7): automatic outcomes and status-line drop detection are
+    paused per account and per limit after a post-upgrade legacy write, a
+    legacy spool change or an unreadable legacy spool, and each limit
+    resumes on its own. WARN while any limit of any account is paused,
+    naming per limit what it waits for; OK otherwise, carrying the recovered
+    note for seven days after an account's last limit recovered; unavailable
+    — WARN, never OK — on an unavailable or unvalidated index. Separate from
+    `journal.legacy_writer`. Never estimates when recovery will happen: a
+    "not before" bound is a guaranteed lower bound, omitted when null or
+    past. ``details.inventoryEpisode`` names the latest inventory episode.
+    An account idle for seven days is not listed (operator decision F7)."""
     data = s.outcome_quarantine
     title = "Outcome quarantine"
     if not data or not data.get("available"):
@@ -4307,25 +4400,47 @@ def _check_accounting_outcome_quarantine(s: DoctorState) -> CheckResult:
                          "up to date, then run `cctally doctor` again."),
             details={"available": False, "accounts": []},
         )
+    now = s.now_utc or dt.datetime.now(dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    # Operator decision F7 (2026-11-02, "Hide after 7 idle days"): an account
+    # not seen in use in the last seven days is left out. Its limits stay
+    # paused and resume on their own once it is used again, when it is
+    # listed again; leaving it in would keep this leg WARN indefinitely.
+    active_since = now - dt.timedelta(days=_OUTCOME_QUARANTINE_ACTIVE_DAYS)
     rows = []
     for row in data.get("accounts") or []:
-        rows.append({**row, "message": _outcome_quarantine_message(row)})
+        last_seen = _parse_iso_utc(row.get("lastSeenAt"))
+        if last_seen is None or last_seen < active_since:
+            continue
+        rows.append({**row, "message": _outcome_quarantine_message(
+            row, now=now, inventory_path=data.get("inventoryPath"))})
     details = {"available": True, "triggered": bool(data.get("triggered")),
                "accounts": rows}
-    if data.get("unresolvedSpoolMarkers"):
-        details["unresolvedSpoolMarkers"] = list(data["unresolvedSpoolMarkers"])
-    if not rows:
+    if details["triggered"]:
+        # Spec 7.1: the trigger's cause and the latest inventory episode
+        # (`inventoryEpisode` replaces `unresolvedSpoolMarkers`).
+        details.update(cause=data.get("cause"),
+                       inventoryEpisode=data.get("inventoryEpisode"))
+    paused = [row for row in rows if _outcome_quarantine_paused(row)]
+    if paused:
         return CheckResult(
-            id="accounting.outcome_quarantine", title=title, severity="ok",
-            summary=("no account is quarantined" if data.get("triggered")
-                     else "no legacy write or spool change since the upgrade"),
-            remediation=None, details=details,
+            id="accounting.outcome_quarantine", title=title, severity="warn",
+            summary=f"automatic outcomes paused for {len(paused)} account(s)",
+            remediation="\n".join(row["message"] for row in paused),
+            details=details,
         )
+    notes = [row["message"] for row in rows if row.get("message")]
+    if notes:
+        summary = f"automatic detection resumed for {len(notes)} account(s)"
+    elif data.get("triggered"):
+        summary = "no account is quarantined"
+    else:
+        summary = "no legacy write or spool change since the upgrade"
     return CheckResult(
-        id="accounting.outcome_quarantine", title=title, severity="warn",
-        summary=(f"automatic outcomes paused for {len(rows)} account(s)"),
-        remediation=" ".join(row["message"] for row in rows),
-        details=details,
+        id="accounting.outcome_quarantine", title=title, severity="ok",
+        summary=summary, remediation="\n".join(notes) or None,
+        details=details, remediation_on_ok=True,
     )
 
 
@@ -4691,6 +4806,64 @@ def _check_accounts_attribution(s: DoctorState) -> CheckResult:
     )
 
 
+_CLAUDE_COST_ATTRIBUTION_REMEDIATION = (
+    "Keep the cctally status line or hooks installed so the active account "
+    "is recorded as Claude writes. cctally cache-sync --rebuild keeps these "
+    "decisions; it does not change them.")
+_CLAUDE_COST_EXPORT_REMEDIATION = (
+    "Check that the cctally journal directory is writable; the export "
+    "retries on the next cctally command.")
+
+
+def _check_accounts_claude_cost_attribution(s: DoctorState) -> CheckResult:
+    """#944 spec 5.9 (U2, U3, U4'): how the Claude cost decided in the last 7
+    days was attributed, and the one-time export of existing stamps. WARN
+    when the export is stalled, or when a decorated Claude provider (more
+    than one real account, R8) had a recent fallback that picked a real
+    account; otherwise OK with the fallback count stated."""
+    st = s.accounts_state or {}
+    d = dict(st.get("claude_cost_attribution") or {})
+    m = int(d.get("totalRows") or 0)
+    n = int(d.get("fallbackRows") or 0)
+    real = int(d.get("fallbackRealAccountRows") or 0)
+    pres = d.get("preservation") or {}
+    state = pres.get("state")
+    saved = int(pres.get("saved") or 0)
+    total = int(pres.get("total") or 0)
+    sentences = []
+    if state == "stalled":
+        sentences.append(
+            "Recording existing Claude cost attribution is stalled at "
+            f"{saved} of {total} rows: the journal could not be written")
+    elif state == "running":
+        sentences.append(
+            "Recording existing Claude cost attribution "
+            f"({saved} of {total} rows saved)")
+    if n:
+        sentences.append(
+            f"{n} of {m} Claude cost rows decided in the last 7 days had no "
+            "write-time account evidence and took the account active at "
+            "ingest; this does not mean they are wrong")
+    else:
+        sentences.append(
+            "Claude cost decided in the last 7 days was attributed from "
+            f"write-time account evidence ({m} rows)")
+    decorated = int((st.get("by_provider") or {}).get("claude") or 0) > 1
+    stalled = state == "stalled"
+    fallback_warn = decorated and real > 0
+    remediation = [text for text, fired in (
+        (_CLAUDE_COST_EXPORT_REMEDIATION, stalled),
+        (_CLAUDE_COST_ATTRIBUTION_REMEDIATION, fallback_warn)) if fired]
+    return CheckResult(
+        id="accounts.claude_cost_attribution",
+        title="Claude cost attribution",
+        severity="warn" if remediation else "ok",
+        summary="; ".join(sentences),
+        remediation=" ".join(remediation) if remediation else None,
+        details=d,
+    )
+
+
 def _check_accounts_codex_reset_anchors(s: DoctorState) -> CheckResult:
     """Surface Codex quota rows that landed after migration 032 with no anchor."""
     st = s.accounts_state or {}
@@ -4863,6 +5036,8 @@ _CATEGORY_DEFINITIONS: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] 
         ("accounts.registry", "_check_accounts_registry"),
         ("accounts.freshness", "_check_accounts_freshness"),
         ("accounts.attribution", "_check_accounts_attribution"),
+        ("accounts.claude_cost_attribution",
+         "_check_accounts_claude_cost_attribution"),
         ("accounts.codex_reset_anchors", "_check_accounts_codex_reset_anchors"),
         ("accounts.codex_window_attribution",
          "_check_accounts_codex_window_attribution"),
@@ -4925,6 +5100,9 @@ _QUOTA_CALIBRATION_WARN: dict = {
         "the stored calibration was fitted by an earlier algorithm",
     "calibration-malformed": "the stored calibration could not be parsed",
     "calibration-unreadable": "the stored calibration could not be read",
+    # #1015 spec 5.4 (U3): a correction changed the fit's inputs.
+    "recalibration-needed":
+        "the stored calibration was fitted before a correction to its inputs",
 }
 
 #: The rejections that are ordinary rather than a problem. An
@@ -4935,6 +5113,10 @@ _QUOTA_CALIBRATION_OK: dict = {
     "calibration-absent": "no calibration fitted yet",
     "calibration-detection-only":
         "a metering-rate change is fitted but not yet predictive",
+    # #1015: transient (a maintenance owner holds the index, or it is not
+    # published yet); the calibration is withheld, not reported broken.
+    "calibration-lineage-unavailable":
+        "the calibration's correction lineage could not be verified",
 }
 
 
@@ -5321,7 +5503,7 @@ def _serialize_check(c: CheckResult) -> dict:
         "summary": c.summary,
         "details": c.details,
     }
-    if c.severity != "ok" and c.remediation:
+    if c.remediation and (c.severity != "ok" or c.remediation_on_ok):
         out["remediation"] = c.remediation
     return out
 
@@ -5430,7 +5612,9 @@ def render_text(report: DoctorReport, *, quiet: bool = False, verbose: bool = Fa
             glyph = _GLYPH.get(c.severity, "?")
             lines.append(f"  {glyph} {c.title:<24s} {c.summary}")
             if c.remediation:
-                lines.append(f"      → {c.remediation}")
+                # A multi-line remediation (#948: one line per limit) keeps
+                # its continuation lines under the arrow.
+                lines.append("      → " + c.remediation.replace("\n", "\n        "))
             if verbose and c.details:
                 lines.append("      details:")
                 for k, v in c.details.items():

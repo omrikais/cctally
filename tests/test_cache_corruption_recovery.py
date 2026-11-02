@@ -8,6 +8,7 @@ from __future__ import annotations
 import types
 
 import ast
+import errno
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -808,15 +810,17 @@ def test_cache_repair_marker_blocks_new_open(tmp_path, monkeypatch):
     assert path.stat().st_ino == inode
 
 
+@pytest.mark.parametrize("marker_form", ["file", "directory"])
 def test_dead_cache_repair_marker_is_reclaimed_before_open(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, marker_form,
 ):
+    """A dead owner's marker, in either #1020 form, never wedges the opener."""
     ns, core, _store = _load(tmp_path, monkeypatch)
     ns["open_cache_db"]().close()
     path = pathlib.Path(core.CACHE_DB_PATH)
     inode = path.stat().st_ino
     marker = path.with_name("cache.db.repairing")
-    marker.write_text("999999999\n")
+    _write_owner_marker(marker, "999999999\n", marker_form)
 
     conn = ns["open_cache_db"]()
     try:
@@ -825,7 +829,8 @@ def test_dead_cache_repair_marker_is_reclaimed_before_open(
         conn.close()
 
     assert path.stat().st_ino == inode
-    assert not marker.exists()
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
 
 
 def test_malformed_cache_repair_marker_is_reclaimed_before_open(
@@ -894,6 +899,805 @@ def test_cache_repair_owner_fallback_identity_is_caller_timezone_independent(
 
     assert tokyo, "the fallback must identify this live pytest process"
     assert tokyo == new_york
+
+
+# --- #1020: owner records on a volume without hard links -------------------
+
+
+def _no_hard_links(monkeypatch, db_mod, code=errno.ENOTSUP):
+    """Rebind ``_cctally_db``'s ``os`` to a copy whose ``link`` fails as a
+    volume without hard links (exFAT) fails; the module-local seam of #630
+    S2, never the shared stdlib object."""
+    iso = types.SimpleNamespace(**vars(db_mod.os))
+
+    def link(src, dst, *args, **kwargs):
+        raise OSError(code, os.strerror(code), str(src), None, str(dst))
+
+    iso.link = link
+    monkeypatch.setattr(db_mod, "os", iso)
+    return iso
+
+
+def _write_owner_marker(marker: pathlib.Path, record: str, form: str) -> None:
+    """Publish ``record`` at ``marker`` as a file or as a directory holding
+    ``owner`` (the #1020 directory form)."""
+    if form == "file":
+        marker.write_text(record)
+    else:
+        marker.mkdir()
+        (marker / "owner").write_text(record)
+
+
+def _owner_record_debris(marker: pathlib.Path) -> list:
+    """Private ``.d`` directories, ``.tmp`` files and ``.removed`` tombs left
+    beside ``marker``."""
+    return sorted(
+        entry.name for entry in marker.parent.iterdir()
+        if entry.name.startswith(f".{marker.name}.")
+    )
+
+
+def _owner_store(tmp_path, monkeypatch):
+    _ns, core, _store = _load(tmp_path, monkeypatch)
+    db_mod = sys.modules["_cctally_db"]
+    path = pathlib.Path(core.CACHE_DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return db_mod, path, db_mod._repair_marker_path(path)
+
+
+def _live_record(db_mod, claim_id="live-claim") -> str:
+    identity = db_mod._process_start_identity(os.getpid())
+    assert identity
+    return db_mod._encode_repair_owner(
+        pid=os.getpid(), process_start=identity, claim_id=claim_id,
+    )
+
+
+@pytest.mark.parametrize("form", ["hard_link", "no_hard_link"])
+def test_owner_record_claim_read_live_and_release_in_each_form(
+    tmp_path, monkeypatch, form,
+):
+    """#1020 T1. Detects: the exFAT claim failure that blocks every recovery;
+    a hard-link volume regressing to the directory form; a release that
+    removes another owner's marker."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    if form == "no_hard_link":
+        _no_hard_links(monkeypatch, db_mod)
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    assert isinstance(claim, db_mod.RepairMarkerClaim), reason
+    if form == "hard_link":
+        assert marker.is_file() and not marker.is_symlink()
+    else:
+        assert marker.is_dir() and not marker.is_symlink()
+        assert sorted(item.name for item in marker.iterdir()) == ["owner"]
+        record = json.loads((marker / "owner").read_text())
+        assert record["claim_id"] == claim.claim_id
+    assert db_mod._read_repair_owner(marker)["claim_id"] == claim.claim_id
+    assert db_mod._repair_marker_is_live(marker)[0] is True
+    second, refusal = db_mod._claim_repair_marker(path)
+    assert second is None
+    assert str(marker) in refusal and "another cache.db repair" in refusal
+    stranger = db_mod.RepairMarkerClaim(marker=marker, claim_id="not-mine")
+    with pytest.raises(OSError, match="ownership changed"):
+        db_mod._release_repair_marker(path, stranger)
+    assert db_mod._read_repair_owner(marker)["claim_id"] == claim.claim_id
+
+    db_mod._release_repair_marker(path, claim)
+
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+@pytest.mark.parametrize("form", ["hard_link", "no_hard_link"])
+def test_owner_record_release_needs_no_new_directory_entry(
+    tmp_path, monkeypatch, form,
+):
+    """#1020 review. Detects: a release on a full disk that cannot create its
+    removal-lock file and so leaves this process's own live record fencing
+    the store (the base's plain unlink needed no new directory entry)."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    if form == "no_hard_link":
+        iso = _no_hard_links(monkeypatch, db_mod)
+    else:
+        iso = types.SimpleNamespace(**vars(db_mod.os))
+        monkeypatch.setattr(db_mod, "os", iso)
+    claim, reason = db_mod._claim_repair_marker(path)
+    assert claim is not None, reason
+    real_open = iso.open
+
+    def full_disk_open(file, flags, *args, **kwargs):
+        if flags & os.O_CREAT and not os.path.lexists(file):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(file))
+        return real_open(file, flags, *args, **kwargs)
+
+    iso.open = full_disk_open
+
+    db_mod._release_repair_marker(path, claim)
+
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+def test_owner_record_directory_is_complete_before_its_name_exists(
+    tmp_path, monkeypatch,
+):
+    """#1020 T2. Detects: a partial record visible at the marker name, which
+    an opener would read as malformed and reclaim under a running recovery."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    iso = _no_hard_links(monkeypatch, db_mod)
+    real_rename = os.rename
+    seen = []
+
+    def observe_rename(src, dst, *args, **kwargs):
+        if pathlib.Path(dst) == marker:
+            src = pathlib.Path(src)
+            seen.append({
+                "marker_exists": os.path.lexists(marker),
+                "private": src.name,
+                "entries": sorted(item.name for item in src.iterdir()),
+                "record": json.loads((src / "owner").read_text()),
+            })
+        return real_rename(src, dst, *args, **kwargs)
+
+    iso.rename = observe_rename
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    assert claim is not None, reason
+    assert len(seen) == 1
+    assert seen[0]["marker_exists"] is False
+    assert seen[0]["private"] == f".{marker.name}.{claim.claim_id}.d"
+    assert seen[0]["entries"] == ["owner"]
+    assert seen[0]["record"]["claim_id"] == claim.claim_id
+    assert seen[0]["record"]["pid"] == os.getpid()
+    db_mod._release_repair_marker(path, claim)
+
+
+@pytest.mark.parametrize("code,platform", [
+    (errno.EACCES, "darwin"),
+    (errno.EIO, "darwin"),
+    (errno.EPERM, "darwin"),
+], ids=["EACCES", "EIO", "darwin-EPERM"])
+def test_owner_record_link_failures_that_are_not_missing_hard_links_propagate(
+    tmp_path, monkeypatch, code, platform,
+):
+    """#1020 T2. Detects: a fallback that masks a real permission or I/O
+    failure behind a directory-form publication."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    _no_hard_links(monkeypatch, db_mod, code)
+    monkeypatch.setattr(sys, "platform", platform)
+
+    with pytest.raises(OSError) as raised:
+        db_mod._claim_repair_marker(path)
+
+    assert raised.value.errno == code
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+def test_owner_record_linux_eperm_publishes_the_directory_form(
+    tmp_path, monkeypatch,
+):
+    """#1020 T2. Detects: Linux vfat/exfat (link(2) EPERM) left unable to
+    claim."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    _no_hard_links(monkeypatch, db_mod, errno.EPERM)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    assert claim is not None, reason
+    assert marker.is_dir()
+    assert db_mod._read_repair_owner(marker)["claim_id"] == claim.claim_id
+
+
+def test_owner_record_rename_failure_that_is_not_contention_propagates(
+    tmp_path, monkeypatch,
+):
+    """#1020 T2. Detects: an I/O failure publishing the directory form
+    reported as contention, or its private directory left behind."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    iso = _no_hard_links(monkeypatch, db_mod)
+    real_rename = os.rename
+
+    def failing_rename(src, dst, *args, **kwargs):
+        if pathlib.Path(dst) == marker:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), str(src))
+        return real_rename(src, dst, *args, **kwargs)
+
+    iso.rename = failing_rename
+
+    with pytest.raises(OSError) as raised:
+        db_mod._claim_repair_marker(path)
+
+    assert raised.value.errno == errno.EIO
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+def _dead_identity_record(db_mod) -> str:
+    return db_mod._encode_repair_owner(
+        pid=999_999_999, process_start="ps:dead", claim_id="dead-claim",
+    )
+
+
+def _reused_pid_record(db_mod) -> str:
+    identity = db_mod._process_start_identity(os.getpid())
+    assert identity
+    return db_mod._encode_repair_owner(
+        pid=os.getpid(), process_start=identity + "-reused",
+        claim_id="reused-claim",
+    )
+
+
+@pytest.mark.parametrize("claimant", ["hard_link", "no_hard_link"])
+@pytest.mark.parametrize("marker_form", ["file", "directory"])
+@pytest.mark.parametrize("record_kind", [
+    "dead-pid", "reused-pid", "malformed", "directory-without-owner",
+])
+def test_stale_owner_records_are_reclaimed_in_either_form(
+    tmp_path, monkeypatch, record_kind, marker_form, claimant,
+):
+    """#1020 T3. Detects: a stale owner record (in either form) that a
+    claimant of either form can never reclaim, wedging every recovery."""
+    if record_kind == "directory-without-owner" and marker_form == "file":
+        pytest.skip("a file marker always carries its own record")
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    if record_kind == "directory-without-owner":
+        marker.mkdir()
+        (marker / "._owner").write_bytes(b"apple-double companion")
+    else:
+        record = {
+            "dead-pid": _dead_identity_record,
+            "reused-pid": _reused_pid_record,
+            "malformed": lambda _db: "{truncated-owner-record",
+        }[record_kind](db_mod)
+        _write_owner_marker(marker, record, marker_form)
+    if claimant == "no_hard_link":
+        _no_hard_links(monkeypatch, db_mod)
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    assert claim is not None, reason
+    assert db_mod._read_repair_owner(marker)["claim_id"] == claim.claim_id
+    db_mod._release_repair_marker(path, claim)
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+@pytest.mark.parametrize("claimant", ["hard_link", "no_hard_link"])
+@pytest.mark.parametrize("marker_form", ["file", "directory"])
+def test_a_live_owner_record_in_either_form_is_refused_untouched(
+    tmp_path, monkeypatch, marker_form, claimant,
+):
+    """#1020 T3. Detects: a live directory-form owner read as malformed and
+    reclaimed under the recovery that holds it."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    record = _live_record(db_mod)
+    _write_owner_marker(marker, record, marker_form)
+    record_file = marker if marker_form == "file" else marker / "owner"
+    if claimant == "no_hard_link":
+        _no_hard_links(monkeypatch, db_mod)
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    assert claim is None
+    assert "another cache.db repair owns" in reason
+    assert record_file.read_text() == record
+    assert _owner_record_debris(marker) == []
+
+
+@pytest.mark.parametrize("case", ["dead", "live-in-lease", "live-past-lease"])
+def test_legacy_pid_only_owner_records_keep_their_lease(
+    tmp_path, monkeypatch, case,
+):
+    """#1020 T3. Detects: a lease semantics change for pre-identity (legacy
+    pid-only) records."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    pid = 999_999_999 if case == "dead" else os.getpid()
+    marker.write_text(f"{pid}\n")
+    if case == "live-past-lease":
+        old = time.time() - db_mod._REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS - 60
+        os.utime(marker, (old, old))
+
+    claim, reason = db_mod._claim_repair_marker(path)
+
+    if case == "live-in-lease":
+        assert claim is None
+        assert "bounded lease" in reason
+        assert marker.read_text() == f"{pid}\n"
+    else:
+        assert claim is not None, reason
+        db_mod._release_repair_marker(path, claim)
+
+
+@pytest.mark.parametrize("owner_age", ["fresh", "expired"])
+def test_directory_marker_lease_is_measured_on_its_owner_file(
+    tmp_path, monkeypatch, owner_age,
+):
+    """#1020 T3. Detects: a lease read from the directory's mtime (which an
+    AppleDouble companion moves), keeping a dead lease live or expiring a
+    live one."""
+    db_mod, _path, marker = _owner_store(tmp_path, monkeypatch)
+    _write_owner_marker(marker, _live_record(db_mod), "directory")
+    monkeypatch.setattr(db_mod, "_process_start_identity", lambda _pid: None)
+    old = time.time() - db_mod._REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS - 60
+    now = time.time()
+    owner_time, directory_time = (now, old) if owner_age == "fresh" else (old, now)
+    os.utime(marker / "owner", (owner_time, owner_time))
+    os.utime(marker, (directory_time, directory_time))
+
+    live, reason = db_mod._repair_marker_is_live(marker)
+
+    if owner_age == "fresh":
+        assert live is True and "bounded lease" in reason
+    else:
+        assert live is False and "lease expired" in reason
+
+
+@pytest.mark.parametrize("direction", ["file-to-directory", "directory-to-file"])
+def test_an_owner_record_changing_form_mid_read_is_read_again(
+    tmp_path, monkeypatch, direction,
+):
+    """#1020 T3. Detects: a record released in one form and republished in
+    the other between the resolver's lstat and its read, judged malformed
+    and reclaimed although its owner is live."""
+    db_mod, _path, marker = _owner_store(tmp_path, monkeypatch)
+    before, after = direction.split("-to-")
+    record = _live_record(db_mod, claim_id="swapped-claim")
+    _write_owner_marker(marker, record, before)
+    real_resolve = db_mod._owner_record_file
+    calls = []
+
+    def resolve_then_swap(target):
+        resolved = real_resolve(target)
+        if not calls:
+            if before == "file":
+                marker.unlink()
+            else:
+                (marker / "owner").unlink()
+                marker.rmdir()
+            _write_owner_marker(marker, record, after)
+        calls.append(resolved)
+        return resolved
+
+    monkeypatch.setattr(db_mod, "_owner_record_file", resolve_then_swap)
+
+    owner = db_mod._read_repair_owner(marker)
+
+    assert owner is not None and owner["claim_id"] == "swapped-claim"
+    assert len(calls) == 2
+    assert db_mod._repair_marker_is_live(marker)[0] is True
+
+
+def test_a_failed_tomb_cleanup_leaves_the_marker_name_to_its_next_owner(
+    tmp_path, monkeypatch,
+):
+    """#1020 T3. Detects: tomb debris that blocks or is mistaken for the next
+    owner's directory marker."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    _no_hard_links(monkeypatch, db_mod)
+    monkeypatch.setattr(db_mod, "shutil", types.SimpleNamespace(
+        **{**vars(db_mod.shutil), "rmtree": lambda *_a, **_k: None}
+    ))
+    claim, reason = db_mod._claim_repair_marker(path)
+    assert claim is not None, reason
+
+    db_mod._release_repair_marker(path, claim)
+
+    assert not os.path.lexists(marker)
+    tombs = [name for name in _owner_record_debris(marker)
+             if name.endswith(".removed")]
+    assert len(tombs) == 1, _owner_record_debris(marker)
+    successor, reason = db_mod._claim_repair_marker(path)
+    assert successor is not None, reason
+    assert db_mod._read_repair_owner(marker)["claim_id"] == successor.claim_id
+
+
+def test_a_directory_removal_whose_barrier_fails_is_not_reported_complete(
+    tmp_path, monkeypatch,
+):
+    """#1020 T4b. Detects: a removal reported complete before its parent
+    fsync, or a tomb deleted before the barrier."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    _write_owner_marker(marker, _dead_identity_record(db_mod), "directory")
+    real_fsync_directory = db_mod._fsync_directory
+
+    def failing_parent_fsync(target):
+        if pathlib.Path(target) == marker.parent:
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        return real_fsync_directory(target)
+
+    monkeypatch.setattr(db_mod, "_fsync_directory", failing_parent_fsync)
+
+    with pytest.raises(OSError, match="injected parent fsync failure"):
+        db_mod._remove_owner_record(marker)
+
+    assert not os.path.lexists(marker)
+    tombs = [name for name in _owner_record_debris(marker)
+             if name.endswith(".removed")]
+    assert len(tombs) == 1
+    assert (marker.parent / tombs[0] / "owner").is_file()
+
+
+@pytest.mark.parametrize("marker_form,claimant", [
+    ("file", "hard_link"), ("directory", "no_hard_link"),
+])
+def test_two_claimants_over_one_stale_record_yield_exactly_one_owner(
+    tmp_path, monkeypatch, marker_form, claimant,
+):
+    """#1020 T4 (deterministic). Detects: double ownership through stale
+    reclaim, where a delayed reclaimer removes the record a faster claimant
+    just published and both run a destructive recovery."""
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    _write_owner_marker(marker, _dead_identity_record(db_mod), marker_form)
+    if claimant == "no_hard_link":
+        _no_hard_links(monkeypatch, db_mod)
+    real_live = db_mod._repair_marker_is_live
+    real_remove_stale = db_mod._remove_stale_repair_marker
+    b_judged = threading.Event()
+    b_resume = threading.Event()
+    a_reclaiming = threading.Event()
+
+    def observed_remove_stale(target):
+        # A's reclaim has begun (its identity lookup and link attempt are
+        # behind it), so the window below observes A against B's held
+        # judgment rather than A still starting up on a loaded runner.
+        if threading.current_thread().name == "claimant-A":
+            a_reclaiming.set()
+        return real_remove_stale(target)
+
+    def held_judgment(target):
+        verdict = real_live(target)
+        if (
+            threading.current_thread().name == "claimant-B"
+            and not b_judged.is_set()
+        ):
+            b_judged.set()
+            b_resume.wait(PRESENCE_BACKSTOP_SECONDS)
+        return verdict
+
+    monkeypatch.setattr(db_mod, "_repair_marker_is_live", held_judgment)
+    monkeypatch.setattr(
+        db_mod, "_remove_stale_repair_marker", observed_remove_stale,
+    )
+    results = {}
+
+    def claim(name):
+        try:
+            results[name] = db_mod._claim_repair_marker(path)
+        except BaseException as exc:  # noqa: BLE001 — reported below
+            results[name] = exc
+
+    b = threading.Thread(
+        target=claim, args=("B",), name="claimant-B", daemon=True,
+    )
+    a = threading.Thread(
+        target=claim, args=("A",), name="claimant-A", daemon=True,
+    )
+    b.start()
+    try:
+        assert b_judged.wait(PRESENCE_BACKSTOP_SECONDS), "B never judged"
+        a.start()
+        assert a_reclaiming.wait(PRESENCE_BACKSTOP_SECONDS), (
+            "A never reached its stale reclaim"
+        )
+        a.join(1.0)
+        a_returned_while_b_held = not a.is_alive()
+        holder_while_b_held = (
+            db_mod._read_repair_owner(marker) or {}
+        ).get("claim_id")
+    finally:
+        b_resume.set()
+        b.join(PRESENCE_BACKSTOP_SECONDS)
+        if a.ident is not None:
+            a.join(PRESENCE_BACKSTOP_SECONDS)
+    assert not a.is_alive() and not b.is_alive()
+    claims = [
+        result[0] for result in results.values()
+        if isinstance(result, tuple) and result[0] is not None
+    ]
+    assert len(claims) == 1, results
+    refused = [
+        result for result in results.values()
+        if isinstance(result, tuple) and result[0] is None
+    ]
+    assert len(refused) == 1, results
+    assert "another cache.db repair owns" in refused[0][1]
+    assert db_mod._read_repair_owner(marker)["claim_id"] == claims[0].claim_id
+    assert not a_returned_while_b_held
+    assert holder_while_b_held == "dead-claim"
+    db_mod._release_repair_marker(path, claims[0])
+
+
+_RACE_CASES = [
+    (claimant, seed)
+    for claimant in ("hard_link", "no_hard_link")
+    for seed in ("absent", "stale-file", "stale-directory")
+]
+
+
+def _owner_race_child(bin_dir, store, cases, rounds, start, done, cleared,
+                      results):
+    sys.path.insert(0, bin_dir)
+    import _cctally_db as db
+
+    # One consistent start identity per pid, without a `ps` per claim.
+    db._process_start_identity = lambda pid: f"stub:{pid}"
+    real_os = db.os
+    no_links = types.SimpleNamespace(**vars(real_os))
+
+    def link(src, dst, *args, **kwargs):
+        raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), str(src))
+
+    no_links.link = link
+    path = pathlib.Path(store)
+    for claimant, _seed in cases:
+        db.os = no_links if claimant == "no_hard_link" else real_os
+        for _round in range(rounds):
+            start.wait()
+            claim = None
+            try:
+                claim, reason = db._claim_repair_marker(path)
+                results.put(claim.claim_id if claim else None)
+            except OSError as exc:
+                results.put(f"error: {exc}")
+            done.wait()
+            if claim is not None:
+                db._release_repair_marker(path, claim)
+            cleared.wait()
+
+
+def test_racing_claim_processes_produce_exactly_one_owner_per_round(
+    tmp_path, monkeypatch,
+):
+    """#1020 T4 (statistical, regression evidence only). Detects: double or
+    missing ownership when several processes claim one store at once, over
+    an absent marker and a stale record in either form, with or without hard
+    links."""
+    import multiprocessing as mp
+
+    db_mod, path, marker = _owner_store(tmp_path, monkeypatch)
+    processes, rounds = 6, 20
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    stale = db_mod._encode_repair_owner(
+        pid=dead.pid, process_start="stub:dead", claim_id="stale-claim",
+    )
+    ctx = mp.get_context("spawn")
+    start, done, cleared = (
+        ctx.Barrier(processes + 1, timeout=PRESENCE_BACKSTOP_SECONDS)
+        for _ in range(3)
+    )
+    results = ctx.Queue()
+    children = [
+        ctx.Process(
+            target=_owner_race_child,
+            args=(str(ROOT / "bin"), str(path), _RACE_CASES, rounds,
+                  start, done, cleared, results),
+            daemon=True,
+        )
+        for _ in range(processes)
+    ]
+    for child in children:
+        child.start()
+    failures = []
+    try:
+        for claimant, seed in _RACE_CASES:
+            for number in range(rounds):
+                db_mod._remove_owner_record(marker)
+                if seed != "absent":
+                    _write_owner_marker(
+                        marker, stale, seed.split("-", 1)[1],
+                    )
+                start.wait()
+                got = [
+                    results.get(timeout=PRESENCE_BACKSTOP_SECONDS)
+                    for _ in range(processes)
+                ]
+                winners = [
+                    item for item in got
+                    if item and not item.startswith("error")
+                ]
+                holder = (db_mod._read_repair_owner(marker) or {}).get(
+                    "claim_id"
+                )
+                if len(winners) != 1 or holder != winners[0]:
+                    failures.append((claimant, seed, number, got, holder))
+                done.wait()
+                cleared.wait()
+    except BaseException:
+        # Release children parked at a barrier at once instead of letting
+        # each wait out its timeout before the join below.
+        for barrier in (start, done, cleared):
+            barrier.abort()
+        raise
+    finally:
+        for child in children:
+            child.join(PRESENCE_BACKSTOP_SECONDS)
+            if child.is_alive():
+                child.kill()
+        results.close()
+        results.join_thread()
+    assert failures == [], failures[:5]
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
+
+
+_RELEASE_KINDS = {
+    "repair": (
+        "_claim_repair_marker", "_release_repair_marker",
+        "_repair_marker_path",
+    ),
+    "keeper-yield": (
+        "_claim_keeper_yield_request", "_release_keeper_yield_request",
+        "_keeper_yield_request_path",
+    ),
+}
+
+
+def _release_case(db_mod, kind, path):
+    claim_name, release_name, path_name = _RELEASE_KINDS[kind]
+    return (
+        getattr(db_mod, claim_name),
+        getattr(db_mod, release_name),
+        getattr(db_mod, path_name)(path),
+    )
+
+
+def _module_os(monkeypatch, db_mod, claimant):
+    if claimant == "no_hard_link":
+        return _no_hard_links(monkeypatch, db_mod)
+    iso = types.SimpleNamespace(**vars(db_mod.os))
+    monkeypatch.setattr(db_mod, "os", iso)
+    return iso
+
+
+@pytest.mark.parametrize("claimant", ["hard_link", "no_hard_link"])
+@pytest.mark.parametrize("kind", sorted(_RELEASE_KINDS))
+def test_a_release_after_its_record_was_reclaimed_spares_the_new_owner(
+    tmp_path, monkeypatch, kind, claimant,
+):
+    """#1020 T4c. Detects: a delayed release (its record already reclaimed)
+    deleting the record a newer owner published under the same name."""
+    db_mod, path, _marker = _owner_store(tmp_path, monkeypatch)
+    iso = _module_os(monkeypatch, db_mod, claimant)
+    claim_fn, release_fn, marker = _release_case(db_mod, kind, path)
+    claim, reason = claim_fn(path)
+    assert claim is not None, reason
+    db_mod._remove_owner_record(marker)  # as a stale reclaim would
+    fresh = []
+    calls = {"read": 0, "remove": 0}
+    state = {"in_read": False}
+
+    def publish_fresh_once():
+        if not fresh:
+            successor, why = claim_fn(path)
+            assert successor is not None, why
+            fresh.append(successor)
+
+    real_lstat = iso.lstat
+
+    def lstat_then_publish(target, *args, **kwargs):
+        try:
+            return real_lstat(target, *args, **kwargs)
+        except FileNotFoundError:
+            if pathlib.Path(target) == marker and not state["in_read"]:
+                publish_fresh_once()
+            raise
+
+    real_read = db_mod._read_repair_owner
+
+    def read_then_publish(target):
+        calls["read"] += 1
+        state["in_read"] = True
+        try:
+            owner = real_read(target)
+        finally:
+            state["in_read"] = False
+        if owner is None and not os.path.lexists(target):
+            publish_fresh_once()
+        return owner
+
+    real_remove = db_mod._remove_owner_record
+
+    def counted_remove(target):
+        calls["remove"] += 1
+        return real_remove(target)
+
+    iso.lstat = lstat_then_publish
+    monkeypatch.setattr(db_mod, "_read_repair_owner", read_then_publish)
+    monkeypatch.setattr(db_mod, "_remove_owner_record", counted_remove)
+
+    release_fn(path, claim)
+
+    assert fresh, "the release never observed the name absent"
+    assert real_read(marker) is not None
+    assert real_read(marker)["claim_id"] == fresh[0].claim_id
+    assert calls == {"read": 0, "remove": 0}
+
+
+@pytest.mark.parametrize("claimant", ["hard_link", "no_hard_link"])
+@pytest.mark.parametrize("record", ["matching", "malformed", "mismatched"])
+@pytest.mark.parametrize("kind", sorted(_RELEASE_KINDS))
+def test_a_release_over_a_present_record_keeps_its_claim_check(
+    tmp_path, monkeypatch, kind, record, claimant,
+):
+    """#1020 T4c. Detects: a release that removes another owner's record, or
+    leaves its own (matching or malformed) behind."""
+    db_mod, path, _marker = _owner_store(tmp_path, monkeypatch)
+    _module_os(monkeypatch, db_mod, claimant)
+    claim_fn, release_fn, marker = _release_case(db_mod, kind, path)
+    claim, reason = claim_fn(path)
+    assert claim is not None, reason
+    record_file = db_mod._owner_record_file(marker)
+    if record == "malformed":
+        record_file.write_text("{truncated-owner-record")
+    elif record == "mismatched":
+        release_claim = db_mod.RepairMarkerClaim(marker=marker, claim_id="gone")
+    if record != "mismatched":
+        release_claim = claim
+
+    if record == "mismatched" and kind == "repair":
+        with pytest.raises(OSError, match="ownership changed"):
+            release_fn(path, release_claim)
+    else:
+        release_fn(path, release_claim)
+
+    if record == "mismatched":
+        assert db_mod._read_repair_owner(marker)["claim_id"] == claim.claim_id
+    else:
+        assert not os.path.lexists(marker)
+        assert _owner_record_debris(marker) == []
+
+
+@pytest.mark.parametrize("marker_form", ["file", "directory"])
+@pytest.mark.parametrize("remover", [
+    "stale-repair", "stale-keeper-yield", "release-repair",
+    "release-keeper-yield",
+])
+def test_a_failed_marker_lookup_is_never_taken_for_absence(
+    tmp_path, monkeypatch, remover, marker_form,
+):
+    """#1020 T4c. Detects: an unreadable marker reported as already removed
+    (admitting an opener under a running recovery) or removed blind."""
+    db_mod, path, _marker = _owner_store(tmp_path, monkeypatch)
+    kind = remover.split("-", 1)[1]
+    _claim_fn, release_fn, marker = _release_case(db_mod, kind, path)
+    record = _dead_identity_record(db_mod)
+    _write_owner_marker(marker, record, marker_form)
+    record_file = marker if marker_form == "file" else marker / "owner"
+    iso = _module_os(monkeypatch, db_mod, "hard_link")
+    real_lstat = iso.lstat
+
+    def denied_lstat(target, *args, **kwargs):
+        if pathlib.Path(target) == marker:
+            raise PermissionError(errno.EACCES, "injected lookup failure",
+                                  str(target))
+        return real_lstat(target, *args, **kwargs)
+
+    iso.lstat = denied_lstat
+    claim = db_mod.RepairMarkerClaim(marker=marker, claim_id="dead-claim")
+
+    if remover == "stale-repair":
+        removed, reason = db_mod._remove_stale_repair_marker(path)
+        assert removed is False
+        assert reason.startswith(f"could not remove stale repair marker {marker}: ")
+    elif remover == "stale-keeper-yield":
+        removed, reason = db_mod._remove_stale_keeper_yield_request(path)
+        assert removed is False
+        assert reason.startswith(
+            f"could not remove stale keeper-yield request {marker}: "
+        )
+    elif remover == "release-repair":
+        with pytest.raises(OSError, match="injected lookup failure"):
+            release_fn(path, claim)
+    else:
+        release_fn(path, claim)
+
+    assert record_file.read_text() == record
 
 
 def _write_recovery_sources(
@@ -1049,7 +1853,14 @@ def test_corrupt_cache_rebuild_preserves_requested_source_scope(
     ).exists()
 
 
-def test_corrupt_cache_with_dead_owner_marker_rebuilds_without_surgery(tmp_path):
+@pytest.mark.parametrize("form", ["hard_link", "no_hard_link"])
+def test_corrupt_cache_with_dead_owner_marker_rebuilds_without_surgery(
+    tmp_path, form,
+):
+    """A corrupt cache.db behind a dead owner's marker rebuilds; #1020 T7:
+    also where the volume has no hard links (child-side link seam), where
+    the recovery's repair marker must publish as a directory. Detects: a
+    fallback wired only into the conversations recovery."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     claude_dir = tmp_path / "claude"
@@ -1068,6 +1879,10 @@ def test_corrupt_cache_with_dead_owner_marker_rebuilds_without_surgery(tmp_path)
             "CODEX_HOME": str(codex_home),
         }
     )
+    trace = tmp_path / "owner-record-trace.txt"
+    env["CCTALLY_TEST_OWNER_RECORD_TRACE"] = str(trace)
+    if form == "no_hard_link":
+        env["CCTALLY_TEST_OWNER_RECORD_LINK_ERRNO"] = "ENOTSUP"
 
     result = subprocess.run(
         [
@@ -1086,7 +1901,12 @@ def test_corrupt_cache_with_dead_owner_marker_rebuilds_without_surgery(tmp_path)
     )
 
     assert result.returncode == 0, result.stderr
-    assert not cache_path.with_name("cache.db.repairing").exists()
+    expected = "directory" if form == "no_hard_link" else "file"
+    published = trace.read_text().splitlines() if trace.exists() else []
+    assert f"cache.db.repairing {expected}" in published, published
+    marker = cache_path.with_name("cache.db.repairing")
+    assert not os.path.lexists(marker)
+    assert _owner_record_debris(marker) == []
     conn = sqlite3.connect(cache_path)
     try:
         assert conn.execute(

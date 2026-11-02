@@ -16,6 +16,7 @@ bind, accept, hydrating frame, then a non-hydrating frame only after release —
 over the session-scoped ``small_corpus``, which is built rather than skipped.
 """
 import datetime as dt
+import ipaddress
 import json
 import pathlib
 import shutil
@@ -24,6 +25,7 @@ import sqlite3
 import threading
 import time
 import types
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
@@ -683,6 +685,79 @@ def test_bind_precedes_the_full_build_and_hydration_clears(
         _await_handler_exit(
             before_handlers, deadline=teardown_deadline,
             name_contains="dashboard-conversations-sync")
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_server_bind_does_not_wait_on_reverse_dns(monkeypatch, tmp_path, host):
+    """Binding the dashboard server must not wait on a reverse-DNS lookup.
+
+    The stdlib `HTTPServer.server_bind` stores `socket.getfqdn(host)` as
+    `server_name`, a PTR lookup made before `cmd_dashboard` can print its URL or
+    serve. Where the resolver never answers PTR it blocks for the resolver's
+    whole timeout — 35 seconds measured on a LAN runner — so the dashboard is
+    unavailable to its user for that long and every harness that boots it times
+    out. The fake here never answers until released, so a bind that still asks
+    it does not construct at all.
+
+    The backstop bounds only the failing case: a bind that never asks returns at
+    once. `localhost` pins that `server_name` is the bound numeric address, not
+    the requested string.
+    """
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    dash = _dash_mod()
+
+    release = threading.Event()
+    calls: list[str] = []
+
+    def never_answering_getfqdn(name=""):
+        calls.append(name)
+        # Its own backstop, so a forgotten release cannot hang the worker.
+        release.wait(2 * PRESENCE_BACKSTOP_SECONDS)
+        return name
+
+    monkeypatch.setattr(socket, "getfqdn", never_answering_getfqdn)
+
+    servers: list = []
+    errors: list[BaseException] = []
+
+    def construct():
+        try:
+            servers.append(dash._QuietThreadingHTTPServer(
+                (host, 0), BaseHTTPRequestHandler))
+        except BaseException as exc:  # surfaced by the assertions below
+            errors.append(exc)
+
+    helper = threading.Thread(
+        target=construct, name="server-bind-probe", daemon=True)
+    helper.start()
+    try:
+        # timing-budget: presence wait; spends the backstop only when bind blocks
+        helper.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        assert not errors, f"constructing the server raised {errors[0]!r}"
+        assert servers, (
+            f"the server was not constructed within {PRESENCE_BACKSTOP_SECONDS}s"
+            f" of binding {host!r}: it is waiting on the resolver;"
+            f" getfqdn calls recorded: {calls!r}")
+        srv = servers[0]
+        bound = srv.socket.getsockname()
+        assert srv.server_name == srv.server_address[0] == bound[0]
+        ipaddress.ip_address(srv.server_name)
+        assert srv.server_port == srv.server_address[1] == bound[1]
+        assert srv.server_port != 0
+        conn = socket.create_connection(
+            (srv.server_name, srv.server_port),
+            timeout=PRESENCE_BACKSTOP_SECONDS)
+        conn.close()
+        # Checked after every read of the attributes, so a lookup deferred to
+        # a lazy `server_name` is caught as well as one made during the bind.
+        assert calls == [], f"the resolver was asked for {calls!r}"
+    finally:
+        release.set()
+        # timing-budget: cleanup join for a thread this test has just released
+        helper.join(timeout=PRESENCE_BACKSTOP_SECONDS)
+        for srv in servers:
+            srv.server_close()
 
 
 # ---------------------------------------------------------------------------

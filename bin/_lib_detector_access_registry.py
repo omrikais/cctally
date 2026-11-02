@@ -195,6 +195,12 @@ WAIT = (
     'reclassifies everything it publishes; never a detector input.'
 )
 
+LINEAGE = (
+    'Correction-to-fit lineage projection (#1015): written for the '
+    'calibration lineage readers (forecast, project, doctor, status line); '
+    'no automatic credit, moved-end or drop-consensus decision reads it.'
+)
+
 REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_account:account_label',
@@ -257,9 +263,18 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=READ_IDX,
     ),
+    # Reviewed re-fingerprint (#1015 T3, epoch 1022, spec 5.7). This one
+    # executescript creates every quota projection table, and its literal
+    # text changed in exactly two places: `meter_rate_change_events` gains the
+    # NULLABLE `fit_lineage` column (the canonical JSON lineage of the fits a
+    # transition compared, NULL on a row detected before #1015), and the
+    # script now also creates `meter_rate_change_supersessions` (the terminal
+    # supersession projection) with its explanatory comments outside the
+    # statement. The statement stays a schema-only MAINT write run at open;
+    # no detector decision reads either addition, so the contract stands.
     AccessContract(
         function='_cctally_core:_apply_quota_projection_schema',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS quota_window_blocks ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), limit_id TEXT, limit_name TEXT, resets_at_utc TEXT NOT NULL, nominal_start_at_utc TEXT NOT NULL, first_observed_at_utc TEXT NOT NULL, last_observed_at_utc TEXT NOT NULL, first_percent REAL NOT NULL, current_percent REAL NOT NULL, last_source_path TEXT NOT NULL, last_line_offset INTEGER NOT NULL, generation TEXT NOT NULL, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', -- public #5: the REVERSE MAP. `physical_group_key` records the -- physical window this block was materialized from, so the -- generation sweep can be scoped to the groups a bounded pass -- actually re-materialized instead of to whole roots. -- `physical_group_digest` is that group\'s contribution to its -- root\'s physical signature: the root value is a digest over the -- root\'s sorted (group key, group digest) pairs, which makes it -- ASSOCIATIVE. A bounded pass recomputes only the dirty groups\' -- digests and re-derives the root value from the stored set — -- O(groups), 608 on the real store, against O(observations) at -- 211K. Hanging it off the blocks is what makes it self-maintaining: -- a group swept to nothing loses its blocks and drops out of the -- composition with them. physical_group_key TEXT, physical_group_digest TEXT, UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc) ); CREATE INDEX IF NOT EXISTS idx_quota_blocks_active ON quota_window_blocks(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc); CREATE TABLE IF NOT EXISTS quota_percent_milestones ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), resets_at_utc TEXT NOT NULL, percent_threshold INTEGER NOT NULL CHECK(percent_threshold BETWEEN 1 AND 100), captured_at_utc TEXT NOT NULL, source_path TEXT NOT NULL, line_offset INTEGER NOT NULL, high_water_percent INTEGER NOT NULL CHECK(high_water_percent BETWEEN 1 AND 100), generation TEXT NOT NULL, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, percent_threshold) ); CREATE INDEX IF NOT EXISTS idx_quota_milestones_active ON quota_percent_milestones(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc, percent_threshold); CREATE TABLE IF NOT EXISTS quota_threshold_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), resets_at_utc TEXT NOT NULL, threshold INTEGER NOT NULL CHECK(threshold BETWEEN 1 AND 100), qualifying_kind TEXT NOT NULL CHECK(qualifying_kind IN (\'actual\',\'projected\')), qualifying_percent REAL, projected_percent REAL, severity TEXT NOT NULL, created_at_utc TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN (\'alerted\',\'suppressed_backfill\')), alerted_at TEXT, suppressed_at TEXT, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', CHECK((disposition = \'alerted\' AND alerted_at IS NOT NULL AND suppressed_at IS NULL) OR (disposition = \'suppressed_backfill\' AND suppressed_at IS NOT NULL AND alerted_at IS NULL)), UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, threshold) ); CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_active ON quota_threshold_events(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc, threshold); CREATE TABLE IF NOT EXISTS quota_projection_state ( source_root_key TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', generation TEXT NOT NULL, physical_signature TEXT NOT NULL, completed_at_utc TEXT NOT NULL, PRIMARY KEY(source_root_key, account_key) ); -- public #5: everything the incremental projector needs to know about -- its own last pass, keyed by provider source. One row, read once per -- reconcile. -- -- `watermark_seq` is the highest `quota_window_change_log.seq` this -- index has consumed. It is written INSIDE the same stats transaction -- as the projection it describes, so the two commit or roll back -- together; a crash therefore replays a ledger range rather than -- skipping one, which is safe because re-materializing a group is -- idempotent. (Writing it after the commit would need a second stats -- transaction, and `run_stats_ingest` is the sole stats writer.) -- -- `interpretation_version` invalidates the mechanism itself: a -- classification change alters interpreted keys with no row mutation -- for the ledger to observe, so a bump queues one complete pass. -- -- `alerts_enabled` / `next_evaluation_at_utc` are the two alert axes -- that are not functions of window dirtiness — a delivery-gate -- transition, and a future-clocked observation that becomes eligible -- when wall time passes it with no row mutation at all. -- `next_evaluation_by_root_json` owns that scalar minimum: one earliest -- future capture per root, so a due hook tick can reconcile only the -- roots whose instants matured. -- -- `last_full_pass_at` is the periodic verification\'s deadline. Two -- cases a scoped sweep structurally cannot see — a block whose physical -- group is absent from the cache entirely, and a milestone on a historic -- root no longer active — are otherwise repairable only by an -- interpretation bump, a rebuild or a burst overflow, none of which -- happen on a normal install. Every full pass stamps it, whatever -- triggered it, so the deadline is satisfied by whichever caller reaches -- it first and the bound on staleness is one interval rather than -- forever. NULL means "never verified", which reads as due. CREATE TABLE IF NOT EXISTS quota_projection_ledger_state ( source TEXT NOT NULL, watermark_seq INTEGER NOT NULL DEFAULT 0, interpretation_version INTEGER NOT NULL DEFAULT 0, alerts_enabled INTEGER, next_evaluation_at_utc TEXT, last_full_pass_at TEXT, next_evaluation_by_root_json TEXT NOT NULL DEFAULT \'{}\', PRIMARY KEY(source) ); -- #661 S2 §6: a provider metering-rate transition, recorded from the -- first upgrade whether or not notification is enabled (§6.2). The -- row is the durable forward-only latch: its presence is what stops -- the same transition alerting twice, and it survives a stats.db -- rebuild because the journal event that created it carries a -- self-sufficient payload (§6.5). -- -- The identity is `(provider, account_key, effective_from)` and the -- promise is stated at exactly that precision — once per exact key, -- not "once per provider regime". `reduce_state` closes and -- re-creates regimes on a fingerprint change and a revised detector -- can select a different `effective_from` for the same underlying -- transition; separately, R8 can turn a formerly merged identity into -- a real account key. Both produce a new key for a transition a human -- would call the same one. The FINGERPRINT stays out of the key -- deliberately: including it would re-alert on our own algorithm -- revisions. -- #690 / #692 (epoch 1012) adds the last four columns: the disclosure -- evidence captured at DETECTION time, stored as four independent -- facts rather than one merged status taxonomy. Folding the baseline -- count into `withholding_status` would make an otherwise healthy -- successor read as currently withheld. -- -- NULL, an empty array and 0 are THREE distinct states and every -- consumer must preserve the distinction: NULL means legacy or -- unrecoverable evidence, an empty typed set means assessed with no -- such origin, 0 means a clean baseline, and a positive count means -- thin baseline evidence. The #689 regime-recovery route sees stored -- calibration regimes and no `QuotaAnalysis` at all, and all four -- values are analysis-derived, so on that route all four are NULL by -- construction — which is why every one of them is nullable. -- -- `detector_input_causes` and `composition_provenance` hold canonical -- JSON arrays of enum VALUES, never their `repr`, so a sixth -- `CompositionProvenance` origin added later cannot silently alias -- onto an existing one. `baseline_withheld_days` carries -- `baseline_fit.population["withheld"]` — the count of fenced -- observations carrying a cause that fall strictly BEFORE -- `window_start` — as a count rather than a boolean, so zero, one and -- many stay distinguishable and honest copy stays possible. -- -- These comments sit OUTSIDE the statement deliberately: SQLite -- stores the CREATE TABLE text verbatim, so a comment written inside -- it lands in `sqlite_schema.sql`, in every `iterdump()` golden and -- in `_REBUILD_SCHEMA_FINGERPRINT`. CREATE TABLE IF NOT EXISTS meter_rate_change_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', effective_from TEXT NOT NULL, previous_units_per_point REAL NOT NULL, new_units_per_point REAL NOT NULL, severity TEXT NOT NULL, detected_at_utc TEXT NOT NULL, created_at_utc TEXT NOT NULL, notified_at TEXT, withholding_status TEXT, detector_input_causes TEXT, composition_provenance TEXT, baseline_withheld_days INTEGER, UNIQUE(provider, account_key, effective_from) ); CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key ON meter_rate_change_events(provider, account_key, effective_from); CREATE TABLE IF NOT EXISTS quota_alert_arming ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), rule_fingerprint TEXT NOT NULL, activated_at_utc TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes) );',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS quota_window_blocks ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), limit_id TEXT, limit_name TEXT, resets_at_utc TEXT NOT NULL, nominal_start_at_utc TEXT NOT NULL, first_observed_at_utc TEXT NOT NULL, last_observed_at_utc TEXT NOT NULL, first_percent REAL NOT NULL, current_percent REAL NOT NULL, last_source_path TEXT NOT NULL, last_line_offset INTEGER NOT NULL, generation TEXT NOT NULL, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', -- public #5: the REVERSE MAP. `physical_group_key` records the -- physical window this block was materialized from, so the -- generation sweep can be scoped to the groups a bounded pass -- actually re-materialized instead of to whole roots. -- `physical_group_digest` is that group\'s contribution to its -- root\'s physical signature: the root value is a digest over the -- root\'s sorted (group key, group digest) pairs, which makes it -- ASSOCIATIVE. A bounded pass recomputes only the dirty groups\' -- digests and re-derives the root value from the stored set — -- O(groups), 608 on the real store, against O(observations) at -- 211K. Hanging it off the blocks is what makes it self-maintaining: -- a group swept to nothing loses its blocks and drops out of the -- composition with them. physical_group_key TEXT, physical_group_digest TEXT, UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc) ); CREATE INDEX IF NOT EXISTS idx_quota_blocks_active ON quota_window_blocks(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc); CREATE TABLE IF NOT EXISTS quota_percent_milestones ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), resets_at_utc TEXT NOT NULL, percent_threshold INTEGER NOT NULL CHECK(percent_threshold BETWEEN 1 AND 100), captured_at_utc TEXT NOT NULL, source_path TEXT NOT NULL, line_offset INTEGER NOT NULL, high_water_percent INTEGER NOT NULL CHECK(high_water_percent BETWEEN 1 AND 100), generation TEXT NOT NULL, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, percent_threshold) ); CREATE INDEX IF NOT EXISTS idx_quota_milestones_active ON quota_percent_milestones(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc, percent_threshold); CREATE TABLE IF NOT EXISTS quota_threshold_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), resets_at_utc TEXT NOT NULL, threshold INTEGER NOT NULL CHECK(threshold BETWEEN 1 AND 100), qualifying_kind TEXT NOT NULL CHECK(qualifying_kind IN (\'actual\',\'projected\')), qualifying_percent REAL, projected_percent REAL, severity TEXT NOT NULL, created_at_utc TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN (\'alerted\',\'suppressed_backfill\')), alerted_at TEXT, suppressed_at TEXT, orphaned_at TEXT, account_key TEXT NOT NULL DEFAULT \'unattributed\', CHECK((disposition = \'alerted\' AND alerted_at IS NOT NULL AND suppressed_at IS NULL) OR (disposition = \'suppressed_backfill\' AND suppressed_at IS NOT NULL AND alerted_at IS NULL)), UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes, resets_at_utc, threshold) ); CREATE INDEX IF NOT EXISTS idx_quota_threshold_events_active ON quota_threshold_events(source, source_root_key, account_key, orphaned_at, logical_limit_key, observed_slot, window_minutes, resets_at_utc, threshold); CREATE TABLE IF NOT EXISTS quota_projection_state ( source_root_key TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', generation TEXT NOT NULL, physical_signature TEXT NOT NULL, completed_at_utc TEXT NOT NULL, PRIMARY KEY(source_root_key, account_key) ); -- public #5: everything the incremental projector needs to know about -- its own last pass, keyed by provider source. One row, read once per -- reconcile. -- -- `watermark_seq` is the highest `quota_window_change_log.seq` this -- index has consumed. It is written INSIDE the same stats transaction -- as the projection it describes, so the two commit or roll back -- together; a crash therefore replays a ledger range rather than -- skipping one, which is safe because re-materializing a group is -- idempotent. (Writing it after the commit would need a second stats -- transaction, and `run_stats_ingest` is the sole stats writer.) -- -- `interpretation_version` invalidates the mechanism itself: a -- classification change alters interpreted keys with no row mutation -- for the ledger to observe, so a bump queues one complete pass. -- -- `alerts_enabled` / `next_evaluation_at_utc` are the two alert axes -- that are not functions of window dirtiness — a delivery-gate -- transition, and a future-clocked observation that becomes eligible -- when wall time passes it with no row mutation at all. -- `next_evaluation_by_root_json` owns that scalar minimum: one earliest -- future capture per root, so a due hook tick can reconcile only the -- roots whose instants matured. -- -- `last_full_pass_at` is the periodic verification\'s deadline. Two -- cases a scoped sweep structurally cannot see — a block whose physical -- group is absent from the cache entirely, and a milestone on a historic -- root no longer active — are otherwise repairable only by an -- interpretation bump, a rebuild or a burst overflow, none of which -- happen on a normal install. Every full pass stamps it, whatever -- triggered it, so the deadline is satisfied by whichever caller reaches -- it first and the bound on staleness is one interval rather than -- forever. NULL means "never verified", which reads as due. CREATE TABLE IF NOT EXISTS quota_projection_ledger_state ( source TEXT NOT NULL, watermark_seq INTEGER NOT NULL DEFAULT 0, interpretation_version INTEGER NOT NULL DEFAULT 0, alerts_enabled INTEGER, next_evaluation_at_utc TEXT, last_full_pass_at TEXT, next_evaluation_by_root_json TEXT NOT NULL DEFAULT \'{}\', PRIMARY KEY(source) ); -- #661 S2 §6: a provider metering-rate transition, recorded from the -- first upgrade whether or not notification is enabled (§6.2). The -- row is the durable forward-only latch: its presence is what stops -- the same transition alerting twice, and it survives a stats.db -- rebuild because the journal event that created it carries a -- self-sufficient payload (§6.5). -- -- The identity is `(provider, account_key, effective_from)` and the -- promise is stated at exactly that precision — once per exact key, -- not "once per provider regime". `reduce_state` closes and -- re-creates regimes on a fingerprint change and a revised detector -- can select a different `effective_from` for the same underlying -- transition; separately, R8 can turn a formerly merged identity into -- a real account key. Both produce a new key for a transition a human -- would call the same one. The FINGERPRINT stays out of the key -- deliberately: including it would re-alert on our own algorithm -- revisions. -- #690 / #692 (epoch 1012) adds the last four columns: the disclosure -- evidence captured at DETECTION time, stored as four independent -- facts rather than one merged status taxonomy. Folding the baseline -- count into `withholding_status` would make an otherwise healthy -- successor read as currently withheld. -- -- NULL, an empty array and 0 are THREE distinct states and every -- consumer must preserve the distinction: NULL means legacy or -- unrecoverable evidence, an empty typed set means assessed with no -- such origin, 0 means a clean baseline, and a positive count means -- thin baseline evidence. The #689 regime-recovery route sees stored -- calibration regimes and no `QuotaAnalysis` at all, and all four -- values are analysis-derived, so on that route all four are NULL by -- construction — which is why every one of them is nullable. -- -- `detector_input_causes` and `composition_provenance` hold canonical -- JSON arrays of enum VALUES, never their `repr`, so a sixth -- `CompositionProvenance` origin added later cannot silently alias -- onto an existing one. `baseline_withheld_days` carries -- `baseline_fit.population["withheld"]` — the count of fenced -- observations carrying a cause that fall strictly BEFORE -- `window_start` — as a count rather than a boolean, so zero, one and -- many stay distinguishable and honest copy stays possible. -- -- These comments sit OUTSIDE the statement deliberately: SQLite -- stores the CREATE TABLE text verbatim, so a comment written inside -- it lands in `sqlite_schema.sql`, in every `iterdump()` golden and -- in `_REBUILD_SCHEMA_FINGERPRINT`. CREATE TABLE IF NOT EXISTS meter_rate_change_events ( id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', effective_from TEXT NOT NULL, previous_units_per_point REAL NOT NULL, new_units_per_point REAL NOT NULL, severity TEXT NOT NULL, detected_at_utc TEXT NOT NULL, created_at_utc TEXT NOT NULL, notified_at TEXT, withholding_status TEXT, detector_input_causes TEXT, composition_provenance TEXT, baseline_withheld_days INTEGER, fit_lineage TEXT, UNIQUE(provider, account_key, effective_from) ); CREATE INDEX IF NOT EXISTS idx_meter_rate_change_events_key ON meter_rate_change_events(provider, account_key, effective_from); -- #1015 epoch 1022 (spec 5.7). `fit_lineage` above is the canonical -- JSON lineage of the fits a transition compared, NULL on a row -- detected before #1015. `meter_rate_change_supersessions` is the -- terminal, idempotent projection of the journalled -- `meter_rate_change_supersession` event: one row per superseded -- transition identity, `corrections` the canonical JSON op ids. CREATE TABLE IF NOT EXISTS meter_rate_change_supersessions ( provider TEXT NOT NULL, account_key TEXT NOT NULL, effective_from TEXT NOT NULL, reason TEXT NOT NULL, corrections TEXT NOT NULL, superseded_at_utc TEXT NOT NULL, created_at_utc TEXT NOT NULL, PRIMARY KEY (provider, account_key, effective_from) ); CREATE TABLE IF NOT EXISTS quota_alert_arming ( id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_root_key TEXT NOT NULL, logical_limit_key TEXT NOT NULL, observed_slot TEXT NOT NULL, window_minutes INTEGER NOT NULL CHECK(window_minutes > 0), rule_fingerprint TEXT NOT NULL, activated_at_utc TEXT NOT NULL, account_key TEXT NOT NULL DEFAULT \'unattributed\', UNIQUE(source, source_root_key, account_key, logical_limit_key, observed_slot, window_minutes) );',
         table='quota_window_blocks',
         keys=(),
         predicate='',
@@ -634,6 +649,84 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=MAINT,
     ),
+    # #1015 epoch 1022 (spec 5.1): the correction-to-fit lineage
+    # projections, created by open_db's schema block beside
+    # `claude_weekly_observation_decisions`: the observation index and its
+    # (account_key, captured_at_utc) index, the reviewed decision history,
+    # the decision op coordinates, and the completed batch lineage with its
+    # footprint. Schema-only statements run at open, so MAINT.
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE INDEX IF NOT EXISTS idx_claude_weekly_observation_index_window ON claude_weekly_observation_index (account_key, captured_at_utc)',
+        table='claude_weekly_observation_index',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint="CREATE TABLE IF NOT EXISTS claude_weekly_correction_history ( decision_op_id TEXT NOT NULL, observation_id TEXT NOT NULL, disposition TEXT NOT NULL CHECK(disposition IN ('hold','retract','accept')), PRIMARY KEY (decision_op_id, observation_id) )",
+        table='claude_weekly_correction_history',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_weekly_correction_ops ( decision_op_id TEXT PRIMARY KEY, op_segment TEXT NOT NULL, op_offset INTEGER NOT NULL )',
+        table='claude_weekly_correction_ops',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS claude_weekly_observation_index ( observation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, captured_at_utc TEXT NOT NULL )',
+        table='claude_weekly_observation_index',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS correction_batch_footprint ( batch_id TEXT NOT NULL, provider TEXT NOT NULL, account_key TEXT NOT NULL, PRIMARY KEY (batch_id, provider, account_key) )',
+        table='correction_batch_footprint',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS correction_batch_lineage ( batch_id TEXT PRIMARY KEY, commit_segment TEXT NOT NULL, commit_offset INTEGER NOT NULL )',
+        table='correction_batch_lineage',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint="CREATE TABLE IF NOT EXISTS five_hour_block_models ( id INTEGER PRIMARY KEY AUTOINCREMENT, block_id INTEGER NOT NULL, five_hour_window_key INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cache_create_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0, entry_count INTEGER NOT NULL DEFAULT 0, account_key TEXT NOT NULL DEFAULT 'unattributed', UNIQUE(account_key, five_hour_window_key, model), FOREIGN KEY (block_id) REFERENCES five_hour_blocks(id) )",
@@ -672,8 +765,38 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state ( account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, source TEXT NOT NULL, baseline_pct REAL NOT NULL, pending_low_pct REAL, pending_at_utc TEXT, pending_observation_id TEXT, baseline_observation_id TEXT, baseline_generation TEXT, pending_generation TEXT, pending_position TEXT, PRIMARY KEY (account_key, five_hour_window_key, source) )',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_credit_confirmation_state ( account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, source TEXT NOT NULL, baseline_pct REAL NOT NULL, pending_low_pct REAL, pending_at_utc TEXT, pending_observation_id TEXT, baseline_observation_id TEXT, baseline_generation TEXT, pending_generation TEXT, pending_position TEXT, pending_captured_at_utc TEXT, PRIMARY KEY (account_key, five_hour_window_key, source) )',
         table='five_hour_credit_confirmation_state',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    # #943 T3 (spec 4.7): the exact-boundary companion of a five-hour credit,
+    # a harvest family (prefix `fhcb`, order 29) keyed by the credit's
+    # natural key. Schema creation only.
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_credit_boundaries ( id INTEGER PRIMARY KEY, account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, effective_reset_at_utc TEXT NOT NULL, boundary_at_utc TEXT NOT NULL, arming_observation_id TEXT NOT NULL, credit_revision TEXT NOT NULL, detected_at_utc TEXT NOT NULL, journal_id TEXT, UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc) )',
+        table='five_hour_credit_boundaries',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    # #956 T5 (spec 4.6.3): the opening fact of a five-hour block, a harvest
+    # family (prefix `fhbo`, order 35) keyed by the block's natural key.
+    # Schema creation only.
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS five_hour_block_openings ( id INTEGER PRIMARY KEY, account_key TEXT NOT NULL, five_hour_window_key INTEGER NOT NULL, five_hour_resets_at TEXT NOT NULL, block_start_at TEXT NOT NULL, first_observed_at_utc TEXT NOT NULL, created_at_utc TEXT NOT NULL, opening_record_id TEXT NOT NULL, creation_kind TEXT NOT NULL, five_hour_percent REAL NOT NULL, seven_day_pct_at_block_start REAL, weekly_observation_held INTEGER NOT NULL DEFAULT 0, weekly_basis_captured_at_utc TEXT, journal_id TEXT, UNIQUE(account_key, five_hour_window_key) )',
+        table='five_hour_block_openings',
         keys=(),
         predicate='',
         ordering='',
@@ -792,8 +915,8 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS outcome_quarantine_certificates (account_key TEXT PRIMARY KEY, accounting_certificate_json TEXT, accounting_trigger_seq INTEGER, control_certificate_json TEXT, control_trigger_seq INTEGER)',
-        table='outcome_quarantine_certificates',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS outcome_quarantine_axis_state (generation INTEGER NOT NULL, account_key TEXT NOT NULL, axis TEXT NOT NULL, state TEXT NOT NULL, waiting_for TEXT, coverage_id TEXT, witness_id TEXT, release_id TEXT, revocation TEXT, since TEXT, recovered_at TEXT, not_before INTEGER, witness_key TEXT, PRIMARY KEY (generation, account_key, axis))',
+        table='outcome_quarantine_axis_state',
         keys=(),
         predicate='',
         ordering='',
@@ -804,8 +927,20 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_core:open_db',
-        sql_fingerprint='CREATE TABLE IF NOT EXISTS outcome_quarantine_envelope (scope TEXT PRIMARY KEY, envelope_json TEXT NOT NULL)',
-        table='outcome_quarantine_envelope',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS outcome_quarantine_bounds (scope TEXT NOT NULL, axis TEXT NOT NULL, bounds_json TEXT NOT NULL, PRIMARY KEY (scope, axis))',
+        table='outcome_quarantine_bounds',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_core:open_db',
+        sql_fingerprint='CREATE TABLE IF NOT EXISTS outcome_quarantine_episodes (opener_segment TEXT, opener_offset INTEGER, opened_at TEXT, closer_segment TEXT, closer_offset INTEGER, closed_at TEXT, PRIMARY KEY (opener_segment, opener_offset))',
+        table='outcome_quarantine_episodes',
         keys=(),
         predicate='',
         ordering='',
@@ -1089,10 +1224,55 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # predicates, ordering, selected columns, execution condition and
     # read-only effect are unchanged and the contract and its MAINT inert
     # rule stand.
+    # Reviewed re-pin (#1019/#1014 Task A, base 5b15db929), for open_db #1,
+    # #2 and #3. Changed: only bindings these sites read through `open_db`'s
+    # closure — `STATS_INDEX_EPOCH` 1019 -> 1020 (spec 4.7 C6), and the
+    # `_init_paths_from_env` assignments of APP_DIR, DB_PATH, LOG_DIR,
+    # HOOK_TICK_LOG_DIR and STATUSLINE_ACCOUNT_BOUND_DIR, whose statements
+    # changed because the same function now also assigns the retired v2 root
+    # and the revision-3 cache path and names the v3 root. DB_PATH's value is
+    # unchanged. No SQL, table selection, predicate, ordering, selected column,
+    # execution condition or effect changed, so each contract and its MAINT
+    # inert rule stand.
+    # Reviewed re-pin (#943 T3, base c5419d209), for open_db #1. Changed: only
+    # bindings this site reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7)
+    # and the producer `open_db` itself, whose epoch-1021 schema block now
+    # also creates `five_hour_credit_boundaries` with its two journal-id
+    # indexes and creates `five_hour_credit_confirmation_state` with the
+    # NULLABLE `pending_captured_at_utc` column; those are literal statements,
+    # registered as their own MAINT contracts. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for open_db #1. Changed: only
+    # the producer `open_db` itself, whose epoch-1021 schema block now also
+    # creates `five_hour_block_openings` (the #956 class-2 opening fact, spec
+    # 4.6.3) and lists it in the two journal-id index loops; the CREATE TABLE is
+    # a literal statement, registered as its own MAINT contract. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for open_db #1. Changed: the
+    # binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1) and the producer
+    # `open_db` itself, whose epoch-1022 schema block now also creates
+    # `claude_weekly_observation_index` with its (account_key,
+    # captured_at_utc) index, `claude_weekly_correction_history`,
+    # `claude_weekly_correction_ops`, `correction_batch_lineage` and
+    # `correction_batch_footprint`; those are literal statements, registered
+    # as their own MAINT contracts. No SQL, table selection, predicate,
+    # ordering, selected column, execution condition or effect of this site
+    # changed, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#948 T-A, base 7e2ea2411), for open_db #1, #2 and #3.
+    # Changed: the binding `STATS_INDEX_EPOCH` 1022 -> 1023 and the producer
+    # `open_db` itself, whose epoch-1023 schema block no longer creates
+    # `outcome_quarantine_envelope` / `outcome_quarantine_certificates` and
+    # now creates `outcome_quarantine_episodes`, `outcome_quarantine_bounds`
+    # and `outcome_quarantine_axis_state`; those are literal statements,
+    # registered as their own MAINT contracts. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # these sites changed, so each contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#1',
-        sql_shape='sha256:447a3914f169d52f',
+        sql_shape='sha256:61bf241458c1f433',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1102,10 +1282,36 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for open_db #2. Changed: only
+    # bindings this site reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7)
+    # and the producer `open_db` itself, whose epoch-1021 schema block now
+    # also creates `five_hour_credit_boundaries` with its two journal-id
+    # indexes and creates `five_hour_credit_confirmation_state` with the
+    # NULLABLE `pending_captured_at_utc` column; those are literal statements,
+    # registered as their own MAINT contracts. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for open_db #2. Changed: only
+    # the producer `open_db` itself, whose epoch-1021 schema block now also
+    # creates `five_hour_block_openings` (the #956 class-2 opening fact, spec
+    # 4.6.3) and lists it in the two journal-id index loops; the CREATE TABLE is
+    # a literal statement, registered as its own MAINT contract. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for open_db #2. Changed: the
+    # binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1) and the producer
+    # `open_db` itself, whose epoch-1022 schema block now also creates
+    # `claude_weekly_observation_index` with its (account_key,
+    # captured_at_utc) index, `claude_weekly_correction_history`,
+    # `claude_weekly_correction_ops`, `correction_batch_lineage` and
+    # `correction_batch_footprint`; those are literal statements, registered
+    # as their own MAINT contracts. No SQL, table selection, predicate,
+    # ordering, selected column, execution condition or effect of this site
+    # changed, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#2',
-        sql_shape='sha256:596eea4ecd91f526',
+        sql_shape='sha256:7d7365dfd8acf5d3',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1115,10 +1321,36 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for open_db #3. Changed: only
+    # bindings this site reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7)
+    # and the producer `open_db` itself, whose epoch-1021 schema block now
+    # also creates `five_hour_credit_boundaries` with its two journal-id
+    # indexes and creates `five_hour_credit_confirmation_state` with the
+    # NULLABLE `pending_captured_at_utc` column; those are literal statements,
+    # registered as their own MAINT contracts. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for open_db #3. Changed: only
+    # the producer `open_db` itself, whose epoch-1021 schema block now also
+    # creates `five_hour_block_openings` (the #956 class-2 opening fact, spec
+    # 4.6.3) and lists it in the two journal-id index loops; the CREATE TABLE is
+    # a literal statement, registered as its own MAINT contract. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for open_db #3. Changed: the
+    # binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1) and the producer
+    # `open_db` itself, whose epoch-1022 schema block now also creates
+    # `claude_weekly_observation_index` with its (account_key,
+    # captured_at_utc) index, `claude_weekly_correction_history`,
+    # `claude_weekly_correction_ops`, `correction_batch_lineage` and
+    # `correction_batch_footprint`; those are literal statements, registered
+    # as their own MAINT contracts. No SQL, table selection, predicate,
+    # ordering, selected column, execution condition or effect of this site
+    # changed, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_core:open_db',
         sql_fingerprint='dynamic:_cctally_core:open_db#3',
-        sql_shape='sha256:425db89e4d3c5003',
+        sql_shape='sha256:d3d6289b75b86c2f',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1216,10 +1448,23 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton', 'range-keyed'),
         inert_rule=ACCOUNTS,
     ),
+    # Reviewed re-pin (#980 D3, base 5b021b820), for _apply_quota_records #1
+    # and #2. Changed (`~ producer`): only the producer's bookkeeping around
+    # its two dynamic statements. It now compares `cache.total_changes`
+    # before and after the batch, collects each executed record's root,
+    # raw reset and canonical anchor into in-memory spans, and, when the
+    # batch changed rows, calls `_cctally_cache.add_codex_finalization_debt`
+    # (a `cache_meta` read and write) with `model` from
+    # `_codex_unresolved_quota_model_exists` (one indexed probe of
+    # `quota_window_snapshots`), all on the same cache.db connection and
+    # transaction. The natural-key read and the INSERT/UPSERT this pin
+    # covers keep their table selection, predicate, ordering, selected
+    # columns, parameter construction, execution conditions and effects, so
+    # the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_apply_quota_records',
         sql_fingerprint='dynamic:_cctally_journal:_apply_quota_records#1',
-        sql_shape='sha256:8e0e66814fdb3614',
+        sql_shape='sha256:265c580d51dc9ea0',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1232,7 +1477,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_journal:_apply_quota_records',
         sql_fingerprint='dynamic:_cctally_journal:_apply_quota_records#2',
-        sql_shape='sha256:e6027d234f49f83b',
+        sql_shape='sha256:b1a8eedf9a7f98c9',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1242,9 +1487,14 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=CODEX,
     ),
+    # #1015 T7 contract review: the evidence backfill also fills the
+    # nullable `fit_lineage` column (spec 5.6) with COALESCE, so a lineage
+    # already folded is never erased. Same table, natural-key predicate and
+    # write effect; the column is read only by the calibration lineage
+    # readers, never by a detector decision.
     AccessContract(
         function='_cctally_journal:_backfill_meter_rate_change_evidence',
-        sql_fingerprint='UPDATE meter_rate_change_events SET withholding_status = COALESCE(withholding_status, ?), detector_input_causes = COALESCE(detector_input_causes, ?), composition_provenance = COALESCE(composition_provenance, ?), baseline_withheld_days = COALESCE(baseline_withheld_days, ?) WHERE provider = ? AND account_key = ? AND effective_from = ?',
+        sql_fingerprint='UPDATE meter_rate_change_events SET withholding_status = COALESCE(withholding_status, ?), detector_input_causes = COALESCE(detector_input_causes, ?), composition_provenance = COALESCE(composition_provenance, ?), baseline_withheld_days = COALESCE(baseline_withheld_days, ?), fit_lineage = COALESCE(fit_lineage, ?) WHERE provider = ? AND account_key = ? AND effective_from = ?',
         table='meter_rate_change_events',
         keys=('provider', 'account_key', 'effective_from'),
         predicate='provider = ? AND account_key = ? AND effective_from = ?',
@@ -1331,10 +1581,48 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # and `UPDATE ... WHERE id = ?`, their keys, predicates, execution
     # conditions and effects are unchanged, so the contracts and their inert
     # rules stand.
+    # Reviewed re-pin (#1019/#1014 Task A, base 5b15db929), for both sites.
+    # Changed: `_lib_account_protocol.strip_stamp` now also strips `wpx`
+    # (new bindings SUCCESSOR_REVISION_KEY and _STAMP_KEYS), the semantic
+    # comparison of a converged event, and the `_init_paths_from_env` path
+    # assignments (see open_db above). The target-table SELECT/UPDATE, keys,
+    # predicates, execution conditions and effects are unchanged, so the
+    # contracts and inert rules stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for
+    # _converge_row_from_effective #1. Changed: the producer, which now ends
+    # with the opening fact's coupled convergence (`_converge_opened_block`, its
+    # statements registered as their own contracts) when the target is
+    # `five_hour_block_openings`; and the `_EVT_SPECS` binding, whose
+    # `five_hour_block_open` spec carries the applier
+    # `_apply_five_hour_block_open`, so the closure now follows it into
+    # `_apply_generic_evt` (and from there `_insert_or_ignore`,
+    # `_resolve_fold_ref`, `_resolve_ref`, `_derived_fk_value`,
+    # `_report_unresolved_fold_reference`, `_SUPPRESSIBLE_FOLD_REFS`,
+    # `JournalError`, `UnresolvedFoldReference`), `_block_opening_row` and
+    # `_materialize_opened_block`. This site still reads `spec.table` from the
+    # spec, never its applier, and the dynamic statement it executes is
+    # unchanged. No SQL, table selection, predicate, ordering, selected column,
+    # execution condition or effect of this site changed, so the contract and
+    # its inert rule stand.
+    # Reviewed re-pin (#1015 T7, base 7455ca434), for _converge_row_from_effective #1. Changed: only the
+    # fold machinery this site reaches through bindings: `_EVT_SPECS` gained
+    # the table-less `meter_rate_change_supersession` spec (order 46), whose
+    # applier `_apply_meter_rate_change_supersession` calls
+    # `_insert_meter_rate_change_supersession` (a literal INSERT OR IGNORE,
+    # registered as its own contract) and reads `MRC_SUPERSESSION_REASON`
+    # and `_canonical_json_or_none`; `_MeterRateChangeRow` gained the
+    # nullable `fit_lineage` field, which `_meter_rate_change_row` fills
+    # through `_canonical_json_or_none` and
+    # `_backfill_meter_rate_change_evidence` COALESCEs (its literal UPDATE is
+    # reviewed beside its own contract). A table-less spec returns
+    # `CONVERGE_DROPPED` before this site's statement, which still names the
+    # spec's table. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_converge_row_from_effective',
         sql_fingerprint='dynamic:_cctally_journal:_converge_row_from_effective#1',
-        sql_shape='sha256:d325c0f9da12ebb6',
+        sql_shape='sha256:b92199c9a76d4a20',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1344,10 +1632,41 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#956 T5, base af10118c7), for
+    # _converge_row_from_effective #2. Changed: the producer, which now ends
+    # with the opening fact's coupled convergence (`_converge_opened_block`, its
+    # statements registered as their own contracts) when the target is
+    # `five_hour_block_openings`; and the `_EVT_SPECS` binding, whose
+    # `five_hour_block_open` spec carries the applier
+    # `_apply_five_hour_block_open`, so the closure now follows it into
+    # `_apply_generic_evt` (and from there `_insert_or_ignore`,
+    # `_resolve_fold_ref`, `_resolve_ref`, `_derived_fk_value`,
+    # `_report_unresolved_fold_reference`, `_SUPPRESSIBLE_FOLD_REFS`,
+    # `JournalError`, `UnresolvedFoldReference`), `_block_opening_row` and
+    # `_materialize_opened_block`. This site still reads `spec.table` from the
+    # spec, never its applier, and the dynamic statement it executes is
+    # unchanged. No SQL, table selection, predicate, ordering, selected column,
+    # execution condition or effect of this site changed, so the contract and
+    # its inert rule stand.
+    # Reviewed re-pin (#1015 T7, base 7455ca434), for _converge_row_from_effective #2. Changed: only the
+    # fold machinery this site reaches through bindings: `_EVT_SPECS` gained
+    # the table-less `meter_rate_change_supersession` spec (order 46), whose
+    # applier `_apply_meter_rate_change_supersession` calls
+    # `_insert_meter_rate_change_supersession` (a literal INSERT OR IGNORE,
+    # registered as its own contract) and reads `MRC_SUPERSESSION_REASON`
+    # and `_canonical_json_or_none`; `_MeterRateChangeRow` gained the
+    # nullable `fit_lineage` field, which `_meter_rate_change_row` fills
+    # through `_canonical_json_or_none` and
+    # `_backfill_meter_rate_change_evidence` COALESCEs (its literal UPDATE is
+    # reviewed beside its own contract). A table-less spec returns
+    # `CONVERGE_DROPPED` before this site's statement, which still names the
+    # spec's table. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_converge_row_from_effective',
         sql_fingerprint='dynamic:_cctally_journal:_converge_row_from_effective#2',
-        sql_shape='sha256:d92a33339d28a17e',
+        sql_shape='sha256:a43354e85f72febd',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1440,6 +1759,14 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#956 T5, base af10118c7), for _delete_scratch_row #1.
+    # Changed: only the producer, which now first calls `_remove_opened_block`
+    # (its statements registered as their own contracts) when the table is
+    # `five_hour_block_openings`, so a tombstoned opening takes the open block
+    # it materialized with it (spec 4.6.3). The `DELETE FROM {table} WHERE id =
+    # ?` this pin covers is unchanged. No SQL, table selection, predicate,
+    # ordering, selected column, execution condition or effect of this site
+    # changed, so the contract and its inert rule stand.
     AccessContract(
         # #825/#832 fix round E: a derivation-completion scratch replay
         # removes the one row a retained tombstone says does not exist, on
@@ -1447,7 +1774,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         # a journal family's own (`_HARVEST_SPECS`/`_EVT_SPECS`).
         function='_cctally_journal:_delete_scratch_row',
         sql_fingerprint='dynamic:_cctally_journal:_delete_scratch_row#1',
-        sql_shape='sha256:25eb83cb79df6e1e',
+        sql_shape='sha256:24df60c360ccd098',
         table='dynamic',
         keys=('id',),
         predicate='id = ? on a scratch projection (a journal family table)',
@@ -1469,10 +1796,25 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for _harvest #1. Changed:
+    # only bindings this site reads — `_HARVEST_SPECS`, which gains the
+    # `five_hour_credit_boundary` spec (table `five_hour_credit_boundaries`,
+    # prefix `fhcb`, order 29). The site iterates the specs generically, so
+    # the new family is harvested by the same statement shapes as every other
+    # harvest family. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for _harvest #1. Changed: only
+    # the `_HARVEST_SPECS` binding, which gains the `five_hour_block_open` spec
+    # (table `five_hour_block_openings`, prefix `fhbo`, order 35). The site
+    # iterates the specs generically, so the new family is harvested by the same
+    # statement shapes as every other harvest family. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_harvest',
         sql_fingerprint='dynamic:_cctally_journal:_harvest#1',
-        sql_shape='sha256:3e35b6ce53d6446a',
+        sql_shape='sha256:eeb08bab185c5989',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1494,10 +1836,17 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#1015 T7, base 7455ca434), for _insert_meter_rate_change #1. Changed: only the
+    # binding `_MeterRateChangeRow`, which gained the nullable `fit_lineage`
+    # field (spec 5.6), so the row-driven INSERT OR IGNORE column list also
+    # writes `fit_lineage`. Same table, natural-key conflict target, parameter
+    # construction and execution condition; the added column is read only
+    # by the calibration lineage readers, never by a detector decision, so
+    # the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_insert_meter_rate_change',
         sql_fingerprint='dynamic:_cctally_journal:_insert_meter_rate_change#1',
-        sql_shape='sha256:f0289da5c72e9295',
+        sql_shape='sha256:2c2d27ca4dddd598',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1506,6 +1855,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='read',
         classes=('cross-period',),
         inert_rule=JOURNAL,
+    ),
+    # #1015 T7: the `meter_rate_change_supersession` evt applier folds one
+    # explicit supersession by its natural key with INSERT OR IGNORE, so a
+    # replay or a duplicate repeats to the same row.
+    AccessContract(
+        function='_cctally_journal:_insert_meter_rate_change_supersession',
+        sql_fingerprint='INSERT OR IGNORE INTO meter_rate_change_supersessions (provider, account_key, effective_from, reason, corrections, superseded_at_utc, created_at_utc) VALUES (?,?,?,?,?,?,?)',
+        table='meter_rate_change_supersessions',
+        keys=('provider', 'account_key', 'effective_from'),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
     ),
     AccessContract(
         function='_cctally_journal:_insert_or_ignore',
@@ -1617,10 +1981,82 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=MAINT,
     ),
+    # #949: the replace mechanism's twin of the four sites above. It stamps
+    # the closed scratch on the scratch's own connection before `os.replace`,
+    # under the regime of the publishing rebuild.
+    AccessContract(
+        function='_cctally_journal:_stamp_replace_scratch',
+        sql_fingerprint='DELETE FROM stats_publication_stamp',
+        table='stats_publication_stamp',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_journal:_stamp_replace_scratch',
+        sql_fingerprint='INSERT INTO stats_publication_stamp (record_path, started_at_utc, stamped_at_utc) VALUES (?, ?, ?)',
+        table='stats_publication_stamp',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_journal:_stamp_replace_scratch',
+        sql_fingerprint="SELECT 1 FROM sqlite_schema WHERE type='table' AND name='journal_selector_state'",
+        table='journal_selector_state',
+        keys=(),
+        predicate="type='table' AND name='journal_selector_state'",
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=MAINT,
+    ),
+    AccessContract(
+        function='_cctally_journal:_stamp_replace_scratch',
+        sql_fingerprint='UPDATE journal_selector_state SET generation_record_path = ?, generation_stamped_at_utc = ?',
+        table='journal_selector_state',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=MAINT,
+    ),
+    # Reviewed re-pin (#1019/#1014 Task A, base 5b15db929), for all five
+    # `_publish_generation_in_place` sites. Changed: only the
+    # `STATS_INDEX_EPOCH` binding (1019 -> 1020) the publication stamps; the
+    # statements, tables, predicates and effects are unchanged.
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _publish_generation_in_place #1. Changed: only bindings this site reads
+    # — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for _publish_generation_in_place #1. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#948 T-A, base 7e2ea2411), for
+    # _publish_generation_in_place #1-#5, _rebuild_stats_index_locked #1 and
+    # stats_index_matches_journal_prefix #1. Changed: only the binding
+    # `STATS_INDEX_EPOCH` 1022 -> 1023 (and, for the rebuild site, its helper
+    # `open_db`, whose schema block changed as described at open_db #1). No
+    # SQL, table selection, predicate, ordering, selected column, execution
+    # condition or effect of these sites changed, so each contract and its
+    # inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#1',
-        sql_shape='sha256:dbbfb479a47a1d9c',
+        sql_shape='sha256:3dbfedf9486acbb9',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1630,10 +2066,19 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _publish_generation_in_place #2/#3/#5. Changed: only bindings this site
+    # reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for _publish_generation_in_place #2. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#2',
-        sql_shape='sha256:75c421b6460d6364',
+        sql_shape='sha256:cde6ffe8c29bd1a7',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1643,10 +2088,19 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _publish_generation_in_place #2/#3/#5. Changed: only bindings this site
+    # reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for _publish_generation_in_place #3. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#3',
-        sql_shape='sha256:75c421b6460d6364',
+        sql_shape='sha256:cde6ffe8c29bd1a7',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1656,10 +2110,19 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _publish_generation_in_place #4. Changed: only bindings this site reads
+    # — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for _publish_generation_in_place #4. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#4',
-        sql_shape='sha256:1ed2b4533f0fd067',
+        sql_shape='sha256:e42670f9ea1e0bc2',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1669,10 +2132,19 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=MAINT,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _publish_generation_in_place #2/#3/#5. Changed: only bindings this site
+    # reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for _publish_generation_in_place #5. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:_publish_generation_in_place',
         sql_fingerprint='dynamic:_cctally_journal:_publish_generation_in_place#5',
-        sql_shape='sha256:75c421b6460d6364',
+        sql_shape='sha256:cde6ffe8c29bd1a7',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1793,10 +2265,133 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # are unchanged; this site's `SELECT COUNT(*) FROM {tbl}` over
     # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
     # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1019/#1014 Task A, base 5b15db929). Changed:
+    # `STATS_INDEX_EPOCH` 1019 -> 1020, `_lib_journal.PROTOCOL_RESOLUTION_KINDS`
+    # gaining `journal_protocol_resolution_v4` (new PROTOCOL_RESOLUTION_V4_KIND
+    # bindings in both modules: the v4 repair acknowledgement, spec 4.7 C5)
+    # and the `_init_paths_from_env` path assignments (see open_db). The
+    # fold's SQL, tables, predicates and effects are unchanged, so the
+    # contract and its inert rule stand.
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # _rebuild_stats_index_locked #1. Changed: only bindings this site reads —
+    # `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7) and the producer `open_db`
+    # itself, whose epoch-1021 schema block now also creates
+    # `five_hour_credit_boundaries` with its two journal-id indexes and
+    # creates `five_hour_credit_confirmation_state` with the NULLABLE
+    # `pending_captured_at_utc` column; those are literal statements,
+    # registered as their own MAINT contracts. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T4, base 6528383a7), for
+    # _rebuild_stats_index_locked #1. Changed: only functions in the closure
+    # it reaches through Phase 2a's `_backfill_five_hour_blocks` —
+    # `_backfill_five_hour_blocks` (its open-candidate path now materializes
+    # start columns and refreshes every open block, its candidate ranking
+    # breaks ties by `journal_id`) and the new `OpenBlockEnd`,
+    # `select_open_block_end`, `project_open_block_end`,
+    # `_materialize_open_candidate` and `_refresh_every_open_block`, whose
+    # literal statements write the rebuild's private scratch index. None of
+    # them is the dynamic statement this pin covers; its table selection,
+    # predicate, ordering, selected columns, execution condition and effect
+    # are unchanged, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for _rebuild_stats_index_locked
+    # #1. Changed: the producer, whose Phase 2a now computes
+    # `retired_block_openings` beside `journaled_block_first_observations` and
+    # passes it to the backfill; `_backfill_five_hour_blocks`, which drops a
+    # tombstoned opening's window from the legacy open candidates;
+    # `select_open_block_end` and the `OpenBlockEnd` docstring, which project an
+    # opening's reading when the window has no readings (origin `opening`; the
+    # new seed read is registered as its own BLOCKS contract); and the helper
+    # `open_db` (see open_db above). None of them is the dynamic statement this
+    # pin covers. No SQL, table selection, predicate, ordering, selected column,
+    # execution condition or effect of this site changed, so the contract and
+    # its inert rule stand.
+    # Reviewed re-pin (#943 F-I1-1, base 63d4363dc), for
+    # _rebuild_stats_index_locked #1. Changed (`~ computed-by`): only
+    # `_apply_op_weekly_credit_floor`, reached through `FOLD_APPLIERS`, which
+    # for a `forced` op now also UPDATEs the `weekly_credit_floors` row at the
+    # same `(account_key, week_start_date, effective_at_utc)` slot to the
+    # forced op's journal id, observed level and applied time (a same-second
+    # `record-credit --force` takes the slot over instead of being IGNOREd).
+    # The applier already wrote that table; the new statement is a literal
+    # write the writer-surface freeze counts, not the dynamic statement this
+    # pin covers. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
+    # Reviewed re-pin (#980 D5, base 5b021b820), for
+    # _rebuild_stats_index_locked #1. Changed (`~ computed-by`
+    # `_maybe_truncate_wal`, `+ computed-by` `_cache_wal_truncate_due` and
+    # `_cache_wal_trigger_bytes`): the cache.db WAL size gate moved out of
+    # `_maybe_truncate_wal` into those two helpers so the budgeted Codex
+    # sync can record the TRUNCATE as owed maintenance. The gate is the same
+    # strict `-wal` size > `CACHE_WAL_CHECKPOINT_TRIGGER_BYTES` comparison
+    # with the same test override, and the checkpoint is a literal cache.db
+    # statement, not the dynamic statement this pin covers. No SQL, table
+    # selection, predicate, ordering, selected column, execution condition
+    # or effect of this site changed, so the contract and its inert rule
+    # stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for
+    # _rebuild_stats_index_locked #1. Added: the bindings
+    # `_cctally_oauth_samples.DECISION_OP_KINDS` (the two reviewed weekly
+    # decision op kinds whose journal coordinates the read pass now records)
+    # and `_cctally_oauth_samples._INSERT_HISTORY` (the literal history
+    # insert). Changed: `STATS_INDEX_EPOCH` 1021 -> 1022; the fold applier
+    # `apply_weekly_observation_decision_op` (`~ computed-by`), which beside
+    # its unchanged decision upsert now writes one
+    # `claude_weekly_correction_history` row per decided observation with its
+    # decoded disposition (`retract` for a schema-3 retraction); the helpers
+    # `open_db` (see the open_db re-pin) and `_apply_quota_projection_schema`
+    # (the `fit_lineage` column and `meter_rate_change_supersessions`, see its
+    # re-fingerprint); and the producer, whose read pass records decision op
+    # coordinates, resolves staged cutover-attributed observations through
+    # `attribute_staged_observations` after the cutover is known, writes the
+    # completed batches' lineage in transaction A and records each decision
+    # op's coordinate after the op folds, and whose inventories list the new
+    # tables. Every new statement is a literal write registered as its own
+    # contract. This site's `SELECT COUNT(*) FROM {tbl}` over the unchanged
+    # `_REBUILD_COUNT_TABLES`, its execution condition and its read-only
+    # effect are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#939 D5, base 81bbcde43), for
+    # _rebuild_stats_index_locked #1. Changed (`~ computed-by`
+    # `_cctally_cache.IngestStats`): the dataclass gains one field,
+    # `failed_paths: set` (default empty), the paths behind `files_failed`
+    # that a conversation sync records through `_record_failed_files` and
+    # only the dashboard's writeIo admission hold compares between passes;
+    # the transcript rebuild worker does not serialize it
+    # (`_CONVERSATION_RESIDUAL_FIELDS`). It is Python state, never SQL: this
+    # site's `SELECT COUNT(*) FROM {tbl}` over the unchanged
+    # `_REBUILD_COUNT_TABLES`, its table selection, predicate, ordering,
+    # selected column, parameters, execution condition and read-only effect
+    # are unchanged, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#948 merge of #939 part A, base f840dd69d), for
+    # _rebuild_stats_index_locked #1: the shape combines the #939 change
+    # above (`IngestStats.failed_paths`) with the #948 T-A change recorded at
+    # _publish_generation_in_place #1 (`STATS_INDEX_EPOCH` 1022 -> 1023 and
+    # the `open_db` schema block). Neither touches this site's SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect, so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1020, base a781dec99), for
+    # _rebuild_stats_index_locked #1. The closure reaches the owner-record
+    # liveness helper `_cctally_db._repair_marker_is_live` through the W9
+    # keeper fence (`_lib_wal_checkpoint._fence_at`). Changed
+    # (`~ computed-by` `_repair_marker_is_live`, `- computed-by`
+    # `_read_repair_owner`, `+ computed-by` `_read_repair_owner_record`,
+    # `_read_owner_record_text`, `_owner_record_file`,
+    # `_decode_repair_owner`, `+ binding` `_OWNER_RECORD_FILE_NAME`,
+    # `_OWNER_RECORD_READ_ATTEMPTS`): the record reader now resolves
+    # `<marker>/owner` for a directory-form record (a volume without hard
+    # links) with a bounded re-read, the old decoding moved unchanged into
+    # `_decode_repair_owner`, and the identity-unavailable lease is taken
+    # from the record file actually read. A file-form record reads and
+    # judges exactly as before. It is file-system Python state, never SQL:
+    # this site's `SELECT COUNT(*) FROM {tbl}` over the unchanged
+    # `_REBUILD_COUNT_TABLES`, its table selection, predicate, ordering,
+    # selected column, parameters, execution condition and read-only effect
+    # are unchanged, so the contract and its MAINT inert rule stand.
     AccessContract(
         function='_cctally_journal:_rebuild_stats_index_locked',
         sql_fingerprint='dynamic:_cctally_journal:_rebuild_stats_index_locked#1',
-        sql_shape='sha256:1663fdf5858150ab',
+        sql_shape='sha256:d9d1dae4e1f35d58',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -1915,13 +2510,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # #943 T3 (spec 4.7): the post-credit floor is now bound from
+    # `resolve_five_hour_axis_floor` (the exact companion boundary, else the
+    # floored slot) instead of an inline COALESCE over the latest
+    # `five_hour_reset_events` row, so the subquery and its ordering left
+    # the statement. Same table, keys, `>=` band direction and read effect;
+    # the older-policy fold branch now issues this identical statement and
+    # is covered by the `_usage_snapshot_fold_decision` contract of the
+    # same text.
     AccessContract(
         function='_cctally_journal:_rematerialize_five_hour_high_water',
-        sql_fingerprint="SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots WHERE five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(COALESCE( (SELECT effective_reset_at_utc FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ? ORDER BY id DESC LIMIT 1), '1970-01-01T00:00:00Z'))",
+        sql_fingerprint='SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots WHERE five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(?)',
         table='weekly_usage_snapshots',
         keys=('five_hour_window_key', 'account_key'),
-        predicate='five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(COALESCE( (SELECT effective_reset_at_utc FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ?',
-        ordering='id DESC',
+        predicate='five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(?)',
+        ordering='',
         selected=('MAX(five_hour_percent)',),
         effects='read',
         classes=('period-keyed', 'range-keyed'),
@@ -2098,18 +2701,6 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         selected=('1',),
         effects='read',
         classes=('period-keyed',),
-        inert_rule=JOURNAL,
-    ),
-    AccessContract(
-        function='_cctally_journal:_usage_snapshot_fold_decision',
-        sql_fingerprint="SELECT MAX(five_hour_percent) FROM weekly_usage_snapshots WHERE five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(COALESCE( (SELECT effective_reset_at_utc FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ? ORDER BY id DESC LIMIT 1), '1970-01-01T00:00:00Z'))",
-        table='weekly_usage_snapshots',
-        keys=('five_hour_window_key', 'account_key'),
-        predicate='five_hour_window_key = ? AND account_key = ? AND unixepoch(captured_at_utc) >= unixepoch(COALESCE( (SELECT effective_reset_at_utc FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ?',
-        ordering='id DESC',
-        selected=('MAX(five_hour_percent)',),
-        effects='read',
-        classes=('period-keyed', 'range-keyed'),
         inert_rule=JOURNAL,
     ),
     AccessContract(
@@ -2376,10 +2967,28 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#956 T4, base 6528383a7), for emit_model_a #1. Changed:
+    # the producer `emit_model_a` itself and one binding it now reads,
+    # `_FIVE_HOUR_DIRTYING_KINDS`. The function gained two calls to
+    # `five_hour_windows_touched_by_evt` (an exact `journal_id` read,
+    # registered as its own JOURNAL contract) and one in-memory update of
+    # `ctx.five_hour_dirty_windows`; the dynamic `SELECT id FROM {table} WHERE
+    # journal_id = ?` this pin covers is unchanged: same table selection,
+    # key, predicate, selected column, execution condition and effect, so
+    # the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for emit_model_a #1. Changed:
+    # only the binding `_FIVE_HOUR_DIRTYING_KINDS`, which gains
+    # `five_hour_block_open`, so an applied opening marks its own window and its
+    # account's open blocks dirty (the in-memory dirty set;
+    # `five_hour_windows_touched_by_evt`'s new account-scoped read is registered
+    # as its own BLOCKS contract). The dynamic `SELECT id FROM {table} WHERE
+    # journal_id = ?` this pin covers is unchanged. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:emit_model_a',
         sql_fingerprint='dynamic:_cctally_journal:emit_model_a#1',
-        sql_shape='sha256:e7dad38dc273784f',
+        sql_shape='sha256:5babe769cb993e34',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2401,10 +3010,23 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=JOURNAL,
     ),
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # latch_crossing_was_retired #1. Changed: only bindings this site reads —
+    # `_HARVEST_SPECS`, which gains the `five_hour_credit_boundary` spec
+    # (table `five_hour_credit_boundaries`, prefix `fhcb`, order 29). No SQL,
+    # table selection, predicate, ordering, selected column, execution
+    # condition or effect of this site changed, so the contract and its inert
+    # rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for latch_crossing_was_retired
+    # #1. Changed: only the `_HARVEST_SPECS` binding, which gains the
+    # `five_hour_block_open` spec (prefix `fhbo`); the site looks up the latch's
+    # own family spec, which is unchanged. No SQL, table selection, predicate,
+    # ordering, selected column, execution condition or effect of this site
+    # changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:latch_crossing_was_retired',
         sql_fingerprint='dynamic:_cctally_journal:latch_crossing_was_retired#1',
-        sql_shape='sha256:dc25754c94998705',
+        sql_shape='sha256:36fef39af242870b',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2438,6 +3060,20 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=JOURNAL,
     ),
+    # #1015 T7: the supersession emitter's presence check returns early
+    # when the explicit row for this natural key already exists.
+    AccessContract(
+        function='_cctally_journal:record_meter_rate_change_supersession',
+        sql_fingerprint='SELECT 1 FROM meter_rate_change_supersessions WHERE provider = ? AND account_key = ? AND effective_from = ?',
+        table='meter_rate_change_supersessions',
+        keys=('provider', 'account_key', 'effective_from'),
+        predicate='provider = ? AND account_key = ? AND effective_from = ?',
+        ordering='',
+        selected=('1',),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='SELECT event_id, rev, status, content_hash, batch_id, event_json FROM journal_effective_events ORDER BY event_id',
@@ -2468,10 +3104,54 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # (the streamed accumulator, D12). The hasher executes no SQL; the SQL
     # text, its execution condition and its read-only effect are unchanged,
     # so the contract and its MAINT inert rule stand.
+    # Reviewed re-pin (#1019/#1014 Task A, base 5b15db929), for #1 and #2.
+    # Changed: `STATS_INDEX_EPOCH`, `PROTOCOL_RESOLUTION_KINDS` (+v4),
+    # `_validate_protocol_resolution` accepting `wpx` in its key set and
+    # identity core, `strip_stamp` stripping `wpx` (new `_WPX`,
+    # SUCCESSOR_REVISION_KEY and _STAMP_KEYS bindings) and the path
+    # assignments. The prefix-match reads, their tables, predicates and
+    # read-only effect are unchanged, so the contracts stand.
+    # Reviewed re-pin (#943 T3, base c5419d209), for
+    # stats_index_matches_journal_prefix #1. Changed: only bindings this site
+    # reads — `STATS_INDEX_EPOCH` 1020 -> 1021 (spec 4.7). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#956 T5, base af10118c7), for
+    # stats_index_matches_journal_prefix #1. Changed: only the `_EVT_SPECS`
+    # binding, whose new `five_hour_block_open` spec carries the applier
+    # `_apply_five_hour_block_open`; the closure follows it into
+    # `_apply_generic_evt` and its helpers (`_insert_or_ignore`,
+    # `_resolve_fold_ref`, `_resolve_ref`, `_derived_fk_value`,
+    # `_report_unresolved_fold_reference`, `_SUPPRESSIBLE_FOLD_REFS`,
+    # `JournalError`, `UnresolvedFoldReference`), `_block_opening_row` and
+    # `_materialize_opened_block`. The site reads the family tables the specs
+    # name, and the new family's table is read by the same statement shape as
+    # every other. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T3, base 16b055cae), for stats_index_matches_journal_prefix #1. Changed: only
+    # the binding `STATS_INDEX_EPOCH` 1021 -> 1022 (spec 5.1). No SQL, table
+    # selection, predicate, ordering, selected column, execution condition or
+    # effect of this site changed, so the contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T7, base 7455ca434), for stats_index_matches_journal_prefix #1. Changed: only the
+    # fold machinery this site reaches through bindings: `_EVT_SPECS` gained
+    # the table-less `meter_rate_change_supersession` spec (order 46), whose
+    # applier `_apply_meter_rate_change_supersession` calls
+    # `_insert_meter_rate_change_supersession` (a literal INSERT OR IGNORE,
+    # registered as its own contract) and reads `MRC_SUPERSESSION_REASON`
+    # and `_canonical_json_or_none`; `_MeterRateChangeRow` gained the
+    # nullable `fit_lineage` field, which `_meter_rate_change_row` fills
+    # through `_canonical_json_or_none` and
+    # `_backfill_meter_rate_change_evidence` COALESCEs (its literal UPDATE is
+    # reviewed beside its own contract). The site skips a table-less spec
+    # (`spec.table is None`) and reads the family tables the other specs
+    # name with the same statement shape. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='dynamic:_cctally_journal:stats_index_matches_journal_prefix#1',
-        sql_shape='sha256:393317bef4c27f3d',
+        sql_shape='sha256:b27ac2227f9613cb',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2482,10 +3162,38 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         inert_rule=MAINT,
     ),
     # Same reviewed re-pin as #1 (#997 D12).
+    # Reviewed re-pin (#956 T5, base af10118c7), for
+    # stats_index_matches_journal_prefix #2. Changed: only the `_EVT_SPECS`
+    # binding, whose new `five_hour_block_open` spec carries the applier
+    # `_apply_five_hour_block_open`; the closure follows it into
+    # `_apply_generic_evt` and its helpers (`_insert_or_ignore`,
+    # `_resolve_fold_ref`, `_resolve_ref`, `_derived_fk_value`,
+    # `_report_unresolved_fold_reference`, `_SUPPRESSIBLE_FOLD_REFS`,
+    # `JournalError`, `UnresolvedFoldReference`), `_block_opening_row` and
+    # `_materialize_opened_block`. The site reads the family tables the specs
+    # name, and the new family's table is read by the same statement shape as
+    # every other. No SQL, table selection, predicate, ordering, selected
+    # column, execution condition or effect of this site changed, so the
+    # contract and its inert rule stand.
+    # Reviewed re-pin (#1015 T7, base 7455ca434), for stats_index_matches_journal_prefix #2. Changed: only the
+    # fold machinery this site reaches through bindings: `_EVT_SPECS` gained
+    # the table-less `meter_rate_change_supersession` spec (order 46), whose
+    # applier `_apply_meter_rate_change_supersession` calls
+    # `_insert_meter_rate_change_supersession` (a literal INSERT OR IGNORE,
+    # registered as its own contract) and reads `MRC_SUPERSESSION_REASON`
+    # and `_canonical_json_or_none`; `_MeterRateChangeRow` gained the
+    # nullable `fit_lineage` field, which `_meter_rate_change_row` fills
+    # through `_canonical_json_or_none` and
+    # `_backfill_meter_rate_change_evidence` COALESCEs (its literal UPDATE is
+    # reviewed beside its own contract). The site skips a table-less spec
+    # (`spec.table is None`) and reads the family tables the other specs
+    # name with the same statement shape. No SQL, table selection,
+    # predicate, ordering, selected column, execution condition or effect of
+    # this site changed, so the contract and its inert rule stand.
     AccessContract(
         function='_cctally_journal:stats_index_matches_journal_prefix',
         sql_fingerprint='dynamic:_cctally_journal:stats_index_matches_journal_prefix#2',
-        sql_shape='sha256:9c0c2275046f7719',
+        sql_shape='sha256:0cb254b5c3b1d634',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',
@@ -2603,6 +3311,90 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=Q7,
     ),
+    # #1015 epoch 1022 (spec 5.1): the correction-to-fit lineage writers.
+    # `project_observation` indexes each admitted Claude weekly observation
+    # by its attributed account on live ingest (reached from
+    # `_pipeline_claude_usage` through `project_record`); the apply-only
+    # rebuild stages a cutover-attributed observation and
+    # `attribute_staged_observations` resolves it once the cutover is known.
+    # `record_correction_op` records a reviewed decision op's journal
+    # coordinate. `write_batch_lineage` records each completed correction
+    # batch's commit coordinate (an authoritative upsert from the selector's
+    # completion step, else INSERT OR IGNORE) and its footprint. All are
+    # keyed writes that a replay repeats to the same rows, and no detector
+    # decision reads them.
+    AccessContract(
+        function='_cctally_journal:write_batch_lineage',
+        sql_fingerprint='INSERT INTO correction_batch_lineage (batch_id, commit_segment, commit_offset) VALUES (?, ?, ?) ON CONFLICT(batch_id) DO UPDATE SET commit_segment = excluded.commit_segment, commit_offset = excluded.commit_offset',
+        table='correction_batch_lineage',
+        keys=('batch_id',),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='upsert',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_journal:write_batch_lineage',
+        sql_fingerprint='INSERT OR IGNORE INTO correction_batch_footprint (batch_id, provider, account_key) VALUES (?, ?, ?)',
+        table='correction_batch_footprint',
+        keys=('batch_id', 'provider', 'account_key'),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_journal:write_batch_lineage',
+        sql_fingerprint='INSERT OR IGNORE INTO correction_batch_lineage (batch_id, commit_segment, commit_offset) VALUES (?, ?, ?)',
+        table='correction_batch_lineage',
+        keys=('batch_id',),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_oauth_samples:attribute_staged_observations',
+        sql_fingerprint='INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) SELECT observation_id, ?, captured_at_utc FROM rebuild_weekly_observation_unstamped',
+        table='claude_weekly_observation_index',
+        keys=('observation_id',),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_oauth_samples:project_observation',
+        sql_fingerprint='INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id, account_key, captured_at_utc) VALUES (?, ?, ?)',
+        table='claude_weekly_observation_index',
+        keys=('observation_id',),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_oauth_samples:record_correction_op',
+        sql_fingerprint='INSERT OR IGNORE INTO claude_weekly_correction_ops (decision_op_id, op_segment, op_offset) VALUES (?, ?, ?)',
+        table='claude_weekly_correction_ops',
+        keys=('decision_op_id',),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
     # #797/#823/#840 epoch 1019 (spec 4.3 D8): the provider-sample
     # projection, reached from `_pipeline_claude_usage` through
     # `project_record`. One row per admitted keyed api observation, keyed by
@@ -2623,48 +3415,48 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_quarantine:load_state',
-        sql_fingerprint='SELECT MAX(seq) FROM outcome_quarantine_triggers',
+        sql_fingerprint='SELECT account_key, axis, state, waiting_for, coverage_id, witness_id, release_id, revocation, since, recovered_at, not_before, witness_key FROM outcome_quarantine_axis_state WHERE generation = ?',
+        table='outcome_quarantine_axis_state',
+        keys=('generation',),
+        predicate='generation = ?',
+        ordering='',
+        selected=('account_key', 'axis', 'state', 'waiting_for', 'coverage_id', 'witness_id', 'release_id', 'revocation', 'since', 'recovered_at', 'not_before', 'witness_key'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=QUARANTINE,
+    ),
+    AccessContract(
+        function='_cctally_quarantine:load_state',
+        sql_fingerprint='SELECT opener_segment, opener_offset, opened_at, closer_segment, closer_offset, closed_at FROM outcome_quarantine_episodes ORDER BY rowid',
+        table='outcome_quarantine_episodes',
+        keys=(),
+        predicate='',
+        ordering='rowid',
+        selected=('opener_segment', 'opener_offset', 'opened_at', 'closer_segment', 'closer_offset', 'closed_at'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=QUARANTINE,
+    ),
+    AccessContract(
+        function='_cctally_quarantine:load_state',
+        sql_fingerprint='SELECT scope, axis, bounds_json FROM outcome_quarantine_bounds',
+        table='outcome_quarantine_bounds',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=('scope', 'axis', 'bounds_json'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=QUARANTINE,
+    ),
+    AccessContract(
+        function='_cctally_quarantine:load_state',
+        sql_fingerprint='SELECT seq, segment, byte_offset, kind, reason, at FROM outcome_quarantine_triggers ORDER BY seq DESC LIMIT 1',
         table='outcome_quarantine_triggers',
         keys=(),
         predicate='',
-        ordering='',
-        selected=('MAX(seq)',),
-        effects='read',
-        classes=('cross-period',),
-        inert_rule=QUARANTINE,
-    ),
-    AccessContract(
-        function='_cctally_quarantine:load_state',
-        sql_fingerprint='SELECT account_key, accounting_certificate_json, accounting_trigger_seq, control_certificate_json, control_trigger_seq FROM outcome_quarantine_certificates',
-        table='outcome_quarantine_certificates',
-        keys=(),
-        predicate='',
-        ordering='',
-        selected=('account_key', 'accounting_certificate_json', 'accounting_trigger_seq', 'control_certificate_json', 'control_trigger_seq'),
-        effects='read',
-        classes=('cross-period',),
-        inert_rule=QUARANTINE,
-    ),
-    AccessContract(
-        function='_cctally_quarantine:load_state',
-        sql_fingerprint='SELECT scope, envelope_json FROM outcome_quarantine_envelope',
-        table='outcome_quarantine_envelope',
-        keys=(),
-        predicate='',
-        ordering='',
-        selected=('scope', 'envelope_json'),
-        effects='read',
-        classes=('cross-period',),
-        inert_rule=QUARANTINE,
-    ),
-    AccessContract(
-        function='_cctally_quarantine:load_state',
-        sql_fingerprint='SELECT seq, segment, byte_offset, reason, at FROM outcome_quarantine_triggers WHERE kind = ? ORDER BY seq',
-        table='outcome_quarantine_triggers',
-        keys=('kind',),
-        predicate='kind = ?',
-        ordering='seq',
-        selected=('seq', 'segment', 'byte_offset', 'reason', 'at'),
+        ordering='seq DESC',
+        selected=('seq', 'segment', 'byte_offset', 'kind', 'reason', 'at'),
         effects='read',
         classes=('cross-period',),
         inert_rule=QUARANTINE,
@@ -3075,6 +3867,113 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('cross-period',),
         inert_rule=CODEX,
     ),
+    # #1015 T5/T7 and R6: the calibration lineage readers. `_read_base`
+    # reads the always-needed half of the correction facts (completed
+    # batches, their footprint, each reviewed op's coordinate, the distinct
+    # ops the history names by a loose primary-key scan, and a probe that the
+    # observation index exists); `_read_rows` reads one op's history rows
+    # joined to their observation, narrowed to what the assessed lineages
+    # can be affected by; `rate_change_supersession` reads one transition's
+    # explicit supersession and its stored lineage by natural key. They feed
+    # the forecast, project, doctor, status-line and quota refusal and the
+    # rate-change marker/notification suppression; no automatic credit,
+    # moved-end or drop-consensus decision reads them.
+    AccessContract(
+        function='_cctally_quota_calibration:_read_base',
+        sql_fingerprint='SELECT batch_id, commit_segment, commit_offset FROM correction_batch_lineage',
+        table='correction_batch_lineage',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=('batch_id', 'commit_segment', 'commit_offset'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:_read_base',
+        sql_fingerprint='SELECT batch_id, provider, account_key FROM correction_batch_footprint',
+        table='correction_batch_footprint',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=('batch_id', 'provider', 'account_key'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:_read_base',
+        sql_fingerprint='SELECT decision_op_id, op_segment, op_offset FROM claude_weekly_correction_ops',
+        table='claude_weekly_correction_ops',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=('decision_op_id', 'op_segment', 'op_offset'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:_read_base',
+        sql_fingerprint='SELECT observation_id, account_key, captured_at_utc FROM claude_weekly_observation_index LIMIT 0',
+        table='claude_weekly_observation_index',
+        keys=(),
+        predicate='LIMIT 0',
+        ordering='',
+        selected=('observation_id', 'account_key', 'captured_at_utc'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:_read_base',
+        sql_fingerprint='WITH RECURSIVE d(op) AS (SELECT MIN(decision_op_id) FROM claude_weekly_correction_history UNION ALL SELECT (SELECT MIN(decision_op_id) FROM claude_weekly_correction_history WHERE decision_op_id > d.op) FROM d WHERE d.op IS NOT NULL) SELECT op FROM d WHERE op IS NOT NULL',
+        table='claude_weekly_correction_history',
+        keys=('decision_op_id',),
+        predicate='decision_op_id > d.op',
+        ordering='',
+        selected=('decision_op_id',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:_read_rows',
+        sql_fingerprint="SELECT h.observation_id, h.disposition, i.account_key, i.captured_at_utc FROM claude_weekly_correction_history h LEFT JOIN claude_weekly_observation_index i ON i.observation_id = h.observation_id WHERE h.decision_op_id = :op AND (i.observation_id IS NULL OR ((:scope = '*' OR i.account_key = :scope) AND (:account IS NULL OR i.account_key = :account) AND (:lo IS NULL OR i.captured_at_utc >= :lo) AND (:hi IS NULL OR i.captured_at_utc < :hi)) OR ((:scope = '*' OR i.account_key = :scope) AND NOT (substr(i.captured_at_utc, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND (substr(i.captured_at_utc, 20) IN ('Z', '+00:00') OR substr(i.captured_at_utc, 20) GLOB '.[0-9][0-9][0-9][0-9][0-9][0-9]Z' OR substr(i.captured_at_utc, 20) GLOB '.[0-9][0-9][0-9][0-9][0-9][0-9]+00:00' OR substr(i.captured_at_utc, 20) GLOB '.[0-9][0-9][0-9]Z' OR substr(i.captured_at_utc, 20) GLOB '.[0-9][0-9][0-9]+00:00') AND substr(i.captured_at_utc, 1, 4) <> '0000' AND datetime(substr(i.captured_at_utc, 1, 19)) = replace(substr(i.captured_at_utc, 1, 19), 'T', ' '))))",
+        table='claude_weekly_correction_history',
+        keys=('decision_op_id',),
+        predicate='h.decision_op_id = :op AND (unresolved, or not a canonical UTC capture, or inside the account scope and the capture box)',
+        ordering='',
+        selected=('observation_id', 'disposition', 'account_key', 'captured_at_utc'),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:rate_change_supersession',
+        sql_fingerprint='SELECT detected_at_utc, fit_lineage FROM meter_rate_change_events WHERE provider = ? AND account_key = ? AND effective_from = ?',
+        table='meter_rate_change_events',
+        keys=('provider', 'account_key', 'effective_from'),
+        predicate='provider = ? AND account_key = ? AND effective_from = ?',
+        ordering='',
+        selected=('detected_at_utc', 'fit_lineage'),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
+    AccessContract(
+        function='_cctally_quota_calibration:rate_change_supersession',
+        sql_fingerprint='SELECT reason, corrections, superseded_at_utc FROM meter_rate_change_supersessions WHERE provider = ? AND account_key = ? AND effective_from = ?',
+        table='meter_rate_change_supersessions',
+        keys=('provider', 'account_key', 'effective_from'),
+        predicate='provider = ? AND account_key = ? AND effective_from = ?',
+        ordering='',
+        selected=('reason', 'corrections', 'superseded_at_utc'),
+        effects='read',
+        classes=('singleton',),
+        inert_rule=LINEAGE,
+    ),
     AccessContract(
         function='_cctally_record:_apply_credit',
         sql_fingerprint='INSERT OR IGNORE INTO weekly_credit_floors (week_start_date, effective_at_utc, observed_pre_credit_pct, applied_at_utc, account_key) VALUES (?, ?, ?, ?, ?)',
@@ -3261,12 +4160,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:_read_five_hour_source_state',
-        sql_fingerprint='SELECT baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ? AND source = ?',
+        sql_fingerprint='SELECT baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position, pending_captured_at_utc FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ? AND source = ?',
         table='five_hour_credit_confirmation_state',
         keys=('account_key', 'five_hour_window_key', 'source'),
         predicate='account_key = ? AND five_hour_window_key = ? AND source = ?',
         ordering='',
-        selected=('baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position'),
+        selected=('baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position', 'pending_captured_at_utc'),
         effects='read',
         classes=('period-keyed',),
         inert_rule=None,
@@ -3278,12 +4177,12 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     # order; the id only fetches it). All three read one account and window.
     AccessContract(
         function='_cctally_record:_rebase_five_hour_sources',
-        sql_fingerprint='SELECT source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ?',
+        sql_fingerprint='SELECT source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position, pending_captured_at_utc FROM five_hour_credit_confirmation_state WHERE account_key = ? AND five_hour_window_key = ?',
         table='five_hour_credit_confirmation_state',
         keys=('account_key', 'five_hour_window_key'),
         predicate='account_key = ? AND five_hour_window_key = ?',
         ordering='',
-        selected=('source', 'baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position'),
+        selected=('source', 'baseline_pct', 'pending_low_pct', 'pending_at_utc', 'pending_observation_id', 'baseline_observation_id', 'baseline_generation', 'pending_generation', 'pending_position', 'pending_captured_at_utc'),
         effects='read',
         classes=('period-keyed',),
         inert_rule=None,
@@ -3362,7 +4261,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:_write_five_hour_source_state',
-        sql_fingerprint='INSERT INTO five_hour_credit_confirmation_state (account_key, five_hour_window_key, source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET baseline_pct = excluded.baseline_pct, pending_low_pct = excluded.pending_low_pct, pending_at_utc = excluded.pending_at_utc, pending_observation_id = excluded.pending_observation_id, baseline_observation_id = excluded.baseline_observation_id, baseline_generation = excluded.baseline_generation, pending_generation = excluded.pending_generation, pending_position = excluded.pending_position',
+        sql_fingerprint='INSERT INTO five_hour_credit_confirmation_state (account_key, five_hour_window_key, source, baseline_pct, pending_low_pct, pending_at_utc, pending_observation_id, baseline_observation_id, baseline_generation, pending_generation, pending_position, pending_captured_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET baseline_pct = excluded.baseline_pct, pending_low_pct = excluded.pending_low_pct, pending_at_utc = excluded.pending_at_utc, pending_observation_id = excluded.pending_observation_id, baseline_observation_id = excluded.baseline_observation_id, baseline_generation = excluded.baseline_generation, pending_generation = excluded.pending_generation, pending_position = excluded.pending_position, pending_captured_at_utc = excluded.pending_captured_at_utc',
         table='five_hour_credit_confirmation_state',
         keys=(),
         predicate='',
@@ -3396,6 +4295,21 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=None,
     ),
+    # #943 T3 (spec 4.7): the credit's exact-boundary companion, written
+    # only when the credit INSERT above inserted a row (rowcount 1), so a
+    # replayed or colliding confirm never mints a second boundary.
+    AccessContract(
+        function='_cctally_record:detect_reset_and_credit',
+        sql_fingerprint='INSERT OR IGNORE INTO five_hour_credit_boundaries (account_key, five_hour_window_key, effective_reset_at_utc, boundary_at_utc, arming_observation_id, credit_revision, detected_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        table='five_hour_credit_boundaries',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=None,
+    ),
     AccessContract(
         function='_cctally_record:detect_reset_and_credit',
         sql_fingerprint='INSERT OR IGNORE INTO week_reset_events (detected_at_utc, old_week_end_at, new_week_end_at, effective_reset_at_utc, account_key, origin_observation_id) VALUES (?, ?, ?, ?, ?, ?)',
@@ -3408,12 +4322,17 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('singleton',),
         inert_rule=None,
     ),
+    # #943 T3 (spec 4.2.3 crash analysis): the detector's previous accepted
+    # row now excludes the observation's own `sa:<observation id>` snapshot,
+    # which step 4a can fold from a crashed cycle before the detector
+    # re-runs. Same table, keys, ordering, selected columns, read effect and
+    # inert rule; live the excluded row does not exist yet.
     AccessContract(
         function='_cctally_record:detect_reset_and_credit',
-        sql_fingerprint='SELECT five_hour_window_key, five_hour_percent, five_hour_resets_at FROM weekly_usage_snapshots WHERE five_hour_window_key IS NOT NULL AND five_hour_percent IS NOT NULL AND account_key = ? ORDER BY captured_at_utc DESC, id DESC LIMIT 1',
+        sql_fingerprint='SELECT five_hour_window_key, five_hour_percent, five_hour_resets_at FROM weekly_usage_snapshots WHERE five_hour_window_key IS NOT NULL AND five_hour_percent IS NOT NULL AND account_key = ? AND (? IS NULL OR journal_id IS NOT ?) ORDER BY captured_at_utc DESC, id DESC LIMIT 1',
         table='weekly_usage_snapshots',
         keys=('account_key',),
-        predicate='five_hour_window_key IS NOT NULL AND five_hour_percent IS NOT NULL AND account_key = ?',
+        predicate='five_hour_window_key IS NOT NULL AND five_hour_percent IS NOT NULL AND account_key = ? AND (? IS NULL OR journal_id IS NOT ?)',
         ordering='captured_at_utc DESC, id DESC',
         selected=('five_hour_window_key', 'five_hour_percent', 'five_hour_resets_at'),
         effects='read',
@@ -3468,12 +4387,18 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         classes=('period-keyed',),
         inert_rule=None,
     ),
+    # #943 (the weekly twin of T3's spec 4.2.3 crash analysis): the weekly
+    # previous accepted row also excludes the observation's own
+    # `sa:<observation id>` snapshot, which step 4a can fold from a cycle
+    # that crashed between the `snapshot_accept` and `wr` appends. Same
+    # table, keys, ordering, selected columns, read effect and inert rule;
+    # live the excluded row does not exist yet.
     AccessContract(
         function='_cctally_record:detect_reset_and_credit',
-        sql_fingerprint='SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots WHERE week_end_at IS NOT NULL AND account_key = ? AND weekly_observation_held = 0 ORDER BY captured_at_utc DESC, id DESC LIMIT 1',
+        sql_fingerprint='SELECT week_end_at, weekly_percent FROM weekly_usage_snapshots WHERE week_end_at IS NOT NULL AND account_key = ? AND weekly_observation_held = 0 AND (? IS NULL OR journal_id IS NOT ?) ORDER BY captured_at_utc DESC, id DESC LIMIT 1',
         table='weekly_usage_snapshots',
         keys=('account_key',),
-        predicate='week_end_at IS NOT NULL AND account_key = ? AND weekly_observation_held = 0',
+        predicate='week_end_at IS NOT NULL AND account_key = ? AND weekly_observation_held = 0 AND (? IS NULL OR journal_id IS NOT ?)',
         ordering='captured_at_utc DESC, id DESC',
         selected=('week_end_at', 'weekly_percent'),
         effects='read',
@@ -3551,66 +4476,6 @@ REGISTRY: "tuple[AccessContract, ...]" = (
         effects='write',
         classes=('period-keyed',),
         inert_rule=Q7,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='DELETE FROM five_hour_block_models WHERE five_hour_window_key = ? AND account_key = ?',
-        table='five_hour_block_models',
-        keys=('five_hour_window_key', 'account_key'),
-        predicate='five_hour_window_key = ? AND account_key = ?',
-        ordering='',
-        selected=(),
-        effects='delete',
-        classes=('period-keyed',),
-        inert_rule=BLOCKS,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='DELETE FROM five_hour_block_projects WHERE five_hour_window_key = ? AND account_key = ?',
-        table='five_hour_block_projects',
-        keys=('five_hour_window_key', 'account_key'),
-        predicate='five_hour_window_key = ? AND account_key = ?',
-        ordering='',
-        selected=(),
-        effects='delete',
-        classes=('period-keyed',),
-        inert_rule=BLOCKS,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='INSERT INTO five_hour_block_models ( block_id, five_hour_window_key, model, input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, cost_usd, entry_count, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        table='five_hour_block_models',
-        keys=(),
-        predicate='',
-        ordering='',
-        selected=(),
-        effects='write',
-        classes=('singleton',),
-        inert_rule=BLOCKS,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='INSERT INTO five_hour_block_projects ( block_id, five_hour_window_key, project_path, input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, cost_usd, entry_count, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        table='five_hour_block_projects',
-        keys=(),
-        predicate='',
-        ordering='',
-        selected=(),
-        effects='write',
-        classes=('singleton',),
-        inert_rule=BLOCKS,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='INSERT INTO five_hour_blocks ( five_hour_window_key, five_hour_resets_at, block_start_at, first_observed_at_utc, last_observed_at_utc, final_five_hour_percent, seven_day_pct_at_block_start, seven_day_pct_at_block_end, crossed_seven_day_reset, total_input_tokens, total_output_tokens, total_cache_create_tokens, total_cache_read_tokens, total_cost_usd, pricing_provenance_json, is_closed, created_at_utc, last_updated_at_utc, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key) DO UPDATE SET last_observed_at_utc = excluded.last_observed_at_utc, final_five_hour_percent = excluded.final_five_hour_percent, seven_day_pct_at_block_end = excluded.seven_day_pct_at_block_end, total_input_tokens = excluded.total_input_tokens, total_output_tokens = excluded.total_output_tokens, total_cache_create_tokens = excluded.total_cache_create_tokens, total_cache_read_tokens = excluded.total_cache_read_tokens, total_cost_usd = excluded.total_cost_usd, pricing_provenance_json = excluded.pricing_provenance_json, last_updated_at_utc = excluded.last_updated_at_utc WHERE five_hour_blocks.is_closed = 0 OR five_hour_blocks.journal_id IS NULL',
-        table='five_hour_blocks',
-        keys=(),
-        predicate='five_hour_blocks.is_closed = 0 OR five_hour_blocks.journal_id IS NULL',
-        ordering='',
-        selected=(),
-        effects='upsert',
-        classes=('singleton',),
-        inert_rule=BLOCKS,
     ),
     AccessContract(
         function='_cctally_record:maybe_update_five_hour_block',
@@ -3710,24 +4575,313 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:maybe_update_five_hour_block',
-        sql_fingerprint='SELECT id FROM five_hour_blocks WHERE is_closed = 0 AND account_key = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
-        table='five_hour_blocks',
-        keys=('account_key',),
-        predicate='is_closed = 0 AND account_key = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
-        ordering='',
-        selected=('id',),
-        effects='read',
-        classes=('range-keyed', 'cross-period'),
-        inert_rule=BLOCKS,
-    ),
-    AccessContract(
-        function='_cctally_record:maybe_update_five_hour_block',
         sql_fingerprint='SELECT id FROM five_hour_blocks WHERE is_closed = 1 AND journal_id IS NOT NULL AND account_key = ? AND last_updated_at_utc = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
         table='five_hour_blocks',
         keys=('account_key', 'last_updated_at_utc'),
         predicate='is_closed = 1 AND journal_id IS NOT NULL AND account_key = ? AND last_updated_at_utc = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
         ordering='',
         selected=('id',),
+        effects='read',
+        classes=('range-keyed', 'cross-period'),
+        inert_rule=BLOCKS,
+    ),
+    # #956 class 2 (spec 4.6.3): every block creation retains an opening fact
+    # whose fold materializes the open block. The opening's writer and the
+    # milestone re-link run inside the creating cycle by exact key; the seed
+    # read projects a reading-less window; the coupled convergence and removal
+    # run only on derivation-completion and correction convergence paths, by
+    # exact physical id or natural key. All are the five-hour block rollup
+    # (BLOCKS), a Q7 cost/display family.
+    AccessContract(
+        function='_cctally_five_hour:select_open_block_end',
+        sql_fingerprint='SELECT first_observed_at_utc, five_hour_percent, seven_day_pct_at_block_start FROM five_hour_block_openings WHERE account_key = ? AND five_hour_window_key = ?',
+        table='five_hour_block_openings',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ?',
+        ordering='',
+        selected=('first_observed_at_utc', 'five_hour_percent', 'seven_day_pct_at_block_start'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_converge_opened_block',
+        sql_fingerprint='SELECT * FROM five_hour_block_openings WHERE id = ?',
+        table='five_hour_block_openings',
+        keys=('id',),
+        predicate='id = ?',
+        ordering='',
+        selected=('*',),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_converge_opened_block',
+        sql_fingerprint='dynamic:_cctally_journal:_converge_opened_block#1',
+        sql_shape='sha256:e37cbdd6ab3cc61d',
+        table='five_hour_blocks',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND is_closed = 0 AND journal_id IS NULL (SET the opening start columns)',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_remove_opened_block',
+        sql_fingerprint='DELETE FROM five_hour_blocks WHERE id = ?',
+        table='five_hour_blocks',
+        keys=('id',),
+        predicate='id = ?',
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_remove_opened_block',
+        sql_fingerprint='SELECT account_key, five_hour_window_key FROM five_hour_block_openings WHERE id = ?',
+        table='five_hour_block_openings',
+        keys=('id',),
+        predicate='id = ?',
+        ordering='',
+        selected=('account_key', 'five_hour_window_key'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_remove_opened_block',
+        sql_fingerprint='SELECT id FROM five_hour_blocks WHERE account_key = ? AND five_hour_window_key = ? AND is_closed = 0 AND journal_id IS NULL',
+        table='five_hour_blocks',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND is_closed = 0 AND journal_id IS NULL',
+        ordering='',
+        selected=('id',),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_remove_opened_block',
+        sql_fingerprint='UPDATE five_hour_milestones SET block_id = 0 WHERE account_key = ? AND five_hour_window_key = ?',
+        table='five_hour_milestones',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ?',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:_remove_opened_block',
+        sql_fingerprint='dynamic:_cctally_journal:_remove_opened_block#1',
+        sql_shape='sha256:4412618cbf5c0995',
+        table='dynamic',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? on each `_BLOCK_CHILDREN` table',
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:five_hour_windows_touched_by_evt',
+        sql_fingerprint='SELECT five_hour_window_key FROM five_hour_blocks WHERE account_key = ? AND is_closed = 0',
+        table='five_hour_blocks',
+        keys=('account_key',),
+        predicate='account_key = ? AND is_closed = 0',
+        ordering='',
+        selected=('five_hour_window_key',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_record:_insert_five_hour_block_opening',
+        sql_fingerprint='INSERT OR IGNORE INTO five_hour_block_openings ( account_key, five_hour_window_key, five_hour_resets_at, block_start_at, first_observed_at_utc, created_at_utc, opening_record_id, creation_kind, five_hour_percent, seven_day_pct_at_block_start, weekly_observation_held, weekly_basis_captured_at_utc ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        table='five_hour_block_openings',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_record:maybe_update_five_hour_block',
+        sql_fingerprint='UPDATE five_hour_milestones SET block_id = ? WHERE account_key = ? AND five_hour_window_key = ? AND block_id = 0',
+        table='five_hour_milestones',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND block_id = 0',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    # #956 class 1 (spec 4.5): the capture-order open-block end projection
+    # and its dirty-window marking and flush. Every site is an exact-key or
+    # account-scoped read or write of the five-hour block rollup (BLOCKS), or
+    # an exact journal-id lookup (JOURNAL).
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='DELETE FROM five_hour_block_models WHERE five_hour_window_key = ? AND account_key = ?',
+        table='five_hour_block_models',
+        keys=('five_hour_window_key', 'account_key'),
+        predicate='five_hour_window_key = ? AND account_key = ?',
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='DELETE FROM five_hour_block_projects WHERE five_hour_window_key = ? AND account_key = ?',
+        table='five_hour_block_projects',
+        keys=('five_hour_window_key', 'account_key'),
+        predicate='five_hour_window_key = ? AND account_key = ?',
+        ordering='',
+        selected=(),
+        effects='delete',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='INSERT INTO five_hour_block_models ( block_id, five_hour_window_key, model, input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, cost_usd, entry_count, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        table='five_hour_block_models',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='INSERT INTO five_hour_block_projects ( block_id, five_hour_window_key, project_path, input_tokens, output_tokens, cache_create_tokens, cache_read_tokens, cost_usd, entry_count, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        table='five_hour_block_projects',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='SELECT * FROM five_hour_blocks WHERE id = ?',
+        table='five_hour_blocks',
+        keys=('id',),
+        predicate='id = ?',
+        ordering='',
+        selected=('*',),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='SELECT EXISTS ( SELECT 1 FROM week_reset_events WHERE account_key = ? AND unixepoch(effective_reset_at_utc) BETWEEN unixepoch(?) AND unixepoch(?) ) OR EXISTS ( SELECT 1 FROM weekly_usage_snapshots WHERE week_start_at IS NOT NULL AND account_key = ? AND unixepoch(week_start_at) > unixepoch(?) AND unixepoch(week_start_at) <= unixepoch(?) )',
+        table='week_reset_events',
+        keys=('account_key',),
+        predicate='account_key = ? AND unixepoch(effective_reset_at_utc) BETWEEN unixepoch(?) AND unixepoch(?) ) OR EXISTS ( SELECT 1 FROM weekly_usage_snapshots WHERE week_start_at IS NOT NULL AND account_key = ? AND unixepoch(week_start_at) > unixepoch(?) AND unixepoch(week_start_at) <= unixepoch(?) )',
+        ordering='',
+        selected=('EXISTS ( SELECT 1',),
+        effects='read',
+        classes=('range-keyed', 'cross-period'),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:project_open_block_end',
+        sql_fingerprint='UPDATE five_hour_blocks SET last_observed_at_utc = ?, final_five_hour_percent = ?, seven_day_pct_at_block_end = ?, total_input_tokens = ?, total_output_tokens = ?, total_cache_create_tokens = ?, total_cache_read_tokens = ?, total_cost_usd = ?, pricing_provenance_json = ?, crossed_seven_day_reset = ?, last_updated_at_utc = ? WHERE id = ? AND is_closed = 0',
+        table='five_hour_blocks',
+        keys=('id',),
+        predicate='id = ? AND is_closed = 0',
+        ordering='',
+        selected=(),
+        effects='write',
+        classes=('singleton',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_five_hour:select_open_block_end',
+        sql_fingerprint='SELECT unixepoch(captured_at_utc) AS captured_epoch, journal_id, captured_at_utc, five_hour_percent, weekly_percent FROM weekly_usage_snapshots WHERE account_key = ? AND five_hour_window_key = ? AND five_hour_percent IS NOT NULL',
+        table='weekly_usage_snapshots',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND five_hour_percent IS NOT NULL',
+        ordering='',
+        selected=('unixepoch(captured_at_utc) AS captured_epoch', 'journal_id', 'captured_at_utc', 'five_hour_percent', 'weekly_percent'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_journal:five_hour_windows_touched_by_evt',
+        sql_fingerprint='SELECT account_key, five_hour_window_key FROM weekly_usage_snapshots WHERE journal_id = ?',
+        table='weekly_usage_snapshots',
+        keys=('journal_id',),
+        predicate='journal_id = ?',
+        ordering='',
+        selected=('account_key', 'five_hour_window_key'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=JOURNAL,
+    ),
+    AccessContract(
+        function='_cctally_record:_refresh_open_five_hour_block',
+        sql_fingerprint='SELECT id, block_start_at, five_hour_resets_at, last_observed_at_utc FROM five_hour_blocks WHERE account_key = ? AND five_hour_window_key = ? AND is_closed = 0',
+        table='five_hour_blocks',
+        keys=('account_key', 'five_hour_window_key'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND is_closed = 0',
+        ordering='',
+        selected=('id', 'block_start_at', 'five_hour_resets_at', 'last_observed_at_utc'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_record:mark_account_open_blocks_dirty',
+        sql_fingerprint='SELECT five_hour_window_key FROM five_hour_blocks WHERE account_key = ? AND is_closed = 0',
+        table='five_hour_blocks',
+        keys=('account_key',),
+        predicate='account_key = ? AND is_closed = 0',
+        ordering='',
+        selected=('five_hour_window_key',),
+        effects='read',
+        classes=('cross-period',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_record:maybe_update_five_hour_block',
+        sql_fingerprint='INSERT INTO five_hour_blocks ( five_hour_window_key, five_hour_resets_at, block_start_at, first_observed_at_utc, last_observed_at_utc, final_five_hour_percent, seven_day_pct_at_block_start, seven_day_pct_at_block_end, crossed_seven_day_reset, total_input_tokens, total_output_tokens, total_cache_create_tokens, total_cache_read_tokens, total_cost_usd, pricing_provenance_json, is_closed, created_at_utc, last_updated_at_utc, account_key ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?) ON CONFLICT(account_key, five_hour_window_key) DO NOTHING',
+        table='five_hour_blocks',
+        keys=(),
+        predicate='',
+        ordering='',
+        selected=(),
+        effects='upsert',
+        classes=('singleton',),
+        inert_rule=BLOCKS,
+    ),
+    AccessContract(
+        function='_cctally_record:maybe_update_five_hour_block',
+        sql_fingerprint='SELECT id, five_hour_window_key FROM five_hour_blocks WHERE is_closed = 0 AND account_key = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
+        table='five_hour_blocks',
+        keys=('account_key',),
+        predicate='is_closed = 0 AND account_key = ? AND (five_hour_window_key < ? OR unixepoch(five_hour_resets_at) < unixepoch(?))',
+        ordering='',
+        selected=('id', 'five_hour_window_key'),
         effects='read',
         classes=('range-keyed', 'cross-period'),
         inert_rule=BLOCKS,
@@ -3794,12 +4948,27 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     ),
     AccessContract(
         function='_cctally_record:resolve_five_hour_reset_event',
-        sql_fingerprint='SELECT detected_at_utc, effective_reset_at_utc, id FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ?',
+        sql_fingerprint='SELECT detected_at_utc, effective_reset_at_utc, id, prior_percent, post_percent FROM five_hour_reset_events WHERE five_hour_window_key = ? AND account_key = ?',
         table='five_hour_reset_events',
         keys=('five_hour_window_key', 'account_key'),
         predicate='five_hour_window_key = ? AND account_key = ?',
         ordering='',
-        selected=('detected_at_utc', 'effective_reset_at_utc', 'id'),
+        selected=('detected_at_utc', 'effective_reset_at_utc', 'id', 'prior_percent', 'post_percent'),
+        effects='read',
+        classes=('period-keyed',),
+        inert_rule=None,
+    ),
+    # #943 T3 (spec 4.7): the boundary resolver's companion lookup, by the
+    # selected credit's natural key; the caller accepts the boundary only
+    # when its `credit_revision` equals the credit's revision.
+    AccessContract(
+        function='_cctally_record:_five_hour_credit_companion',
+        sql_fingerprint='SELECT boundary_at_utc, credit_revision FROM five_hour_credit_boundaries WHERE account_key = ? AND five_hour_window_key = ? AND effective_reset_at_utc = ?',
+        table='five_hour_credit_boundaries',
+        keys=('account_key', 'five_hour_window_key', 'effective_reset_at_utc'),
+        predicate='account_key = ? AND five_hour_window_key = ? AND effective_reset_at_utc = ?',
+        ordering='',
+        selected=('boundary_at_utc', 'credit_revision'),
         effects='read',
         classes=('period-keyed',),
         inert_rule=None,
@@ -3831,7 +5000,7 @@ REGISTRY: "tuple[AccessContract, ...]" = (
     AccessContract(
         function='_cctally_statusline:_tokens_from',
         sql_fingerprint='dynamic:_cctally_statusline:_tokens_from#1',
-        sql_shape='sha256:ba847e069d2ffffc',
+        sql_shape='sha256:3792420114949f41',
         table='dynamic',
         keys=(),
         predicate='dynamic SQL',

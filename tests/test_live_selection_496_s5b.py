@@ -76,18 +76,27 @@ def _read_selector(dest):
 # Task 8 — the generation identity is written inside the publication txn
 # --------------------------------------------------------------------------
 
-def test_the_physical_replacement_path_writes_no_stamp(core, tmp_path):
-    """A destination that does not exist yet is published by `os.replace`,
-    which writes no `stats_publication_stamp` at all.
+def test_the_physical_replacement_path_stamps_the_generation(core, tmp_path):
+    """#949. A destination that does not exist yet is published by
+    `os.replace`, and the scratch is stamped before the swap, so the replaced
+    index carries one `stats_publication_stamp` row and the same identity on
+    `journal_selector_state`.
 
-    That resolves INDETERMINATE, which means fall back to full selection. It is
-    the conservative direction and it is stated here so nobody later reads the
-    fallback on that path as a defect.
+    This pin used to assert the opposite and call the fallback safe. It was not:
+    an unstamped generation fails every later generation check, the durable
+    selector stops advancing, and the next rebuild reports
+    `selectorDesynchronized`. It detects a replace publication that leaves
+    either identity unset or the two disagreeing.
     """
     F.build_selector_scenarios(core.APP_DIR)
     dest = _rebuild(tmp_path / "fresh.db")
-    assert _read_stamp(dest) == []
-    assert _read_selector(dest).state.generation_record_path is None
+    stamp = _read_stamp(dest)
+    assert len(stamp) == 1
+    state = _read_selector(dest).state
+    assert (state.generation_record_path, state.generation_stamped_at_utc) == (
+        stamp[0][0],
+        stamp[0][2],
+    )
 
 
 def test_publication_stamps_the_selector_generation_atomically(core, tmp_path):
@@ -112,19 +121,17 @@ def test_a_failure_between_the_two_writes_rolls_both_back(
     """Spec §7 case 5: a failure BETWEEN the publication-stamp write and the
     selector-identity write. They are one transaction, so neither survives.
 
-    THREE publications, not two, and the third is what makes the assertions
-    non-convergent. The first rebuild creates the file and therefore publishes
-    by `os.replace`, which writes no stamp at all and leaves the selector
-    identity NULL — so injecting into the second would assert against a state
-    the fixture already had, and would pass whether or not the transaction held.
-    The second publishes in place and stamps it, so the injection into the third
-    asserts that the stamp is still the OLD one and the selector identity is
-    still the OLD one.
+    THREE publications, and the third is the one injected into. The first
+    rebuild creates the file and therefore publishes by `os.replace` (which,
+    since #949, stamps its scratch before the swap); the second publishes in
+    place, so the fixture already carries an in-place identity and the injection
+    into the third asserts that the stamp is still the OLD one and the selector
+    identity is still the OLD one.
     """
     jr = _jr()
     F.build_selector_scenarios(core.APP_DIR)
     dest = tmp_path / "dest.db"
-    _rebuild(dest)          # physical replacement — no stamp
+    _rebuild(dest)          # physical replacement — stamps its scratch
     _rebuild(dest)          # in-place publication — stamps both
     stamped = _read_stamp(dest)
     before = _read_selector(dest).state

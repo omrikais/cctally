@@ -27,7 +27,7 @@ Four disclosures follow from how that value was obtained, and none of them is a 
 
 **It is the provider's budget minus an unmeasured, workload-dependent amount.** Your quota is charged for work this machine cannot see — usage from claude.ai, the desktop app, another machine, and the summarisation call a compaction makes, which carries no `usage` block and never reaches local session data. Every one of those raises the meter without raising the local token total, so the fitted units-per-point comes out lower than the provider's own figure by however much of that you do.
 
-**No per-family multiplier ships.** Every family known to drain the general weekly meter contributes through the same four token-class coefficients of the era in force. The Opus 5.5, Sonnet 5.5 and Haiku 5.5 families are recognised and drain the general weekly meter, which the operator confirmed rather than an API price card. The research prototype carried a `MODEL_WEIGHT_DEFAULT` of 0.70 for anything it did not recognise; nothing like it ships, and an unrecognised family withholds the day instead.
+**No per-family multiplier is applied to units.** Every family known to drain the general weekly meter contributes through the same four token-class coefficients of the era in force. The Opus 5.5, Sonnet 5.5 and Haiku 5.5 families are recognised and drain the general weekly meter, which the operator confirmed rather than an API price card. The research prototype carried a `MODEL_WEIGHT_DEFAULT` of 0.70 for anything it did not recognise; nothing like it ships, and an unrecognised family withholds the day instead. The `opus-5-5` era does carry one piece of per-family metadata, a meter-evidence rate bound for Sonnet 5.5 (see *Two radii, plus an evidence-bounded family test for forecasts* below). It is support metadata, not a multiplier: it decides whether a forecast's family mix is supported, no weighting path reads it, and it never changes anyone's units or the fitted rate.
 
 **One era per analysis, selected by the clock.** The command analyses only the era that contains the current time, so today that is `opus-5-5` and the analysis starts at 2026-09-22 whatever `--since` you pass. `--since` and `--watch-from` narrow the window and never cross into an earlier era: days from two eras weigh the same tokens differently, so they are never summed or fitted together, and the change of coefficients on 2026-09-22 is never reported as a metering-rate change. A `--watch-from` earlier than the era's start evaluates the first in-era day with an empty baseline, which cannot confirm a change. History before 2026-07-25 is covered by no validated era and stays unvalidated. If your entire retained history predates the selected era the command reports `unvalidated-coefficient-era` and withholds at exit `3`; with only a few days in the era it reports `insufficient-history` or `unstable-fit` at exit `4`.
 
@@ -67,13 +67,36 @@ For the current subscription week: the modelled consumption in weekly points wit
 
 A mid-week credit does not re-anchor the week when it comes from `record-credit`, so the week's units are counted from the post-credit slice rather than from the week anchor. Counting from the anchor would divide a whole week's tokens by a meter that was reset partway through.
 
-### The two radii are effective, not observed
+### Two radii, plus an evidence-bounded family test for forecasts
 
-The command publishes two composition-support radii, one over the family shares and one over the raw token-class shares, and a day is supported only when it lies inside both. **Each published radius is the effective one: `max(observed spread, materiality floor)`.** The observed spread is published separately.
+The command publishes two composition-support radii, one over the family shares and one over the raw token-class shares, and a day is supported only when it lies inside both. The current week's forecast population gets one more chance on the family axis, described under *The evidence-bounded family test* below; the token-class radius always applies.
+
+#### The radii are effective, not observed
+
+**Each published radius is the effective one: `max(observed spread, materiality floor)`.** The observed spread is published separately.
 
 This matters because the two can differ by everything. A single-model user's observed family spread is exactly `0.0`, and the effective radius is then the `0.03` family floor. Reading `0.03` as a measurement of that user's variation would be wrong in both directions: the observed variation is zero, and the number that decides support is not a measurement at all. The floor is the smallest clean bound above the corrected supported maximum of `0.0274`; the corrected empirical radius is `0.0934`, so the measured store's own outlier decision is unchanged. The floor exists precisely so that a user who adds a small share of a second model is not locked out of their own calibration by a radius that collapsed to zero.
 
 The terminal report prints both, labelled. The JSON publishes `composition.familyRadiusEffective` and `composition.familyRadiusEmpirical`, and the same pair for the token-class axis.
+
+#### The evidence-bounded family test
+
+A forecast whose family shares fall outside the family radius is still supported when meter evidence bounds the worst-case effect of that shift on the forecast within 5%, the same materiality the token-class axis uses. The token-class radius is never relaxed, and the per-day test on a confirmed rate change's decisive watch days is unchanged: this test applies only to the population a forecast is made for.
+
+The evidence is a rate bound per family, relative to the era's reference family. For `opus-5-5` the reference is Opus 5.5, and one family is bounded: **Sonnet 5.5 is metered at 0.09–0.61 of Opus 5.5 per kernel unit** (nominal simultaneous 95%, meter evidence from one store). Equal rate lies outside that interval, so the evidence shows Sonnet 5.5 draining the meter more slowly than Opus 5.5 per unit, but how much more slowly is known only to that range. The bound decides support only. It is never applied as a multiplier, so it cannot move the fitted rate, the consumption or the projection; it can only decide whether they are published.
+
+The effect bound compares the forecast's family shares with the fit-weighted family shares of the days the published fit was taken over (`fitFamilyShares`), because that is the blend the fitted rate describes. For each family it takes the share change times the largest distance of its rate bound from 1, and divides the sum by the fit's units at each family's lowest admissible rate. A 5% Sonnet 5.5 shift over a pure Opus 5.5 fit gives 0.05 × 0.91 = 0.0455, inside the limit, so it is published; a 10% shift gives 0.091 and stays withheld. For a fit with no unbounded family, that admits a Sonnet-only shift of up to about 5.5 points of share, against the 0.03 family floor alone.
+
+**Haiku 5.5 and the legacy families carry no bound.** Haiku 5.5 appears in too few of the measured store's segments for its rate to be bounded at that coverage: its estimate moved from 0.25 to 1.15 of Opus 5.5 between two captures of the same store, and its simultaneous upper bound does not exist. Sonnet 5 and Haiku 4.5 appear in too few of the era's segments for any bound at all. A family without a bound contributes nothing while its share is unchanged, but when its share changes at all the effect cannot be bounded, and the forecast is supported only if it is inside the family radius. That is the conservative direction: an unmeasured family never counts as harmless.
+
+When the test withholds a forecast, the withheld values name which family failure did it, in their `qualifications`:
+
+| Code | Meaning |
+| --- | --- |
+| `forecast-family-effect-over-limit` | The shift is bounded, but its bound exceeds 5%. |
+| `forecast-family-unbounded` | A family without a rate bound changed share, so the effect could not be bounded. |
+
+The terminal report shows them on the withheld lines, for example `withheld: unsupported-model-mix  (forecast-family-unbounded)`, and adds two lines under the radii: `forecast family distance` (the forecast's total-variation distance from the reference centre, and whether it is inside the family radius) and `forecast family effect` (the bound and whether it admitted the forecast, or the families whose change could not be bounded). A withholding caused by the token-class axis alone carries neither code.
 
 ## The day a new Claude family ships
 
@@ -149,7 +172,8 @@ analysis    — baseline.fit, watch.fit
 currentWeek — start, end, observedPercent, observedMinusModelled,
               consumption, projection, headroom
 composition — baseline/current share vectors, both effective radii,
-              both empirical radii, radiusRule
+              both empirical radii, radiusRule, familyMateriality,
+              forecastProbe
 health      — entriesThrough, day counts, the eligibility fence,
               unattributed units and entries, the excluded in-progress day,
               excluded fast-mode entries,
@@ -164,7 +188,18 @@ Above one real account the per-account payloads appear under `accounts`, and the
 
 Every calibration value takes the same evidence shape: `state` is `available` or `withheld`; an available value carries `value`, `interval`, `support` and `population`; a withheld one carries a typed `code` and no value at all. There is no confidence field on any of them, because the design never defined what a confidence would mean here.
 
-The coefficient-era fields are additive. `method.supportedCompositionFrom` is the selected era's start. `method.coefficientSupport` carries `supportedCompositionFrom`, `supportedCompositionUntil` (the era's exclusive end, or `null` for the open era), `coefficientEra` (the selected era's id) and `fastModeParticipation`. `method.coefficientEras` lists the whole catalogue in order: the unvalidated record before 2026-07-25 (`id: null`, no weights), then `opus-5` and `opus-5-5`, each with `id`, `from`, `until`, `state`, `provenance` and `tokenClassWeights`.
+The coefficient-era fields are additive. `method.supportedCompositionFrom` is the selected era's start. `method.coefficientSupport` carries `supportedCompositionFrom`, `supportedCompositionUntil` (the era's exclusive end, or `null` for the open era), `coefficientEra` (the selected era's id) and `fastModeParticipation`. `method.coefficientEras` lists the whole catalogue in order: the unvalidated record before 2026-07-25 (`id: null`, no weights), then `opus-5` and `opus-5-5`, each with `id`, `from`, `until`, `state`, `provenance` and `tokenClassWeights`. Every record also carries `referenceFamily` and `familyRateBounds` (each bound with `family`, `low`, `high` and `provenance`); the unvalidated record has `referenceFamily: null` and an empty list.
+
+The two `composition` objects are additive:
+
+- **`familyMateriality`** carries the evidence test's inputs: `reference` (`fit-weighted`), `fitFamilyShares` (the published fit's family composition, or `null`), `referenceFamily`, `familyRateBounds` and `maxRelativeEffect` (0.05).
+- **`forecastProbe`** carries the forecast population's test. `state` is `probed`, `not-probed` (no forecast population), `unaggregatable` (a population whose entries contribute no units) or `no-reference` (no reference composition to compare with). `familyShares` and `classShares` are the forecast population's own vectors, present for `probed` and `no-reference` and `null` otherwise. The measurements are `null` unless `state` is `probed`: `familyDistance` (against `familyDistanceReference`, `baseline-family-shares`), `familyWithinRadius`, `familyEffectBound` (against `familyEffectReference`, `fit-family-shares`), `familyEffectUnavailable` (`null` when a bound was computed, otherwise a `reason` such as `unevidenced-family-change` and the sorted `families` involved), `familyAdmittedBy` (`radius`, `materiality` or `null`), `classDistance` and `classWithinRadius`. `supported` is set in every state. The effect bound is computed even when the distance is inside the radius, as a diagnostic.
+
+**A correction to a calibration's inputs.** A stored calibration records which observations and which completed corrections it was fitted from. When a reviewed `cctally db rederive` correction (a hold or retract) later changes an observation inside that fit's window, for that account, the calibration stops steering anything: `cctally forecast`, the dashboard Forecast panel and `cctally project` withhold their calibrated figures with the cause `recalibration-needed` until a `cctally quota` run fits a replacement. The terminal report appends to the `recorded prior` line: the stored calibration was fitted before a correction to its inputs; run cctally quota to recalibrate. A metering-rate change fitted from such inputs is superseded: its status-line, TUI and doctor marker stops showing, a notification still owed for it is not sent, and the dashboard's Recent Alerts keeps the row labelled `Status: superseded by a correction`. A correction outside the fit's window, or for another account, changes nothing. A calibration recorded before this shipped has no recorded inputs, so any correction up to its fit date counts.
+
+`calibration.recorded.lineage` states that assessment: `{state, corrections}`, where `state` is `clean`, `recalibration-needed` or `unavailable` (the correction facts could not be read, so the calibration is neither trusted nor refused), and `corrections` lists the corrections that tainted it as `{opId, observations}`. It is additive, and the status and exit code are unchanged by it.
+
+A stored calibration also records its fit's `fitFamilyShares`, so `calibration.recorded` shows it. A calibration fitted before this test shipped is reported `stale`, and the consumers that apply a stored calibration fall back as they do for any stale one until the next successful `cctally quota` run records a current one.
 
 These fields can be `null` when the clock selects no era. That happens only for a clock before 2026-07-25, which no real run has and which is reachable only through the test harnesses' fixed clock. Such a run reads nothing, so `scope.analysisStart`, `method.supportedCompositionFrom`, and `supportedCompositionFrom`, `supportedCompositionUntil` and `coefficientEra` inside `method.coefficientSupport` are all `null`. The run reports status `unvalidated-coefficient-era` with `health.storeCause` `history-predates-supported-composition` and exits `3`. `method.coefficientEras` still lists the whole catalogue. Under any real clock `scope.analysisStart` and `method.supportedCompositionFrom` are strings, and only `supportedCompositionUntil` is `null`, for the open era.
 
@@ -184,7 +219,7 @@ The two date bounds compose in a fixed order. The start of the selected coeffici
 
 ## What is out of scope
 
-The five-hour meter. Fable 5's and Mythos's dedicated pools — all three families drain the general weekly meter as well, and only that draining is modelled. Any statement about an individual family's exchange rate. Named budget or promotional hypotheses, which are not reported at any support level.
+The five-hour meter. Fable 5's and Mythos's dedicated pools — all three families drain the general weekly meter as well, and only that draining is modelled. Any estimate of an individual family's exchange rate: the Sonnet 5.5 rate bound above is evidence for the support test, not a rate the command fits, reports per user or applies. Named budget or promotional hypotheses, which are not reported at any support level.
 
 ## Related
 

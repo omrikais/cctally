@@ -1,6 +1,7 @@
 """#661 S2 Task D1 — the ONE cause-code copy table (spec section 8).
 
-S1 publishes fifteen withheld-figure codes in `EVIDENCE_CODES`. Section 8
+S1 publishes fifteen withheld-figure codes in `EVIDENCE_CODES`, and #1015
+adds a sixteenth, `recalibration-needed`. Section 8
 renders them through one table in two registers, and this module is that
 table.
 
@@ -27,7 +28,7 @@ matters because a dashboard tab can outlive a server restart through
 `execvp` and will meet an older server's envelope.
 
 Pure: no I/O, no clock, no store. The cause vocabulary is the closed
-15-member `EVIDENCE_CODES` union, and the separate basis vocabulary names
+16-member `EVIDENCE_CODES` union, and the separate basis vocabulary names
 which measurement produced a projection. They share this rendering boundary
 but never one semantic union: a basis is not a withholding cause.
 """
@@ -79,6 +80,10 @@ _LONG_FORM: dict = {
         "the stored calibration came from a newer cctally than this one",
     "unavailable":
         "no usable calibration could be read for this account",
+    # --- #1015: the stored calibration's own refusal (U3, spec 2) ---
+    "recalibration-needed":
+        "the stored calibration was fitted before a correction to its "
+        "inputs; run cctally quota to recalibrate",
 }
 
 #: Projection-basis copy in the same two registers, deliberately separate

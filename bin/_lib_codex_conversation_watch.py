@@ -17,6 +17,9 @@ All six §5.4 bullets are contract:
 1. **walk_root-only seed.** The frontier index starts as JUST the configured
    ``CodexProviderRoot.walk_root`` — construction walks nothing. Directories are
    discovered incrementally as the frontier is enumerated.
+   #970: a native home's archive directory is a second seed, enumerated FLAT
+   (its subdirectories never join the frontier) under the same budget, and
+   each mappable file registers under its DATED logical path.
 2. **One shared per-cycle operation budget** covering directory ``stat``s,
    directory enumerations, and pending-candidate ``stat``s, with round-robin
    fairness across the three work classes and rotating continuation cursors, so
@@ -52,6 +55,8 @@ All six §5.4 bullets are contract:
 from __future__ import annotations
 
 import os
+import pathlib
+
 import _lib_codex_rollout_container as _rc
 
 
@@ -102,13 +107,20 @@ def default_file_size(filepath):
     return st.st_size
 
 
-def default_file_sig(filepath):
+def default_file_sig(filepath, *, archive_dir=None):
     """The selected container's live-tail signature (#968 spec 5.9).
 
     Plain keeps today's size (as ``("plain", size)``); a compressed-only
-    rollout reports its container fingerprint instead of vanishing.
+    rollout reports its container fingerprint instead of vanishing. #970: with
+    an ``archive_dir`` (a dated rollout of a native home), an archived
+    container is observed too, its signature carrying the ``"archive"``
+    location; the dated containers are tried first, so a dated rollout costs
+    exactly today's probe.
     """
-    return _rc.observe_watch_sig(filepath)
+    sig = _rc.observe_watch_sig(filepath)
+    if sig is not None or archive_dir is None:
+        return sig
+    return _rc.observe_watch_sig(filepath, archive_dir=archive_dir)
 
 
 def _as_sig(value):
@@ -122,26 +134,33 @@ def codex_sig_advanced(observed, committed) -> bool:
 
     Plain grows (append-only, size decides); any other change of a compressed
     container, or of the container kind, is a change. A bare int on either
-    side is a legacy plain size.
+    side is a legacy plain size. #970: a plain container at a different
+    location (the trailing ``"archive"`` element) is a change whatever its
+    size, so a pure archive move is observed once.
     """
     obs, com = _as_sig(observed), _as_sig(committed)
     if obs is None:
         return False
     if com is None:
         return True
-    if obs[0] == com[0] == _rc.PLAIN:
+    if obs[0] == com[0] == _rc.PLAIN and obs[2:] == com[2:]:
         return obs[1] > com[1]
     return obs != com
 
 
 def committed_watch_sig(kind, size_bytes, container_size_bytes, mtime_ns,
-                        device, inode):
+                        device, inode, location=_rc.DATED):
     """The signature a cursor row's ACCEPTED container would observe: the
-    leaf's ``ContainerFingerprint.watch_sig`` shape, device included."""
+    leaf's ``ContainerFingerprint.watch_sig`` shape, device included, with
+    the location appended exactly when the leaf appends it (#970: only for a
+    container outside the dated location, so every dated signature keeps
+    today's shape)."""
     if kind in (None, _rc.PLAIN):
-        return (_rc.PLAIN, int(size_bytes or 0))
-    return (_rc.ZSTD, int(container_size_bytes or 0), int(mtime_ns or 0),
-            int(device or 0), int(inode or 0))
+        sig = (_rc.PLAIN, int(size_bytes or 0))
+    else:
+        sig = (_rc.ZSTD, int(container_size_bytes or 0), int(mtime_ns or 0),
+               int(device or 0), int(inode or 0))
+    return sig if location == _rc.DATED else sig + (str(location),)
 
 
 _SENTINEL = object()
@@ -157,24 +176,37 @@ class CodexChildFrontier:
         self,
         walk_root,
         *,
+        archive_root=None,
         op_budget: int = 64,
         pending_expiry_cycles: int = 50,
         scandir_fn=default_scandir,
         dir_mtime_fn=default_dir_mtime,
-        file_size_fn=default_file_sig,
+        file_size_fn=None,
         clock_fn=None,
     ):
         self._walk_root = str(walk_root)
+        # #970 spec 5.8: a native home's archive directory is a second seeded
+        # directory, enumerated FLAT under the same operation budget; each
+        # mappable file registers under its dated logical path.
+        self._archive_root = None if archive_root is None else str(archive_root)
+        self._locations = (_rc.CodexLocations(
+            pathlib.Path(self._walk_root),
+            None if self._archive_root is None
+            else pathlib.Path(self._archive_root)),)
         self._op_budget = max(1, int(op_budget))
         self._pending_expiry = max(1, int(pending_expiry_cycles))
         self._scandir = scandir_fn
         self._dir_mtime = dir_mtime_fn
-        self._file_size = file_size_fn
+        self._file_size = file_size_fn or self._default_file_sig
         self._clock = clock_fn or (lambda: 0)
 
-        # Frontier index — seeded with JUST walk_root (no enumeration at start).
+        # Frontier index — seeded with JUST walk_root (and the archive
+        # directory, when there is one); no enumeration at start.
         self._dirs: list[str] = [self._walk_root]
         self._dir_set: set[str] = {self._walk_root}
+        if self._archive_root is not None:
+            self._dirs.append(self._archive_root)
+            self._dir_set.add(self._archive_root)
         # dir -> mtime observed when it was last enumerated (absent => never).
         self._enum_mtime: dict[str, int] = {}
         # dirs awaiting a scandir, each carried with the mtime that triggered it.
@@ -189,6 +221,12 @@ class CodexChildFrontier:
         self._rotation_start = None
         self._completed_rotation_watermark = None
         self._rotation_count = 0
+
+    def _default_file_sig(self, path):
+        """The production signature probe, archive candidates included."""
+        archive_dir = (None if self._archive_root is None
+                       else _rc.archive_dir_for(path, self._locations))
+        return default_file_sig(path, archive_dir=archive_dir)
 
     # ── introspection (tests / diagnostics) ──────────────────────────────────
 
@@ -303,6 +341,9 @@ class CodexChildFrontier:
         d, mt = self._enum_queue.pop(0)
         entries = self._scandir(d)                    # 1 fs op
         self._enum_mtime[d] = mt
+        if d == self._archive_root:
+            self._register_archive_entries(entries, ingest)
+            return True
         for (name, path, is_dir, is_sym) in entries:
             if is_sym:
                 continue                              # never traverse a symlink
@@ -317,6 +358,24 @@ class CodexChildFrontier:
                     self._pending[logical] = 0        # register BEFORE first ingest
                     ingest.add(logical)               # first ingest attempt now
         return True
+
+    def _register_archive_entries(self, entries, ingest: set) -> None:
+        """Register the archive's mappable files under their dated logical
+        paths (#970 spec 5.3, 5.8). Flat: a subdirectory never joins the
+        frontier. An unmappable name has no logical identity and is skipped.
+        A symlinked entry is skipped exactly as under the walk root (bullet
+        4): this discovery is a fast path, and the full sync still reaches a
+        linked rollout under its canonical identity."""
+        for (name, path, is_dir, is_sym) in entries:
+            if is_sym or is_dir or not _rc.is_container_name(name):
+                continue
+            dated = _rc.dated_logical_for_archive(path, self._locations)
+            if dated is None:
+                continue
+            logical = os.fspath(dated)
+            if logical not in self._known and logical not in self._pending:
+                self._pending[logical] = 0            # register BEFORE first ingest
+                ingest.add(logical)                   # first ingest attempt now
 
     def _op_pending(self, ingest: set) -> bool:
         """Check one pending candidate (rotating cursor). Vanished → dropped; no

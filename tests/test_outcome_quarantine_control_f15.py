@@ -1,23 +1,24 @@
-"""#825/#832 Task 3.6 — drop-consensus withholding and the control certificate,
-case F15 (spec 5.6 items 1(b) and 7).
+"""#825/#832 Task 3.6 — drop-consensus withholding, case F15 (spec 5.6
+items 1(b) and 7), rewritten for #948's per-axis recovery barrier (spec
+6.3, 6.4, 6.8).
 
 (a) Spool-only legacy activity — a frozen render writing a legacy candidate and
     no journal observation — is journaled as `legacy_spool_activity` before the
-    next current publication and quarantines every account, including the
+    next current publication and pauses every account, including the
     round-6 interleaving inside the cutover establishment and the stale loser
     of the establishment race.
-(b) During control quarantine a pending drop below the database baseline is
+(b) While an axis is paused a pending drop below the database baseline is
     published neither by consensus nor at its deadline; a rise publishes.
-(c) Accounting recovery without an OAuth publication leaves drop consensus
-    withheld.
-(d) A bound two-axis authoritative publication for A restores A's control
-    certificate and not B's.
+(c) Fresh readings without completed OAuth authority release nothing, so drop
+    consensus stays withheld.
+(d) A bound authoritative publication covers A and not B: after the fresh
+    period A's drop publishes and B's stays withheld.
 (e) Retained-low expiry, an empty spool and a non-expiring inflight tombstone
     never count as recovery.
-(f) Spec revision 3: after spool-only activity the unresolved marker keeps
-    accounting uncertified and drops withheld through the full recovery
-    schedule, ingest, rebuild, rederive and doctor; (c) and (d) run over a
-    history whose trigger leaves no marker.
+(f) After spool-only activity, only the whole barrier — expiry, completed
+    authority, a fresh witness and its release — resumes drops; an
+    unchanged complete inventory closes an open episode with a non-trigger
+    completion op whatever the sidecar says.
 """
 from __future__ import annotations
 
@@ -50,6 +51,7 @@ class Clock:
 
     def _pin(self):
         self._monkeypatch.setenv("CCTALLY_AS_OF", T.iso(self.value))
+        T.pin_journal_clock(self._monkeypatch, self.value)
 
     def advance(self, seconds):
         self.value += seconds
@@ -179,8 +181,7 @@ def test_a_and_b_spool_only_legacy_activity_withholds_the_drop(app, monkeypatch)
     ops = _spool_activity_ops()
     assert [op["payload"]["reason"] for op in ops] == ["changed"]
     for name in ("A", "B", "unattributed"):
-        status = _status(app, name)
-        assert not status["accounting"] and not status["control"], name
+        assert _paused(app, name), name
     # Published neither by consensus nor at its deadline: it stays pending.
     assert not _published("A", 20)
     assert _weekly(app, "A") == 70
@@ -245,21 +246,21 @@ def _refuse_legacy_inventory(monkeypatch, failure, failing):
 
 
 def _marker_reasons(app):
-    import _cctally_quarantine as G
-    conn = app.open_db()
-    try:
-        report = G.report(conn)
-    finally:
-        conn.close()
-    return [m["reason"] for m in report.get("unresolvedSpoolMarkers") or []]
+    """The reasons of every legacy-spool trigger, in journal order (#948:
+    the unresolved spool markers became the barrier's triggers)."""
+    return [t["reason"] for t in T.quarantine_state(app)["triggers"]
+            if t["kind"] == "legacy-spool-activity"]
+
+
+def _paused(app, name):
+    """Whether every axis of ``name`` is paused."""
+    return not any(T.axis_allowed(app, name).values())
 
 
 def _assert_markers(app, expected, step):
     assert _marker_reasons(app) == expected, step
     for name in ("A", "B", "unattributed"):
-        status = _status(app, name)
-        assert not status["accounting"] and not status["control"], (
-            step, name)
+        assert _paused(app, name), (step, name)
 
 
 @pytest.mark.parametrize("failure", ["file-read", "directory-listing"])
@@ -352,26 +353,16 @@ def test_a_an_incomplete_spool_inventory_never_authorizes_the_low_drop(
     assert _weekly(app, "A") == 80
 
 
-#: Operator-approved revision 5 doctor wording (spec section 8), verbatim.
-INVENTORY_MARKER_TEXT = (
-    "Automatic credit, reset and status-line drop detection is paused for "
-    "{account} since {time} because cctally could not read the status-line "
-    "files an older cctally release used, so it cannot rule out that an "
-    "older process changed them. This version of cctally cannot yet confirm "
-    "a safe point to resume, so the pause does not end on its own; usage "
-    "recording continues. If your usage was reset in place meanwhile, record "
-    "it with `cctally record-credit`.")
-
-
 def test_a_pre_cutover_incomplete_inventory_is_the_cutovers_own_trigger(
         app, monkeypatch):
     """Spec revision 5, section 7 *Before the initial cutover*: the legacy
     spool cannot be read when the first current producer establishes the
     cutover. The cutover records the uncertainty in itself — no separate op,
-    no baseline — and that is the unresolved-marker trigger: drops stay
-    withheld and doctor words the marker as an unreadable inventory, through
-    ingest, rebuild and rederive, while recording continues. The next
-    complete inventory anchors a baseline under its own op."""
+    no baseline — and that is the trigger that opens an inventory episode:
+    drops stay withheld through ingest, rebuild and rederive, while
+    recording continues. The next complete inventory anchors a baseline
+    under its own op, which closes the episode (and is itself a trigger,
+    #948 spec 6.3). Doctor's wording of it is pinned by the doctor tests."""
     import _cctally_core as core
     import _cctally_journal as jr
     import _lib_account_protocol as P
@@ -398,11 +389,7 @@ def test_a_pre_cutover_incomplete_inventory_is_the_cutovers_own_trigger(
             T.retain_session_input(app, "A")
             T.rederive(app)
         _assert_markers(app, ["inventory-incomplete"], step)
-        rows = _doctor_rows(app)
-        row = rows[_key("A")]
-        assert row["unresolvedSpoolMarker"], row
-        assert row["message"] == INVENTORY_MARKER_TEXT.format(
-            account=row["accountLabel"], time=row["accountingSince"]), row
+        assert T.quarantine_report(app)["inventoryEpisode"]["state"] == "open"
     _drive(app, clock, "A", (("one", 80), ("two", 80)), WEEK, 2)
     assert _weekly(app, "A") == 80
     failing[0] = False
@@ -422,20 +409,16 @@ def test_a_pre_cutover_incomplete_inventory_is_the_cutovers_own_trigger(
             T.rebuild(app)
         assert _marker_reasons(app) == ["inventory-incomplete",
                                         "inventory-complete"], step
-        row = _doctor_rows(app)[_key("A")]
-        assert row["unresolvedSpoolMarker"], (step, row)
-        assert row["message"] == INVENTORY_MARKER_TEXT.format(
-            account=row["accountLabel"], time=row["accountingSince"]), (
-            step, row)
+        assert T.quarantine_report(app)["inventoryEpisode"]["state"] == \
+            "closed", step
+        assert _paused(app, "A"), step
     # A later genuine legacy change is still told apart: it anchors against
-    # the complete baseline and words the marker as legacy activity.
+    # the complete baseline as legacy activity.
     _write_legacy_candidate('{"sevenDay": 71}')
     _drive(app, clock, "A", (("one", 80), ("two", 80)), WEEK, 1)
     assert [op["payload"]["reason"] for op in _spool_activity_ops()] == [
         "inventory-complete", "changed"]
-    row = _doctor_rows(app)[_key("A")]
-    assert row["message"] != INVENTORY_MARKER_TEXT.format(
-        account=row["accountLabel"], time=row["accountingSince"]), row
+    assert T.quarantine_report(app)["cause"] == "legacy-spool-activity"
 
 
 def test_a_the_stale_establishment_loser_installs_nothing(app, monkeypatch):
@@ -541,8 +524,7 @@ def test_a_two_producer_race_with_a_legacy_write_before_the_loser_resumes(
     first_trigger = kinds.index(P.LEGACY_SPOOL_ACTIVITY_KIND)
     assert "publication" not in kinds[:first_trigger], kinds
     for name in ("A", "B", "unattributed"):
-        status = _status(app, name)
-        assert not status["accounting"] and not status["control"], name
+        assert _paused(app, name), name
     assert not _published("A", 20)
     assert _weekly(app, "A") == 70
 
@@ -569,11 +551,12 @@ def _excluded_trigger(app, clock, week_reset, five_reset):
     T.ingest(app)
 
 
-def test_c_d_accounting_recovery_alone_is_not_enough_and_oauth_is_per_account(
+def test_c_d_fresh_readings_alone_are_not_enough_and_oauth_is_per_account(
         app, monkeypatch):
-    """(c) and (d) over a history WITHOUT an unresolved spool marker (spec
-    revision 3, F15 (f)): the trigger is an excluded observation, so the
-    idle-gap readings certify accounting."""
+    """(c) and (d) over an excluded-observation trigger: fresh first entries
+    release nothing without completed authority, so B's drop stays withheld;
+    A's bound authoritative publication covers A only, and A's fresh first
+    entries then release both of A's axes, so A's drop publishes."""
     clock = Clock(app, monkeypatch, T0)
     _seed(app, clock, "A", 30, week_reset=T0 + 86400, five=10,
           five_reset=T0 + 3600)
@@ -582,23 +565,22 @@ def test_c_d_accounting_recovery_alone_is_not_enough_and_oauth_is_per_account(
     _excluded_trigger(app, clock, T0 + 86400, T0 + 3600)
     assert not _spool_activity_ops()
     for name in ("A", "B"):
-        assert not _status(app, name)["accounting"], name
+        assert _paused(app, name), name
+    clock.advance(TICK)
+    # (d) A bound two-axis authoritative publication for A only.
+    _authoritative(app, clock, "A", 31, T0 + 86400, 11, T0 + 3600)
+    [completion] = T.ops_of_kind("outcome_authority_completion")
+    assert completion["payload"]["account"] == _key("A")
+    assert _paused(app, "A"), "coverage alone releases nothing"
     # An idle gap spanning the weekly reset and the five-hour window end.
     clock.advance(86400 + 3600)
     new_week = clock.value + 7 * 86400
     for name in ("A", "B"):
         _seed(app, clock, name, 70, week_reset=new_week, five=10,
               five_reset=clock.value + 3 * 3600, source="statusline")
-        assert _status(app, name)["accounting"], name
-        assert not _status(app, name)["control"], name
-    clock.advance(TICK)
-    # (c) Accounting recovery without an OAuth publication: withheld.
-    _drive(app, clock, "A", (("one", 20), ("two", 20)), new_week, 6)
-    assert not _published("A", 20)
-    # (d) A bound two-axis authoritative publication for A only.
-    _authoritative(app, clock, "A", 70, new_week, 11, clock.value + 3 * 3600)
-    assert _status(app, "A")["control"]
-    assert not _status(app, "B")["control"]
+    assert T.axis_allowed(app, "A") == {"sevenDay": True, "fiveHour": True}
+    # (c) B's fresh readings release nothing without authority.
+    assert _paused(app, "B")
     clock.advance(TICK)
     _drive(app, clock, "A", (("one", 20), ("two", 20)), new_week, 6)
     assert _published("A", 20)
@@ -606,53 +588,23 @@ def test_c_d_accounting_recovery_alone_is_not_enough_and_oauth_is_per_account(
     assert not _published("B", 20)
 
 
-#: Operator-approved revision 3 doctor wording (spec section 8), verbatim.
-MARKER_TEXT = (
-    "Automatic credit, reset and status-line drop detection is paused for "
-    "{account} since {time} because an older cctally process wrote "
-    "status-line data after the upgrade. This version of cctally cannot yet "
-    "confirm a safe point to resume, so the pause does not end on its own; "
-    "usage recording continues. If your usage was reset in place meanwhile, "
-    "record it with `cctally record-credit`.")
-
-
-def _doctor_rows(app):
-    import dataclasses
-    import _cctally_doctor
-    import _lib_doctor
-    kwargs = {f.name: None for f in dataclasses.fields(_lib_doctor.DoctorState)}
-    kwargs.update(outcome_quarantine=_cctally_doctor._gather_outcome_quarantine(),
-                  now_utc=dt.datetime.now(dt.timezone.utc))
-    result = _lib_doctor._check_accounting_outcome_quarantine(
-        _lib_doctor.DoctorState(**kwargs))
-    assert result.severity == "warn", result
-    return {row["account"]: row for row in result.details["accounts"]}
-
-
-def _assert_marker_withholds(app, clock, week_reset, step):
-    for name in ("A", "B"):
-        assert not _status(app, name)["accounting"], (step, name)
-    rows = _doctor_rows(app)
-    for name in ("A", "B"):
-        row = rows[_key(name)]
-        assert row["unresolvedSpoolMarker"] and row["accountingPaused"], row
-        assert row["message"] == MARKER_TEXT.format(
-            account=row["accountLabel"], time=row["accountingSince"]), row
+def _assert_withholds(app, clock, week_reset, step, names=("A", "B")):
+    for name in names:
+        assert _paused(app, name), (step, name)
     # The drop stays withheld: neither consensus nor its deadline publishes.
     _drive(app, clock, "A", (("one", 20), ("two", 20)), week_reset,
            1 + 2 * DEADLINE // TICK)
     assert not _published("A", 20), step
 
 
-def test_f_the_spool_marker_persists_through_the_full_recovery_schedule(
+def test_f_the_whole_barrier_resumes_drops_after_spool_activity(
         app, monkeypatch):
-    """(f) Spec revision 3 (finding CD3-O01): after a `legacy_spool_activity`
-    trigger, the full recovery schedule — an idle gap spanning a weekly reset
-    and the end of the five-hour window, fresh two-axis readings and a
-    completed OAuth reconciliation — leaves accounting uncertified and drops
-    withheld, through ingest, rebuild and rederive, and doctor keeps
-    reporting it. The control certificate still reconciles independently and
-    ordinary recording continues."""
+    """(f) After a `legacy_spool_activity` trigger, fresh two-axis readings
+    alone and an OAuth reconciliation alone leave the drops withheld; once
+    the cohort has expired, a completed OAuth reconciliation covered A and
+    A's next fresh period produced a witness and its release, A's drop
+    publishes — and B, never covered, stays paused. The state is the same
+    after ingest, rebuild and rederive."""
     clock = Clock(app, monkeypatch, T0)
     for name in ("A", "B", "unattributed"):
         T.retain_session_input(app, name)
@@ -668,23 +620,128 @@ def test_f_the_spool_marker_persists_through_the_full_recovery_schedule(
     for name in ("A", "B"):
         _seed(app, clock, name, 70, week_reset=new_week, five=10,
               five_reset=clock.value + 3 * 3600, source="statusline")
-        # Ordinary recording continues; the fresh reading never certifies.
+        # Ordinary recording continues; the fresh reading releases nothing.
         assert _weekly(app, name) == 70, name
-        assert not _status(app, name)["accounting"], name
     clock.advance(TICK)
-    _assert_marker_withholds(app, clock, new_week, "after fresh readings")
-    # A completed OAuth reconciliation for A: its control certificate
-    # reconciles (as in (d)); accounting, and so drop consensus, stays paused.
+    _assert_withholds(app, clock, new_week, "after fresh readings")
+    # A completed OAuth reconciliation for A after expiry covers A.
     _authoritative(app, clock, "A", 70, new_week, 11, clock.value + 3 * 3600)
-    assert _status(app, "A")["control"]
-    assert not _status(app, "B")["control"]
+    assert [op["payload"]["account"]
+            for op in T.ops_of_kind("outcome_authority_completion")] == [_key("A")]
     clock.advance(TICK)
-    _assert_marker_withholds(app, clock, new_week, "after OAuth")
-    T.rebuild(app)
-    _assert_marker_withholds(app, clock, new_week, "after rebuild")
-    T.rederive(app)
-    _assert_marker_withholds(app, clock, new_week, "after rederive")
-    assert _weekly(app, "A") == 70
+    _assert_withholds(app, clock, new_week, "after OAuth")
+    # A's next fresh period: the first entry of the following week.
+    clock.value = new_week + 60
+    clock._pin()
+    third_week = new_week + 7 * 86400
+    _seed(app, clock, "A", 40, week_reset=third_week, five=12,
+          five_reset=clock.value + 3 * 3600, source="statusline")
+    assert T.axis_allowed(app, "A") == {"sevenDay": True, "fiveHour": True}
+    assert _paused(app, "B")
+    result = T.continue_through_maintenance(app, monkeypatch)
+    assert result["live_state"] == result["rebuilt_state"] == (
+        result["rederived_state"])
+    assert T.axis_allowed(app, "A") == {"sevenDay": True, "fiveHour": True}
+    clock.advance(TICK)
+    _drive(app, clock, "A", (("one", 20), ("two", 20)), third_week,
+           1 + 2 * DEADLINE // TICK)
+    assert _published("A", 20)
+
+
+@pytest.mark.parametrize("sidecar", ["missing", "stale-closed", "stale-open"])
+def test_f_an_unchanged_complete_inventory_closes_the_episode(
+        app, monkeypatch, sidecar):
+    """#948 spec 6.3: the inventory pass decides from the JOURNAL whether an
+    episode is open. When reads recover and the spool is unchanged against
+    its anchored baseline, it appends one non-trigger
+    `legacy_spool_inventory_completion` naming the episode, whatever the
+    local sidecar says — missing, already closed (an upgrade over the
+    previous release's sidecar), or still open."""
+    clock = Clock(app, monkeypatch, T0)
+    _seed(app, clock, "A", 70, week_reset=WEEK)   # establishes the cutover
+    failing = [True]
+    _refuse_legacy_inventory(monkeypatch, "directory-listing", failing)
+    _write_legacy_candidate('{"sevenDay": 70}')
+    _drive(app, clock, "A", (("one", 80),), WEEK, 1)
+    [opener] = _spool_activity_ops()
+    assert opener["payload"]["reason"] == "inventory-incomplete"
+    generation = T.account_status(app, "A")["generation"]
+    failing[0] = False
+    # The first complete scan sees the candidate: `changed` closes the
+    # episode and is itself a trigger.
+    _drive(app, clock, "A", (("one", 80),), WEEK, 1)
+    assert _marker_reasons(app) == ["inventory-incomplete", "changed"]
+    # A second failure episode, then an UNCHANGED complete scan.
+    failing[0] = True
+    _drive(app, clock, "A", (("one", 81),), WEEK, 1)
+    second = _spool_activity_ops()[-1]
+    assert second["payload"]["reason"] == "inventory-incomplete"
+    generation = T.account_status(app, "A")["generation"]
+    import _cctally_journal as jr
+    episode = jr.legacy_spool_anchor_state().uncertain
+    assert episode is not None
+    sidecar_path = jr._inventory_episode_path()
+    if sidecar == "missing":
+        sidecar_path.unlink(missing_ok=True)
+    elif sidecar == "stale-closed":
+        # The previous release closed the episode in its sidecar only.
+        jr.close_legacy_spool_inventory_episode(episode)
+        assert not jr.legacy_spool_anchor_state().episode_open
+    failing[0] = False
+    _drive(app, clock, "A", (("one", 81),), WEEK, 1)
+    completions = T.ops_of_kind("legacy_spool_inventory_completion")
+    assert len(completions) == 1, completions
+    report = T.quarantine_report(app)
+    assert report["inventoryEpisode"]["state"] == "closed"
+    assert T.account_status(app, "A")["generation"] == generation, (
+        "the completion op is no trigger")
+    _drive(app, clock, "A", (("one", 81),), WEEK, 1)
+    assert len(T.ops_of_kind("legacy_spool_inventory_completion")) == 1, (
+        "one op per episode")
+    # Review finding F18, the positive endpoint: with the episode closed the
+    # rest of the barrier recovers A. Once the cohort expired, a completed
+    # OAuth reconciliation covers A; the first entry of the first week that
+    # starts after the cohort's bound (U7.end) witnesses and releases
+    # weekly, and A's genuine drop then publishes.
+    clock.advance(DEADLINE)
+    _authoritative(app, clock, "A", 81, WEEK, 11, clock.value + 3600)
+    assert [op["payload"]["account"] for op in T.ops_of_kind(
+        "outcome_authority_completion")] == [_key("A")]
+    assert T.ops_of_kind("outcome_axis_release") == []
+    clock.value = WEEK + 7 * 86400 + 60
+    clock._pin()
+    fresh_week = WEEK + 14 * 86400
+    _seed(app, clock, "A", 40, week_reset=fresh_week, source="statusline")
+    assert [op["payload"]["axis"] for op in T.ops_of_kind(
+        "outcome_axis_release")] == ["sevenDay"]
+    assert T.axis_allowed(app, "A")["sevenDay"] is True
+    clock.advance(TICK)
+    _drive(app, clock, "A", (("one", 10), ("two", 10)), fresh_week,
+           1 + 2 * DEADLINE // TICK)
+    assert _published("A", 10)
+
+
+def test_t8_a_no_trigger_render_loop_appends_no_recovery_op(app, monkeypatch):
+    """Review finding F17 (spec 6.12, T8 on the reducer path): with no
+    trigger, a long loop of renders through the real reducer — unchanged
+    frames and changed values alike — appends no recovery op and no op of a
+    kind the store did not already hold. A per-render or unbounded journal
+    write on the statusline path fails here."""
+    clock = Clock(app, monkeypatch, T0)
+    _seed(app, clock, "A", 30, week_reset=WEEK)   # establishes the cutover
+    before = {rec["payload"].get("kind") for rec in T.journal_records()
+              if rec.get("t") == "op"}
+    for i in range(24):
+        percent = 30 + i // 6
+        _drive(app, clock, "A", (("one", percent), ("two", percent)), WEEK, 1)
+    kinds = {rec["payload"].get("kind") for rec in T.journal_records()
+             if rec.get("t") == "op"}
+    assert not kinds & {"legacy_spool_activity",
+                        "legacy_spool_inventory_completion",
+                        "outcome_authority_completion",
+                        "outcome_axis_release"}, kinds
+    assert kinds <= before, kinds - before
+    assert _weekly(app, "A") == 33, "non-vacuity: the changed values published"
 
 
 def test_e_expiry_an_empty_spool_and_an_inflight_tombstone_are_not_recovery(
@@ -701,7 +758,7 @@ def test_e_expiry_an_empty_spool_and_an_inflight_tombstone_are_not_recovery(
     clock.advance(2 * DEADLINE)
     sl._statusline_reduce_and_publish(nudge_sink=lambda: None)
     assert not _published("A", 20)
-    assert not _status(app, "A")["control"]
+    assert _paused(app, "A")
     # An inflight tombstone never expires into recovery either.
     window = _pending(app, clock, "A").canonical_key
     sl._write_tombstone("sevenDay", C.Tombstone(
@@ -711,7 +768,7 @@ def test_e_expiry_an_empty_spool_and_an_inflight_tombstone_are_not_recovery(
     clock.advance(DEADLINE)
     _drive(app, clock, "A", (("one", 20), ("two", 20)), WEEK, 3)
     assert not _published("A", 20)
-    assert not _status(app, "A")["control"]
+    assert _paused(app, "A")
 
 
 def test_a_plan_frozen_before_a_trigger_does_not_publish_after_it(app, monkeypatch):
@@ -748,3 +805,40 @@ def test_a_plan_frozen_before_a_trigger_does_not_publish_after_it(app, monkeypat
     after = sl._read_transition(_key("A"), now_epoch=clock.value)
     assert after.publication is None
     assert after.quarantine["dropWithheld"] is True
+
+
+_TWO_KEY = {"authorityCommit": None, "dropWithheld": True}
+
+
+@pytest.mark.parametrize("doc, withheld", [
+    ({"authorityCommit": None, "dropWithheld": False}, frozenset()),
+    (_TWO_KEY, frozenset({"sevenDay", "fiveHour"})),
+    (dict(_TWO_KEY, dropWithheldAxes=["sevenDay"]), frozenset({"sevenDay"})),
+    (dict(_TWO_KEY, dropWithheldAxes=["fiveHour"]), frozenset({"fiveHour"})),
+], ids=["none", "both-two-key-form", "weekly-only", "five-hour-only"])
+def test_the_frozen_transition_withholds_drops_per_axis(doc, withheld):
+    """Review finding F1: the render path reduces each axis with the
+    withheld set the frozen transition records. A one-axis document
+    round-trips with its axis; a set flag naming none — every document an
+    earlier build wrote — withholds both, the conservative reading."""
+    import types
+    import _cctally_statusline as sl
+    validated = sl._validate_transition_quarantine(doc)
+    assert sl._withheld_axes(types.SimpleNamespace(quarantine=validated)) == withheld
+    assert sl._quarantine_document(None, withheld) == dict(doc, authorityCommit=None)
+
+
+@pytest.mark.parametrize("axes, flag", [
+    (["sevenDay", "fiveHour"], True), (["fiveHour", "sevenDay"], True),
+    ([], True), (["sevenDay"], False), (["daily"], True), ("sevenDay", True),
+])
+def test_an_invalid_per_axis_withheld_document_is_refused(axes, flag):
+    """A malformed control document fails closed (it is never read as some
+    other permission): only a proper, sorted, known subset with the flag set
+    is valid."""
+    import _cctally_statusline as sl
+    import _lib_statusline_candidates as C
+    with pytest.raises(C.StateValidationError):
+        sl._validate_transition_quarantine(
+            {"authorityCommit": None, "dropWithheld": flag,
+             "dropWithheldAxes": axes})

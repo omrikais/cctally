@@ -48,6 +48,16 @@ class RegimeRejection(str, enum.Enum):
     #: gate. The mark is S1 stating that the regime must not be used to
     #: predict, so it is refused here rather than applied.
     DETECTION_ONLY = "calibration-detection-only"
+    #: #1015 spec 5.4: the open regime was fitted before a reviewed
+    #: correction to its inputs was materialized (its lineage assesses
+    #: `tainted`, or a sweep already annotated it). Wire code
+    #: `recalibration-needed`.
+    RECALIBRATION_NEEDED = "recalibration-needed"
+    #: #1015 spec 5.4: the regime's correction lineage could not be read
+    #: (no published facts, a missing projection, a read error) or holds an
+    #: unresolved reference. Never an unverified calibrated number; the wire
+    #: states `unavailable`.
+    LINEAGE_UNAVAILABLE = "calibration-lineage-unavailable"
 
 
 #: The qualification S1 writes onto a successor fit that is below its
@@ -96,6 +106,12 @@ class ValidatedRegime:
     #: member of `qm.COEFFICIENT_ERAS` (#978).
     coefficient_era: str
     qualifications: tuple = ()
+    #: The fit-weighted family composition of the days the regime's fit was
+    #: taken over (#991 spec 4.5), the reference the evidence-bounded family
+    #: test measures a consumer population against. None when the stored
+    #: record carries no valid one, which disables that test for the regime
+    #: and leaves the radius rule alone deciding.
+    fit_family_shares: "dict | None" = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,6 +175,36 @@ def _shares(value) -> "dict | None":
         if not isinstance(name, str) or not _finite(share):
             return None
         out[name] = float(share)
+    return out
+
+
+def _fit_reference_shares(value) -> "dict | None":
+    """A stored `fitFamilyShares`, or None when it is unusable (#991).
+
+    Stricter than `_shares`, which accepts `{}`, negative shares and any sum
+    and stays as it is for the TV references: a non-empty dict of string keys
+    and finite, non-negative numbers whose `math.fsum` is within 1e-9 of 1,
+    returned exactly as stored, never renormalized or rounded. Anything else
+    is None, not a rejection, because the regime's fit and its TV references
+    remain usable.
+    """
+    if not isinstance(value, dict) or not value:
+        return None
+    out = {}
+    for name, share in value.items():
+        if not isinstance(name, str) or isinstance(share, bool) \
+                or not isinstance(share, (int, float)) \
+                or not _finite(share) or share < 0.0:
+            return None
+        out[name] = float(share)
+    try:
+        total = math.fsum(out[k] for k in sorted(out))
+    except OverflowError:
+        # Finite shares whose sum leaves the float range are no
+        # distribution; raising would take the whole calibration with it.
+        return None
+    if abs(total - 1.0) > 1e-9:
+        return None
     return out
 
 
@@ -272,6 +318,7 @@ def validate_regime(raw, *, account_key, expected_fingerprint,
         class_radius=class_radius,
         coefficient_era=era.id,
         qualifications=marks,
+        fit_family_shares=_fit_reference_shares(raw.get("fitFamilyShares")),
     )
 
 
@@ -338,9 +385,16 @@ def apply_regime(regime: ValidatedRegime, entries, *, interval
     if aggregated is None:
         return ApplyRejection.EMPTY_POPULATION
     family_shares, class_shares = aggregated
-    if not qm.is_supported(family_shares, class_shares,
-                           regime.family_shares, regime.family_radius,
-                           regime.class_shares, regime.class_radius):
+    # #991 spec 4.6: the same evaluator as the forecast probe, against the
+    # regime's OWN fit-weighted family composition and era.
+    support = qm.evaluate_prediction_support(
+        family_shares, class_shares,
+        family_centre=regime.family_shares,
+        family_radius=regime.family_radius,
+        class_centre=regime.class_shares,
+        class_radius=regime.class_radius,
+        fit_family_shares=regime.fit_family_shares, era=era)
+    if not support.supported:
         return ApplyRejection.UNSUPPORTED_COMPOSITION
 
     units = population_units(entries, era=era)

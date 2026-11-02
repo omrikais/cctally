@@ -136,3 +136,93 @@ def test_codex_identity_leg_is_registered(D):
     ids = [cid for _key, _title, checks in D._CATEGORY_DEFINITIONS
            for cid, _fn in checks]
     assert "accounts.codex_identity" in ids
+
+
+# -- claude_cost_attribution (#944 spec 5.9: U2, U3, U4') -------------------
+
+_U3_REMEDIATION = (
+    "Keep the cctally status line or hooks installed so the active account "
+    "is recorded as Claude writes. cctally cache-sync --rebuild keeps these "
+    "decisions; it does not change them.")
+_U4_REMEDIATION = (
+    "Check that the cctally journal directory is writable; the export "
+    "retries on the next cctally command.")
+
+
+def _cca(*, claude_accounts=1, total=0, fallback=0, real=0, preserved=0,
+         state="complete", saved=0, of=0):
+    return _s(by_provider={"claude": claude_accounts},
+              claude_cost_attribution={
+                  "totalRows": total, "fallbackRows": fallback,
+                  "fallbackRealAccountRows": real,
+                  "fallbackUnattributedRows": fallback - real,
+                  "preservedRows": preserved,
+                  "preservation": {"state": state, "saved": saved,
+                                   "total": of, "lastError": None,
+                                   "lastErrorAt": None}})
+
+
+@pytest.mark.parametrize("kw,severity,summary,remediation", [
+    # No decisions (also a fresh install with no cache.db).
+    ({}, "ok", "Claude cost decided in the last 7 days was attributed from "
+     "write-time account evidence (0 rows)", None),
+    # All evidence.
+    ({"total": 5}, "ok", "Claude cost decided in the last 7 days was "
+     "attributed from write-time account evidence (5 rows)", None),
+    # Preserved history alone is neither evidence nor fallback.
+    ({"preserved": 4}, "ok", "Claude cost decided in the last 7 days was "
+     "attributed from write-time account evidence (0 rows)", None),
+    # Mixed preserved / fallback, single real account: OK with the count.
+    ({"total": 3, "fallback": 2, "real": 2, "preserved": 4}, "ok",
+     "2 of 3 Claude cost rows decided in the last 7 days had no write-time "
+     "account evidence and took the account active at ingest; this does not "
+     "mean they are wrong", None),
+    # Two real accounts and a fallback that picked one: WARN.
+    ({"claude_accounts": 2, "total": 3, "fallback": 1, "real": 1}, "warn",
+     "1 of 3 Claude cost rows decided in the last 7 days had no write-time "
+     "account evidence and took the account active at ingest; this does not "
+     "mean they are wrong", _U3_REMEDIATION),
+    # Two real accounts but every fallback unattributed: OK.
+    ({"claude_accounts": 2, "total": 3, "fallback": 1, "real": 0}, "ok",
+     "1 of 3 Claude cost rows decided in the last 7 days had no write-time "
+     "account evidence and took the account active at ingest; this does not "
+     "mean they are wrong", None),
+    # Export running: OK, the progress and the fallback sentence both shown.
+    ({"total": 2, "fallback": 1, "real": 1, "state": "running", "saved": 3,
+      "of": 10}, "ok",
+     "Recording existing Claude cost attribution (3 of 10 rows saved); "
+     "1 of 2 Claude cost rows decided in the last 7 days had no write-time "
+     "account evidence and took the account active at ingest; this does not "
+     "mean they are wrong", None),
+    # Export stalled: WARN on any install.
+    ({"state": "stalled", "saved": 3, "of": 10}, "warn",
+     "Recording existing Claude cost attribution is stalled at 3 of 10 rows: "
+     "the journal could not be written; Claude cost decided in the last 7 "
+     "days was attributed from write-time account evidence (0 rows)",
+     _U4_REMEDIATION),
+    # Stalled and a decorated real-account fallback: both remediations.
+    ({"claude_accounts": 2, "total": 1, "fallback": 1, "real": 1,
+      "state": "stalled", "saved": 3, "of": 10}, "warn",
+     "Recording existing Claude cost attribution is stalled at 3 of 10 rows: "
+     "the journal could not be written; 1 of 1 Claude cost rows decided in "
+     "the last 7 days had no write-time account evidence and took the "
+     "account active at ingest; this does not mean they are wrong",
+     _U4_REMEDIATION + " " + _U3_REMEDIATION),
+], ids=["none", "evidence", "preserved-only", "mixed-single-account",
+        "two-accounts-real", "two-accounts-null", "running", "stalled",
+        "stalled-and-fallback"])
+def test_claude_cost_attribution_states(D, kw, severity, summary,
+                                        remediation):
+    """Detects: a fallback hidden behind export progress, a WARN on a
+    single-account install (or for unattributed fallbacks), a stalled export
+    reported OK, or a remediation shown on OK."""
+    r = D._check_accounts_claude_cost_attribution(_cca(**kw))
+    assert (r.severity, r.summary, r.remediation) == (
+        severity, summary, remediation)
+
+
+def test_claude_cost_attribution_leg_is_registered_after_attribution(D):
+    ids = [cid for _key, _title, checks in D._CATEGORY_DEFINITIONS
+           for cid, _fn in checks]
+    assert ids.index("accounts.claude_cost_attribution") == (
+        ids.index("accounts.attribution") + 1)

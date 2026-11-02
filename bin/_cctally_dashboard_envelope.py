@@ -987,6 +987,34 @@ def _source_bundle_to_envelope(bundle: object | None) -> dict:
 METER_RATE_CHANGE_LIMIT = 20
 
 
+def _rate_change_supersessions(conn: sqlite3.Connection) -> dict:
+    """Wire `supersession` objects by transition identity (#1015 spec 5.7).
+
+    Read through `read_rate_change_supersessions` on the build's own stats
+    connection, so both the explicit `meter_rate_change_supersessions` rows
+    and the supersessions derived from a transition's lineage before any
+    sweep journals one are covered. `superseded_at` is the explicit event's
+    sweep clock, or null for a derived-only state. Unreadable facts publish
+    no supersession — the pre-#1015 row — rather than emptying the array: the
+    marker and delivery paths refuse on their own when the facts cannot be
+    verified.
+    """
+    try:
+        qcal = sys.modules["cctally"]._load_sibling(
+            "_cctally_quota_calibration")
+        state = qcal.read_rate_change_supersessions(conn)
+    except Exception:                                  # noqa: BLE001
+        return {}
+    return {
+        tuple(identity): {
+            "reason": record.reason,
+            "superseded_at": record.superseded_at,
+            "corrections": list(record.corrections),
+        }
+        for identity, record in state.by_identity.items()
+    }
+
+
 def _build_meter_rate_change_array(
     conn: sqlite3.Connection, limit: int = METER_RATE_CHANGE_LIMIT,
 ) -> list:
@@ -1046,6 +1074,7 @@ def _build_meter_rate_change_array(
         # background worker. An empty array renders as "no change recorded",
         # which is the truth on that store, rather than emptying the envelope.
         return []
+    supersessions = _rate_change_supersessions(conn) if rows else {}
     out: list[dict] = []
     for (provider, account_key, effective_from, previous, new, severity,
          detected_at, created_at, status, causes, provenance,
@@ -1082,6 +1111,11 @@ def _build_meter_rate_change_array(
             "composition_provenance": _decode_evidence_array(provenance),
             "baseline_withheld_days": (
                 None if baseline_days is None else int(baseline_days)),
+            # #1015 spec 5.7 (U2): published always and nulled, so the client
+            # can tell an ordinary row (null) from one an older server sent
+            # (absent). The row and its historical values are kept.
+            "supersession": supersessions.get(
+                (str(provider), str(account_key), str(effective_from))),
         }
         entry.update(account_fields(str(provider), account_key))
         out.append(entry)

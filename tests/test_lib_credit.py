@@ -88,8 +88,8 @@ def test_build_credit_plan_happy_path():
     p = _plan()
     assert isinstance(p, CreditPlan)
     assert p.to_pct == 31.0 and p.from_pct == 46.0
-    assert p.effective_iso == "2026-06-19T14:00:00+00:00"   # floored to hour
-    assert p.captured_iso == "2026-06-19T14:37:00Z"          # un-floored now, Z
+    assert p.effective_iso == "2026-06-19T14:37:00+00:00"   # exact --at (#943 O1)
+    assert p.captured_iso == "2026-06-19T14:37:00Z"          # same instant, Z
     assert p.cur_end_canon == "2026-06-20T05:00:00+00:00"
     assert p.from_source == "hwm"
 

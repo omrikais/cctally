@@ -20,6 +20,13 @@ from conftest import load_script, redirect_paths
 from tests._support_http import PRESENCE_BACKSTOP_SECONDS
 
 
+#: A weekly reset inside the plausibility band whenever the test runs: #948
+#: checks the OAuth ingress bands BEFORE the (stubbed) record step, so a fixed
+#: date would age out of the band and record nothing.
+_RESET = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).strftime(
+    "%Y-%m-%dT%H:00:00Z")
+
+
 def _load(monkeypatch, tmp_path):
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
@@ -163,7 +170,7 @@ def test_ok_via_hook_resets_backoff_state(monkeypatch, tmp_path):
     assert ns["_oauth_backoff_remaining_seconds"]() == 0.0
     assert ns["_oauth_backoff_count"]() == 1
 
-    api = {"seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"}}
+    api = {"seven_day": {"utilization": 22.0, "resets_at": _RESET}}
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: api)
 
@@ -189,7 +196,7 @@ def test_hook_record_failure_keeps_backoff_state(monkeypatch, tmp_path):
         lambda token, timeout_seconds: {
             "seven_day": {
                 "utilization": 22.0,
-                "resets_at": "2026-05-02T12:00:00Z",
+                "resets_at": _RESET,
             }
         },
     )
@@ -233,7 +240,7 @@ def test_hook_rechecks_selected_freshness_after_lock(monkeypatch, tmp_path):
 
 
 def _ok_api():
-    return {"seven_day": {"utilization": 5.0, "resets_at": "2026-05-02T12:00:00Z"}}
+    return {"seven_day": {"utilization": 5.0, "resets_at": _RESET}}
 
 
 def test_backfill_skips_when_statusline_fresh(monkeypatch, tmp_path):

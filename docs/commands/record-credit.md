@@ -36,7 +36,7 @@ This command is weekly/7d only. The 5-hour dimension has its own auto-detection 
 | --- | --- | --- | --- |
 | `--to FLOAT` | yes | — | New post-credit weekly %. Must be in `[0, 100]` and strictly **less than** `--from` (a credit is a decrease). |
 | `--from FLOAT` | no | current reset-aware HWM for the week | Pre-credit baseline. By default resolved to the same floored `MAX(weekly_percent)` the statusline and the write-site clamp use, so it matches what you currently see. When a credit floor already exists for the week (completion or `--force`), the default instead comes from that floor's recorded pre-credit value. |
-| `--at ISO` | no | now | Effective credit moment, internally floored to the hour for the credit floor's timestamp. **Naive timestamps are treated as UTC** (not host-local). Must be within the resolved week window and not in the future. |
+| `--at ISO` | no | now | Effective credit moment, recorded to the exact second (sub-second precision is dropped) as the credit floor's timestamp. Readings captured before it stay genuine pre-credit history. **Naive timestamps are treated as UTC** (not host-local). Must be within the resolved week window and not in the future. |
 | `--week DATE` | no | the snapshot week whose window contains `--at`/now | `week_start_date` as `YYYY-MM-DD`. The default resolves the week window **containing `--at`** (correct at a reset edge, where the most-recent snapshot can belong to a just-ended week). If no snapshot week contains `--at`, the command refuses and points at `--week`. |
 | `--dry-run` | no | off | Print the plan, write nothing, exit 0. Works with or without `--json`, on a TTY or not. |
 | `--yes` | no | off | Apply without the confirm prompt. |
@@ -63,9 +63,9 @@ The dry-run prints a preview like:
 record-credit — weekly in-place credit
   week:          2026-06-13 -> 2026-06-20 05:00 UTC
   from -> to:    46% -> 31%   (from: current HWM)
-  effective:     2026-06-19 14:00 UTC  (floored from 2026-06-19 14:37)
+  effective:     2026-06-19 14:37:00 UTC
   writes:
-    + weekly_credit_floors  (effective=2026-06-19T14:00:00+00:00, pre_credit=46)
+    + weekly_credit_floors  (effective=2026-06-19T14:37:00+00:00, pre_credit=46)
     ~ hwm-7d                46 -> 31
     - stale replays         0 rows
     + snapshot              captured=2026-06-19T14:37:00Z, weekly_percent=31
@@ -94,7 +94,7 @@ After applying, `cctally report` (and the statusline / dashboard) read **31%** f
     "fromPct": 46.0,
     "toPct": 31.0,
     "fromSource": "hwm",
-    "effectiveAtUtc": "2026-06-19T14:00:00Z"
+    "effectiveAtUtc": "2026-06-19T14:37:00Z"
   },
   "actions": {
     "creditFloorInserted": true,
@@ -110,7 +110,7 @@ After applying, `cctally report` (and the statusline / dashboard) read **31%** f
 
 ## Re-running: completion, refuse, and `--force`
 
-Because the underlying repair commits the credit floor and cleanup *before* the post-credit snapshot, a crash in between can leave a **half-applied** credit (floor row present, no snapshot — every post-credit read then sees an empty segment). A plain rerun (no `--force`) detects this and **finishes it** — no special flag needed, and it **reuses the existing floor's effective moment** rather than re-flooring to the rerun's "now", so a rerun at a later wall-clock can't strand stale pre-credit readings inside the floored window.
+Because the underlying repair commits the credit floor and cleanup *before* the post-credit snapshot, a crash in between can leave a **half-applied** credit (floor row present, no snapshot — every post-credit read then sees an empty segment). A plain rerun (no `--force`) detects this and **finishes it** — no special flag needed, and it **reuses the existing floor's effective moment** rather than taking the rerun's own `--at`, so a rerun at a later wall-clock can't strand stale pre-credit readings inside the floored window. A credit recorded by an earlier release keeps its stored hour-floored moment. Whenever the reused moment differs from the rerun's `--at` (an earlier release's hour-floored credit, or a half-applied credit first recorded at another `--at`), the preview's `effective:` line shows `(floored from …)` naming the rerun's `--at`.
 
 A **fully-applied** credit (floor row plus a command-owned snapshot) is **refused by default** (exit 2), naming the recorded pre-credit value and effective time. Pass `--force` for a clean re-do: it deletes only that week's `source='record-credit'` synthetic rows and its `weekly_credit_floors` row(s) — never your real status-line snapshots, and never `week_reset_events` or `percent_milestones` — and then re-records.
 
@@ -123,7 +123,7 @@ A **fully-applied** credit (floor row plus a command-owned snapshot) is **refuse
 ## Notes
 
 - "Now" routes through the same `CCTALLY_AS_OF` testing hook the other reporting commands use.
-- The effective credit moment is floored to the hour; the synthetic snapshot is captured at the un-floored `--at`, so the floored `MAX` always includes it.
+- The effective credit moment is the exact `--at` second, and the synthetic snapshot is captured at that same second, so the floored `MAX` always includes it while readings captured before `--at` are kept as genuine pre-credit history. Earlier releases floored the moment to the hour, which could retire genuine readings taken between the top of the hour and `--at` and count them as post-credit; credits recorded then keep their stored hour-floored moment.
 - Milestones are **untouched**: a partial credit writes no `week_reset_events` row, so the milestone segmentation (keyed on `reset_event_id`) never fires — the percent milestones you already crossed (e.g. 32–46%) correctly don't re-fire, and the credit doesn't undo the cost already spent. Milestones above `--to` re-fire normally as you re-climb.
 - The credit lowers a clamp floor only; it does **not** re-anchor the week. Known limitation: the *historical* "final %" of a credited *past* week (as used by the forecast trailing-4-week $/% median and the `diff` multi-week average) still reads the pre-credit `MAX` — deciding the right $/%-denominator for a credited past week is a separate question scoped out of this command, which targets the current-week display.
 - No schema migration is involved. The `weekly_credit_floors` table is created via `CREATE TABLE IF NOT EXISTS` in the normal schema init (no `user_version` bump), so a dev/worktree binary can still open and repair the production DB.

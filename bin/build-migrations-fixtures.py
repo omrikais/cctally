@@ -48,7 +48,7 @@ Per-migration goldens (lazy-adopted; one pair per migration that ships them):
 
 Builder-less goldens: only STATS 005/006 (percent/five-hour reset_event_id) are
 hand-built frozen artifacts with NO build_per_migration_* function — they are
-intentionally outside the #197 byte-idempotency guard (see
+intentionally outside the #197 content-idempotency guard (see
 tests/test_build_migrations_fixtures_stamps_markers.py).
 """
 
@@ -69,8 +69,9 @@ from _fixture_builders import register_fixture_db, create_stats_db  # noqa: E402
 FIXTURES_ROOT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "migrations"
 
 # Pinned instant for the stats-five per-migration goldens (W3 backfill, #279 S7).
-# Deterministic — never wall-clock — so a builder regen is byte-idempotent under
-# the #197 guard (tests/test_build_migrations_fixtures_stamps_markers.py).
+# Deterministic — never wall-clock — so a builder regen reproduces the same
+# content, which the #197 content-idempotency guard asserts
+# (tests/test_build_migrations_fixtures_stamps_markers.py; contract per #1030).
 TS_STATS_FIVE_APPLIED = "2026-04-30T12:00:00Z"
 
 
@@ -1534,7 +1535,7 @@ def build_per_migration_002_conversation_messages_backfill(
             # wider _apply_cache_schema schema drift — newer tables landing in
             # this golden as later migrations add them — was out of scope for
             # #194 and is resolved by #197: the committed goldens are refreshed
-            # to the current schema and a byte-idempotency guard
+            # to the current schema and a content-idempotency guard
             # [test_build_migrations_fixtures_stamps_markers.py] keeps them
             # current.) _stamp_applied commits.
             db._stamp_applied(
@@ -4444,7 +4445,7 @@ def build_per_migration_023_conversation_sessions_enrichment_columns(
 # how the cache goldens reuse ``_apply_cache_schema``) EXCEPT 007, whose golden
 # must show a week_reset_events WITHOUT ``observed_pre_credit_pct`` — so 007
 # hardcodes the pre-007 historical shape. All builders pin every timestamp
-# (``TS_STATS_FIVE_APPLIED``) so a regen stays byte-idempotent under the #197
+# (``TS_STATS_FIVE_APPLIED``) so a regen stays content-idempotent under the #197
 # guard; 001/002/003 discard a throwaway work cache and synthetic projects dir.
 
 
@@ -4590,7 +4591,7 @@ def build_per_migration_001_five_hour_block_models_backfill_v1(
 
 
 # Fixed cutover Claude account_key baked into the 029 golden (deterministic;
-# NOT derived from any machine state so the #197 byte-idempotency guard holds).
+# NOT derived from any machine state so the #197 content-idempotency guard holds).
 _CACHE_029_CUTOVER_ACCOUNT = "cafef00dcafef00dcafef00dcafef00d"
 
 
@@ -7370,10 +7371,10 @@ def build_per_migration_conversations_009_conversation_title_staging_and_account
     The seeded `source_path` values are STABLE LITERALS that do not exist on
     any filesystem, so every message row takes the backfill's classified-gap
     branch. That is not a shortcut around the stamping branch — it is the only
-    branch a byte-idempotent golden can hold. A stamp carries a randomly minted
+    branch a content-idempotent golden can hold. A stamp carries a randomly minted
     incarnation id and the absolute path of a real file, and a regen into a
     different temporary directory would reproduce neither, so the #197
-    byte-idempotency guard would fail on every rebuild. The stamping branch is
+    content-idempotency guard would fail on every rebuild. The stamping branch is
     pinned against a live store in
     `tests/test_conversation_account_dimension.py`.
     """
@@ -7906,6 +7907,258 @@ def build_per_migration_049_codex_rollout_containers(scenario_dir: Path) -> None
     _build_pre(pre)
     _build_post(pre, post)
 
+
+#: #944: the pinned instant of the 050 golden's export (decision time, chunk
+#: time and the scratch journal's segment).
+_TS_944 = "2026-10-29T12:00:00Z"
+
+
+def build_per_migration_050_preserve_claude_cost_attribution(
+        scenario_dir: Path) -> None:
+    """Per-migration goldens for #944's U1 export of existing Claude stamps.
+
+    ``pre.sqlite`` is a genuine 049-head install: the current schema apply
+    delivers the attribution tables, the link column and its two partial
+    indexes, so all are removed again. It holds three pre-upgrade rows -- a
+    keyed row stamped with a real account, a keyed stably-absent (NULL) row,
+    and a row lacking an id stamped with the real account (the legacy
+    projection form). ``post.sqlite`` is that store after the handler, run
+    against a scratch journal with every clock pinned: each row keeps its
+    stamp and is linked to a ``preserved_history`` decision.
+    """
+    import contextlib
+    import datetime as dt
+    import os
+    import shutil
+    import tempfile
+
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "050_preserve_claude_cost_attribution"
+    account = "a" * 32
+    pinned = dt.datetime(2026, 10, 29, 12, 0, tzinfo=dt.timezone.utc)
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths",
+                         "048_codex_quota_physical_group_order",
+                         "049_codex_rollout_containers"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            conn.execute("DROP INDEX IF EXISTS idx_entries_attr_unlinked")
+            conn.execute("DROP INDEX IF EXISTS idx_entries_attr_nonkeyed")
+            for table in db._CLAUDE_ATTRIBUTION_CACHE_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table}")
+            conn.execute(
+                "ALTER TABLE session_entries DROP COLUMN "
+                "attribution_decision_key")
+            conn.executemany(
+                "INSERT INTO session_entries (source_path, line_offset,"
+                " timestamp_utc, model, msg_id, req_id, input_tokens,"
+                " output_tokens, cache_create_tokens, cache_read_tokens,"
+                " speed, cost_usd_raw, cache_create_1h_tokens,"
+                " cache_create_5m_tokens, account_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    ("/fixtures/claude/projects/p/s1.jsonl", 0,
+                     "2026-10-01T10:00:00+00:00", "claude-sonnet-4-5",
+                     "msg-1", "req-1", 1000, 500, 0, 0, "standard", None,
+                     0, 0, account),
+                    ("/fixtures/claude/projects/p/s1.jsonl", 600,
+                     "2026-10-01T10:05:00+00:00", "claude-sonnet-4-5",
+                     "msg-2", "req-2", 1000, 300, 0, 0, "standard", None,
+                     0, 0, None),
+                    ("/fixtures/claude/projects/p/s1.jsonl", 1200,
+                     "2026-10-01T10:10:00+00:00", "claude-sonnet-4-5",
+                     None, None, 1000, 200, 100, 0, None, None, None, None,
+                     account),
+                ],
+            )
+            conn.execute("PRAGMA user_version=49")
+            conn.commit()
+        finally:
+            conn.close()
+
+    @contextlib.contextmanager
+    def _scratch_runtime():
+        """Point every runtime path at a scratch data dir and pin the
+        clocks, so the export journals into throwaway segments and the
+        decisions it records are byte-stable."""
+        import _cctally_core as core
+        import _cctally_journal as jr
+        scratch = Path(tempfile.mkdtemp(prefix="cctally-050-golden-"))
+        saved_env = {k: os.environ.get(k) for k in (
+            "CCTALLY_DATA_DIR", "HOME")}
+        db = sys.modules["_cctally_db"]
+        saved = (core.now_utc_iso, db.now_utc_iso, jr._utc_now)
+        os.environ["CCTALLY_DATA_DIR"] = str(scratch / "data")
+        os.environ["HOME"] = str(scratch / "home")
+        (scratch / "home").mkdir()
+        core._init_paths_from_env()
+        core.now_utc_iso = db.now_utc_iso = lambda now_utc=None: _TS_944
+        jr._utc_now = lambda: pinned
+        try:
+            yield
+        finally:
+            core.now_utc_iso, db.now_utc_iso, jr._utc_now = saved
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            core._init_paths_from_env()
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        with _scratch_runtime():
+            conn = sqlite3.connect(dst)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                _cache_handler(db, migration)(conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (migration, _TS_PUBLIC_5),
+                )
+                conn.execute("PRAGMA user_version=50")
+                conn.commit()
+            finally:
+                conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
+
+
+
+def build_per_migration_051_codex_retained_identities(scenario_dir: Path) -> None:
+    """Per-migration goldens for #927's retained-identity inventory.
+
+    ``pre.sqlite`` is a genuine 050-head install: the current schema apply
+    creates the inventory table, its expression index and its eight triggers,
+    so all are removed again with the state key. It holds a Codex cursor row
+    and one accounting row, so ``post.sqlite`` records ``bootstrap:files:0``
+    over an empty table: the handler never scans history.
+    """
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+    pre = scenario_dir / "pre.sqlite"
+    post = scenario_dir / "post.sqlite"
+    migration = "051_codex_retained_identities"
+
+    def _build_pre(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+        register_fixture_db(path)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            db._apply_cache_schema(conn)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(name TEXT PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+            )
+            for name in (*_PRIOR_CHAIN_THROUGH_035,
+                         "036_codex_quota_window_identity_index",
+                         "037_codex_quota_change_ledger",
+                         "038_codex_session_files_ingest_complete",
+                         "039_codex_quota_observed_model_backfill",
+                         "040_codex_quota_physical_group_index",
+                         "041_codex_quota_unresolved_model_index",
+                         "042_codex_entries_root_path_index",
+                         "043_codex_window_attributions",
+                         "044_codex_accounting_change_ledger",
+                         "045_conversation_render_revision_columns",
+                         "046_codex_source_file_identity",
+                         "047_spill_free_read_paths",
+                         "048_codex_quota_physical_group_order",
+                         "049_codex_rollout_containers",
+                         "050_preserve_claude_cost_attribution"):
+                conn.execute(
+                    "INSERT INTO schema_migrations(name, applied_at_utc) "
+                    "VALUES (?, ?)",
+                    (name, _TS_PUBLIC_5),
+                )
+            for kind, name in reversed(db._CODEX_RETAINED_IDENTITY_OBJECTS):
+                if kind == "trigger":
+                    conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute("DROP TABLE IF EXISTS codex_retained_identities")
+            conn.execute(
+                "DELETE FROM cache_meta WHERE key='codex_identity_inventory'")
+            conn.execute(
+                "INSERT INTO codex_session_files "
+                "(path, size_bytes, mtime_ns, last_byte_offset, "
+                " last_ingested_at, source_root_key) VALUES (?,?,?,?,?,?)",
+                ("/fixtures/codex/sessions/2026/10/31/rollout.jsonl",
+                 512, 1700000000000000000, 512, _TS_PUBLIC_5, "rk-fixture"),
+            )
+            conn.execute(
+                "INSERT INTO codex_session_entries "
+                "(source_path, line_offset, timestamp_utc, session_id, model, "
+                " source_root_key) VALUES (?,?,?,?,?,?)",
+                ("/fixtures/codex/sessions/2026/10/31/rollout.jsonl", 0,
+                 "2026-10-31T10:00:00+00:00", "session-fixture",
+                 "gpt-5.3-codex", "rk-fixture"),
+            )
+            conn.execute("PRAGMA user_version=50")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _build_post(src: Path, dst: Path) -> None:
+        if dst.exists():
+            dst.unlink()
+        import shutil
+        shutil.copy(src, dst)
+        register_fixture_db(dst)
+        db = _load_cctally_for_fixture()
+        conn = sqlite3.connect(dst)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _cache_handler(db, migration)(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at_utc) "
+                "VALUES (?, ?)",
+                (migration, _TS_PUBLIC_5),
+            )
+            conn.execute("PRAGMA user_version=51")
+            conn.commit()
+        finally:
+            conn.close()
+
+    _build_pre(pre)
+    _build_post(pre, post)
 
 def build_per_migration_conversations_010_codex_conversation_source_file_identity(
     scenario_dir: Path,
@@ -8930,6 +9183,12 @@ def main() -> int:
     )
     build_per_migration_049_codex_rollout_containers(
         FIXTURES_ROOT / "per-migration" / "049_codex_rollout_containers"
+    )
+    build_per_migration_050_preserve_claude_cost_attribution(
+        FIXTURES_ROOT / "per-migration" / "050_preserve_claude_cost_attribution"
+    )
+    build_per_migration_051_codex_retained_identities(
+        FIXTURES_ROOT / "per-migration" / "051_codex_retained_identities"
     )
     build_per_migration_conversations_010_codex_conversation_source_file_identity(
         FIXTURES_ROOT / "per-migration"

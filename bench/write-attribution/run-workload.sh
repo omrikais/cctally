@@ -44,13 +44,16 @@
 #      `projection_replay.py p2-extract` slice placed in the scratch root (each
 #      file truncated at the window start) and its lines re-appended at their
 #      original relative times by `p2-replay` instead of the ~100 KB/min appender
-# Drained admission (spec §6.3, Q11): after seeding, catchup.py drains the clone with
-# the tree's own `cache-sync --source all` (under the interposer, its receipt in
-# catchup.json) and admits it only on the certifiable-sync predicates, Claude's
-# alternatively through the stable-residual exception bound to SRC_ROOT's
-# preparation receipt (revision 10: `catchup.py prep` once per source); the existing
-# 900 s admission deadline covers that drain AND the dashboard's warm admission, and
-# an expired deadline or a refused drain makes the attempt INVALID (admission.json),
+# Drained admission (#939 spec D6, replacing §6.3 Q11's certifiable predicates):
+# after seeding, catchup.py drains the clone with the tree's own
+# `cache-sync --source all` in rounds (under the interposer, its receipt in
+# catchup.json, the logical-identity frontier it captured first in
+# frontier.json) and admits it on two consecutive census-complete rounds with
+# identical observations, judged only from evidence both trees provide; SRC_ROOT's
+# preparation receipt (`catchup.py prep` once per source) is identity evidence. The
+# existing 900 s admission deadline covers that drain AND the dashboard's warm
+# admission, and an expired deadline or a refused drain makes the attempt INVALID
+# (admission.json),
 # never extended. Verdicts: A/B/L `workload.py ab-verdict`, C `c-verdict`, D
 # `d-verdict`, each importing the candidate kernel from THIS tree. The appender runs in
 # its own process group and is reaped on every exit path; the terminal rusage,
@@ -167,9 +170,8 @@ fi
 # ── drained admission (catch-up under the interposer; its receipt is evidence) ──
 REMAIN=$((ADMIT_DEADLINE-SECONDS))
 [ $REMAIN -gt 0 ] || invalid "the admission deadline expired before the catch-up"
-# --source names the copy so catchup.py reads its preparation receipt
-# ($SRC/prep-receipt.json, `catchup.py prep`): the only route for a Claude walk
-# that does not certify (spec §6.3 revision 10); a missing receipt is INVALID.
+# --source names the copy so catchup.py records its preparation receipt
+# ($SRC/prep-receipt.json, `catchup.py prep`) and frozen qualification.
 ( export_clone_env; export WTRACE_OUT=$OUT/catchup WTRACE_PERIOD=5 DYLD_INSERT_LIBRARIES=$DYLIB
   wa_exec $PY "$P/catchup.py" --tree "$TREE" --out "$OUT/catchup.json" --deadline-s "$REMAIN" --source "$SRC" ) \
   > "$OUT/catchup.log" 2>&1 &
@@ -252,6 +254,14 @@ while [ $SECONDS -lt $end ] && kill -0 "$PID" 2>/dev/null; do
   wa_sleep $((10 + RANDOM % 11))
 done
 END=$($PY -c 'import time; print(time.time())')
+# #939 D6: J_W, the frontier judged at the window's end against catch-up's
+# stable pair (J_T follows the terminal drain, below).
+judge() {
+  run_env $PY "$P/frontier.py" judge --frontier "$OUT/frontier.json" --data "$ROOT/data" \
+    --reference "$OUT/catchup.json" --out "$OUT/judge-$1.json" --tree "$TREE" \
+    >> "$OUT/judge.log" 2>&1
+}
+judge window || invalid "the window judgement (J_W) failed (judge.log)"
 if [ -n "$RPID" ]; then
   wa_wait rewind "$RPID" || exit 2
   RPID=""
@@ -263,7 +273,7 @@ sample
 [ "$W" = C ] && run_env $PY "$P/workload.py" record-snapshot --root "$ROOT" > "$OUT/record-end.json"
 sleep 6
 ALIVE=0; kill -0 "$PID" 2>/dev/null && ALIVE=1
-echo "{\"t\": $($PY -c 'import time; print(time.time())'), \"alive\": $ALIVE}" > "$OUT/terminal.json"
+echo "{\"t\": $($PY -c 'import time; print(time.time())'), \"alive\": $ALIVE, \"judgements\": {\"window\": \"judge-window.json\", \"terminal\": \"judge-terminal.json\"}}" > "$OUT/terminal.json"
 echo "{\"workload\": \"$LABEL\", \"traceStart\": $TRACE_START, \"warm\": $WARM, \"start\": $START, \"end\": $END}" > "$OUT/window.json"
 # ── terminal drain: no close-time checkpoint, then the measured copier ──
 if [ -n "$APID" ]; then
@@ -278,6 +288,11 @@ wa_reap_detached
   wa_exec $PY "$P/terminal_drain.py" --data "$ROOT/data" --terminal "$OUT/terminal.json" ) \
   > "$OUT/drain.log" 2>&1 &
 wa_wait terminal_drain $!
+# #939 D6: J_T, once the dashboard has exited, its workers are reaped and the
+# copier has read the wal-index it measures (a read-only open before it could
+# disturb that evidence; the content is the same after its checkpoint). A
+# missing J_T leaves ab-verdict INVALID.
+judge terminal || echo "the terminal judgement (J_T) failed (judge.log)" >&2
 reap
 wa_finish_once "$(cat "$OUT/pid")" || { echo "__exit_status=2"; exit 2; }
 echo "__exit_status=done"

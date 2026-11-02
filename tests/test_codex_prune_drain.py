@@ -477,9 +477,9 @@ def test_a_pass_discovers_once_and_scopes_every_identity(debt_estate, monkeypatc
     discover = cache_mod._discover_codex_files_with_roots
     scope = cache_mod._codex_prune_scope
 
-    def counting_discover():
+    def counting_discover(**kwargs):  # #970: walks pass `skipped=`
         calls["discover"] += 1
-        return discover()
+        return discover(**kwargs)
 
     def counting_scope(files):
         calls["scope"] += 1
@@ -858,3 +858,440 @@ def test_spawn_isolation_survives_alias_and_helper_owned_reloads(
         # Popen guard records and rejects any actual detached-worker attempt.
         assert _cache_mod()._request_codex_drain_worker(
             "_codex-prune-drain") == "spawned"
+
+
+# ── #970 T5: archive moves, strict absence and the deletion witness ─────────
+
+def _archive_name(i: int, day: str = "20") -> str:
+    return (f"rollout-2026-07-{day}T0{i}-00-00-"
+            f"0199aaaa-bbbb-7ccc-8ddd-eeeeffff09{i:02d}.jsonl")
+
+
+def _archive_records(i: int, turns: int = 3) -> list:
+    """A rollout that feeds every family: accounting, quota (a weekly
+    account-level window) and a normalized conversation. Fewer ``turns`` is
+    a byte prefix of more."""
+    from _codex_zstd_fixtures import conversation_records
+    records = conversation_records(turns, session_id=f"0199aaaa-arch-{i:04d}",
+                                   label=f"arch{i}")
+    for record in records:
+        payload = record.get("payload", {})
+        if payload.get("type") == "token_count":
+            payload["info"]["rate_limits"] = {
+                "limit_id": "codex", "limit_name": "codex",
+                "primary": {"used_percent": 20 + i, "window_minutes": 10080,
+                            "resets_at": 1785150000}}
+    return records
+
+
+def _sync_both(ns):
+    conn = _cache(ns)
+    try:
+        ns["sync_codex_cache"](conn)
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        ns["sync_codex_conversations"](conv)
+    finally:
+        conv.close()
+
+
+def _drain_both():
+    cc = _cache_mod()
+    return (cc.run_codex_prune_drain(wait_for_requests=False),
+            cc.run_codex_conversation_prune_drain(wait_for_requests=False))
+
+
+_ARCHIVE_CACHE_ROWS = (
+    ("codex_session_entries", "source_path"),
+    ("quota_window_snapshots", "source_path"),
+    ("codex_conversation_threads", "source_path"),
+)
+_ARCHIVE_CONVERSATION_ROWS = (
+    ("codex_conversation_messages", "source_path"),
+    ("codex_conversation_events", "source_path"),
+    ("codex_conversation_file_touches", "source_path"),
+)
+
+
+def _identity_state(ns, path) -> dict:
+    """Every derived row of one identity in both stores, plus each cursor
+    without ``container_path`` (the one column a move may write)."""
+    out = {}
+    for opener, tables, cursor in (
+            (_cache, _ARCHIVE_CACHE_ROWS, "codex_session_files"),
+            (lambda _ns: ns["open_conversations_db"](),
+             _ARCHIVE_CONVERSATION_ROWS, "codex_conversation_source_files")):
+        conn = opener(ns)
+        try:
+            for table, column in tables:
+                out[table] = [tuple(r) for r in conn.execute(
+                    f"SELECT * FROM {table} WHERE {column}=? ORDER BY rowid",
+                    (str(path),))]
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({cursor})")
+                    if r[1] != "container_path"]
+            out[cursor] = [tuple(r) for r in conn.execute(
+                f"SELECT {', '.join(cols)} FROM {cursor} WHERE path=?",
+                (str(path),))]
+        finally:
+            conn.close()
+    return out
+
+
+def _debt(ns) -> "tuple[set, set]":
+    conn = _cache(ns)
+    try:
+        cache = {r[0] for r in conn.execute(
+            "SELECT source_path FROM codex_prune_debt")}
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        conversations = {r[0] for r in conv.execute(
+            "SELECT source_path FROM codex_conversation_prune_debt")}
+    finally:
+        conv.close()
+    return cache, conversations
+
+
+@pytest.fixture
+def archive_estate(tmp_path, monkeypatch):
+    """A native home with a target and a keeper ingested from
+    ``sessions/2026/07/20`` in both stores, and an ``archived_sessions``."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    provider = tmp_path / "codex"
+    day = provider / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(provider))
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    target, keeper = day / _archive_name(1), day / _archive_name(2)
+    write_rollout(target, _archive_records(1))
+    write_rollout(keeper, _archive_records(2))
+    _sync_both(ns)
+    state = _identity_state(ns, target)
+    assert all(state[t] for t, _c in _ARCHIVE_CACHE_ROWS)
+    assert all(state[t] for t in ("codex_conversation_messages",
+                                  "codex_conversation_events"))
+    return ns, provider, day, archive, target, keeper
+
+
+def test_move_after_ingest_keeps_history(archive_estate):
+    """#970 R1 (AC3): archiving a rollout cctally had ingested from
+    `sessions/` turned its identity into an orphan, and both prune drains
+    deleted its whole history — usage, cost, quota and conversation. After
+    the move and both drains every derived row must be identical."""
+    ns, _provider, _day, archive, target, _keeper = archive_estate
+    before = _identity_state(ns, target)
+    moved = archive / target.name
+    os.rename(target, moved)
+    _sync_both(ns)
+    _drain_both()
+    _sync_both(ns)
+    after = _identity_state(ns, target)
+    # 16b055cae: the drains found no container beside the logical path and
+    # deleted every family (the comparison shows empty lists).
+    assert after == before
+    conn = _cache(ns)
+    try:
+        assert conn.execute(
+            "SELECT container_path FROM codex_session_files WHERE path=?",
+            (str(target),)).fetchone() == (str(moved),)
+    finally:
+        conn.close()
+
+
+def test_stale_debt_for_archived_identity_is_dropped(archive_estate):
+    """Debt an older binary recorded before an archive move (or for an
+    archived identity it could not see) must be dropped, never acted on: the
+    rollout is present in the archive, so deleting it loses its history.
+    Non-regression pin: I1's root-aware selection already finds it present;
+    this guards the strict-absence rewrite of both drains."""
+    ns, _provider, _day, archive, target, _keeper = archive_estate
+    before = _identity_state(ns, target)
+    os.rename(target, archive / target.name)
+    conn = _cache(ns)
+    try:
+        conn.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) SELECT path, source_root_key, '2026-07-21' "
+            "FROM codex_session_files WHERE path=?", (str(target),))
+        conn.commit()
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        conv.execute(
+            "INSERT INTO codex_conversation_prune_debt (source_path, "
+            "source_root_key, recorded_at_utc) SELECT path, source_root_key, "
+            "'2026-07-21' FROM codex_conversation_source_files WHERE path=?",
+            (str(target),))
+        conv.commit()
+    finally:
+        conv.close()
+    cache_result, conv_result = _drain_both()
+    assert (cache_result.identities_dropped, conv_result.identities_dropped) == (1, 1)
+    assert (cache_result.identities_deleted, conv_result.identities_deleted) == (0, 0)
+    assert _debt(ns) == (set(), set())
+    assert _identity_state(ns, target) == before
+
+
+def test_inaccessible_archive_keeps_debt_and_rows(archive_estate):
+    """A rollout moved into an archive directory cctally cannot read is not
+    proved absent: a lenient check reads the stat error as absence and the
+    drains deleted its history. Its debt and rows must survive until the
+    archive is readable again, when the debt is dropped."""
+    ns, _provider, _day, archive, target, _keeper = archive_estate
+    before = _identity_state(ns, target)
+    os.rename(target, archive / target.name)
+    os.chmod(archive, 0)
+    try:
+        _sync_both(ns)
+        assert _debt(ns) == ({str(target)}, {str(target)})
+        cache_result, conv_result = _drain_both()
+        # BASE: the lenient selection read EACCES as absent and deleted.
+        assert _identity_state(ns, target) == before
+        assert _debt(ns) == ({str(target)}, {str(target)})
+        assert cache_result.remaining == 1 and conv_result.remaining == 1
+    finally:
+        os.chmod(archive, 0o755)
+    cache_result, conv_result = _drain_both()
+    assert (cache_result.identities_dropped, conv_result.identities_dropped) == (1, 1)
+    assert _identity_state(ns, target) == before
+
+
+def test_dangling_archive_link_keeps_debt_and_rows(archive_estate, tmp_path):
+    """#970 N2: an `archived_sessions` symlinked to a volume that is not
+    mounted reads as a missing directory to a following stat, so both
+    witnesses agreed on "missing", the strict probe found nothing, and both
+    drains deleted the history of a rollout that was merely archived onto
+    the absent volume. A dangling link is unknown, never absence: the debt
+    and the rows must survive until the volume returns, when the debt is
+    dropped. A directory that genuinely does not exist still witnesses as
+    missing."""
+    ns, _provider, _day, archive, target, _keeper = archive_estate
+    cc = _cache_mod()
+    assert cc._codex_directory_witness(tmp_path / "never-created") == "missing"
+    before = _identity_state(ns, target)
+    volume = tmp_path / "unmounted" / "archived_sessions"
+    in_flight = tmp_path / "in-flight.jsonl"
+    os.rename(target, in_flight)
+    archive.rmdir()
+    archive.symlink_to(volume)
+    _sync_both(ns)
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    cache_result, conv_result = _drain_both()
+    # BASE: both witnesses read "missing", so both drains deleted.
+    assert (cache_result.identities_deleted, conv_result.identities_deleted) == (0, 0)
+    assert _identity_state(ns, target) == before
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    volume.mkdir(parents=True)
+    os.rename(in_flight, volume / target.name)
+    cache_result, conv_result = _drain_both()
+    assert (cache_result.identities_dropped, conv_result.identities_dropped) == (1, 1)
+    assert _identity_state(ns, target) == before
+
+
+def test_dangling_sessions_link_keeps_debt_and_rows(archive_estate, tmp_path):
+    """#970 V2: the twin of N2 one level up. A rollout cctally accepted in the
+    archive is unarchived back into `sessions/`, which is symlinked to a
+    volume that is then unmounted. Every dated directory under the dangling
+    link fails a following stat with ENOENT, so the dated witness read
+    "missing" on both passes, the archive witness was unchanged, the strict
+    probe found nothing, the deletion witness (the readable archive, its
+    accepted location) authorized it, and both drains deleted the history of
+    a rollout that was merely on the absent volume. A directory under a
+    dangling link is unknown, never absence: the debt and the rows must
+    survive until the volume returns, when the debt is dropped. A directory
+    genuinely missing under real directories still witnesses as missing."""
+    ns, provider, day, archive, target, _keeper = archive_estate
+    cc = _cache_mod()
+    assert cc._codex_directory_witness(day / "21" / "22") == "missing"
+    before = _identity_state(ns, target)
+    os.rename(target, archive / target.name)
+    # An archived rollout keeps the root recognizable once `sessions/` goes.
+    write_rollout(archive / _archive_name(3), _archive_records(3))
+    _sync_both(ns)                       # accepted in the archive
+    assert _identity_state(ns, target) == before
+    os.rename(archive / target.name, target)   # unarchived onto the volume
+    sessions = provider / "sessions"
+    volume = tmp_path / "unmounted" / "sessions"
+    in_flight = tmp_path / "in-flight-sessions"
+    os.rename(sessions, in_flight)
+    sessions.symlink_to(volume)          # the volume is unmounted
+    # Debt recorded before the unmount outlives it.
+    conn = _cache(ns)
+    try:
+        conn.execute(
+            "INSERT INTO codex_prune_debt (source_path, source_root_key, "
+            "recorded_at_utc) SELECT path, source_root_key, '2026-07-21' "
+            "FROM codex_session_files WHERE path=?", (str(target),))
+        conn.commit()
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        conv.execute(
+            "INSERT INTO codex_conversation_prune_debt (source_path, "
+            "source_root_key, recorded_at_utc) SELECT path, source_root_key, "
+            "'2026-07-21' FROM codex_conversation_source_files WHERE path=?",
+            (str(target),))
+        conv.commit()
+    finally:
+        conv.close()
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    cache_result, conv_result = _drain_both()
+    # BASE: the dated witness read "missing" twice, so both drains deleted.
+    assert (cache_result.identities_deleted, conv_result.identities_deleted) == (0, 0)
+    assert _identity_state(ns, target) == before
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    assert cc._codex_directory_witness(day) is None
+    volume.parent.mkdir(parents=True)
+    os.rename(in_flight, volume)         # the volume returns
+    cache_result, conv_result = _drain_both()
+    assert (cache_result.identities_dropped, conv_result.identities_dropped) == (1, 1)
+    assert _identity_state(ns, target) == before
+
+
+def test_unarchive_during_probe_keeps_debt(archive_estate, monkeypatch, tmp_path):
+    """A move that races the probes (the dated candidates probed before the
+    rename lands, the archive after it) reads as absent to an unwitnessed
+    check, which deleted a rollout that was merely moving. The changed
+    directory witness must keep the debt and the rows."""
+    ns, _provider, day, _archive, target, _keeper = archive_estate
+    before = _identity_state(ns, target)
+    in_flight = tmp_path / "in-flight.jsonl"
+    os.rename(target, in_flight)
+    _sync_both(ns)
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    cc = _cache_mod()
+    landed: list[str] = []
+
+    def unarchive_lands(path):
+        if path == str(target) and in_flight.exists():
+            os.rename(in_flight, target)   # modifies the dated directory
+            landed.append(path)
+
+    monkeypatch.setattr(cc, "_CODEX_ABSENCE_PROBE_HOOK", unarchive_lands,
+                        raising=False)
+    cache_result = cc.run_codex_prune_drain(wait_for_requests=False)
+    if target.exists():
+        os.rename(target, in_flight)       # in flight again for the twin
+        # A directory's mtime may be coarser than one drain's prologue; let
+        # the landing rename fall in a later tick than this departure.
+        time.sleep(0.05)
+    conv_result = cc.run_codex_conversation_prune_drain(wait_for_requests=False)
+    if in_flight.exists():
+        os.rename(in_flight, target)
+    # BASE: no witness, so both drains deleted the "absent" identity.
+    assert len(landed) == 2
+    assert (cache_result.identities_deleted, conv_result.identities_deleted) == (0, 0)
+    assert _debt(ns) == ({str(target)}, {str(target)})
+    assert _identity_state(ns, target) == before
+    monkeypatch.setattr(cc, "_CODEX_ABSENCE_PROBE_HOOK", None, raising=False)
+    cache_result, conv_result = _drain_both()
+    assert (cache_result.identities_dropped, conv_result.identities_dropped) == (1, 1)
+    assert _identity_state(ns, target) == before
+
+
+def _archive_first(ns, provider, i: int, *, compressed: bool):
+    """An archive-only rollout whose dated directory (07/19) never existed."""
+    from _codex_zstd_fixtures import compress_in_place
+    archived = provider / "archived_sessions" / _archive_name(i, "19")
+    write_rollout(archived, _archive_records(i))
+    if compressed:
+        archived = compress_in_place(archived)
+    logical = provider / "sessions" / "2026" / "07" / "19" / _archive_name(i, "19")
+    assert not logical.parent.exists()
+    return archived, logical
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_archive_first_deletion_without_dated_dir_prunes(
+        archive_estate, compressed):
+    """A rollout deleted from the archive must still be pruned (AC3): with
+    the logical parent as the only witness, an archive-first rollout whose
+    dated directory never existed was refused forever and stayed counted.
+    The accepted location's directory witnesses its deletion; the keeper
+    survives."""
+    ns, provider, _day, _archive, _target, keeper = archive_estate
+    archived, logical = _archive_first(ns, provider, 5, compressed=compressed)
+    _sync_both(ns)
+    _sync_both(ns)   # a compressed conversation publishes behind its seal
+    state = _identity_state(ns, logical)
+    assert state["codex_session_entries"] and state["quota_window_snapshots"]
+    keeper_before = _identity_state(ns, keeper)
+    archived.unlink()
+    _sync_both(ns)
+    # BASE: refused for the missing dated parent, so no debt was planned.
+    assert _debt(ns) == ({str(logical)}, {str(logical)})
+    _drain_both()
+    after = _identity_state(ns, logical)
+    assert all(rows == [] for rows in after.values()), after
+    assert _identity_state(ns, keeper) == keeper_before
+
+
+def test_verified_archive_adoption_then_deletion_prunes(archive_estate):
+    """The verifier must record a PLAIN archive location when it adopts a
+    zstd→plain transition (G7). If it wrote NULL, a deletion straight after
+    the adoption (no ordinary walk rewrote the cursor) would be witnessed by
+    the missing dated parent and refused forever, leaving the rollout
+    counted after the user deleted it."""
+    ns, provider, _day, _archive, _target, keeper = archive_estate
+    archived, logical = _archive_first(ns, provider, 6, compressed=True)
+    _sync_both(ns)
+    plain = archived.with_name(archived.name[:-len(".zst")])
+    import _lib_codex_rollout_container as rc
+    with rc.open_decoded(rc.select_container(logical, archive_dir=archived.parent)) as fh:
+        plain.write_bytes(fh.read())
+    archived.unlink()
+    _sync_both(ns)                                  # records the transition
+    _cache_mod().run_codex_container_verification_drain(wait_for_requests=False)
+    conn = _cache(ns)
+    try:
+        assert conn.execute(
+            "SELECT container_path, container_kind, container_state FROM "
+            "codex_session_files WHERE path=?", (str(logical),)).fetchone() == (
+            str(plain), "plain", "accepted")
+    finally:
+        conn.close()
+    keeper_before = _identity_state(ns, keeper)
+    plain.unlink()
+    _sync_both(ns)
+    _drain_both()
+    after = _identity_state(ns, logical)
+    assert after["codex_session_entries"] == [] and after["codex_session_files"] == []
+    assert after["codex_conversation_source_files"] == []
+    assert _identity_state(ns, keeper) == keeper_before
+
+
+def test_uncontained_stored_location_is_ignored(archive_estate, tmp_path):
+    """The deletion witness follows a stored location only when it lies in
+    the root's archive directory; a stored path elsewhere (a tampered or
+    foreign row) must not let a readable unrelated directory authorize the
+    deletion of an identity whose own directories say nothing."""
+    ns, provider, _day, archive, target, _keeper = archive_estate
+    cc = _cache_mod()
+    root = cc._codex_provider_roots()[0]
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    conn = _cache(ns)
+    try:
+        def witness(stored):
+            conn.execute("UPDATE codex_session_files SET container_path=? "
+                         "WHERE path=?", (stored, str(target)))
+            return cc._codex_deletion_witness(
+                conn, "codex_session_files", str(target), root)
+        assert witness(None) == target.parent
+        assert witness(str(archive / target.name)) == archive.resolve()
+        assert witness(str(elsewhere / target.name)) == target.parent
+        link = archive / ("link-" + target.name)
+        link.symlink_to(elsewhere / target.name)
+        assert witness(str(link)) == target.parent   # canonicalizes outside
+        conn.rollback()
+    finally:
+        conn.close()

@@ -667,3 +667,90 @@ def test_690_an_undecodable_evidence_column_degrades_to_null(ns):
         conn.close()
     assert row["detector_input_causes"] is None
     assert row["composition_provenance"] is None
+
+
+# --------------------------------------------------------------------------
+# #1015 spec 5.7, U2: the row stays and carries its supersession
+# --------------------------------------------------------------------------
+def _seed_correction_facts(conn, *, account_key="acct-a",
+                           captured_at="2026-08-20T10:00:00+00:00"):
+    """One reviewed hold of an observation captured before the transition was
+    detected, materialized by a later completed batch touching its account.
+    A null-lineage transition is assessed over `(-inf, detected_at]`, so this
+    correction supersedes it with no explicit event (derived)."""
+    conn.execute("INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+                 ("obs-1", account_key, captured_at))
+    conn.execute("INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
+                 ("op-1", "obs-1", "hold"))
+    conn.execute("INSERT INTO claude_weekly_correction_ops VALUES (?,?,?)",
+                 ("op-1", "observations-2026-08.jsonl", 100))
+    conn.execute("INSERT INTO correction_batch_lineage VALUES (?,?,?)",
+                 ("batch-1", "observations-2026-08.jsonl", 200))
+    conn.execute("INSERT INTO correction_batch_footprint VALUES (?,?,?)",
+                 ("batch-1", "claude", account_key))
+    conn.commit()
+
+
+def test_1015_an_unsuperseded_row_carries_a_null_supersession(ns):
+    """Published always and nulled, so the client can tell an ordinary row
+    from one an older server sent (absent)."""
+    row = _rows(ns)[0]
+    assert "supersession" in row
+    assert row["supersession"] is None
+
+
+def test_1015_an_explicit_supersession_is_published_with_its_instant(ns):
+    """Detects a superseded transition the history would present as live:
+    the explicit event's sweep clock and op ids reach the wire."""
+    conn = ns["open_db"]()
+    try:
+        _seed(conn)
+        conn.execute(
+            "INSERT INTO meter_rate_change_supersessions VALUES "
+            "(?,?,?,?,?,?,?)",
+            ("claude", "unattributed", BOUNDARY, "reviewed-correction",
+             '[{"observations":2,"opId":"op-7"}]',
+             "2026-09-02T00:00:00+00:00", "2026-09-02T00:00:00+00:00"))
+        conn.commit()
+        row = ns["_build_meter_rate_change_array"](conn)[0]
+    finally:
+        conn.close()
+    assert row["supersession"] == {
+        "reason": "reviewed-correction",
+        "superseded_at": "2026-09-02T00:00:00+00:00",
+        "corrections": ["op-7"],
+    }
+    # The row and its historical values are kept.
+    assert row["previous_units_per_point"] == pytest.approx(2_442_620.0)
+    assert row["new_units_per_point"] == pytest.approx(1_685_000.0)
+
+
+def test_1015_a_derived_supersession_is_published_before_any_sweep(ns):
+    """Correction -> rebuild -> read, before `cctally quota` journals the
+    explicit event: the row is labelled from its lineage alone, with a null
+    instant."""
+    conn = ns["open_db"]()
+    try:
+        _seed(conn)
+        _seed_correction_facts(conn)
+        row = ns["_build_meter_rate_change_array"](conn)[0]
+    finally:
+        conn.close()
+    assert row["supersession"] == {
+        "reason": "reviewed-correction",
+        "superseded_at": None,
+        "corrections": ["op-1"],
+    }
+
+
+def test_1015_a_correction_after_detection_supersedes_nothing(ns):
+    """Negative control: an observation captured after the legacy
+    transition's detection is outside its conservative window."""
+    conn = ns["open_db"]()
+    try:
+        _seed(conn)
+        _seed_correction_facts(conn, captured_at="2026-09-20T10:00:00+00:00")
+        row = ns["_build_meter_rate_change_array"](conn)[0]
+    finally:
+        conn.close()
+    assert row["supersession"] is None

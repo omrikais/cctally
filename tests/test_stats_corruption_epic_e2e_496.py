@@ -401,12 +401,15 @@ def _port_accepting(port: int) -> bool:
 
 
 def _worker_lock_held(app: pathlib.Path) -> bool:
-    """Whether a detached heal worker currently owns its admission flock.
+    """Whether a detached heal worker currently holds its worker flock.
 
-    `cmd_stats_corruption_heal_internal` takes `LOCK_EX | LOCK_NB` on
-    `stats-corruption-heal.worker.lock` and returns immediately when it cannot,
-    so a held lock IS the "exactly one admitted worker" property, observed the
-    same way a second worker would observe it.
+    `cmd_stats_corruption_heal_internal` holds
+    `stats-corruption-heal.worker.lock` for its whole run (#1012: after its
+    claim lock). A second worker does not return at once when it cannot take
+    it: it waits out a non-owner hold and records `busy` only against a
+    positively identified live owner. A held lock therefore still shows the
+    "exactly one admitted worker" property; this observation itself is a
+    non-owner hold, which a starting worker outwaits.
     """
     import fcntl
 

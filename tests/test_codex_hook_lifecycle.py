@@ -337,6 +337,58 @@ def test_codex_tick_hands_a_declined_byte_zero_replay_to_a_drain_worker(
     assert captured.out == captured.err == ""
 
 
+def test_codex_tick_defers_a_pending_quota_index_and_leaves_markers_due(
+    runtime, monkeypatch, capsys,
+):
+    """#977 C5: while the quota index is rebuilt off the hook, the budgeted
+    sync stops before the quota-bearing file. Acknowledging that tick as a
+    success would throttle the root for fifteen seconds and report a sync
+    that journaled nothing as `result=success`."""
+    ns, _first, _second = runtime
+    calls: list[str] = []
+
+    class Cache:
+        def close(self):
+            calls.append("cache-close")
+
+    import _cctally_update
+    monkeypatch.setattr(
+        _cctally_update, "_spawn_detached", lambda command: True)
+    monkeypatch.setitem(ns, "open_cache_db", lambda: Cache())
+    monkeypatch.setitem(
+        ns, "sync_codex_cache",
+        lambda conn, *, lock_timeout, **_budget: calls.append("sync")
+        or SimpleNamespace(
+            lock_contended=False, deferred_reason="quota_index_pending",
+            backlog_files=3),
+    )
+    monkeypatch.setitem(
+        ns, "reconcile_codex_quota_projection",
+        lambda **kwargs: calls.append("reconcile") or SimpleNamespace(
+            blocks_upserted=0, milestones_upserted=0, alerts_dispatched=0),
+    )
+    monkeypatch.setitem(
+        ns, "maybe_record_codex_budget_milestone",
+        lambda saved, **kwargs: calls.append("budget") or 0,
+    )
+
+    assert ns["cmd_hook_tick"](_hook_args()) == 0
+
+    lines = (ns["APP_DIR"] / "logs" / "hook-tick.log").read_text().splitlines()
+    assert len(lines) == 2  # one per due root
+    for line in lines:
+        fields = dict(
+            token.split("=", 1) for token in line.split()[1:] if "=" in token)
+        assert fields["sync"] == "deferred"
+        assert fields["result"] == "noop"
+        assert fields["reason"] == "quota_index_pending"
+    marker_dir = ns["APP_DIR"] / "codex-hook-tick"
+    assert not list(marker_dir.glob("*.last-success")), (
+        "a deferred tick acknowledged its roots")
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
 def test_codex_tick_records_what_the_blanket_except_swallowed(
     runtime, monkeypatch, capsys,
 ):
@@ -1069,3 +1121,58 @@ def test_liveness_markers_report_never_when_only_rejected_suffixes_exist(
     assert records["root-a"] == {
         "last_success_at": None, "marker_count": 0, "unavailable": False,
     }
+
+
+def test_deferral_liveness_doctor_reader_and_rollover(tmp_path, monkeypatch):
+    """#981 T-A5 / P2 / P4. Repeated due hooks under continuing appends stay
+    deferred while the snapshot cannot be proven complete (a declined
+    byte-zero replay), doctor's lifecycle reader counts those ticks as
+    neither success nor error, and a deferral spanning a period boundary
+    drops only the prior period's pending crossing; the first eligible hook
+    then evaluates. Detects: a deferral reported as a success or an error, a
+    crossing fabricated for a period that ended unevaluated, and a hook that
+    never resumes evaluation."""
+    from test_968_gate_reader_contracts import BudgetHarness
+    import _cctally_doctor as doctor
+    h = BudgetHarness(tmp_path, monkeypatch, codex_budget={
+        "amount_usd": 0.001, "period": "calendar-month",
+        "alerts_enabled": True, "alert_thresholds": [50]})
+    h.rollout("seed", 3)
+    h.seed_sync()
+    conn = h.cache_conn()
+    conn.execute("INSERT OR REPLACE INTO cache_meta(key,value) VALUES(?, '1')",
+                 (h.cache.CODEX_REPLAY_FROM_ZERO_KEY,))
+    conn.commit()
+    conn.close()
+
+    def lifecycle():
+        return doctor._codex_lifecycle_activity_24h(
+            root_keys={h.root_key},
+            now_utc=dt.datetime.now(dt.timezone.utc))
+
+    for turns in (4, 5):  # the July spend already crosses 50% of $0.001
+        h.rollout("seed", turns)
+        h.hook()
+        fields = h.log()[-1]
+        assert (fields["sync"], fields["result"], fields.get("reason")) == (
+            "deferred", "noop", "budget_replay_pending")
+        assert not h.marker().exists()
+        assert lifecycle() == {}, "a deferral counted as success or error"
+    assert h.budget_rows() == [] and h.spend == []
+
+    # The period ends while deferred; the replay drain then runs.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-08-02T12:00:00Z")
+    h.seed_sync()
+    h.hook()
+
+    fields = h.log()[-1]
+    assert (fields["sync"], fields["result"]) == ("ok", "success"), fields
+    assert h.marker().is_file()
+    (start, account, total), = h.spend
+    assert start == dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
+    assert account is None and total == 0.0
+    assert h.budget_rows() == [], (
+        "the July crossing was fabricated after its period ended")
+    row = lifecycle()[h.root_key]
+    assert (row["success_count_24h"], row["error_count_24h"]) == (1, 0)
+    assert row["last_tick_at"] is not None

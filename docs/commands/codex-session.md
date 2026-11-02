@@ -77,9 +77,7 @@ the tier.
 
 - Sort defaults to **ascending** (earliest first) — matches upstream
   `ccusage-codex session` and pairs well with terminal scrollback.
-- Each row corresponds to one Codex session file at
-  `~/.codex/sessions/...`. Codex doesn't have a Claude-style
-  `--resume`-across-files concept, so no merging happens here.
+- Each row corresponds to one Codex session file at `~/.codex/sessions/...`; a thread archived into `~/.codex/archived_sessions/` keeps its row and its original `sessions/` path. Codex doesn't have a Claude-style `--resume`-across-files concept, so no merging happens here.
 - **Cross-root collisions** (multi-root `$CODEX_HOME`): two distinct session
   files sharing the same relative path under different roots stay separate
   rows (counts are never merged). Since `sessionId` is the upstream-compatible

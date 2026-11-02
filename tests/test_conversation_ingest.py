@@ -1377,3 +1377,585 @@ def test_backfill_ai_titles_rerun_does_not_regress(isolated):
         "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
     ).fetchone()[0]
     assert second == first == "Newer", (first, second)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #939 D1/D2: Claude prepare-then-apply batches and the pass-scoped cache
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The batch bounds are module constants a test monkeypatches. Faults are real
+# SQLite failures wherever SQLite can produce them (TEMP triggers, a deferred
+# foreign key, a competing connection); a Python-level hook is used only for
+# the exceptions SQLite cannot raise.
+
+
+def _d1_line(session, uuid, text, *, ts="2026-06-01T00:00:00Z"):
+    return json.dumps({
+        "type": "user", "uuid": uuid, "sessionId": session, "timestamp": ts,
+        "message": {"role": "user", "content": text},
+    }) + "\n"
+
+
+def _d1_edit_line(session, uuid, target, *, ts="2026-06-01T00:00:30Z"):
+    """An assistant turn whose Edit tool use derives a file-touch row."""
+    return json.dumps({
+        "type": "assistant", "uuid": uuid, "sessionId": session,
+        "requestId": f"r-{uuid}", "timestamp": ts,
+        "message": {
+            "role": "assistant", "id": f"m-{uuid}", "model": "claude-opus-4-7",
+            "content": [{"type": "tool_use", "name": "Edit", "id": f"t-{uuid}",
+                         "input": {"file_path": target, "old_string": "x",
+                                   "new_string": "y"}}],
+            "usage": {"input_tokens": 10, "output_tokens": 5,
+                      "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0},
+        },
+    }) + "\n"
+
+
+def _d1_files(projects, names, *, lines=1):
+    """One transcript per name; equal-length names give equal-size files."""
+    out = []
+    for name in names:
+        path = projects / f"{name}.jsonl"
+        path.write_text("".join(
+            _d1_line(f"s-{name}", f"{name}-{i}", f"{name} text {i}")
+            for i in range(lines)))
+        out.append(path)
+    return out
+
+
+def _d1_unit():
+    return len(_d1_line("s-a", "a-0", "a text 0"))
+
+
+def _d1_other(ns, *, timeout=5.0):
+    return sqlite3.connect(
+        str(ns["_cctally_core"].CONVERSATIONS_DB_PATH), timeout=timeout)
+
+
+def _d1_committed_cursors(ns):
+    """Committed cursors by file stem, read through a second connection."""
+    other = _d1_other(ns)
+    try:
+        return {
+            pathlib.Path(path).stem: offset for path, offset in other.execute(
+                "SELECT path,last_byte_offset FROM conversation_source_files")
+        }
+    finally:
+        other.close()
+
+
+def _d1_on_parse(monkeypatch, cache, on_start):
+    """Call ``on_start(stem)`` as each file's parse begins."""
+    real = cache._iter_sync_entries
+
+    def walking(fh, path_str, *args, **kwargs):
+        on_start(pathlib.Path(path_str).stem)
+        yield from real(fh, path_str, *args, **kwargs)
+    monkeypatch.setattr(cache, "_iter_sync_entries", walking)
+    return real
+
+
+def _d1_traced(ns, conn, **kwargs):
+    statements: list = []
+    conn.set_trace_callback(statements.append)
+    try:
+        stats = ns["sync_claude_conversations"](conn, **kwargs)
+    finally:
+        conn.set_trace_callback(None)
+    return stats, statements
+
+
+def _d1_batches(statements, stems):
+    """The stems whose cursors each committed transaction wrote, in order."""
+    batches, current, previous = [], [], None
+    for statement in statements:
+        if statement.lstrip().startswith("--") or statement == previous:
+            continue
+        previous = statement
+        head = statement.lstrip().upper()
+        if head.startswith(("COMMIT", "END")):
+            if current:
+                batches.append(current)
+            current = []
+        elif head.startswith("ROLLBACK") and not head.startswith("ROLLBACK TO"):
+            current = []
+        elif head.startswith("INSERT INTO CONVERSATION_SOURCE_FILES"):
+            current.append(next(
+                stem for stem in stems if f"/{stem}.jsonl'" in statement))
+    return batches
+
+
+def _d1_sql_text(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def test_claude_no_write_transaction_is_open_while_a_file_is_prepared(
+        isolated, monkeypatch):
+    """Detects: a file parsed and attributed inside an open write transaction,
+    which holds the write lock through the parse and pins the attribution
+    reads to a snapshot older than the record."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    _d1_files(projects, ["a", "b", "c"], lines=2)
+    seen = []
+    real = cache._iter_sync_entries
+
+    def walking(fh, path_str, *args, **kwargs):
+        for item in real(fh, path_str, *args, **kwargs):
+            seen.append((pathlib.Path(path_str).stem, conn.in_transaction))
+            yield item
+    monkeypatch.setattr(cache, "_iter_sync_entries", walking)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_processed == 3
+    assert {stem for stem, _open in seen} == {"a", "b", "c"}
+    assert not any(open_ for _stem, open_ in seen)
+
+
+def test_claude_changed_files_share_bounded_batches(isolated, monkeypatch):
+    """Detects: a pass that commits once per file (the repeated-frame cost
+    #939 measured) or a batch that grows past its file bound."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    names = ["a", "b", "c", "d", "e"]
+    _d1_files(projects, names)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_FILES", 2)
+    stats, statements = _d1_traced(ns, conn)
+    assert stats.files_processed == 5 and stats.files_failed == 0
+    assert _d1_batches(statements, names) == [["a", "b"], ["c", "d"], ["e"]]
+
+
+def test_claude_batch_byte_bound_admits_by_new_input(isolated, monkeypatch):
+    """Detects: a batch admitted past its byte bound, an exact fit split, or
+    an appended file measured by its whole size instead of its new input."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    unit = _d1_unit()
+    z = projects / "z.jsonl"
+    z.write_text("".join(
+        _d1_line("s-z", f"z-{i}", f"z text {i}") for i in range(8)))
+    ns["sync_claude_conversations"](conn)
+    with z.open("a") as fh:
+        fh.write(_d1_line("s-z", "z-8", "z text 8"))
+    _d1_files(projects, ["a", "b", "c", "e"])
+    _d1_files(projects, ["d"], lines=3)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_BYTES", 2 * unit)
+    stats, statements = _d1_traced(ns, conn)
+    assert stats.files_processed == 6
+    # a+b fit exactly; c crosses and starts a batch; d (3 units) is oversized
+    # and runs alone; z's append (1 unit) joins e although z is 9 units long.
+    assert _d1_batches(statements, ["a", "b", "c", "d", "e", "z"]) == [
+        ["a", "b"], ["c"], ["d"], ["e", "z"]]
+
+
+def test_claude_oversized_file_parses_after_the_open_batch_commits(
+        isolated, monkeypatch):
+    """Detects: a file that crosses the bound parsed while the open batch
+    still holds its rows (two batches of input in memory) or with the batch's
+    write transaction open."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    _d1_files(projects, ["a", "b"])
+    _d1_files(projects, ["c"], lines=2)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_BYTES", 3 * _d1_unit())
+    observed = {}
+
+    def on_start(stem):
+        if stem == "c":
+            observed["cursors"] = set(_d1_committed_cursors(ns))
+            observed["open"] = conn.in_transaction
+    _d1_on_parse(monkeypatch, cache, on_start)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_processed == 3
+    assert observed == {"cursors": {"a", "b"}, "open": False}
+
+
+def test_claude_growth_during_parse_stops_at_the_read_limit(
+        isolated, monkeypatch):
+    """Detects: a pass that consumes records appended after the file was
+    admitted, so a batch holds more input than it admitted."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    (a,) = _d1_files(projects, ["a"], lines=2)
+    admitted = a.stat().st_size
+    fired = []
+
+    def on_start(_stem):
+        if not fired:
+            fired.append(True)
+            with a.open("a") as fh:
+                fh.write(_d1_line("s-a", "a-9", "a text 9"))
+    _d1_on_parse(monkeypatch, cache, on_start)
+    ns["sync_claude_conversations"](conn)
+    assert fired
+    assert _d1_committed_cursors(ns) == {"a": admitted}
+    assert [r[0] for r in _conv_rows(conn)] == ["a-0", "a-1"]
+    ns["sync_claude_conversations"](conn)
+    assert _d1_committed_cursors(ns) == {"a": a.stat().st_size}
+    assert [r[0] for r in _conv_rows(conn)] == ["a-0", "a-1", "a-9"]
+
+
+def _d1_store(conn, root):
+    """The stored result, with random incarnation ids named by their path and
+    ingest times and file identity (inode, mtime, device) removed."""
+    current = {
+        inc: path for path, inc in conn.execute(
+            "SELECT path,source_incarnation_id FROM conversation_source_files")
+    }
+
+    def strip(value):
+        return value.replace(root, "<root>") if isinstance(value, str) else value
+
+    def inc_name(inc, path):
+        return "current:" + strip(path) if inc in current else "old:" + strip(path)
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(conversation_messages)")
+            if r[1] != "id"]
+    messages = [tuple(strip(v) for v in row) for row in conn.execute(
+        f"SELECT {','.join(cols)} FROM conversation_messages "
+        "ORDER BY source_path,byte_offset")]
+    touches = [tuple(strip(v) for v in row) for row in conn.execute(
+        "SELECT m.source_path,m.byte_offset,t.session_id,t.uuid,t.file_path,t.tool "
+        "FROM conversation_file_touches t JOIN conversation_messages m "
+        "ON m.id=t.message_id ORDER BY 1,2,5,6")]
+    titles = [tuple(strip(v) for v in row) for row in conn.execute(
+        "SELECT session_id,ai_title,source_path,byte_offset "
+        "FROM conversation_ai_titles ORDER BY session_id")]
+    stamps = sorted(
+        (strip(path), inc_name(inc, path), offset, digest, account)
+        for path, inc, offset, digest, account in conn.execute(
+            "SELECT canonical_source_path,source_incarnation_id,byte_offset,"
+            "record_sha256,account_key FROM claude_conversation_account_stamps"))
+    sources = [
+        (strip(path), size, offset, inc_name(inc, path), prefix)
+        for path, size, offset, inc, prefix in conn.execute(
+            "SELECT path,size_bytes,last_byte_offset,source_incarnation_id,"
+            "committed_prefix_sha256 FROM conversation_source_files ORDER BY path")
+    ]
+    return {"messages": messages, "touches": touches, "titles": titles,
+            "stamps": stamps, "sources": sources}
+
+
+def _d1_timeline(ns, projects):
+    """Two passes over a changing corpus: new files, an append with a
+    file-touching tool use, a smaller rewrite (truncation) and a title."""
+    for old in projects.glob("*.jsonl"):
+        old.unlink()
+    conn = ns["open_conversations_db"]()
+    try:
+        a, b, c = (projects / f"{n}.jsonl" for n in ("a", "b", "c"))
+        a.write_text(_d1_line("s-a", "a-0", "alpha") + _d1_edit_line(
+            "s-a", "a-1", "/w/one.py"))
+        b.write_text("".join(_d1_line("s-b", f"b-{i}", f"bravo {i}")
+                             for i in range(3)))
+        c.write_text(_d1_line("s-c", "c-0", "charlie"))
+        ns["sync_claude_conversations"](conn)
+        with a.open("a") as fh:
+            fh.write(_d1_line("s-a", "a-2", "alpha again")
+                     + _d1_edit_line("s-a", "a-3", "/w/two.py"))
+        b.write_text(_d1_line("s-b", "b-9", "rewritten"))
+        with c.open("a") as fh:
+            fh.write(json.dumps({"type": "ai-title", "aiTitle": "Charlie",
+                                 "sessionId": "s-c"}) + "\n")
+        (projects / "d.jsonl").write_text(
+            _d1_line("s-d", "d-0", "delta") + _d1_line("s-d", "d-1", "delta 2"))
+        stats = ns["sync_claude_conversations"](conn)
+        assert stats.files_failed == 0 and stats.files_reset_truncated == 1
+        return _d1_store(conn, str(projects))
+    finally:
+        conn.close()
+
+
+def test_claude_one_file_control_produces_the_same_store(isolated, monkeypatch):
+    """Detects: batching that changes what a pass stores (a lost or
+    duplicated message, touch, title, stamp or cursor) relative to the
+    one-file-per-transaction control."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    conn.close()
+    files_bound = cache.CLAUDE_CONVERSATION_BATCH_FILES
+    bytes_bound = cache.CLAUDE_CONVERSATION_BATCH_BYTES
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_FILES", 1)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_BYTES", 1)
+    control = _d1_timeline(ns, projects)
+    db_path = ns["_cctally_core"].CONVERSATIONS_DB_PATH
+    for suffix in ("", "-wal", "-shm"):
+        pathlib.Path(f"{db_path}{suffix}").unlink(missing_ok=True)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_FILES", files_bound)
+    monkeypatch.setattr(cache, "CLAUDE_CONVERSATION_BATCH_BYTES", bytes_bound)
+    batched = _d1_timeline(ns, projects)
+    assert control["touches"] and control["titles"] and control["stamps"]
+    assert batched == control
+
+
+def _d1_wrap_begin(monkeypatch, cache, *, before=None, after=None):
+    real = cache._begin_claude_conversation_batch
+
+    def begin(conn):
+        if before is not None:
+            before(conn)
+        real(conn)
+        if after is not None:
+            after(conn)
+    monkeypatch.setattr(cache, "_begin_claude_conversation_batch", begin)
+    return real
+
+
+def test_claude_batch_survives_a_competing_commit_before_apply(
+        isolated, monkeypatch):
+    """Detects: a batch failed by SQLITE_BUSY_SNAPSHOT because the other
+    provider's writer committed between preparation and apply, and a
+    truncation read that does not see that commit."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    b = projects / "b.jsonl"
+    b.write_text(_d1_line("s-b", "b-0", "bravo") + _d1_line("s-b", "b-1", "two"))
+    ns["sync_claude_conversations"](conn)
+    b.write_text(_d1_line("s-b", "b-9", "short"))
+    _d1_files(projects, ["a"])
+
+    def compete(_conn):
+        other = _d1_other(ns)
+        try:
+            other.execute(
+                "INSERT INTO conversation_messages(session_id,uuid,source_path,"
+                "byte_offset,timestamp_utc,entry_type,text,blocks_json,"
+                "is_sidechain) VALUES('s-rival','rival',?,999999,'t','human',"
+                "'rival','[]',0)", (str(b),))
+            other.commit()
+        finally:
+            other.close()
+    _d1_wrap_begin(monkeypatch, cache, before=compete)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_failed == 0 and stats.files_processed == 2
+    assert stats.files_reset_truncated == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM conversation_messages WHERE uuid='rival'"
+    ).fetchone()[0] == 0
+
+
+def test_claude_batch_holds_the_write_lock_during_apply(isolated, monkeypatch):
+    """Detects: a deferred BEGIN, whose first read pins a snapshot that the
+    first write must upgrade (SQLITE_BUSY_SNAPSHOT, which no busy timeout
+    retries); the batch must hold the write lock from its BEGIN."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    _d1_files(projects, ["a", "b"])
+    outcomes = []
+
+    def probe(_conn):
+        other = _d1_other(ns, timeout=0)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            outcomes.append("acquired")
+            other.rollback()
+        except sqlite3.OperationalError:
+            outcomes.append("busy")
+        finally:
+            other.close()
+    _d1_wrap_begin(monkeypatch, cache, after=probe)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_processed == 2
+    assert outcomes == ["busy"]
+
+
+@pytest.mark.parametrize("exc_type,committed", [
+    (RuntimeError, {"a", "b"}),
+    (KeyboardInterrupt, set()),
+], ids=["exception", "base-exception"])
+def test_claude_prepare_exception_resolves_the_open_batch(
+        isolated, monkeypatch, exc_type, committed):
+    """Detects: files prepared before an escaping exception being lost (an
+    Exception applies them first) or committed under an interrupt (a
+    BaseException drops them, for the next pass to re-read)."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    names = ["a", "b", "c", "d", "e"]
+    _d1_files(projects, names)
+
+    def on_start(stem):
+        if stem == "c":
+            raise exc_type("injected")
+    real = _d1_on_parse(monkeypatch, cache, on_start)
+    with pytest.raises(exc_type):
+        ns["sync_claude_conversations"](conn)
+    assert set(_d1_committed_cursors(ns)) == committed
+    assert not conn.in_transaction
+    monkeypatch.setattr(cache, "_iter_sync_entries", real)
+    ns["sync_claude_conversations"](conn)
+    assert set(_d1_committed_cursors(ns)) == set(names)
+
+
+def test_claude_unreadable_file_fails_alone_inside_its_batch(
+        isolated, monkeypatch):
+    """Detects: a read error that fails or splits the rest of its batch, or a
+    failed file the #939 D5 residual does not name."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    _a, b, _c = _d1_files(projects, ["a", "b", "c"])
+
+    def on_start(stem):
+        if stem == "b":
+            raise OSError("injected")
+    _d1_on_parse(monkeypatch, cache, on_start)
+    stats, statements = _d1_traced(ns, conn)
+    assert stats.files_failed == 1 and stats.files_processed == 2
+    assert stats.failed_paths == {str(b)}
+    assert _d1_batches(statements, ["a", "b", "c"]) == [["a", "c"]]
+
+
+def test_claude_busy_begin_fails_every_file_of_the_batch(isolated, monkeypatch):
+    """Detects: a batch whose BEGIN IMMEDIATE timed out yet advanced a cursor
+    or counted a file processed, so the next pass would skip its records."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    paths = _d1_files(projects, ["a", "b", "c"])
+    real = cache._begin_claude_conversation_batch
+
+    def begin(c):
+        other = _d1_other(ns)
+        other.execute("BEGIN IMMEDIATE")
+        (previous,) = c.execute("PRAGMA busy_timeout").fetchone()
+        c.execute("PRAGMA busy_timeout=0")
+        try:
+            real(c)
+        finally:
+            c.execute(f"PRAGMA busy_timeout={int(previous)}")
+            other.rollback()
+            other.close()
+    monkeypatch.setattr(cache, "_begin_claude_conversation_batch", begin)
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_failed == 3 and stats.files_processed == 0
+    assert stats.failed_paths == {str(path) for path in paths}
+    assert _d1_committed_cursors(ns) == {}
+    assert not conn.in_transaction
+    monkeypatch.setattr(cache, "_begin_claude_conversation_batch", real)
+    assert ns["sync_claude_conversations"](conn).files_processed == 3
+
+
+@pytest.mark.parametrize("raise_kind,failed,committed", [
+    ("ABORT", 1, {"a", "c"}),
+    ("ROLLBACK", 3, set()),
+], ids=["savepoint-rollback", "transaction-lost"])
+def test_claude_savepoint_database_error(isolated, raise_kind, failed,
+                                         committed):
+    """Detects: a database error in one file undoing its batch's other files
+    (savepoint rollback), or, when the error ended the transaction, files
+    counted processed although nothing of the batch was committed."""
+    ns, conn, projects, _sync = isolated
+    _, b, _ = _d1_files(projects, ["a", "b", "c"])
+    conn.execute(
+        "CREATE TEMP TRIGGER d1_fail BEFORE INSERT ON main.conversation_source_files "
+        f"WHEN NEW.path = {_d1_sql_text(b)} "
+        f"BEGIN SELECT RAISE({raise_kind}, 'd1 injected'); END")
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_failed == failed
+    assert stats.files_processed == 3 - failed
+    assert set(_d1_committed_cursors(ns)) == committed
+    assert not conn.in_transaction
+    conn.execute("DROP TRIGGER temp.d1_fail")
+    ns["sync_claude_conversations"](conn)
+    assert set(_d1_committed_cursors(ns)) == {"a", "b", "c"}
+
+
+@pytest.mark.parametrize("exc_type,committed", [
+    (RuntimeError, {"a"}),
+    (KeyboardInterrupt, set()),
+], ids=["exception", "base-exception"])
+def test_claude_apply_exception_keeps_or_discards_released_files(
+        isolated, monkeypatch, exc_type, committed):
+    """Detects: an exception during apply that leaves the batch's transaction
+    open on the caller's connection, loses the files released before it (an
+    Exception commits them) or commits under an interrupt."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    _d1_files(projects, ["a", "b", "c"])
+    real = cache._fill_file_touches
+
+    def touching(c, scope=None):
+        if scope is not None and any(
+                pathlib.Path(path).stem == "b" for path, _offset in scope):
+            raise exc_type("injected")
+        return real(c, scope=scope)
+    monkeypatch.setattr(cache, "_fill_file_touches", touching)
+    with pytest.raises(exc_type):
+        ns["sync_claude_conversations"](conn)
+    assert set(_d1_committed_cursors(ns)) == committed
+    assert not conn.in_transaction
+
+
+def test_claude_commit_failure_fails_every_released_file_once(isolated):
+    """Detects: a failed COMMIT that leaves its transaction open or counts a
+    file processed whose cursor never committed."""
+    ns, conn, projects, _sync = isolated
+    paths = _d1_files(projects, ["a", "b", "c"])
+    c = paths[2]
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("CREATE TEMP TABLE d1_parent(id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TEMP TABLE d1_child(pid INTEGER REFERENCES d1_parent(id) "
+        "DEFERRABLE INITIALLY DEFERRED)")
+    conn.execute(
+        "CREATE TEMP TRIGGER d1_defer AFTER INSERT ON main.conversation_source_files "
+        f"WHEN NEW.path = {_d1_sql_text(c)} "
+        "BEGIN INSERT INTO d1_child VALUES (7); END")
+    stats = ns["sync_claude_conversations"](conn)
+    assert stats.files_failed == 3 and stats.files_processed == 0
+    assert stats.failed_paths == {str(path) for path in paths}
+    assert _d1_committed_cursors(ns) == {}
+    assert not conn.in_transaction
+
+
+def test_claude_targeted_truncation_applies_the_open_batch_first(
+        isolated, monkeypatch):
+    """Detects: the targeted truncation early return dropping the files the
+    open batch already prepared, or leaving its transaction open."""
+    ns, conn, projects, _sync = isolated
+    cache = ns["_cctally_cache"]
+    a, b = _d1_files(projects, ["a", "b"], lines=2)
+    ns["sync_claude_conversations"](conn)
+    with a.open("a") as fh:
+        fh.write(_d1_line("s-a", "a-7", "a text 7"))
+
+    def on_start(stem):
+        if stem == "a":
+            b.write_text(_d1_line("s-b", "b-9", "x"))
+    _d1_on_parse(monkeypatch, cache, on_start)
+    stats = ns["sync_claude_conversations"](conn, only_paths={str(a), str(b)})
+    assert stats.deferred_reason == "truncation"
+    assert stats.files_processed == 1
+    assert _d1_committed_cursors(ns)["a"] == a.stat().st_size
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "exception"])
+def test_conversation_sync_cache_scope(isolated, provider, fails):
+    """Detects: the pass's 64 MiB writer cache leaking onto a connection the
+    caller keeps (cache-sync, the viewer's targeted syncs) or onto the
+    attached accounting store."""
+    ns, conn, projects, _sync = isolated
+    if provider == "claude":
+        _d1_files(projects, ["a"])
+    conn.execute("PRAGMA main.cache_size=-1234")
+    (cache_db_before,) = conn.execute("PRAGMA cache_db.cache_size").fetchone()
+    during = []
+
+    def progress(phase, _stats):
+        if phase == "ingest" and not during:
+            during.append((
+                conn.execute("PRAGMA main.cache_size").fetchone()[0],
+                conn.execute("PRAGMA cache_db.cache_size").fetchone()[0]))
+            if fails:
+                raise RuntimeError("injected")
+    sync = ns[f"sync_{provider}_conversations"]
+    if fails:
+        with pytest.raises(RuntimeError):
+            sync(conn, progress=progress)
+    else:
+        sync(conn, progress=progress)
+    assert during == [(-65536, cache_db_before)]
+    assert conn.execute("PRAGMA main.cache_size").fetchone()[0] == -1234
+    assert conn.execute(
+        "PRAGMA cache_db.cache_size").fetchone()[0] == cache_db_before

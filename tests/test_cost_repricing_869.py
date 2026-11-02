@@ -537,6 +537,202 @@ def test_genuinely_priced_close_freezes_its_milestones_875(
     ] == [(1, pytest.approx(3.0), None), (2, pytest.approx(6.0), pytest.approx(3.0))]
 
 
+_O2_LINE = (
+    "Milestone repair withheld for 1 five-hour block(s) with ambiguous "
+    "history; rerun with --json and see withheldMilestoneRepairs."
+)
+
+
+def _cli_884(tmp_path, *argv):
+    """One real ``bin/cctally`` process over the isolated store."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = dict(os.environ)
+    env.update({
+        "HOME": str(tmp_path),
+        "CCTALLY_DATA_DIR": str(tmp_path / ".local" / "share" / "cctally"),
+        "CCTALLY_DISABLE_DEV_AUTODETECT": "1",
+        "CCTALLY_DISABLE_TELEMETRY": "1",
+        "TZ": "Etc/UTC",
+    })
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    completed = subprocess.run(
+        [sys.executable,
+         str(Path(__file__).resolve().parents[1] / "bin" / "cctally"),
+         *argv],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    assert completed.returncode == 0, (argv, completed.stdout,
+                                       completed.stderr)
+    return completed.stdout
+
+
+def _breakdown_884(tmp_path):
+    rendered = json.loads(_cli_884(
+        tmp_path, "five-hour-breakdown", "--ago", "1", "--json"))
+    return rendered["block"], [
+        (m["percentThreshold"], m["blockCostUSD"], m["marginalCostUSD"])
+        for m in rendered["milestones"]
+    ]
+
+
+def _seed_repriced_block_884(mod, *, divergent):
+    """A closed block whose lower crossing an earlier rederive repriced.
+
+    The live writer priced both crossings at $3 per entry; a completed
+    ``rederive:claude-usage:`` batch then wrote the lower one at $4.50 (and
+    its successor's marginal to match) with unchanged identity and ``at``,
+    leaving the close's $6 alone. ``divergent`` writes rev 1 two ways in
+    two batches before a third resolves it, an ambiguous history.
+    """
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    _insert_entries(mod, [
+        (offset, stamp, KNOWN, 1000000, 0, 0, 0, 0, "acct-869", None)
+        for offset, stamp in (
+            (0, "2026-07-25T11:55:00+00:00"),
+            (100, "2026-07-25T12:30:00+00:00"),
+            (200, "2026-07-25T16:00:00+00:00"),
+        )
+    ])
+    _observe_points(mod, [
+        (AT[0], RESETS[0], 1.0, 1.0),
+        ("2026-07-25T12:45:00Z", RESETS[0], 2.0, 2.0),
+        (AT[1], RESETS[1], 3.0, 1.0),
+    ])
+    [(closed_key, closed_total, close_id)] = _closed_costs(mod)
+    assert closed_total == pytest.approx(6.0)
+    selection = journal.resolve_effective_events(_events(mod))
+    crossings = {
+        record["payload"]["percent_threshold"]: record
+        for record in selection.active
+        if record["payload"]["kind"] == "five_hour_milestone"
+        and record["payload"]["five_hour_window_key"] == closed_key
+    }
+    lower, upper = crossings[1], crossings[2]
+
+    def rewrite(name, rev, cost):
+        actions = [{"action": "replace", "id": lower["id"], "rev": rev,
+                    "at": lower["at"],
+                    "payload": dict(lower["payload"], block_cost_usd=cost)}]
+        if rev == 1 and name != "b":
+            actions.append({
+                "action": "replace", "id": upper["id"], "rev": 1,
+                "at": upper["at"],
+                "payload": dict(upper["payload"], marginal_cost_usd=1.5)})
+        runtime.append_records(journal.make_correction_batch(
+            batch_id=f"rederive:claude-usage:884-{name}",
+            family="claude-usage", at="2026-08-01T00:00:00Z",
+            actions=actions,
+        ))
+
+    rewrite("a", 1, 4.5)
+    if divergent:
+        rewrite("b", 1, 5.0)
+        rewrite("c", 2, 4.5)
+    return closed_key, close_id, lower, upper
+
+
+def test_884_cli_restores_repriced_milestone_and_second_rederive_is_noop(
+    tmp_path, monkeypatch,
+):
+    """#884 spec §7 integration (A6): the real CLI repairs a repriced crossing.
+
+    Detects: a frozen block keeping an earlier rederive's later-card price
+    in stats.db for good. The damage is read back from a fresh process;
+    ``db rederive --yes`` restores the at-crossing amount and the
+    successor's marginal, an independent ``db rebuild`` reproduces them,
+    and a second rederive appends nothing.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    import _lib_journal as journal
+
+    closed_key, close_id, lower, upper = _seed_repriced_block_884(
+        mod, divergent=False)
+    _cli_884(tmp_path, "db", "rebuild", "--db", "stats", "--json")
+    selection = journal.resolve_effective_events(_events(mod))
+    damaged = selection.by_id[lower["id"]]
+    assert damaged.rev == 1 and damaged.record["at"] == lower["at"]
+    def unpriced(payload):
+        return {k: v for k, v in payload.items() if k != "block_cost_usd"}
+
+    assert unpriced(damaged.record["payload"]) == unpriced(lower["payload"])
+    assert selection.by_id[close_id].record["payload"]["total_cost_usd"] == \
+        pytest.approx(6.0)
+    block, milestones = _breakdown_884(tmp_path)
+    assert block["fiveHourWindowKey"] == closed_key
+    assert milestones == [(1, pytest.approx(4.5), None),
+                          (2, pytest.approx(6.0), pytest.approx(1.5))]
+
+    applied = json.loads(_cli_884(
+        tmp_path, "db", "rederive", "--family", "claude-usage", "--yes",
+        "--json"))
+    assert applied["status"] == "applied", applied
+    assert _kind_counts(applied, "five_hour_milestone")["supersede"] == 2
+    assert _kind_counts(applied, "five_hour_block_close")["supersede"] == 0
+    assert "withheldMilestoneRepairs" not in applied
+    repaired = [(1, pytest.approx(3.0), None),
+                (2, pytest.approx(6.0), pytest.approx(3.0))]
+    block, milestones = _breakdown_884(tmp_path)
+    assert block["totalCost"] == pytest.approx(6.0)
+    assert milestones == repaired
+    materialized = _materialized_costs(mod.DB_PATH)
+
+    _cli_884(tmp_path, "db", "rebuild", "--db", "stats", "--json")
+    assert _materialized_costs(mod.DB_PATH) == materialized
+    assert _breakdown_884(tmp_path)[1] == repaired
+
+    stable_journal = _journal_bytes(mod)
+    second = json.loads(_cli_884(
+        tmp_path, "db", "rederive", "--family", "claude-usage", "--json"))
+    assert sum(second["actionCounts"][name]
+               for name in ("supersede", "tombstone", "add")) == 0, second
+    assert _journal_bytes(mod) == stable_journal
+
+
+def test_884_cli_ambiguous_history_is_withheld_and_disclosed(
+    tmp_path, monkeypatch,
+):
+    """#884 spec §7 integration, ambiguous variant (A5): fail closed.
+
+    Detects: a guessed restoration from a superseded divergence, or a
+    withheld repair the operator cannot find. The amount is kept, the JSON
+    names the block, and the text output carries operator decision O2's
+    line right after the status line.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+
+    closed_key, close_id, lower, _upper = _seed_repriced_block_884(
+        mod, divergent=True)
+    _cli_884(tmp_path, "db", "rebuild", "--db", "stats", "--json")
+    damaged = _breakdown_884(tmp_path)[1]
+    assert damaged[0] == (1, pytest.approx(4.5), None)
+
+    preview = json.loads(_cli_884(
+        tmp_path, "db", "rederive", "--family", "claude-usage", "--json"))
+    assert preview["withheldMilestoneRepairs"] == [{
+        "accountKey": "acct-869", "fiveHourWindowKey": closed_key,
+        "closeEventIds": [close_id],
+        "milestones": [{"eventId": lower["id"], "currentRevision": 2,
+                        "candidateRevisions": [0, 1],
+                        "reasonCodes": ["divergent-revision"]}],
+    }], preview
+    assert preview["uncertainCostFactCount"] == 1, preview
+    text = _cli_884(tmp_path, "db", "rederive", "--family", "claude-usage")
+    assert text.splitlines()[1] == _O2_LINE, text
+
+    applied = json.loads(_cli_884(
+        tmp_path, "db", "rederive", "--family", "claude-usage", "--yes",
+        "--json"))
+    assert applied["withheldMilestoneRepairs"] == \
+        preview["withheldMilestoneRepairs"], applied
+    assert _breakdown_884(tmp_path)[1] == damaged
+
+
 def test_open_unpriced_block_keeps_computation_provenance_across_card_adoption(
     tmp_path, monkeypatch, capsys,
 ):
@@ -2265,3 +2461,606 @@ def test_retired_codex_crossing_is_not_revived_without_claude_observations(
     assert _kind_counts(again, "budget")["supersede"] == 0
     assert _journal_bytes(mod) == retired
     assert _codex_budget_rows(mod.DB_PATH) == []
+
+
+# ---------------------------------------------------------------------------
+# #1040: derivation completion keeps closed five-hour money frozen
+# ---------------------------------------------------------------------------
+
+_1040_POPULATION_KEYS = (
+    "total_input_tokens", "total_output_tokens", "total_cache_create_tokens",
+    "total_cache_read_tokens",
+)
+_1040_CHILD_KEYS = (
+    "model", "project_path", "account_key", "input_tokens", "output_tokens",
+    "cache_create_tokens", "cache_read_tokens", "entry_count",
+)
+_1040_MILESTONE_MONEY = ("block_cost_usd", "marginal_cost_usd")
+
+
+def _1040_money(payload):
+    """A close payload's money group (spec §5.2)."""
+    return {key: value for key, value in payload.items()
+            if key.startswith("total_") or key in {
+                "_models", "_projects", "_pricing", "pricing_provenance_json"}}
+
+
+def _1040_population(payload):
+    """A close payload's card-independent population (spec §5.2)."""
+    def children(key):
+        return sorted(
+            tuple(child.get(field) for field in _1040_CHILD_KEYS)
+            for child in payload.get(key) or [])
+    return (tuple(payload.get(key) for key in _1040_POPULATION_KEYS),
+            children("_models"), children("_projects"))
+
+
+def _1040_metadata(payload):
+    money = _1040_money(payload)
+    return {key: value for key, value in payload.items() if key not in money}
+
+
+def _1040_selected(mod):
+    import _lib_journal as journal
+    return journal.resolve_effective_events(_events(mod)).by_id
+
+
+def _1040_block_records(by_id, window_key):
+    """The block's selected close and milestones (``{id: payload}``)."""
+    out = {}
+    for event_id, item in by_id.items():
+        payload = (item.record or {}).get("payload") or {}
+        if (item.status == "active"
+                and payload.get("kind") in ("five_hour_block_close",
+                                            "five_hour_milestone")
+                and payload.get("five_hour_window_key") == window_key):
+            out[event_id] = payload
+    return out
+
+
+def _1040_record_block(mod):
+    """Live-record a closed block with two crossings ($3/entry at the
+    embedded card): entries 11:55 and 12:30 in the block, 16:00 in its
+    successor; readings 12:00 (1 %), 12:45 (2 %) and 16:05 (closes it)."""
+    _insert_entries(mod, [
+        (offset, stamp, KNOWN, 1000000, 0, 0, 0, 0, "acct-869", None)
+        for offset, stamp in (
+            (0, "2026-07-25T11:55:00+00:00"),
+            (100, "2026-07-25T12:30:00+00:00"),
+            (200, "2026-07-25T16:00:00+00:00"),
+        )
+    ])
+    _observe_points(mod, [
+        (AT[0], RESETS[0], 1.0, 1.0),
+        ("2026-07-25T12:45:00Z", RESETS[0], 2.0, 2.0),
+        (AT[1], RESETS[1], 3.0, 1.0),
+    ])
+    [(window_key, total, _journal_id)] = _closed_costs(mod)
+    assert total == pytest.approx(6.0)
+    return window_key
+
+
+def _1040_revised_card(monkeypatch, pricing):
+    """KNOWN's input card ×7/3 (the embedded $3/entry becomes $7)."""
+    later = dict(pricing.current_pricing_snapshot().claude_pricing)
+    later[KNOWN] = {**later[KNOWN], "input_cost_per_token": 7e-6}
+    revision = _pricing_revision(pricing, claude_prices=later,
+                                 date="2026-09-24")
+    monkeypatch.setattr(pricing, "current_pricing_snapshot", lambda: revision)
+
+
+def _1040_rewrite_journal(mod, transform):
+    """Rewrite every segment through ``transform(records) -> records`` and
+    drop the index, so the next rebuild completes from the journal origin."""
+    import _lib_journal as journal
+    for path in sorted(mod.JOURNAL_DIR.glob("*.jsonl")):
+        records = [journal.decode_line(line)
+                   for line in path.read_bytes().split(b"\n") if line]
+        path.write_bytes(b"".join(
+            journal.encode_line(record) for record in transform(records)))
+    for suffix in ("", "-wal", "-shm"):
+        candidate = mod.DB_PATH.parent / (mod.DB_PATH.name + suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+
+def _1040_drop_opening(mod, window_key):
+    """The gap: the block's ``five_hour_block_open`` decision is missing."""
+    _1040_rewrite_journal(mod, lambda records: [
+        record for record in records
+        if not ((record.get("payload") or {}).get("kind")
+                == "five_hour_block_open"
+                and record["payload"].get("five_hour_window_key")
+                == window_key)])
+
+
+def _1040_splice_earlier_reading(mod, window_key):
+    """The gap: a current-stamped reading captured before the block's first
+    one (11:58, 0.5 %) is spliced in at its journal position, without any
+    decision. With it the block opens earlier; its population does not
+    change (no entry between 11:58 and the next reading's capture moves)."""
+    import _lib_journal as journal
+
+    weekly_reset = int(dt.datetime(
+        2026, 7, 27, tzinfo=dt.timezone.utc).timestamp())
+    earlier = journal.make_obs(
+        at="2026-07-25T11:58:00Z", src="record-usage", provider="claude",
+        account="acct-869", payload={
+            "captured_at": "2026-07-25T11:58:00Z", "source": "statusline",
+            "weekly_percent": 0.5, "resets_at": weekly_reset,
+            "five_hour_percent": 0.5, "five_hour_resets_at": RESETS[0],
+        })
+
+    def splice(records):
+        out = []
+        for record in records:
+            if record.get("t") == "obs" and record.get("at") == AT[0]:
+                out.append(earlier)
+            out.append(record)
+        return out
+
+    _1040_rewrite_journal(mod, splice)
+    assert any(record.get("id") == earlier["id"] for record in _events(mod))
+
+
+class _1040_Capture:
+    """A pass-through capture of completion's per-round candidate maps:
+    ``_owned_by_id`` is called with the with-gap events, then the
+    without-gap ones."""
+
+    def __init__(self, monkeypatch):
+        import _cctally_completion as completion
+        self.calls = []
+        real = completion._owned_by_id
+
+        def capture(events):
+            out = real(events)
+            self.calls.append(out)
+            return out
+
+        monkeypatch.setattr(completion, "_owned_by_id", capture)
+
+    def rounds(self):
+        return [(self.calls[index], self.calls[index + 1])
+                for index in range(0, len(self.calls) - 1, 2)]
+
+
+def _1040_rebuild(mod, capsys):
+    before = _events(mod)
+    code = mod.cmd_db_rebuild(argparse.Namespace(db="stats", json=True))
+    out = capsys.readouterr().out
+    assert code == 0, out
+    return _events(mod)[len(before):]
+
+
+@pytest.mark.parametrize("gap", ["opening-removed", "earlier-reading"])
+def test_1040_metadata_gap_keeps_frozen_money_under_revised_card(
+    tmp_path, monkeypatch, capsys, gap,
+):
+    """#1040 T1 (A3, A6): a metadata-only gap under a revised card.
+
+    Detects: an upgrade rebuild's derivation completion repricing a closed
+    five-hour block's frozen money at the binary's current card because the
+    gap changed only the block's opening metadata. The capture proves the
+    mechanism's relation (the close is acted on, D and R agree on population
+    and money and differ in non-monetary fields, C's money differs from D's);
+    after the rebuild the close's money group and every milestone's money are
+    the recorded amounts, the opening (and, where the gap changes it, the
+    close's metadata) is journaled, and a second rebuild appends nothing.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    import _lib_pricing as pricing
+
+    window_key = _1040_record_block(mod)
+    capsys.readouterr()
+    recorded = _1040_block_records(_1040_selected(mod), window_key)
+    close_id = f"fhbc:acct-869:{window_key}"
+    current = recorded[close_id]
+    assert len(recorded) == 3, sorted(recorded)
+
+    _1040_revised_card(monkeypatch, pricing)
+    if gap == "opening-removed":
+        _1040_drop_opening(mod, window_key)
+    else:
+        _1040_splice_earlier_reading(mod, window_key)
+    capture = _1040_Capture(monkeypatch)
+    appended = _1040_rebuild(mod, capsys)
+
+    [(with_gap, without_gap)] = capture.rounds()
+    desired = with_gap[close_id]["payload"]
+    reference = without_gap[close_id]["payload"]
+    assert _1040_metadata(desired) != _1040_metadata(reference)
+    assert _1040_population(desired) == _1040_population(reference)
+    assert _1040_money(desired) == _1040_money(reference)
+    assert desired["total_cost_usd"] != current["total_cost_usd"]
+    diagnostics = {
+        "appended": [(r.get("t"), r.get("id"), r.get("rev"),
+                      (r.get("payload") or {}).get("total_cost_usd"),
+                      (r.get("payload") or {}).get("block_cost_usd"))
+                     for r in appended],
+        "metadata": {key: (current.get(key), desired.get(key))
+                     for key in _1040_metadata(desired)
+                     if current.get(key) != desired.get(key)},
+    }
+
+    final = _1040_block_records(_1040_selected(mod), window_key)
+    assert sorted(final) == sorted(recorded), diagnostics
+    assert _1040_money(final[close_id]) == _1040_money(current), diagnostics
+    for event_id, payload in recorded.items():
+        if payload["kind"] != "five_hour_milestone":
+            continue
+        assert ({key: final[event_id][key] for key in _1040_MILESTONE_MONEY}
+                == {key: payload[key] for key in _1040_MILESTONE_MONEY}), (
+            event_id, diagnostics)
+    opening = f"fhbo:acct-869:{window_key}"
+    assert _1040_selected(mod)[opening].status == "active", diagnostics
+    if _1040_metadata(desired) != _1040_metadata(current):
+        assert _1040_metadata(final[close_id]) == _1040_metadata(desired), \
+            diagnostics
+
+    stable = _journal_bytes(mod)
+    assert _1040_rebuild(mod, capsys) == []
+    assert _journal_bytes(mod) == stable
+
+
+_1040_BLOCK_ENTRIES = (
+    (0, "2026-07-25T11:55:00+00:00"),
+    (100, "2026-07-25T12:30:00+00:00"),
+    (200, "2026-07-25T16:00:00+00:00"),
+)
+
+
+def _1040_reading(at, weekly, five_hour, reset=RESETS[0]):
+    import _lib_journal as journal
+
+    weekly_reset = int(dt.datetime(
+        2026, 7, 27, tzinfo=dt.timezone.utc).timestamp())
+    return journal.make_obs(
+        at=at, src="record-usage", provider="claude", account="acct-869",
+        payload={"captured_at": at, "source": "statusline",
+                 "weekly_percent": weekly, "resets_at": weekly_reset,
+                 "five_hour_percent": five_hour, "five_hour_resets_at": reset})
+
+
+def _1040_splice_before(mod, reading, before_at):
+    """Splice ``reading`` (no decision) in front of the obs captured at
+    ``before_at``, at its journal position, and drop the index."""
+    def splice(records):
+        out = []
+        for record in records:
+            if record.get("t") == "obs" and record.get("at") == before_at:
+                out.append(reading)
+            out.append(record)
+        return out
+
+    _1040_rewrite_journal(mod, splice)
+    assert any(record.get("id") == reading["id"] for record in _events(mod))
+
+
+def _1040_drop_kind(mod, window_key, kind):
+    _1040_rewrite_journal(mod, lambda records: [
+        record for record in records
+        if not ((record.get("payload") or {}).get("kind") == kind
+                and record["payload"].get("five_hour_window_key")
+                == window_key)])
+
+
+def _1040_price_only_rewrite(mod, window_key):
+    """A pre-#875 rederive's price-only correction of the block's first
+    crossing to the revised card's $7 (its successor's marginal follows),
+    under the unchanged close: #884 reads it as a pending ``restore``."""
+    import _cctally_journal as runtime
+    import _lib_journal as journal
+
+    by_id = _1040_selected(mod)
+    one = by_id[f"fhm:acct-869:{window_key}:0:1"].record
+    two = by_id[f"fhm:acct-869:{window_key}:0:2"].record
+    runtime.append_records(journal.make_correction_batch(
+        batch_id="rederive:claude-usage:1040-price-only",
+        family="claude-usage", at="2026-07-25T17:00:00Z", actions=[
+            {"action": "replace", "id": one["id"], "rev": 1, "at": one["at"],
+             "payload": {**one["payload"], "block_cost_usd": 7.0}},
+            {"action": "replace", "id": two["id"], "rev": 1, "at": two["at"],
+             "payload": {**two["payload"], "marginal_cost_usd": -1.0}},
+        ]))
+
+
+def _1040_scenario(mod, monkeypatch, scenario):
+    """Record one closed block live, then revise the card and open the
+    scenario's gap. Returns the block's window key."""
+    import _lib_pricing as pricing
+
+    present = pricing.current_pricing_snapshot()
+    if scenario == "missing-card-metadata":
+        monkeypatch.setattr(pricing, "current_pricing_snapshot",
+                            lambda old=_without_card(pricing, KNOWN): old)
+    entries = list(_1040_BLOCK_ENTRIES)
+    readings = [(AT[0], RESETS[0], 1.0, 1.0),
+                ("2026-07-25T12:45:00Z", RESETS[0], 2.0, 2.0),
+                (AT[1], RESETS[1], 3.0, 1.0)]
+    if scenario.startswith("spliced-population"):
+        entries.append((300, "2026-07-25T13:30:00+00:00"))
+    if scenario == "earlier-crossing":
+        readings = readings[1:]
+    _insert_entries(mod, [
+        (offset, stamp, KNOWN, 1000000, 0, 0, 0, 0, "acct-869", None)
+        for offset, stamp in entries])
+    _observe_points(mod, readings)
+    [(window_key, _total, _journal_id)] = _closed_costs(mod)
+    if scenario == "spliced-population-pending-restore":
+        _1040_price_only_rewrite(mod, window_key)
+    if scenario == "missing-card-metadata":
+        monkeypatch.setattr(pricing, "current_pricing_snapshot",
+                            lambda: present)
+    else:
+        _1040_revised_card(monkeypatch, pricing)
+    if scenario == "opening-removed":
+        _1040_drop_kind(mod, window_key, "five_hour_block_open")
+    elif scenario == "close-removed":
+        _1040_drop_kind(mod, window_key, "five_hour_block_close")
+    elif scenario in ("earlier-reading", "missing-card-metadata"):
+        _1040_splice_before(mod, _1040_reading(
+            "2026-07-25T11:58:00Z", 0.5, 0.5), AT[0])
+    elif scenario == "earlier-crossing":
+        _1040_splice_before(mod, _1040_reading(AT[0], 1.0, 1.0),
+                            "2026-07-25T12:45:00Z")
+    elif scenario.startswith("spliced-population"):
+        _1040_splice_before(mod, _1040_reading(
+            "2026-07-25T14:00:00Z", 2.5, 3.0), AT[1])
+    else:
+        raise AssertionError(scenario)
+    return window_key
+
+
+class _1040_Decisions:
+    """Wraps the module-attribute planner call to read its decisions."""
+
+    def __init__(self, monkeypatch):
+        import _lib_rederive
+        self.plans = []
+        real = _lib_rederive.plan_completion_five_hour
+
+        def capture(**kwargs):
+            plan = real(**kwargs)
+            self.plans.append(plan)
+            return plan
+
+        monkeypatch.setattr(_lib_rederive, "plan_completion_five_hour",
+                            capture)
+
+    def of(self, window_key):
+        return [decision for plan in self.plans
+                for decision in plan.decisions
+                if decision.block == ("acct-869", window_key)]
+
+
+def _1040_lineage_decisions(mod, window_key):
+    """#884's decision for every active milestone of the block, read as
+    `db rederive` plans it."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    accumulators: dict = {}
+    selection = journal.resolve_effective_events(
+        _events(mod), accumulators=accumulators)
+    lineage = rederive.build_five_hour_lineage(
+        accumulators["fold"], selection=selection, physical_revisions={})
+    return {
+        event_id: lineage.restoration(event_id, item.record).action
+        for event_id, item in selection.by_id.items()
+        if item.status == "active"
+        and item.record["payload"]["kind"] == "five_hour_milestone"
+        and item.record["payload"]["five_hour_window_key"] == window_key}
+
+
+def _1040_milestone_money(payloads):
+    return {payload["percent_threshold"]: (payload["block_cost_usd"],
+                                           payload["marginal_cost_usd"])
+            for payload in payloads.values()
+            if payload["kind"] == "five_hour_milestone"}
+
+
+@pytest.mark.parametrize("scenario", ["close-removed", "earlier-crossing"])
+def test_1040_added_close_keeps_milestone_money(
+    tmp_path, monkeypatch, capsys, scenario,
+):
+    """#1040 T2 (A5, A8): additions around frozen milestone money.
+
+    Detects: milestones repriced around a close the gap adds, and a frozen
+    block's existing crossings repriced when the gap adds a crossing below
+    them. A removed close is journaled at today's card as a plain event
+    while every milestone keeps its money; an earlier reading adds the
+    block's first crossing at today's card, the existing crossing keeps its
+    money, and the close keeps its money group under the new opening
+    metadata. #884 decides ``keep`` for every milestone of the block and a
+    second rebuild appends nothing.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    window_key = _1040_scenario(mod, monkeypatch, scenario)
+    recorded = _1040_block_records(_1040_selected(mod), window_key)
+    decisions = _1040_Decisions(monkeypatch)
+    appended = _1040_rebuild(mod, capsys)
+
+    close_id = f"fhbc:acct-869:{window_key}"
+    final = _1040_block_records(_1040_selected(mod), window_key)
+    [decision] = decisions.of(window_key)
+    if scenario == "close-removed":
+        assert close_id not in recorded
+        assert decision.block_class == "ADDED"
+        [close_event] = [record for record in appended
+                         if record.get("id") == close_id]
+        assert (close_event["t"], close_event.get("rev", 0)) == ("evt", 0)
+        assert final[close_id]["total_cost_usd"] == pytest.approx(14.0)
+        assert _1040_milestone_money(final) == _1040_milestone_money(recorded)
+    else:
+        assert decision.block_class == "FROZEN"
+        assert _1040_money(final[close_id]) == _1040_money(recorded[close_id])
+        assert final[close_id]["first_observed_at_utc"] == AT[0]
+        assert _1040_milestone_money(recorded) == {2: (pytest.approx(6.0),
+                                                       None)}
+        assert _1040_milestone_money(final) == {
+            1: (pytest.approx(7.0), None), 2: (pytest.approx(6.0), None)}
+    assert decision.landed == "class", decision
+    assert set(_1040_lineage_decisions(mod, window_key).values()) == {"keep"}
+
+    stable = _journal_bytes(mod)
+    assert _1040_rebuild(mod, capsys) == []
+    assert _journal_bytes(mod) == stable
+
+
+@pytest.mark.parametrize("variant", ["spliced-population",
+                                     "spliced-population-pending-restore"])
+def test_1040_gap_population_change_replaces_block_paired(
+    tmp_path, monkeypatch, capsys, variant,
+):
+    """#1040 T3 (A5, A8): a gap that moves entries into a closed block.
+
+    Detects: a legitimate close change journaled without its milestones,
+    and a REPLACED batch that would create `unpaired-close-change`. A
+    reading spliced in after the block's last live one (real replay, no
+    decision) extends the block's observed range over one more entry, so
+    the retained close matches the without-gap population and the with-gap
+    close differs. The close and every existing milestone are corrected in
+    ONE completion batch at today's card, the gap-added crossing lands, the
+    marginals follow the final chain, #884 decides ``keep`` for every
+    milestone, the rederive preview withholds nothing, and a second rebuild
+    appends nothing. With a pending price-only restore on the first crossing
+    that the replacement would leave unpaired, the block lands F instead:
+    the close keeps its money and that crossing still decides ``restore``.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    window_key = _1040_scenario(mod, monkeypatch, variant)
+    recorded = _1040_block_records(_1040_selected(mod), window_key)
+    close_id = f"fhbc:acct-869:{window_key}"
+    assert recorded[close_id]["total_cost_usd"] == pytest.approx(6.0)
+    capture = _1040_Capture(monkeypatch)
+    decisions = _1040_Decisions(monkeypatch)
+    appended = _1040_rebuild(mod, capsys)
+
+    [(with_gap, without_gap)] = capture.rounds()
+    current = recorded[close_id]
+    assert _1040_population(current) == _1040_population(
+        without_gap[close_id]["payload"])
+    assert _1040_population(with_gap[close_id]["payload"]) != \
+        _1040_population(current)
+    [decision] = decisions.of(window_key)
+    assert decision.block_class == "REPLACED", decision
+    final = _1040_block_records(_1040_selected(mod), window_key)
+    lineage = _1040_lineage_decisions(mod, window_key)
+    one = f"fhm:acct-869:{window_key}:0:1"
+    if variant == "spliced-population":
+        assert decision.landed == "class", decision
+        assert final[close_id]["total_cost_usd"] == pytest.approx(21.0)
+        assert _1040_milestone_money(final) == {
+            1: (pytest.approx(7.0), None),
+            2: (pytest.approx(14.0), pytest.approx(7.0)),
+            3: (pytest.approx(21.0), pytest.approx(7.0)),
+        }
+        batches = {record.get("batch") for record in appended
+                   if record.get("t") == "correction"
+                   and record["id"] in (close_id, one,
+                                        f"fhm:acct-869:{window_key}:0:2")}
+        assert len(batches) == 1 and None not in batches, appended
+        assert set(lineage.values()) == {"keep"}, lineage
+    else:
+        assert decision.landed == "F", decision
+        assert _1040_money(final[close_id]) == _1040_money(current)
+        assert final[close_id]["last_observed_at_utc"] == \
+            "2026-07-25T14:00:00Z"
+        assert lineage[one] == "restore", lineage
+        assert {event_id: action for event_id, action in lineage.items()
+                if event_id != one} == {
+            f"fhm:acct-869:{window_key}:0:2": "keep",
+            f"fhm:acct-869:{window_key}:0:3": "keep"}
+        assert _1040_milestone_money(final)[1] == (pytest.approx(7.0), None)
+
+    preview = _rederive(mod, capsys, apply=False)
+    assert not preview.get("withheldMilestoneRepairs"), preview
+    stable = _journal_bytes(mod)
+    assert _1040_rebuild(mod, capsys) == []
+    assert _journal_bytes(mod) == stable
+
+
+def _1040_five_hour_ids(records, window_key):
+    return sorted(
+        record["id"] for record in records
+        if (record.get("payload") or {}).get("kind") in (
+            "five_hour_block_close", "five_hour_milestone")
+        and record["payload"].get("five_hour_window_key") == window_key)
+
+
+@pytest.mark.parametrize("scenario", [
+    "opening-removed", "earlier-reading", "close-removed", "earlier-crossing",
+    "spliced-population", "spliced-population-pending-restore",
+    "missing-card-metadata",
+])
+def test_1040_completion_is_idempotent_under_interruption_and_later_gap(
+    tmp_path, monkeypatch, capsys, scenario,
+):
+    """#1040 T4 (A7): completion never re-journals its own targets.
+
+    Detects: a completion that re-journals the five-hour records it chose
+    (an unstable decision or a non-fixed-point target). (a) A completion
+    interrupted after its correction batch commits and before its plain
+    events re-runs to exactly those plain events; (b) after the completed
+    round, another decision of the same block's readings goes missing, so
+    completion runs over the same blocks again and appends that gap's
+    records without any five-hour close or milestone of the block. The
+    marked $0 missing-card close takes its correction in the first round.
+    """
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    import _cctally_journal as runtime
+
+    window_key = _1040_scenario(mod, monkeypatch, scenario)
+    real = runtime.append_records
+    attempts: list = []
+
+    def interrupted(records, **kwargs):
+        records = list(records)
+        commits = [index for index, record in enumerate(records)
+                   if record.get("t") == "correction_batch"
+                   and record.get("phase") == "commit"
+                   and record.get("family") == "derivation-completion"]
+        if not commits or attempts:
+            return real(records, **kwargs)
+        attempts.append(records)
+        real(records[:commits[-1] + 1], **kwargs)
+        raise RuntimeError("interrupted between the batch and its events")
+
+    monkeypatch.setattr(runtime, "append_records", interrupted)
+    assert mod.cmd_db_rebuild(argparse.Namespace(db="stats", json=True)) != 0
+    capsys.readouterr()
+    monkeypatch.setattr(runtime, "append_records", real)
+    [first] = attempts
+    cut = max(index for index, record in enumerate(first)
+              if record.get("t") == "correction_batch"
+              and record.get("phase") == "commit")
+    owed = [(record["id"], record.get("rev", 0), record.get("payload"))
+            for record in first[cut + 1:]]
+    resumed = _1040_rebuild(mod, capsys)
+    assert [(record["id"], record.get("rev", 0), record.get("payload"))
+            for record in resumed] == owed
+    if scenario == "missing-card-metadata":
+        close = _1040_block_records(_1040_selected(mod), window_key)[
+            f"fhbc:acct-869:{window_key}"]
+        assert close["total_cost_usd"] == pytest.approx(6.0)
+        assert close["_pricing"]["basis"] == RECORDED_BASIS
+    assert _1040_rebuild(mod, capsys) == []
+    settled = _1040_block_records(_1040_selected(mod), window_key)
+
+    reading = next(record for record in _events(mod)
+                   if record.get("t") == "obs"
+                   and record.get("at") == "2026-07-25T12:45:00Z")
+    decision_id = "sa:" + reading["id"]
+    _1040_rewrite_journal(mod, lambda records: [
+        record for record in records
+        if not (record.get("t") == "evt" and record.get("id") == decision_id)])
+    decisions = _1040_Decisions(monkeypatch)
+    later = _1040_rebuild(mod, capsys)
+    # The block is re-decided by the planner, not sent down today's path.
+    assert decisions.of(window_key), [plan.decisions
+                                      for plan in decisions.plans]
+    assert decision_id in {record.get("id") for record in later}
+    assert _1040_five_hour_ids(later, window_key) == [], later
+    assert _1040_block_records(_1040_selected(mod), window_key) == settled
+    assert _1040_rebuild(mod, capsys) == []

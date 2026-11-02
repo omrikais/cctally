@@ -20,6 +20,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import fractions
+import functools
 import hashlib
 import http.client
 import importlib
@@ -4297,6 +4298,21 @@ def _validate_retention_stages(name: str, metrics: dict) -> None:
         raise ValueError(f"{name} durationSeconds is shorter than its stages")
 
 
+@functools.lru_cache(maxsize=1)
+def _current_schema_heads() -> dict[str, tuple[int, int]]:
+    """(prior schema, current head) per upgrade artifact.
+
+    The current heads are the registry lengths `_cctally_store._expected_head`
+    uses, read from this soak's own tree: evidence production refuses any
+    other checkout, so these are the heads its upgrade artifacts must reach.
+    """
+    db = _candidate_module(REPO, "_cctally_db")
+    return {
+        "cache-044": (44, len(db._CACHE_MIGRATIONS)),
+        "conversations-009": (9, len(db._CONVERSATIONS_MIGRATIONS)),
+    }
+
+
 def _validate_external_metrics(kind: str, name: str, metrics: dict) -> None:
     """Bound measurements independently of any self-reported passed flag."""
     if not isinstance(metrics, dict):
@@ -4332,10 +4348,7 @@ def _validate_external_metrics(kind: str, name: str, metrics: dict) -> None:
         return
 
     if kind == "upgrade":
-        before, current = {
-            "cache-044": (44, 48),
-            "conversations-009": (9, 11),
-        }[name]
+        before, current = _current_schema_heads()[name]
         number("schemaBefore", before, before, integer=True)
         number("schemaAfter", current, current, integer=True)
         number(

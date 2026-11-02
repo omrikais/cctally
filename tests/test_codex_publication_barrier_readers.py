@@ -138,11 +138,22 @@ def test_the_conversation_pass_first_publishes_nothing_until_certified(env):
     stats = _conv(ns)
     assert _conv_rows(ns, "SELECT COUNT(*) FROM codex_conversation_messages") == [(0,)]
     assert stats.barrier_files_deferred == 1
+    # #939 D5 residual: an uncovered deferral is named, with its cause, and no
+    # publication; a residual that missed it would let writeIo settle early.
+    assert set(stats.barrier_deferred_keys) == {str(a)}
+    assert stats.barrier_deferred_targets[str(a)][1] is False
+    assert stats.barrier_retry_causes == {"uncovered"}
+    assert stats.barrier_published_paths == set()
     _sync(ns)
     key = _key(ns, a)
     assert _surfaces(ns, key)["list"] is None      # certified, not yet published
     stats = _conv(ns)
     assert stats.barrier_keys_published == 1
+    # covered, deferred in phase one and published in phase two of one pass
+    assert stats.barrier_deferred_keys[str(a)] == frozenset({key})
+    assert stats.barrier_deferred_targets[str(a)][1] is True
+    assert stats.barrier_published_paths == {str(a)}
+    assert stats.barrier_retry_causes == set()
     accounts = _accounts(ns)
     s = _surfaces(ns, key, accounts)
     assert s["list"][1] == _label(ns, "/tmp/proj-a") and s["list"][2] > 0
@@ -165,6 +176,14 @@ def test_a_new_conversation_waits_for_every_readable_contributor(env):
     stats = _conv(ns)
     assert stats.barrier_files_deferred == 2
     assert stats.barrier_keys_published == 0
+    # #939 D5 residual: a covered deferral left unpublished (no seal) beside an
+    # uncovered one; both stay in the residual, neither as published.
+    assert stats.barrier_deferred_keys == {str(a): frozenset({key}),
+                                           str(b): frozenset({key})}
+    assert stats.barrier_deferred_targets[str(a)][1] is True
+    assert stats.barrier_deferred_targets[str(b)][1] is False
+    assert stats.barrier_published_paths == set()
+    assert "uncovered" in stats.barrier_retry_causes
     pending = _surfaces(ns, key)
     assert pending["list"] is None and pending["search"] is False
     assert pending["detail"][0] == "normalization_pending"
@@ -612,6 +631,7 @@ def test_publication_is_atomic_and_monotonic(env, monkeypatch, scenario):
         monkeypatch.setattr(cc, "_CODEX_PUBLICATION_PRECOMMIT_HOOK", explode)
         stats = _conv(ns)
         assert stats.barrier_retry is True
+        assert "publication_error" in stats.barrier_retry_causes
         assert _surfaces(ns, key, accounts) == before
         assert _message_ids(ns, key) == ids
         assert _publication(ns, key)[0] == published
@@ -1154,6 +1174,7 @@ def test_unqualified_certificate_contributor_keeps_retry_without_a_new_seal(env,
     stats = _conv(ns, only_paths={str(a)})
     assert calls and stats.barrier_keys_deferred == 1
     assert stats.barrier_retry, "unplannable sealed contributor must retain retry debt"
+    assert "qualification" in stats.barrier_retry_causes
     assert not frontier.conversation_sync_certifiable("targeted", stats, expected_paths=1)
     assert not frontier.conversation_sync_certifiable("full", stats)
     assert _publication(ns, key) is None
@@ -1238,3 +1259,110 @@ def test_parent_list_probes_search_nonempty_snapshot_branches_for_found_and_miss
             assert any(f"SEARCH {alias} USING COVERING INDEX {index} " in line
                        and "(source_root_key=? AND native_thread_id=?)" in line
                        for line in st.plan), st.plan
+
+
+# ── #939 D5: the startup deferral facts writeIo's admission hold anchors ────
+
+def test_the_startup_deferral_facts_read_the_real_schema(env):
+    """Detects: writeIo's admission hold reading a column or table the real
+    barrier schema does not have (every pass then fails closed and the hold
+    never releases), or a fact read from the wrong store; and an append
+    beyond the anchored end moving the digest of a deferral blocked at
+    startup (a hold that never settles)."""
+    import _lib_write_io as wio
+    ns, _provider, _day, _spawned = env
+    cache = ns["open_cache_db"]()
+    try:
+        cache.executescript(
+            "INSERT INTO codex_barrier_targets (file_identity, source_path,"
+            " source_root_key, generation_token, scan_target,"
+            " complete_line_end, state, reason, accepted_generation_token,"
+            " accepted_complete_line_end) VALUES ('id-a', '/r/a.jsonl', 'root',"
+            " 'g1', 100, 100, 'suspended', 'verification-unverified', 'g1', 100);"
+            "INSERT INTO codex_barrier_membership (file_identity,"
+            " generation_token, conversation_key, source_path) VALUES"
+            " ('id-a', 'g1', 'k-member', '/r/a.jsonl'),"
+            " ('id-a', 'g0', 'k-stale', '/r/a.jsonl');"
+            "INSERT INTO codex_barrier_population (conversation_key,"
+            " required_revision, entered_at_utc) VALUES"
+            " ('k-member', 3, '2026-11-01T00:00:00Z'),"
+            " ('k-named', 2, '2026-11-01T00:00:00Z');"
+            "INSERT INTO codex_barrier_certificates (conversation_key, revision,"
+            " certificate_json, sealed_at_utc) VALUES"
+            " ('k-member', 1, '{}', '2026-11-01T00:00:00Z'),"
+            " ('k-member', 2, '{}', '2026-11-01T00:00:00Z');"
+            "INSERT INTO codex_barrier_repairs (conversation_key, revision,"
+            " reason) VALUES ('k-member', 3, 'x');")
+        cache.commit()
+    finally:
+        cache.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        conn.execute(
+            "INSERT INTO codex_conversation_publications (conversation_key,"
+            " published_revision, updated_at_utc) VALUES"
+            " ('k-member', 1, '2026-11-01T00:00:00Z')")
+        conn.commit()
+        entries = {"/r/a.jsonl": ("id-a", frozenset({"k-named"})),
+                   "/r/gone.jsonl": ("id-gone", frozenset({"k-none"}))}
+        facts = _cache().read_codex_startup_deferral_facts(conn, entries)
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+    assert facts == {
+        "/r/a.jsonl": {
+            "target": {"generation": "g1", "complete_line_end": 100,
+                       "accepted_generation": "g1", "accepted_end": 100,
+                       "state": "suspended",
+                       "reason": "verification-unverified"},
+            "membership": frozenset({"k-member"}),
+            "keys": {
+                "k-member": {"required": 3, "certificate": 2, "published": 1,
+                             "repair": 3},
+                "k-named": {"required": 2, "certificate": None,
+                            "published": None, "repair": None}}},
+        "/r/gone.jsonl": {
+            "target": None, "membership": frozenset(),
+            "keys": {"k-none": {"required": None, "certificate": None,
+                                "published": None, "repair": None}}}}
+
+    # The anchor resolves from these facts; an append beyond the anchored end
+    # (scan target, line end, accepted offset, requirement and repair advance)
+    # leaves the deferral's digest unchanged.
+    def observe(drain, facts):
+        drain.observe({
+            "counted": True, "census_complete": True, "certifiable": False,
+            "providers": {"codex": {"mode": "full",
+                                    "residual": (("container_pending", 1),)}},
+            "deferrals": {"/r/a.jsonl": ("id-a", True,
+                                         frozenset({"k-named"}))},
+            "facts": {"/r/a.jsonl": facts["/r/a.jsonl"]}})
+        return drain.digest
+
+    drain = wio.StartupDrain()
+    drain.observe_accounting(ended_ns=0, census_complete=True,
+                             residuals={"claude": (), "codex": ()})
+    before = observe(drain, facts)
+    assert drain.anchors["/r/a.jsonl"].end == 100
+    cache = ns["open_cache_db"]()
+    try:
+        cache.executescript(
+            "UPDATE codex_barrier_targets SET scan_target=180,"
+            " complete_line_end=180, accepted_complete_line_end=180;"
+            "UPDATE codex_barrier_population SET required_revision=5"
+            " WHERE conversation_key='k-member';"
+            "UPDATE codex_barrier_population SET required_revision=4"
+            " WHERE conversation_key='k-named';"
+            "UPDATE codex_barrier_repairs SET revision=5;")
+        cache.commit()
+    finally:
+        cache.close()
+    conn = ns["open_conversations_db"]()
+    try:
+        appended = _cache().read_codex_startup_deferral_facts(
+            conn, {"/r/a.jsonl": ("id-a", frozenset({"k-named"}))})
+    finally:
+        conn.close()
+    assert appended["/r/a.jsonl"]["keys"]["k-member"]["required"] == 5
+    assert appended["/r/a.jsonl"]["target"]["complete_line_end"] == 180
+    assert observe(drain, appended) == before

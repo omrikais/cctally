@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import inspect
 import json
 import os
@@ -727,6 +728,11 @@ def test_reset_drain_does_not_infer_equivalence_from_a_partial_cursor(
     real_clock = cache._walk_clock
     ticks = iter(i / 10 for i in range(1000))
     monkeypatch.setattr(cache, "_walk_clock", lambda: next(ticks))
+    # #977: a budgeted sync defers on a missing quota index until the detached
+    # worker publishes one. This schedule is about the partial cursor, so the
+    # index is published first, as the worker would have.
+    assert importlib.import_module(
+        "_cctally_journal").rebuild_quota_index() == "published"
     conn = ns["open_cache_db"]()
     try:
         partial = ns["sync_codex_cache"](

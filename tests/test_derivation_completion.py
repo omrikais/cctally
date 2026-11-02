@@ -229,12 +229,79 @@ def test_a_live_decision_over_an_excluded_legacy_twin_is_a_correction(ns):
     legacy_view = J.resolve_effective_events(_records())
     assert legacy_view.by_id[event_id].rev == 1
     assert legacy_view.conflicts == ()
+    # #1015 spec 5.1, detects a changed input published without the facts
+    # that invalidate fits over it: the emitted batch's lineage committed in
+    # the same transaction as its event, before any later ingest, at the end
+    # of its commit marker, touching the reading's account.
+    [batch] = {r["id"] for r in _records() if r.get("t") == "correction_batch"}
+    commit = None
+    for segment, offset, raw in jr.iter_range(None, jr.journal_high_water()):
+        record = J.decode_line(raw)
+        if (record is not None and record.get("t") == "correction_batch"
+                and record.get("phase") == "commit"):
+            commit = (segment, offset + len(raw) + 1)
+    lineage = _lineage_rows()
+    assert lineage == ([(batch, commit[0], commit[1])],
+                       [(batch, "claude", "unattributed")]), lineage
 
     before = _journal_bytes()
     jr.run_stats_ingest(mode="authoritative")
+    assert _lineage_rows() == lineage
     assert _rebuild(ns) == 0
     assert _journal_bytes() == before
     assert _percents() == [7.0, 9.0]
+    assert _lineage_rows() == lineage, "the rebuild derives the same facts"
+
+
+def test_the_next_live_cycle_records_a_nonempty_batch_from_its_actions(ns):
+    """#1015 spec 5.1 (F3), detects a nonempty completed batch that live
+    incremental selection consumes without recording its lineage — a fit
+    over the input it replaced would stay clean until the next rebuild. The
+    excluded-twin correction's own emitter rows are removed, standing for an
+    emission that recorded none; the next live cycle's incremental
+    selection (`merge_delta`) then writes the batch at its commit marker with
+    exactly the footprint its action gives (the reading's account), and the
+    cycle's ordinary decisions, which complete no batch, write nothing. The
+    store is rebuilt first, so a durable selector generation exists and the
+    live cycle continues it incrementally rather than by the full fallback."""
+    jr, J, core = _mods()
+    _seed(jr, J)
+    assert _rebuild(ns) == 0
+    reading = _obs(J, "2026-01-04T10:00:00Z", 9.0)
+    jr.append_record(reading)
+    _raw_append_tail([_legacy_snapshot_accept(J, reading)])
+    jr.run_stats_ingest(mode="authoritative")
+    lineage = _lineage_rows()
+    [batch] = {r["id"] for r in _records() if r.get("t") == "correction_batch"}
+    assert [row[0] for row in lineage[0]] == [batch], lineage
+    conn = core.open_db()
+    try:
+        conn.execute("DELETE FROM correction_batch_footprint")
+        conn.execute("DELETE FROM correction_batch_lineage")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _lineage_rows() == ([], [])
+    jr.append_record(_obs(J, "2026-01-04T11:00:00Z", 10.0))
+    jr.run_stats_ingest(mode="authoritative")
+    assert _lineage_rows() == lineage
+    assert lineage[1] == [(batch, "claude", "unattributed")]
+    assert _percents() == [7.0, 9.0, 10.0]
+
+
+def _lineage_rows():
+    _jr, _J, core = _mods()
+    conn = core.open_db()
+    try:
+        return (
+            [tuple(r) for r in conn.execute(
+                "SELECT batch_id, commit_segment, commit_offset"
+                " FROM correction_batch_lineage ORDER BY batch_id")],
+            [tuple(r) for r in conn.execute(
+                "SELECT batch_id, provider, account_key"
+                " FROM correction_batch_footprint ORDER BY 1, 2, 3")])
+    finally:
+        conn.close()
 
 
 def test_an_admitted_twin_still_suppresses_a_metadata_only_append(

@@ -9,6 +9,7 @@ command surface of sections 8, 21, 23 and 24.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
 import json
 import sqlite3
@@ -2652,3 +2653,268 @@ def test_an_offset_pre_era_row_does_not_crash_the_command(
     assert payload["scope"]["analysisStart"] == "2026-09-22T00:00:00Z"
     assert payload["status"] != "unavailable", payload["health"]
     assert code in (0, 1, 3, 4), code
+
+
+# --------------------------------------------------------------------------
+# #991 spec 4.8 and 4.9: the two additive composition objects, the era
+# metadata and the two COMPOSITION SUPPORT lines. Each analysis is the real
+# kernel's over an in-process `opus-5-5` series, rendered by the real glue.
+# --------------------------------------------------------------------------
+_O55 = "claude-opus-5-5"
+_S55 = "claude-sonnet-5-5"
+_H55 = "claude-haiku-5-5"
+_NOW991 = dt.datetime(2026, 10, 20, 12, tzinfo=UTC)
+_WEEK991 = dt.datetime(2026, 10, 15, tzinfo=UTC)
+
+
+def _series991(glue, n=12):
+    qm = glue.qm
+    return [qm.DailyObservation(
+        date=dt.date(2026, 9, 23) + dt.timedelta(days=i), segment_id=0,
+        meter_delta=10.0, units=10e6 + (i % 5) * 1e5,
+        class_shares={"fresh": 1.0}, family_shares={_O55: 1.0})
+        for i in range(n)]
+
+
+def _forecast991(glue, units):
+    return [glue.qm.EntryRecord(
+        at=dt.datetime(2026, 10, 20, 6, tzinfo=UTC), model=model, fresh=fresh,
+        output=0, cache_create_total=0, cache_1h=0, cache_read=0)
+        for model, fresh in units.items()]
+
+
+def _result991(glue, *, series=None, units=None, recorded=None, era=None):
+    qm = glue.qm
+    era = era if era is not None else qm.era_by_id("opus-5-5")
+    analysis = qm.analyse(
+        _series991(glue) if series is None else series, now=_NOW991,
+        newest_at=_NOW991 - dt.timedelta(hours=1), era=qm.era_by_id("opus-5-5"),
+        observed_percent=40, current_week_units=40e6,
+        current_week_start=_WEEK991,
+        current_week_end=_WEEK991 + dt.timedelta(days=7),
+        forecast_population=(() if units is None
+                             else _forecast991(glue, units)))
+    return glue.AccountResult(
+        account_key=None, label=None, analysis=analysis,
+        load=glue.LoadResult(analysis_start=dt.datetime(2026, 9, 22,
+                                                        tzinfo=UTC)),
+        week=None, recorded=recorded, stale_prior=False,
+        mode_kind="automatic", clean=analysis, era=era)
+
+
+_SONNET5 = {_O55: 950_000, _S55: 50_000}
+_SONNET10 = {_O55: 900_000, _S55: 100_000}
+_LEGACY = {_O55: 940_000, _H55: 20_000, "claude-sonnet-5": 20_000,
+           "claude-haiku-4-5": 20_000}
+_MEASUREMENTS = ("familyDistance", "familyWithinRadius", "familyEffectBound",
+                 "familyEffectUnavailable", "familyAdmittedBy",
+                 "classDistance", "classWithinRadius")
+
+
+def _probe(glue, result):
+    return glue.account_payload(result)["composition"]["forecastProbe"]
+
+
+def test_991_the_forecast_probe_object_for_a_materiality_admission(glue):
+    """The wire states what admitted the forecast and against which
+    reference, so a consumer can tell a radius admission from a bounded one."""
+    probe = _probe(glue, _result991(glue, units=_SONNET5))
+    assert list(probe) == [
+        "state", "familyShares", "classShares", "familyDistance",
+        "familyDistanceReference", "familyWithinRadius", "familyEffectBound",
+        "familyEffectReference", "familyEffectUnavailable",
+        "familyAdmittedBy", "classDistance", "classWithinRadius",
+        "supported"]
+    assert probe["state"] == "probed"
+    assert probe["familyShares"] == pytest.approx({_O55: 0.95, _S55: 0.05})
+    assert list(probe["familyShares"]) == sorted(probe["familyShares"])
+    assert probe["classShares"]["fresh"] == 1.0
+    assert probe["familyDistance"] == pytest.approx(0.05)
+    assert probe["familyDistanceReference"] == "baseline-family-shares"
+    assert probe["familyWithinRadius"] is False
+    assert probe["familyEffectBound"] == pytest.approx(0.0455)
+    assert probe["familyEffectReference"] == "fit-family-shares"
+    assert probe["familyEffectUnavailable"] is None
+    assert probe["familyAdmittedBy"] == "materiality"
+    assert probe["classDistance"] == 0.0
+    assert probe["classWithinRadius"] is True
+    assert probe["supported"] is True
+
+
+def test_991_an_unevidenced_change_names_its_families_sorted(glue):
+    probe = _probe(glue, _result991(glue, units=_LEGACY))
+    assert probe["familyEffectBound"] is None
+    assert probe["familyEffectUnavailable"] == {
+        "reason": "unevidenced-family-change",
+        "families": ["claude-haiku-4-5", _H55, "claude-sonnet-5"]}
+    assert probe["familyAdmittedBy"] is None
+    assert probe["supported"] is False
+
+
+@pytest.mark.parametrize("case,state,supported", [
+    ("not-probed", "not-probed", True),
+    ("unaggregatable", "unaggregatable", False),
+    ("no-reference", "no-reference", True),
+])
+def test_991_the_null_rules_of_every_unprobed_state(glue, case, state,
+                                                    supported):
+    """Measurements are null unless the evaluator ran; the vectors are
+    published only for an aggregatable population. A zero in place of a
+    null would read as a measured distance."""
+    if case == "not-probed":
+        result = _result991(glue)
+    elif case == "unaggregatable":
+        result = _result991(glue, units={"claude-vega-9": 1_000_000})
+    else:
+        result = _result991(glue, series=_series991(glue, 1), units=_SONNET5)
+    probe = _probe(glue, result)
+    assert probe["state"] == state
+    assert probe["supported"] is supported
+    for key in _MEASUREMENTS:
+        assert probe[key] is None, key
+    if case == "no-reference":
+        assert probe["familyShares"] == pytest.approx({_O55: 0.95, _S55: 0.05})
+        assert probe["classShares"] is not None
+    else:
+        assert probe["familyShares"] is None
+        assert probe["classShares"] is None
+    assert probe["familyDistanceReference"] == "baseline-family-shares"
+    assert probe["familyEffectReference"] == "fit-family-shares"
+
+
+def test_991_the_family_materiality_object(glue):
+    result = _result991(glue, units=_SONNET5)
+    materiality = glue.account_payload(result)["composition"][
+        "familyMateriality"]
+    assert materiality == {
+        "reference": "fit-weighted",
+        "fitFamilyShares": result.analysis.fit_family_shares,
+        "referenceFamily": _O55,
+        "familyRateBounds": [{"family": _S55, "low": 0.09, "high": 0.61,
+                              "provenance": "991-meter-evidence-2026-10-23"}],
+        "maxRelativeEffect": 0.05,
+    }
+    assert materiality["fitFamilyShares"] == pytest.approx({_O55: 1.0})
+    empty = glue.account_payload(_result991(glue, series=[]))
+    assert empty["composition"]["familyMateriality"]["fitFamilyShares"] is None
+
+
+def test_991_the_published_eras_carry_their_reference_and_bounds(glue):
+    """`method.coefficientEras` is built independently of the kernel's
+    fingerprint payload, so it must be extended explicitly."""
+    eras = glue.published_coefficient_eras()
+    assert eras[0]["state"] == "unvalidated"
+    assert eras[0]["referenceFamily"] is None
+    assert eras[0]["familyRateBounds"] == []
+    by_id = {e["id"]: e for e in eras[1:]}
+    assert by_id["opus-5"]["referenceFamily"] == "claude-opus-5"
+    assert by_id["opus-5"]["familyRateBounds"] == []
+    assert by_id["opus-5-5"]["referenceFamily"] == _O55
+    assert by_id["opus-5-5"]["familyRateBounds"] == [
+        {"family": _S55, "low": 0.09, "high": 0.61,
+         "provenance": "991-meter-evidence-2026-10-23"}]
+    assert glue.account_payload(_result991(glue))["method"][
+        "coefficientEras"] == eras
+
+
+def test_991_the_recorded_prior_carries_its_stored_fit_reference(glue):
+    recorded = {"effectiveFrom": "2026-09-22T00:00:00+00:00",
+                "effectiveUntil": None, "asOf": "2026-10-19T00:00:00+00:00",
+                "unitsPerPoint": 2.0e6, "fitFamilyShares": {_O55: 1.0}}
+    payload = glue.account_payload(_result991(glue, recorded=recorded))
+    assert payload["calibration"]["recorded"]["fitFamilyShares"] == \
+        {_O55: 1.0}
+
+
+def _composition_lines(glue, result):
+    lines = glue.render_text([result], now=_NOW991, decorated=False)
+    start = next(i for i, line in enumerate(lines)
+                 if line.startswith("  token-class radius"))
+    end = lines.index(f"  {glue.qm.DEDICATED_POOL_SCOPE_NOTE}")
+    return lines[start + 1:end]
+
+
+def _with_support(glue, result, **effect):
+    support = dataclasses.replace(
+        result.analysis.forecast_support,
+        family_effect=glue.qm.FamilyEffect(**effect), family_admitted_by=None,
+        supported=False)
+    analysis = dataclasses.replace(result.analysis, forecast_support=support)
+    return dataclasses.replace(result, analysis=analysis)
+
+
+_PAD = " " * 29
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("inside", ["  forecast family distance   0.0000   (inside the family radius)",
+                "  forecast family effect     -   (not needed: inside the "
+                "family radius)"]),
+    ("materiality", [
+        "  forecast family distance   0.0500   (outside the family radius)",
+        "  forecast family effect     4.55%   (within 5.00%: admitted by "
+        "family rate bounds)"]),
+    ("over-limit", [
+        "  forecast family distance   0.1000   (outside the family radius)",
+        "  forecast family effect     9.10%   (above 5.00%)"]),
+    ("unevidenced", [
+        "  forecast family distance   0.0600   (outside the family radius)",
+        "  forecast family effect     not bounded: claude-haiku-4-5, "
+        "claude-haiku-5-5,",
+        _PAD + "claude-sonnet-5 changed share without rate bounds"]),
+    ("other-unavailable", [
+        "  forecast family distance   0.0500   (outside the family radius)",
+        "  forecast family effect     -   (not evaluated: "
+        "nonpositive-denominator)"]),
+    ("not-probed", ["  forecast family distance   -   (no forecast population)",
+                    "  forecast family effect     -"]),
+    ("unaggregatable", [
+        "  forecast family distance   -   (forecast population not "
+        "aggregatable)",
+        "  forecast family effect     -"]),
+    ("no-reference", [
+        "  forecast family distance   -   (no reference composition)",
+        "  forecast family effect     -"]),
+])
+def test_991_the_composition_support_lines(glue, case, expected):
+    """Exactly spec 4.9's renderings, under the two radius lines.
+
+    A renderer that printed a measured-looking zero for an unprobed state, or
+    that dropped the reason a bound was not computed, would tell the user
+    something the evidence does not say.
+    """
+    if case == "inside":
+        result = _result991(glue, units={_O55: 1_000_000})
+    elif case == "materiality":
+        result = _result991(glue, units=_SONNET5)
+    elif case == "over-limit":
+        result = _result991(glue, units=_SONNET10)
+    elif case == "unevidenced":
+        result = _result991(glue, units=_LEGACY)
+    elif case == "other-unavailable":
+        result = _with_support(
+            glue, _result991(glue, units=_SONNET5), bound=None,
+            unavailable=glue.qm.FamilyEffectUnavailable.NONPOSITIVE_DENOMINATOR)
+    elif case == "not-probed":
+        result = _result991(glue)
+    elif case == "unaggregatable":
+        result = _result991(glue, units={"claude-vega-9": 1_000_000})
+    else:
+        result = _result991(glue, series=_series991(glue, 1), units=_SONNET5)
+    assert _composition_lines(glue, result) == expected
+    for line in expected:
+        assert len(line) <= 80 or "admitted by family rate bounds" in line
+
+
+def test_991_a_withheld_line_carries_the_family_qualifier(glue):
+    lines = glue.render_text([_result991(glue, units={_O55: 950_000,
+                                                      _H55: 50_000})],
+                             now=_NOW991, decorated=False)
+    assert ("  modelled consumption       withheld: unsupported-model-mix"
+            "  (forecast-family-unbounded)") in lines
+    assert ("  projection to week end     withheld: unsupported-model-mix"
+            "  (forecast-family-unbounded)") in lines
+    over = glue.render_text([_result991(glue, units=_SONNET10)],
+                            now=_NOW991, decorated=False)
+    assert ("  fitted                     withheld: unsupported-model-mix"
+            "  (forecast-family-effect-over-limit)") in over

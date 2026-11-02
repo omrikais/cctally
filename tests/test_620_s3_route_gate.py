@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import fcntl
 import hashlib
 import http.client
 import inspect
@@ -234,6 +235,15 @@ def test_a_denied_request_never_opens_the_conversations_store(
         return real(kind)
 
     monkeypatch.setattr(sources, "open_read_only", _spy)
+    # #1000: conversations opens through the bundle's read admission.
+    real_conversations = sources.StoreBundle._open_conversations
+
+    def _spy_conversations(self):
+        opened.append("conversations")
+        return real_conversations(self)
+
+    monkeypatch.setattr(sources.StoreBundle, "_open_conversations",
+                        _spy_conversations)
     _run_bounded_in_process(monkeypatch, sources)
     response = claude_server.get(f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}",
                                  host=_DENIED_HOST)
@@ -258,6 +268,35 @@ def test_a_denied_plan_publishes_no_conversations_generation_component(
     assert "conversations" in allowed["results"][0]["generation"]
     assert (denied["results"][0]["generation"]["generationId"]
             != allowed["results"][0]["generation"]["generationId"])
+
+
+def test_the_route_worker_reads_transcripts_under_the_parents_maintenance_lock(
+        claude_server, tmp_path, monkeypatch):
+    """#1000 §5.10: the route builds in a forkserver worker that reloads
+    cctally and is handed the parent's store paths. Its read admission must
+    take the PARENT's conversation maintenance lock, or it opens the
+    transcript store while the pre-rebuild probe reads it in place (or while
+    recovery quarantines it), and under a redirected data folder it writes a
+    lock file into the default one. A worker re-derives its other paths from
+    the forkserver's environment, frozen when that server started, so the
+    parent's lock sits where no environment derives it: only a worker handed
+    the lock path can find it. Holding that lock exclusive, as the probe
+    does, must make the worker decline the store, so the report publishes no
+    `conversations` component."""
+    lock = tmp_path / "parent-only" / "conversations.db.maintenance.lock"
+    lock.parent.mkdir()
+    monkeypatch.setattr(sys.modules["_cctally_core"],
+                        "CONVERSATIONS_LOCK_MAINTENANCE_PATH", lock)
+    query = f"/api/diagnosis?source=claude&window={_WINDOW_QUERY}"
+    free = claude_server.get(query, host="127.0.0.1")
+    assert free.status == 200, free.body
+    # Non-vacuity: with the lock free, this worker does read transcripts.
+    assert "conversations" in free.json["results"][0]["generation"]
+    with open(lock, "a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        response = claude_server.get(query, host="127.0.0.1")
+    assert response.status == 200, response.body
+    assert "conversations" not in response.json["results"][0]["generation"]
 
 
 def test_codex_fanout_is_measured_on_a_denied_route(codex_server):

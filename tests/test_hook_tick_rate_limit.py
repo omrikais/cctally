@@ -1,6 +1,14 @@
 """Hook-tick throttle, skip-if-fresh, and 429 fallback tests."""
+import datetime as dt
+
 import pytest
 from conftest import load_script
+
+# #948: the OAuth refresh layer checks the plausibility band
+# [now-30d, now+8d] before `cmd_record_usage` (stubbed here) is called, so a
+# fixed reset date goes stale; keep the weekly reset three days ahead of now.
+_RESETS_AT = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=3)).replace(
+    minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture(scope="module")
@@ -59,7 +67,7 @@ def test_hook_tick_fetches_when_snapshot_older_than_throttle(ns, monkeypatch, tm
     monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
     api = {
-        "seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"},
+        "seven_day": {"utilization": 22.0, "resets_at": _RESETS_AT},
     }
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: api)
@@ -84,7 +92,7 @@ def test_hook_tick_five_hour_inactive_null_resets(ns, monkeypatch, tmp_path):
                         lambda args, **kw: captured.update(vars(args)) or 0)
 
     api = {
-        "seven_day": {"utilization": 22.0, "resets_at": "2026-05-02T12:00:00Z"},
+        "seven_day": {"utilization": 22.0, "resets_at": _RESETS_AT},
         "five_hour": {"utilization": 0, "resets_at": None},
     }
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
@@ -106,7 +114,7 @@ def test_hook_tick_fetches_when_no_snapshot_exists(ns, monkeypatch, tmp_path):
     monkeypatch.setitem(ns, "_newest_snapshot_age_seconds", lambda: None)
     monkeypatch.setitem(ns, "cmd_record_usage", lambda args, **kw: 0)
 
-    api = {"seven_day": {"utilization": 1.0, "resets_at": "2026-05-02T12:00:00Z"}}
+    api = {"seven_day": {"utilization": 1.0, "resets_at": _RESETS_AT}}
     monkeypatch.setitem(ns, "_fetch_oauth_usage",
                         lambda token, timeout_seconds: api)
 

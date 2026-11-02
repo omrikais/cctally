@@ -4978,3 +4978,479 @@ def test_the_unvalidatable_replacement_path_returns_no_lines_either(monkeypatch)
     assert record["refused"] is True, record
     assert record["refusal"] == "unvalidatable-replacement", record
     assert out == [], out
+
+
+# ------------------------------------------ the private failure detail (#1011)
+#
+# The console block and the public extract are scrubbed; the private detail is
+# the same failure, unscrubbed and bounded, kept only on the runner. These cases
+# pin the parser against pinned-pytest output, the tail-first byte bounds and
+# the shares between subjects. None of them asserts anything about the scrub.
+
+import os as _os  # noqa: E402  (appended section; the head of the file is frozen)
+import subprocess as _subprocess  # noqa: E402
+
+_DETAIL_REAP_MESSAGE = "the reap deadline passed before the group exited"
+_DETAIL_SECOND_MESSAGE = "second genuine failure survives"
+_DETAIL_LONG_NAME = (
+    "test_memory_validator_validates_explicit_root_within_one_timeout_"
+    "and_reaps_group_with_a_long_descriptive_name"
+)
+
+
+def _detail_size(lines):
+    return sum(len(line.encode("utf-8", "replace")) + 1 for line in lines)
+
+
+def _xdist_available():
+    try:
+        import xdist  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _real_pytest_output(tmp_path, modules, *, xdist=None, dist=None):
+    """Run the pinned pytest with the legs' flags over scratch modules.
+
+    The rootdir is pinned to the scratch directory by its own `pytest.ini`, so
+    no repository configuration and no outer run's variables shape the output.
+    `dist` adds `--dist <mode>` (the bulk leg runs `--dist loadgroup`).
+    """
+    for name, text in modules.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    use_xdist = _xdist_available() if xdist is None else xdist
+    cmd = [sys.executable, "-m", "pytest", "-q", "-rfE", "-p", "no:cacheprovider"]
+    if use_xdist:
+        cmd += ["-n", "2"]
+        if dist:
+            cmd += ["--dist", dist]
+    cmd += sorted(modules)
+    env = {k: v for k, v in _os.environ.items()
+           if not k.startswith(("PYTEST_", "CCTALLY_"))}
+    env["COLUMNS"] = "80"
+    proc = _subprocess.run(
+        cmd, cwd=str(tmp_path), env=env, capture_output=True, text=True,
+        timeout=120,
+    )
+    return proc.stdout.splitlines()
+
+
+@pytest.mark.parametrize("node_id,title", [
+    ("tests/t.py::test_a", "test_a"),
+    ("tests/t.py::TestA::test_b[p]", "TestA.test_b[p]"),
+    ("tests/t.py::test_x[a::b]", "test_x[a::b]"),
+])
+def test_pytest_node_title_keeps_a_parameter_suffix_verbatim(node_id, title):
+    # Detects: a parameter id containing `::` rewritten into `.`, so its
+    # section header never matches the summary node and the traceback is lost.
+    assert K.pytest_node_title(node_id) == title
+
+
+_ORDINARY_MODULE = f'''
+import pytest
+
+MESSAGE = " ".join({_DETAIL_REAP_MESSAGE.split()!r})
+SECOND = " ".join({_DETAIL_SECOND_MESSAGE.split()!r})
+
+
+def helper():
+    raise AssertionError(MESSAGE)
+
+
+def {_DETAIL_LONG_NAME}():
+    helper()
+
+
+@pytest.mark.parametrize("value", [1], ids=["a::b"])
+def test_param(value):
+    assert value == 2
+
+
+def test_prints_lookalikes():
+    print("===== warnings summary =====")
+    print("===== diagnostic output =====")
+    print("____ fake ____")
+    assert False
+
+
+def test_second_genuine():
+    raise ValueError(SECOND)
+
+
+@pytest.fixture
+def broken():
+    raise RuntimeError("setup " + "exploded")
+
+
+def test_uses_broken(broken):
+    pass
+'''
+
+
+def test_private_detail_parses_real_pytest_output_for_ordinary_failures(tmp_path):
+    # Detects: pytest header formats (one-underscore long titles, `::` in a
+    # parameter id) and captured lookalikes (banners, fake headers) that make
+    # the parser lose a failing node's traceback or hide a later failure.
+    lines = _real_pytest_output(tmp_path, {"test_ordinary.py": _ORDINARY_MODULE})
+    parsed = K.extract_pytest_failure_sections(lines)
+    joined = "\n".join(lines)
+    assert _DETAIL_REAP_MESSAGE in joined, joined  # non-vacuity
+    nodes = [node for _kind, node in parsed["summary_nodes"]]
+    assert len(nodes) == 5, (nodes, joined)
+    titles = [section["title"] for section in parsed["sections"]]
+    for kind, node in parsed["summary_nodes"]:
+        title = K.pytest_node_title(node)
+        assert any(t in (title, "ERROR at setup of " + title) for t in titles), (
+            node, titles)
+    assert parsed["unparsed_nodes"] == [], parsed["unparsed_nodes"]
+    for title in titles:
+        assert title.replace("_", "").strip(), titles
+        assert title != "fake", titles
+    by_title = {s["title"]: s for s in parsed["sections"]}
+    long_tb = "\n".join(by_title[_DETAIL_LONG_NAME]["traceback"])
+    assert _DETAIL_REAP_MESSAGE in long_tb, long_tb
+    second = "\n".join(by_title["test_second_genuine"]["traceback"])
+    assert _DETAIL_SECOND_MESSAGE in second, second
+    for section in parsed["sections"]:
+        tb = section["traceback"]
+        assert any(line.startswith("E ") for line in tb), section
+        assert any(re.match(r"^\S+\.py:\d+: ", line) for line in tb), section
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1")
+    text = "\n".join(block)
+    assert _DETAIL_REAP_MESSAGE in text and _DETAIL_SECOND_MESSAGE in text
+
+
+def test_private_detail_parses_a_real_collection_error(tmp_path):
+    # Detects: a collection error (no `::` node, `ERROR collecting` header)
+    # parsed as nothing, so the collector's error lines are lost.
+    lines = _real_pytest_output(
+        tmp_path, {"test_broken_syntax.py": "def test_x(:\n    pass\n"})
+    parsed = K.extract_pytest_failure_sections(lines)
+    titles = [s["title"] for s in parsed["sections"]]
+    assert "ERROR collecting test_broken_syntax.py" in titles, ("\n".join(lines))
+    section = parsed["sections"][titles.index("ERROR collecting test_broken_syntax.py")]
+    assert "SyntaxError" in "\n".join(section["traceback"]), section
+
+
+def test_private_detail_names_a_real_worker_crash(tmp_path):
+    # Detects: an xdist worker crash, which has no assertion frames and whose
+    # report header is not the node's title, leaving the detail empty.
+    pytest.importorskip("xdist")
+    lines = _real_pytest_output(
+        tmp_path,
+        {"test_crash.py": "import os\n\ndef test_crash():\n    os._exit(1)\n"},
+        xdist=True,
+    )
+    parsed = K.extract_pytest_failure_sections(lines)
+    named = [s["title"] for s in parsed["sections"]] + parsed["unparsed_nodes"]
+    assert any("test_crash" in name for name in named), "\n".join(lines)
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1")
+    assert "crashed" in "\n".join(block), "\n".join(lines)
+
+
+def _synthetic_pytest_log(sections, summary_nodes):
+    """A pytest report: a FAILURES region, `sections` as (title, lines), and a
+    short test summary naming `summary_nodes`."""
+    lines = ["F" * len(summary_nodes), "=" * 35 + " FAILURES " + "=" * 35]
+    for title, body in sections:
+        lines.append("_" * 20 + " " + title + " " + "_" * 20)
+        lines.extend(body)
+    lines.append("=" * 25 + " short test summary info " + "=" * 25)
+    lines.extend("FAILED " + node for node in summary_nodes)
+    lines.append("%d failed in 0.10s" % len(summary_nodes))
+    return lines
+
+
+def test_private_detail_keeps_the_assertion_under_a_tight_byte_share():
+    # Detects: a byte cut that drops the decisive assertion (the traceback's
+    # tail) or lets a huge captured stdout displace it.
+    big_tb = ["    frame_%03d = %s" % (i, "x" * 4000) for i in range(300)]
+    big_tb += ["y" * 10000, "E   AssertionError: decisive", "tests/t.py:9: AssertionError"]
+    small_tb = ["    def test_noisy():", ">       assert False", "E       assert False",
+                "tests/t.py:20: AssertionError"]
+    captured = ["-" * 30 + " Captured stdout call " + "-" * 30]
+    captured += ["captured line %04d" % i for i in range(2000)]
+    log = _synthetic_pytest_log(
+        [("test_big", big_tb), ("test_noisy", small_tb + captured)],
+        ["tests/t.py::test_big - AssertionError: decisive",
+         "tests/t.py::test_noisy - assert False"],
+    )
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", log)], run_id="r1", max_bytes=64 * 1024)
+    assert _detail_size(block) <= 64 * 1024
+    text = "\n".join(block)
+    assert "---- test_big ----" in block
+    assert "E   AssertionError: decisive" in block
+    assert "tests/t.py:9: AssertionError" in block
+    big = block[block.index("---- test_big ----"):block.index("---- test_noisy ----")]
+    first_kept = next(i for i, line in enumerate(big) if line.startswith("    frame_"))
+    assert re.match(r"^\[… \d+ lines omitted …\]$", big[first_kept - 1]), big[:3]
+    cut = [line for line in block if line.startswith("yyyy")]
+    assert cut and cut[0].endswith("bytes truncated]"), cut
+    assert len(cut[0].encode("utf-8")) < 10000
+    assert "captured line 1999" in text
+    assert "captured line 0000" not in text
+    assert "E       assert False" in block
+
+
+@pytest.mark.parametrize("noisy,decisive", [
+    (("pytest", "logs/pytest.log"), ("benchmark", "logs/pytest-benchmark.log")),
+    (("a", "logs/a.log"), ("b", "logs/b.log")),
+])
+def test_private_detail_shares_bytes_between_subjects(noisy, decisive):
+    # Detects: a first, noisy subject starving a later subject's decisive
+    # failure of the block budget.
+    if noisy[0] == "pytest":
+        sections = [("test_n%02d" % i, ["    line %d %s" % (j, "n" * 900) for j in range(300)]
+                     + ["E   assert noisy", "tests/t.py:%d: AssertionError" % i])
+                    for i in range(60)]
+        noisy_log = _synthetic_pytest_log(
+            sections, ["tests/t.py::test_n%02d" % i for i in range(60)])
+        decisive_log = _synthetic_pytest_log(
+            [("test_bench", ["E   AssertionError: benchmark decisive",
+                             "tests/b.py:3: AssertionError"])],
+            ["tests/b.py::test_bench"])
+        marker = "E   AssertionError: benchmark decisive"
+    else:
+        noisy_log = ["FAIL noisy %d %s" % (i, "n" * 900) for i in range(3000)]
+        decisive_log = ["setup ok", "FAIL decisive-b: rows diverged", "  expected 3"]
+        marker = "FAIL decisive-b: rows diverged"
+    max_bytes = 128 * 1024
+    block = K.build_private_failure_detail(
+        [(noisy[0], noisy[1], noisy_log), (decisive[0], decisive[1], decisive_log)],
+        run_id="r1", max_bytes=max_bytes)
+    assert _detail_size(block) <= max_bytes
+    assert marker in block
+    head = "==== subject %s (%s) ====" % noisy
+    tail = "==== subject %s (%s) ====" % decisive
+    noisy_part = block[block.index(head):block.index(tail)]
+    share = (max_bytes - _detail_size([block[0], block[-1]])) // 2
+    assert _detail_size(noisy_part) <= share
+
+
+@pytest.mark.parametrize("log,expected", [
+    # The note itself, because the node id and its FAILED line also appear in
+    # the summary, which renders whether or not the fallback does.
+    (_synthetic_pytest_log(
+        [("test_a", ["E   assert 0", "tests/t.py:2: AssertionError"])],
+        ["tests/t.py::test_a - assert 0", "tests/t.py::test_ghost - boom"]),
+     ["[no failure section was parsed for 1 failing nodes: tests/t.py::test_ghost; "
+      "raw failure windows follow]"]),
+    (["INTERNALERROR> Traceback (most recent call last):",
+      "INTERNALERROR>   File \"plugin.py\", line 3, in hook",
+      "INTERNALERROR> RuntimeError: plugin exploded"],
+     ["INTERNALERROR> RuntimeError: plugin exploded"]),
+])
+def test_private_detail_falls_back_to_raw_windows_for_unparsed_failures(log, expected):
+    # Detects: an empty detail for a failure pytest reported without a
+    # parseable section (a node with no section, an INTERNALERROR crash).
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", log)], run_id="r1")
+    subject = block[block.index("==== subject pytest (logs/pytest.log) ===="):-1]
+    assert len(subject) > 1, block
+    text = "\n".join(subject)
+    for needle in expected:
+        assert needle in text, block
+
+
+def test_private_detail_keeps_harness_continuation_lines_the_scrub_redacts():
+    # Detects (R6): a failing harness's free-form detail, which the scrub
+    # redacts by class, lost from the private detail too.
+    log = ["FAIL case-x", "    expected 3 rows, got 4", "    first diverging row: 7"]
+    scrubbed = K.build_scrubbed_extract(
+        {"h": log}, K.ScrubContext(), {"h": 10}, clusters={"h": None})
+    assert scrubbed.count(K.UNCLASSIFIED_PLACEHOLDER) >= 2, scrubbed
+    block = K.build_private_failure_detail([("h", "logs/h.log", log)], run_id="r1")
+    assert "    expected 3 rows, got 4" in block
+    assert "    first diverging row: 7" in block
+    assert block[0].startswith("==== cctally-test-all run r1: unsanitized failure detail")
+    assert block[-1] == "==== end of run r1 ===="
+
+
+# --- review fixes (#1011 complete-diff review) -------------------------------
+
+_GROUPED_MODULE = """
+import pytest
+
+
+@pytest.mark.xdist_group("g1")
+@pytest.mark.parametrize("n", [0, 1])
+def test_grouped(n):
+    assert n == 5, "grouped decisive %d" % n
+
+
+@pytest.mark.xdist_group("g2")
+def test_grouped_alone():
+    assert False, "alone decisive"
+
+
+def test_plain():
+    assert False, "plain decisive"
+"""
+
+
+def test_private_detail_parses_real_loadgroup_output(tmp_path):
+    # Detects (review 1): the bulk leg runs `--dist loadgroup`, whose summary
+    # prints a grouped node as `<id>@<group>` while its section header has no
+    # suffix, so every grouped failure fell to the unparsed fallback.
+    pytest.importorskip("xdist")
+    lines = _real_pytest_output(
+        tmp_path, {"test_grouped.py": _GROUPED_MODULE}, xdist=True, dist="loadgroup")
+    joined = "\n".join(lines)
+    assert "test_grouped.py::test_grouped[0]@g1" in joined, joined  # non-vacuity
+    parsed = K.extract_pytest_failure_sections(lines)
+    assert parsed["unparsed_nodes"] == [], (parsed["unparsed_nodes"], joined)
+    # Summary nodes are reported by their plain ids, the form pytest accepts.
+    assert sorted(node for _kind, node in parsed["summary_nodes"]) == [
+        "test_grouped.py::test_grouped[0]", "test_grouped.py::test_grouped[1]",
+        "test_grouped.py::test_grouped_alone", "test_grouped.py::test_plain"]
+    by_title = {s["title"]: s for s in parsed["sections"]}
+    for title, message in (("test_grouped[0]", "grouped decisive 0"),
+                           ("test_grouped[1]", "grouped decisive 1"),
+                           ("test_grouped_alone", "alone decisive"),
+                           ("test_plain", "plain decisive")):
+        assert any(line.startswith("E ") and message in line
+                   for line in by_title[title]["traceback"]), (title, joined)
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", lines)], run_id="r1")
+    assert not any(line.startswith("[no failure section") for line in block), block
+
+
+def test_private_detail_strips_only_a_group_suffix_from_summary_nodes():
+    # Detects (review 1): a parameter id or directory holding `@` cut as if it
+    # were xdist's group suffix (xdist's rule: the last `@` follows the last
+    # `]` and the last `::`), losing the node's section.
+    cases = (
+        ("tests/t.py::test_x[a@b]", "test_x[a@b]"),
+        ("tests/t.py::test_x[a@b]@g", "test_x[a@b]"),
+        ("tests/a@b/t.py::test_y@g-1", "test_y"),
+        ("tests/t.py::Cls::test_z@f17-3", "Cls.test_z"),
+    )
+    sections = [(title, ["E   assert 0", "tests/t.py:1: AssertionError"])
+                for _node, title in cases]
+    parsed = K.extract_pytest_failure_sections(
+        _synthetic_pytest_log(sections, [node for node, _title in cases]))
+    assert parsed["unparsed_nodes"] == [], parsed["unparsed_nodes"]
+    assert [title for _node, title in cases] == [s["title"] for s in parsed["sections"]]
+
+
+def test_private_detail_keeps_a_collection_error_path_holding_an_at_sign():
+    # Detects (#1011 recheck, Codex P2): a collection error's path holding `@`
+    # cut as if it were xdist's group suffix (a path-only id has no `]` or
+    # `::`), so its genuine `ERROR collecting` header failed the summary check
+    # and the collector's traceback fell to the raw fallback windows.
+    log = [
+        "==================================== ERRORS ====================================",
+        "_____________________ ERROR collecting tests/a@b/test_bad.py _____________________",
+        "tests/a@b/test_bad.py:1: in <module>",
+        "    import nope",
+        "E   ModuleNotFoundError: No module named 'nope'",
+        "=========================== short test summary info ============================",
+        "ERROR tests/a@b/test_bad.py - ModuleNotFoundError: No module named 'nope'",
+        "1 error in 0.10s",
+    ]
+    parsed = K.extract_pytest_failure_sections(log)
+    assert parsed["unparsed_nodes"] == [], parsed["unparsed_nodes"]
+    assert parsed["summary_nodes"] == [("ERROR", "tests/a@b/test_bad.py")], parsed["summary_nodes"]
+    assert [s["title"] for s in parsed["sections"]] == ["ERROR collecting tests/a@b/test_bad.py"]
+
+
+def test_private_detail_fallback_renders_the_summary_once():
+    # Detects (review 2): the raw fallback windows already holding the
+    # summary's FAILED lines, then the summary rendered again after them.
+    log = _synthetic_pytest_log(
+        [("test_a", ["E   assert 0", "tests/t.py:2: AssertionError"])],
+        ["tests/t.py::test_a - assert 0", "tests/t.py::test_ghost - boom"])
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", log)], run_id="r1")
+    assert any(line.startswith("[no failure section was parsed") for line in block), block
+    assert block.count("FAILED tests/t.py::test_ghost - boom") == 1, block
+    assert block.count("FAILED tests/t.py::test_a - assert 0") == 1, block
+
+
+def test_private_detail_a_mid_log_lookalike_banner_stays_captured_content():
+    # Detects (review 4): a captured `warnings summary` banner or pytest
+    # counter line in an EARLIER section closing the FAILURES region, so a
+    # later genuine section is lost. Deterministic, unlike the real-output
+    # case, where xdist's completion order may put the printing test last.
+    captured = ["-" * 30 + " Captured stdout call " + "-" * 30,
+                "=" * 30 + " warnings summary " + "=" * 30,
+                "3 passed in 0.50s",
+                "captured after the lookalikes"]
+    log = _synthetic_pytest_log(
+        [("test_prints", ["E   assert printed", "tests/t.py:3: AssertionError"] + captured),
+         ("test_later", ["E   assert later", "tests/t.py:9: AssertionError"])],
+        ["tests/t.py::test_prints - assert printed", "tests/t.py::test_later - assert later"])
+    parsed = K.extract_pytest_failure_sections(log)
+    assert [s["title"] for s in parsed["sections"]] == ["test_prints", "test_later"], parsed
+    assert parsed["unparsed_nodes"] == [] and not parsed["empty_region"], parsed
+    assert parsed["sections"][0]["captured"] == [captured], parsed["sections"][0]
+    assert "E   assert later" in parsed["sections"][1]["traceback"]
+
+
+def test_private_detail_a_partial_window_never_renders_without_its_marker():
+    # Detects (review 6): the harness window that no longer fits rendering
+    # the short lines around its marker when the marker itself did not fit,
+    # an excerpt that names no failure.
+    log = ["FAIL first: rows diverged"]
+    log += ["filler %03d" % i for i in range(1, 301)]
+    log += ["FAIL second: " + "z" * 3000]
+    log += ["after %d" % i for i in range(10)]
+    block = K.build_private_failure_detail([("h", "logs/h.log", log)], run_id="r1",
+                                           max_bytes=4096)
+    assert _detail_size(block) <= 4096
+    assert "FAIL first: rows diverged" in block  # non-vacuity: window 1 fits
+    assert not any(line.startswith("FAIL second") for line in block), block
+    assert "filler 300" not in block and "after 0" not in block, block
+
+
+def test_private_detail_parses_a_header_longer_than_a_line_cut():
+    # Detects (review 7): lines cut to MAX_LINE_BYTES before parsing, so a
+    # header longer than that (a huge parameter id) lost its closing `_` and
+    # the node's traceback fell to the unparsed fallback.
+    param = "p" * (K.MAX_LINE_BYTES + 900)
+    log = _synthetic_pytest_log(
+        [("test_param[%s]" % param, ["E   assert 0", "tests/t.py:4: AssertionError"])],
+        ["tests/t.py::test_param[%s] - assert 0" % param])
+    assert len(log[2].encode()) > K.MAX_LINE_BYTES  # the header itself is long
+    parsed = K.extract_pytest_failure_sections(log)
+    assert parsed["unparsed_nodes"] == [], parsed["unparsed_nodes"][:1]
+    max_bytes = 64 * 1024
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", log)], run_id="r1", max_bytes=max_bytes)
+    assert _detail_size(block) <= max_bytes
+    assert "E   assert 0" in block
+    assert not any(line.startswith("[no failure section") for line in block), block
+    # Rendering still cuts every line.
+    cap = K.MAX_LINE_BYTES + len(" … [99999 bytes truncated]".encode())
+    assert all(len(line.encode()) <= cap for line in block)
+    assert any(line.startswith("---- test_param[ppp") and line.endswith("bytes truncated]")
+               for line in block), [line[:40] for line in block]
+
+
+def test_private_detail_parses_pathological_lines_in_linear_time():
+    # Detects (review 8): a backtracking header pattern, quadratic in a line's
+    # length, which an uncut 64 KiB line turned into minutes of CPU for one
+    # failing run. No timing is pinned: the suite's per-test timeout is the
+    # detector, and a linear parser finishes in milliseconds.
+    size = 64 * 1024
+    bad = [
+        "_ " + "a" * size,                 # a header opening, never closed
+        "_ " + "a _" * (size // 3),         # frame-separator-like runs
+        "= " + "x" * size,                  # a banner opening, never closed
+    ]
+    # A counter line closes the region (no genuine header follows), so it
+    # goes after the summary, where it is only a summary line.
+    counter = "1 failed in 0.1s" + " =x" * (size // 3)
+    log = _synthetic_pytest_log(
+        [("test_a", bad * 20 + ["E   assert 0", "tests/t.py:1: AssertionError"])],
+        ["tests/t.py::test_a - assert 0"]) + [counter] + bad * 4
+    parsed = K.extract_pytest_failure_sections(log)
+    assert [s["title"] for s in parsed["sections"]] == ["test_a"]
+    block = K.build_private_failure_detail(
+        [("pytest", "logs/pytest.log", log)], run_id="r1")
+    assert "E   assert 0" in block

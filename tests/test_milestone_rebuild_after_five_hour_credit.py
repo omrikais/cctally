@@ -1,10 +1,13 @@
 """A stats rebuild keeps every milestone a journaled suppression orphaned.
 
 #825/#832 Task 4.0 (spec 4.7, case M19). A five-hour in-place credit's
-stale-replica DELETE removes every snapshot from floor10(arming tick) within
-1pp of the pre-credit peak. That band also holds the GENUINE peak tick when it
-shares the arming tick's ten-minute slot, and that tick is the one that crossed
-the last weekly and five-hour milestones. A rebuild folds the suppression
+stale-replica DELETE used to remove every snapshot from floor10(arming tick)
+within 1pp of the pre-credit peak. That band also held the GENUINE peak tick
+when it shared the arming tick's ten-minute slot, and that tick is the one that
+crossed the last weekly and five-hour milestones. Since #943 the band starts at
+the arming observation's exact capture second (the `five_hour_credit_boundary`
+companion), so the genuine peak is kept; the rebuild cases below still pin the
+milestone resolver for a suppression that names a crossing tick. A rebuild folds the suppression
 (order 30) before the milestones (order 60), so the milestones' logical
 `usage_snapshot_ref` no longer resolved: `INSERT OR IGNORE` dropped every such
 NOT NULL row without a word, and the next tick re-recorded the highest weekly
@@ -242,27 +245,79 @@ def _record_historical_policy(monkeypatch):
     monkeypatch.setattr(_lib_journal, "make_obs", make_obs)
 
 
+def _snapshot_rows(app):
+    """``{minute: (weekly, five-hour, held)}`` of every snapshot row."""
+    conn = app.open_db()
+    try:
+        return {
+            (int(r[0]) - NOW) // 60: (r[1], r[2], r[3])
+            for r in conn.execute(
+                "SELECT unixepoch(captured_at_utc), weekly_percent,"
+                " five_hour_percent, weekly_observation_held"
+                " FROM weekly_usage_snapshots")}
+    finally:
+        conn.close()
+
+
+def _assert_trace_d_rows(app, peak_ref, label, *, later=None):
+    """Trace D's rows after its five-hour credit (#943, spec 6.2): the genuine
+    00:21 peak keeps its five-hour 38 and its weekly 12, unheld; no 00:24 row
+    carries the clamped 38; the post-credit 00:26 reads its own 3 (and
+    ``later`` the minute and five-hour value of a further post-credit tick);
+    the five-hour milestones the peak crossed keep a real
+    ``usage_snapshot_id`` naming it."""
+    rows = _snapshot_rows(app)
+    assert rows[PEAK_MINUTE] == (12.0, 38.0, 0), (
+        f"{label}: genuine 00:21 peak lost or retired: {sorted(rows.items())}")
+    assert rows.get(24, (None, None, None))[1] != 38.0, (
+        f"{label}: the 00:24 clamped replica survived")
+    assert rows[26][1] == 3.0, f"{label}: credit undone at 00:26: {rows}"
+    if later is not None:
+        assert rows[later[0]][1] == later[1], (
+            f"{label}: credit undone at {later[0]}: {rows}")
+    conn = app.open_db()
+    try:
+        crossed = conn.execute(
+            "SELECT m.percent_threshold, m.usage_snapshot_id, s.journal_id"
+            " FROM five_hour_milestones m"
+            " LEFT JOIN weekly_usage_snapshots s ON s.id = m.usage_snapshot_id"
+            " WHERE unixepoch(m.captured_at_utc) = ?",
+            (NOW + PEAK_MINUTE * 60,)).fetchall()
+    finally:
+        conn.close()
+    assert crossed, f"{label}: non-vacuity: the peak crossed five-hour milestones"
+    assert all(int(r[1]) != 0 and r[2] == peak_ref for r in crossed), (
+        f"{label}: a peak milestone lost its snapshot link: "
+        f"{[tuple(r) for r in crossed]}")
+
+
 @pytest.mark.parametrize("policy", ["historical", "first_post_floor"])
 def test_rebuild_keeps_milestones_whose_snapshot_a_five_hour_credit_suppressed(
         app, monkeypatch, tmp_path, alert_sink, policy):
-    """Under either fold policy the credit retires only the peak tick's
-    five-hour effect and keeps its accepted weekly 12 (spec 4.7 revision 6,
-    fix round K15). The milestones survive a rebuild and the next tick does
-    not wedge ingest."""
+    """Under either fold policy the credit keeps the genuine peak tick and its
+    milestones (#943; before it the floored band retired the peak's five-hour
+    effect, spec 4.7 revision 6, fix round K15). The milestones survive a
+    rebuild and the next tick does not wedge ingest.
+
+    Detects (#943 F2): a five-hour credit banded from the floored ten-minute
+    slot of its arming DETECTION clock retires the genuine 00:21 peak of 38
+    captured before the arming 00:24 observation, under either fold policy;
+    and the older policy's inline clamp floor must move with the boundary, or
+    the post-credit 3 is clamped back up to that kept 38."""
     if policy == "historical":
         _record_historical_policy(monkeypatch)
     peak_ref = _trace_d(app, monkeypatch, tmp_path, alert_sink)
     assert peak_ref, "the :21 peak tick was accepted and journaled"
 
-    # Non-vacuity: the credit fired and its one suppression list names the
-    # genuine peak tick, so the 12% weekly and 35%-38% five-hour milestones
-    # it crossed now reference a snapshot whose five-hour effect the credit
-    # retired.
+    # Non-vacuity: the credit fired, and its one suppression list no longer
+    # names the genuine peak tick (#943 inverts the K15-era pin): the band
+    # starts at the arming observation's exact capture second.
     credits = [r for r in _journal() if r.get("t") == "evt"
                and (r.get("payload") or {}).get("kind") == "five_hour_credit"]
     assert len(credits) == 1, credits
     assert "five_hour_retirement" not in credits[0]["payload"]
-    assert peak_ref in credits[0]["payload"]["suppression"]
+    assert peak_ref not in (credits[0]["payload"].get("suppression") or [])
+    _assert_trace_d_rows(app, peak_ref, "live")
     live = _milestones(app)
     peak_pm = [json.loads(r) for r in live["percent_milestones"]
                if json.loads(r)["percent_threshold"] == 12]
@@ -272,6 +327,7 @@ def test_rebuild_keeps_milestones_whose_snapshot_a_five_hour_credit_suppressed(
 
     assert _rebuild(app) == 0
     assert _milestones(app) == live
+    _assert_trace_d_rows(app, peak_ref, "rebuilt")
 
     # The next tick after the rebuild must not re-record the 12% milestone (a
     # re-record is what converged into a NOT NULL violation and wedged ingest).
@@ -305,6 +361,51 @@ def test_rebuild_keeps_milestones_whose_snapshot_a_five_hour_credit_suppressed(
     assert _milestones(app) == after_tick
 
 
+def _replay(monkeypatch, replay):
+    """One production replay of the live index: the epoch transition or the
+    corrupt-index heal's detached worker (as
+    `tests/test_account_bound_replay_m19.py` drives them)."""
+    import os
+    import types
+    import _cctally_core as core
+    import _cctally_journal as JR
+    if replay == "epoch-transition":
+        JR.run_epoch_transition(claude_json_path=str(core.CLAUDE_JSON_PATH))
+        return
+    import _cctally_db
+    import _cctally_store as st
+    import _cctally_update
+    monkeypatch.setattr(_cctally_update, "_spawn_detached", lambda command: True)
+    monkeypatch.setattr(_cctally_update, "_spawn_detached_with_pid",
+                        lambda command, **_kw: os.getpid())
+    with open(core.DB_PATH, "r+b") as handle:
+        handle.write(b"not a database " * 200)
+    with pytest.raises(_cctally_db.StatsHealDeferred):
+        core.open_db()
+    assert st.cmd_stats_corruption_heal_internal(types.SimpleNamespace()) == 0
+
+
+@pytest.mark.parametrize("replay", ["epoch-transition", "corruption-heal"])
+def test_five_hour_credit_keeps_the_genuine_peak_through_every_replay(
+        app, monkeypatch, tmp_path, alert_sink, replay):
+    """Trace D, then a post-credit 00:34 reading of 7 (#943 A3, spec 6.2).
+
+    Detects: a replay path (the epoch transition, the corruption heal) that
+    folds the credit without its exact boundary, so it bands from the floored
+    slot again and retires the genuine 00:21 peak, or reads a post-credit
+    value against the floored slot and clamps 3 and 7 back up to 38. The
+    `db rebuild` path is the policy-parametrized test above."""
+    peak_ref = _trace_d(app, monkeypatch, tmp_path, alert_sink)
+    assert _drive(app, monkeypatch, tmp_path, 34, 12.0, 7.0) == 0
+    _assert_trace_d_rows(app, peak_ref, "live", later=(34, 7.0))
+    live_rows = _snapshot_rows(app)
+    live = _milestones(app)
+    _replay(monkeypatch, replay)
+    _assert_trace_d_rows(app, peak_ref, replay, later=(34, 7.0))
+    assert _snapshot_rows(app) == live_rows
+    assert _milestones(app) == live
+
+
 def _peak_ref(app, minute):
     conn = app.open_db()
     try:
@@ -326,12 +427,13 @@ def test_rebuild_keeps_milestones_whose_snapshot_a_weekly_credit_suppressed(
         app, monkeypatch, tmp_path, alert_sink, capsys, credit):
     """The weekly suppressions ride the same resolver.
 
-    `record-credit` (`weekly_credit_effects`, order 50) floors its effective
-    instant to the hour, so its band reaches back over the genuine peak tick
-    the 12% weekly milestone was recorded against — the same defect as the
-    five-hour credit, on the manual remedy's path. Since spec 4.7 revision 7
-    the tick, which carries its own five-hour reading, is kept weekly-held
-    rather than deleted, and the milestone keeps its reference.
+    `record-credit` (`weekly_credit_effects`, order 50) bands from its
+    effective instant, which since #943 (O1) is the exact `--at` second
+    (00:20) rather than its hour floor. The peak tick (00:21) is captured
+    AFTER that second, so it is a genuine stale replica in the band and the
+    suppression still names it. Since spec 4.7 revision 7 the tick, which
+    carries its own five-hour reading, is kept weekly-held rather than
+    deleted, and the milestone keeps its reference.
 
     The automatic weekly paths cannot reach it: since #750 S3 §1.4 a
     `week_reset` bands from the EXACT capture second of the triggering (or
@@ -365,6 +467,10 @@ def test_rebuild_keeps_milestones_whose_snapshot_a_weekly_credit_suppressed(
     if credit == "record-credit":
         assert _suppressing_events(peak_ref), (
             "non-vacuity: the credit's suppression names the peak tick")
+        # #943 (O1): unchanged by the exact `--at` second, because the 00:21
+        # peak is captured after the 00:20 `--at` instant and so stays in the
+        # band; a reading captured before `--at` is the case that changed
+        # (`tests/test_record_credit.py`, the F3 trace).
         # #825/#832 spec 4.7 revision 7 (fix round K16b): the peak tick
         # carries its own five-hour reading, so the weekly cleanup retires
         # only its weekly effect and keeps it weekly-held. The milestone keeps

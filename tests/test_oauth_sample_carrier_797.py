@@ -233,3 +233,79 @@ def test_no_key_for_hook_discarded_response(app, monkeypatch):
     _direct_record(app, weekly=40, source="api")
     assert len(_usage_obs()) == 1
     assert _keyed() == []
+
+
+# --------------------------------------------------------------------------
+# #1019/#1014 (spec 4.7 C1, C6): the samples across epoch 1020
+# --------------------------------------------------------------------------
+
+def test_oauth_samples_survive_epoch_1020_rebuild_row_for_row(app, monkeypatch):
+    """C1/C6: a keyed api observation 1.116.1 wrote before the revision-3
+    boundary (`wpr: 2`, no `wpx`) still carries a sample, because
+    `has_current_revision` keeps qualifying revision-2 carriers; a current
+    one (`wpx: 3`) does too. Rebuilding a 1019 index at 1020 reconstructs
+    both samples row for row (detects the epoch rebuild dropping a
+    historical carrier, or `wpx` becoming the carrier test)."""
+    import _cctally_core as core
+    import _cctally_journal as jr
+    import _lib_journal as J
+    import _outcome_quarantine_trace as T
+    jr._establish_account_bound_revision(jr._ensure_original_cutover())
+    # The previous release's refresh: its appends establish no revision 3.
+    with monkeypatch.context() as previous:
+        previous.setattr(jr, "establish_revision_before_decision",
+                         lambda **kw: None)
+        previous.setattr(jr, "ensure_account_bound_cutover",
+                         lambda **kw: jr._establish_account_bound_revision(
+                             jr._ensure_original_cutover(**kw)))
+        _advancing_fetch(monkeypatch, app)
+        assert app._refresh_usage_inproc().status == "ok"
+    [keyed] = _keyed()
+    assert keyed["wpx"] == 3
+    # 1.116.1's own keyed reading one second later: `wpr: 2`, no `wpx`, its
+    # content id over that core (built by hand, so the RED run against the
+    # parent exercises the same bytes).
+    def later(text):
+        moved = _instant(text) + dt.timedelta(seconds=1)
+        return moved.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if "." in text else (
+            moved.isoformat().replace("+00:00", "Z"))
+    payload = dict(keyed["payload"], captured_at=later(
+        keyed["payload"]["captured_at"]), **{KEY: later(keyed["payload"][KEY])})
+    old = {k: v for k, v in keyed.items() if k not in ("wpx", "id")}
+    old["payload"] = payload
+    old["id"] = J.content_id({k: v for k, v in old.items() if k != "v"})
+    T.raw_append([old])
+    assert not any((r.get("payload") or {}).get("kind")
+                   == "account_bound_revision_v3" for r in _journal())
+
+    _set_clock(monkeypatch, NOW + 600)
+    _advancing_fetch(monkeypatch, app, response=_response(weekly=62, five=66))
+    assert app._refresh_usage_inproc().status == "ok"
+    assert len(_keyed()) == 3
+    T.ingest(app)
+    query = "SELECT * FROM claude_oauth_samples ORDER BY observation_id"
+
+    def rows():
+        conn = app.open_db()
+        try:
+            return [tuple(r) for r in conn.execute(query)]
+        finally:
+            conn.close()
+
+    before = rows()
+    assert {r for r in before if old["id"] in r}, "the revision-2 carrier lost"
+    assert len(before) == 3, before
+    import sqlite3
+    conn = sqlite3.connect(str(core.DB_PATH))
+    try:
+        conn.execute("PRAGMA user_version = 1019")
+        conn.commit()
+    finally:
+        conn.close()
+    T.rebuild(app)
+    conn = sqlite3.connect(str(core.DB_PATH))
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1023
+    finally:
+        conn.close()
+    assert rows() == before

@@ -159,13 +159,7 @@ line.
 
 ### `$CODEX_HOME`
 
-Codex commands read session JSONL and `config.toml` from `$CODEX_HOME` — a
-single directory or a **comma-separated** list (default `~/.codex`). Each
-entry with a `sessions/` subdirectory is treated as a Codex home (sessions
-under `<entry>/sessions`, config at `<entry>/config.toml`); an entry without
-`sessions/` is read directly as a JSONL directory. `--speed auto` resolves to
-fast pricing if **any** root's `config.toml` sets `service_tier = "fast"` or
-`"priority"`.
+Codex commands read session JSONL and `config.toml` from `$CODEX_HOME` — a single directory or a **comma-separated** list (default `~/.codex`). Each entry with a `sessions/` or `archived_sessions/` subdirectory is treated as a Codex home (sessions under `<entry>/sessions`, archived threads under `<entry>/archived_sessions`, config at `<entry>/config.toml`); an entry with neither is read directly as a JSONL directory. Archived threads count like any other session. `--speed auto` resolves to fast pricing if **any** root's `config.toml` sets `service_tier = "fast"` or `"priority"`.
 
 ## See also
 

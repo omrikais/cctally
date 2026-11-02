@@ -400,3 +400,76 @@ def test_each_refusal_state_gets_its_own_operator_phrase():
         "a read that failed says nothing about which pricing table is older"
     )
     assert "older" not in phrases["malformed"]
+
+
+# ---------------------------------------------------------------------------
+# #944 L2 / spec 5.6: the prune deletes accounting rows, so it links every
+# unlinked one (an old writer's stamp) to a journaled decision first. The
+# dashboard's automatic self-heal calls the function directly; the operator's
+# form is `cache-sync --prune-orphans`.
+# ---------------------------------------------------------------------------
+
+def _old_writer_orphan(ns, conn, conversations, projects):
+    """Sync one transcript as a writer that knows nothing of attribution
+    decisions (its row is stamped A and unlinked), then remove it."""
+    import _cctally_claude_attribution as G
+    from test_claude_account_attribution import _login
+    gone = projects / "-proj-gone" / "o.jsonl"
+    _write(gone, "OLD", [_assistant("m1", "r1", uuid="u1")])
+    text = gone.read_text()
+    a = _login("A")
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(G, "schema_present", lambda _conn: False)
+        _sync(ns, conn, conversations)
+    assert conn.execute(
+        "SELECT account_key, attribution_decision_key FROM session_entries"
+    ).fetchall() == [(a, None)]
+    import shutil; shutil.rmtree(gone.parent)
+    return gone, text, a
+
+
+def _prune(ns, conn, how):
+    if how == "direct":
+        return ns["_prune_orphaned_cache_entries"](conn, lock_timeout=None)
+    args = ns["build_parser"]().parse_args(
+        ["cache-sync", "--source", "claude", "--prune-orphans"])
+    return args.func(args)
+
+
+@pytest.mark.parametrize("how", ["direct", "cli"])
+def test_prune_links_unlinked_rows_before_deleting_them(env, how):
+    """Detects: a prune deleting an old writer's stamped row with no decision,
+    so the restored transcript re-ingests under whoever is logged in then."""
+    from test_claude_account_attribution import _login
+    ns, conn, conversations, projects = env
+    gone, text, a = _old_writer_orphan(ns, conn, conversations, projects)
+    _login("B")
+    _prune(ns, conn, how)
+    assert _counts(conn, conversations, str(gone))[:2] == (0, 0)
+    assert conn.execute(
+        "SELECT account_key, basis FROM claude_cost_decisions"
+    ).fetchall() == [(a, "preserved_history")]
+    gone.parent.mkdir(parents=True)
+    gone.write_text(text)
+    _sync(ns, conn, conversations)
+    assert conn.execute(
+        "SELECT e.account_key FROM session_entries e JOIN claude_cost_decisions"
+        " d ON d.decision_key = e.attribution_decision_key"
+    ).fetchall() == [(a,)]
+
+
+def test_prune_with_an_unwritable_journal_prunes_nothing(env, monkeypatch,
+                                                          capsys):
+    """Detects: a prune deleting rows whose decisions it could not journal."""
+    import _cctally_journal as jr
+    ns, conn, conversations, projects = env
+    gone, _text, _a = _old_writer_orphan(ns, conn, conversations, projects)
+
+    def boom(*_a, **_k):
+        raise OSError(30, "Read-only file system")
+    monkeypatch.setattr(jr, "append_records", boom)
+    capsys.readouterr()
+    assert _prune(ns, conn, "cli") == 1
+    assert ("[cache-sync] prune-orphans skipped: the cctally journal could not"
+            " be written.") in capsys.readouterr().err
+    assert _counts(conn, conversations, str(gone))[:2] == (1, 1)

@@ -20,12 +20,19 @@ kinds of proof live here, for every rewrite:
   returned — a frozen copy of the old statement and its Python — over data
   built to separate them: ties, NULL and empty values, missing keys, duplicate
   inputs, and the title choice and its ordering.
+
+#1046 added two equivalence proofs for statements the audit had missed: the
+#1015 calibration-basis digest relations (ordered in Python instead of by a
+sorter) and the #970 cursorless archive-spelled sources (de-duplicated in
+Python over an index-served order instead of by a ``DISTINCT`` temp B-tree).
 """
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import importlib
 import json
+import os
 import pathlib
 import sqlite3
 import sys
@@ -1471,3 +1478,411 @@ def _legacy_qualified_path_sql(analytics, identity_count: int) -> str:
         "     ORDER BY entries.timestamp_utc ASC",
         f"       AND ({predicates})\n     ORDER BY entries.timestamp_utc ASC",
     )
+
+
+# ── #1046: the calibration-basis digest relations, ordered in Python ─────────
+
+#: Today's two sorted relation statements, kept verbatim: the oracle.
+_LEGACY_CALIBRATION_ORDERED_SQL = {
+    "correction_batch_lineage": (
+        "SELECT batch_id, commit_segment, commit_offset "
+        "FROM correction_batch_lineage "
+        "ORDER BY batch_id, commit_segment, commit_offset"),
+    "claude_weekly_correction_ops": (
+        "SELECT decision_op_id, op_segment, op_offset "
+        "FROM claude_weekly_correction_ops "
+        "ORDER BY decision_op_id, op_segment, op_offset"),
+}
+#: Today's whole calibration basis, frozen in today's order: the two
+#: rewritten relations with their sorted statements, and the two unchanged
+#: ones verbatim, so a registry reorder or edit cannot carry the oracle along.
+_LEGACY_CALIBRATION_BASIS_RELATIONS = (
+    ("correction_batch_lineage",
+     _LEGACY_CALIBRATION_ORDERED_SQL["correction_batch_lineage"]),
+    ("correction_batch_footprint",
+     "SELECT batch_id, provider, account_key FROM correction_batch_footprint "
+     "ORDER BY batch_id, provider, account_key"),
+    ("claude_weekly_correction_history",
+     "SELECT h.decision_op_id, h.observation_id, h.disposition, "
+     "o.op_segment, o.op_offset, i.account_key, i.captured_at_utc "
+     "FROM claude_weekly_correction_history AS h "
+     "LEFT JOIN claude_weekly_correction_ops AS o "
+     "ON o.decision_op_id = h.decision_op_id "
+     "LEFT JOIN claude_weekly_observation_index AS i "
+     "ON i.observation_id = h.observation_id "
+     "ORDER BY h.decision_op_id, h.observation_id, h.disposition, "
+     "o.op_segment, o.op_offset, i.account_key, i.captured_at_utc"),
+    ("claude_weekly_correction_ops",
+     _LEGACY_CALIBRATION_ORDERED_SQL["claude_weekly_correction_ops"]),
+)
+#: (key, segment, offset) per row, inserted deliberately out of order. The
+#: NULL-key run in segment "s" mixes storage classes in its offset, with the
+#: REAL 2.0**63 inserted before the integer 2**63 - 1: a float-converting key
+#: ties them and keeps insertion order, while SQLite puts the integer first.
+_CALIBRATION_ROWS = (
+    (None, "s", 2), (None, "s", 1), (None, "s", 1.5), (None, "s", 2.0 ** 63),
+    (None, "s", 2 ** 63 - 1), (None, "s", "x"),
+    (None, "s", 1),
+    (None, "r", 9), (None, "r", 4),
+    ("b", "t", 1), ("ab", "t", 1), ("a", "t", 1), ("", "t", 1),
+    ("\U0001F600", "t", 1), ("Ａ", "t", 1),
+    (7, "t", 1),
+    (b"k", "t", 1),
+)
+_CALIBRATION_S_OFFSET_TYPES = (
+    "integer", "integer", "real", "real", "integer", "text")
+
+
+def _legacy_calibration_basis_digest(conn) -> str:
+    """Today's ``_stats_relations_digest`` over the frozen calibration
+    basis."""
+    relation_rows = []
+    for _name, sql in _LEGACY_CALIBRATION_BASIS_RELATIONS:
+        try:
+            rows = conn.execute(sql).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            rows = ()
+        relation_rows.append([list(row) for row in rows])
+    canonical = json.dumps(
+        relation_rows, allow_nan=False, ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _float_converting_key(row):
+    def value(v):
+        if v is None:
+            return (0, 0)
+        if isinstance(v, (int, float)):
+            return (1, float(v))
+        if isinstance(v, str):
+            return (2, v)
+        return (3, v)
+    return tuple(value(v) for v in row)
+
+
+def test_the_calibration_basis_relations_match_todays_order(
+    tmp_path, monkeypatch,
+):
+    """#1046: the two calibration-basis relations are read with no ORDER BY
+    and sorted in Python. The rows, the canonical JSON and the digest are
+    today's, over NULL keys (the comparator reaches the offset), mixed
+    storage classes, a full duplicate, text order (code points, prefixes, a
+    supplementary character) and an integer key stored as TEXT. Detects a
+    digest that changes value, a spurious or missed dashboard recompute."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_core
+
+    sources = importlib.import_module("_lib_dashboard_sources")
+    entries = {entry[0]: entry
+               for entry in sources._CALIBRATION_BASIS_DIGEST_RELATIONS}
+    conn = ns["open_db"]()
+    conn.close()
+    conn = sqlite3.connect(_cctally_core.DB_PATH)
+    try:
+        # The empty store first: both digests over no rows.
+        sources._STATS_RELATIONS_DIGEST_MEMO.clear()
+        assert (sources.calibration_basis_digest(conn)
+                == _legacy_calibration_basis_digest(conn))
+        assert conn.execute("PRAGMA encoding").fetchone()[0] == "UTF-8"
+        for name, sql in _LEGACY_CALIBRATION_ORDERED_SQL.items():
+            columns = sql.split("SELECT ", 1)[1].split(" FROM", 1)[0]
+            conn.executemany(
+                f"INSERT INTO {name} ({columns}) VALUES (?,?,?)",
+                _CALIBRATION_ROWS)
+        conn.commit()
+        wants = {}
+        for name, sql in _LEGACY_CALIBRATION_ORDERED_SQL.items():
+            columns = sql.split("SELECT ", 1)[1].split(" FROM", 1)[0]
+            key, _segment, offset = columns.split(", ")
+            types = conn.execute(
+                f"SELECT typeof({key}), {key}, typeof({offset}) FROM {name} "
+                "ORDER BY rowid").fetchall()
+            assert [t[2] for t in types[:6]] == list(
+                _CALIBRATION_S_OFFSET_TYPES), (name, types)
+            assert types[15][:2] == ("text", "7"), (name, types[15])
+            assert types[16][0] == "blob", (name, types[16])
+            want = [list(row) for row in conn.execute(sql)]
+            assert len(want) == len(_CALIBRATION_ROWS)
+            # Negative controls: each wrong order differs on this fixture.
+            plain = [list(row) for row in conn.execute(
+                sql.split(" ORDER BY", 1)[0])]
+            assert plain != want, name
+            key_only = [list(row) for row in conn.execute(
+                sql.split(" ORDER BY", 1)[0] + f" ORDER BY {key}")]
+            assert key_only != want, name
+            assert sorted(plain, key=_float_converting_key) != want, name
+            wants[name] = want
+        # The product read, only after every control above has held.
+        for name, want in wants.items():
+            got = sources._stats_relation_rows(conn, entries[name])
+            assert got == want, name
+        # JSON cannot encode bytes, today or after.
+        for name, sql in _LEGACY_CALIBRATION_ORDERED_SQL.items():
+            columns = sql.split("SELECT ", 1)[1].split(" FROM", 1)[0]
+            key = columns.split(", ")[0]
+            conn.execute(f"DELETE FROM {name} WHERE typeof({key}) = 'blob'")
+        conn.commit()
+        frozen = _legacy_calibration_basis_digest(conn)
+        sources._STATS_RELATIONS_DIGEST_MEMO.clear()
+        assert sources.calibration_basis_digest(conn) == frozen
+        sources._STATS_RELATIONS_DIGEST_MEMO.clear()
+        assert sources._stats_relations_digest(
+            conn, sources._CALIBRATION_BASIS_DIGEST_RELATIONS) == frozen
+    finally:
+        sources._STATS_RELATIONS_DIGEST_MEMO.clear()
+        conn.close()
+
+
+# ── #1046: the cursorless archive-spelled sources, de-duplicated in Python ───
+
+_ARCHIVE_FAMILY_TABLES = (
+    "codex_conversation_messages", "codex_conversation_events",
+    "codex_conversation_file_touches")
+
+
+def _legacy_cursorless_archive_sources(cache, conn, roots, cursor_paths):
+    """Today's ``_codex_cursorless_archive_spelled_conversation_sources``,
+    verbatim but for the module prefix: the oracle."""
+    out = {}
+    for root in roots:
+        if root.archive_root is None:
+            continue
+        for spelling in cache._codex_archive_spellings(root):
+            low = spelling + os.sep
+            high = spelling + chr(ord(os.sep) + 1)
+            for table, has_root in (("codex_conversation_messages", True),
+                                    ("codex_conversation_events", True),
+                                    ("codex_conversation_file_touches", False)):
+                columns = ("source_path, source_root_key" if has_root
+                           else "source_path, NULL")
+                for stored, root_key in conn.execute(
+                        f"SELECT DISTINCT {columns} FROM {table} "
+                        "WHERE source_path >= ? AND source_path < ?",
+                        (low, high)).fetchall():
+                    path = str(stored)
+                    rest = path[len(low):]
+                    if (not rest or os.sep in rest or path in cursor_paths
+                            or cache._codex_scope_root(path, None, roots)
+                            is not None):
+                        continue
+                    if out.get(path) is None:
+                        out[path] = root_key or root.source_root_key
+    return sorted(out.items())
+
+
+def _legacy_distinct_pairs(conn, table, columns, low, high) -> set:
+    return set(conn.execute(
+        f"SELECT DISTINCT {columns} FROM {table} "
+        "WHERE source_path >= ? AND source_path < ?", (low, high)))
+
+
+def _archive_stream(conn, table, columns, order, low, high) -> list:
+    """The statement's stream with no de-duplication."""
+    return [tuple(row) for row in conn.execute(
+        f"SELECT {columns} FROM {table} "
+        f"WHERE source_path >= ? AND source_path < ? ORDER BY {order}",
+        (low, high))]
+
+
+def _archive_row(conn, table, path, line_offset, root_key) -> None:
+    if table == "codex_conversation_messages":
+        conn.execute(
+            "INSERT INTO codex_conversation_messages (conversation_key,"
+            " source_root_key, source_path, line_offset, kind, record_family,"
+            " text, content_digest, content_len) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("ck-archive", root_key, path, line_offset, "assistant",
+             "response_item", "t", "d" * 32, 1))
+    elif table == "codex_conversation_events":
+        conn.execute(
+            "INSERT INTO codex_conversation_events (source_path, line_offset,"
+            " source_root_key, payload_json) VALUES (?,?,?,?)",
+            (path, line_offset, root_key, "{}"))
+    else:
+        conn.execute(
+            "INSERT INTO codex_conversation_file_touches (message_id,"
+            " conversation_key, source_path, file_path, tool)"
+            " VALUES (?,?,?,?,?)",
+            (line_offset, "ck-archive", path, f"{path}#{line_offset}",
+             "apply_patch"))
+
+
+#: Today's statement shapes per family, and the reference order (spec 5.2).
+_ARCHIVE_FAMILIES = (
+    ("codex_conversation_messages", "source_path, source_root_key",
+     "source_path, id"),
+    ("codex_conversation_events", "source_path, source_root_key",
+     "source_path, line_offset"),
+    ("codex_conversation_file_touches", "source_path, NULL", "source_path"),
+)
+
+
+def _archive_root(cache, base: pathlib.Path, key: str):
+    (base / "sessions").mkdir(parents=True)
+    (base / "archived_sessions").mkdir()
+    root = cache.CodexProviderRoot(
+        base, base / "sessions", key, base / "archived_sessions")
+    assert root.archive_root is not None
+    spelling = cache._codex_archive_spellings(root)[0]
+    return root, spelling, spelling + os.sep, spelling + chr(ord(os.sep) + 1)
+
+
+def _first_pairs(stream) -> list:
+    seen, out = set(), []
+    for pair in stream:
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
+
+
+def test_the_cursorless_archive_sources_match_todays_distinct(
+    tmp_path, monkeypatch,
+):
+    """#1046 (D5): the three archive statements drop DISTINCT for an
+    index-served ORDER BY and de-duplicate ``(path, root key)`` pairs in
+    Python at first occurrence. Each statement's pair set is today's on every
+    runtime; with no multi-root path the function returns exactly today's
+    output; a multi-root path keeps the reference order's root key (messages
+    by id, events by line offset). Detects a wrong stale-source set or root
+    key reaching the conversations prune drain, which would retire or keep
+    the wrong conversations rows.
+
+    One store, three native homes: S1 (no multi-root path), S2 (multi-root
+    paths) and an empty archive range. The function only reads the archive
+    spellings of the roots it is given, so each scenario sees its own rows.
+    Every negative control runs before the rewritten helpers read the
+    populated store. The closing plan capture is the I1 check, which depends
+    on the plan by design; every equivalence assertion holds on every
+    runtime."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_core
+
+    cache = importlib.import_module("_cctally_cache")
+    root1, spelling1, low1, high1 = _archive_root(
+        cache, tmp_path / "home-s1", "root-native-1")
+    root2, _spelling2, low2, high2 = _archive_root(
+        cache, tmp_path / "home-s2", "root-native-2")
+    root3, spelling3, low3, high3 = _archive_root(
+        cache, tmp_path / "home-empty", "root-native-3")
+
+    conn = ns["open_conversations_db"](attach_cache=False)
+    conn.close()
+    conn = sqlite3.connect(_cctally_core.CONVERSATIONS_DB_PATH)
+    try:
+        # A store with no archive-spelled rows at all.
+        assert _legacy_cursorless_archive_sources(
+            cache, conn, [root1, root2, root3], set()) == []
+        assert cache._codex_cursorless_archive_spelled_conversation_sources(
+            conn, [root1, root2, root3], set()) == []
+
+        # S1: no multi-root path. Each family has its own paths; repeated
+        # rows carry distinct unique keys.
+        m1, e1, t1 = (f"{low1}{n}.jsonl" for n in ("m1", "e1", "t1"))
+        cursor = {f"{low1}c-{t}.jsonl" for t in _ARCHIVE_FAMILY_TABLES}
+        for n in range(5):
+            _archive_row(conn, "codex_conversation_messages", m1, n, "root-a")
+            _archive_row(conn, "codex_conversation_events", e1, n, "root-b")
+        for n in range(3):
+            _archive_row(conn, "codex_conversation_file_touches", t1, n, None)
+        for table in _ARCHIVE_FAMILY_TABLES:
+            for path in (f"{low1}nested/n-{table}.jsonl",
+                         f"{low1}c-{table}.jsonl",
+                         f"{spelling1}2/s-{table}.jsonl"):
+                _archive_row(conn, table, path, 0, "root-c")
+                _archive_row(conn, table, path, 1, "root-c")
+        # S2: multi-root paths whose id order and line order disagree.
+        m2, e2 = f"{low2}m2.jsonl", f"{low2}e2.jsonl"
+        for table, path in (("codex_conversation_messages", m2),
+                            ("codex_conversation_events", e2)):
+            for line_offset, key in ((200, "A"), (100, "B"), (300, "A")):
+                _archive_row(conn, table, path, line_offset, key)
+        # The empty range: rows only just outside it.
+        for table in _ARCHIVE_FAMILY_TABLES:
+            _archive_row(conn, table, f"{spelling3}2/s-{table}.jsonl", 0, "x")
+        conn.commit()
+
+        # Fixture-only checks (negative controls), before any product call.
+        for table, columns, order in _ARCHIVE_FAMILIES:
+            raw = _archive_stream(conn, table, columns, order, low1, high1)
+            assert len(raw) > len(set(raw)), f"S1 non-de-duplicated: {table}"
+            assert set(raw) == _legacy_distinct_pairs(
+                conn, table, columns, low1, high1), table
+        canonical = {
+            "codex_conversation_messages": [(m2, "A"), (m2, "B")],
+            "codex_conversation_events": [(e2, "B"), (e2, "A")],
+            "codex_conversation_file_touches": [],
+        }
+        swapped = {
+            "codex_conversation_messages": "source_path, line_offset",
+            "codex_conversation_events": "source_path, id",
+        }
+        for table, columns, order in _ARCHIVE_FAMILIES[:2]:
+            raw = _archive_stream(conn, table, columns, order, low2, high2)
+            assert len(raw) > len(set(raw)), f"S2 non-de-duplicated: {table}"
+            assert _first_pairs(raw) == canonical[table], table
+            assert _first_pairs(_archive_stream(
+                conn, table, columns, swapped[table], low2, high2,
+            )) == canonical[table][::-1], f"swapped order: {table}"
+        by_path = {}
+        for path, key in _archive_stream(conn, *_ARCHIVE_FAMILIES[0][:3],
+                                         low2, high2):
+            by_path.setdefault(path, key)
+        assert sorted(by_path.items()) == [(m2, "A")], (
+            "de-duplication by path drops (m2, 'B')")
+        assert _legacy_cursorless_archive_sources(
+            cache, conn, [root3], set()) == []
+
+        # The product: the triple, then S1, S2 and the empty range.
+        assert tuple(table for table, _columns, _order in (
+            cache._CODEX_CURSORLESS_ARCHIVE_SOURCE_FAMILIES)) == (
+                _ARCHIVE_FAMILY_TABLES)
+        for table, columns, order in _ARCHIVE_FAMILIES:
+            got = list(cache._codex_archive_spelled_source_pairs(
+                conn, table, columns, order, low1, high1))
+            assert len(got) == len(set(got)), (table, got)
+            assert set(got) == _legacy_distinct_pairs(
+                conn, table, columns, low1, high1), table
+        got = cache._codex_cursorless_archive_spelled_conversation_sources(
+            conn, [root1], cursor)
+        assert got == _legacy_cursorless_archive_sources(
+            cache, conn, [root1], cursor)
+        assert dict(got) == {m1: "root-a", e1: "root-b", t1: "root-native-1"}
+
+        for table, columns, order in _ARCHIVE_FAMILIES:
+            got = list(cache._codex_archive_spelled_source_pairs(
+                conn, table, columns, order, low2, high2))
+            assert got == canonical[table], table
+            assert set(got) == _legacy_distinct_pairs(
+                conn, table, columns, low2, high2), table
+            if table in swapped:
+                assert list(cache._codex_archive_spelled_source_pairs(
+                    conn, table, columns, swapped[table], low2, high2,
+                )) == canonical[table][::-1], f"swapped order: {table}"
+        assert dict(
+            cache._codex_cursorless_archive_spelled_conversation_sources(
+                conn, [root2], set())) == {m2: "A", e2: "B"}
+
+        assert cache._codex_cursorless_archive_spelled_conversation_sources(
+            conn, [root3], set()) == []
+        for table, columns, order in _ARCHIVE_FAMILIES:
+            assert list(cache._codex_archive_spelled_source_pairs(
+                conn, table, columns, order, low3, high3)) == [], table
+    finally:
+        conn.close()
+
+    # Sorter-free: the generator's statements build no temp structure.
+    with guard.capture_sql_plans(temp_store="FILE") as recorder:
+        conn = sqlite3.connect(_cctally_core.CONVERSATIONS_DB_PATH)
+        try:
+            cache._codex_cursorless_archive_spelled_conversation_sources(
+                conn, [root1, root2, root3], cursor)
+        finally:
+            conn.close()
+    _bounded(recorder, "_cctally_cache._codex_archive_spelled_source_pairs",
+             "FILE")

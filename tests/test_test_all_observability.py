@@ -3565,3 +3565,146 @@ def test_seeded_loss_survives_a_successful_run_until_it_ages_out(tmp_path):
     (root / ".retention.json").write_text(json.dumps(record_doc))
     record, _result = _embedded_retention(root, "current")
     assert record["seededLoss"] == [] and record["coverage"] == "complete"
+
+
+# ------------------------------------------ the private failure detail (#1011)
+#
+# Under the runner supervisor the run directory, and the raw logs in it, go
+# when the run ends. The supervisor names one private file through
+# CCTALLY_TEST_ALL_DETAIL_FILE, and a failing evidence-rooted run appends its
+# bounded, UNSCRUBBED detail there. These cases drive the real aggregator.
+
+DETAIL_ENV_NAME = "CCTALLY_TEST_ALL_DETAIL_FILE"
+DETAIL_MESSAGE = "the reap deadline passed before the group exited"
+_DETAIL_PROBE = (
+    "MESSAGE = ' '.join(%r)\n\n\n"
+    "def helper():\n"
+    "    raise AssertionError(MESSAGE)\n\n\n"
+    "def test_detail_probe():\n"
+    "    helper()\n" % (DETAIL_MESSAGE.split(),)
+)
+
+
+def _detail_estate(tmp_path, failing=True):
+    est = _estate(tmp_path, smoke=False)
+    (est / "tests" / "test_detail_probe.py").write_text(
+        _DETAIL_PROBE if failing else "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+    return est
+
+
+def _failure_class(root):
+    (run_dir,) = _run_dirs(root)
+    return json.loads((run_dir / "manifest.json").read_text())["failureClass"]
+
+
+def test_a_failing_pytest_leg_appends_unsanitized_detail_only_to_the_named_file(
+    tmp_path,
+):
+    # Detects (R1, R4): the assertion and helper frame lost from the private
+    # file, the unscrubbed message leaking into the console or the export, or
+    # the private writer changing the run's verdict.
+    est = _detail_estate(tmp_path)
+    detail = tmp_path / "detail.txt"
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {
+        "CCTALLY_TEST_EVIDENCE_ROOT": str(root), DETAIL_ENV_NAME: str(detail)})
+    assert res.returncode == 1, res.stdout + res.stderr
+    raw = (_run_dirs(root)[0] / "logs" / "pytest.log").read_text()
+    assert DETAIL_MESSAGE in raw, raw  # non-vacuity
+    text = detail.read_text(encoding="utf-8")
+    assert DETAIL_MESSAGE in text, text
+    assert "def helper" in text, text
+    assert re.search(r"^E\s+AssertionError: ", text, re.M), text
+    assert DETAIL_MESSAGE not in res.stderr
+    assert DETAIL_MESSAGE not in res.stdout
+    export = (_run_dirs(root)[0] / "export" / "failure-context.txt").read_text()
+    assert DETAIL_MESSAGE not in export, export
+    assert stat.S_IMODE(detail.stat().st_mode) == 0o600
+
+    detail.unlink()
+    plain_root = tmp_path / "ev-plain"
+    plain = _drive(est, tmp_path, {"CCTALLY_TEST_EVIDENCE_ROOT": str(plain_root)})
+    assert plain.returncode == res.returncode, plain.stdout + plain.stderr
+    assert _failure_class(plain_root) == _failure_class(root) == "product"
+    assert not detail.exists()
+
+
+def test_distinct_run_ids_append_one_block_per_failing_invocation(tmp_path):
+    # Detects: a later invocation truncating an earlier block, or a passing
+    # invocation writing (or erasing) anything.
+    failing = _detail_estate(tmp_path / "fail")
+    passing = _detail_estate(tmp_path / "pass", failing=False)
+    detail = tmp_path / "detail.txt"
+    root = tmp_path / "ev"
+    for est, run_id, rc in ((failing, "detail-a", 1), (failing, "detail-b", 1),
+                            (passing, "detail-c", 0)):
+        res = _drive(est, tmp_path, {
+            "CCTALLY_TEST_EVIDENCE_ROOT": str(root), DETAIL_ENV_NAME: str(detail),
+            "CCTALLY_TEST_RUN_ID": run_id})
+        assert res.returncode == rc, res.stdout + res.stderr
+    text = detail.read_text(encoding="utf-8")
+    ends = re.findall(r"^==== end of run (\S+) ====$", text, re.M)
+    assert ends == ["detail-a", "detail-b"], text
+
+
+_LOCK_HOLDER = (
+    "import fcntl, sys, time\n"
+    "handle = open(sys.argv[1], 'a')\n"
+    "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+    "print('locked', flush=True)\n"
+    "time.sleep(600)\n"
+)
+
+
+@pytest.mark.parametrize("target_kind", ["fifo", "locked"])
+def test_the_detail_writer_never_waits(tmp_path, target_kind):
+    # Detects (R9): the private writer blocking the aggregator on a FIFO with
+    # no reader or on a lock another writer holds, or a refusal changing the
+    # run's exit code or class.
+    est = _detail_estate(tmp_path)
+    target = tmp_path / "detail.txt"
+    holder = None
+    if target_kind == "fifo":
+        os.mkfifo(target)
+    else:
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _LOCK_HOLDER, str(target)],
+            stdout=subprocess.PIPE, text=True,
+        )
+        assert holder.stdout.readline().strip() == "locked"
+    try:
+        root = tmp_path / "ev"
+        res = _drive(est, tmp_path, {
+            "CCTALLY_TEST_EVIDENCE_ROOT": str(root), DETAIL_ENV_NAME: str(target)})
+    finally:
+        if holder is not None:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert _failure_class(root) == "product"
+    assert "the private failure detail for run" in res.stderr, res.stderr
+    if target_kind == "locked":
+        assert target.read_text(encoding="utf-8") == ""
+
+
+def test_a_detail_refusal_reason_carries_no_free_text(tmp_path):
+    # Detects (#1011 review 9): an OS message or an exception's text carried
+    # into the refusal note, which reaches the console (spec 4.7 allows only a
+    # run id, a byte count and a command on public surfaces). The reason is
+    # fixed text and the errno or exception TYPE name.
+    est = _detail_estate(tmp_path)
+    target = tmp_path / "no-such-dir" / "detail.txt"
+    root = tmp_path / "ev"
+    res = _drive(est, tmp_path, {
+        "CCTALLY_TEST_EVIDENCE_ROOT": str(root), DETAIL_ENV_NAME: str(target)})
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert _failure_class(root) == "product"
+    assert re.search(r"the private failure detail for run \S+ was not written "
+                     r"\(the file could not be opened: ENOENT\)", res.stderr), res.stderr
+    exported = [path.read_text(errors="replace")
+                for path in (_run_dirs(root)[0] / "export").rglob("*") if path.is_file()]
+    for text in [res.stderr, res.stdout] + exported:
+        assert "No such file" not in text

@@ -28,6 +28,19 @@ decision. (The schema-3 `retract` projects each retraction as an ordinary
 Rows are retained: nothing in this work prunes the table. The read is exact-
 window (spec D9) and an unavailable projection raises
 :class:`ProjectionUnavailable` rather than answering "no sample".
+
+#1015 (spec 5.1) adds the lineage facts beside them, on the same paths:
+
+* `claude_weekly_observation_index`, one row per admitted Claude usage
+  observation carrying a weekly reading (:func:`project_observation` live and
+  scratch; :class:`RebuildProjector` in the rebuild, which stages a record the
+  legacy normalization would stamp in `rebuild_weekly_observation_unstamped`
+  until :func:`attribute_staged_observations` knows the cutover account);
+* `claude_weekly_correction_history`, every decision of every reviewed op with
+  its decoded disposition, written by the same op applier;
+* `claude_weekly_correction_ops`, the op's journal coordinate, written by
+  :func:`record_correction_op` on the published paths only (live ingest and
+  the rebuild). A scratch replay never writes it.
 """
 from __future__ import annotations
 
@@ -63,7 +76,7 @@ _READ_WEEKLY = (
     "   AND NOT EXISTS (SELECT 1 FROM claude_weekly_observation_decisions AS d"
     "                    WHERE d.observation_id = s.observation_id"
     "                      AND d.disposition = 'hold')"
-    " ORDER BY s.requested_at_utc, s.observation_id"
+    " ORDER BY s.requested_at_utc"
 )
 _READ_FIVE_HOUR = (
     f"SELECT {_COLUMNS} FROM claude_oauth_samples AS s"
@@ -71,8 +84,38 @@ _READ_FIVE_HOUR = (
     "   AND s.requested_at_utc > ? AND s.five_hour_percent IS NOT NULL"
     "   AND unixepoch(s.captured_at_utc)"
     "       < MIN(unixepoch(s.five_hour_resets_at_utc), s.five_hour_window_key)"
-    " ORDER BY s.requested_at_utc, s.observation_id"
+    " ORDER BY s.requested_at_utc"
 )
+_INSERT_OBSERVATION = (
+    "INSERT OR IGNORE INTO claude_weekly_observation_index (observation_id,"
+    " account_key, captured_at_utc) VALUES (?, ?, ?)"
+)
+#: The rebuild's staging table for observations whose account is the cutover
+#: op's (known only after the read pass). Scratch-index only; dropped by
+#: :func:`attribute_staged_observations` before the inventory check.
+STAGING_TABLE = "rebuild_weekly_observation_unstamped"
+_CREATE_STAGING = (
+    "CREATE TABLE IF NOT EXISTS rebuild_weekly_observation_unstamped ("
+    " observation_id TEXT PRIMARY KEY, captured_at_utc TEXT NOT NULL)"
+)
+_INSERT_STAGED = (
+    "INSERT OR IGNORE INTO rebuild_weekly_observation_unstamped"
+    " (observation_id, captured_at_utc) VALUES (?, ?)"
+)
+_INSERT_HISTORY = (
+    "INSERT OR IGNORE INTO claude_weekly_correction_history (decision_op_id,"
+    " observation_id, disposition) VALUES (?, ?, ?)"
+)
+_INSERT_OP = (
+    "INSERT OR IGNORE INTO claude_weekly_correction_ops (decision_op_id,"
+    " op_segment, op_offset) VALUES (?, ?, ?)"
+)
+#: The reviewed weekly decision op kinds whose journal coordinate lineage
+#: records.
+DECISION_OP_KINDS = frozenset((
+    "claude_weekly_observation_decision",
+    "claude_weekly_observation_decision_v2",
+))
 _UPSERT_DECISION = (
     "INSERT INTO claude_weekly_observation_decisions (observation_id,"
     " disposition, decision_op_id) VALUES (?, ?, ?)"
@@ -132,6 +175,86 @@ def project_record(conn, rec) -> None:
         project_sample(conn, sample)
 
 
+def _weekly_observation_key(rec) -> "tuple[str, str] | None":
+    """``(observation_id, captured_at_utc)`` of one Claude usage observation
+    carrying a weekly reading — exactly the records
+    `_cctally_record._pipeline_claude_usage` derives — or None. The capture
+    instant is the recording path's fallback (`payload.captured_at`, else the
+    record's `at`) in canonical full-precision UTC; a record whose instants
+    are both unparsable projects nothing."""
+    if not isinstance(rec, dict) or rec.get("t") != "obs":
+        return None
+    if rec.get("provider") != "claude":
+        return None
+    payload = rec.get("payload")
+    if (not isinstance(payload, dict)
+            or "resets_at" not in payload or "weekly_percent" not in payload):
+        return None
+    import _cctally_record
+    if rec.get("src") not in _cctally_record._CLAUDE_OBS_SRCS:
+        return None
+    observation_id = rec.get("id")
+    if not isinstance(observation_id, str) or not observation_id:
+        return None
+    for value in (payload.get("captured_at"), rec.get("at")):
+        if not value:
+            continue
+        try:
+            return observation_id, _lib_oauth_samples.canonical_instant(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def project_observation(conn, rec, *, cutover_account=None) -> None:
+    """#1015 spec 5.1: project ``rec`` into `claude_weekly_observation_index`
+    on live ingest and the scratch replays, under the one attribution rule:
+    the stamp, else `unattributed` — except a record the legacy normalization
+    would stamp, which takes the cutover op's Claude account.
+
+    The scratch replays normalize before their hooks, so they never reach
+    that branch. Live ingest does NOT normalize an observation before the
+    pipeline, so it passes ``cutover_account`` (a zero-argument callable,
+    resolved at most once per cycle) and the index still agrees with the
+    rebuild's staged attribution. Idempotent under the primary key."""
+    key = _weekly_observation_key(rec)
+    if key is None:
+        return
+    import _cctally_journal
+    import _lib_accounts
+    account = rec.get("account") or _lib_accounts.UNATTRIBUTED
+    if (cutover_account is not None
+            and _cctally_journal.needs_cutover_attribution(rec)):
+        account = cutover_account()
+    conn.execute(_INSERT_OBSERVATION, (key[0], account, key[1]))
+
+
+def attribute_staged_observations(conn, claude_account: str) -> int:
+    """Move the rebuild's staged observations into the index under the
+    cutover op's Claude account (``claude_account``, `unattributed` when the
+    journal has none), then drop the staging table. One transaction; a no-op
+    when nothing was staged. Returns the number of rows moved."""
+    present = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (STAGING_TABLE,)).fetchone()
+    if present is None:
+        return 0
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        moved = conn.execute(
+            "INSERT OR IGNORE INTO claude_weekly_observation_index"
+            " (observation_id, account_key, captured_at_utc)"
+            " SELECT observation_id, ?, captured_at_utc"
+            " FROM rebuild_weekly_observation_unstamped",
+            (claude_account,)).rowcount
+        conn.execute("DROP TABLE rebuild_weekly_observation_unstamped")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return moved
+
+
 class RebuildProjector:
     """The apply-only rebuild's leg of the projection: its single read pass
     offers every admitted record, and samples are projected into the scratch
@@ -143,30 +266,54 @@ class RebuildProjector:
     def __init__(self, conn) -> None:
         self._conn = conn
         self._pending: list = []
+        # #1015: observation-index rows, ``(statement, params)``, flushed in
+        # the same bounded batches.
+        self._observations: list = []
+        self._staging_created = False
         self.projected = 0
 
     def offer(self, rec) -> None:
         sample = sample_from_record(rec)
-        if sample is None:
-            return
-        self._pending.append(sample)
-        if len(self._pending) >= self.BATCH:
+        if sample is not None:
+            self._pending.append(sample)
+        key = _weekly_observation_key(rec)
+        if key is not None:
+            # The record is not yet normalized: a record the legacy
+            # normalization would stamp takes the cutover account, which only
+            # the end of the pass knows, so it is staged; every other record
+            # keeps its stamp or `unattributed` (spec 5.1's three cases).
+            import _cctally_journal
+            if _cctally_journal.needs_cutover_attribution(rec):
+                self._observations.append((_INSERT_STAGED, key))
+            else:
+                import _lib_accounts
+                self._observations.append(
+                    (_INSERT_OBSERVATION,
+                     (key[0], rec.get("account") or _lib_accounts.UNATTRIBUTED,
+                      key[1])))
+        if len(self._pending) + len(self._observations) >= self.BATCH:
             self.flush()
 
     def flush(self) -> None:
-        if not self._pending:
+        if not self._pending and not self._observations:
             return
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             for sample in self._pending:
                 project_sample(conn, sample)
+            for statement, params in self._observations:
+                if statement is _INSERT_STAGED and not self._staging_created:
+                    conn.execute(_CREATE_STAGING)
+                    self._staging_created = True
+                conn.execute(statement, params)
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
         self.projected += len(self._pending)
         self._pending = []
+        self._observations = []
 
 
 def apply_weekly_observation_decision_op(conn, record) -> None:
@@ -186,6 +333,11 @@ def apply_weekly_observation_decision_op(conn, record) -> None:
     op_id = record.get("id")
     if not isinstance(op_id, str):
         return
+    # #1015 spec 5.1: the history carries the DECODED disposition, so a
+    # schema-3 retraction (projected as an ordinary `hold`) is `retract`.
+    retractions = payload.get("weekly_axis_retractions") if version == 3 else None
+    retracted = (frozenset(r for r in retractions if isinstance(r, str))
+                 if isinstance(retractions, list) else frozenset())
     for item in decisions:
         if not isinstance(item, dict):
             continue
@@ -195,6 +347,28 @@ def apply_weekly_observation_decision_op(conn, record) -> None:
                 and disposition in _DISPOSITIONS):
             conn.execute(_UPSERT_DECISION,
                          (observation_id, disposition, op_id))
+            conn.execute(_INSERT_HISTORY, (
+                op_id, observation_id,
+                "retract" if (disposition == "hold"
+                              and observation_id in retracted)
+                else disposition))
+
+
+def record_correction_op(conn, record, coordinate) -> None:
+    """#1015 spec 5.1: record where a reviewed weekly decision op sits in the
+    journal — ``coordinate`` is the END ``(segment, offset)`` of its line, as
+    the published path read it. Live ingest and the rebuild call this; a
+    scratch replay has no coordinate and never does. Idempotent."""
+    if coordinate is None or not isinstance(record, dict):
+        return
+    payload = record.get("payload")
+    if (not isinstance(payload, dict)
+            or payload.get("kind") not in DECISION_OP_KINDS):
+        return
+    op_id = record.get("id")
+    if not isinstance(op_id, str) or not op_id:
+        return
+    conn.execute(_INSERT_OP, (op_id, str(coordinate[0]), int(coordinate[1])))
 
 
 def read_samples(conn, *, account_key: str,
@@ -232,6 +406,10 @@ def read_samples(conn, *, account_key: str,
         rows = conn.execute(sql, (account_key, key, after)).fetchall()
     except sqlite3.OperationalError as exc:
         raise ProjectionUnavailable(str(exc)) from exc
+    # #1019: the window's index serves the `q` order; equal-`q` ties are
+    # ordered here, because an `observation_id` term in the SQL ORDER BY needs
+    # a temporary B-tree, which the render path's plan policy refuses (#902).
+    rows.sort(key=lambda row: (row[2], row[1]))
     return tuple(_lib_oauth_samples.OAuthSample(*row) for row in rows)
 
 

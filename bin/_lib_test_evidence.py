@@ -3046,3 +3046,541 @@ def build_known_tokens(repo_root: str) -> frozenset:
             _register(tokens, parts[1])
 
     return frozenset(t for t in tokens if not _is_forbidden_word(t))
+
+
+# ------------------------------------------ the private failure detail (#1011)
+#
+# The console block and `export/failure-context.txt` are scrubbed, because both
+# leave the machine. Under the runner supervisor the raw logs they summarise
+# live only in the run directory, which the supervisor removes when the run
+# ends, so a failing node's assertion and traceback used to be lost with it.
+# This section renders the same failure UNSCRUBBED and bounded, for a private
+# file the supervisor names and keeps in its kept-log store. Nothing here
+# changes the scrub: the transformer, its placeholders and the validator above
+# are untouched, and these functions never feed the console or the export.
+#
+# Budgets are BYTES, filled tail first: the assertion, the final frame and its
+# location are at the end of a traceback, so they are the last thing a bound
+# can remove. Lines are parsed uncut, so a long header keeps its closing
+# delimiter, and every line is cut to MAX_LINE_BYTES before it is counted or
+# rendered.
+
+DETAIL_MAX_BYTES = 1048576
+DETAIL_MAX_SECTIONS = 50
+DETAIL_SECTION_FLOOR_BYTES = 8192
+DETAIL_TRACEBACK_TAIL_LINES = 240
+DETAIL_TRACEBACK_HEAD_LINES = 60
+DETAIL_CAPTURED_TAIL_LINES = 50
+DETAIL_SUMMARY_LINE_CAP = 200
+DETAIL_NAMES_CAP = 50
+PYTEST_DETAIL_SUBJECTS = ("pytest", "benchmark")
+
+_DETAIL_OMISSION = "[… %d lines omitted …]"
+
+# pytest draws banners with `=` and section headers with `_` on both sides,
+# down to ONE delimiter when the title is long, so neither check may demand a
+# run of three. Both are plain string scans, linear in the line's length: the
+# lines are parsed uncut, and a backtracking pattern such as
+# `^_+ (.*\S.*?) _+$` is quadratic on a long line that opens like a header.
+_PYTEST_CAPTURED_RE = re.compile(
+    r"^-+ Captured (?:stdout|stderr|log) (?:setup|call|teardown) -+$"
+)
+_PYTEST_COUNTER_LINE_RE = re.compile(
+    r"^(?:=+ )?\d+ [a-z]+(?:, \d+ [a-z]+)* in \d+(?:\.\d+)?s\b.*?(?: =+)?$"
+)
+_PYTEST_SLOWEST_RE = re.compile(r"^slowest(?: \d+)? durations$")
+_PYTEST_SUMMARY_TITLE = "short test summary info"
+_PYTEST_REGION_TITLES = frozenset({"FAILURES", "ERRORS"})
+_PYTEST_CLOSING_TITLES = frozenset({
+    "PASSES", "XFAILURES", "XPASSES", "warnings summary",
+    "rerun test summary info", _PYTEST_SUMMARY_TITLE,
+})
+_PYTEST_SUMMARY_NODE_RE = re.compile(r"^(?P<kind>FAILED|ERROR) (?P<rest>\S.*)$")
+
+
+def _delimited_title(line, delimiter):
+    """The title of `<delim>+ <title> <delim>+`, unstripped, or None.
+
+    The same grammar as `^D+ (?P<title>.+?) D+$`: a full run of the delimiter,
+    one space, a non-empty title, one space and a full run to the end. Each
+    run must be the whole run, because the character after it must be the
+    space, so the title is exactly what lies between the two runs and their
+    spaces.
+    """
+    if not line.startswith(delimiter) or not line.endswith(delimiter):
+        return None
+    head = len(line) - len(line.lstrip(delimiter))
+    tail = len(line) - len(line.rstrip(delimiter))
+    start, end = head + 1, len(line) - tail - 1
+    if start >= end or line[head] != " " or line[end] != " ":
+        return None
+    return line[start:end]
+
+
+def _pytest_banner_title(line):
+    title = _delimited_title(line, "=")
+    return None if title is None else title.strip()
+
+
+def _pytest_header_title(line):
+    """A section header's title; None for a non-header and for pytest's frame
+    separator `_ _ _ _`, whose title holds only delimiters and spaces."""
+    title = _delimited_title(line, "_")
+    if title is None or not title.replace("_", "").strip():
+        return None
+    return title.strip()
+
+
+def plain_pytest_node_id(node_id: str) -> str:
+    """`node_id` without the `@<group>` suffix `--dist loadgroup` adds.
+
+    xdist appends `@<group>` to a grouped node's id, and the short test
+    summary prints that id, while the section header carries the plain
+    title. The rule is xdist's own, as in tests/_pytest_durations_plugin.py
+    and the failed-node parser in bin/cctally-test-all: the last `@` must
+    follow the last `]` and the last `::`, so an `@` inside a parameter id or
+    a directory name is kept.
+    """
+    at = node_id.rfind("@")
+    if at > node_id.rfind("]") and at > node_id.rfind("::"):
+        return node_id[:at]
+    return node_id
+
+
+def _detail_line_bytes(line) -> int:
+    return len(line.encode("utf-8", "replace")) + 1
+
+
+def _detail_size(lines) -> int:
+    return sum(_detail_line_bytes(line) for line in lines)
+
+
+def cut_detail_line(line: str) -> str:
+    """One line cut to MAX_LINE_BYTES UTF-8 bytes at a character boundary.
+
+    Unlike `bound_extract_lines`, which replaces an oversized line whole
+    because a prefix of an unclassified line is still unclassified, the
+    private detail keeps the prefix: legibility is its purpose.
+    """
+    raw = line.encode("utf-8", "replace")
+    if len(raw) <= MAX_LINE_BYTES:
+        return line
+    kept = raw[:MAX_LINE_BYTES].decode("utf-8", "ignore")
+    dropped = len(raw) - len(kept.encode("utf-8", "replace"))
+    return "%s … [%d bytes truncated]" % (kept, dropped)
+
+
+def pytest_node_title(node_id: str) -> str:
+    """The section title pytest prints for a node id.
+
+    Only the part before the first `[` is split on `::`; the parameter suffix
+    is kept verbatim, because a parameter id may itself contain `::`.
+    """
+    bracket = node_id.find("[")
+    base, suffix = (node_id, "") if bracket < 0 else (node_id[:bracket], node_id[bracket:])
+    parts = base.split("::")
+    if len(parts) < 2:
+        return node_id
+    return ".".join(parts[1:]) + suffix
+
+
+def _summary_node_titles(kind, node):
+    titles = set()
+    if kind == "ERROR":
+        titles.add("ERROR collecting " + node)
+    if "::" in node.split("[", 1)[0]:
+        title = pytest_node_title(node)
+        titles.update({
+            title, "ERROR at setup of " + title, "ERROR at teardown of " + title,
+        })
+    return titles
+
+
+def _closing_banner(line, title) -> bool:
+    if _PYTEST_COUNTER_LINE_RE.match(line):
+        return True
+    if title is None:
+        return False
+    return title in _PYTEST_CLOSING_TITLES or bool(_PYTEST_SLOWEST_RE.match(title))
+
+
+def extract_pytest_failure_sections(lines) -> dict:
+    """pytest's failing sections, parsed from one log.
+
+    The summary is the region after the LAST `short test summary info`
+    banner, because pytest prints it after every report section and any
+    earlier one is a test's captured text. Captured output is printed
+    unescaped, so a header counts only when its title names a node that
+    summary lists, and a closing banner (pytest's own titles only) closes a
+    region only when no genuine header follows it before the summary.
+    Without a summary (a truncated log) every syntactic header in a region
+    counts.
+
+    Returns `sections` (each `{"title", "traceback", "captured"}`, every
+    captured part starting with its sub-header), `summary`, `summary_start`
+    (the index of that last summary banner, or None), `summary_nodes`
+    (`(kind, node_id)`, each id without xdist's `@<group>` suffix, the form
+    pytest accepts back), `unparsed_nodes` (summary nodes no section names,
+    in the same plain form), `has_region` and `empty_region` (a
+    FAILURES/ERRORS region that yielded no section).
+    """
+    lines = list(lines)
+    banners = {}
+    for idx, line in enumerate(lines):
+        title = _pytest_banner_title(line)
+        if title is not None:
+            banners[idx] = title
+
+    summary_at = None
+    for idx in sorted(banners, reverse=True):
+        if banners[idx] == _PYTEST_SUMMARY_TITLE:
+            summary_at = idx
+            break
+    summary = []
+    summary_nodes = []
+    limit = len(lines)
+    if summary_at is not None:
+        end = next((i for i in sorted(banners) if i > summary_at), len(lines))
+        summary = lines[summary_at + 1:end]
+        limit = summary_at
+        for line in summary:
+            match = _PYTEST_SUMMARY_NODE_RE.match(line)
+            if match:
+                raw = match.group("rest").split(" - ", 1)[0].strip()
+                # xdist's group suffix exists only on an item id; a collection
+                # error names a bare path, which may itself hold an `@`.
+                node = plain_pytest_node_id(raw) if "::" in raw else raw
+                if node:
+                    summary_nodes.append((match.group("kind"), node))
+    valid = None
+    if summary_at is not None:
+        valid = set()
+        for kind, node in summary_nodes:
+            valid |= _summary_node_titles(kind, node)
+
+    genuine = {}
+    for idx in range(limit):
+        title = _pytest_header_title(lines[idx])
+        if title is not None and (valid is None or title in valid):
+            genuine[idx] = title
+    last_genuine = max(genuine) if genuine else -1
+
+    sections = []
+    current = None
+    in_region = has_region = empty_region = False
+    region_sections = 0
+    for idx in range(limit):
+        line = lines[idx]
+        title = banners.get(idx)
+        if title in _PYTEST_REGION_TITLES:
+            if not in_region:
+                in_region = has_region = True
+                region_sections = 0
+                current = None
+                continue
+            # ERRORS then FAILURES: a real transition is followed at once by
+            # a genuine header; anything else is a test's captured text.
+            if idx + 1 in genuine:
+                empty_region = empty_region or region_sections == 0
+                region_sections = 0
+                current = None
+                continue
+        elif _closing_banner(line, title):
+            if not in_region:
+                continue
+            if last_genuine <= idx:
+                empty_region = empty_region or region_sections == 0
+                in_region = False
+                current = None
+                continue
+        if not in_region:
+            continue
+        if idx in genuine:
+            current = {"title": genuine[idx], "lines": []}
+            sections.append(current)
+            region_sections += 1
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    if in_region and region_sections == 0:
+        empty_region = True
+
+    parsed_sections = []
+    for section in sections:
+        traceback, captured = [], []
+        for line in section["lines"]:
+            if _PYTEST_CAPTURED_RE.match(line):
+                captured.append([line])
+            elif captured:
+                captured[-1].append(line)
+            else:
+                traceback.append(line)
+        parsed_sections.append(
+            {"title": section["title"], "traceback": traceback, "captured": captured}
+        )
+
+    titles = {section["title"] for section in parsed_sections}
+    unparsed = []
+    by_node = {}
+    for kind, node in summary_nodes:
+        by_node.setdefault(node, set()).update(_summary_node_titles(kind, node))
+    for node, node_titles in by_node.items():
+        if not node_titles & titles:
+            unparsed.append(node)
+    return {
+        "sections": parsed_sections,
+        "summary": summary,
+        "summary_start": summary_at,
+        "summary_nodes": summary_nodes,
+        "unparsed_nodes": unparsed,
+        "has_region": has_region,
+        "empty_region": empty_region,
+    }
+
+
+class _DetailFill:
+    """A selection of line indices under a byte budget.
+
+    The cost counts every selected line and one omission line per gap, each
+    priced at the longest omission line this list can produce, so the
+    rendered output never exceeds the budget the selection was admitted
+    under. The gap count is maintained exactly as indices are added.
+    """
+
+    def __init__(self, lines, budget):
+        self.lines = lines
+        self.budget = budget
+        self.chosen = set()
+        self.used = 0
+        self.gaps = 1 if lines else 0
+        self.gap_cost = _detail_line_bytes(_DETAIL_OMISSION % len(lines))
+
+    def cost(self) -> int:
+        return self.used + self.gaps * self.gap_cost
+
+    def affordable(self) -> bool:
+        return self.cost() <= self.budget
+
+    def add(self, idx) -> bool:
+        if idx in self.chosen:
+            return True
+        left = idx == 0 or (idx - 1) in self.chosen
+        right = idx == len(self.lines) - 1 or (idx + 1) in self.chosen
+        gaps = self.gaps + (-1 if left and right else 0 if left or right else 1)
+        used = self.used + _detail_line_bytes(self.lines[idx])
+        if used + gaps * self.gap_cost > self.budget:
+            return False
+        self.chosen.add(idx)
+        self.used, self.gaps = used, gaps
+        return True
+
+    def add_all(self, indices) -> bool:
+        saved = (set(self.chosen), self.used, self.gaps)
+        for idx in indices:
+            if not self.add(idx):
+                self.chosen, self.used, self.gaps = saved
+                return False
+        return True
+
+    def render(self):
+        if not self.affordable():
+            return []
+        out, gap = [], 0
+        for idx, line in enumerate(self.lines):
+            if idx in self.chosen:
+                if gap:
+                    out.append(_DETAIL_OMISSION % gap)
+                    gap = 0
+                out.append(line)
+            else:
+                gap += 1
+        if gap:
+            out.append(_DETAIL_OMISSION % gap)
+        return out
+
+
+def _render_detail_section(section, share):
+    header = cut_detail_line("---- %s ----" % section["title"])
+    if share < _detail_line_bytes(header):
+        return []
+    traceback = section["traceback"]
+    body = list(traceback)
+    for part in section["captured"]:
+        body.extend(part)
+    fill = _DetailFill(body, share - _detail_line_bytes(header))
+    if not fill.affordable():
+        return [header]
+    count = len(traceback)
+    # (2) the traceback's tail: the final frame, its `E` lines, its location.
+    for idx in range(count - 1, max(count - DETAIL_TRACEBACK_TAIL_LINES, 0) - 1, -1):
+        if not fill.add(idx):
+            break
+    # (3) the traceback's head: the test's own frame.
+    for idx in range(min(DETAIL_TRACEBACK_HEAD_LINES, count)):
+        if not fill.add(idx):
+            break
+    # (4) each captured part's sub-header and tail, latest output first.
+    offset = count
+    for part in section["captured"]:
+        if fill.add(offset):
+            low = max(offset + len(part) - DETAIL_CAPTURED_TAIL_LINES, offset + 1)
+            for idx in range(offset + len(part) - 1, low - 1, -1):
+                if not fill.add(idx):
+                    break
+        offset += len(part)
+    return [header] + fill.render()
+
+
+def _render_detail_windows(lines, budget):
+    """A harness's marker windows, raw, in order, within `budget` bytes and
+    PER_SUBJECT_LINE_CAP lines. The window that no longer fits keeps its
+    marker line, up to WINDOW_BEFORE_LINES before it, and what fits after;
+    when even its marker does not fit, nothing of it is kept. Windows are
+    chosen on the uncut lines and rendered cut."""
+    fill = _DetailFill([cut_detail_line(line) for line in lines], budget)
+    if not fill.affordable():
+        return []
+    kept = 0
+    for win in select_failure_windows(lines, failing=True):
+        span = [i for i in range(win["start"], win["end"] + 1) if i not in fill.chosen]
+        if kept + len(span) <= PER_SUBJECT_LINE_CAP and fill.add_all(span):
+            kept += len(span)
+            continue
+        marker = win["marker_index"] if win["marker_index"] is not None else win["start"]
+        if marker not in fill.chosen:
+            if kept >= PER_SUBJECT_LINE_CAP or not fill.add(marker):
+                break
+            kept += 1
+        before = range(marker - 1, max(win["start"], marker - WINDOW_BEFORE_LINES) - 1, -1)
+        after = range(marker + 1, win["end"] + 1)
+        for group in (before, after):
+            for idx in group:
+                if kept >= PER_SUBJECT_LINE_CAP or not fill.add(idx):
+                    break
+                kept += 1
+        break
+    return fill.render()
+
+
+def _names_line(template, names):
+    shown = list(names[:DETAIL_NAMES_CAP])
+    listed = ", ".join(shown)
+    if len(names) > len(shown):
+        listed += ", …"
+    return cut_detail_line(template % (len(names), listed))
+
+
+def _cut_section(section):
+    return {
+        "title": section["title"],
+        "traceback": [cut_detail_line(line) for line in section["traceback"]],
+        "captured": [[cut_detail_line(line) for line in part]
+                     for part in section["captured"]],
+    }
+
+
+def _render_detail_pytest(lines, budget):
+    """One pytest log, parsed from its uncut `lines` and rendered cut."""
+    parsed = extract_pytest_failure_sections(lines)
+    sections = parsed["sections"]
+    out = []
+    remaining = budget
+    render = 0
+    if sections:
+        # At least one section, so a share below the floor still keeps the
+        # first failure's assertion rather than nothing but names.
+        render = min(len(sections), DETAIL_MAX_SECTIONS,
+                     max(1, budget // DETAIL_SECTION_FLOOR_BYTES))
+    omitted_line = None
+    if len(sections) > render:
+        omitted_line = _names_line(
+            "[%d more failing sections omitted: %s]",
+            [section["title"] for section in sections[render:]],
+        )
+        if _detail_line_bytes(omitted_line) > remaining:
+            omitted_line = None
+        else:
+            remaining -= _detail_line_bytes(omitted_line)
+    fallback = (bool(parsed["unparsed_nodes"]) or not parsed["has_region"]
+                or parsed["empty_region"])
+    slots = render + (1 if fallback else 0)
+    for k, section in enumerate(sections[:render]):
+        part = _render_detail_section(_cut_section(section),
+                                      max(remaining, 0) // (slots - k))
+        remaining -= _detail_size(part)
+        out.extend(part)
+    if omitted_line is not None:
+        out.append(omitted_line)
+    if fallback:
+        if parsed["unparsed_nodes"]:
+            note = _names_line(
+                "[no failure section was parsed for %d failing nodes: %s; "
+                "raw failure windows follow]",
+                parsed["unparsed_nodes"],
+            )
+        else:
+            note = ("[no failure section was parsed from this log; raw failure "
+                    "windows follow]")
+        if _detail_line_bytes(note) <= remaining:
+            remaining -= _detail_line_bytes(note)
+            # The summary renders once, below, so the raw windows stop at its
+            # banner rather than repeat its FAILED lines.
+            raw = lines if parsed["summary_start"] is None else lines[:parsed["summary_start"]]
+            windows = _render_detail_windows(raw, remaining)
+            remaining -= _detail_size(windows)
+            out.append(note)
+            out.extend(windows)
+    summary = [cut_detail_line(line) for line in parsed["summary"]]
+    if summary and remaining > 0:
+        fill = _DetailFill(summary, remaining)
+        for idx in range(min(len(summary), DETAIL_SUMMARY_LINE_CAP)):
+            if not fill.add(idx):
+                break
+        out.extend(fill.render())
+    return out
+
+
+def build_private_failure_detail(subjects, *, run_id: str,
+                                 max_bytes: int = DETAIL_MAX_BYTES):
+    """The private, UNSCRUBBED failure detail of one aggregator invocation.
+
+    `subjects` is a sequence of `(name, log_name, lines)` in the order they
+    failed. Returns the block's lines (no newlines) whose UTF-8 size, one
+    newline per line, is at most `max_bytes`. Pytest legs render first, then
+    harnesses; each subject's share is the remaining budget divided by the
+    subjects still to render, so none can starve a later one.
+
+    PRIVATE BY CONTRACT: never print this to the console or write it into the
+    evidence export. Its only consumer is the supervisor-named private file.
+    """
+    entries, seen = [], set()
+    for name, log_name, lines in subjects:
+        if name in seen:
+            continue
+        seen.add(name)
+        entries.append((name, log_name, lines))
+    ordered = [e for p in PYTEST_DETAIL_SUBJECTS for e in entries if e[0] == p]
+    ordered += [e for e in entries if e[0] not in PYTEST_DETAIL_SUBJECTS]
+    opening = (
+        "==== cctally-test-all run %s: unsanitized failure detail, %d failed "
+        "subjects (private: never printed to the console or exported) ===="
+        % (run_id, len(ordered))
+    )
+    closing = "==== end of run %s ====" % run_id
+    out = [opening]
+    remaining = max_bytes - _detail_line_bytes(opening) - _detail_line_bytes(closing)
+    for k, (name, log_name, lines) in enumerate(ordered):
+        share = max(remaining, 0) // (len(ordered) - k)
+        header = cut_detail_line("==== subject %s (%s) ====" % (name, log_name))
+        if share < _detail_line_bytes(header):
+            continue
+        budget = share - _detail_line_bytes(header)
+        if name in PYTEST_DETAIL_SUBJECTS:
+            body = _render_detail_pytest(lines, budget)
+        else:
+            body = _render_detail_windows(lines, budget)
+        part = [header] + body
+        remaining -= _detail_size(part)
+        out.extend(part)
+    out.append(closing)
+    return out

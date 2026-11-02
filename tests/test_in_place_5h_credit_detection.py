@@ -161,6 +161,7 @@ def _arm_5h_source_state(
     source: str = "statusline",
     account_key: str = "unattributed",
     pending_observation_id: str = "o:seeded-descent",
+    pending_captured_at_utc: str | None = None,
 ) -> None:
     """Seed one contributor's ARMED five-hour credit state (#769 S2 §3, #751).
 
@@ -182,17 +183,23 @@ def _arm_5h_source_state(
     remove. ``_ARMED_AT`` is fixed at import and set thirty seconds early, so it
     precedes every instant any test seeds and its floor can never land after
     one.
+
+    ``pending_captured_at_utc`` (#943 spec 4.2.1) is the arming observation's
+    capture second, the credit's exact boundary; it defaults to the arming
+    instant, which precedes every seeded row for the same reason.
     """
     conn.execute(
         "INSERT INTO five_hour_credit_confirmation_state "
         "(account_key, five_hour_window_key, source, baseline_pct, "
-        " pending_low_pct, pending_at_utc, pending_observation_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        " pending_low_pct, pending_at_utc, pending_observation_id, "
+        " pending_captured_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(account_key, five_hour_window_key, source) DO UPDATE SET "
         " baseline_pct = excluded.baseline_pct, "
         " pending_low_pct = excluded.pending_low_pct, "
         " pending_at_utc = excluded.pending_at_utc, "
-        " pending_observation_id = excluded.pending_observation_id",
+        " pending_observation_id = excluded.pending_observation_id, "
+        " pending_captured_at_utc = excluded.pending_captured_at_utc",
         (
             account_key,
             int(five_hour_window_key),
@@ -201,6 +208,7 @@ def _arm_5h_source_state(
             float(pending_low_pct),
             pending_at_utc or _ARMED_AT,
             pending_observation_id,
+            pending_captured_at_utc or pending_at_utc or _ARMED_AT,
         ),
     )
 
@@ -746,6 +754,19 @@ def test_same_slot_collision_absorbed_by_unique(ns, tmp_path, monkeypatch):
         e = dict(events[0])
         assert round(e["prior_percent"], 1) == 28.0
         assert round(e["post_percent"], 1) == 8.0
+        # #943 spec 4.2.3/4.2.5: the absorbed second credit installs no
+        # boundary companion and runs no cleanup. Detects a cleanup that is
+        # not gated on the credit insert's rowcount: it retired the genuine
+        # 14% climb (inside the second descent's band) live, although no evt
+        # is journaled for the absorbed credit, so a rebuild restored it.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_credit_boundaries"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM weekly_usage_snapshots "
+            " WHERE five_hour_window_key = ? AND five_hour_percent = 14.0",
+            (window_key,),
+        ).fetchone()[0] == 1, "the collision retired the genuine 14% reading"
     finally:
         conn.close()
 
@@ -1258,9 +1279,18 @@ def test_5h_self_heal_probe_scoped_to_active_segment(ns, tmp_path):
 
 def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
     """Round-3 / memory ``project_dedup_must_not_gate_side_effects.md``:
-    pivots (HWM force-write + stale-replica DELETE) MUST run even when
-    the ``INSERT OR IGNORE`` returns ``rowcount == 0`` because a prior
-    crashed invocation already committed the event row.
+    the HWM force-write pivot MUST run even when the ``INSERT OR IGNORE``
+    returns ``rowcount == 0`` because the event row already exists.
+
+    #943 spec 4.2.3 narrows this to the HWM projection. The stale-replica
+    cleanup (retirement + DELETE) and the suppression capture are now gated
+    on the insert having taken effect: the crash this test was written for
+    (an event row committed BEFORE its cleanup) cannot occur any more, since
+    the credit, its boundary companion and its cleanup commit in one
+    transaction, and a crashed cycle's journaled ``fhcb``/``fhc`` evts are
+    folded WITH their suppression by step 4a of the next ingest. An ungated
+    cleanup on an absorbed insert mutates rows no journaled evt names, a
+    live-only effect a rebuild reverts. The original rationale follows.
 
     Failure mode the user could hit before this fix: tick N detects the
     credit, INSERTs the event row, ``conn.commit()`` lands — and then
@@ -1398,9 +1428,10 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
         f"{hwm_parts[1]} (pre-fix bug: stays at 28.0)"
     )
 
-    # Assertion 3: stale-replica DELETE ran — no rows in
-    # weekly_usage_snapshots at the pre-credit value captured AT-or-
-    # AFTER the pre-committed effective_iso.
+    # Assertion 3 (#943 spec 4.2.3, inverted): the absorbed insert ran NO
+    # cleanup and installed no companion — the 28.0 row captured at or after
+    # the pre-committed slot is untouched. Detects an ungated cleanup, which
+    # retires rows the existing (journaled) credit's suppression never named.
     conn = ns["open_db"]()
     try:
         stale_count = conn.execute(
@@ -1410,9 +1441,12 @@ def test_pivots_run_when_event_row_already_committed(ns, tmp_path):
             "  AND round(five_hour_percent, 1) = 28.0",
             (window_key, precommitted_iso),
         ).fetchone()["c"]
-        assert stale_count == 0, (
-            "stale-replica DELETE pivot must run on recovery tick"
+        assert stale_count == 1, (
+            "an absorbed credit insert must not run the stale-replica cleanup"
         )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_credit_boundaries"
+        ).fetchone()[0] == 0
         # Original pre-credit seed (well before effective_iso)
         # survives.
         original = conn.execute(
@@ -1555,8 +1589,14 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
     ``project_dedup_must_not_gate_side_effects.md``): when a recovery
     tick pair-matches the already-stored event row (genuine replay),
     the dedup pre-check correctly suppresses the duplicate INSERT —
-    but the pivots (HWM force-write + stale-replica DELETE) MUST
-    still fire.
+    but the HWM force-write pivot MUST still fire.
+
+    #943 spec 4.2.3: the stale-replica cleanup no longer does. A pair-check
+    duplicate inserts no credit and journals no evt, so a cleanup here would
+    be a live-only mutation; the stored credit's own journaled suppression is
+    what removes its replicas, on every path (see
+    ``test_pivots_run_when_event_row_already_committed``). The original
+    rationale follows.
 
     Pre-fix (pivots gated on ``if not is_dup:``): a crash-recovery
     tick where the original credit's event row already exists AND
@@ -1673,12 +1713,9 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
         f"tick; got {hwm_parts[1]} (pre-fix bug: stays at 20.0)"
     )
 
-    # Assertion 3: stale-replica DELETE ran (idempotent — the
-    # pre-credit snapshot we staged with captured_at = "now" matches
-    # the DELETE predicate `captured_at >= effective_iso AND
-    # five_hour_percent = prior_5h_pct = 20.0`). After the pivot,
-    # zero rows at the pre-credit value should remain at-or-after the
-    # effective_iso slot.
+    # Assertion 3 (#943 spec 4.2.3, inverted): the pair-check duplicate
+    # ran NO cleanup — the staged 20.0 row is untouched. Detects a cleanup
+    # not gated on a credit insert taking effect.
     conn = ns["open_db"]()
     try:
         stale_count = conn.execute(
@@ -1688,9 +1725,8 @@ def test_replay_with_pair_match_still_runs_pivots(ns, tmp_path):
             "  AND round(five_hour_percent, 1) = 20.0",
             (window_key, precommitted_iso),
         ).fetchone()["c"]
-        assert stale_count == 0, (
-            "stale-replica DELETE pivot must run on pair-match recovery "
-            "tick"
+        assert stale_count == 1, (
+            "a pair-check duplicate must not run the stale-replica cleanup"
         )
     finally:
         conn.close()
@@ -1795,6 +1831,12 @@ def test_characterization_r2_direct_record_usage_stale_high_re_raise_mints_a_sec
     resets_iso, resets_epoch_str, resets_epoch = _future_5h_block_window()
     window_key = ns["_canonical_5h_window_key"](resets_epoch)
     base_as_of = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    # The CAPTURE clock follows each tick's controlled instant too. An open
+    # block ends at its window's latest capture, an equal-second tie broken by
+    # logical identity (#956 class 1), so wall-clock captures inside one second
+    # would end the block at whichever reading's id sorts last rather than at
+    # the last reading this sequence records.
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
 
     def _tick(five_hour_percent: float, *, offset_seconds: int) -> None:
         """One `record-usage` tick at its own controlled capture instant."""

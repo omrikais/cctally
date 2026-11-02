@@ -62,7 +62,8 @@ def _cctally():
 #: outside the stored regime's coefficient era (#978 spec 4.6).
 ATTRIBUTION_CAUSES = ("account-not-resolved", "calibration-absent",
                       "regime-boundary", "unsupported-composition",
-                      "no-local-history", "unvalidated-coefficient-era")
+                      "no-local-history", "unvalidated-coefficient-era",
+                      "recalibration-needed")
 
 #: The three bases a row or a run can carry.
 ATTRIBUTION_BASES = ("modelled", "cost-share", "withheld")
@@ -198,7 +199,8 @@ def resolve_attribution_account_gate(*, account_key, decorated):
     return None, None
 
 
-def resolve_week_attribution(regime, records, *, week_start, week_end):
+def resolve_week_attribution(regime, records, *, week_start, week_end,
+                             absent_cause="calibration-absent"):
     """Whether one subscription week can be modelled, and at what rate.
 
     A week whose entries do not all fall inside the regime's half-open
@@ -214,7 +216,10 @@ def resolve_week_attribution(regime, records, *, week_start, week_end):
     not this one.
     """
     if regime is None:
-        return WeekAttribution("cost-share", "calibration-absent", None)
+        # #1015: a calibration that exists and was refused keeps its own
+        # cause (`recalibration-needed`, or its attempt's status) rather than
+        # reading as absent.
+        return WeekAttribution("cost-share", absent_cause, None)
     if week_start < regime.effective_from:
         return WeekAttribution("cost-share", "regime-boundary", None)
     if regime.effective_until is not None \
@@ -288,6 +293,9 @@ _ATTRIBUTION_CAUSE_COPY: dict = {
     "unvalidated-coefficient-era":
         "the week is not inside the coefficient era the calibration's token "
         "weights are validated for",
+    "recalibration-needed":
+        "the stored calibration was fitted before a correction to its "
+        "inputs; run cctally quota to recalibrate",
     RESIDUAL_MISALIGNED:
         "the account, the window or the population does not align",
     RESIDUAL_OBSERVED_ABSENT:
@@ -301,7 +309,14 @@ _ATTRIBUTION_CAUSE_COPY: dict = {
 def _cause_copy(cause) -> str:
     if cause is None:
         return "no cause stated"
-    return _ATTRIBUTION_CAUSE_COPY.get(cause, str(cause))
+    copy = _ATTRIBUTION_CAUSE_COPY.get(cause)
+    if copy is None:
+        # #1015: a refused calibration may state its recalibration attempt's
+        # status, a member of the quota kernel's cause vocabulary, whose
+        # sentence the shared copy table owns.
+        copy = _cctally()._load_sibling("_lib_quota_copy")._LONG_FORM.get(
+            str(cause))
+    return copy if copy is not None else str(cause)
 
 
 def render_attribution_footer(totals, *, basis, cause) -> "list[str]":
@@ -977,11 +992,21 @@ def cmd_project(args: argparse.Namespace) -> int:
         account_key=acct_key, decorated=_decorated,
     )
     attribution_regime = None
+    # #1015 spec 5.4: the WHOLE read is kept, so a refused calibration states
+    # its cause rather than `calibration-absent`.
+    absent_cause = "calibration-absent"
     if run_basis is None:
         try:
             qcg = c._load_sibling("_cctally_quota_calibration")
-            attribution_regime = qcg.read_calibration_file(
-                account_key=acct_key).regime
+            attribution_read = qcg.read_calibration_file(
+                account_key=acct_key, stats_conn=conn)
+            attribution_regime = attribution_read.regime
+            if attribution_read.rejection is \
+                    qcg.RegimeRejection.RECALIBRATION_NEEDED:
+                qm = c._load_sibling("_lib_quota_model")
+                stored = attribution_read.regime_status
+                absent_cause = (stored if stored in qm.EVIDENCE_CODES
+                                else qm.RECALIBRATION_NEEDED)
         except Exception:                              # noqa: BLE001
             attribution_regime = None
     # Per-week weighted units, and the records the whole-week support test
@@ -1140,7 +1165,8 @@ def cmd_project(args: argparse.Namespace) -> int:
         week_attribution[ws] = resolve_week_attribution(
             attribution_regime, week_records.get(ws, ()),
             week_start=ws,
-            week_end=_end_by_start.get(ws, ws + dt.timedelta(days=7)))
+            week_end=_end_by_start.get(ws, ws + dt.timedelta(days=7)),
+            absent_cause=absent_cause)
     modelled_weeks = sorted(
         ws for ws, attr in week_attribution.items()
         if attr.basis == "modelled")
@@ -1161,7 +1187,7 @@ def cmd_project(args: argparse.Namespace) -> int:
         attribution_basis = "cost-share"
         attribution_cause = (
             week_attribution[fallback_weeks[0]].cause if fallback_weeks
-            else "calibration-absent")
+            else absent_cause)
 
     # Collapse (project_key, week) buckets into one row per project, summing
     # tokens / cost / sessions / first_seen / last_seen / models across the

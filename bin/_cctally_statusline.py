@@ -56,23 +56,37 @@ def _cctally():
     return sys.modules["cctally"]
 
 
-# Per-model context window (used by `cctally statusline` segment 4).
-# Keep in sync with Anthropic's docs:
-#   https://docs.anthropic.com/en/docs/about-claude/models
-# Unknown model id → segment renders `🧠 N/A` + one-shot stderr warn.
+# Per-model context window FALLBACK (used by `cctally statusline` segment 4
+# and by `explain`'s per-request capacity). The payload's own
+# `context_window.context_window_size` is authoritative whenever Claude Code
+# sends it (#1002); these tables answer only when it does not, and they are
+# `explain`'s only source because transcripts record a bare model id.
+# Resolution order lives in `_resolve_context_window`: any `[1m]`-suffixed id
+# → 1M (generic, no entry needed), this registry, the family default below,
+# else `🧠 N/A` + a one-shot stderr warning.
+#
+# Registry of VERIFIED current-generation defaults: ids whose bare form runs
+# in a 1M window (Claude API model reference shipped with Claude Code
+# 2.1.312). Exact match on the lowercased id with one trailing `-YYYYMMDD`
+# stripped, so `claude-opus-5` never matches `claude-opus-5-5`. Add a model
+# here, beside its pricing, when it ships. Prior generations (Opus 5 / 4.x,
+# Sonnet 5 / 4.x, Haiku 4.5) stay on the 200K family default. Where one offered
+# 1M (Opus 5, 4.8 and 4.7, Sonnet 4.5) it was an explicit `[1m]` opt-in that
+# the transcript id does not record, so a bare id of theirs is historically
+# ambiguous and deliberately left at 200K.
 CLAUDE_MODEL_CONTEXT_WINDOWS = {
-    # 1M-token variants (explicit IDs override the family default).
-    "claude-opus-5[1m]": 1_000_000,
-    "claude-opus-4-8[1m]": 1_000_000,
-    "claude-opus-4-7[1m]": 1_000_000,
-    "claude-sonnet-4-5[1m]": 1_000_000,
-    # Default 200K for every other Sonnet/Opus/Haiku family member.
-    # The resolver does a substring match on the family token if the
-    # exact id is missing — see _resolve_context_window.
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5-5": 1_000_000,
+    "claude-haiku-5-5": 1_000_000,
+    "claude-fable-5-1": 1_000_000,
+    "claude-fable-5": 1_000_000,
+    "claude-mythos-5-1": 1_000_000,
 }
 
 CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY = {
     # Substring (case-insensitive) → window. Order matters; first hit wins.
+    # Deliberately no `fable`/`mythos` entry: an unregistered member of those
+    # lines has no verified window and renders `N/A` rather than a guess.
     "sonnet": 200_000,
     "opus":   200_000,
     "haiku":  200_000,
@@ -321,7 +335,8 @@ def cmd_statusline(args: argparse.Namespace) -> int:
 # =========================================================================
 #
 # Every current statusline coordination file lives under ONE sibling root,
-# `APP_DIR/statusline-account-bound-v2/`, partitioned by the exact account:
+# `APP_DIR/statusline-account-bound-v3/` (#1019/#1014; v2 before it), partitioned
+# by the exact account:
 #
 #   selected.lock                       the selected-state / persist flock
 #   transport.last                      render-path transport marker
@@ -658,12 +673,23 @@ def _candidate_from_input(parsed, *, received_at: int) -> "_candidates.Candidate
 
 
 def _activity_cache_path(token: str) -> pathlib.Path:
-    """The contributor's provider-activity scan cache in the v2 spool (#797
+    """The contributor's provider-activity scan cache in the v3 spool (#797
     spec 4.1, D10a): one accelerator document per contributor, never read by
     acknowledgement, detached reduction or frozen-plan recovery."""
     if _candidates.CANDIDATE_TOKEN_RE.fullmatch(token) is None:
         raise ValueError("invalid candidate token")
     return _bound_root() / "activity-cache" / f"{token}.json"
+
+
+def _legacy_activity_cache_path(token: str) -> pathlib.Path:
+    """The same contributor's scan cache in the v2 spool: the starting state
+    of an absent v3 document (#1019 C4), read once and never locked, written
+    or pruned. The cache is an accelerator, not coordination state; without
+    it every session with more than eight subagent files carried unknown
+    witnesses for its first renders after the cutover."""
+    if _candidates.CANDIDATE_TOKEN_RE.fullmatch(token) is None:
+        raise ValueError("invalid candidate token")
+    return _cctally_core.STATUSLINE_ACCOUNT_BOUND_V2_DIR / "activity-cache" / f"{token}.json"
 
 
 def _capture_activity(parsed, token: str):
@@ -676,7 +702,8 @@ def _capture_activity(parsed, token: str):
 
     path = parsed.transcript_path if isinstance(parsed.transcript_path, str) else None
     return _lib_provider_activity.capture_activity(
-        path, cache_path=_activity_cache_path(token))
+        path, cache_path=_activity_cache_path(token),
+        seed_path=_legacy_activity_cache_path(token))
 
 
 #: Completion markers of the account-bound root's persistence barriers
@@ -1207,6 +1234,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
 
         five_projection = None
         five_retired = None
+        five_floor_epoch = None
         if five_groups:
             canonical = max(five_groups)
             # #832: the exact account's event, by logical order. A database
@@ -1219,6 +1247,7 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
             five_floor = _cctally_journal.resolve_five_hour_axis_floor(
                 conn, account_key=account_key, canonical_window_key=canonical)
             generation = five_floor.logical_generation
+            five_floor_epoch = five_floor.floor_epoch
             eligible = [
                 row for row in five_groups[canonical]
                 if _cctally_journal.captured_at_or_after_floor(
@@ -1263,7 +1292,8 @@ def _read_db_projection_once(*, account_key: str, at: "int | None" = None,
                 conn, account_key, groups=weekly_groups, selected=weekly_selected,
                 projection=weekly_projection, floor=weekly_floor,
                 reference=reference,
-                five_window=max(five_groups) if five_groups else None))
+                five_window=max(five_groups) if five_groups else None,
+                five_projection=five_projection, five_floor_epoch=five_floor_epoch))
     finally:
         conn.close()
     if validity is not None:
@@ -1312,12 +1342,15 @@ class _StaleInputs:
     five_samples: tuple = ()
 
 
-#: #797 spec 4.4: ``(samples_after, receipts_held)`` for the partition the
-#: detached reducer is working on — the earliest provider-activity instant
-#: any of its members or receipts can need a sample after, and whether it
-#: holds receipts (a refusal is then possible, so an uncovered sample
-#: projection makes classification unavailable, never "no proof needed").
-_STALE_SCOPE = contextvars.ContextVar("statusline_stale_scope", default=(None, False))
+#: #797 spec 4.4: ``(samples_after, receipts_held, drop_work)`` for the
+#: partition the detached reducer is working on — the earliest instant any
+#: of its members, receipts, retained supports or frozen-plan dependencies
+#: can need a sample after, whether it holds receipts, and its drop-proof
+#: work (#1019 spec 4.4, `_DropWork`, None outside a detached pass). A
+#: refusal is then possible, so an uncovered sample projection makes
+#: classification unavailable, never "no proof needed".
+_STALE_SCOPE = contextvars.ContextVar("statusline_stale_scope",
+                                      default=(None, False, None))
 
 
 def _stale_index_identity(conn) -> str:
@@ -1507,30 +1540,44 @@ def _five_hour_window_credits(conn, account_key: str, window: int) -> tuple:
 
 
 def _read_stale_inputs(conn, account_key: str, *, groups, selected, projection,
-                       floor, reference, five_window=None) -> _StaleInputs:
+                       floor, reference, five_window=None, five_projection=None,
+                       five_floor_epoch=None) -> _StaleInputs:
     """The account's `_StaleInputs` on the caller's snapshot (#797 spec 4.4).
     Provider samples are read only when the partition's members or receipts
     need them (`_STALE_SCOPE`); an uncovered sample projection with receipts
-    held raises `ProjectionUnavailable`, so the classification is
-    unavailable rather than silently "no proof"."""
+    held, or with proof work on either axis (#1019 spec 4.4, 4.5,
+    `_DropWork`: drop-proof or rise-proof work, the five-hour axis judged
+    against ``five_projection`` and ``five_floor_epoch``), raises
+    `ProjectionUnavailable`, so the classification is unavailable rather
+    than silently "no proof"."""
     import _cctally_oauth_samples
     import _lib_stale_proof
 
     identity = _stale_index_identity(conn)
     if not groups and five_window is None:
         return _StaleInputs(None, None, (), (), None, True, identity, frozenset())
-    after, receipts_held = _STALE_SCOPE.get()
+    after, receipts_held, drop_work = _STALE_SCOPE.get()
     covered = _cctally_oauth_samples.projection_covered(conn, account_key=account_key)
-    if not covered and receipts_held:
+    if not covered and (receipts_held or (
+            drop_work is not None and (
+                drop_work.needs_samples(
+                    max(groups) if groups else None, projection,
+                    None if floor is None else floor.floor_epoch)
+                or drop_work.needs_samples(
+                    five_window, five_projection, five_floor_epoch,
+                    axis="fiveHour")))):
         raise _cctally_oauth_samples.ProjectionUnavailable(
             "the provider sample projection does not cover this account")
     five_accounted, five_credits, five_samples = _five_hour_stale_inputs(
         conn, account_key, five_window, after=after if covered else None)
     if not groups:
         # Review F-I5-1: the five-hour refusal inputs never depend on a
-        # weekly reading. The weekly fields keep the no-window shape.
-        return _StaleInputs(None, None, (), (), None, True, identity, frozenset(),
-                            five_window, five_accounted, five_credits, five_samples)
+        # weekly reading. The weekly fields keep the no-window shape, but the
+        # sample bound and coverage are the five-hour samples' own (#1019:
+        # the render cache decides five-hour drop proofs from them).
+        return _StaleInputs(None, None, (), (), after if covered else None, covered,
+                            identity, frozenset(), five_window, five_accounted,
+                            five_credits, five_samples)
     window = max(groups)
     supports = {f"row:{int(row['id'])}" for row in groups[window]}
     samples = ()
@@ -2108,12 +2155,22 @@ def _pending_document(value: "_candidates.PendingDrop | None") -> dict | None:
                         "percent": item.percent,
                         "rawResetsAt": item.raw_resets_at,
                         "receivedAt": item.received_at,
+                        # #1019/#1014 (spec 4.2): control schema 3.
+                        "witness": _witness_document(item.witness),
                     }
                     for item in value.retained.observations
                 ],
             }
         ),
     }
+
+
+def _witness_document(witness) -> "dict | None":
+    """A retained observation's persisted witness, or None."""
+    if witness is None:
+        return None
+    import _lib_provider_activity
+    return _lib_provider_activity.witness_to_json(witness)
 
 
 def _control_document(control: "_candidates.ControlState") -> dict:
@@ -2770,11 +2827,14 @@ class _Transition:
     publication: "dict | None" = None
     #: #825/#832 spec 5.6 item 7: ``{"authorityCommit": <observation id of
     #: the last bound authoritative publication whose control reconcile
-    #: committed>, "dropWithheld": bool}``, or None. The control recovery
-    #: certificate needs BOTH the journal-derived witness in the index and
-    #: this transition's record of its commit; ``dropWithheld`` lets the
-    #: render path's file-only fork decision see a withheld drop without
-    #: opening the index.
+    #: committed>, "dropWithheld": bool}``, or None. Since #948 neither key
+    #: gates recovery (authority is journal-only, spec 6.4);
+    #: ``dropWithheld`` (some axis's drop was withheld) lets the render
+    #: path's file-only fork decision see a withheld drop without opening
+    #: the index. When exactly one axis is withheld the document also
+    #: carries ``"dropWithheldAxes": [axis]`` so the render reduces each
+    #: axis with its own permission (review finding F1); without it a set
+    #: ``dropWithheld`` withholds both axes (`_withheld_axes`).
     quarantine: "dict | None" = None
     #: #825/#832 spec 4.3 revision 2: the intake acknowledgement checkpoint —
     #: every logged evaluation with a sequence number at or below it has a
@@ -2824,6 +2884,16 @@ class _StaleCache:
     #: limit. They are no longer receipt work for a render (eviction and
     #: omission still mean eligible) until a writer replaces this cache.
     omitted: frozenset = frozenset()
+    #: #1019 (spec 4.5): the compact five-hour provider samples of
+    #: ``five_window`` read after ``samples_after``, so a render can tell
+    #: whether a five-hour reading's drop proof is decided (`_render_drop_work`).
+    five_samples: tuple = ()
+    #: #1019 review finding P1 (and its #797 twin): the sample identities
+    #: whose RISE the completion that wrote this cache refused against the
+    #: receipts it kept. The render reduces with those refusals while the
+    #: index fingerprint is unchanged; without them a refused rise reads as
+    #: an eligible one and every render dispatches the detached reducer.
+    refused: frozenset = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2892,6 +2962,9 @@ def _receipt_document(receipt) -> dict:
 
 _SAMPLE_FIELDS = ("observationId", "requestedAt", "capturedAt", "weeklyPercent",
                   "weeklyResetsAt")
+#: #1019 (spec 4.5): one cached five-hour provider sample.
+_FIVE_SAMPLE_FIELDS = ("observationId", "requestedAt", "capturedAt", "fiveHourPercent",
+                       "fiveHourResetsAt", "fiveHourWindowKey")
 
 
 def _stale_cache_document(cache: _StaleCache) -> dict:
@@ -2907,6 +2980,14 @@ def _stale_cache_document(cache: _StaleCache) -> dict:
         "fiveHourWindow": cache.five_window,
         "fiveHourAccountedPercent": cache.five_accounted_percent,
         "omitted": sorted(cache.omitted),
+        # #1019 (spec 4.5): written only when there are any, so a cache
+        # without five-hour samples keeps its earlier shape.
+        **({} if not cache.five_samples else {"fiveHourSamples": [
+            [s.observation_id, s.requested_at_utc, s.captured_at_utc,
+             s.five_hour_percent, s.five_hour_resets_at_utc, s.five_hour_window_key]
+            for s in cache.five_samples]}),
+        # Written only when there are any, like the five-hour samples.
+        **({} if not cache.refused else {"refusedRises": sorted(cache.refused)}),
     }
 
 
@@ -2921,14 +3002,19 @@ def _validate_stale_cache(value, *, account_key: str):
     base = {"window", "accountedPercent", "floorEpoch", "samplesAfter",
             "samplesCovered", "samples"}
     five_keys = {"fiveHourWindow", "fiveHourAccountedPercent", "omitted"}
-    if set(doc) != base and set(doc) != base | five_keys:
+    keys = set(doc)
+    if not (keys == base or base | five_keys <= keys
+            <= base | five_keys | {"fiveHourSamples", "refusedRises"}):
         raise _candidates.StateValidationError("unexpected stale contributor cache keys")
     five_window = doc.get("fiveHourWindow")
     five_percent = doc.get("fiveHourAccountedPercent")
     omitted = doc.get("omitted", [])
+    refused = doc.get("refusedRises", [])
     if (not (five_window is None or _candidates._is_int(five_window))
             or not isinstance(omitted, list)
-            or not all(isinstance(k, str) and len(k) == 64 for k in omitted)):
+            or not all(isinstance(k, str) and len(k) == 64 for k in omitted)
+            or not isinstance(refused, list)
+            or not all(isinstance(k, str) and len(k) == 64 for k in refused)):
         raise _candidates.StateValidationError("invalid stale contributor cache")
     if five_percent is not None:
         five_percent = _candidates._percent(five_percent)
@@ -2949,6 +3035,19 @@ def _validate_stale_cache(value, *, account_key: str):
             raise _candidates.StateValidationError("invalid cached provider sample")
         samples.append(_lib_oauth_samples.OAuthSample(
             account_key, row[0], row[1], row[2], float(row[3]), row[4], None, None, None))
+    five_rows = doc.get("fiveHourSamples", [])
+    if not isinstance(five_rows, list) or (five_rows and five_window is None):
+        raise _candidates.StateValidationError("invalid stale contributor cache")
+    five_samples = []
+    for row in five_rows:
+        if (not isinstance(row, list) or len(row) != len(_FIVE_SAMPLE_FIELDS)
+                or not all(isinstance(row[i], str) for i in (0, 1, 2, 4))
+                or isinstance(row[3], bool) or not isinstance(row[3], (int, float))
+                or not _candidates._is_int(row[5]) or int(row[5]) != int(five_window)):
+            raise _candidates.StateValidationError("invalid cached provider sample")
+        five_samples.append(_lib_oauth_samples.OAuthSample(
+            account_key, row[0], row[1], row[2], None, None, float(row[3]), row[4],
+            int(row[5])))
     accounted = None
     if window is not None:
         accounted = _lib_stale_proof.Accounted(
@@ -2956,7 +3055,8 @@ def _validate_stale_cache(value, *, account_key: str):
             support_id=None, support_hash=None, floor_epoch=floor, credits=(),
             coverage=None)
     return _StaleCache(window, accounted, tuple(samples), after, covered,
-                       five_window, five_percent, frozenset(omitted))
+                       five_window, five_percent, frozenset(omitted), tuple(five_samples),
+                       frozenset(refused))
 
 
 def _validate_receipts(value, *, account_key: str) -> tuple:
@@ -3145,13 +3245,61 @@ def _validate_transition_quarantine(value):
     if value is None:
         return None
     doc = _candidates._require_object(value, "outcomeQuarantine")
-    _candidates._require_exact_keys(doc, {"authorityCommit", "dropWithheld"})
+    _candidates._require_exact_keys(
+        doc, {"authorityCommit", "dropWithheld"}
+        | ({"dropWithheldAxes"} & set(doc)))
     commit = doc["authorityCommit"]
     if commit is not None and (not isinstance(commit, str) or not commit):
         raise _candidates.StateValidationError("invalid authority commit")
     if not isinstance(doc["dropWithheld"], bool):
         raise _candidates.StateValidationError("invalid drop-withheld flag")
-    return {"authorityCommit": commit, "dropWithheld": doc["dropWithheld"]}
+    out = {"authorityCommit": commit, "dropWithheld": doc["dropWithheld"]}
+    if "dropWithheldAxes" in doc:
+        axes = doc["dropWithheldAxes"]
+        # #948 review finding F1: present only for a proper, non-empty
+        # subset of the axes, sorted, with the flag set.
+        if (not doc["dropWithheld"] or not isinstance(axes, list)
+                or not axes or len(axes) >= len(_candidates.AXES)
+                or axes != sorted(set(axes))
+                or not set(axes) <= set(_candidates.AXES)):
+            raise _candidates.StateValidationError("invalid drop-withheld axes")
+        out["dropWithheldAxes"] = list(axes)
+    return out
+
+
+def _withheld_axes(transition) -> frozenset:
+    """The axes whose drop the transition's last detached decision withheld
+    (#948 spec 6.8, review finding F1): none without a set flag, the named
+    axes when the document names them, and both axes for a set flag that
+    names none (the conservative reading of every earlier document)."""
+    doc = None if transition is None else transition.quarantine
+    if not doc or not doc.get("dropWithheld"):
+        return frozenset()
+    axes = doc.get("dropWithheldAxes")
+    return frozenset(_candidates.AXES if axes is None else axes)
+
+
+def _withheld_permission(withheld: frozenset):
+    """``reduce_candidates``' drop permission for the withheld axes: open
+    when none, closed when all, else per axis."""
+    if not withheld:
+        return True
+    if withheld >= frozenset(_candidates.AXES):
+        return False
+    return {axis: axis not in withheld for axis in _candidates.AXES}
+
+
+def _quarantine_document(transition, withheld: frozenset) -> dict:
+    """The transition's quarantine document recording ``withheld``: the two
+    keys every reader knows, plus ``dropWithheldAxes`` only when exactly one
+    axis is withheld (both or none is the two-key form)."""
+    doc = {"authorityCommit": (None if transition is None
+                               or transition.quarantine is None
+                               else transition.quarantine.get("authorityCommit")),
+           "dropWithheld": bool(withheld)}
+    if withheld and not withheld >= frozenset(_candidates.AXES):
+        doc["dropWithheldAxes"] = sorted(withheld)
+    return doc
 
 
 def _write_transition(transition: _Transition) -> None:
@@ -3293,8 +3441,8 @@ def _reconcile_selected_control(
     anchor = _retained_anchor(
         projection, None if existing is None else existing.five_hour_anchor)
     # #825/#832 spec 5.6 item 7: the control transition records the commit of
-    # this bound authoritative publication — half of the control recovery
-    # certificate (the index holds the journal-ordered other half).
+    # this bound authoritative publication (routine bookkeeping; since #948
+    # it gates no recovery — spec 6.4).
     quarantine = ... if authority_commit is None else {
         "authorityCommit": authority_commit, "dropWithheld": False}
     _write_transition(_replace_transition(
@@ -3528,6 +3676,37 @@ def _authoritative_repair_required(*, now_epoch: int, binding=None) -> bool:
     return False
 
 
+def _plausible_oauth_axes(args: argparse.Namespace, observed_axes):
+    """#948 spec 6.4: the record kernel's ingress bands, applied before any
+    fence. Returns the observed axes to fence — five-hour dropped (and its
+    fields cleared, exactly as the kernel would drop them) when its reset is
+    out of band — or None when the weekly reset is implausible."""
+    import _cctally_record
+
+    now_dt = _cctally_core._command_as_of()
+    now_check = int(now_dt.timestamp())
+    if not _cctally_record.check_resets_at_plausibility(
+            int(args.resets_at), now_check,
+            past_slack_s=_cctally_record._RECORD_USAGE_WEEK_PAST_SLACK_S,
+            future_band_s=_cctally_record._RECORD_USAGE_WEEK_FUTURE_BAND_S):
+        # The record step's own notice (review finding F16: the rejection
+        # the user sees is unchanged by checking the band first).
+        eprint(_cctally_record._weekly_resets_rejection_notice(
+            int(args.resets_at), now_dt))
+        return None
+    if (getattr(args, "five_hour_resets_at", None) is not None
+            and not _cctally_record.check_resets_at_plausibility(
+                int(args.five_hour_resets_at), now_check,
+                past_slack_s=_cctally_record._RECORD_USAGE_5H_PAST_SLACK_S,
+                future_band_s=_cctally_record._RECORD_USAGE_5H_FUTURE_BAND_S)):
+        eprint(_cctally_record._five_hour_resets_drop_notice(
+            int(args.five_hour_resets_at), now_dt))
+        args.five_hour_resets_at = None
+        args.five_hour_percent = None
+        return tuple(axis for axis in observed_axes if axis != "fiveHour")
+    return observed_axes
+
+
 def _authoritative_record_usage(
     args: argparse.Namespace,
     observed_axes,
@@ -3597,6 +3776,15 @@ def _authoritative_record_usage(
         # here and this publication continues; only an uncertainty op that
         # could not be made durable raises, and then nothing is published.
         _rescan_legacy_spool()
+        # #948 spec 6.4 *Plausibility first*: the OAuth ingress bands the
+        # record kernel applies are checked BEFORE authoritative windows and
+        # fences are installed, so an implausible reading installs no fence
+        # and covers nothing.
+        observed_axes = _plausible_oauth_axes(args, observed_axes)
+        if observed_axes is None:
+            # The record step's exit status, as before the band moved ahead
+            # of the fences (review finding F16): nothing is fenced.
+            return _AuthoritativeRecordResult("record_failed", "exit 2")
         windows = _authoritative_windows(args, binding, now_epoch=now_epoch)
         if "fiveHour" in windows:
             args.five_hour_window_key = windows["fiveHour"]
@@ -3609,7 +3797,8 @@ def _authoritative_record_usage(
     try:
         rc = _cctally().cmd_record_usage(
             args, binding=binding, nudge_dashboard=nudge_dashboard,
-            nudge_sink=nudge_sink, appended=appended)
+            nudge_sink=nudge_sink, appended=appended,
+            selected_state_locked=True)
     except _cctally().StatsRebuildDeferred as exc:
         return _AuthoritativeRecordResult("record_failed", str(exc))
     except Exception as exc:
@@ -3629,6 +3818,13 @@ def _authoritative_record_usage(
             observed_axes=observed_axes,
             authority_commit=(appended[-1] if appended else None),
         )
+        if appended:
+            # #948 spec 6.4: the reconciliation has committed, in this same
+            # critical section, so the completion op (appended only when this
+            # observation newly covers a paused axis) proves it.
+            import _cctally_quarantine
+            _cctally_quarantine.run_authority_completion(
+                binding.account_key, appended[-1], appended[-1])
         _cctally()._statusline_observe_touch(binding=binding)
     except Exception as exc:
         # Do not clean up the inflight tombstone on a post-record failure.
@@ -3764,7 +3960,7 @@ def _axis_value_document(value) -> "dict | None":
 def _bound_publication_plan(decision, projection, candidates, binding, *,
                             generation: int, now_epoch: int,
                             intake_sequence: int,
-                            refused=None) -> "dict | None":
+                            refused=None, drop_refused=None) -> "dict | None":
     """Freeze one partition's combined two-axis publication plan.
 
     Every published axis records its provenance — ``candidate`` (the winning
@@ -3777,15 +3973,24 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
     same control replacement.
 
     ``refused`` maps an axis to the contributor tokens the reducer refused
-    on it (#797 spec 4.4): a candidate axis's provenance names the selected
-    ELIGIBLE winner, never a refused member that happens to tie its value.
+    on it (#797 spec 4.4) — every rise-ineligible token, receipt-refused or
+    drop-refused (#1019 P-R2, `_rise_ineligible_tokens`): a candidate axis's
+    provenance names the selected ELIGIBLE winner, never a refused member
+    that happens to tie its value.
     Refusal filters only a rise: an accepted drop (consensus or deadline,
     below the same window's baseline) publishes exactly as today, its
     provenance included (review RV-3), because the reducer selects it from
-    the unfiltered set."""
+    the unfiltered set.
+
+    ``drop_refused`` maps an axis to the tokens whose LOW the reducer
+    refused (#1019 spec 4.3): a drop's provenance names the selected
+    DROP-ELIGIBLE winner, never a drop-refused member that ties its value;
+    when every member of that value is drop-refused the drop came from the
+    retained low and its provenance says so."""
     import _cctally_journal
 
     refused = refused or {}
+    drop_refused = drop_refused or {}
     account_key = binding.account_key
     if projection.account_key not in (None, account_key):
         raise ValueError("cross-account publication projection")
@@ -3809,7 +4014,10 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
         drop = (baseline is not None
                 and baseline.canonical_key == value.canonical_key
                 and value.percent < baseline.percent)
-        excluded = () if drop else refused.get(axis, ())
+        # #1019 (spec 4.3, P-R2): a drop's winner is drop-eligible; a rise's
+        # winner is rise-eligible (``refused`` is the rise-ineligible set).
+        excluded = (drop_refused.get(axis, ()) if drop
+                    else refused.get(axis, ()))
         winners = sorted(
             (candidate for candidate in candidates
              if (axis_value := _candidates._candidate_axis(candidate, axis)) is not None
@@ -3830,6 +4038,9 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
             provenance[axis] = {
                 "kind": "retained_low", "account": account_key,
                 "window": value.canonical_key, "controlGeneration": generation,
+                # #1019/#1014 (spec 4.3): the supports the retained low is
+                # published from, frozen inside the publication identity.
+                "supports": _retained_supports(decision, axis),
             }
     plan = {
         "capturedAt": now_epoch,
@@ -3857,6 +4068,29 @@ def _bound_publication_plan(decision, projection, candidates, binding, *,
     # from — its acknowledgement advances the intake checkpoint past it.
     plan["intakeSequence"] = int(intake_sequence)
     return plan
+
+
+def _retained_supports(decision, axis: str) -> list:
+    """The retained observations a ``retained_low`` axis publishes from, as
+    documents sorted by observation id, ties broken by the canonical JSON of
+    the witness (#1019/#1014 spec 4.3). Empty when the decision's control
+    state holds no retained evidence on ``axis``."""
+    pending = (decision.control.pending_drops or {}).get(axis)
+    retained = None if pending is None else pending.retained
+    if retained is None:
+        return []
+    supports = [{
+        "observationId": item.observation_id,
+        "token": item.token,
+        "percent": item.percent,
+        "rawResetsAt": item.raw_resets_at,
+        "receivedAt": item.received_at,
+        "witness": _witness_document(item.witness),
+    } for item in retained.observations]
+    return sorted(supports, key=lambda item: (
+        item["observationId"],
+        json.dumps(item["witness"], sort_keys=True, separators=(",", ":"),
+                   allow_nan=False)))
 
 
 def _activity_provenance(candidate: "_candidates.Candidate") -> dict:
@@ -3892,20 +4126,119 @@ def _axis_members(candidates, axis: str) -> list:
         value = candidate.seven_day if axis == "sevenDay" else candidate.five_hour
         if value is None:
             continue
-        if axis == "sevenDay":
-            window = int(_cctally_core._normalize_week_boundary_dt(
-                dt.datetime.fromtimestamp(value.raw_resets_at, tz=dt.timezone.utc)
-            ).timestamp())
-        elif value.canonical_key is not None:
-            window = int(value.canonical_key)
-        else:
-            window = int(_cctally()._canonical_5h_window_key(int(value.raw_resets_at)))
+        window = _member_window(value, axis)
         sigma = _lib_stale_proof.sample_identity(
             candidate.token, candidate.activity, axis=axis,
             percent=value.percent, window=window)
         if sigma is not None:
             members.append(_lib_stale_proof.Member(sigma, int(value.raw_resets_at)))
     return members
+
+
+def _member_window(value, axis: str) -> int:
+    """A member's window on ``axis``: the normalized weekly reset, or the
+    canonical five-hour window key (the value's own when it carries one)."""
+    if axis == "sevenDay":
+        return int(_cctally_core._normalize_week_boundary_dt(
+            dt.datetime.fromtimestamp(value.raw_resets_at, tz=dt.timezone.utc)
+        ).timestamp())
+    if value.canonical_key is not None:
+        return int(value.canonical_key)
+    return int(_cctally()._canonical_5h_window_key(int(value.raw_resets_at)))
+
+
+#: #1019 (spec 4.1-4.5): the axes whose drops the glue refuses. Both: the
+#: five-hour leg (spec 4.5) reads the samples `_five_hour_stale_inputs`
+#: reads, in the account-local canonical five-hour window, and each member's
+#: and support's advertised five-hour reset. Weekly and five-hour
+#: eligibility are decided independently per member.
+_DROP_AXES = ("sevenDay", "fiveHour")
+
+
+def _axis_drop_members(candidates, axis: str) -> list:
+    """The ``axis`` readings of ``candidates`` as `_lib_stale_proof.DropMember`s
+    (#1019 spec 4.1): every member with a usable bound — its frozen
+    supported ``t_m``, else its ``received_at`` second (`drop_bound`). The
+    fallback never becomes a σ: it reaches the drop proof only."""
+    import _lib_stale_proof
+
+    members = []
+    for candidate in candidates:
+        value = _candidates._candidate_axis(candidate, axis)
+        if value is None:
+            continue
+        window = _member_window(value, axis)
+        bound = _lib_stale_proof.drop_bound(
+            candidate.token, candidate.activity, int(candidate.received_at),
+            axis=axis, percent=value.percent, window=window)
+        if bound is not None:
+            members.append(_lib_stale_proof.DropMember(
+                candidate.token, bound, axis, float(value.percent), window,
+                int(value.raw_resets_at)))
+    return members
+
+
+def _support_drop_member(item, axis: str, window: "int | None" = None):
+    """One retained supporting observation as a `DropMember`: its own frozen
+    witness, else its own ``received_at`` (#1019/#1014 spec 4.2), never a
+    later candidate's. None without a usable bound.
+
+    ``window`` is the support's account-local five-hour key — the pending
+    drop's, or the frozen plan value's (#1019 spec 4.5) — which a raw floor
+    of its reset could miss across a ten-minute boundary; without one the
+    window is derived from the reset (`_member_window`)."""
+    import _lib_stale_proof
+
+    if window is None:
+        window = _member_window(
+            _candidates.AxisValue(item.percent, item.raw_resets_at), axis)
+    bound = _lib_stale_proof.drop_bound(
+        item.token, item.witness, int(item.received_at), axis=axis,
+        percent=item.percent, window=window)
+    if bound is None:
+        return None
+    return _lib_stale_proof.DropMember(item.token, bound, axis, float(item.percent),
+                                       window, int(item.raw_resets_at))
+
+
+def _support_window(axis: str, key) -> "int | None":
+    """The window a retained support of ``axis`` is proven in: on the
+    five-hour axis the account-local key its pending drop or frozen plan
+    carries (#1019 spec 4.5); on the weekly axis None, so the normalized
+    reset of the support itself decides (`_member_window`)."""
+    if axis != "fiveHour" or isinstance(key, bool) or not isinstance(key, int):
+        return None
+    return int(key)
+
+
+def _refuted_supports(stale: "_StaleInputs | None", pending_drops) -> "dict | None":
+    """Per drop axis, the `support_identity` of every retained supporting
+    observation the current samples refute (#1019/#1014 spec 4.2): each one
+    proven stale on its own bound, its contributor present or absent. None
+    when nothing is refuted, so the reducer prunes nothing."""
+    import _lib_stale_proof
+
+    if stale is None or not pending_drops:
+        return None
+    out = {}
+    for axis, window, samples, _credits, _supports in _stale_axes(stale):
+        if axis not in _DROP_AXES or window is None:
+            continue
+        pending = pending_drops.get(axis)
+        if pending is None or pending.retained is None:
+            continue
+        refuted = set()
+        for item in pending.retained.observations:
+            member = _support_drop_member(item, axis, _support_window(
+                axis, pending.canonical_key))
+            if member is not None and _lib_stale_proof.proven_stale_low(
+                    member.bound_utc, samples, axis=axis, window=member.window,
+                    percent=member.percent,
+                    advertised_reset_epoch=member.advertised_reset_epoch) is not None:
+                refuted.add(_candidates.support_identity(item))
+        if refuted:
+            out[axis] = frozenset(refuted)
+    return out or None
 
 
 def _weekly_members(candidates) -> list:
@@ -3926,30 +4259,52 @@ def _stale_axes(stale: "_StaleInputs") -> tuple:
 
 def _stale_member_facts(stale: "_StaleInputs | None", receipts, candidates):
     """The reducer's per-axis member facts (#797 spec 4.4), or None when no
-    member is refused, so such a window reduces exactly as before. Each axis
-    is decided on its own window's members, samples, credits and receipts;
-    an axis without a refused member is absent (all eligible)."""
+    member is refused in either direction, so such a window reduces exactly
+    as before. Each axis is decided on its own window's members, samples,
+    credits and receipts; an axis without a refused member is absent (all
+    eligible).
+
+    #1019 (spec 4.4): the rise facts still need receipts; the drop facts
+    need none and come from the same validated snapshot, for every member
+    with a usable bound on a drop axis (`_DROP_AXES`)."""
     import _lib_stale_proof
 
-    if stale is None or not receipts:
+    if stale is None:
         return None
     out = {}
     for axis, window, samples, credits, supports in _stale_axes(stale):
         if window is None:
             continue
-        members = [m for m in _axis_members(candidates, axis) if m.sigma.window == window]
-        if not members:
+        members = ([m for m in _axis_members(candidates, axis)
+                    if m.sigma.window == window] if receipts else [])
+        drops = (_axis_drop_members(candidates, axis) if axis in _DROP_AXES
+                 else [])
+        if not members and not drops:
             continue
         facts = _lib_stale_proof.refusal_facts(
             axis, members, samples, receipts, credits,
-            index_identity=stale.index_identity, supports=supports)
-        if any(f.refused for f in facts.values()):
+            index_identity=stale.index_identity, supports=supports,
+            drop_members=drops)
+        if any(f.refused or f.drop_refused for f in facts.values()):
             out[axis] = facts
     return out or None
 
 
 def _refused_tokens(member_facts) -> dict:
     return {axis: frozenset(token for token, f in facts.items() if f.refused)
+            for axis, facts in (member_facts or {}).items()}
+
+
+def _drop_refused_tokens(member_facts) -> dict:
+    """Per axis, the contributor tokens whose LOW the facts refuse (#1019)."""
+    return {axis: _candidates.drop_refused_tokens(facts)
+            for axis, facts in (member_facts or {}).items()}
+
+
+def _rise_ineligible_tokens(member_facts) -> dict:
+    """Per axis, the contributor tokens that may not RISE: receipt-refused
+    or drop-refused (#1019 spec 4.2 P-R2, `rise_ineligible_tokens`)."""
+    return {axis: _candidates.rise_ineligible_tokens(facts)
             for axis, facts in (member_facts or {}).items()}
 
 
@@ -3993,6 +4348,13 @@ def _completion_receipts(transition, classified, members):
             completed_at_utc=completed, index_identity=stale.index_identity))
     receipts = _lib_stale_proof.latest_per_token(
         _lib_stale_proof.merge_receipts(kept, earned))
+    # #1019 review finding P1 (#797 twin): the rises this completion refuses
+    # against the receipts it keeps, for the render to reduce with.
+    facts = _stale_member_facts(stale, receipts, members) or {}
+    refused = frozenset(
+        m.sigma.key() for axis, axis_facts in facts.items()
+        for m in _axis_members(members, axis)
+        if getattr(axis_facts.get(m.sigma.token), "refused", False))
     floor = None if stale.accounted is None else stale.accounted.floor_epoch
     cache = _StaleCache(
         stale.window, stale.accounted,
@@ -4000,7 +4362,11 @@ def _completion_receipts(transition, classified, members):
             stale.samples, window=stale.window, floor_epoch=floor),
         stale.samples_after, stale.samples_covered,
         stale.five_window,
-        None if stale.five_accounted is None else stale.five_accounted.percent)
+        None if stale.five_accounted is None else stale.five_accounted.percent,
+        five_samples=() if stale.five_window is None else _lib_stale_proof.compact_samples(
+            stale.five_samples, window=stale.five_window, floor_epoch=None,
+            axis="fiveHour"),
+        refused=refused)
     return receipts, cache
 
 
@@ -4029,9 +4395,11 @@ def _fit_transition(transition: _Transition, *, prior=(), referenced=()) -> _Tra
         # the cache. Its member stays eligible.
         fitted = dataclasses.replace(transition, receipts=tuple(kept))
         if fitted.stale_cache is not None:
+            # A refusal rests on its member's receipt: eviction means eligible.
+            held = {r.sigma.key() for r in kept}
             fitted = dataclasses.replace(fitted, stale_cache=dataclasses.replace(
-                fitted.stale_cache,
-                omitted=evaluated - {r.sigma.key() for r in kept}))
+                fitted.stale_cache, omitted=evaluated - held,
+                refused=fitted.stale_cache.refused & held))
         return fitted
 
     receipts = _lib_stale_proof.bounded_receipts(
@@ -4113,10 +4481,210 @@ def _receipt_work(transition: _Transition, members) -> bool:
     return False
 
 
+@dataclasses.dataclass(frozen=True)
+class _DropWork:
+    """The proof work a partition's detached pass may meet (#1019 spec 4.4,
+    P-R3, P-R4): the ``(axis, window, percent, received_at)`` readings of its
+    logged and current members on the drop axes, whether a pending drop
+    holds retained support, and whether an unappended frozen plan publishes
+    a candidate or retained reading on a drop axis.
+
+    Drop-proof work is a reading below the same window's baseline, a pending
+    drop with retained support or an unappended drop plan; rise-proof work
+    is a reading above that baseline, a reading received at or after the
+    floor of a floor-retired window (a potential first post-floor
+    publication) or an unappended rise plan — a rise's eligibility depends
+    on drop facts (P-R2). With either, an uncovered sample projection makes
+    the classification unavailable (`_read_stale_inputs`), never "no
+    proof". Each axis is judged against its own window, baseline and floor
+    (#1019 spec 4.5: ``axis`` names it; the weekly axis by default)."""
+
+    readings: frozenset = frozenset()
+    retained: bool = False
+    plan: bool = False
+
+    def needs_samples(self, window: "int | None", projection,
+                      floor_epoch: "int | None" = None, *,
+                      axis: str = "sevenDay") -> bool:
+        if self.retained or self.plan:
+            return True
+        if window is None:
+            return False
+        for reading_axis, w, percent, received_at in self.readings:
+            if reading_axis != axis or int(w) != int(window):
+                continue
+            if projection is not None:
+                if float(percent) != float(projection.percent):
+                    return True
+            elif floor_epoch is not None and int(received_at) >= int(floor_epoch):
+                return True
+        return False
+
+
+#: Every drop-proof work there could be: the error path's scope.
+_ALL_DROP_WORK = _DropWork(retained=True, plan=True)
+#: The earliest request instant, so every sample of a window is read.
+_EVERY_SAMPLE = "1970-01-01T00:00:00.000000Z"
+
+
+def _plan_supports(source) -> "list | None":
+    """A frozen ``retained_low`` provenance's supports as
+    `SupportingObservation`s (#1019/#1014 spec 4.3), or None when they are
+    missing or malformed (the plan then cannot be revalidated)."""
+    supports = source.get("supports") if isinstance(source, dict) else None
+    if not isinstance(supports, list) or not supports:
+        return None
+    out = []
+    try:
+        for doc in supports:
+            out.append(_candidates._supporting_observation(
+                doc, now_epoch=2 ** 62))
+    except (_candidates.StateValidationError, TypeError, KeyError):
+        return None
+    return out
+
+
+def _plan_frozen_drops(plan: dict) -> tuple:
+    """The axes a frozen plan publishes as a DROP (#1019/#1014 spec 4.3),
+    decided on the plan's own frozen evidence — its ``retained_low``
+    provenance, or a ``candidate`` value below the baseline of the same
+    window in the control projection frozen with it — never on the current
+    baseline, which could classify a formerly selected drop differently."""
+    out = []
+    provenance = plan.get("provenance") or {}
+    frozen = ((plan.get("control") or {}).get("dbProjection") or {})
+    for axis in _candidates.AXES:
+        value, source = plan.get(axis), provenance.get(axis)
+        if value is None or not isinstance(source, dict):
+            continue
+        if source.get("kind") == "retained_low":
+            out.append(axis)
+        elif source.get("kind") == "candidate":
+            base = frozen.get(axis)
+            if (isinstance(base, dict) and base.get("canonicalKey") == value.get(
+                    "canonicalKey") and float(value["percent"]) < float(base["percent"])):
+                out.append(axis)
+    return tuple(out)
+
+
+def _cached_drop_proof(cache, member) -> tuple:
+    """``(decided, proof)`` for one drop member against the render cache
+    (#1019 spec 4.4, review finding P1): decided when the cache is covered,
+    holds the member's own window on its axis and every sample requested
+    after its bound; ``proof`` the cached sample proving its low stale, or
+    None. `compact_samples` keeps every `proven_stale_low` answer, so a
+    decided proof is the one the detached reducer reaches on the same index."""
+    import _lib_stale_proof
+
+    if cache is None or not cache.samples_covered:
+        return False, None
+    window, samples = ((cache.window, cache.samples) if member.axis == "sevenDay"
+                       else (cache.five_window, cache.five_samples))
+    if window is None or member.window != window:
+        return False, None
+    bound = _lib_stale_proof.floor_microsecond(member.bound_utc)
+    if cache.samples_after is None or bound is None or cache.samples_after > bound:
+        return False, None
+    return True, _lib_stale_proof.proven_stale_low(
+        member.bound_utc, samples, axis=member.axis, window=member.window,
+        percent=member.percent, advertised_reset_epoch=member.advertised_reset_epoch)
+
+
+def _render_member_facts(transition: "_Transition | None", members) -> "dict | None":
+    """The refusal facts the transition's render cache decides for
+    ``members`` (#1019 review finding P1 and its #797 twin), per axis: the
+    rises the completion that wrote the cache refused (``refused``, by exact
+    sample identity), and the lows a cached sample proves stale, refused
+    exactly as the detached reducer refuses them. The render reduces only
+    against an unchanged index fingerprint, so the cache answers for the
+    index the reducer would read. Without them a refused reading looks
+    eligible in every render's reduction, and every render dispatches a
+    detached pass that refuses it again. A member the cache cannot decide
+    gets no fact (eligible) and stays the detached reducer's work
+    (`_render_drop_work`, `_receipt_work`). None when nothing is refused."""
+    import _lib_stale_proof
+
+    cache = None if transition is None else transition.stale_cache
+    if cache is None:
+        return None
+    out = {}
+    for axis in _candidates.AXES:
+        facts = {}
+        if cache.refused:
+            for member in _axis_members(members, axis):
+                if member.sigma.key() in cache.refused:
+                    facts[member.sigma.token] = dataclasses.replace(
+                        _lib_stale_proof.ALL_ELIGIBLE, refused=True, receipt_valid=True)
+        if axis in _DROP_AXES:
+            for member in _axis_drop_members(members, axis):
+                decided, proof = _cached_drop_proof(cache, member)
+                if decided and proof is not None:
+                    facts[member.token] = dataclasses.replace(
+                        facts.get(member.token, _lib_stale_proof.ALL_ELIGIBLE),
+                        drop_refused=True,
+                        drop_proof_observation_id=proof.observation_id)
+        if facts:
+            out[axis] = facts
+    return out or None
+
+
+def _render_drop_work(transition: _Transition, members) -> bool:
+    """Whether a NOOP the render would acknowledge leaves proof work, drop
+    or rise, that the transition's cached facts cannot decide (#1019 spec
+    4.4, P-R3, P-R4), judged from those files alone (C4: the render reads no
+    index): a pending drop's retained support, a member reading below or
+    above the same window's baseline, or a member received at or after the
+    floor of a floor-retired window, with no covered cache of the samples
+    after its bound. A retained support the cached samples prove stale is
+    work too: the detached reducer prunes it from the pending drop. A member
+    they prove stale is not: the render already reduced with that refusal
+    (`_render_member_facts`, review finding P1). Such work is the detached
+    reducer's: the render neither acknowledges nor swallows it. Each axis is
+    judged on its own cached window and samples (#1019 spec 4.5: the
+    five-hour ones beside the weekly ones)."""
+    projection = transition.control.db_projection
+    supports, active = [], []
+    for axis in _DROP_AXES:
+        pending = transition.control.pending_drops.get(axis)
+        if pending is not None and _candidates._has_evidence(pending.retained):
+            key = _support_window(axis, pending.canonical_key)
+            supports.extend(m for m in (_support_drop_member(item, axis, key)
+                                        for item in pending.retained.observations)
+                            if m is not None)
+        db_axis = _candidates._projection_axis(projection, axis)
+        if db_axis is not None:
+            active.extend(d for d in _axis_drop_members(members, axis)
+                          if d.window == db_axis.canonical_key
+                          and d.percent != db_axis.percent)
+        else:
+            evidence = _candidates.axis_evidence(projection, axis)
+            if (evidence is not None
+                    and evidence.kind == _candidates.EVIDENCE_FLOOR_RETIRED
+                    and evidence.floor_epoch is not None):
+                for candidate in members:
+                    if int(candidate.received_at) < int(evidence.floor_epoch):
+                        continue
+                    active.extend(d for d in _axis_drop_members((candidate,), axis)
+                                  if d.window == int(evidence.group_key))
+    cache = transition.stale_cache
+    for member in supports:
+        decided, proof = _cached_drop_proof(cache, member)
+        if not decided or proof is not None:
+            return True
+    for member in active:
+        decided, _proof = _cached_drop_proof(cache, member)
+        if not decided:
+            return True
+    return False
+
+
 def _stale_scope(account_key: str, candidates, transition) -> tuple:
-    """``(samples_after, receipts_held)`` for one partition's detached work
-    (`_STALE_SCOPE`): the earliest instant any member of its logged and
-    current evaluations, or any receipt it holds, needs a sample after."""
+    """``(samples_after, receipts_held, drop_work)`` for one partition's
+    detached work (`_STALE_SCOPE`): the earliest instant any member of its
+    logged and current evaluations, any receipt it holds, any retained
+    supporter of its pending drops or any dependency of its frozen plan
+    needs a sample after (#1019 spec 4.4: a member's drop bound, its σ or
+    its ``received_at``), and the drop-proof work it may meet (`_DropWork`)."""
     import _lib_stale_proof
 
     instants = [r.sigma.activity_at_utc
@@ -4127,12 +4695,47 @@ def _stale_scope(account_key: str, candidates, transition) -> tuple:
             account_key, after=_acknowledged_through(transition)))
     except (OSError, ValueError, TypeError, KeyError):
         pass
+    readings = set()
     for members in sets:
         instants.extend(m.sigma.activity_at_utc for m in _all_members(members))
+        for axis in _DROP_AXES:
+            for candidate in members:
+                for d in _axis_drop_members((candidate,), axis):
+                    instants.append(d.bound_utc)
+                    readings.add((axis, d.window, d.percent,
+                                  int(candidate.received_at)))
+    retained = plan = False
+    if transition is not None:
+        for axis in _DROP_AXES:
+            pending = transition.control.pending_drops.get(axis)
+            if pending is None or not _candidates._has_evidence(pending.retained):
+                continue
+            retained = True
+            for item in pending.retained.observations:
+                member = _support_drop_member(item, axis)
+                if member is not None:
+                    instants.append(member.bound_utc)
+        if transition.publication is not None:
+            frozen = [a for a in _plan_frozen_drops(transition.publication)
+                      if a in _DROP_AXES]
+            provenance = transition.publication.get("provenance") or {}
+            # Drop or rise: every unappended plan whose drop axis publishes a
+            # candidate or retained reading is proof work (P-R3).
+            plan = bool(frozen) or any(
+                isinstance(provenance.get(axis), dict)
+                and provenance[axis].get("kind") == "candidate"
+                and transition.publication.get(axis) is not None
+                for axis in _DROP_AXES)
+            for axis in frozen:
+                for item in _plan_supports(provenance.get(axis)) or ():
+                    member = _support_drop_member(item, axis)
+                    if member is not None:
+                        instants.append(member.bound_utc)
     bounds = [b for b in (_lib_stale_proof.floor_microsecond(i) for i in instants)
               if b is not None]
     return (min(bounds) if bounds else None,
-            bool(transition is not None and transition.receipts))
+            bool(transition is not None and transition.receipts),
+            _DropWork(frozenset(readings), retained, plan))
 
 
 def _plan_members(account_key: str, plan: dict) -> tuple:
@@ -4151,13 +4754,152 @@ def _plan_members(account_key: str, plan: dict) -> tuple:
 
 def _plan_winner_refused(plan: dict, member_facts) -> bool:
     """Whether a frozen plan's candidate provenance names a member the
-    current facts refuse on that axis (#797 spec 4.4, T4)."""
-    refused = _refused_tokens(member_facts)
+    current facts refuse on that axis (#797 spec 4.4, T4). #1019 (spec 4.3,
+    P-R2): a winner that became drop-refused is refused for its rise too
+    (`_rise_ineligible_tokens`); a drop's winner is decided by
+    `_plan_drop_dependencies` on its bound evidence."""
+    receipt_refused = _refused_tokens(member_facts)
+    rise_refused = _rise_ineligible_tokens(member_facts)
+    drops = _plan_frozen_drops(plan)
     for axis, source in (plan.get("provenance") or {}).items():
+        refused = receipt_refused if axis in drops else rise_refused
         if (isinstance(source, dict) and source.get("kind") == "candidate"
                 and source.get("token") in refused.get(axis, ())):
             return True
     return False
+
+
+#: `_plan_drop_dependencies` answers.
+_DROP_SUPPORTED = "supported"
+_DROP_REFUSED = "refused"
+_DROP_DEFER = "defer"
+_DROP_EVIDENCE_REASON = "drop dependency evidence unavailable"
+
+
+def _plan_drop_facts(account_key: str, plan: dict, stale) -> "dict | None":
+    """The current drop facts of a frozen plan's ``candidate`` winners on
+    the drop axes, drop and rise alike (#1019/#1014 spec 4.3, P-R3: a
+    rise's eligibility needs the same drop facts), per drop axis, keyed by
+    token — each computed only for the plan's own evaluation member BOUND
+    to the frozen provenance: the same token, the same observation identity
+    (account partition, axis, window and value) and the same activity
+    witness fields. A winner no such member backs is absent (its evidence
+    is missing). None when the stale inputs are unavailable."""
+    import _lib_stale_proof
+
+    if stale is None:
+        return None
+    provenance = plan.get("provenance") or {}
+    members = None
+    out: dict = {}
+    for axis, window, samples, _credits, _supports in _stale_axes(stale):
+        if axis not in _DROP_AXES:
+            continue
+        out[axis] = {}
+        source = provenance.get(axis)
+        if not isinstance(source, dict) or source.get("kind") != "candidate":
+            continue
+        if members is None:
+            members = _plan_members(account_key, plan)
+        bound = []
+        for member in members:
+            value = _candidates._candidate_axis(member, axis)
+            if (member.token != source.get("token") or value is None
+                    or _candidates.observation_identity(member.token, axis, value)
+                    != source.get("observationIdentity")):
+                continue
+            try:
+                activity = _activity_provenance(member)
+            except ValueError:
+                continue
+            if all(source.get(k) == v for k, v in activity.items()):
+                bound.append(member)
+        if len(bound) != 1:
+            continue
+        facts = _lib_stale_proof.refusal_facts(
+            axis, [], samples if window is not None else (), (), (),
+            index_identity=stale.index_identity,
+            drop_members=_axis_drop_members(bound, axis))
+        if bound[0].token in facts:
+            out[axis][bound[0].token] = facts[bound[0].token]
+    return out
+
+
+def _plan_refuted_supports(plan: dict, stale) -> "dict | None":
+    """Per drop axis, the `support_identity` of every frozen ``retained_low``
+    support the current samples refute (#1019/#1014 spec 4.3), read from the
+    plan itself. None when the stale inputs are unavailable."""
+    import _lib_stale_proof
+
+    if stale is None:
+        return None
+    provenance = plan.get("provenance") or {}
+    out: dict = {}
+    for axis, window, samples, _credits, _supports in _stale_axes(stale):
+        if axis not in _DROP_AXES:
+            continue
+        refuted = set()
+        frozen = plan.get(axis)
+        key = _support_window(
+            axis, frozen.get("canonicalKey") if isinstance(frozen, dict) else None)
+        for item in _plan_supports(provenance.get(axis)) or ():
+            member = _support_drop_member(item, axis, key)
+            if (member is not None and window is not None
+                    and _lib_stale_proof.proven_stale_low(
+                        member.bound_utc, samples, axis=axis, window=member.window,
+                        percent=member.percent,
+                        advertised_reset_epoch=member.advertised_reset_epoch)
+                    is not None):
+                refuted.add(_candidates.support_identity(item))
+        out[axis] = frozenset(refuted)
+    return out
+
+
+def _plan_drop_dependencies(plan: dict, facts, refuted_supports) -> str:
+    """Revalidate an unappended frozen plan's drop dependencies (#1019/#1014
+    spec 4.3), beside `_plan_winner_refused`: ``"refused"`` when a
+    ``candidate`` winner's bound member is drop-refused — a drop's, or a
+    rise's (P-R2: a drop-refused member is rise-ineligible) — or every
+    frozen support of a ``retained_low`` drop is refuted; ``"defer"`` when
+    the evidence to decide either is missing (never read as "no proof",
+    P-R3); else ``"supported"``. A ``retained_low`` stays supported while
+    one frozen support remains eligible.
+
+    ``facts`` (`_plan_drop_facts`) and ``refuted_supports``
+    (`_plan_refuted_supports`) name the axes they decide; an axis they
+    leave out is not decided here (all eligible), and None for either is
+    missing evidence."""
+    verdict = _DROP_SUPPORTED
+    provenance = plan.get("provenance") or {}
+    drops = _plan_frozen_drops(plan)
+    for axis in _candidates.AXES:
+        source = provenance.get(axis)
+        if (plan.get(axis) is None or not isinstance(source, dict)
+                or source.get("kind") not in ("candidate", "retained_low")
+                or (source.get("kind") == "retained_low" and axis not in drops)):
+            continue
+        if source.get("kind") == "candidate":
+            if facts is None:
+                return _DROP_DEFER
+            if axis not in facts:
+                continue
+            fact = facts[axis].get(source.get("token"))
+            if fact is None:
+                return _DROP_DEFER
+            if fact.drop_refused:
+                verdict = _DROP_REFUSED
+        else:
+            if refuted_supports is None:
+                return _DROP_DEFER
+            if axis not in refuted_supports:
+                continue
+            supports = _plan_supports(source)
+            if supports is None:
+                return _DROP_DEFER
+            if all(_candidates.support_identity(item) in refuted_supports[axis]
+                   for item in supports):
+                verdict = _DROP_REFUSED
+    return verdict
 
 
 def _plan_record_args(plan: dict) -> argparse.Namespace:
@@ -4662,6 +5404,9 @@ def _publish_plan(transition, plan: dict, binding, classified: "_Classified", *,
         rc = _cctally().cmd_record_usage(
             _plan_record_args(plan), binding=binding, publication=plan,
             ingest_mode="opportunistic", nudge_sink=nudge_sink,
+            # #948 spec 6.7: the reducer pass holds the selected-state lock,
+            # so the release protocol runs inside its critical section.
+            selected_state_locked=True,
             **_bound_append_kwargs(classified.high_water))
     except _cctally_journal.JournalError as exc:
         return _Resolution(transition, None, "deferred", _frontier_conflict(
@@ -4733,7 +5478,18 @@ def _resolve_frozen_publication(transition: _Transition, *, now_epoch: int, nudg
     # evaluation, still unacknowledged, is reduced again with those facts.
     facts = _stale_member_facts(classified.stale, transition.receipts,
                                 _plan_members(account_key, plan))
-    if _plan_winner_refused(plan, facts):
+    # #1019/#1014 spec 4.3: a drop the plan froze is revalidated against
+    # current drop facts bound to its frozen evidence — a refused candidate
+    # or exhausted retained support supersedes the WHOLE unappended plan
+    # (its evaluation is reduced again, the other axis preserved); missing
+    # evidence keeps it frozen under its identity.
+    dependencies = _plan_drop_dependencies(
+        plan, _plan_drop_facts(account_key, plan, classified.stale),
+        _plan_refuted_supports(plan, classified.stale))
+    if dependencies == _DROP_DEFER:
+        return _Resolution(transition, classified, "deferred", AccountResult(
+            account_key, "deferred", None, _DROP_EVIDENCE_REASON))
+    if _plan_winner_refused(plan, facts) or dependencies == _DROP_REFUSED:
         dropped = _replace_transition(
             transition, account_key=account_key, binding=transition.binding,
             projection=before, publication=None)
@@ -4766,18 +5522,22 @@ def _resolve_frozen_publication(transition: _Transition, *, now_epoch: int, nudg
         return _Resolution(transition, classified, "deferred", AccountResult(
             account_key, "deferred", None, _BASELINE_UNKNOWN_REASON,
             retry_at=_evidence_retry_at(classified)))
-    if authority is not None and not _drop_permitted(classified, transition, frontier):
+    if authority is not None and any(
+            not _drop_permitted(classified, transition, frontier, axis)
+            for axis in _plan_drop_axes(plan, classified.projection)):
         # #825/#832 spec 5.6 item 7: a plan frozen before a trigger must not
         # publish a withheld drop after it. Dropped durably without spending
         # an attempt; the pending drop itself stays in the control state.
+        # #948 spec 6.8: only when an axis the plan drops on is withheld —
+        # a drop on a released axis publishes.
         withheld = _replace_transition(
             transition, account_key=account_key, binding=transition.binding,
             projection=before, publication=None,
-            quarantine={
-                "authorityCommit": (
-                    None if transition.quarantine is None
-                    else transition.quarantine.get("authorityCommit")),
-                "dropWithheld": True})
+            quarantine=_quarantine_document(transition, _withheld_axes(
+                transition) | frozenset(
+                    axis for axis in _plan_drop_axes(plan, classified.projection)
+                    if not _drop_permitted(classified, transition, frontier,
+                                           axis))))
         _write_transition(withheld)
         return _Resolution(withheld, classified, "withheld")
     supersession = _publication_supersession(
@@ -4855,6 +5615,21 @@ def _plan_reading_after_floor(plan: dict, axis: str, evidence, receipts) -> "boo
         and percent == float(value["percent"])
         and received >= int(evidence.floor_epoch)
         for key, raw, percent, received in loaded[axis])
+
+
+def _plan_drop_axes(plan: dict, projection: "_candidates.DbProjection") -> tuple:
+    """The axes a frozen plan publishes BELOW the classified database
+    baseline of the same window (#948 spec 6.8: the drop gate is consulted
+    for exactly these)."""
+    axes = []
+    for axis in _candidates.AXES:
+        value = plan.get(axis)
+        db_axis = _candidates._projection_axis(projection, axis)
+        if (value is not None and db_axis is not None
+                and db_axis.canonical_key == value["canonicalKey"]
+                and float(value["percent"]) < db_axis.percent):
+            axes.append(axis)
+    return tuple(axes)
 
 
 def _plan_drop_authority(plan: dict, projection: "_candidates.DbProjection", *,
@@ -4980,7 +5755,8 @@ def _later_reading_fence(axis: str, tombstone, db_axis, *, at: int,
 
 def _reduce_partition(account_key, candidates, transition, *, now_epoch, projection,
                       drop_consensus_allowed=True, fence_epoch=None,
-                      same_second_later=frozenset(), member_facts=None):
+                      same_second_later=frozenset(), member_facts=None,
+                      refuted_supports=None):
     """One partition's pure transition: (decision, anchor, canonical
     candidates, tombstones). Only this account's candidates, control,
     anchor and fences are inputs. ``now_epoch`` is the reduction instant (a
@@ -4990,8 +5766,11 @@ def _reduce_partition(account_key, candidates, transition, *, now_epoch, project
     projected reading shares the instant and was accepted after this
     evaluation (`_later_reading_fence`); only the detached reducer, which
     can read the journal, ever supplies it. ``member_facts`` are the
-    per-axis refusal facts (#797 spec 4.4); only the detached reducer, which
-    reads the provider samples, ever supplies them."""
+    per-axis refusal facts (#797 spec 4.4) and ``refuted_supports`` the
+    refuted retained supports (#1019/#1014 spec 4.2); only the detached
+    reducer, which reads the provider samples, supplies them in full. A
+    render supplies just the refusals its cache decides
+    (`_render_member_facts`, #1019 review finding P1)."""
     control = (
         _candidates.ControlState(projection, transition.control.pending_drops)
         if transition is not None else _empty_control(projection)
@@ -5012,7 +5791,8 @@ def _reduce_partition(account_key, candidates, transition, *, now_epoch, project
     decision = _candidates.reduce_candidates(
         active, db=projection, control=control, tombstones=tombstones,
         now_epoch=now_epoch, account_key=account_key,
-        drop_consensus_allowed=drop_consensus_allowed, member_facts=member_facts)
+        drop_consensus_allowed=drop_consensus_allowed, member_facts=member_facts,
+        refuted_supports=refuted_supports)
     return decision, anchor, active, tombstones
 
 
@@ -5437,20 +6217,30 @@ def _rebuild_unclassifiable() -> _Unclassifiable:
 
 
 def _drop_permitted(classified: _Classified, transition,
-                    frontier: "_PublicationFrontier | None") -> bool:
-    """The control gate of the outcome quarantine (#825/#832 spec 5.6 item
-    7). Consulted only when a reduction would publish a drop below the
-    classified baseline. A `legacy_spool_activity` op this pass appended
-    withholds outright. Otherwise allowed when no trigger exists, or when the
-    account holds BOTH certificates and its control transition records the
-    commit of the very publication that witnesses the control certificate."""
-    import _cctally_quarantine
-
+                    frontier: "_PublicationFrontier | None", axis: str) -> bool:
+    """The per-axis drop gate of the outcome quarantine (#948 spec 6.8).
+    Consulted only when a reduction would publish a drop below the
+    classified baseline on ``axis``. Withheld when the pass appended a
+    trigger (``frontier.local_activity``) or ``axis`` of the account is
+    paused; allowed when no trigger exists or the axis is released in the
+    current generation. Release state is the fold's, read from the same
+    validated index snapshot (covering the journal through ``frontier``)
+    that the classification used — never from selected state, so
+    ``transition`` gates nothing (spec 6.4: authority is journal-only)."""
+    del transition
     if frontier is None or frontier.local_activity:
         return False
-    commit = (None if transition is None or transition.quarantine is None
-              else transition.quarantine.get("authorityCommit"))
-    return _cctally_quarantine.control_recovered(classified.status, commit)
+    status = classified.status if isinstance(classified.status, dict) else {}
+    axis_status = (status.get("axes") or {}).get(axis)
+    return bool(isinstance(axis_status, dict)
+                and axis_status.get("allowed") is True)
+
+
+def _axis_view(decision, axis: str):
+    """What ``decision`` does on ``axis``: the candidate it publishes there
+    and the pending drop it leaves (#948 spec 6.8 compares per axis)."""
+    return (_plan_axis(decision.plan, axis),
+            decision.control.pending_drops.get(axis))
 
 
 def _bound_append_kwargs(bound) -> dict:
@@ -5460,34 +6250,44 @@ def _bound_append_kwargs(bound) -> dict:
 
 def _gated_reduction(account_key, candidates, transition, *, eval_epoch,
                      fence_epoch, classified: _Classified, frontier=None,
-                     same_second_later=frozenset(), member_facts=None):
+                     same_second_later=frozenset(), member_facts=None,
+                     refuted_supports=None):
     """Reduce once with drop consensus open and once closed, against the
-    classified projection. Only when they differ — a drop below the baseline
-    would publish — is the quarantine gate consulted, so the ordinary tick
-    pays nothing for it. Returns the reduction, whether a drop was withheld,
-    and the axes whose baseline that withholding leaves unestablished
+    classified projection. Only an axis on which they differ — a drop below
+    the baseline would publish there — consults that axis's quarantine gate,
+    so the ordinary tick pays nothing for it (#948 spec 6.8: per axis, the
+    opened reduction where allowed, the closed one where withheld). Returns
+    the reduction, the frozenset of axes whose drop was withheld (empty when
+    none), and the axes whose baseline that withholding leaves unestablished
     (`_unestablished_axes`)."""
-    opened = _reduce_partition(account_key, candidates, transition,
-                               now_epoch=eval_epoch, fence_epoch=fence_epoch,
-                               projection=classified.projection,
-                               same_second_later=same_second_later,
-                               member_facts=member_facts)
-    closed = _reduce_partition(account_key, candidates, transition,
-                               now_epoch=eval_epoch, fence_epoch=fence_epoch,
-                               projection=classified.projection,
-                               drop_consensus_allowed=False,
-                               same_second_later=same_second_later,
-                               member_facts=member_facts)
+    def reduce(allowed):
+        return _reduce_partition(account_key, candidates, transition,
+                                 now_epoch=eval_epoch, fence_epoch=fence_epoch,
+                                 projection=classified.projection,
+                                 drop_consensus_allowed=allowed,
+                                 same_second_later=same_second_later,
+                                 member_facts=member_facts,
+                                 refuted_supports=refuted_supports)
+
+    opened = reduce(True)
+    closed = reduce(False)
     # Fix round K13 (review cycle 7 finding P1-2): unknown classification
     # defers the whole evaluation whatever the gate says — an open gate is
     # no classification evidence (spec 4.3 *Classification evidence*).
     unknown = opened[0].unknown_axes | closed[0].unknown_axes
     if opened[0] == closed[0]:
-        return opened, False, unknown
-    if _drop_permitted(classified, transition, frontier):
-        return opened, False, unknown
-    return closed, True, _unestablished_axes(
-        opened[0], closed[0], classified.projection)
+        return opened, frozenset(), unknown
+    withheld = frozenset(
+        axis for axis in _candidates.AXES
+        if _axis_view(opened[0], axis) != _axis_view(closed[0], axis)
+        and not _drop_permitted(classified, transition, frontier, axis))
+    if not withheld:
+        return opened, withheld, unknown
+    chosen = (closed if withheld == frozenset(_candidates.AXES)
+              else reduce({axis: axis not in withheld
+                           for axis in _candidates.AXES}))
+    return chosen, withheld, _unestablished_axes(
+        opened[0], chosen[0], classified.projection)
 
 
 def _unestablished_axes(opened, closed,
@@ -5587,11 +6387,17 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
     # this classification's snapshot and the transition's receipts.
     facts = _stale_member_facts(
         classified.stale, () if transition is None else transition.receipts, members)
+    # #1019/#1014 spec 4.2: the retained supports the same samples refute,
+    # pruned before the kernel decides the pending drops.
+    refuted = _refuted_supports(
+        classified.stale,
+        None if transition is None else transition.control.pending_drops)
     (decision, anchor, active, tombstones), withheld, unestablished = (
         _gated_reduction(
             account_key, members, transition, eval_epoch=evaluation.at,
             fence_epoch=fence_epoch, classified=classified, frontier=frontier,
-            same_second_later=same_second_later | unknown, member_facts=facts))
+            same_second_later=same_second_later | unknown, member_facts=facts,
+            refuted_supports=refuted))
     if unknown:
         # Fix round K6 (825-832-CD6-V01): an order that cannot be established
         # is neither later nor earlier. When the reduction is the same either
@@ -5603,7 +6409,8 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
         unfenced, unfenced_withheld, unfenced_unestablished = _gated_reduction(
             account_key, members, transition, eval_epoch=evaluation.at,
             fence_epoch=fence_epoch, classified=classified, frontier=frontier,
-            same_second_later=same_second_later, member_facts=facts)
+            same_second_later=same_second_later, member_facts=facts,
+            refuted_supports=refuted)
         if (unfenced[0] != decision or unfenced_withheld != withheld
                 or unfenced_unestablished != unestablished):
             return _Resolution(transition, classified, "deferred", AccountResult(
@@ -5633,16 +6440,13 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
                        if _plan_axis(decision.plan, axis) is not None
                        else decision.control.pending_drops.get(axis))
                 for axis in _candidates.AXES}))
-    prior_withheld = bool(transition is not None and transition.quarantine
-                          and transition.quarantine.get("dropWithheld"))
     quarantine = ...
-    if withheld != prior_withheld:
-        quarantine = {
-            "authorityCommit": (None if transition is None
-                                or transition.quarantine is None
-                                else transition.quarantine.get("authorityCommit")),
-            "dropWithheld": withheld,
-        }
+    if frozenset(withheld) != _withheld_axes(transition):
+        # #948 review finding F1: the persisted flag is True when some axis's
+        # drop was withheld, and names that axis when only one is, so the
+        # render path reduces each axis with its own permission and a
+        # released axis's drop is never acknowledged as nothing to do.
+        quarantine = _quarantine_document(transition, frozenset(withheld))
     control_repair_required = (
         transition is None
         or transition.control.db_projection.db_files != projection.db_files
@@ -5657,7 +6461,8 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
         plan = _bound_publication_plan(
             decision, projection, active, binding, generation=generation + 1,
             now_epoch=evaluation.at, intake_sequence=evaluation.sequence,
-            refused=_refused_tokens(facts))
+            refused=_rise_ineligible_tokens(facts),
+            drop_refused=_drop_refused_tokens(facts))
     if plan is None:
         if decision.action == "NOOP" and control_repair_required:
             decision = dataclasses.replace(decision, action="WRITE_CONTROL")
@@ -5722,7 +6527,9 @@ def _reduce_evaluation(account_key, evaluation: _Evaluation, transition, *,
                 active, db=after, control=decision.control,
                 tombstones=tombstones, now_epoch=evaluation.at,
                 account_key=account_key,
-                drop_consensus_allowed=not withheld, member_facts=facts).control
+                drop_consensus_allowed={
+                    axis: axis not in withheld for axis in _candidates.AXES},
+                member_facts=facts, refuted_supports=refuted).control
         # The record kernel can deliberately leave the DB unchanged: the
         # first zero arms its own debounce and unsupported small drops are HWM
         # rejected. Preserve the precomputed bounded attempt state so the next
@@ -5764,7 +6571,10 @@ def _reduce_and_publish_partition(account_key, candidates, transition, *,
     try:
         scope = _stale_scope(account_key, candidates, transition)
     except (OSError, ValueError, TypeError, KeyError):
-        scope = (None, bool(transition is not None and transition.receipts))
+        # Unknown scope: every sample is read and every kind of drop-proof
+        # work is assumed (#1019 spec 4.4), never "no proof needed".
+        scope = (_EVERY_SAMPLE, bool(transition is not None and transition.receipts),
+                 _ALL_DROP_WORK)
     token = _STALE_SCOPE.set(scope)
     try:
         return _reduce_and_publish_partition_work(
@@ -6161,8 +6971,11 @@ def _rescan_legacy_spool() -> bool:
         # #797/#823/#840 spec 4.6 B4: the v1 coordination state joins the
         # inventory at the revision-2 boundary, never before it, so a store
         # whose revision is not yet established compares like for like.
+        # #1019/#1014 spec 4.7 C4: the v2 state joins at the revision-3
+        # boundary the same way.
         state = _cctally_journal.capture_legacy_spool_state(
-            include_v1=cutover.revision is not None)
+            include_v1=cutover.revision is not None,
+            include_v2=cutover.revision3 is not None)
     except _cctally_journal.LegacySpoolInventoryIncomplete as failure:
         return _cctally_journal.record_legacy_spool_inventory_incomplete(
             failure) is not None
@@ -6187,9 +7000,15 @@ def _rescan_legacy_spool() -> bool:
             changed=changed, new_state=state, reason="baseline-unavailable")
         return True
     if baseline.digest() == state.digest():
-        if anchor.episode_open:
-            # A complete inventory ends the failure episode; the spool is
-            # unchanged, so it anchors nothing new and clears nothing.
+        if anchor.uncertain is not None:
+            # #948 spec 6.3: a complete inventory ends the failure episode the
+            # JOURNAL shows open (whatever the sidecar says, so an upgrade
+            # over a sidecar-closed episode still completes it): the spool is
+            # unchanged, so it anchors nothing new; the completion op closes
+            # the episode for the outcome quarantine's recovery barrier and is
+            # no trigger. The sidecar stays the writer's local dedup hint.
+            _cctally_journal.append_legacy_spool_inventory_completion(
+                episode=anchor.uncertain, digest=state.digest())
             _cctally_journal.close_legacy_spool_inventory_episode(
                 anchor.uncertain)
         return False
@@ -6370,10 +7189,12 @@ def _wait_class(result: "AccountResult") -> "dict | None":
         kind = "evidence"
     elif reason in ("unreadable", "coverage", "rebuild", "busy",
                     _ORDER_UNKNOWN_REASON, _LEGACY_INVENTORY_REASON,
-                    _PUBLICATION_SCAN_REASON):
+                    _PUBLICATION_SCAN_REASON, _DROP_EVIDENCE_REASON):
         # Unknown same-second order resolves when the journal becomes
         # readable, which only a retry can observe, as well as on a later
-        # accepted reading (a relevant evidence change).
+        # accepted reading (a relevant evidence change). #1019 review
+        # finding P2: so does a frozen plan's missing drop evidence; without
+        # a wait every render dispatched a pass that deferred it again.
         kind = "io"
     else:
         return None
@@ -6471,7 +7292,10 @@ def _tokens_from(conn, account_key: str, reason: "str | None") -> str:
         status = _cctally_quarantine.account_status(conn, account_key)
         document = {"index": index, "rows": rows,
                     "quarantine": {k: status[k] for k in sorted(status)}}
-        if reason == "coverage":
+        # #1019 review finding P2: a frozen plan's missing drop evidence is
+        # most often unprojected provider samples, so it waits on the
+        # journal cursor too.
+        if reason in ("coverage", _DROP_EVIDENCE_REASON):
             try:
                 cursor = conn.execute(
                     "SELECT segment, offset, applied_segment, applied_offset "
@@ -7685,7 +8509,7 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
     proof = transition.coverage
     if proof is None or proof["digest"] != coverage:
         return False
-    withheld = bool(transition.quarantine and transition.quarantine.get("dropWithheld"))
+    withheld = _withheld_axes(transition)
     last = None
     for count, evaluation in enumerate(_intake_evaluations(
             account_key, after=transition.intake_acknowledged)):
@@ -7707,10 +8531,12 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
             # ends where the evaluation recorded — then the reading precedes
             # it. Otherwise the detached reducer decides.
             return False
+        facts = _render_member_facts(transition, evaluation.members)
         decision, anchor, _active, _fences = _reduce_partition(
             account_key, evaluation.members, transition, now_epoch=evaluation.at,
             fence_epoch=now_epoch, projection=transition.control.db_projection,
-            drop_consensus_allowed=not withheld)
+            drop_consensus_allowed=_withheld_permission(withheld),
+            member_facts=facts)
         if (decision.action != "NOOP" or decision.unknown_axes
                 or anchor != transition.five_hour_anchor
                 or _partition_binding(evaluation.members, transition)
@@ -7722,7 +8548,8 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
         if withheld and _unestablished_axes(_reduce_partition(
                 account_key, evaluation.members, transition,
                 now_epoch=evaluation.at, fence_epoch=now_epoch,
-                projection=transition.control.db_projection)[0], decision,
+                projection=transition.control.db_projection,
+                member_facts=facts)[0], decision,
                 transition.control.db_projection):
             # Fix round K10 (P1-2): a NOOP only because the gate is closed on
             # an axis with no baseline is unknown classification, never an
@@ -7735,6 +8562,10 @@ def _render_acknowledge(account_key: str, transition: _Transition, *,
         if _receipt_work(transition, evaluation.members):
             # #797 spec 4.4 (D7c q3): a NOOP that leaves receipt work for
             # either earning path is the detached reducer's to complete.
+            return False
+        if _render_drop_work(transition, evaluation.members):
+            # #1019 spec 4.4: nor is pending drop-proof work the cached
+            # facts cannot decide consumed here.
             return False
         last = evaluation.sequence
     if last is None:
@@ -7825,13 +8656,15 @@ def _preliminary_decision() -> "_candidates.ReductionDecision | None":
             return fork
         # A drop the detached reducer last withheld stays withheld here: the
         # render path cannot open the index to re-check the quarantine (C4),
-        # and re-forking every render for it would be pure disk cost.
+        # and re-forking every render for it would be pure disk cost. Each
+        # axis keeps its own permission (#948 review finding F1): a released
+        # axis's drop is reduced open, so its deadline forks.
         decision, _anchor, _active, _fences = _reduce_partition(
             account_key, active, transition, now_epoch=now_epoch,
             projection=transition.control.db_projection,
-            drop_consensus_allowed=not (
-                transition.quarantine
-                and transition.quarantine.get("dropWithheld")))
+            drop_consensus_allowed=_withheld_permission(
+                _withheld_axes(transition)),
+            member_facts=_render_member_facts(transition, active))
         if decision.action != "NOOP":
             return decision
         if decision.unknown_axes:
@@ -7843,6 +8676,10 @@ def _preliminary_decision() -> "_candidates.ReductionDecision | None":
             # #797 spec 4.4 (D7c q3): the NOOP leaves receipt work, so the
             # preliminary NOOP exit must not swallow it: the detached reducer
             # completes the evaluation and earns.
+            return fork
+        if _render_drop_work(transition, active):
+            # #1019 spec 4.4: drop-proof work the cached facts cannot decide
+            # is the detached reducer's too.
             return fork
     return None
 
@@ -8098,16 +8935,26 @@ def _statusline_oauth_tick(*, sync_for_test: bool = False) -> None:
 
 
 def _resolve_context_window(model_id, warn_once) -> "int | None":
-    """Look up ``model_id`` in ``CLAUDE_MODEL_CONTEXT_WINDOWS``; fall back
-    to a family-substring match against
+    """The model FALLBACK for a context window (#1002 spec §5.3).
+
+    Empty id → ``None`` silently. Otherwise, on the lowercased id: a
+    terminal ``[1m]`` → 1,000,000 whatever the family; then, with one
+    trailing ``-YYYYMMDD`` stripped, an exact hit in
+    ``CLAUDE_MODEL_CONTEXT_WINDOWS``; then a family-substring match against
     ``CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY``. Unknown id → ``None`` +
-    one-shot stderr warning.
+    one-shot stderr warning (naming the id as given).
     """
     if not model_id:
         return None
-    if model_id in CLAUDE_MODEL_CONTEXT_WINDOWS:
-        return CLAUDE_MODEL_CONTEXT_WINDOWS[model_id]
     mid_lower = model_id.lower()
+    if mid_lower.endswith("[1m]"):
+        return 1_000_000
+    # One anchored trailing snapshot date (`claude-opus-5-5-20261001`).
+    registered = CLAUDE_MODEL_CONTEXT_WINDOWS.get(
+        re.sub(r"-\d{8}$", "", mid_lower)
+    )
+    if registered is not None:
+        return registered
     for family, window in CLAUDE_MODEL_CONTEXT_WINDOW_DEFAULT_FAMILY.items():
         if family in mid_lower:
             return window
@@ -8500,39 +9347,55 @@ def _build_statusline_injections(warn_once):
             except Exception:
                 pass
 
-    def _context_pct(transcript_path, model_id):
-        if not transcript_path or not model_id:
+    def _context_pct(transcript_path, model_id, window_size, context_tokens):
+        # #1002 spec §5.2. The payload's window and numerator (already
+        # validated by the kernel) each win when not None; the model table
+        # and the transcript tail are independent fallbacks. `is not None`
+        # throughout so a payload zero is honored.
+        if context_tokens is None and not transcript_path:
+            return None  # silent: nothing to measure (today's path)
+        if window_size is not None:
+            window = window_size  # skips the model lookup and its warning
+        elif model_id:
+            # May warn; model resolution precedes any transcript read.
+            window = _resolve_context_window(model_id, warn_once)
+        else:
+            return None  # silent: no window source at all
+        if window is None or window <= 0:
             return None
-        window = _resolve_context_window(model_id, warn_once)
-        if window is None:
-            return None
+        if context_tokens is not None:
+            ctx_tokens = context_tokens  # the transcript is not opened
+        else:
+            try:
+                usage = _read_last_assistant_usage(transcript_path)
+            except Exception:
+                return None
+            if not isinstance(usage, dict):
+                return None
+            try:
+                ctx_tokens = (
+                    int(usage.get("input_tokens", 0) or 0)
+                    + int(usage.get("cache_read_input_tokens", 0) or 0)
+                    + int(usage.get("cache_creation_input_tokens", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                return None
         try:
-            usage = _read_last_assistant_usage(transcript_path)
-        except Exception:
-            return None
-        if not isinstance(usage, dict):
-            return None
-        try:
-            ctx_tokens = (
-                int(usage.get("input_tokens", 0) or 0)
-                + int(usage.get("cache_read_input_tokens", 0) or 0)
-                + int(usage.get("cache_creation_input_tokens", 0) or 0)
-            )
-        except (TypeError, ValueError):
-            return None
-        if window <= 0:
-            return None
-        return ctx_tokens / window * 100.0
+            return ctx_tokens / window * 100.0
+        except OverflowError:
+            return None  # a count no float can hold: `🧠 N/A`, not a crash
 
     def _quota_regimes() -> tuple:
         """#661 S2 §9. The stored metering regimes, read without mutating.
 
         Three properties this read must have, and each is a decision:
 
-        * It takes NO flock and NO throttle. `save_calibrations` writes
-          through `os.replace` in the same directory, so a lock-free reader
-          always sees a complete old or new inode; a flock here would let a
-          writer stall a prompt.
+        * It takes NO blocking flock and NO throttle. `save_calibrations`
+          writes through `os.replace` in the same directory, so a lock-free
+          reader always sees a complete old or new inode; a blocking flock
+          here would let a writer stall a prompt. (#1015: the lineage facts
+          read tries the stats maintenance flock SHARED and NON-blocking, and
+          a busy lock hides the marker rather than waiting.)
         * It goes through `read_stored_state_readonly`, not through
           `load_calibrations`. The loader renames a malformed or
           version-ahead file aside through `_quarantine`, and a status line
@@ -8547,13 +9410,22 @@ def _build_statusline_injections(warn_once):
 
         It also NEVER opens `cache.db` and never calls `analyse`. The
         marker is derived from the regime pair alone.
+
+        #1015 spec 5.6: the regimes handed to the marker are the CLEAN ones,
+        and none at all when the active transition is superseded or the
+        correction facts cannot be verified (no marker is asserted). The
+        facts are read — through the fail-fast read-only opener, which never
+        waits, recovers or writes — only when a change is active.
         """
         try:
             glue = _cctally()._load_sibling("_cctally_quota_model")
             state = glue.read_stored_state_readonly()
             if state is None:
                 return ()
-            return tuple(glue.stored_regimes(state, None))
+            calibration = _cctally()._load_sibling(
+                "_cctally_quota_calibration")
+            return tuple(calibration.marker_regimes(
+                None, regimes=glue.stored_regimes(state, None)))
         except Exception:                              # noqa: BLE001
             return ()
 

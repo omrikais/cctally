@@ -436,6 +436,43 @@ def test_lost_or_contended_cache_is_unknown(pa, tmp_path, cache):
     assert _capture(pa, main, cache).status == "known"
 
 
+def _listing(directory):
+    return {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in directory.iterdir()}
+
+
+def test_a_cache_miss_starts_from_the_seed_document_read_only(pa, tmp_path, cache, opens):
+    """#1019 L14 (accuracy): the revision-3 cutover moves the scan cache to a
+    new spool. Started cold, a session with more than eight subagent files
+    carries unknown witnesses for its first arrivals after an upgrade, so an
+    idle session's stale-low reading loses the drop proof's activity bound."""
+    main = _write(tmp_path / "p" / "s.jsonl", [_assistant("2026-10-26T10:00:00Z")])
+    for i in range(20):
+        _write(_subagent(main, f"agent-{i:02d}.jsonl"), [_assistant(f"2026-10-26T10:{i + 1:02d}:00Z")])
+    seed = tmp_path / "legacy" / "activity-cache" / cache.name
+    assert [_capture(pa, main, seed).status for _ in range(3)][-1] == "known"
+    before = _listing(seed.parent)
+    opens.clear()
+    w = pa.capture_activity(str(main), cache_path=cache, seed_path=seed)
+    assert (w.status, w.instant_utc, w.files_examined) == ("known", "2026-10-26T10:20:00Z", 21)
+    assert opens == []  # every seeded record was a hit
+    assert _listing(seed.parent) == before  # never locked, written or pruned
+    # The new spool keeps its own document: the seed is a starting state only.
+    seed.unlink()
+    assert _capture(pa, main, cache).status == "known"
+    # A present document is never replaced by a seed, even a partial one.
+    partial = tmp_path / "s2" / "activity-cache" / cache.name
+    assert _capture(pa, main, partial).files_examined == 9
+    w = pa.capture_activity(str(main), cache_path=partial, seed_path=cache)
+    assert (w.status, w.files_examined) == ("unknown", 17)
+    # An invalid seed is an ordinary first arrival, not invalid cache data.
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    w = pa.capture_activity(str(main), cache_path=tmp_path / "s3" / cache.name, seed_path=bad)
+    plain = _capture(pa, main, tmp_path / "s4" / cache.name)
+    assert (w.reason, w.files_examined, w.digest) == ("coverage-incomplete", 9, plain.digest)
+    assert bad.read_text() == "{not json"
+
+
 def test_cached_unknown_never_becomes_known(pa, tmp_path, cache, opens):
     main = _write(tmp_path / "p" / "s.jsonl", [_assistant("2026-10-26T10:00:00Z")])
     full = _assistant("2026-10-26T10:05:00Z")
@@ -528,7 +565,7 @@ def test_render_capture_embeds_the_witness_in_the_v2_candidate(app, tmp_path):
     assert pa.witness_from_json(doc["activity"]) == candidate.activity
     assert str(main) not in raw.read_text() and "sess-797" not in raw.read_text()
     assert _slot(sl, candidate) == candidate
-    # The scan cache lives in the v2 spool, one file per contributor.
+    # The scan cache lives in the v3 spool, one file per contributor.
     import _cctally_core as core
     cached = core.STATUSLINE_ACCOUNT_BOUND_DIR / "activity-cache" / f"{candidate.token}.json"
     assert cached.is_file() and str(main) not in cached.read_text()
@@ -537,6 +574,30 @@ def test_render_capture_embeds_the_witness_in_the_v2_candidate(app, tmp_path):
                                      received_at=int(time.time()))
     assert (blind.activity.status, blind.activity.reason) == (
         "unknown", "no-transcript-path")
+
+
+def test_a_v3_render_starts_from_the_v2_scan_cache_without_touching_v2(app, tmp_path):
+    """#1019 L14 (accuracy: a false in-place reset). After the revision-3
+    cutover an idle session's first renders carried an unknown witness, so
+    the provider-sample proof had no activity bound for its stale-low
+    reading. The v2 document the previous release kept seeds the v3 cache."""
+    sl = sys.modules["_cctally_statusline"]
+    pa = sys.modules["_lib_provider_activity"]
+    import _cctally_core as core
+    main = _write(tmp_path / "proj" / "s.jsonl", [_assistant("2026-10-26T10:00:00Z")])
+    for i in range(12):
+        _write(_subagent(main, f"agent-{i:02d}.jsonl"), [_assistant(f"2026-10-26T10:{i + 1:02d}:00Z")])
+    parsed = _status(app, transcript=main)
+    token = sl._candidate_identity_token(parsed)
+    legacy = core.STATUSLINE_ACCOUNT_BOUND_V2_DIR / "activity-cache" / f"{token}.json"
+    assert [pa.capture_activity(str(main), cache_path=legacy).status
+            for _ in range(2)] == ["unknown", "known"]
+    before = _listing(legacy.parent)
+    candidate = sl._candidate_from_input(parsed, received_at=int(time.time()))
+    w = candidate.activity
+    assert (w.status, w.instant_utc, w.files_examined) == ("known", "2026-10-26T10:12:00Z", 13)
+    assert (core.STATUSLINE_ACCOUNT_BOUND_DIR / "activity-cache" / f"{token}.json").is_file()
+    assert _listing(legacy.parent) == before
 
 
 def test_missing_witness_makes_v2_document_malformed(app, tmp_path):

@@ -263,6 +263,7 @@ def test_the_tui_sync_hands_the_codex_frontier_the_kernels_verdict(
     def spy(self, provider, conn, *, roots, guard_paths=(), trusted=True,
             cutoff=None):
         seen[provider] = trusted
+        seen[(provider, "roots")] = roots
         return original_seed(
             self, provider, conn, roots=roots, guard_paths=guard_paths,
             trusted=trusted, cutoff=cutoff,
@@ -295,3 +296,36 @@ def test_the_tui_sync_hands_the_codex_frontier_the_kernels_verdict(
     locked(skip_sync=False)
 
     assert seen.get("codex") is enabled
+    # #970 T8: the TUI's frontier roots are the native home's locations.
+    rc = ns["_load_sibling"]("_lib_codex_rollout_container")
+    assert seen.get(("codex", "roots")) == (
+        rc.CodexLocations(home / "sessions", home / "archived_sessions"),)
+
+
+def test_frontier_roots_follow_native_home_recognition(runtime, monkeypatch):
+    """#970 T8 (spec 5.1, 5.8): both frontiers' Codex roots come from native-home
+    recognition, never a hard-coded `<home>/sessions`. Detects an archive-only
+    home (or a direct rollout directory) whose frontier certifies the wrong
+    directories, so archive moves and new rollouts there are never seen
+    without a hook; a direct directory keeps its direct semantics."""
+    ns, home = runtime
+    import _cctally_dashboard
+
+    rc = ns["_load_sibling"]("_lib_codex_rollout_container")
+
+    def codex_roots():
+        _frontier_mod, context = _cctally_dashboard._conversation_frontier_context()
+        return context["codex"][0]
+
+    native = rc.CodexLocations(home / "sessions", home / "archived_sessions")
+    (home / "archived_sessions").mkdir()           # archive-only native home
+    assert codex_roots() == (native,)
+    (home / "sessions").mkdir()                    # first unarchive: unchanged
+    assert codex_roots() == (native,)
+
+    direct = home.parent / "direct-rollouts"
+    direct.mkdir()
+    (direct / "rollout.jsonl").write_text("{}\n")
+    missing = home.parent / "not-there"
+    monkeypatch.setenv("CODEX_HOME", f"{home},{direct},{missing}")
+    assert codex_roots() == (native, rc.CodexLocations(direct, None))

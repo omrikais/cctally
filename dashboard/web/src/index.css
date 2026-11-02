@@ -994,6 +994,8 @@ body { padding: 16px; box-sizing: border-box; max-width: 2100px; margin: 0 auto;
   color: var(--text-dim);
   font-style: italic;
   overflow-wrap: anywhere;
+  /* #948: a multi-line remediation (one line per limit) keeps its breaks. */
+  white-space: pre-line;
 }
 .doctor-modal__flag {
   display: inline-block;

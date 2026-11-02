@@ -30,12 +30,23 @@ import re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
+ENTRY = BIN / "cctally"
 EXECUTE_ATTRS = frozenset({"execute", "executemany", "executescript"})
+
+
+def module_paths(bin_dir=BIN):
+    """The sibling modules `_modules()` parses, sorted."""
+    return sorted(bin_dir.glob("_*.py"))
+
+
+def input_paths():
+    """Every real-tree source the collector reads: the modules and the entry."""
+    return module_paths() + [ENTRY]
 
 
 def _modules(bin_dir=BIN):
     out = {}
-    for path in sorted(bin_dir.glob("_*.py")):
+    for path in module_paths(bin_dir):
         out[path.stem] = ast.parse(path.read_text(encoding="utf-8"), str(path))
     return out
 
@@ -381,8 +392,7 @@ class CallGraph:
         #: fingerprinted rather than left out. ``entry`` is its tree; the
         #: real `bin/cctally` is read when the graph is the real tree.
         if entry is None and modules is None:
-            entry = ast.parse((BIN / "cctally").read_text(encoding="utf-8"),
-                              str(BIN / "cctally"))
+            entry = ast.parse(ENTRY.read_text(encoding="utf-8"), str(ENTRY))
         self.entry = _Module("cctally", entry) if entry is not None else None
         self._definers = {}
         for name, mod in self.modules.items():

@@ -30,7 +30,7 @@ purpose. They must NEVER be "refreshed" from ``_apply_cache_schema`` /
 ancient fixture is to represent a shape the current code no longer emits, so the
 full migration chain has something real to migrate. Regenerate ONLY on a
 deliberate decision (e.g. a new migration needs a new legacy column), and review
-the diff by hand. This script is named so the #197 byte-idempotency guard does
+the diff by hand. This script is named so the #197 content-idempotency guard does
 NOT auto-discover it (it is not ``build_per_migration_*`` inside
 ``build-migrations-fixtures.py``); it is driven end-to-end by
 ``tests/test_migration_ancient_to_head.py`` instead.
@@ -432,7 +432,7 @@ migrate. Regenerate ONLY when a deliberate decision requires it (e.g. a new
 migration needs a new legacy column), by running
 `python3 bin/build-ancient-migration-fixtures.py` and hand-reviewing the diff.
 The builder is intentionally NOT a `build_per_migration_*` in
-`build-migrations-fixtures.py`, so the #197 byte-idempotency guard does not
+`build-migrations-fixtures.py`, so the #197 content-idempotency guard does not
 auto-discover it.
 """
 

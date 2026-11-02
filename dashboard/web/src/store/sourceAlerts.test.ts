@@ -1,8 +1,8 @@
 // #294 S5 Task 7 — the source-aware toast pipeline (INGEST_SOURCE_ALERTS).
 import { beforeEach, describe, expect, it } from 'vitest';
-import { _resetForTests, dispatch, getState } from './store';
+import { _resetForTests, dispatch, getState, isMeterRateChangePayload } from './store';
 import type { AlertsConfig } from './store';
-import type { SourceAlertRow } from '../types/envelope';
+import type { MeterRateChangeEntry, SourceAlertRow } from '../types/envelope';
 
 const CONFIG: AlertsConfig = {
   enabled: true,
@@ -111,5 +111,94 @@ describe('INGEST_SOURCE_ALERTS toast pipeline', () => {
     ingest([claudeRow, codexBudgetRow], true);
     expect(getState().toast).toBeNull();
     expect(getState().seenAlertIds.has(`codex:${codexBudgetRow.key}`)).toBe(true);
+  });
+});
+
+// #1015 spec 5.7 (R1-P1-6) — a transition fitted from inputs a reviewed
+// correction later changed must not reach the user as a toast, including one
+// already queued behind another alert when the supersession arrives.
+describe('INGEST_SOURCE_ALERTS reconciles superseded rate changes', () => {
+  const rateChange: MeterRateChangeEntry = {
+    id: 'meter_rate_change:claude:unattributed:2026-10-20T00:00:00+00:00',
+    family: 'meter_rate_change',
+    provider: 'claude',
+    owner: 'claude',
+    severity: 'alarm',
+    effective_from: '2026-10-20T00:00:00+00:00',
+    detected_at: '2026-10-21T00:00:00+00:00',
+    recorded_at: '2026-10-21T00:00:00+00:00',
+    previous_units_per_point: 2.0,
+    new_units_per_point: 1.0,
+    supersession: null,
+  };
+  const superseded: MeterRateChangeEntry = {
+    ...rateChange,
+    supersession: {
+      reason: 'reviewed-correction',
+      superseded_at: null,
+      corrections: ['op-1'],
+    },
+  };
+
+  function tick(rows: SourceAlertRow[], rateChanges: MeterRateChangeEntry[], isFirstTick = false): void {
+    dispatch({
+      type: 'INGEST_SOURCE_ALERTS', rows, rateChanges, alertsSettings: CONFIG, isFirstTick,
+    });
+  }
+
+  function transitionShown(): boolean {
+    const toast = getState().toast;
+    return toast?.kind === 'alert' && isMeterRateChangePayload(toast.payload)
+      && toast.payload.id === rateChange.id;
+  }
+
+  it('drops a queued transition once it arrives superseded, and never re-queues it', () => {
+    tick([], [], true);
+    // The transition queues behind a threshold alert.
+    tick([claudeRow], [rateChange]);
+    expect(getState().toast?.kind).toBe('alert');
+    expect(transitionShown()).toBe(false);
+    expect(getState().alertToastQueue.map(
+      (entry) => (isMeterRateChangePayload(entry) ? entry.id : 'threshold'),
+    )).toEqual([rateChange.id]);
+
+    // The correction lands: the same identity now arrives superseded.
+    tick([claudeRow], [superseded]);
+    expect(getState().alertToastQueue).toEqual([]);
+    expect(getState().seenAlertIds.has(rateChange.id)).toBe(true);
+
+    // Dismissing the preceding alert promotes nothing.
+    dispatch({ type: 'HIDE_TOAST' });
+    expect(getState().toast).toBeNull();
+
+    // A later array never re-queues it.
+    tick([claudeRow], [superseded]);
+    expect(getState().toast).toBeNull();
+    expect(getState().alertToastQueue).toEqual([]);
+  });
+
+  it('creates no toast for a superseded row arriving fresh, and keeps it seen', () => {
+    tick([], [], true);
+    tick([], [superseded]);
+    expect(getState().toast).toBeNull();
+    expect(getState().alertToastQueue).toEqual([]);
+    expect(getState().seenAlertIds.has(rateChange.id)).toBe(true);
+  });
+
+  it('dismisses the visible transition toast when it arrives superseded', () => {
+    tick([], [], true);
+    tick([], [rateChange]);
+    expect(transitionShown()).toBe(true);
+    tick([], [superseded]);
+    expect(getState().toast).toBeNull();
+  });
+
+  it('leaves every other queued alert in place', () => {
+    tick([], [], true);
+    tick([claudeRow, codexBudgetRow], [rateChange]);
+    expect(getState().alertToastQueue.length).toBe(2);
+    tick([claudeRow, codexBudgetRow], [superseded]);
+    expect(getState().alertToastQueue.length).toBe(1);
+    expect('source' in getState().alertToastQueue[0]).toBe(true);
   });
 });

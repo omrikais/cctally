@@ -243,8 +243,10 @@ def test_group_append_without_a_cutover_establishes_it_first(app):
     _cctally_journal.append_records(records)
     kinds = [_kind(r) for _s, _o, r in _lines()]
     # #797/#823/#840 (spec 4.6 B2): on a fresh store the revision-2 op
-    # follows the cutover op immediately.
+    # follows the cutover op immediately, and (#1019/#1014 spec 4.7 C2) the
+    # revision-3 op follows it.
     assert kinds == ["account_bound_cutover", "account_bound_revision",
+                     "account_bound_revision_v3",
                      "account_label", "account_label"]
 
 

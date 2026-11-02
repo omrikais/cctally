@@ -116,11 +116,13 @@ def test_the_cutover_reuse_scan_reads_through_the_seam(opened, journal_fixture):
 
 def test_the_quota_dedup_rebuild_reads_through_the_seam(opened, journal_fixture):
     """The fourth read route: the re-derivable quota natural-key index rebuild
-    scans every segment when its compact index is absent."""
+    scans every segment when its compact index is absent. Since #977 that scan
+    is `rebuild_quota_index` (off the leaf lock, never inside an append); it
+    still reads each segment once, through the seam."""
     jr = _journal()
     jr._QUOTA_DEDUP_KEYS.clear()
     jr._QUOTA_DEDUP_LOADED = False
     jr._QUOTA_DEDUP_DIR = None
     opened.clear()
-    jr._load_quota_dedup_keys()
+    assert jr.rebuild_quota_index() == "published"
     assert opened == jr.list_segments()

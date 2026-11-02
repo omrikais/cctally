@@ -1,6 +1,7 @@
 """#661 S2 Task D1 — the single cause-code copy table (spec section 8).
 
-Fifteen codes, two registers, one table. What these tests own is that the
+Sixteen codes (#1015 added `recalibration-needed`), two registers, one
+table. What these tests own is that the
 table covers the whole closed union, that the short register is derivable
 from the code alone so a client with no presentation fields renders a token
 rather than a blank, and that `--json` keeps emitting the machine code
@@ -25,7 +26,7 @@ def test_d1_every_evidence_code_has_both_registers():
     ns = load_script()
     copy = _copy(ns)
     qm = _qm(ns)
-    assert len(qm.EVIDENCE_CODES) == 15, sorted(qm.EVIDENCE_CODES)
+    assert len(qm.EVIDENCE_CODES) == 16, sorted(qm.EVIDENCE_CODES)
     for code in qm.EVIDENCE_CODES:
         assert copy.short_form(code), code
         assert copy.long_form(code), code
@@ -144,3 +145,15 @@ def test_the_era_sentence_does_not_claim_the_window_predates_the_weights():
     assert text == ("this window is not inside a single coefficient era the "
                     "token weights are validated for")
     assert "predate" not in text
+
+
+def test_1015_recalibration_needed_reads_in_the_operator_decided_words():
+    """U3 (#1015 spec 2): the short register is derived, and the long one is
+    the decided sentence. Detects a refusal shown with a generic or absent
+    cause, which would leave the user unable to act on a withheld forecast."""
+    ns = load_script()
+    copy = _copy(ns)
+    assert copy.short_form("recalibration-needed") == "recalibration needed"
+    assert copy.long_form("recalibration-needed") == (
+        "the stored calibration was fitted before a correction to its "
+        "inputs; run cctally quota to recalibrate")

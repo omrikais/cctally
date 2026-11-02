@@ -31,6 +31,7 @@ from typing import Any
 
 from _lib_codex_pools import codex_model_scoped_quota_pool
 from _lib_source_identity import canonical_identity_from_root_key
+from _lib_claude_attribution import valid_record_id as _valid_record_id
 
 
 def _eprint(*args: Any) -> None:
@@ -262,8 +263,19 @@ def _classify_cost_entry(obj, path_str: str):
     except ValueError:
         return None, "bad-timestamp"
 
+    # #944 F1: only a non-empty string names a record. An empty, numeric or
+    # object id counts as missing HERE, at the shared parser chokepoint, so the
+    # dedup index, the id-less partial indexes, the direct fallback's dedup map
+    # and the attribution identity all see the same NULL: such a line is
+    # deduplicated by its location and attributed by its bytes, and can never
+    # reach the journal as a keyed item it would reject (which aborted every
+    # later sync).
     msg_id = msg.get("id")
     req_id = obj.get("requestId")
+    if not _valid_record_id(msg_id):
+        msg_id = None
+    if not _valid_record_id(req_id):
+        req_id = None
     cost_usd_raw = obj.get("costUSD")
     try:
         cost_usd = float(cost_usd_raw) if cost_usd_raw is not None else None

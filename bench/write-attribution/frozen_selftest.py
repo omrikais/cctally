@@ -126,6 +126,8 @@ WALL_CLOCK = {
     "generated_at", "first_ingested_at", "last_checked_at", "completed_at_utc",
     # the control tree (before W8) rewrites this on every walk
     "updated_at_utc",
+    # #944: a Claude cost decision's own instant (claude_cost_decisions)
+    "decided_at_utc",
 }
 #: (table, column) pairs holding a per-run nonce rather than input content.
 NONCE = {("quota_projection_state", "generation")}

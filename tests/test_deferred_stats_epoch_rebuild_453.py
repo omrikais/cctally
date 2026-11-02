@@ -190,29 +190,27 @@ def test_scheduler_failed_spawn_is_immediately_retryable(runtime, monkeypatch):
 def test_scheduler_suppresses_launch_while_long_worker_holds_flock(
     runtime, monkeypatch,
 ):
-    """An active replay outliving the marker TTL must not spawn a duplicate."""
+    """An active replay outliving the marker TTL must not spawn a duplicate.
+
+    #1012: the running worker is identified by its records, not by probing
+    its flock."""
     _ns, core, _db, store = runtime
     import _cctally_update
+    from test_997_worker_lifecycle import _SyntheticOwner
 
     core.APP_DIR.mkdir(parents=True, exist_ok=True)
     marker = core.APP_DIR / "stats-epoch-rebuild.pending"
     marker.touch()
     stale = time.time() - store._STATS_EPOCH_REBUILD_RETRY_SECONDS - 1
     os.utime(marker, (stale, stale))
-    lock_path = core.APP_DIR / "stats-epoch-rebuild.worker.lock"
-    held = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     spawned: list[str] = []
     monkeypatch.setattr(
         _cctally_update,
         "_spawn_detached_with_pid",
         lambda command, **_kw: spawned.append(command) or os.getpid(),
     )
-    try:
+    with _SyntheticOwner("epoch"):
         assert store.defer_stats_epoch_rebuild() == "pending"
-    finally:
-        fcntl.flock(held, fcntl.LOCK_UN)
-        os.close(held)
     assert spawned == []
     assert time.time() - marker.stat().st_mtime < 5
 
@@ -428,22 +426,27 @@ def test_worker_failure_stays_retryable_and_logs_sanitized_error(
 def test_worker_flock_prevents_concurrent_rebuild_execution(
     runtime, monkeypatch,
 ):
-    """The worker flock is the final defense against concurrent replay."""
+    """The worker flock is the final defense against concurrent replay: a
+    worker started while another runs records `busy` (#1012: after losing
+    the claim to that running owner) and never enters the resolver."""
     _ns, core, _db, store = runtime
+    from test_997_worker_lifecycle import _Run, _SyntheticOwner, _until
+
     core.APP_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = core.APP_DIR / "stats-epoch-rebuild.worker.lock"
-    held = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
-    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     monkeypatch.setattr(
         store,
         "resolve_stats_epoch_mismatch",
         lambda: pytest.fail("duplicate worker entered the resolver"),
     )
-    try:
-        assert store.cmd_stats_epoch_rebuild_internal(SimpleNamespace()) == 0
-    finally:
-        fcntl.flock(held, fcntl.LOCK_UN)
-        os.close(held)
+    with _SyntheticOwner("epoch"):
+        duplicate = _Run(
+            lambda: store.cmd_stats_epoch_rebuild_internal(SimpleNamespace()),
+            name="duplicate worker")
+        duplicate.start()
+        _until(lambda: not duplicate.is_alive(),
+               "the duplicate worker never returned")
+        duplicate.finish()
+        assert duplicate.result == 0
 
 
 def test_worker_real_rebuild_converges_then_next_open_is_steady(
@@ -491,6 +494,52 @@ def test_worker_real_rebuild_converges_then_next_open_is_steady(
         ).fetchone()[0] >= 1
     finally:
         conn.close()
+
+
+def test_pending_rebuild_publishes_through_a_probe_overlap(
+    runtime, monkeypatch,
+):
+    """#1012 T5. Detects the activity probe suppressing a pending epoch
+    rebuild: probing at the worker's start made it exit `busy`, so the index
+    stayed at the old epoch. Through the overlap the worker must publish the
+    current epoch from the journal, including an observation appended after
+    the last ingest (a header-only stamp cannot pass), and the next open
+    must schedule nothing."""
+    _ns, core, _db, store = runtime
+    import _cctally_journal as journal
+    import _lib_journal as wire
+    from test_997_worker_lifecycle import _run_overlap
+
+    journal.append_record(_usage_obs(wire, 12.0, "2026-08-02T12:00:00Z"))
+    journal.run_stats_ingest(mode="authoritative")
+    _stamp(core.DB_PATH, core.STATS_INDEX_EPOCH - 1)
+    marker = core.APP_DIR / "stats-epoch-rebuild.pending"
+    marker.touch()
+    journal.append_record(_usage_obs(wire, 37.5, "2026-08-02T12:05:00Z"))
+
+    run = _run_overlap(SimpleNamespace(app=core.APP_DIR, st=store),
+                       monkeypatch, "epoch",
+                       store._stats_epoch_rebuild_worker_active)
+    log = core.LOG_DIR / "stats-epoch-rebuild.log"
+    assert run.outcome == "success", log.read_text() if log.exists() else ""
+    assert store.stats_epoch_rebuild_pending() is False
+    assert not marker.exists()
+    monkeypatch.setattr(
+        store,
+        "defer_stats_epoch_rebuild",
+        lambda: pytest.fail("steady open scheduled a second worker"),
+        raising=False,
+    )
+    conn = core.open_db()
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == (
+            core.STATS_INDEX_EPOCH
+        )
+        percents = sorted(r[0] for r in conn.execute(
+            "SELECT weekly_percent FROM weekly_usage_snapshots"))
+    finally:
+        conn.close()
+    assert percents == [12.0, 37.5]
 
 
 def _applied_cursor(core, journal):
@@ -601,12 +650,11 @@ def _epoch_run(store):
     """The epoch worker's recorded run, read without touching its flock.
 
     `_WorkerRun.begin()` writes the run only after the worker has won its
-    flock, so a recorded run is a started worker. The handshake must never
-    poll `_stats_epoch_rebuild_worker_active()`: that probe try-locks the
-    worker flock EXCLUSIVE for an instant, and a worker whose own
-    non-blocking claim lands in that instant exits `busy`, while the fresh
-    pending marker suppresses a respawn, so the test waited out its
-    backstop and failed."""
+    flock, so a recorded run is a started worker. (The handshake once polled
+    `_stats_epoch_rebuild_worker_active()`, which then try-locked the worker
+    flock: a worker whose claim landed in that instant exited `busy`, the
+    fresh pending marker suppressed a respawn, and the test waited out its
+    backstop. #1012 made the probe lock-free; this reads the run directly.)"""
     return (store.read_worker_state("epoch")["state"] or {}).get("run")
 
 

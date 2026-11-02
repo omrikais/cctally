@@ -44,6 +44,15 @@ def test_the_durations_recorder_strips_only_a_group_suffix():
         assert _pytest_durations_plugin.plain_nodeid(raw) == plain, raw
 
 
+def test_the_private_failure_detail_strips_only_a_group_suffix():
+    # Detects (#1011 review 1): the private failure detail's summary parser
+    # drifting from the recorders' rule, so a grouped failure's section is
+    # never matched (or a parameter id holding `@` is cut).
+    import _lib_test_evidence
+    for raw, plain in PLAIN:
+        assert _lib_test_evidence.plain_pytest_node_id(raw) == plain, raw
+
+
 GROUPED = '''
 import pytest
 

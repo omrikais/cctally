@@ -26,9 +26,16 @@ nothing, and one that conflicts is detected from the retained whole-record
 digest, which taints the batch and forces a rebuild that re-derives from the
 journal.
 
-This module imports nothing outside the stdlib and `_lib_journal`, and in
-particular never imports `_cctally_journal`, so it is unit-testable without a
-journal on disk — the same rule `bin/_lib_journal_router.py` follows.
+This module imports nothing outside the stdlib, `_lib_journal` and the pure
+`_lib_quota_lineage` kernel, and in particular never imports
+`_cctally_journal`, so it is unit-testable without a journal on disk — the same
+rule `bin/_lib_journal_router.py` follows.
+
+#1015 (spec 5.1): the batch-completion step also gives each newly completed
+batch's lineage footprint (:func:`completed_batch_footprints`) while it still
+holds every action core, before compaction drops them. The footprint is kept
+off :class:`SelectorRows` — those rows are compared for validation and owned by
+the selector — and handed to the caller through ``lineage`` out-dicts.
 """
 from __future__ import annotations
 
@@ -36,6 +43,7 @@ import json
 from dataclasses import dataclass, replace
 
 import _lib_journal as _jl
+import _lib_quota_lineage
 
 
 #: Bumped whenever the durable row shapes or the merge semantics change. A
@@ -800,6 +808,107 @@ def advance_counter(
     )
 
 
+def _revision_of(winner, owner_of):
+    """The `_lib_quota_lineage.Revision` of one winning candidate."""
+    if winner.status != "active" or winner.record is None:
+        return _lib_quota_lineage.Revision("tombstone")
+    return _lib_quota_lineage.Revision(
+        "active", owner_of((winner.record or {}).get("payload")))
+
+
+def _takes_winner(prior, candidate) -> bool:
+    """The selector's winner rule: the highest revision, and at the same
+    revision the lowest sequence (a durable winner with no sequence keeps its
+    place)."""
+    if prior is None or candidate.rev > prior.rev:
+        return True
+    if candidate.rev < prior.rev:
+        return False
+    return (prior.sequence is not None and candidate.sequence is not None
+            and candidate.sequence < prior.sequence)
+
+
+def completed_batch_footprints(fold, batch_ids, *, owner_of, seed=None):
+    """#1015 spec 5.1: the footprint of each completed batch in ``batch_ids``.
+
+    Returns ``{batch_id: frozenset((provider, account_key), ...)}`` through
+    `_lib_quota_lineage.batch_footprint`. Batches are walked in commit
+    order, and each action's predecessor is the revision effective
+    immediately before its batch commits: the winner over ``seed`` (the
+    durable winner of an event id before ``fold``'s stream, None on a full
+    pass) advanced by every base evt folded before that commit and by every
+    earlier completed batch — dominated and tombstoned revisions included —
+    then the revision the batch's own earlier action produced.
+
+    ``owner_of(payload)`` is the `(provider, account_key)` the evt fold stores
+    for a payload, or None when it cannot be resolved. ``batch_ids`` names
+    batches whose cores ``fold`` still holds (newly completed on this pass);
+    any other id is ignored.
+    """
+    targets = []
+    for batch_id in batch_ids:
+        if batch_id not in fold.completed:
+            continue
+        commit = fold.markers.get(batch_id, {}).get("commit")
+        actions = fold.actions.get(batch_id, {})
+        if commit is None or any(
+                actions[seq][0] is None for seq in actions):
+            continue
+        targets.append((commit[3], batch_id))
+    if not targets:
+        return {}
+    targets.sort()
+    base = sorted(
+        (candidate for candidate in fold.candidates
+         if candidate.batch_id is None),
+        key=lambda item: item.sequence)
+    winners: dict = {}
+    seeded: set = set()
+
+    def current(event_id):
+        if event_id not in seeded:
+            seeded.add(event_id)
+            if event_id not in winners and seed is not None:
+                prior = seed(event_id)
+                if prior is not None:
+                    winners[event_id] = prior
+        return winners.get(event_id)
+
+    def offer(candidate):
+        prior = current(candidate.event_id)
+        if _takes_winner(prior, candidate):
+            winners[candidate.event_id] = candidate
+
+    footprints: dict = {}
+    position = 0
+    for commit_sequence, batch_id in targets:
+        while position < len(base) and base[position].sequence < commit_sequence:
+            offer(base[position])
+            position += 1
+        batch_actions = fold.actions.get(batch_id, {})
+        ordered = [batch_actions[seq] for seq in sorted(batch_actions)]
+        actions = []
+        for normalized, _digest, _sequence in ordered:
+            tombstone = normalized.get("action") == "tombstone"
+            actions.append(_lib_quota_lineage.Action(
+                event_id=normalized["id"],
+                rev=int(normalized["rev"]),
+                kind="tombstone" if tombstone else "replace",
+                payload_owner=(None if tombstone
+                               else owner_of(normalized.get("payload"))),
+            ))
+
+        def predecessor_of(event_id, _rev):
+            winner = current(event_id)
+            return None if winner is None else _revision_of(winner, owner_of)
+
+        footprints[batch_id] = _lib_quota_lineage.batch_footprint(
+            actions, predecessor_of)
+        for normalized, _digest, sequence in ordered:
+            offer(_jl._candidate_from_correction(normalized, sequence))
+    return footprints
+
+
 def merge_delta(
     rows: SelectorRows,
     new_records,
@@ -807,6 +916,7 @@ def merge_delta(
     next_sequence: int,
     coordinates=None,
     covered=None,
+    lineage=None,
 ):
     """Continue the fold over ``new_records`` from durable state.
 
@@ -826,6 +936,13 @@ def merge_delta(
     `journal_protocol_resolution` op: acknowledging a violation authenticates an
     exact length-framed raw-prefix SHA-256, a claimed hash is never accepted
     without recomputation, and no durable summary can reconstruct it.
+
+    ``lineage`` (#1015) is an optional out-dict. When it carries an
+    ``"owner_of"`` callable, it receives under ``"footprints"`` the
+    footprint of every batch this delta completed, computed here, in the
+    batch-completion step, before the cores are compacted away (see
+    :func:`completed_batch_footprints`); the predecessor of an action is
+    seeded from the durable winner of its event id.
     """
     fold = _seed_fold(rows)
     seeded_completed = {
@@ -902,6 +1019,17 @@ def merge_delta(
     # rebuild through a longer prefix than necessary. Both orders converge;
     # this one converges through the narrowest prefix.
     transitions.sort(key=lambda item: (item.causal_sequence, item.batch_id))
+
+    if lineage is not None and lineage.get("owner_of") is not None:
+        prior_rows = {row.event_id: row for row in rows.effective}
+
+        def seed(event_id):
+            row = prior_rows.get(event_id)
+            return None if row is None else _event_from_row(row)
+
+        lineage["footprints"] = completed_batch_footprints(
+            fold, sorted(fold.completed - seeded_completed),
+            owner_of=lineage["owner_of"], seed=seed)
 
     winners, conflicts = _merge_candidates(rows, fold.candidates)
     batches, batch_records = _batch_rows(fold, coordinates)

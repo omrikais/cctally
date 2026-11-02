@@ -30,10 +30,10 @@ PREVIOUS_EPOCH = 1013
 #: using it mean "the epoch a store ends up at": the head constant itself, and
 #: the epoch an upgraded 1013 store reaches, which is always the head rather
 #: than the intermediate epoch that first added this table. #769 S11 moved the
-#: head to 1015, then #869 moved it to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019.
+#: head to 1015, then #869 moved it to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019, then #1019/#1014 to 1020, then #943 to 1021.
 #: Everything else here — what epoch 1014 ADDED, and the prose recording it —
 #: is historical fact and stays.
-NEW_EPOCH = 1019
+NEW_EPOCH = 1023
 STATE_TABLE = "five_hour_credit_confirmation_state"
 STATE_COLUMNS = {
     "account_key", "five_hour_window_key", "source", "baseline_pct",
@@ -42,6 +42,9 @@ STATE_COLUMNS = {
     # generation's identity columns, NULL until that work writes them.
     "baseline_observation_id", "baseline_generation", "pending_generation",
     "pending_position",
+    # #943 epoch 1021 (spec 4.2.1): the arming observation's capture second,
+    # the credit's exact boundary, recorded by both detectors.
+    "pending_captured_at_utc",
 }
 
 

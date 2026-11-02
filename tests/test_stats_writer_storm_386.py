@@ -1959,34 +1959,55 @@ def test_stats_open_fails_fast_while_maintenance_is_held(tmp_path):
 def test_stats_open_names_background_rebuild_while_heal_worker_holds_maintenance(
     tmp_path,
 ):
-    """A concurrent opener must name the detached background rebuild."""
+    """A concurrent opener must name the detached background rebuild.
+
+    The holder stands in for a running heal worker: it takes the claim lock
+    and the worker flock, records its running run (its own pid and birth;
+    #1012 decides activity from those records, not from the flock), then
+    holds maintenance."""
     env = _storm_env(tmp_path / "data")
     _seed_journal(env, 3)
     app = _resolved_app_dir(env)
-    maintenance_lock = app / "stats.db.maintenance.lock"
-    worker_lock = app / "stats-corruption-heal.worker.lock"
     request = app / "stats-corruption-heal.pending"
     request.write_text(json.dumps({
         "schemaVersion": 1,
         "healId": "concurrent-opener",
         "forensicsDisposition": "confirmed",
     }))
-    holder_code = (
-        "import fcntl, sys, time; "
-        "worker = open(sys.argv[1], 'a+'); "
-        "fcntl.flock(worker, fcntl.LOCK_EX); "
-        "maintenance = open(sys.argv[2], 'a+'); "
-        "fcntl.flock(maintenance, fcntl.LOCK_EX); "
-        "print('held', flush=True); time.sleep(120)"
-    )
+    holder_code = """
+import fcntl, json, os, pathlib, subprocess, sys, time
+app = pathlib.Path(sys.argv[1])
+claim = open(app / "stats-corruption-heal.claim.lock", "a+")
+fcntl.flock(claim, fcntl.LOCK_EX)
+worker = open(app / "stats-corruption-heal.worker.lock", "a+")
+fcntl.flock(worker, fcntl.LOCK_EX)
+pid = os.getpid()
+ps = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                    capture_output=True, text=True,
+                    env={**os.environ, "LC_ALL": "C"})
+birth = " ".join(ps.stdout.split()) or None
+at = "2026-10-31T00:00:00Z"
+run = {"runId": "run-holder", "launchId": "L-holder", "pid": pid,
+       "birth": birth, "status": "running", "phase": "starting",
+       "phaseStartedAt": at, "progressAt": at, "counters": {},
+       "outcome": None, "startedAt": at, "finishedAt": None,
+       "finalization": None}
+(app / "stats-heal.launches.json").write_text(json.dumps({
+    "schemaVersion": 1, "counts": {}, "lastDeathAt": None,
+    "entries": [{"launchId": "L-holder", "at": at, "pid": pid,
+                 "birth": birth, "spawn": "ok",
+                 "ack": {"kind": "started", "runId": "run-holder", "at": at},
+                 "outcome": None, "settledAt": None}]}))
+(app / "stats-heal.state.json").write_text(json.dumps({
+    "schemaVersion": 1, "run": run, "deaths": [],
+    "previousUnreadable": None}))
+maintenance = open(app / "stats.db.maintenance.lock", "a+")
+fcntl.flock(maintenance, fcntl.LOCK_EX)
+print("held", flush=True)
+time.sleep(120)
+"""
     holder = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            holder_code,
-            str(worker_lock),
-            str(maintenance_lock),
-        ],
+        [sys.executable, "-c", holder_code, str(app)],
         stdout=subprocess.PIPE,
         text=True,
     )

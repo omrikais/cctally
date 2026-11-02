@@ -47,7 +47,7 @@ def _open_stats(core, tmp_path, name="scratch-stats.db"):
 def test_current_epoch_creates_the_four_selector_tables(core, tmp_path):
     conn = _open_stats(core, tmp_path)
     try:
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1019
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 1023
         names = {
             row[0]
             for row in conn.execute(
@@ -1054,7 +1054,9 @@ def test_a_rebuild_populates_selector_state_matching_full_selection(
         coordinates=_marker_coordinates(core, fixture),
         covered=fixture["high_water"],
     )
-    assert stored == expected
+    # The generation identity is written at publication (#949: a replace
+    # publication stamps it too), so it is compared the way validation does.
+    assert _kernel().comparable(stored) == expected
 
 
 def test_the_selector_prefix_equals_the_applied_cursor(core, tmp_path):
@@ -1072,21 +1074,38 @@ def test_the_selector_prefix_equals_the_applied_cursor(core, tmp_path):
     assert (state.covered_segment, state.covered_offset) == tuple(cursor)
 
 
-def test_the_generation_identity_is_absent_until_publication(core, tmp_path):
+def test_the_generation_identity_is_absent_until_publication(
+    core, tmp_path, monkeypatch
+):
     """`stats_publication_stamp` is written AFTER the scratch is built, so a
     row populated during the scratch build cannot carry the identity it will
-    publish under. Stage 2 sets it inside the publication transaction."""
+    publish under. Stage 2 sets it inside the publication transaction.
+
+    #949: a destination that does not exist yet is published by `os.replace`,
+    which now stamps the closed scratch before the swap. The scratch is observed
+    at that stamp, so this still detects a scratch build that writes an identity
+    of its own (one no publication stamp can match); the replaced destination's
+    stamp is pinned by
+    `test_live_selection_496_s5b.test_the_physical_replacement_path_stamps_the_generation`."""
     jr = importlib.import_module("_cctally_journal")
     F.build_selector_scenarios(core.APP_DIR)
-    dest = _rebuild(tmp_path)
-    conn = sqlite3.connect(dest)
-    try:
-        state = jr._read_selector_rows(conn).state
-    finally:
-        conn.close()
-    assert state.generation_record_path is None
-    assert state.generation_stamped_at_utc is None
-    assert state.selector_version == _kernel().SELECTOR_VERSION
+    built = []
+    real_stamp = jr._stamp_replace_scratch
+
+    def observe_scratch(scratch, **kwargs):
+        conn = sqlite3.connect(f"file:{scratch}?mode=ro", uri=True)
+        try:
+            built.append(jr._read_selector_rows(conn).state)
+        finally:
+            conn.close()
+        return real_stamp(scratch, **kwargs)
+
+    monkeypatch.setattr(jr, "_stamp_replace_scratch", observe_scratch)
+    _rebuild(tmp_path)
+    assert len(built) == 1, "a missing destination publishes by replacement"
+    assert built[0].generation_record_path is None
+    assert built[0].generation_stamped_at_utc is None
+    assert built[0].selector_version == _kernel().SELECTOR_VERSION
 
 
 def test_the_rebuild_records_the_earliest_commit_coordinate(core, tmp_path):

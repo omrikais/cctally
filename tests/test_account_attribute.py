@@ -1168,6 +1168,185 @@ def test_a_rerun_after_a_failed_projection_completes_the_stats_step(store):
             "the rerun finishes the step the failed run never reached")
 
 
+def _owe_model_resolution(store) -> None:
+    """Persist #980 finalization debt whose ``model`` flag fences every quota
+    projection publisher (D6) until model resolution runs."""
+    conn = store._cache()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta(key, value) VALUES (?, ?)",
+            ("codex_finalization_debt", json.dumps({
+                "v": 1, "full": False, "model": True, "attribution": False,
+                "strikes": 0, "items": {}})))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _model_owed(store) -> bool:
+    conn = store._cache()
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key='codex_finalization_debt'"
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(row and json.loads(row[0]).get("model"))
+
+
+def _attribution_owed(store) -> bool:
+    conn = store._cache()
+    try:
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key='codex_finalization_debt'"
+        ).fetchone()
+    finally:
+        conn.close()
+    return bool(row and json.loads(row[0]).get("attribution"))
+
+
+def test_a_successful_apply_settles_the_attribution_it_arms(
+        store, monkeypatch, capsys):
+    """#980 (review R7): the apply's rehydrate arms ``attribution`` debt in
+    the same transaction its strict reconciliation then performs.
+
+    Detects: the flag surviving the commit, so every account-scoped Codex
+    budget read on a hook deferred (``finalization_debt``) until some later
+    settlement re-ran a reconciliation the command had already done."""
+    import _cctally_cache as cache_mod
+    since, until = _selector()
+    armed: list[bool] = []
+    real_add = cache_mod.add_codex_finalization_debt
+
+    def spy(conn, **kwargs):
+        armed.append(bool(kwargs.get("attribution")))
+        return real_add(conn, **kwargs)
+
+    monkeypatch.setattr(cache_mod, "add_codex_finalization_debt", spy)
+    code = store.ns["main"]([
+        "account", "attribute", "work", "--since", since, "--until", until,
+        "--yes", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0 and payload["status"] == "applied", payload
+    assert True in armed, "non-vacuity: the apply armed attribution debt"
+    assert not _attribution_owed(store), (
+        "the reconciliation the apply performed is still owed")
+
+
+def test_an_owed_model_resolution_is_settled_before_the_projection(store):
+    """#980 D6: the quota projection refuses while model resolution is owed.
+
+    Detects: `account attribute --yes` reporting `applied` (exit 0) while the
+    model fence refused the projection, so the percentage axis never carries
+    the attribution the operator was told had been applied."""
+    since, until = _selector()
+    _owe_model_resolution(store)
+    proc, payload = store.json_attribute(
+        "--since", since, "--until", until, "--yes")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert payload["status"] == "applied", payload
+    assert not _model_owed(store), "the unbudgeted settlement ran"
+    blocks = store.block_accounts()
+    for index in SELECTED:
+        assert blocks[_reset_iso(index)] == {store.account}, (
+            "the projection was published after the settlement")
+
+
+@pytest.mark.parametrize("resolution", ["succeeds", "fails"])
+def test_the_reconciliation_never_runs_over_an_owed_model(
+        store, monkeypatch, capsys, resolution):
+    """#980 F1: model resolution is a prerequisite of the apply's own
+    reconciliation, whose adoption demotes Spark windows through the resolved
+    ``observed_model`` (#373).
+
+    Detects: `account attribute --yes` reconciling (and adopting window
+    spend) while model resolution was still owed -- resolved only afterwards,
+    for the projection -- so a resolvable NULL Spark window could be filed as
+    account quota and stamp spend no later resolution undoes. When resolution
+    fails the apply must abort into `recordedPending` without reconciling."""
+    import _cctally_cache as cache_mod
+    since, until = _selector()
+    _owe_model_resolution(store)
+    seen: list[bool] = []
+    real = cache_mod.reconcile_codex_window_attribution_spend
+
+    def spy(conn, *args, **kwargs):
+        seen.append(cache_mod.codex_model_resolution_pending(conn))
+        return real(conn, *args, **kwargs)
+
+    monkeypatch.setattr(cache_mod, "reconcile_codex_window_attribution_spend",
+                        spy)
+    if resolution == "fails":
+        def failing(_conn):
+            raise sqlite3.OperationalError("injected resolution failure")
+        monkeypatch.setattr(cache_mod._cctally_db_sib,
+                            "backfill_codex_quota_observed_model", failing)
+    code = store.ns["main"]([
+        "account", "attribute", "work", "--since", since, "--until", until,
+        "--yes", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    if resolution == "succeeds":
+        assert code == 0 and payload["status"] == "applied", payload
+        assert seen and not any(seen), (
+            "the reconciliation ran over an owed model")
+        assert not _model_owed(store)
+    else:
+        assert payload["status"] == "recordedPending", payload
+        assert seen == [], "the reconciliation ran after resolution failed"
+        assert _model_owed(store)
+        assert store.account not in {
+            account for _ts, account in store.entry_accounts()}, (
+            "spend moved over an unresolved model")
+
+
+def test_a_still_deferred_projection_reports_recorded_pending(
+        store, monkeypatch):
+    """The settlement takes the cache writer flocks with the unbudgeted sync's
+    single non-blocking attempt; when another process holds them the model
+    stays owed and the projection stays refused.
+
+    Detects: that refusal reported as success instead of `recordedPending`
+    with the `deferred_model` reason."""
+    import multiprocessing as mp
+    import sys
+
+    import _cctally_account as account
+    import _cctally_core as core
+    monkeypatch.setattr(
+        sys.modules["_cctally_update"], "_spawn_detached", lambda command: True)
+    _owe_model_resolution(store)
+    ctx = mp.get_context("spawn")
+    ready, release = ctx.Event(), ctx.Event()
+    holder = ctx.Process(target=_hold_cache_writer_flocks, args=(
+        str(core.CACHE_LOCK_PATH), str(core.CACHE_LOCK_CODEX_PATH),
+        ready, release))
+    holder.start()
+    try:
+        assert ready.wait(30)
+        deferred = account._attribute_publish_projection()
+    finally:
+        release.set()
+        holder.join(30)
+    assert deferred == "deferred_model"
+    assert _model_owed(store)
+
+
+def _hold_cache_writer_flocks(writer, provider, ready, release) -> None:
+    import fcntl
+    fds = []
+    try:
+        for path in (writer, provider):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            fds.append(fd)
+        ready.set()
+        release.wait(60)
+    finally:
+        for fd in reversed(fds):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
 # ── T3-4: a five-hour window is not a model pool ─────────────────────────────
 
 def test_a_five_hour_window_is_refused_as_not_weekly(store):

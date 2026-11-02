@@ -1040,3 +1040,228 @@ def test_breakdown_correlates_root_qualified_physical_tuples_and_reprices_at_rea
     assert standard[-1].cost_usd > 0
     assert fast[-1].cost_usd != standard[-1].cost_usd
     assert automatic[-1].cost_usd == fast[-1].cost_usd
+
+
+# ── #980 D6: quota projection requires established model resolution ─────────
+
+
+def cc_module():
+    import _cctally_cache
+    return _cctally_cache
+
+
+class _ProducerStop(BaseException):
+    """A process stopped between a committed batch and its finalization."""
+
+
+def _stage_accounting_only_root(tmp_path, monkeypatch):
+    """The S1 rollout without its quota payload: an accounting-only batch."""
+    provider_root = tmp_path / "accounting-only-home"
+    rollout = (provider_root / "sessions" / "2026" / "07" / "15"
+               / "rollout-accounting.jsonl")
+    rollout.parent.mkdir(parents=True)
+    lines = []
+    for line in CODEX_S1_FIXTURE.read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        info = (record.get("payload") or {}).get("info")
+        if isinstance(info, dict):
+            info.pop("rate_limits", None)
+        lines.append(json.dumps(record))
+    rollout.write_text("\n".join(lines) + "\n")
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+
+
+def _unresolved_quota_row(ns):
+    """A quota row whose ``observed_model`` is still NULL (no producer)."""
+    _seed_quota(ns, root_key="root-null", source_path="/codex/null.jsonl",
+                observations=[(_iso(10), 1, 5.0)])
+
+
+def _fail_resolution(monkeypatch):
+    import _cctally_cache as cc
+
+    def fail(_conn):
+        raise sqlite3.OperationalError("synthetic model resolution failure")
+
+    monkeypatch.setattr(
+        cc._cctally_db_sib, "backfill_codex_quota_observed_model", fail)
+
+
+def _produce_core_failure(ns, tmp_path, monkeypatch):
+    _unresolved_quota_row(ns)
+    _stage_real_s1_codex_root(tmp_path, monkeypatch)
+    with pytest.MonkeyPatch.context() as patch:
+        _fail_resolution(patch)
+        cache = ns["open_cache_db"]()
+        try:
+            assert ns["sync_codex_cache"](cache).maintenance_failed
+        finally:
+            cache.close()
+
+
+def _produce_journal_only(ns, tmp_path, monkeypatch):
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    _unresolved_quota_row(ns)
+    cache = ns["open_cache_db"]()
+    try:
+        assert not cc_module().codex_model_resolution_pending(cache)
+    finally:
+        cache.close()
+    observation = jl.make_obs(
+        at="2026-07-15T10:00:00Z", src="codex-quota", provider="codex",
+        account=None,
+        payload={
+            "kind": "quota_window_snapshot", "source": "codex",
+            "source_root_key": "root-j", "source_path": "/codex/j.jsonl",
+            "line_offset": 10, "captured_at_utc": "2026-07-15T10:00:00Z",
+            "observed_slot": "primary", "logical_limit_key": "limit-primary",
+            "limit_id": "native-primary", "limit_name": "Primary",
+            "window_minutes": 300, "used_percent": 42.0,
+            "resets_at_utc": RESET, "plan_type": "pro",
+            "individual_limit_json": None, "reached_type": None,
+            "observed_model": None,
+        })
+    assert jr._cache_applier([(observation, "seg", 0)]) is None
+
+
+def _produce_accounting_only_then_stop(ns, tmp_path, monkeypatch):
+    import _cctally_cache as cc
+    _unresolved_quota_row(ns)
+    _stage_accounting_only_root(tmp_path, monkeypatch)
+
+    def stop(*_args, **_kwargs):
+        raise _ProducerStop()
+
+    cache = ns["open_cache_db"]()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(cc, "_codex_settle_finalization", stop)
+            with pytest.raises(_ProducerStop):
+                ns["sync_codex_cache"](cache, budget_seconds=5.0)
+        cache.rollback()
+        assert cache.execute(
+            "SELECT COUNT(*) FROM codex_session_entries").fetchone()[0] > 0, (
+            "non-vacuity: the accounting batch committed before the stop")
+        assert cache.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots "
+            "WHERE source_path != '/codex/null.jsonl'").fetchone()[0] == 0
+    finally:
+        cache.close()
+
+
+def _produce_unexpanded_full(ns, tmp_path, monkeypatch):
+    import _cctally_cache as cc
+    _unresolved_quota_row(ns)
+    cache = ns["open_cache_db"]()
+    try:
+        cc.add_codex_finalization_debt(cache, full=True)
+        cache.commit()
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("producer", [
+    _produce_core_failure,
+    _produce_journal_only,
+    _produce_accounting_only_then_stop,
+    _produce_unexpanded_full,
+], ids=["core-failure", "journal-only", "accounting-only-stop",
+        "unexpanded-full"])
+def test_model_fence_refuses_every_publisher(tmp_path, monkeypatch, producer):
+    """Every quota projection publisher refuses while model resolution is
+    owed (``model`` set or ``full`` unexpanded): it publishes neither rows nor
+    a certificate and requests the executor, which resolves the models and
+    then requests ``_codex-quota-verify``, whose pass republishes."""
+    import argparse
+    ns, quota = _load(tmp_path, monkeypatch)
+    import _cctally_cache as cc               # the module ``_load`` just loaded
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
+    spawned: list[str] = []
+    monkeypatch.setattr(cc, "_request_codex_drain_worker",
+                        lambda command: spawned.append(command) or "spawned")
+    monkeypatch.setattr(
+        quota, "_defer_codex_quota_verification",
+        lambda: spawned.append(quota.CODEX_QUOTA_VERIFY_COMMAND) or "spawned")
+    statuses: list[tuple[str, str]] = []
+    real_reconcile = quota.reconcile_codex_quota_projection
+    publisher = {"name": "producer"}
+
+    def recording_reconcile(*args, **kwargs):
+        result = real_reconcile(*args, **kwargs)
+        statuses.append((publisher["name"], result.status))
+        return result
+
+    monkeypatch.setattr(quota, "reconcile_codex_quota_projection",
+                        recording_reconcile)
+    producer(ns, tmp_path, monkeypatch)
+    cache = ns["open_cache_db"]()
+    try:
+        assert cc.codex_model_resolution_pending(cache), "the producer armed it"
+    finally:
+        cache.close()
+    statuses.clear()
+    state_before = _projection_rows(ns, "quota_projection_state")
+    certificate_before = _certificate_present(ns)
+
+    # 1. The hook's reconcile (alert-eligible, as the lifecycle runs it).
+    publisher["name"] = "hook"
+    result = quota.reconcile_codex_quota_projection(
+        alert_eligible_root_keys=("root-null",))
+    assert result.status == quota.PROJECTION_DEFERRED_MODEL
+    # 2. ``sync_codex_cache``'s post-flock reconcile; the sync's own core
+    # resolution keeps failing, so the flag survives into the publisher.
+    publisher["name"] = "post-flock"
+    with pytest.MonkeyPatch.context() as patch:
+        _fail_resolution(patch)
+        cache = ns["open_cache_db"]()
+        try:
+            ns["sync_codex_cache"](cache, quota_reconcile="auto")
+        finally:
+            cache.close()
+    # 3. The detached ``_codex-quota-verify`` worker.
+    publisher["name"] = "verify"
+    assert quota.cmd_codex_quota_verify_internal(argparse.Namespace()) == 0
+    refused = {name for name, status in statuses
+               if status == quota.PROJECTION_DEFERRED_MODEL}
+    assert {"hook", "post-flock", "verify"} <= refused, statuses
+    assert all(status == quota.PROJECTION_DEFERRED_MODEL
+               for _name, status in statuses), statuses
+    assert _projection_rows(ns, "quota_projection_state") == state_before
+    assert _certificate_present(ns) == certificate_before
+    assert cc.CODEX_PRUNE_DRAIN_COMMAND in spawned, "the executor was requested"
+
+    # The executor resolves the models, then requests the verify worker,
+    # whose pass republishes.
+    spawned.clear()
+    drained = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert drained.finalization_units >= 1
+    cache = ns["open_cache_db"]()
+    try:
+        assert not cc.codex_model_resolution_pending(cache)
+    finally:
+        cache.close()
+    assert quota.CODEX_QUOTA_VERIFY_COMMAND in spawned
+    statuses.clear()
+    publisher["name"] = "republish"
+    assert quota.cmd_codex_quota_verify_internal(argparse.Namespace()) == 0
+    assert statuses == [("republish", "published")]
+    assert _certificate_present(ns)
+
+
+def test_hook_lifecycle_line_carries_the_deferred_projection_token():
+    """The hook's lifecycle line names a refused projection (#980 D6)."""
+    load_script()
+    import _cctally_record as record
+    line = record._codex_lifecycle_log_line(
+        source_root_key="root", event="Stop", sync="ok", result="noop",
+        blocks=0, milestones=0, alert_eligible_roots=0, quota_alerts=0,
+        budget_alerts=0, dur_ms=1, projection="deferred")
+    assert " projection=deferred" in line
+    plain = record._codex_lifecycle_log_line(
+        source_root_key="root", event="Stop", sync="ok", result="noop",
+        blocks=0, milestones=0, alert_eligible_roots=0, quota_alerts=0,
+        budget_alerts=0, dur_ms=1)
+    assert "projection=" not in plain

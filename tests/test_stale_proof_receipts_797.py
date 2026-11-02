@@ -677,6 +677,166 @@ def test_compact_samples_preserve_every_proof_and_support(sp):
                              index_identity="ix")
 
 
+# --- #1019: the receipt-free drop proof (spec 4.1, L4, L13) ---------------------------
+
+
+def _low_case(name):
+    """``(negative, positive, mutation)`` for one boundary of
+    `proven_stale_low` over a member LOW of 18 bound at ``T_M``: each is
+    ``(bound, samples, kwargs)``; the negative stays eligible, its positive
+    control is proven, and the named mutation of
+    `tests/_stale_contributor_trace.py` (or None) proves the negative."""
+    base = dict(axis="sevenDay", window=RESET, percent=18.0)
+    proof = [sample("o:p", q=Q_LATE, weekly=51)]
+    if name == "equal-second":
+        bound = "2026-10-22T09:31:22Z"
+        return ((bound, [sample("o:n", q="2026-10-22T09:31:22.900000Z", weekly=51)], base),
+                (bound, [sample("o:p", q="2026-10-22T09:31:23.000000Z", weekly=51)], base),
+                "drop-bound-ignored")
+    if name == "earlier-q":
+        return ((Q_LATE, [sample("o:n", q="2026-10-21T22:50:14.000000Z", weekly=51)], base),
+                (T_M, proof, base), "drop-bound-ignored")
+    if name == "tolerance":
+        return ((T_M, [sample("o:n", q=Q_LATE, weekly=19.0)], base),
+                (T_M, [sample("o:p", q=Q_LATE, weekly=19.0001)], base),
+                "drop-no-tolerance")
+    if name == "other-window":
+        return ((T_M, [sample("o:n", q=Q_LATE, weekly=51,
+                              reset="2026-10-31T05:00:00Z")], base),
+                (T_M, proof, base), None)
+    if name == "at-advertised-reset":
+        late = [sample("o:n", q="2026-10-24T04:59:50.000000Z", weekly=51,
+                       captured="2026-10-24T04:59:59Z")]
+        return ((T_M, late, dict(base, advertised_reset_epoch=RESET - 30)),
+                (T_M, late, dict(base, advertised_reset_epoch=RESET)), None)
+    if name == "received-at-fallback":
+        # No supported witness: the bound is the received_at second
+        # (2026-10-22T09:00:00Z), and only a sample requested after it
+        # proves the low.
+        return (("received", 1792659600, [sample("o:n", q="2026-10-22T09:00:00.500000Z",
+                                             weekly=51)], base),
+                ("received", 1792659600, [sample("o:p", q="2026-10-22T09:00:01.000000Z",
+                                             weekly=51)], base),
+                "drop-bound-ignored")
+    if name == "weekly-refused-five-hour-eligible":
+        both = [five_sample("o:n", q=Q_LATE, five=5)]          # weekly 40
+        return ((T_M, both, dict(base, axis="fiveHour", window=FIVE_KEY,
+                                 advertised_reset_epoch=FIVE_RESET)),
+                (T_M, both, base), None)
+    if name == "five-hour-refused-weekly-eligible":
+        both = [five_sample("o:n", q=Q_LATE, five=51)]         # weekly 40
+        return ((T_M, both, dict(base, percent=45.0)),
+                (T_M, both, dict(base, percent=45.0, axis="fiveHour", window=FIVE_KEY,
+                                 advertised_reset_epoch=FIVE_RESET)), None)
+    raise AssertionError(name)
+
+
+def _bound_of(sp, case):
+    if case[0] == "received":
+        _tag, received, samples, kwargs = case
+        bound = sp.drop_bound("a" * 64, None, received, axis=kwargs["axis"],
+                              percent=kwargs["percent"], window=kwargs["window"])
+        assert sp.sample_identity("a" * 64, None, axis=kwargs["axis"],
+                                  percent=kwargs["percent"], window=kwargs["window"]) is None
+        return bound, samples, kwargs
+    return case
+
+
+@pytest.mark.parametrize("name", ["equal-second", "earlier-q", "tolerance", "other-window",
+                                  "at-advertised-reset", "received-at-fallback",
+                                  "weekly-refused-five-hour-eligible",
+                                  "five-hour-refused-weekly-eligible"])
+def test_proven_stale_low_boundaries(sp, monkeypatch, name):
+    """L4 (accuracy: a genuine low refused, or a stale one admitted, at a
+    proof boundary): request order under the precision intervals (the equal
+    second, an earlier q), the strict 1 pp tolerance, the member's window
+    and advertised reset, the received_at fallback (a whole-second bound
+    that never becomes a sigma), and weekly/five-hour independence. Each
+    negative case has a positive control, and the mutation violating its
+    boundary proves the negative. Another account's sample is the exact-
+    account read's boundary, not this kernel's: L3b's b-first order and the
+    `samples-cross-account` mutation pin it (`MUTATION_BITES`)."""
+    negative, positive, mutation = _low_case(name)
+    bound, samples, kwargs = _bound_of(sp, negative)
+    assert sp.proven_stale_low(bound, samples, **kwargs) is None
+    pbound, psamples, pkwargs = _bound_of(sp, positive)
+    assert sp.proven_stale_low(pbound, psamples, **pkwargs) is not None
+    if mutation is not None:
+        S.mutate(monkeypatch, mutation)
+        assert sp.proven_stale_low(bound, samples, **kwargs) is not None, mutation
+
+
+def test_drop_facts_are_receipt_free_and_independent_of_rise_facts(sp):
+    """L4: `refusal_facts` gives a drop-refused member its drop fields with
+    no receipt held, leaves the rise fields of `ALL_ELIGIBLE`, and decides
+    each axis on its own samples."""
+    low = sp.DropMember("a" * 64, T_M, "sevenDay", 18.0, RESET, RESET)
+    samples = [sample("o:p", q=Q_LATE, weekly=51)]
+    facts = sp.refusal_facts("sevenDay", [], samples, (), (), index_identity="ix",
+                             drop_members=[low])
+    assert facts == {"a" * 64: sp.MemberFacts(False, None, False, drop_refused=True,
+                                              drop_proof_observation_id="o:p")}
+    assert sp.refusal_facts("fiveHour", [], samples, (), (), index_identity="ix",
+                            drop_members=[low]) == {}
+
+
+def test_compact_samples_equivalence_for_proven_stale_low(sp, monkeypatch):
+    """L13 (accuracy: the render cache dropping a sample a drop proof
+    needs): over randomized and edge sample sets with nonempty proving
+    populations, `compact_samples` yields the same `proven_stale_low`
+    answer for every bound, value and advertised reset; a compaction that
+    drops a necessary sample breaks it."""
+    import random
+    rng = random.Random(1019)
+
+    def population():
+        out = []
+        for i in range(rng.randint(6, 24)):
+            minute = rng.randint(0, 900)
+            q = f"2026-10-22T{minute // 60:02d}:{minute % 60:02d}:{rng.randint(0, 59):02d}." \
+                f"{rng.randint(0, 999999):06d}Z"
+            out.append(sample(f"o:{i}", q=q, weekly=rng.choice((0, 1, 18, 19, 19.5, 51, 52))))
+        out.append(sample("o:late", q="2026-10-24T04:40:00.000000Z", weekly=60,
+                          captured="2026-10-24T04:59:30Z"))
+        return out
+
+    def check(compact_of):
+        for _round in range(40):
+            pop = population()
+            compact = compact_of(pop)
+            proving = 0
+            for minute in (0, 120, 450, 899):
+                bound = f"2026-10-22T{minute // 60:02d}:{minute % 60:02d}:00.000Z"
+                for percent in (0.0, 17.5, 18.0, 50.0):
+                    for reset in (RESET, RESET - 60):
+                        want = sp.proven_stale_low(bound, pop, axis="sevenDay",
+                                                   window=RESET, percent=percent,
+                                                   advertised_reset_epoch=reset)
+                        proving += want is not None
+                        got = sp.proven_stale_low(bound, compact, axis="sevenDay",
+                                                  window=RESET, percent=percent,
+                                                  advertised_reset_epoch=reset)
+                        if got != want:
+                            return False
+            assert proving, "a vacuous round: nothing proven"
+        return True
+
+    assert check(lambda pop: sp.compact_samples(pop, window=RESET, floor_epoch=FLOOR))
+
+    def drop_latest(pop):
+        # Mutation `compact-drops-necessary-sample`: the latest sample of
+        # each value is discarded.
+        compact = list(sp.compact_samples(pop, window=RESET, floor_epoch=FLOOR))
+        latest = {}
+        for s in compact:
+            key = s.weekly_percent
+            if key not in latest or s.requested_at_utc > latest[key].requested_at_utc:
+                latest[key] = s
+        return tuple(s for s in compact if s not in latest.values())
+
+    assert not check(drop_latest)
+
+
 # =============================================================================
 # Part 2: the real intake, detached reducer and record kernel
 # (`tests/_stale_contributor_trace.py`).
@@ -799,7 +959,9 @@ def test_admission_traces(monkeypatch, tmp_path, name):
     assert result == TRACE_EXPECTED[name], "RESULT=" + repr(result)
 
 
-#: Which admission trace each mutation control must break.
+#: Which admission trace each receipt mutation control must break (the
+#: drop refusal's mutations, #1019, are pinned by `MUTATION_BITES` and the
+#: L-tests of `tests/test_797_stale_contributor_evidence.py`).
 MUTATION_TARGETS = {
     "domination-alone": "d7b",
     "numerical-domination": "d7b",
@@ -809,7 +971,7 @@ MUTATION_TARGETS = {
 }
 
 
-@pytest.mark.parametrize("mutation", S.MUTATIONS)
+@pytest.mark.parametrize("mutation", S.RECEIPT_MUTATIONS)
 def test_mutation_controls_break_the_admission_traces(monkeypatch, tmp_path, mutation):
     t = S.Trace(monkeypatch, tmp_path)
     S.mutate(monkeypatch, mutation)
@@ -910,20 +1072,26 @@ def test_a_crash_loses_a_receipt_that_is_re_earned_later(monkeypatch, tmp_path):
         "e_sigma was reconstructed from an earlier capture")
 
 
+#: #1019 (P-R2): a member a later-requested provider sample proves stale by
+#: more than the 1 pp tolerance is rise-ineligible whatever its receipt, so
+#: the receipt traces below present an idle 82 beside the OAuth 83 (inside
+#: the drop proof's tolerance): the member's eligibility they observe is the
+#: receipt's alone. #797 pinned them with an idle 74, which the drop proof
+#: now refuses in both directions.
 def test_rebuild_invalidates_receipts(monkeypatch, tmp_path):
     import _outcome_quarantine_trace as T
     t = S.Trace(monkeypatch, tmp_path)
-    a = t.session("idle74")
+    a = t.session("idle82")
     a.respond("2026-10-21T22:50:00Z")
     t.oauth(83, at=DAY + "09:00:00Z")
-    t.render(a, 74, at=DAY + "09:00:30Z")
+    t.render(a, 82, at=DAY + "09:00:30Z")
     (old,) = t.receipts()
     T.rebuild(t.app)
     t.oauth(0, at=DAY + "09:10:00Z")
-    t.render(a, 74, at=DAY + "09:10:30Z")
+    t.render(a, 82, at=DAY + "09:10:30Z")
     # The receipt was bound to the old index identity: the replay is
     # admitted (R16) and its publication earns a new receipt.
-    assert t.published() == [74.0]
+    assert t.published() == [82.0]
     assert all(r.index_identity != old.index_identity for r in t.receipts())
 
 
@@ -931,7 +1099,7 @@ def test_eviction_at_the_document_limit_means_eligible(monkeypatch, tmp_path):
     t = S.Trace(monkeypatch, tmp_path)
     sl = t.sl
     lib = sys.modules["_lib_statusline_candidates"]
-    a = t.session("idle74")
+    a = t.session("idle82")
     a.respond("2026-10-21T22:50:00Z")
     t.oauth(83, at=DAY + "09:00:00Z")
     real = sl._fit_transition
@@ -947,13 +1115,13 @@ def test_eviction_at_the_document_limit_means_eligible(monkeypatch, tmp_path):
             monkeypatch.setattr(lib, "CONTROL_DOCUMENT_MAX_BYTES", 1 << 20)
 
     monkeypatch.setattr(sl, "_fit_transition", tight)
-    t.render(a, 74, at=DAY + "09:00:30Z")
+    t.render(a, 82, at=DAY + "09:00:30Z")
     assert t.receipts() == [], "the new receipt was omitted at the limit"
     monkeypatch.setattr(sl, "_fit_transition", real)
     t.oauth(0, at=DAY + "09:10:00Z")
     monkeypatch.setattr(sl, "_fit_transition", tight)
-    t.render(a, 74, at=DAY + "09:10:30Z")
-    assert t.published() == [74.0], "an evicted member was refused"
+    t.render(a, 82, at=DAY + "09:10:30Z")
+    assert t.published() == [82.0], "an evicted member was refused"
 
 
 def test_last_resort_eviction_of_a_refusing_receipt_re_reduces_the_work(
@@ -964,17 +1132,19 @@ def test_last_resort_eviction_of_a_refusing_receipt_re_reduces_the_work(
     receipt, so the last resort evicts it although the evaluation it refused
     references it. The refusal no longer has a receipt to rest on: the
     evaluation is reduced again with the member eligible, and its rise
-    publishes now rather than waiting for another reading."""
+    publishes now rather than waiting for another reading. An unchanged
+    render no longer dispatches a completion (#1019 review finding P1), so a
+    new provider sample changes the index and starts it."""
     t = S.Trace(monkeypatch, tmp_path)
     sl = t.sl
     lib = sys.modules["_lib_statusline_candidates"]
-    a = t.session("idle74")
+    a = t.session("idle82")
     a.respond("2026-10-21T22:50:00Z")
     t.oauth(83, at=DAY + "09:00:00Z")
-    t.render(a, 74, at=DAY + "09:00:30Z")
+    t.render(a, 82, at=DAY + "09:00:30Z")
     assert len(t.receipts()) == 1
     t.oauth(0, at=DAY + "09:10:00Z")
-    t.render(a, 74, at=DAY + "09:10:30Z")
+    t.render(a, 82, at=DAY + "09:10:30Z")
     assert t.published() == [], "the replay must be refused on its receipt"
     assert len(t.receipts()) == 1
     real = sl._fit_transition
@@ -990,9 +1160,10 @@ def test_last_resort_eviction_of_a_refusing_receipt_re_reduces_the_work(
             monkeypatch.setattr(lib, "CONTROL_DOCUMENT_MAX_BYTES", 1 << 20)
 
     monkeypatch.setattr(sl, "_fit_transition", tight)
-    t.render(a, 74, at=DAY + "09:11:00Z")
+    t.oauth(0, at=DAY + "09:10:50Z")
+    t.render(a, 82, at=DAY + "09:11:00Z")
     assert t.receipts() == [], "the referenced receipt was not evicted"
-    assert t.published() == [74.0], "the evicted refusal was not re-reduced"
+    assert t.published() == [82.0], "the evicted refusal was not re-reduced"
 
 
 def test_a_hold_of_the_support_invalidates(monkeypatch, tmp_path, capsys):
@@ -1002,11 +1173,11 @@ def test_a_hold_of_the_support_invalidates(monkeypatch, tmp_path, capsys):
     the account, hence the first sample.)"""
     import _cctally_journal as jr
     t = S.Trace(monkeypatch, tmp_path)
-    a = t.session("idle74")
+    a = t.session("idle82")
     a.respond("2026-10-21T22:50:00Z")
     t.oauth(80, at=DAY + "08:50:00Z")
     t.oauth(83, at=DAY + "09:00:00Z")
-    t.render(a, 74, at=DAY + "09:00:30Z")
+    t.render(a, 82, at=DAY + "09:00:30Z")
     (receipt,) = t.receipts()
     high_water = jr.journal_high_water()
     manifest = {
@@ -1036,8 +1207,8 @@ def test_a_hold_of_the_support_invalidates(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr()
     assert rc == 0, "OUT=" + out.out + " ERR=" + out.err
     t.oauth(0, at=DAY + "09:10:00Z")
-    t.render(a, 74, at=DAY + "09:10:30Z")
-    assert t.published() == [74.0]
+    t.render(a, 82, at=DAY + "09:10:30Z")
+    assert t.published() == [82.0]
 
 
 # --- T15 five-hour rows through the real paths (Task 5) -----------------------------

@@ -151,10 +151,29 @@ def test_parse_at_default_is_now(ns):
 def test_build_plan_happy(ns):
     p = _plan(ns)
     assert p.to_pct == 31.0 and p.from_pct == 46.0
-    assert p.effective_iso == "2026-06-19T14:00:00+00:00"   # floored to hour
-    assert p.captured_iso == "2026-06-19T14:37:00Z"          # un-floored now, Z
+    assert p.effective_iso == "2026-06-19T14:37:00+00:00"   # the exact --at (O1)
+    assert p.captured_iso == "2026-06-19T14:37:00Z"          # same instant, Z
     assert p.cur_end_canon == "2026-06-20T05:00:00+00:00"
     assert p.from_source == "hwm"
+
+
+def test_build_plan_effective_is_the_exact_second_and_completion_keeps_its_floor(
+        ns):
+    """#943 (O1). Detects the hour floor coming back: a floored effective
+    reaches back over genuine readings captured before `--at`, which the
+    stale-replica band then retires and the floored MAX then counts as
+    post-credit. Sub-second precision is truncated on both instants, so the
+    synthetic sits exactly on the boundary and the `>=` MAX still includes it.
+    A completion reuses the existing floor row's effective verbatim, including
+    a historical hour floor, so a half-applied credit keeps its own boundary."""
+    at = NOW.replace(second=5, microsecond=999999)
+    p = _plan(ns, at_dt=at, now=at)
+    assert p.effective_iso == "2026-06-19T14:37:05+00:00"
+    assert p.captured_iso == "2026-06-19T14:37:05Z"
+    completed = _plan(
+        ns, effective_override="2026-06-19T14:00:00+00:00")
+    assert completed.effective_iso == "2026-06-19T14:00:00+00:00"
+    assert completed.captured_iso == "2026-06-19T14:37:00Z"
 
 
 def test_build_plan_rejects_to_ge_from(ns):
@@ -266,7 +285,7 @@ def test_apply_happy_path_s1(ns, monkeypatch):
         "FROM weekly_credit_floors WHERE week_start_date=?",
         ("2026-06-13",)).fetchone()
     assert fl is not None and float(fl[1]) == 46.0
-    assert fl[0] == "2026-06-19T14:00:00+00:00"   # floored to hour, UTC spelling
+    assert fl[0] == "2026-06-19T14:37:00+00:00"   # exact --at (O1), UTC spelling
     n_events = conn.execute(
         "SELECT COUNT(*) FROM week_reset_events").fetchone()[0]
     assert n_events == 0, "record-credit must NOT write a week_reset_events row (M2)"
@@ -333,7 +352,7 @@ def test_record_credit_non_mutating_exits_create_no_pipeline_artifacts(
 def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):
     """Under a non-UTC host TZ, the credit floor's effective_at_utc MUST be
     stored with a +00:00 spelling, not the host offset — and the instant must
-    still be the expected floored hour (2026-06-19T14:00 UTC).
+    still be the exact `--at` second (2026-06-19T14:37 UTC, #943 O1).
 
     Non-vacuity: drop the .astimezone(dt.timezone.utc) in _apply_credit and
     this fails — the stored value carries -04:00/-05:00. (Existing tests run
@@ -354,10 +373,10 @@ def test_apply_stores_effective_in_utc_on_non_utc_host(ns, monkeypatch):
     assert fl is not None
     assert fl[0].endswith("+00:00"), f"stored host offset, not UTC: {fl[0]!r}"
     assert "-04:00" not in fl[0] and "-05:00" not in fl[0]
-    expected = int(dt.datetime(2026, 6, 19, 14, 0,
+    expected = int(dt.datetime(2026, 6, 19, 14, 37,
                                tzinfo=dt.timezone.utc).timestamp())
     assert fl[1] == expected
-    assert fl[0] == "2026-06-19T14:00:00+00:00"
+    assert fl[0] == "2026-06-19T14:37:00+00:00"
 
 
 def test_s12_no_reanchor(ns, monkeypatch):
@@ -591,9 +610,13 @@ def _apply_once(ns):
 
 def test_s8_completion_path_after_half_apply(ns, monkeypatch):
     """S8 (M2): floor row present (effective 14:00), NO command-owned snapshot
-    -> a plain rerun at a LATER time (15:00) finishes it, REUSING the existing
-    14:00 effective (not a fresh floor_to_hour(15:00)=15:00), so no stale
-    [14:00,15:00) pre-credit replay leaks into the floored MAX."""
+    -> a plain rerun at a LATER time (15:07) finishes it, REUSING the existing
+    14:00 effective (not a fresh effective at the rerun's own `--at`), so no
+    stale [14:00,15:07) pre-credit replay leaks into the floored MAX.
+
+    #943 (O1): fresh plans now use the exact `--at` second, but a completion
+    keeps the existing floor verbatim — here a historical hour-floored one —
+    and this detects a completion that moves it."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     conn = ns["open_db"](); _seed_week(ns, conn)
     # Simulate crash between 4a and 4d: floor row only, NO synthetic snapshot.
@@ -656,24 +679,82 @@ def test_s4_fully_applied_refused_before_prompt(ns, monkeypatch, capsys):
 
 
 def test_s9_force_scope_keeps_real_history(ns, monkeypatch):
+    """`--force` replaces the week's command-owned synthetic and floor rather
+    than stacking. Since #943 (O1) a re-record later in the SAME hour carries a
+    different `effective_at_utc`, so `UNIQUE(account_key, week_start_date,
+    effective_at_utc)` no longer collides: this detects the old floor surviving
+    beside the new one (two floors, the later one winning only by ordering) or
+    the new floor being lost."""
     monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
     assert _apply_once(ns) == 0
     conn = ns["open_db"]()
     conn.execute("INSERT INTO weekly_usage_snapshots (captured_at_utc, week_start_date,"
                  " week_end_date, week_start_at, week_end_at, weekly_percent, page_url,"
                  " source, payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
-                 ("2026-06-19T15:00:00Z", "2026-06-13", "2026-06-20", WS_AT, WE_AT,
+                 ("2026-06-19T14:45:00Z", "2026-06-13", "2026-06-20", WS_AT, WE_AT,
                   33.0, None, "userscript", "{}"))
     conn.commit(); conn.close()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:52:00Z")
     rc = ns["cmd_record_credit"](_rc_args(dry_run=False, yes=True, force=True))
     assert rc == 0
     conn = ns["open_db"]()
     kept = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots "
                         "WHERE source='userscript' AND weekly_percent=33.0").fetchone()[0]
-    owned = conn.execute("SELECT COUNT(*) FROM weekly_usage_snapshots "
-                         "WHERE source='record-credit'").fetchone()[0]
+    owned = conn.execute("SELECT captured_at_utc FROM weekly_usage_snapshots "
+                         "WHERE source='record-credit'").fetchall()
+    floors = conn.execute("SELECT effective_at_utc FROM weekly_credit_floors "
+                          "WHERE week_start_date='2026-06-13'").fetchall()
     conn.close()
-    assert kept == 1 and owned == 1                   # real row kept, single re-do'd synthetic
+    assert kept == 1                                  # real row kept
+    assert [r[0] for r in owned] == ["2026-06-19T14:52:00Z"]   # single re-do'd synthetic
+    assert [r[0] for r in floors] == ["2026-06-19T14:52:00+00:00"], floors
+
+
+def test_s9_force_at_the_same_second_replaces_the_floor(ns, monkeypatch):
+    """`--force` at exactly the previous credit's `--at` second (F-I1-1).
+
+    Detects the re-record ending with NO credit floor: the forced op's floor
+    `INSERT OR IGNORE` collided on `UNIQUE(account_key, week_start_date,
+    effective_at_utc)` with the floor it replaces, and the effects' floor
+    suppression then deleted that old floor, so the week lost its credit
+    (C3: `--force` replaces the floor, it never removes or stacks it). Live
+    and after a rebuild there is exactly one floor, the forced op's, with its
+    new pre-credit percent, and exactly one synthetic, the forced op's."""
+    import _cctally_core as core
+    import _cctally_journal as jr
+    import _lib_journal as J
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    assert _apply_once(ns) == 0
+    assert ns["cmd_record_credit"](_rc_args(
+        dry_run=False, yes=True, force=True, from_pct=50.0, to=29.0)) == 0
+    ops = [J.decode_line(line) for segment in jr.list_segments()
+           for line in (core.JOURNAL_DIR / segment).read_bytes().splitlines()]
+    forced = [op["id"] for op in ops if op and op.get("t") == "op"
+              and (op.get("payload") or {}).get("kind") == "weekly_credit_floor"
+              and (op.get("payload") or {}).get("forced")]
+    assert len(forced) == 1, forced
+
+    def state():
+        conn = ns["open_db"]()
+        try:
+            return (
+                [tuple(r) for r in conn.execute(
+                    "SELECT journal_id, effective_at_utc, observed_pre_credit_pct"
+                    " FROM weekly_credit_floors")],
+                [tuple(r) for r in conn.execute(
+                    "SELECT journal_id, captured_at_utc, weekly_percent"
+                    " FROM weekly_usage_snapshots WHERE source='record-credit'")],
+            )
+        finally:
+            conn.close()
+
+    expected = (
+        [(forced[0], "2026-06-19T14:37:00+00:00", 50.0)],
+        [(f"sa:{forced[0]}:syn:0", "2026-06-19T14:37:00Z", 29.0)],
+    )
+    assert state() == expected, "live"
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    assert state() == expected, "rebuilt"
 
 
 def test_apply_clears_reset_debounce_state(ns, monkeypatch):
@@ -918,8 +999,10 @@ def test_835_held_row_survives_the_stale_replica_delete(ns, monkeypatch, site):
         lambda n: None)
     conn = ns["open_db"]()
     _seed_week(ns, conn)                       # 46% pre-credit peak
-    # Both rows land at/after the credit's effective instant (14:00Z, floored
-    # from the 14:37 AS_OF) and inside the 1.0-point band of 46.
+    # Both rows land at/after the credit's effective instant and inside the
+    # 1.0-point band of 46: 14:00Z for the automatic leg, and the manual legs'
+    # exact `--at` of 14:05Z (#943 O1: the manual effective is no longer the
+    # hour floor of the 14:37 AS_OF, so an `--at` before both rows is named).
     plain_id = _seed_replica(
         ns, conn, captured="2026-06-19T14:10:00Z", pct=46.0, held=0,
         five_hour_pct=11.0, journal_id=jid(1))
@@ -941,11 +1024,14 @@ def test_835_held_row_survives_the_stale_replica_delete(ns, monkeypatch, site):
             conn.close()
     elif site == "manual_ingest":
         assert ns["cmd_record_credit"](_rc_args(
-            to=31.0, dry_run=False, yes=True, week="2026-06-13")) == 0
+            to=31.0, dry_run=False, yes=True, week="2026-06-13",
+            at="2026-06-19T14:05:00Z")) == 0
     else:
         conn = ns["open_db"]()
         try:
-            ns["_apply_credit"](conn, _plan(ns))
+            ns["_apply_credit"](conn, _plan(
+                ns, at_dt=dt.datetime(2026, 6, 19, 14, 5,
+                                      tzinfo=dt.timezone.utc)))
         finally:
             conn.close()
 
@@ -1188,11 +1274,15 @@ def test_835_r4_the_stale_replay_count_runs_on_a_pre_column_store(ns, tmp_path):
     `account_key` but not `weekly_observation_held`, which is the shape fifteen
     test modules and six fixture builders create."""
     conn = _pre_column_store(tmp_path / "pre-column-count.sqlite")
+    # #943 (O1): the plan's effective is its exact `--at`, so name one before
+    # the seeded 14:10Z row rather than relying on an hour floor.
+    plan = _plan(ns, at_dt=dt.datetime(2026, 6, 19, 14, 5,
+                                       tzinfo=dt.timezone.utc))
     try:
         count = ns["_count_stale_replays"](
-            conn, _plan(ns), account_key="unattributed")
+            conn, plan, account_key="unattributed")
         enumerated = ns["_stale_replay_candidates"](
-            conn, _plan(ns), account_key="unattributed")
+            conn, plan, account_key="unattributed")
     finally:
         conn.close()
     assert count == 1
@@ -1492,3 +1582,114 @@ def test_837_preview_omits_the_account_at_one_real_account(
         f"R8: a single real account must render no decoration:\n{text}")
     assert "accountKey" not in payload and "accountLabel" not in payload, (
         f"R8: a single real account must emit no account field: {payload!r}")
+
+
+# ── #943 (O1): record-credit from the exact `--at` second ──────────────
+
+import test_milestone_rebuild_after_five_hour_credit as _M19  # noqa: E402
+from test_milestone_rebuild_after_five_hour_credit import (  # noqa: E402,F401
+    alert_sink, app)
+
+
+def _rows_by_minute(app):
+    conn = app.open_db()
+    try:
+        return {
+            (int(r[0]) - _M19.NOW) // 60: (r[1], r[2], r[3])
+            for r in conn.execute(
+                "SELECT unixepoch(captured_at_utc), weekly_percent,"
+                " five_hour_percent, weekly_observation_held"
+                " FROM weekly_usage_snapshots")}
+    finally:
+        conn.close()
+
+
+def test_943_record_credit_keeps_genuine_readings_captured_before_at(
+        app, monkeypatch, tmp_path, alert_sink, capsys):
+    """#943 F3, through the real entry point. Detects the hour floor leaking
+    pre-`--at` readings into the post-credit maximum: with `--at 00:20` floored
+    to 00:00 the genuine 00:17 reading (weekly 12) was retired weekly-held as a
+    stale replica, and the 00:13 reading of 11 then counted as post-credit
+    evidence, so the genuine post-credit 6 at 00:30 was stored held at 11. The
+    effective instant is now the exact `--at` second, live and after a
+    rebuild."""
+    for minute, weekly, five in ((13, 11.0, 30.0), (17, 12.0, 34.0)):
+        assert _M19._drive(app, monkeypatch, tmp_path, minute, weekly, five) == 0
+    _M19._tick(monkeypatch, 20 * 60 + 30)
+    capsys.readouterr()
+    args = app.build_parser().parse_args(
+        ["record-credit", "--to", "5", "--at", _M19._iso(_M19.NOW + 20 * 60),
+         "--yes", "--json"])
+    assert args.func(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["credit"]["effectiveAtUtc"] == "2026-10-08T00:20:00Z"
+    assert out["actions"]["staleReplaysDeleted"] == 0
+    assert _M19._drive(app, monkeypatch, tmp_path, 30, 6.0, 40.0) == 0
+    for label in ("live", "rebuilt"):
+        if label == "rebuilt":
+            assert _M19._rebuild(app) == 0
+        rows = _rows_by_minute(app)
+        assert rows[13] == (11.0, 30.0, 0), (label, rows)
+        assert rows[17] == (12.0, 34.0, 0), (label, rows)
+        assert rows[20][0] == 5.0, (label, rows)
+        assert rows[30] == (6.0, 40.0, 0), (label, rows)
+
+
+def test_943_the_manual_band_stays_strict_at_exactly_one_point(
+        ns, monkeypatch):
+    """The manual credit's stale-replica band is `|Δ| < 1.0`, unchanged by
+    O1. Detects a band widened to `<= 1.0` (a genuine reading exactly one point
+    below the pre-credit value removed) or one that matches nothing after the
+    exact-second move (a replica after `--at` surviving)."""
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-06-19T14:37:00Z")
+    conn = ns["open_db"]()
+    _seed_week(ns, conn)                       # 46% pre-credit peak
+    edge_id = _seed_replica(
+        ns, conn, captured="2026-06-19T14:10:00Z", pct=45.0, held=0,
+        five_hour_pct=11.0, journal_id="sa:seed:edge")
+    replica_id = _seed_replica(
+        ns, conn, captured="2026-06-19T14:20:00Z", pct=45.5, held=0,
+        five_hour_pct=12.0, journal_id="sa:seed:replica")
+    conn.close()
+    assert ns["cmd_record_credit"](_rc_args(
+        to=31.0, dry_run=False, yes=True, week="2026-06-13", from_pct=46.0,
+        at="2026-06-19T14:05:00Z")) == 0
+    surviving = _surviving_replicas(ns, (edge_id, replica_id))
+    assert edge_id in surviving, "|46 - 45| = 1.0 is outside the strict band"
+    assert replica_id not in surviving, "|46 - 45.5| < 1.0 is a stale replica"
+
+
+def test_943_a_retained_hour_floored_op_replays_its_floor(ns, monkeypatch):
+    """Historical `record-credit` ops keep their stored floor: the fold
+    replays the op payload's `effective_at_utc` verbatim. Detects a rebuild
+    that re-derives the effective from the plan's `--at` (moving an old
+    credit's boundary) instead of replaying what was journaled."""
+    import _cctally_journal as jr
+    import _cctally_record as rec
+    from _lib_blocks import _floor_to_hour
+
+    real = rec._build_credit_plan
+
+    def hour_floored_plan(**kwargs):
+        # The release before O1 floored a fresh plan to the hour.
+        if kwargs.get("effective_override") is None:
+            kwargs["effective_override"] = _floor_to_hour(
+                kwargs["at_dt"]).isoformat(timespec="seconds")
+        return real(**kwargs)
+
+    monkeypatch.setattr(rec, "_build_credit_plan", hour_floored_plan)
+    conn = ns["open_db"](); _seed_week(ns, conn); conn.close()
+    assert ns["cmd_record_credit"](_authorized_credit_args()) == 0
+    monkeypatch.setattr(rec, "_build_credit_plan", real)
+
+    def floors():
+        conn = ns["open_db"]()
+        try:
+            return [r[0] for r in conn.execute(
+                "SELECT effective_at_utc FROM weekly_credit_floors")]
+        finally:
+            conn.close()
+
+    assert floors() == ["2026-06-19T14:00:00+00:00"]
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+    assert floors() == ["2026-06-19T14:00:00+00:00"]

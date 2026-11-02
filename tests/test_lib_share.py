@@ -3047,6 +3047,11 @@ _SHARE_SNAPSHOT_BYPASS_WAIVERS = {
 }
 
 
+def _share_snapshot_scan_paths():
+    """Every file under `bin/` the constructor scan reads, before its token prefilter."""
+    return sorted(p for p in (_REPO_ROOT / "bin").rglob("*") if p.is_file())
+
+
 def _share_snapshot_construction_sites():
     """Find every `ShareSnapshot(...)` call in any text file under `bin/`.
 
@@ -3058,9 +3063,7 @@ def _share_snapshot_construction_sites():
     import re as _re
 
     found = []
-    for path in sorted((_REPO_ROOT / "bin").rglob("*")):
-        if not path.is_file():
-            continue
+    for path in _share_snapshot_scan_paths():
         try:
             source = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:

@@ -11,11 +11,11 @@ existing `ns["_build_credit_plan"]` / `ns["_normalize_percent"]` /
 
 `_normalize_percent` is the single chokepoint that flushes IEEE 754 ULP
 noise out of ingress percents; `_build_credit_plan` validates the
-record-credit inputs and floors the effective moment to the hour. Both
+record-credit inputs and takes the effective moment from the exact `--at`
+second (#943, operator decision O1; it used to floor to the hour). Both
 are pure and stdlib-only apart from two kernel imports
 (`parse_iso_datetime`, `_canonicalize_optional_iso` from `_cctally_core`)
-and the pure hour-floor from `_lib_blocks` — no cross-sibling I/O and no
-`cctally` back-import.
+— no cross-sibling I/O and no `cctally` back-import.
 
 Spec: docs/superpowers/specs/2026-07-09-279-s4-record-kernelization-design.md
 """
@@ -25,7 +25,6 @@ import datetime as dt
 from dataclasses import dataclass
 
 from _cctally_core import parse_iso_datetime, _canonicalize_optional_iso
-from _lib_blocks import _floor_to_hour
 
 
 _PERCENT_NORMALIZE_DECIMALS = 10
@@ -61,8 +60,8 @@ class CreditPlan:
     from_pct: float
     from_source: str          # "hwm" | "explicit" | "prior_credit"
     to_pct: float
-    effective_iso: str        # weekly_credit_floors.effective_at_utc (floored to hour)
-    captured_iso: str         # synthetic snapshot captured_at_utc (un-floored), 'Z'
+    effective_iso: str        # weekly_credit_floors.effective_at_utc (the exact --at second)
+    captured_iso: str         # synthetic snapshot captured_at_utc (same second), 'Z'
 
 
 def _parse_credit_at(value, now):
@@ -85,13 +84,21 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
     """Validate inputs and build a CreditPlan. Pure (no DB/file I/O).
     Raises ValueError(msg) on any violation — caller maps to exit 2.
 
+    A fresh plan (a first credit or a `--force` re-record) takes its effective
+    instant from the exact `--at` second, microseconds truncated (#943,
+    operator decision O1). Flooring it to the hour reached back over genuine
+    readings captured before `--at`: the stale-replica band retired them and
+    the floored MAX counted them as post-credit evidence. The synthetic
+    snapshot is captured at that same truncated second, so it sits exactly on
+    the boundary and the `>=` MAX still includes it.
+
     `effective_override` (an ISO string) is the completion-path reuse of an
     EXISTING `weekly_credit_floors.effective_at_utc` (spec §4a): when present,
-    the plan's effective is that value rather than `floor_to_hour(at)`, so a
-    rerun of a half-applied credit at a later wall-clock keeps the original
-    floor moment and never leaks a stale pre-credit replay into the floored
-    MAX. The synthetic snapshot's captured timestamp stays the un-floored
-    `at` either way."""
+    the plan's effective is that value VERBATIM — including a historical hour
+    floor written before O1 — so a rerun of a half-applied credit at a later
+    wall-clock keeps the original floor moment and never leaks a stale
+    pre-credit replay into the floored MAX. The synthetic snapshot's captured
+    timestamp stays `at` either way."""
     to_pct = _normalize_percent(to_pct)
     from_pct = _normalize_percent(from_pct)
     # Defensive None-guard (issue #212 N3). `_normalize_percent` returns None
@@ -118,7 +125,8 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
             effective_override, "effective_override"
         ).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
     else:
-        effective_iso = _floor_to_hour(at_dt).isoformat(timespec="seconds")
+        effective_iso = at_dt.astimezone(dt.timezone.utc).replace(
+            microsecond=0).isoformat(timespec="seconds")
     cur_end_canon = _canonicalize_optional_iso(week_end_at, "record-credit.week_end")
     return CreditPlan(
         week_start_date=week_start_date,
@@ -129,5 +137,6 @@ def _build_credit_plan(*, week_start_date, week_start_at, week_end_at,
         from_source=from_source,
         to_pct=to_pct,
         effective_iso=effective_iso,
-        captured_iso=at_dt.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        captured_iso=at_dt.astimezone(dt.timezone.utc).replace(
+            microsecond=0).isoformat(timespec="seconds").replace("+00:00", "Z"),
     )

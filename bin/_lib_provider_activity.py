@@ -627,15 +627,23 @@ def _witness(status, instant, reason, total, examined, digest) -> ActivityWitnes
         files_total=total, files_examined=examined, digest=digest)
 
 
-def capture_activity(transcript_path: str | None, *, cache_path: pathlib.Path) -> ActivityWitness:
+def capture_activity(transcript_path: str | None, *, cache_path: pathlib.Path,
+                     seed_path: pathlib.Path | None = None) -> ActivityWitness:
     """Capture one arrival's provider-activity evidence (spec 4.1). Called
     once per arrival, before the intake commit and outside the intake
     critical section; never raises for anything a transcript or the cache
-    can contain."""
+    can contain.
+
+    ``seed_path`` is the starting state of an absent cache (#1019 C4): the
+    same contributor's document in a previous spool, read without its lock
+    and never written. Its records are keyed by file incarnation, so a seed
+    is as valid as a document this arrival would write; an unreadable or
+    invalid seed is an ordinary first arrival."""
     if not isinstance(transcript_path, str) or not transcript_path:
         return _witness("unknown", None, "no-transcript-path", 0, 0, _digest([], True, True))
     try:
-        return _capture_locked(transcript_path, pathlib.Path(cache_path))
+        return _capture_locked(transcript_path, pathlib.Path(cache_path),
+                               None if seed_path is None else pathlib.Path(seed_path))
     except Exception:
         # Every transcript and cache condition is classified above; anything
         # else is still an explicit, eligible unknown capture, never a
@@ -643,18 +651,28 @@ def capture_activity(transcript_path: str | None, *, cache_path: pathlib.Path) -
         return _witness("unknown", None, "unreadable", 0, 0, _digest([], False, False))
 
 
-def _capture_locked(transcript_path: str, cache_path: pathlib.Path) -> ActivityWitness:
+def _capture_locked(transcript_path: str, cache_path: pathlib.Path,
+                    seed_path: pathlib.Path | None) -> ActivityWitness:
     lock = _lock_cache(cache_path)
     try:
+        seeded = False
         if lock is None:
             cache, cache_valid, contended = _Cache(), True, True
         else:
-            (cache, cache_valid), contended = _load_cache(cache_path), False
+            contended = False
+            # Under the lock no other arrival writes this cache, so an absent
+            # document stays absent until this arrival stores one.
+            seeded = seed_path is not None and not os.path.lexists(cache_path)
+            if seeded:
+                seed, seed_valid = _load_cache(seed_path)
+                cache, cache_valid = (seed if seed_valid else _Cache()), True
+            else:
+                cache, cache_valid = _load_cache(cache_path)
         before = None if contended else _cache_document(cache)
         result = _capture(transcript_path, cache, cache_valid=cache_valid)
         if lock is not None:
             after = _cache_document(cache)
-            if after != before or not cache_valid:
+            if after != before or not cache_valid or seeded:
                 _store_cache(cache_path, after)
         return result
     finally:

@@ -314,3 +314,325 @@ def test_a_saturated_document_does_not_dispatch_on_every_render(monkeypatch, tmp
     assert [quiet_render(t, m, 83, at=at(DAY + "09:03:40Z", 20 * i))
             for i, m in enumerate((a, c, a, c))] == [False] * 4
     assert t.published() == []
+
+
+# --- #1019 L7: frozen-plan recovery revalidates drop dependencies --------------------
+
+#: A stale member's fixed supported activity, long before every sample.
+STALE_ACTIVITY = "2026-10-21T22:50:00Z"
+
+
+def _frozen(t, steps):
+    """Run ``steps`` until the reducer freezes a publication plan and the
+    process dies right after (`after-freeze`); return the unappended plan."""
+    fired = crash_at(t, "after-freeze")
+    with pytest.raises(Crash):
+        steps()
+    assert fired == ["after-freeze"]
+    plan = t.transition().publication
+    assert plan is not None
+    return plan
+
+
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def _unadmitted(t, observation_id):
+    """While open, the provider sample ``observation_id`` is not yet visible
+    to the sample reader: the race in which a proof is admitted after the
+    reduction that froze a plan read its samples. No later reading is
+    captured, so nothing supersedes the plan; its recovery meets the proof."""
+    samples = sys.modules["_cctally_oauth_samples"]
+    real = samples.read_samples
+
+    def read(*args, **kwargs):
+        return tuple(s for s in real(*args, **kwargs)
+                     if s.observation_id != observation_id)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(samples, "read_samples", read)
+        yield
+
+
+def _proof(t, value, *, at):
+    """An admitted OAuth ``value`` captured at ``at``; returns its
+    observation id."""
+    q = t.oauth(value, at=at)
+    (obs,) = [r[0] for r in t._rows(
+        "SELECT observation_id FROM claude_oauth_samples "
+        "WHERE account_key = ? AND requested_at_utc = ?", (t.account, q))]
+    return obs
+
+
+def _stale_drop_plan(t, *, five=None):
+    """Baseline 51 from a status-line reading, then an OAuth 51 requested
+    after the stale X's activity that the freezing passes do not yet see;
+    X reports 18 twice and the unanimous drop is frozen (its second report
+    also carries the five-hour ``five``). Returns ``(plan, proof)``."""
+    live, x = t.session("live"), t.session("staleX")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 51, at=DAY + "09:00:10Z", five=5)
+    proof = _proof(t, 51, at=DAY + "09:04:00Z")
+    with _unadmitted(t, proof):
+        plan = _frozen(t, lambda: (t.render(x, 18, at=DAY + "09:05:00Z"),
+                                   t.render(x, 18, at=DAY + "09:05:30Z", five=five)))
+    return plan, proof
+
+
+def test_unappended_candidate_drop_plan_superseded_when_winner_refused(monkeypatch, tmp_path):
+    """L7 (accuracy: a frozen plan publishing a refuted low): the plan's
+    candidate winner becomes drop-refused before recovery appends it, so the
+    whole unappended plan is superseded and its evaluation reduced again,
+    which still publishes the other axis (the five-hour rise). RED on the
+    parent: the 18 publishes and resets the week."""
+    t = S.Trace(monkeypatch, tmp_path)
+    plan, _proof_id = _stale_drop_plan(t, five=10)
+    assert plan["provenance"]["sevenDay"]["kind"] == "candidate"
+    assert plan["fiveHour"]["percent"] == 10.0
+    t.render(t.session("live"), 51, at=DAY + "09:06:00Z", five=10)
+    assert t.transition().publication is None
+    assert [p for p in t.published() if p < 51.0] == []
+    assert t.resets() == []
+    assert 10.0 in t.five_published(), "the other axis was discarded with the plan"
+
+
+def _retained_plan(t, *, survivor):
+    """A ``retained_low`` plan: stale X (and, with ``survivor``, genuine Y
+    whose response follows the proof's request) report 18 once and age
+    out; at the deadline the live 51 is present and the retained low
+    publishes. The proof, an OAuth 51 requested after X's activity, is not
+    yet visible to those passes."""
+    live, x, y = t.session("live"), t.session("staleX"), t.session("genuineY")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 51, at=DAY + "09:00:10Z")
+    proof = _proof(t, 51, at=DAY + "09:04:00Z")
+    with _unadmitted(t, proof):
+        t.render(x, 18, at=DAY + "09:05:00Z")
+        if survivor:
+            y.respond(DAY + "09:04:30Z")
+            t.render(y, 18, at=DAY + "09:05:05Z")
+        plan = _frozen(t, lambda: t.render(live, 51, at=DAY + "09:08:10Z"))
+    source = plan["provenance"]["sevenDay"]
+    assert source["kind"] == "retained_low"
+    assert len(source["supports"]) == (2 if survivor else 1)
+    return plan
+
+
+def test_retained_low_plan_with_exhausted_support_superseded(monkeypatch, tmp_path):
+    """L7: every frozen support of a ``retained_low`` plan is refuted, so
+    the plan is superseded and nothing below the baseline publishes. RED on
+    the parent: the retained 18 publishes."""
+    t = S.Trace(monkeypatch, tmp_path)
+    _retained_plan(t, survivor=False)
+    t.render(t.session("live"), 51, at=DAY + "09:08:40Z")
+    assert t.transition().publication is None
+    assert [p for p in t.published() if p < 51.0] == []
+    assert t.resets() == []
+
+
+def test_retained_low_plan_with_surviving_support_publishes_as_that_support(
+        monkeypatch, tmp_path):
+    """L7: one frozen support is refuted and the genuine one, whose bound
+    follows the proof, survives: the plan publishes under its own identity."""
+    t = S.Trace(monkeypatch, tmp_path)
+    plan = _retained_plan(t, survivor=True)
+    t.render(t.session("live"), 51, at=DAY + "09:08:40Z")
+    assert t.transition().publication is None
+    assert t.published()[:2] == [51.0, 18.0]
+    assert [p for _o, _n, p in t.resets()] == [51.0]
+    ids = _appended_publication_ids(t)
+    assert ids.count(plan["publicationId"]) == 1 and ids[1] == plan["publicationId"]
+
+
+def _appended_publication_ids(t) -> list:
+    """The publication identity of every status-line observation journalled."""
+    return [payload["publication_id"] for rec in T.journal_records()
+            if rec.get("t") == "obs"
+            and (payload := rec.get("payload") or {}).get("source") == "statusline"
+            and payload.get("publication_id") is not None]
+
+
+def test_missing_recovery_evidence_defers_with_identity_unchanged(monkeypatch, tmp_path):
+    """L7: recovery cannot bind the frozen winner to its evaluation member
+    (the intake record is unreadable): the plan stays frozen under its
+    identity and publishes nothing — missing evidence is never "no proof".
+    Review finding P2 (machine safety): the deferral is an io wait, so the
+    head waits and renders stop dispatching a pass that defers again. RED:
+    no wait was installed and every render dispatched."""
+    t = S.Trace(monkeypatch, tmp_path)
+    plan, _proof_id = _stale_drop_plan(t)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(t.sl, "_plan_members", lambda account_key, plan: ())
+        t.render(t.session("live"), 51, at=DAY + "09:06:00Z")
+        held = t.transition().publication
+        assert held is not None and held["publicationId"] == plan["publicationId"]
+        assert [p for p in t.published() if p < 51.0] == []
+        wait = t.sl._read_wait(t.account)
+        assert wait is not None and (wait["class"], wait["reason"]) == (
+            "io", t.sl._DROP_EVIDENCE_REASON)
+        # Retried on the io backoff (it doubles), not on every render.
+        due = wait["retry"]["deadline"]
+        quiet = [quiet_render(t, t.session("live"), 51, at=at(DAY + "09:06:10Z", 10 * i))
+                 for i in range(3)]
+        assert S.epoch(at(DAY + "09:06:10Z", 20)) < due
+        assert quiet == [False] * 3, "a deferred plan dispatched every render"
+
+
+def test_appended_plan_completes_unchanged(monkeypatch, tmp_path):
+    """L7: an already-appended plan completes under its identity, never
+    revalidated, even when a proof of its winner has since arrived."""
+    t = S.Trace(monkeypatch, tmp_path)
+    live, x = t.session("live"), t.session("staleX")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 51, at=DAY + "09:00:10Z")
+    proof = _proof(t, 51, at=DAY + "09:04:00Z")
+    fired = crash_at(t, "after-append")
+    with _unadmitted(t, proof), pytest.raises(Crash):
+        t.render(x, 18, at=DAY + "09:05:00Z")
+        t.render(x, 18, at=DAY + "09:05:30Z")
+    assert fired == ["after-append"]
+    plan = t.transition().publication
+    t.render(live, 51, at=DAY + "09:06:00Z")
+    assert t.transition().publication is None
+    assert t.published()[:2] == [51.0, 18.0]
+    ids = _appended_publication_ids(t)
+    assert ids.count(plan["publicationId"]) == 1 and ids[1] == plan["publicationId"]
+
+
+def _rise_plan(t, *, proof=True):
+    """Baseline 0 after a status-line credit; stale X (fixed supported
+    activity, no receipt) then reports 74 and the rise is frozen. With
+    ``proof``, an admitted OAuth 83 requested after X's activity and before
+    the credit exists but is not yet visible to the freezing pass."""
+    live, x, y = t.session("live"), t.session("staleX"), t.session("freshY")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 83, at=DAY + "09:00:10Z")
+    hidden = _proof(t, 83, at=DAY + "09:10:00Z") if proof else None
+    y.respond(DAY + "09:30:00Z")
+    t.render(y, 0, at=DAY + "09:30:10Z")
+    t.render(y, 0, at=DAY + "09:30:40Z")
+    assert t.stored() == 0.0
+    assert t.receipt_for(x, 74) is None
+    with (_unadmitted(t, hidden) if hidden else contextlib.nullcontext()):
+        plan = _frozen(t, lambda: t.render(x, 74, at=DAY + "09:32:00Z"))
+    assert plan["provenance"]["sevenDay"]["token"] == t.token(x)
+    return plan
+
+
+def test_unappended_rise_plan_superseded_when_winner_drop_refused(monkeypatch, tmp_path):
+    """L7 rise side (P-R2, P-R3; accuracy: a stale pre-credit reading
+    re-raising a credited account): an admitted OAuth 83 requested after
+    X's activity makes the frozen rise's winner drop-refused, so the plan is
+    superseded and the 74 never publishes. RED on the parent: it publishes
+    the 74."""
+    t = S.Trace(monkeypatch, tmp_path)
+    _rise_plan(t)
+    t.render(t.session("freshY"), 0, at=DAY + "09:32:30Z")
+    assert t.transition().publication is None
+    assert 74.0 not in t.published()
+
+
+def test_unappended_rise_plan_with_missing_drop_evidence_defers(monkeypatch, tmp_path):
+    """L7 rise side (P-R3): missing drop evidence for an unappended rise
+    plan defers it under its identity instead of reading as "no proof".
+    RED on the parent: the rise publishes."""
+    t = S.Trace(monkeypatch, tmp_path)
+    plan = _rise_plan(t, proof=False)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(t.sl, "_plan_members", lambda account_key, plan: ())
+        t.render(t.session("freshY"), 0, at=DAY + "09:32:30Z")
+        held = t.transition().publication
+        assert held is not None and held["publicationId"] == plan["publicationId"]
+        assert 74.0 not in t.published()
+
+
+# --- #1019 L9: render acknowledgement keeps pending drop-proof work ---------------
+
+
+def test_797_a_refused_stale_rise_does_not_dispatch_on_every_render(monkeypatch, tmp_path):
+    """Review finding P1's twin in #797 (machine safety: one detached
+    reducer pass per render). After a credit, a replayed pre-credit reading
+    whose receipt an ordered sample refutes is refused; unchanged renders of
+    either session are then acknowledged instead of dispatching a pass that
+    refuses it again. RED (1.116.x too): the render reduced without the
+    refusal, saw an eligible rise and dispatched on every render."""
+    t = S.Trace(monkeypatch, tmp_path)
+    g, z = t.session("genuine"), t.session("delayed")
+    _statusline_floor(t, g, z)
+    t.oauth(0, at=DAY + "09:19:00Z")
+    t.render(z, 0, at=DAY + "09:19:30Z")
+    t.render(g, 30, at=DAY + "09:20:00Z")
+    t.render(z, 0, at=DAY + "09:20:10Z")
+    assert t.published() == [30.0, 0.0] and t.receipt_for(g, 30) is not None
+    quiet = ((g, 30), (z, 0), (g, 30), (z, 0))
+    dispatched = [quiet_render(t, m, v, at=at(DAY + "09:20:20Z", 20 * i))
+                  for i, (m, v) in enumerate(quiet)]
+    assert dispatched == [False] * 4, "a refused stale rise dispatched every render"
+    assert t.published() == [30.0, 0.0]
+
+
+def test_1019_a_refused_stale_low_does_not_dispatch_on_every_render(monkeypatch, tmp_path):
+    """Review finding P1 (machine safety: one detached reducer pass per
+    render). Once the detached reducer refuses a proven-stale low, the
+    render's covered cache decides the same refusal: unchanged renders of
+    either session are acknowledged instead of dispatching a pass that
+    refuses it again, until a new reading arrives (work once). RED: the
+    render reduced without the drop facts, re-armed the drop and dispatched
+    on every render while the stale member stayed active."""
+    t = S.Trace(monkeypatch, tmp_path)
+    live, x = t.session("live"), t.session("staleX")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 51, at=DAY + "09:00:10Z")
+    t.oauth(51, at=DAY + "09:04:00Z")
+    t.render(live, 51, at=DAY + "09:04:50Z")
+    t.render(x, 18, at=DAY + "09:05:00Z")
+    t.render(live, 51, at=DAY + "09:05:10Z")
+    assert t.transition().control.pending_drops.get("sevenDay") is None
+    quiet = ((live, 51), (x, 18), (live, 51), (x, 18))
+    dispatched = [quiet_render(t, m, v, at=at(DAY + "09:05:20Z", 20 * i))
+                  for i, (m, v) in enumerate(quiet)]
+    assert dispatched == [False] * 4, "a refused stale low dispatched every render"
+    # A new reading is work once; refused again, it is quiet again.
+    assert quiet_render(t, x, 17, at=DAY + "09:07:00Z") is True
+    t.render(x, 17, at=DAY + "09:07:20Z")
+    assert [quiet_render(t, m, v, at=at(DAY + "09:07:40Z", 20 * i))
+            for i, (m, v) in enumerate(((live, 51), (x, 17)))] == [False] * 2
+    assert [p for p in t.published() if p < 51.0] == [] and t.resets() == []
+
+
+def test_1019_l9_render_ack_keeps_pending_drop_proof_work(monkeypatch, tmp_path):
+    """L9 (accuracy: a refuted retained low kept alive by the render): a
+    drop armed before its proof was visible is pending beside the live 51,
+    which dissents; the render's cached facts no longer cover its support.
+    An unchanged render that reduces to a NOOP must not acknowledge that
+    proof work but dispatch the detached reducer, which prunes the refuted
+    support and cancels the drop. The receipt checks are disabled, so only
+    the proof-work check decides. RED on the parent: the render acknowledges
+    and the refuted drop stays pending."""
+    t = S.Trace(monkeypatch, tmp_path)
+    live, x = t.session("live"), t.session("staleX")
+    live.respond(DAY + "09:00:00Z")
+    x.respond(STALE_ACTIVITY)
+    t.render(live, 51, at=DAY + "09:00:10Z")
+    proof = _proof(t, 51, at=DAY + "09:04:00Z")
+    with _unadmitted(t, proof):
+        t.render(live, 51, at=DAY + "09:04:50Z")
+        t.render(x, 18, at=DAY + "09:05:00Z")
+        t.render(live, 51, at=DAY + "09:05:20Z")
+        t.render(x, 18, at=DAY + "09:05:30Z")
+    transition = t.transition()
+    assert transition.control.pending_drops.get("sevenDay") is not None
+    # The covered cache the hidden passes wrote is replaced by none, as a
+    # writer of a projection it was not read for leaves it.
+    t.sl._write_transition(dataclasses.replace(transition, stale_cache=None))
+    monkeypatch.setattr(t.sl, "_receipt_work", lambda transition, members: False)
+    assert quiet_render(t, live, 51, at=DAY + "09:05:50Z") is True
+    t.render(live, 51, at=DAY + "09:06:10Z")
+    assert t.transition().control.pending_drops.get("sevenDay") is None
+    assert [p for p in t.published() if p < 51.0] == []

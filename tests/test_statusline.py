@@ -3,17 +3,21 @@
 Test contract: import _lib_statusline directly; pass fully-controlled
 StatuslineInput / StatuslineArgs / StatuslineInjections; assert against
 the rendered string. No subprocess, no DB, no transcript files —
-except for the config-precedence subprocess tests at the bottom which
-exercise the I/O layer in `bin/cctally` end-to-end (matching the spec's
-config-persistence acceptance criteria).
+except for `TestContextPortInProcess`, which loads the script to reach the
+real `context_pct` port and writes scratch transcripts, and the
+config-precedence subprocess tests at the bottom which exercise the I/O
+layer in `bin/cctally` end-to-end (matching the spec's config-persistence
+acceptance criteria).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,7 +44,7 @@ def _make_inj(**overrides):
         active_block=lambda now: None,
         hwm_clamp=lambda fr, sr: (None, None),
         db_latest_rate_limits=lambda: None,
-        context_pct=lambda tp, mid: None,
+        context_pct=lambda tp, mid, win, tok: None,
         warn_once=_noop_warn,
     )
     defaults.update(overrides)
@@ -147,6 +151,83 @@ class TestParseStdin:
         inp = ls.parse_statusline_stdin(json.dumps(payload).encode())
         assert inp.session_id is None
         assert inp.model_display_name is None
+
+    # #1002: the payload's `context_window` → two normalized optional fields.
+    _SAMPLE_USAGE = (
+        '{"input_tokens": 2, "output_tokens": 467, '
+        '"cache_creation_input_tokens": 2888, "cache_read_input_tokens": 346924}'
+    )
+
+    @pytest.mark.parametrize("context_window, expected", [
+        # The captured 2.1.312 sample: 2 + 2,888 + 346,924 input-side tokens.
+        ('{"context_window_size": 1000000, "current_usage": %s}'
+         % _SAMPLE_USAGE, (1_000_000, 349_814)),
+        ('{"context_window_size": 1000000, "current_usage": null}',
+         (1_000_000, None)),
+        ('{"context_window_size": 1000000, "current_usage": {}}',
+         (1_000_000, None)),
+        ('{"current_usage": {"input_tokens": null, '
+         '"cache_read_input_tokens": null, '
+         '"cache_creation_input_tokens": null}}', (None, None)),
+        # output_tokens is not an input-side field.
+        ('{"current_usage": {"output_tokens": 5}}', (None, None)),
+        # An explicit zero is an observation, not an absence.
+        ('{"current_usage": {"input_tokens": 0, "cache_read_input_tokens": 0, '
+         '"cache_creation_input_tokens": 0}}', (None, 0)),
+        ('{"current_usage": {"cache_read_input_tokens": 5}}', (None, 5)),
+        ('{"current_usage": {"input_tokens": 5.0}}', (None, 5)),
+        # Any invalid input-side field voids the whole sum.
+        ('{"current_usage": {"input_tokens": 3, '
+         '"cache_read_input_tokens": "x"}}', (None, None)),
+        ('{"current_usage": {"input_tokens": true}}', (None, None)),
+        ('{"current_usage": {"input_tokens": "5"}}', (None, None)),
+        ('{"current_usage": {"input_tokens": 1.5}}', (None, None)),
+        ('{"current_usage": {"input_tokens": -1}}', (None, None)),
+        ('{"current_usage": {"input_tokens": 1e999}}', (None, None)),
+        ('{"current_usage": [1, 2, 3]}', (None, None)),
+        ('{"context_window_size": 0}', (None, None)),
+        ('{"context_window_size": -1}', (None, None)),
+        ('{"context_window_size": true}', (None, None)),
+        ('{"context_window_size": "1000000"}', (None, None)),
+        ('{"context_window_size": 1e999}', (None, None)),
+        ('{"context_window_size": 1000000.0}', (1_000_000, None)),
+        # The two fields are validated independently.
+        ('{"context_window_size": 1000000, '
+         '"current_usage": {"input_tokens": "x"}}', (1_000_000, None)),
+        ('{"context_window_size": "big", '
+         '"current_usage": {"input_tokens": 7}}', (None, 7)),
+        ('[1000000]', (None, None)),
+        ('"1000000"', (None, None)),
+    ])
+    def test_context_window_parses_only_valid_counts(
+            self, context_window, expected):
+        """Detects malformed payload data producing a fabricated context %:
+        a bool, string, fraction, negative or non-finite count, a skipped
+        invalid component, or one bad field discarding the other."""
+        raw = '{"model": {"id": "claude-opus-5-5"}, "context_window": %s}' % (
+            context_window,)
+        inp = ls.parse_statusline_stdin(raw)
+        assert isinstance(inp, ls.StatuslineInput)
+        got = (inp.context_window_size, inp.context_tokens)
+        assert got == expected
+        for value in got:
+            assert value is None or type(value) is int
+
+    def test_precomputed_percentages_and_totals_are_never_read(self):
+        """Detects the context % following Claude Code's pre-rounded
+        `used_percentage` or `total_input_tokens` instead of the counts."""
+        base = json.loads(
+            '{"context_window_size": 1000000, "current_usage": %s}'
+            % self._SAMPLE_USAGE)
+        contradictory = dict(base, used_percentage=99, remaining_percentage=1,
+                             total_input_tokens=5, total_output_tokens=7)
+        parsed = [
+            ls.parse_statusline_stdin(json.dumps(
+                {"context_window": cw, "exceeds_200k_tokens": flag}))
+            for cw, flag in ((base, False), (contradictory, True))
+        ]
+        fields = [(p.context_window_size, p.context_tokens) for p in parsed]
+        assert fields == [(1_000_000, 349_814), (1_000_000, 349_814)]
 
 
 # ---- TestModelSegment ------------------------------------------------------
@@ -364,7 +445,7 @@ class TestBurnRate:
 
 class TestContextPct:
     def test_green_band(self):
-        inj = _make_inj(context_pct=lambda tp, mid: 35.0)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 35.0)
         inp = ls.StatuslineInput(
             model_id="claude-sonnet-4-5", transcript_path="/x.jsonl",
         )
@@ -373,7 +454,7 @@ class TestContextPct:
         assert out == "🧠 35%"  # color off → no ANSI
 
     def test_yellow_band(self):
-        inj = _make_inj(context_pct=lambda tp, mid: 65.0)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 65.0)
         inp = ls.StatuslineInput(
             model_id="claude-sonnet-4-5", transcript_path="/x.jsonl",
         )
@@ -381,7 +462,7 @@ class TestContextPct:
         assert out == "🧠 65%"
 
     def test_red_band(self):
-        inj = _make_inj(context_pct=lambda tp, mid: 95.0)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 95.0)
         inp = ls.StatuslineInput(
             model_id="claude-sonnet-4-5", transcript_path="/x.jsonl",
         )
@@ -390,7 +471,7 @@ class TestContextPct:
 
     def test_unknown_model_returns_na(self):
         """When injection returns None (unknown model), kernel renders N/A."""
-        inj = _make_inj(context_pct=lambda tp, mid: None)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: None)
         inp = ls.StatuslineInput(
             model_id="future-model-xyz", transcript_path="/x.jsonl",
         )
@@ -398,12 +479,220 @@ class TestContextPct:
         assert out == "🧠 N/A"
 
     def test_no_transcript_returns_na(self):
-        inj = _make_inj(context_pct=lambda tp, mid: None)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: None)
         inp = ls.StatuslineInput(
             model_id="claude-sonnet-4-5", transcript_path=None,
         )
         out = ls.resolve_context_pct(inp, _make_args(), inj)
         assert out == "🧠 N/A"
+
+    @pytest.mark.parametrize("pct, low, medium, text, color", [
+        (49.4, 50, 80, "🧠 49%", "green"),
+        (49.6, 50, 80, "🧠 50%", "yellow"),
+        (79.4, 50, 80, "🧠 79%", "yellow"),
+        (79.6, 50, 80, "🧠 80%", "red"),
+        (59.6, 50, 60, "🧠 60%", "red"),
+        (59.4, 50, 60, "🧠 59%", "yellow"),
+        # An exact tie (1/8 of a window is exactly 12.5%): the band follows
+        # the integer `int(round())` renders, not the unrounded value.
+        (12.5, 13, 80, "🧠 12%", "green"),
+        # A tie that rounds UP across the boundary: banding on the raw 13.5
+        # would say green, the rendered 14 says yellow.
+        (13.5, 14, 80, "🧠 14%", "yellow"),
+    ])
+    def test_band_color_agrees_with_the_rendered_integer(
+            self, pct, low, medium, text, color):
+        """Detects a low or medium band boundary disagreeing with the
+        percentage text the segment shows."""
+        inj = _make_inj(context_pct=lambda *_a: pct)
+        args = _make_args(color=True, cctally_extensions=False,
+                          context_low_threshold=low,
+                          context_medium_threshold=medium)
+        out = ls.render_statusline(
+            ls.StatuslineInput(model_display_name="M"), args, inj, _FIXED_NOW)
+        assert out.split(" | ")[-1] == (
+            f"{ls._ANSI[color]}{text}{ls._ANSI['reset']}")
+
+
+# ---- TestContextPortInProcess (#1002) ---------------------------------------
+
+
+_CAPTURED_USAGE = {"input_tokens": 2, "output_tokens": 467,
+                   "cache_creation_input_tokens": 2888,
+                   "cache_read_input_tokens": 346924}
+_CAPTURED_PCT = 349_814 / 1_000_000 * 100.0
+
+
+class TestContextPortInProcess:
+    """The REAL `context_pct` port (`_build_statusline_injections`), reached
+    through the kernel's own call in `resolve_context_pct`, so the payload is
+    parsed and forwarded exactly as `cmd_statusline` does it.
+
+    Detects precedence errors (the model table or the transcript winning over
+    the payload), a regression of today's silent and warning `N/A` paths,
+    and a zero usage dropped by a truthiness test.
+    """
+
+    @pytest.fixture
+    def port(self, monkeypatch, tmp_path):
+        mod = load_script_module()
+        sl = mod._load_sibling("_cctally_statusline")
+        opened = []
+        real_read = sl._read_last_assistant_usage
+
+        def _recording_read(path):
+            opened.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(sl, "_read_last_assistant_usage", _recording_read)
+        warnings = []
+        inj = sl._build_statusline_injections(warnings.append)
+        returned = []
+        real_port = inj.context_pct
+
+        def _capturing_port(*args):
+            value = real_port(*args)
+            returned.append(value)
+            return value
+
+        wired = dataclasses.replace(inj, context_pct=_capturing_port)
+
+        def transcript(input_tokens):
+            path = tmp_path / f"t-{input_tokens}.jsonl"
+            path.write_text(json.dumps({"type": "assistant", "message": {
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0,
+                          "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0}}}) + "\n")
+            return str(path)
+
+        def run(payload):
+            inp = ls.parse_statusline_stdin(json.dumps(payload))
+            ls.resolve_context_pct(inp, _make_args(), wired)
+            assert len(returned) == 1
+            return returned.pop()
+
+        return SimpleNamespace(run=run, transcript=transcript,
+                               warnings=warnings, opened=opened,
+                               tmp_path=tmp_path)
+
+    @staticmethod
+    def _close(value, expected):
+        assert value is not None and abs(value - expected) < 1e-9, value
+
+    def test_payload_window_with_a_transcript_numerator(self, port):
+        path = port.transcript(350_000)
+        pct = port.run({"model": {"id": "claude-opus-4-7"},
+                        "transcript_path": path,
+                        "context_window": {"context_window_size": 1_000_000}})
+        self._close(pct, 35.0)
+        assert port.warnings == []
+        assert port.opened == [path]
+
+    def test_payload_numerator_with_a_table_window(self, port):
+        pct = port.run({"model": {"id": "claude-sonnet-4-5"},
+                        "context_window": {
+                            "current_usage": {"input_tokens": 100_000}}})
+        self._close(pct, 50.0)
+        assert port.warnings == []
+
+    def test_payload_numerator_wins_and_the_transcript_is_not_opened(
+            self, port):
+        path = port.transcript(150_000)
+        pct = port.run({"model": {"id": "claude-opus-5-5"},
+                        "transcript_path": path,
+                        "context_window": {"context_window_size": 1_000_000,
+                                           "current_usage": _CAPTURED_USAGE}})
+        self._close(pct, _CAPTURED_PCT)
+        assert port.opened == []
+        assert port.warnings == []
+
+    def test_payload_numerator_ignores_a_missing_transcript_file(self, port):
+        missing = str(port.tmp_path / "does-not-exist.jsonl")
+        pct = port.run({"model": {"id": "claude-opus-5-5"},
+                        "transcript_path": missing,
+                        "context_window": {"context_window_size": 1_000_000,
+                                           "current_usage": _CAPTURED_USAGE}})
+        self._close(pct, _CAPTURED_PCT)
+        assert port.warnings == []
+
+    def test_contradictory_precomputed_percentage_does_not_move_the_value(
+            self, port):
+        """Detects the port following Claude Code's pre-rounded
+        `used_percentage` / `remaining_percentage` or its running totals
+        instead of the counts it parsed."""
+        pct = port.run({"model": {"id": "claude-opus-5-5"},
+                        "context_window": {
+                            "context_window_size": 1_000_000,
+                            "current_usage": {"input_tokens": 350_000},
+                            "used_percentage": 99,
+                            "remaining_percentage": 1,
+                            "total_input_tokens": 5}})
+        self._close(pct, 35.0)
+        assert port.warnings == []
+
+    def test_an_out_of_range_payload_count_is_unavailable_not_a_crash(
+            self, port):
+        """Detects a status line that prints nothing (the division raises
+        OverflowError and `cmd_statusline` exits 1) when a payload count is
+        too large for a float, instead of rendering `🧠 N/A`."""
+        assert port.run({"model": {"id": "claude-opus-5-5"},
+                         "context_window": {
+                             "context_window_size": 1_000_000,
+                             "current_usage": {
+                                 "input_tokens": 10 ** 400}}}) is None
+
+    def test_zero_payload_usage_is_zero_percent_not_unavailable(self, port):
+        pct = port.run({"model": {"id": "claude-opus-5-5"},
+                        "context_window": {
+                            "context_window_size": 1_000_000,
+                            "current_usage": {
+                                "input_tokens": 0,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0}}})
+        assert pct == 0.0
+        assert port.warnings == []
+
+    def test_complete_payload_needs_no_transcript_and_no_model(self, port):
+        pct = port.run({"context_window": {
+            "context_window_size": 1_000_000,
+            "current_usage": _CAPTURED_USAGE}})
+        self._close(pct, _CAPTURED_PCT)
+        assert port.warnings == []
+
+    def test_unknown_model_with_a_payload_window_renders_without_warning(
+            self, port):
+        path = port.transcript(350_000)
+        pct = port.run({"model": {"id": "mystery-9000"},
+                        "transcript_path": path,
+                        "context_window": {"context_window_size": 1_000_000}})
+        self._close(pct, 35.0)
+        assert port.warnings == []
+
+    def test_payload_window_overrides_the_registry_default(self, port):
+        pct = port.run({"model": {"id": "claude-opus-5-5"},
+                        "context_window": {
+                            "context_window_size": 200_000,
+                            "current_usage": {"input_tokens": 100_000}}})
+        self._close(pct, 50.0)
+        assert port.warnings == []
+
+    def test_no_payload_and_no_transcript_stays_silent(self, port):
+        assert port.run({"model": {"id": "mystery-9000"}}) is None
+        assert port.warnings == []
+
+    def test_unknown_model_without_a_payload_window_still_warns(self, port):
+        path = port.transcript(350_000)
+        assert port.run({"model": {"id": "mystery-9000"},
+                         "transcript_path": path}) is None
+        assert len(port.warnings) == 1
+        assert "mystery-9000" in port.warnings[0]
+
+    def test_fable_without_a_payload_renders_a_percentage(self, port):
+        path = port.transcript(350_000)
+        pct = port.run({"model": {"id": "claude-fable-5-1"},
+                        "transcript_path": path})
+        self._close(pct, 35.0)
+        assert port.warnings == []
 
 
 # ---- TestCctallyExtensions -------------------------------------------------
@@ -511,7 +800,7 @@ class TestRenderStatusline:
             cctally_session_cost=lambda sid: 1.23,
             today_cost=lambda tz, now: 46.36,
             active_block=lambda now: (13.48, 12120, 5880),
-            context_pct=lambda tp, mid: 35.0,
+            context_pct=lambda tp, mid, win, tok: 35.0,
         )
         out = ls.render_statusline(inp, _make_args(), inj, _FIXED_NOW)
         assert out == (
@@ -528,7 +817,7 @@ class TestRenderStatusline:
             rate_limits_5h_pct=34.0,
             rate_limits_5h_resets_at=_FIVE_RESETS,
         )
-        inj = _make_inj(context_pct=lambda tp, mid: 35.0)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 35.0)
         args = _make_args(cctally_extensions=False)
         out = ls.render_statusline(inp, args, inj, _FIXED_NOW)
         # Segment 5 omitted → line ends after context segment. The
@@ -555,7 +844,7 @@ class TestRenderStatusline:
             transcript_path="/x.jsonl",
             model_id="claude-sonnet-4-5",
         )
-        inj = _make_inj(context_pct=lambda tp, mid: 35.0)  # green band
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 35.0)  # green band
         out = ls.render_statusline(inp, _make_args(color=True), inj, _FIXED_NOW)
         assert "\033[32m" in out  # green ANSI present (context, < 50)
         assert "\033[0m" in out
@@ -566,7 +855,7 @@ class TestRenderStatusline:
             transcript_path="/x.jsonl",
             model_id="claude-sonnet-4-5",
         )
-        inj = _make_inj(context_pct=lambda tp, mid: 35.0)
+        inj = _make_inj(context_pct=lambda tp, mid, win, tok: 35.0)
         out = ls.render_statusline(inp, _make_args(color=False), inj, _FIXED_NOW)
         assert "\033[" not in out
 

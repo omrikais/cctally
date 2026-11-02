@@ -34,6 +34,7 @@ import sys
 from dataclasses import dataclass
 
 import _lib_account_protocol
+import _lib_claude_attribution
 
 LINE_VERSION = 1
 
@@ -429,12 +430,20 @@ _WPG = _lib_account_protocol.WRITER_GENERATION_KEY
 #: metadata exactly like ``wpg``.
 _WRITER_REVISION = _lib_account_protocol.PROTOCOL_REVISION
 _WPR = _lib_account_protocol.REVISION_KEY
+#: #1019/#1014 (spec 4.7 C1): the successor revision stamp, transport
+#: metadata exactly like ``wpg`` and ``wpr`` and part of the same content-id
+#: core, so 1.116.1 re-derives a current record's id unchanged.
+_WRITER_SUCCESSOR = _lib_account_protocol.SUCCESSOR_REVISION
+_WPX = _lib_account_protocol.SUCCESSOR_REVISION_KEY
 #: ``writer_revision`` default: the current revision when the record carries
 #: the current writer generation, none for a previous release's shape.
+#: ``writer_successor`` default: the successor revision when the record
+#: carries a protocol revision, none otherwise.
 _REVISION_DEFAULT = object()
 
 
-def _writer_core(core: dict, writer_generation, writer_revision) -> None:
+def _writer_core(core: dict, writer_generation, writer_revision,
+                 writer_successor=_REVISION_DEFAULT) -> None:
     if writer_generation is not None:
         core[_WPG] = writer_generation
     if writer_revision is _REVISION_DEFAULT:
@@ -442,12 +451,18 @@ def _writer_core(core: dict, writer_generation, writer_revision) -> None:
                            else _WRITER_REVISION)
     if writer_revision is not None:
         core[_WPR] = writer_revision
+    if writer_successor is _REVISION_DEFAULT:
+        writer_successor = (None if writer_revision is None
+                            else _WRITER_SUCCESSOR)
+    if writer_successor is not None:
+        core[_WPX] = writer_successor
 
 
 def make_obs(at: str, src: str, provider: str, payload: dict,
              account: str | None = None, *,
              writer_generation: str | None = _WRITER_GENERATION,
-             writer_revision=_REVISION_DEFAULT) -> dict:
+             writer_revision=_REVISION_DEFAULT,
+             writer_successor=_REVISION_DEFAULT) -> dict:
     """Build a complete ``obs`` line record (raw capture; canonicalization is
     derivation-time, never baked into the stored line — spec §4.2).
 
@@ -467,28 +482,36 @@ def make_obs(at: str, src: str, provider: str, payload: dict,
     protocol revision, also part of the content-id core. It defaults to the
     current revision for a current-generation record and to none for a
     previous release's shape; ``None`` with the current generation builds
-    the revision-1 (#825) shape."""
+    the revision-1 (#825) shape.
+
+    ``writer_successor`` (#1019/#1014 spec 4.7 C1) is the top-level ``wpx``
+    successor revision, also part of the content-id core. It defaults to the
+    successor revision for a record carrying a protocol revision; ``None``
+    with the current revision builds the revision-2 (1.116.x) shape."""
     core = {"t": "obs", "at": at, "src": src, "provider": provider, "payload": payload}
     if account is not None:
         core["account"] = account
-    _writer_core(core, writer_generation, writer_revision)
+    _writer_core(core, writer_generation, writer_revision, writer_successor)
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
 def make_op(at: str, src: str, payload: dict, *,
             writer_generation: str | None = _WRITER_GENERATION,
-            writer_revision=_REVISION_DEFAULT) -> dict:
+            writer_revision=_REVISION_DEFAULT,
+            writer_successor=_REVISION_DEFAULT) -> dict:
     """Build a complete ``op`` (operator record) line — no ``provider``.
-    ``writer_generation`` and ``writer_revision`` as in ``make_obs``."""
+    ``writer_generation``, ``writer_revision`` and ``writer_successor`` as in
+    ``make_obs``."""
     core = {"t": "op", "at": at, "src": src, "payload": payload}
-    _writer_core(core, writer_generation, writer_revision)
+    _writer_core(core, writer_generation, writer_revision, writer_successor)
     return {"v": LINE_VERSION, **core, "id": content_id(core)}
 
 
 def prepare_record(record: dict) -> dict:
     """The single shared preparation step both append APIs apply (#825/#832
     spec 5.1): return ``record`` carrying the current writer generation and,
-    since #797/#823/#840 (spec 4.6 B1), the current protocol revision.
+    since #797/#823/#840 (spec 4.6 B1), the current protocol revision and,
+    since #1019/#1014 (spec 4.7 C1), the successor revision.
 
     A content-id record (``id`` starting ``o:``) that is not yet fully
     stamped and whose id verifies over its current core is re-identified over
@@ -498,7 +521,8 @@ def prepare_record(record: dict) -> dict:
     stamps is returned unchanged. Only records about to be appended pass
     through here, so a retained record is never restamped."""
     if (_lib_account_protocol.is_stamped(record)
-            and _lib_account_protocol.has_current_revision(record)):
+            and _lib_account_protocol.has_current_revision(record)
+            and _lib_account_protocol.has_successor_revision(record)):
         return record
     stamped = _lib_account_protocol.stamp(record)
     rid = record.get("id")
@@ -518,11 +542,12 @@ def unstamped_record(record: dict) -> dict:
     record whose id verifies over its stamped core, re-identifies it over the
     unstamped core. Any other id is preserved. For fixtures and tests that
     simulate a pre-stamp writer; never used on a production write path.
-    The protocol revision (``wpr``) goes with the stamp."""
+    The protocol revision (``wpr``) and the successor revision (``wpx``) go
+    with the stamp."""
     if not isinstance(record, dict) or (
-            _WPG not in record and _WPR not in record):
+            _WPG not in record and _WPR not in record and _WPX not in record):
         return record
-    out = {k: v for k, v in record.items() if k not in (_WPG, _WPR)}
+    out = {k: v for k, v in record.items() if k not in (_WPG, _WPR, _WPX)}
     rid = record.get("id")
     if (record.get("t") in ("obs", "op") and isinstance(rid, str)
             and rid.startswith("o:")):
@@ -538,9 +563,24 @@ def prerevision_record(record: dict) -> dict:
     generation without the protocol revision, re-identified like
     ``unstamped_record``. For fixtures and tests that simulate the previous
     release; never used on a production write path."""
-    if not isinstance(record, dict) or _WPR not in record:
+    if not isinstance(record, dict) or (_WPR not in record
+                                        and _WPX not in record):
         return record
-    out = {k: v for k, v in record.items() if k != _WPR}
+    return _without_keys(record, (_WPR, _WPX))
+
+
+def revision2_record(record: dict) -> dict:
+    """The revision-2 (1.116.x) shape of ``record`` (#1019/#1014 spec 4.7):
+    ``wpg`` and ``wpr`` without the successor revision, re-identified like
+    ``unstamped_record``. For fixtures and tests only; never used on a
+    production write path."""
+    if not isinstance(record, dict) or _WPX not in record:
+        return record
+    return _without_keys(record, (_WPX,))
+
+
+def _without_keys(record: dict, keys) -> dict:
+    out = {k: v for k, v in record.items() if k not in keys}
     rid = record.get("id")
     if (record.get("t") in ("obs", "op") and isinstance(rid, str)
             and rid.startswith("o:")):
@@ -605,9 +645,12 @@ _PROTOCOL_RESOLUTION_V2_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V2_KIND
 #: #797/#823/#840 (spec 4.6 B5): the previous release's v2 validator rejects
 #: the protocol revision stamp, so the current binary emits this successor.
 PROTOCOL_RESOLUTION_V3_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V3_KIND
+#: #1019/#1014 (spec 4.7 C5): 1.116.1's v3 validator rejects the successor
+#: revision stamp, so the current binary emits this successor.
+PROTOCOL_RESOLUTION_V4_KIND = _lib_account_protocol.PROTOCOL_RESOLUTION_V4_KIND
 PROTOCOL_RESOLUTION_KINDS = frozenset((
     _PROTOCOL_RESOLUTION_KIND, _PROTOCOL_RESOLUTION_V2_KIND,
-    PROTOCOL_RESOLUTION_V3_KIND))
+    PROTOCOL_RESOLUTION_V3_KIND, PROTOCOL_RESOLUTION_V4_KIND))
 _PROTOCOL_RESOLUTION_SRC = "journal-repair"
 
 
@@ -647,7 +690,7 @@ def make_protocol_resolution(
         at=at,
         src=_PROTOCOL_RESOLUTION_SRC,
         payload={
-            "kind": PROTOCOL_RESOLUTION_V3_KIND,
+            "kind": PROTOCOL_RESOLUTION_V4_KIND,
             "violations": refs,
             "journal_high_water": {
                 "segment": segment,
@@ -681,7 +724,8 @@ def make_evt(kind: str, id: str, at: str, payload: dict, rev: int = 0) -> dict:
     body["kind"] = kind
     return {"v": LINE_VERSION, "t": "evt", "id": id, "rev": rev,
             "at": at, "src": "ingest", "payload": body,
-            _WPG: _WRITER_GENERATION, _WPR: _WRITER_REVISION}
+            _WPG: _WRITER_GENERATION, _WPR: _WRITER_REVISION,
+            _WPX: _WRITER_SUCCESSOR}
 
 
 # --------------------------------------------------------------------------
@@ -721,9 +765,10 @@ def _validate_protocol_resolution(record: dict) -> dict:
     required = {"v", "t", "id", "at", "src", "payload"}
     # #825/#832: a current record also carries the writer-generation stamp,
     # which is part of its content-id core; #797/#823/#840 adds the protocol
-    # revision (spec 4.6 B5).
+    # revision (spec 4.6 B5) and #1019/#1014 the successor revision (C5).
     if set(record) not in (required, required | {_WPG},
-                           required | {_WPG, _WPR}):
+                           required | {_WPG, _WPR},
+                           required | {_WPG, _WPR, _WPX}):
         raise JournalProtocolError(
             "journal protocol resolution record shape is invalid"
         )
@@ -747,6 +792,8 @@ def _validate_protocol_resolution(record: dict) -> dict:
         core[_WPG] = record[_WPG]
     if _WPR in record:
         core[_WPR] = record[_WPR]
+    if _WPX in record:
+        core[_WPX] = record[_WPX]
     if record.get("id") != content_id(core):
         raise JournalProtocolError(
             "journal protocol resolution record id does not match its content"
@@ -900,6 +947,7 @@ def make_correction_batch(
         "actions_hash": actions_hash,
         _WPG: _WRITER_GENERATION,
         _WPR: _WRITER_REVISION,
+        _WPX: _WRITER_SUCCESSOR,
     }
     records = [{**marker, "phase": "begin"}]
     for seq, core in enumerate(cores):
@@ -912,6 +960,7 @@ def make_correction_batch(
                 "seq": seq,
                 _WPG: _WRITER_GENERATION,
                 _WPR: _WRITER_REVISION,
+                _WPX: _WRITER_SUCCESSOR,
             }
         )
     records.append({**marker, "phase": "commit"})
@@ -930,13 +979,22 @@ def revision_batch_id(batch_id: str, begins) -> str:
     hashes markers byte-exactly), and a copy without the stamp would land
     after the revision boundary, where admission excludes it. Its plan is
     therefore authored afresh under a derived id, and the original begin
-    stays the inert, incomplete batch it was."""
+    stays the inert, incomplete batch it was.
+
+    #1019/#1014 (spec 4.7 C5 bullet 4): the reuse test is now the successor
+    revision. A begin with ``wpr`` but no ``wpx`` (1.116.x) is retried under
+    ``<logical>:wpx3``, where ``logical`` is ``batch_id`` without a trailing
+    ``:wpr2`` (the revision-2 retry suffix), so an interrupted revision-2
+    attempt and its original share one revision-3 retry identity."""
     begins = list(begins)
     if not begins or any(
-            _lib_account_protocol.has_current_revision(begin)
+            _lib_account_protocol.has_successor_revision(begin)
             for begin in begins):
         return batch_id
-    return f"{batch_id}:wpr{_lib_account_protocol.PROTOCOL_REVISION}"
+    suffix = f":wpr{_lib_account_protocol.PROTOCOL_REVISION}"
+    logical = (batch_id[:-len(suffix)] if batch_id.endswith(suffix)
+               else batch_id)
+    return f"{logical}:wpx{_lib_account_protocol.SUCCESSOR_REVISION}"
 
 
 def _validate_batch_marker(record: dict) -> dict:
@@ -1850,6 +1908,199 @@ def make_codex_window_attribution_retract(
     payload["retracted_assertion_ids"] = targets
     return make_op(at=_normalize_attribution_instant(at),
                    src=WINDOW_ATTRIBUTION_SRC, payload=payload)
+
+
+# --------------------------------------------------------------------------
+# #944: durable write-time Claude cost attribution decisions
+# --------------------------------------------------------------------------
+
+CLAUDE_COST_ACCOUNT_KIND = "claude_cost_account"
+CLAUDE_COST_ACCOUNT_SRC = "claude-cost-account"
+CLAUDE_COST_ACCOUNT_VERSION = 1
+_CLAUDE_COST_ACCOUNT_KEYS = frozenset((
+    "kind", "v", "rule", "basis", "reason", "account_key", "decided_at",
+    "journal_hw", "closing_capture", "evidence", "items",
+))
+_HEX32_LEN = 32
+_HEX64_LEN = 64
+
+
+def _is_hex(value, length: int) -> bool:
+    return (isinstance(value, str) and len(value) == length
+            and all(ch in "0123456789abcdef" for ch in value))
+
+
+def _nonneg_int(value) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _valid_instant_text(value) -> bool:
+    try:
+        _lib_claude_attribution.capture_interval(value)
+    except (ValueError, OverflowError):
+        return False
+    return True
+
+
+def _valid_stamp(value) -> bool:
+    """The two-shaped stamp rule: a present account is a real key, never the
+    ``unattributed`` sentinel (NULL omits the field)."""
+    return (isinstance(value, str) and bool(value)
+            and value != _ATTRIBUTION_SENTINEL)
+
+
+def _validate_claude_cost_item(item, basis: str) -> None:
+    if not isinstance(item, list) or not item:
+        raise ValueError("claude_cost_account item must be a non-empty list")
+    form = item[0]
+    preserved = basis == _lib_claude_attribution.BASIS_PRESERVED
+    if form == _lib_claude_attribution.FORM_KEYED:
+        size = 3 if preserved else 4
+        if len(item) != size:
+            raise ValueError("keyed item has the wrong shape")
+        if not all(isinstance(v, str) and v for v in item[1:3]):
+            raise ValueError("keyed item ids must be non-empty strings")
+        if not preserved and item[3] is not None and not isinstance(
+                item[3], str):
+            raise ValueError("keyed item timestamp must be a string")
+        return
+    if form == _lib_claude_attribution.FORM_PHYSICAL:
+        if preserved or len(item) != 5:
+            raise ValueError("physical item has the wrong shape")
+        if not _is_hex(item[1], _HEX32_LEN):
+            raise ValueError("physical item location is not a location digest")
+        if not _nonneg_int(item[2]) or not _is_hex(item[3], _HEX64_LEN):
+            raise ValueError("physical item offset or digest is invalid")
+        if item[4] is not None and not isinstance(item[4], str):
+            raise ValueError("physical item timestamp must be a string")
+        return
+    if form == _lib_claude_attribution.FORM_LEGACY:
+        if not preserved or len(item) != 5:
+            raise ValueError("legacy item has the wrong shape")
+        if not _is_hex(item[1], _HEX32_LEN):
+            raise ValueError("legacy item location is not a location digest")
+        if not _nonneg_int(item[2]) or not _is_hex(item[3], _HEX64_LEN):
+            raise ValueError("legacy item offset or digest is invalid")
+        projection = item[4]
+        if (not isinstance(projection, list) or len(projection)
+                != len(_lib_claude_attribution.PROJECTION_FIELDS)):
+            raise ValueError("legacy item projection has the wrong shape")
+        if _lib_claude_attribution.projection_sha256(projection) != item[3]:
+            raise ValueError("legacy item digest does not match its projection")
+        return
+    raise ValueError(f"unknown claude_cost_account item form {form!r}")
+
+
+def validate_claude_cost_account(payload: dict) -> None:
+    """Validate one ``claude_cost_account`` payload (#944 spec 5.4);
+    ``ValueError`` on any malformed field. A rejected payload is never
+    applied."""
+    if not isinstance(payload, dict):
+        raise ValueError("claude_cost_account payload must be an object")
+    unknown = set(payload) - _CLAUDE_COST_ACCOUNT_KEYS
+    if unknown:
+        raise ValueError(f"unknown claude_cost_account keys {sorted(unknown)}")
+    if payload.get("kind") != CLAUDE_COST_ACCOUNT_KIND:
+        raise ValueError("payload is not a claude_cost_account op")
+    if payload.get("v") != CLAUDE_COST_ACCOUNT_VERSION or type(
+            payload.get("v")) is not int:
+        raise ValueError("claude_cost_account version is invalid")
+    rule = payload.get("rule")
+    if type(rule) is not int or rule < 1:
+        raise ValueError("claude_cost_account rule is invalid")
+    basis = payload.get("basis")
+    if basis not in _lib_claude_attribution.BASES:
+        raise ValueError("claude_cost_account basis is invalid")
+    if basis == _lib_claude_attribution.BASIS_FALLBACK:
+        if payload.get("reason") not in _lib_claude_attribution.FALLBACK_REASONS:
+            raise ValueError("a fallback decision needs a known reason")
+    elif "reason" in payload:
+        raise ValueError("only a fallback decision carries a reason")
+    if "account_key" in payload and not _valid_stamp(payload["account_key"]):
+        raise ValueError("claude_cost_account account_key is invalid")
+    if not _valid_instant_text(payload.get("decided_at")):
+        raise ValueError("claude_cost_account decided_at is invalid")
+    hw = payload.get("journal_hw")
+    if (not isinstance(hw, list) or len(hw) != 2
+            or not isinstance(hw[0], str) or not hw[0]
+            or not _nonneg_int(hw[1])):
+        raise ValueError("claude_cost_account journal_hw is invalid")
+    capture = payload.get("closing_capture")
+    if capture is not None or "closing_capture" in payload:
+        if basis != _lib_claude_attribution.BASIS_AGREEMENT:
+            raise ValueError("only an agreement uses a closing capture")
+        if (not isinstance(capture, dict)
+                or not set(capture) <= {"at", "account_key"}
+                or not _valid_instant_text(capture.get("at"))):
+            raise ValueError("claude_cost_account closing_capture is invalid")
+        if "account_key" in capture and not _valid_stamp(capture["account_key"]):
+            raise ValueError("closing capture account_key is invalid")
+    if "evidence" in payload:
+        evidence = payload["evidence"]
+        if basis == _lib_claude_attribution.BASIS_PRESERVED:
+            raise ValueError("preserved history carries no evidence")
+        if not isinstance(evidence, list):
+            raise ValueError("claude_cost_account evidence must be a list")
+        for entry in evidence:
+            if (not isinstance(entry, list) or len(entry) != 3
+                    or not _valid_instant_text(entry[0])
+                    or not isinstance(entry[1], str) or not entry[1]
+                    or not _nonneg_int(entry[2])):
+                raise ValueError("claude_cost_account evidence is invalid")
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("claude_cost_account needs at least one item")
+    for item in items:
+        _validate_claude_cost_item(item, basis)
+
+
+def make_claude_cost_account(*, basis: str, reason: "str | None",
+                             account_key: "str | None", decided_at: str,
+                             journal_hw, closing_capture: "dict | None",
+                             evidence: list, items: list) -> dict:
+    """Build one ``claude_cost_account`` op: a homogeneous batch of durable
+    Claude cost attribution decisions (#944 spec 5.4) sharing one basis,
+    reason, account, rule version and closing capture.
+
+    Two-shaped stamp rule: a real account rides ``payload.account_key`` and a
+    NULL decision OMITS it -- never the literal ``unattributed``. The payload
+    carries no credential, no transcript text and no clear-text path: physical
+    and legacy items name their file by its location digest only."""
+    record = claude_cost_account_op_unvalidated(
+        basis=basis, reason=reason, account_key=account_key,
+        decided_at=decided_at, journal_hw=journal_hw,
+        closing_capture=closing_capture, evidence=evidence, items=items)
+    validate_claude_cost_account(record["payload"])
+    return record
+
+
+def claude_cost_account_op_unvalidated(
+        *, basis: str, reason: "str | None", account_key: "str | None",
+        decided_at: str, journal_hw, closing_capture: "dict | None",
+        evidence: list, items: list) -> dict:
+    """The op ``make_claude_cost_account`` builds, WITHOUT validating it.
+
+    Only for measuring a candidate line's encoded size (the batch builder
+    sizes each batch from a one-item skeleton); never append its result --
+    every appended op goes through ``make_claude_cost_account``."""
+    payload = {
+        "kind": CLAUDE_COST_ACCOUNT_KIND,
+        "v": CLAUDE_COST_ACCOUNT_VERSION,
+        "rule": _lib_claude_attribution.RULE_VERSION,
+        "basis": basis,
+        "decided_at": decided_at,
+        "journal_hw": [str(journal_hw[0]), int(journal_hw[1])],
+        "items": [list(item) for item in items],
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    if account_key is not None:
+        payload["account_key"] = account_key
+    if closing_capture is not None:
+        payload["closing_capture"] = dict(closing_capture)
+    if evidence:
+        payload["evidence"] = [list(entry) for entry in evidence]
+    return make_op(at=decided_at, src=CLAUDE_COST_ACCOUNT_SRC, payload=payload)
 
 
 # --------------------------------------------------------------------------

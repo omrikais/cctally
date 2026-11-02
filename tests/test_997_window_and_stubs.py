@@ -108,8 +108,24 @@ def _index_dump():
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall():
             if table in _VOLATILE_TABLES:
                 continue
-            out[table] = sorted((tuple(row) for row in conn.execute(
-                f"SELECT * FROM {table}")), key=repr)
+            rows = [tuple(row) for row in conn.execute(
+                f"SELECT * FROM {table}")]
+            if table == "journal_selector_state":
+                # Its generation identity (columns 1 and 2) names the
+                # publication that installed the index, which every rebuild,
+                # replace publications included since #949, writes afresh.
+                rows = [(row[0], None, None, *row[3:]) for row in rows]
+            if table == "outcome_quarantine_bounds":
+                # #948: the meta row's `maxAdmittedAt` is the greatest `at`
+                # of ANY admitted record (spec 6.3's H), so it includes the
+                # ops each build's setup stamps with the wall clock before
+                # the compared part of the journal.
+                rows = [(scope, axis, json.dumps(
+                            {**json.loads(doc), "maxAdmittedAt": None},
+                            sort_keys=True))
+                        if (scope, axis) == ("*", "meta") else (scope, axis, doc)
+                        for scope, axis, doc in rows]
+            out[table] = sorted(rows, key=repr)
         return out
     finally:
         conn.close()

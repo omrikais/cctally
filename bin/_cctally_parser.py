@@ -3872,6 +3872,42 @@ def _build_codex_prune_drain_parser(subparsers, name, *, help_text, xref=None):
     )
     pd.set_defaults(func=c.cmd_codex_prune_drain_internal)
 
+def _build_quota_index_rebuild_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_quota-index-rebuild` parser (#977 C7)."""
+    c = _cctally()
+    qi = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: detached worker that rebuilds the
+                    journal's Codex quota natural-key index off the hook,
+                    with a bounded locked publication. Always returns 0;
+                    the outcome is written to hook-tick.log.
+                    """
+                ),
+    )
+    qi.set_defaults(func=c.cmd_quota_index_rebuild_internal)
+
+def _build_codex_inventory_bootstrap_parser(subparsers, name, *, help_text, xref=None):
+    """Build the `_codex-inventory-bootstrap` parser (#927 spec §4.2 B2)."""
+    c = _cctally()
+    ib = subparsers.add_parser(
+        name,
+        help=help_text,
+        formatter_class=CLIHelpFormatter,
+        description=textwrap.dedent(
+                    """\
+                    Internal subcommand: detached worker that backfills the
+                    Codex retained-identity inventory off the hook, one
+                    admitted chunk at a time. Always returns 0; the outcome
+                    is written to hook-tick.log.
+                    """
+                ),
+    )
+    ib.set_defaults(func=c.cmd_codex_inventory_bootstrap_internal)
+
 def _build_repair_symlinks_parser(subparsers, name, *, help_text, xref=None):
     """Build the `repair-symlinks` parser (registered via _REGISTRATION; #279 S6 W3).
 
@@ -3962,6 +3998,8 @@ _REGISTRATION = (
     _Reg('_artifact-retention', _build_artifact_retention_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-replay-drain', _build_codex_replay_drain_parser, argparse.SUPPRESS, None, None),
     _Reg('_codex-prune-drain', _build_codex_prune_drain_parser, argparse.SUPPRESS, None, None),
+    _Reg('_quota-index-rebuild', _build_quota_index_rebuild_parser, argparse.SUPPRESS, None, None),
+    _Reg('_codex-inventory-bootstrap', _build_codex_inventory_bootstrap_parser, argparse.SUPPRESS, None, None),
     _Reg('repair-symlinks', _build_repair_symlinks_parser, argparse.SUPPRESS, None, None),
 )
 

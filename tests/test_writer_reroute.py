@@ -859,8 +859,11 @@ def _seed_five_hour_index(path, *, window_key, account_key, rows, reset_at=None)
     """Build a minimal read-only stand-in for a published stats index.
 
     `_rematerialize_five_hour_high_water` opens its destination read-only and
-    touches exactly two tables, so a hand-built database exercises the real
-    query. Hand-built rows would be worthless in a test that then rebuilds —
+    touches exactly two tables (and the #943 boundary companion table, which a
+    store without it simply lacks: the credit then keeps its floored slot), so
+    a hand-built database exercises the real query. Since #943 the floor comes
+    from the shared resolver, which reads each credit's detection instant and
+    ends to verify its revision, so the stand-in carries those columns. Hand-built rows would be worthless in a test that then rebuilds —
     a rebuild reconstructs the index from the journal and would discard them —
     but nothing here rebuilds: the subject is the SQL this pass runs against an
     index that has already been published.
@@ -874,8 +877,10 @@ def _seed_five_hour_index(path, *, window_key, account_key, rows, reset_at=None)
             " account_key TEXT NOT NULL DEFAULT 'unattributed')")
         conn.execute(
             "CREATE TABLE five_hour_reset_events ("
-            " id INTEGER PRIMARY KEY, five_hour_window_key INTEGER, "
-            " account_key TEXT, effective_reset_at_utc TEXT)")
+            " id INTEGER PRIMARY KEY, detected_at_utc TEXT, "
+            " five_hour_window_key INTEGER, prior_percent REAL, "
+            " post_percent REAL, account_key TEXT, "
+            " effective_reset_at_utc TEXT)")
         for captured_at, pct in rows:
             conn.execute(
                 "INSERT INTO weekly_usage_snapshots "
@@ -885,8 +890,10 @@ def _seed_five_hour_index(path, *, window_key, account_key, rows, reset_at=None)
         if reset_at is not None:
             conn.execute(
                 "INSERT INTO five_hour_reset_events "
-                "(five_hour_window_key, account_key, effective_reset_at_utc) "
-                "VALUES (?, ?, ?)", (window_key, account_key, reset_at))
+                "(detected_at_utc, five_hour_window_key, prior_percent, "
+                " post_percent, account_key, effective_reset_at_utc) "
+                "VALUES (?, ?, 30.0, 5.0, ?, ?)",
+                (reset_at, window_key, account_key, reset_at))
         conn.commit()
     finally:
         conn.close()
@@ -2610,7 +2617,10 @@ def test_concurrency_storm_every_id_materialized_once(tmp_path):
 # ==========================================================================
 
 def _r5_credit_args(**over):
-    args = dict(to=30.0, from_pct=63.0, at="2026-01-04T09:02:00Z",
+    # `--at` is the first reading's own second: since #943 (O1) the credit takes
+    # effect at the exact `--at` second rather than its hour, and both seeded
+    # readings (09:00, 09:05) must stay inside the stale-replica band.
+    args = dict(to=30.0, from_pct=63.0, at="2026-01-04T09:00:00Z",
                 week="2026-01-01", dry_run=False, yes=True, json=False,
                 force=False)
     args.update(over)

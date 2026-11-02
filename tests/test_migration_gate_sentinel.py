@@ -64,8 +64,12 @@ def _seed_cache(db, tmp_path):
     return conn
 
 
-def test_cache_001_clears_marker(tmp_path):
-    db = _load_db()
+def test_cache_001_clears_marker(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    # 001 links and journals the seeded row through the journal leaf lock,
+    # which creates APP_DIR: pin every data path inside tmp_path (#1026).
+    redirect_paths(load_script(), monkeypatch, home)
+    db = _load_db()  # keeps _cctally_core, so the redirection holds
     conn = _seed_cache(db, tmp_path)
     conn.execute("INSERT INTO cache_meta(key, value) VALUES (?, ?)",
                  (MARKER, "2026-01-01T00:00:00+00:00"))
@@ -75,6 +79,11 @@ def test_cache_001_clears_marker(tmp_path):
     db._001_dedup_highest_wins(conn)  # runs its own BEGIN IMMEDIATE + commit
     assert conn.execute("SELECT 1 FROM cache_meta WHERE key=?", (MARKER,)).fetchone() is None
     assert conn.execute("SELECT 1 FROM session_entries LIMIT 1").fetchone() is None  # wiped too
+    # 001 exports the seeded unlinked row as a preserved-history decision; it
+    # must have journaled into the redirected data directory (#1026).
+    journal = home / ".local" / "share" / "cctally" / "journal"
+    segments = [p for p in journal.glob("*.jsonl") if p.stat().st_size > 0]
+    assert segments, f"no journal segment under the redirected {journal}"
 
 
 # --------------------------------------------------------------------------

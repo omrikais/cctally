@@ -4407,3 +4407,235 @@ def test_857_the_identity_is_bound_to_the_opened_file_and_joins_a_pinned_read(
         assert cache.in_transaction, "the identity ended the caller's pinned read"
     finally:
         cache.rollback()
+
+
+# --------------------------------------------------------------------------
+# #1015 spec 5.4: the calibration dependency rides the dispatch key
+# --------------------------------------------------------------------------
+# The forecast's calibrated fields and the rate-change array's supersession
+# label depend on the calibration sidecar and on the correction lineage
+# relations, none of which a dispatch-signature leg reads. Without the
+# `calibration_dependency` component a refit, a recorded attempt, a completed
+# correction batch or an explicit supersession left an open dashboard idling on
+# the forecast it had before (A12).
+_1015_EFFECTIVE = "2026-07-01T00:00:00+00:00"
+
+
+def _1015_store(tmp_path, monkeypatch):
+    import _lib_snapshot_cache as sc
+
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    sc.reset_dispatch_state()
+    ns["_cctally_tui"]._tui_reset_partial_retry_state()
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT INTO meter_rate_change_events "
+            "(provider, account_key, effective_from, previous_units_per_point,"
+            " new_units_per_point, severity, detected_at_utc, created_at_utc) "
+            "VALUES ('claude', 'unattributed', ?, 2.0, 1.0, 'alarm', "
+            "        '2026-07-15T00:00:00+00:00', '2026-07-15T00:00:00+00:00')",
+            (_1015_EFFECTIVE,))
+        stats.commit()
+    finally:
+        stats.close()
+    _1015_write_sidecar(units=1.0)
+    return ns
+
+
+def _1015_write_sidecar(*, units, attempt=None, in_place=False):
+    """The sidecar as `cctally quota` leaves it: an atomic replacement, or (an
+    attempt record) an in-place rewrite keeping the inode."""
+    import _cctally_quota_model as qmg
+
+    bucket = {"regimes": [{"unitsPerPoint": units,
+                           "effectiveFrom": "2026-06-01T00:00:00+00:00"}]}
+    if attempt is not None:
+        bucket["recalibrationAttempt"] = {
+            "status": attempt, "basis": ["batch-1"],
+            "asOf": "2026-07-16T00:00:00+00:00"}
+    payload = json.dumps({
+        "schemaVersion": qmg.CALIBRATION_STATE_SCHEMA_VERSION,
+        "accounts": {qmg.MERGED_STATE_KEY: bucket},
+    }, sort_keys=True)
+    path = pathlib.Path(qmg.calibration_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if in_place and path.exists():
+        path.write_text(payload, encoding="utf-8")
+        return
+    staged = path.with_name(path.name + ".tmp")
+    staged.write_text(payload, encoding="utf-8")
+    os.replace(staged, path)
+
+
+def _1015_seed_correction(ns):
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            ("obs-1", "acct-a", "2026-07-10T10:00:00+00:00"))
+        stats.execute(
+            "INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
+            ("op-1", "obs-1", "hold"))
+        stats.execute(
+            "INSERT INTO claude_weekly_correction_ops VALUES (?,?,?)",
+            ("op-1", "observations-2026-07.jsonl", 100))
+        stats.execute("INSERT INTO correction_batch_lineage VALUES (?,?,?)",
+                      ("batch-1", "observations-2026-07.jsonl", 200))
+        stats.execute(
+            "INSERT INTO correction_batch_footprint VALUES (?,?,?)",
+            ("batch-1", "claude", "acct-a"))
+        stats.commit()
+    finally:
+        stats.close()
+
+
+def _1015_seed_supersession(ns):
+    stats = ns["open_db"]()
+    try:
+        stats.execute(
+            "INSERT INTO meter_rate_change_supersessions VALUES "
+            "(?,?,?,?,?,?,?)",
+            ("claude", "unattributed", _1015_EFFECTIVE, "reviewed-correction",
+             '[{"observations":1,"opId":"op-9"}]',
+             "2026-07-16T00:00:00+00:00", "2026-07-16T00:00:00+00:00"))
+        stats.commit()
+    finally:
+        stats.close()
+
+
+def _1015_signature(ns):
+    stats = ns["open_db"]()
+    try:
+        return ns["_cctally_tui"]._tui_compute_dispatch_signature(stats)
+    finally:
+        stats.close()
+
+
+_1015_INVALIDATIONS = (
+    # (id, mutate, every dispatch-signature leg unchanged, expected label)
+    ("sidecar-refit",
+     lambda ns: _1015_write_sidecar(units=1.4), True, None),
+    ("attempt-status",
+     lambda ns: _1015_write_sidecar(
+         units=1.0, attempt="insufficient-history", in_place=True), True, None),
+    ("completed-correction-batch", _1015_seed_correction, True, None),
+    ("supersession-row", _1015_seed_supersession, False,
+     "2026-07-16T00:00:00+00:00"),
+)
+
+
+@pytest.mark.parametrize(
+    "case_id,mutate,signature_unchanged,superseded_at",
+    _1015_INVALIDATIONS, ids=[case[0] for case in _1015_INVALIDATIONS])
+def test_1015_a_calibration_dependency_change_leaves_the_idle_path(
+    tmp_path, monkeypatch, case_id, mutate, signature_unchanged, superseded_at,
+):
+    """Detects an open dashboard that keeps a forecast calibrated from a fit a
+    correction tainted (or keeps refusing after the refit), and a rate-change
+    row that never gains its "superseded by a correction" label."""
+    import _lib_snapshot_cache as sc
+
+    ns = _1015_store(tmp_path, monkeypatch)
+    tui = ns["_cctally_tui"]
+    try:
+        first = _857_tick(ns, _857_AFTER)
+        assert [row.get("supersession") for row in first.meter_rate_changes] == [
+            None], "precondition: the published row is not superseded"
+        calls = _857_spy(monkeypatch, tui)
+        _857_tick(ns, _857_AFTER + _857_TICK)
+        assert calls["forecast"] == 0, "precondition: an unchanged tick idles"
+
+        before = _1015_signature(ns)
+        mutate(ns)
+        if signature_unchanged:
+            assert _1015_signature(ns) == before, (
+                "non-vacuity: no dispatch-signature leg may see this change")
+        rebuilt = _857_tick(ns, _857_AFTER + _857_TICK * 2)
+        assert calls["forecast"] == 1, (
+            f"{case_id}: the dashboard kept the idle forecast")
+        if case_id == "completed-correction-batch":
+            assert rebuilt.meter_rate_changes[0].get("supersession") == {
+                "reason": "reviewed-correction", "superseded_at": None,
+                "corrections": ["op-1"]}
+        elif superseded_at is not None:
+            assert (rebuilt.meter_rate_changes[0].get("supersession")
+                    or {}).get("superseded_at") == superseded_at
+        _857_tick(ns, _857_AFTER + _857_TICK * 3)
+        assert calls["forecast"] == 1, "the new key must settle and idle"
+    finally:
+        sc.reset_dispatch_state()
+        tui._tui_reset_partial_retry_state()
+
+
+_1015_LINEAGE_TABLES = (
+    "CORRECTION_BATCH_LINEAGE",
+    "CORRECTION_BATCH_FOOTPRINT",
+    "CLAUDE_WEEKLY_CORRECTION_HISTORY",
+    "CLAUDE_WEEKLY_CORRECTION_OPS",
+    "CLAUDE_WEEKLY_OBSERVATION_INDEX",
+    "METER_RATE_CHANGE_SUPERSESSIONS",
+)
+
+
+def test_1015_an_unchanged_settled_tick_scans_no_lineage_relation(
+    tmp_path, monkeypatch,
+):
+    """Detects an idle dashboard that pays a correction or supersession scan
+    (or a second stats connection) on every tick: an unchanged, settled stats
+    file serves both digests from the memo, and the sidecar leg is a stat."""
+    import importlib
+    import _lib_snapshot_cache as sc
+
+    kernel = importlib.import_module("_lib_dashboard_sources")
+    monkeypatch.setattr(kernel, "_STATS_RELATIONS_DIGEST_MEMO", {})
+    monkeypatch.setattr(
+        kernel, "_stats_memo_now", lambda: time.time() + 3600.0)
+    ns = _1015_store(tmp_path, monkeypatch)
+    _1015_seed_correction(ns)
+    _1015_seed_supersession(ns)
+    tui = ns["_cctally_tui"]
+    store = sys.modules["_cctally_store"]
+    real_open = tui.open_db
+    real_failfast = store.stats_open_readonly_failfast
+    opened = {"stats": 0, "failfast": 0}
+    statements: list = []
+
+    def traced_open(*args, **kwargs):
+        opened["stats"] += 1
+        conn = real_open(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    def counted_failfast(*args, **kwargs):
+        opened["failfast"] += 1
+        return real_failfast(*args, **kwargs)
+
+    def lineage_reads():
+        return [s for s in statements
+                if any(table in s.upper() for table in _1015_LINEAGE_TABLES)]
+
+    try:
+        _857_tick(ns, _857_AFTER)
+        _857_tick(ns, _857_AFTER + _857_TICK)
+        calls = _857_spy(monkeypatch, tui)
+        monkeypatch.setattr(tui, "open_db", traced_open)
+        monkeypatch.setattr(store, "stats_open_readonly_failfast",
+                            counted_failfast)
+        _857_tick(ns, _857_AFTER + _857_TICK * 2)
+        assert calls["forecast"] == 0, "precondition: the tick idled"
+        assert statements, "non-vacuity: the trace saw the tick's reads"
+        assert lineage_reads() == [], lineage_reads()
+        assert opened == {"stats": 1, "failfast": 0}, opened
+
+        # Non-vacuity: a cold memo reads the relations on the same handle.
+        monkeypatch.setattr(kernel, "_STATS_RELATIONS_DIGEST_MEMO", {})
+        statements.clear()
+        _857_tick(ns, _857_AFTER + _857_TICK * 3)
+        assert calls["forecast"] == 0, "a cold memo is not a dispatch change"
+        assert lineage_reads(), "the trace must see the cold digest reads"
+    finally:
+        sc.reset_dispatch_state()
+        tui._tui_reset_partial_retry_state()

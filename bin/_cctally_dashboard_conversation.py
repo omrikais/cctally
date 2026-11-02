@@ -46,6 +46,8 @@ import base64
 import collections
 import dataclasses
 import hashlib
+import os
+import pathlib
 import secrets
 import select
 import threading
@@ -444,17 +446,86 @@ def _cached_file_sigs(conn, paths):
     return out
 
 
-#: The cursor columns a Codex live-tail signature is computed from (#968 5.9).
+#: The cursor columns a Codex live-tail signature is computed from (#968 5.9;
+#: #970 appends ``container_path``, the accepted location).
 _CODEX_WATCH_SIG_COLUMNS = (
     "path, size_bytes, container_kind, container_size_bytes, mtime_ns, "
-    "device_id, inode, pending_container_fingerprint")
+    "device_id, inode, pending_container_fingerprint, container_path")
 
 
 def _codex_watch_kernel():
     return sys.modules["cctally"]._load_sibling("_lib_codex_conversation_watch")
 
 
-def _codex_acknowledged_sig(row):
+def _codex_watch_locations():
+    """The configured Codex container locations (#970), for one batch."""
+    return tuple(_rc.CodexLocations(root.walk_root, root.archive_root)
+                 for root in _codex_provider_roots())
+
+
+def _codex_lazy_locations():
+    """A memoized locations getter: resolved on first need, at most once.
+
+    A home without archived containers never needs it, so its signatures
+    cost exactly what they cost before #970.
+    """
+    memo: list = []
+
+    def get():
+        if not memo:
+            memo.append(_codex_watch_locations())
+        return memo[0]
+
+    return get
+
+
+def _codex_sig_location(container_path, logical, locations) -> str:
+    """The location a stored container path names (#970 A8).
+
+    NULL is the logical path (dated). A container whose directory is the
+    rollout's archive directory — canonically, when the spellings differ —
+    is ``"archive"``; anything else (the dated twin, an uncontained stored
+    path) is ``"dated"``. This is exactly how selection names a location, so
+    a committed signature equals the observation of the same container.
+    """
+    if not container_path:
+        return _rc.DATED
+    parent = pathlib.Path(container_path).parent
+    if parent == pathlib.Path(logical).parent:
+        return _rc.DATED
+    archive_dir = _rc.archive_dir_for(logical, locations())
+    if archive_dir is None:
+        return _rc.DATED
+    if parent == archive_dir:
+        return _rc.ARCHIVE
+    try:
+        same = os.path.realpath(parent) == os.path.realpath(archive_dir)
+    except (OSError, ValueError):
+        return _rc.DATED
+    return _rc.ARCHIVE if same else _rc.DATED
+
+
+def _codex_observe_watch_sig(path, locations=None):
+    """The live probe: the selected container's signature, archive included.
+
+    The dated containers are tried first through the leaf alone, so a dated
+    rollout costs exactly today's probe; only when neither exists, and the
+    path is a dated rollout of a native home, are its archive candidates
+    observed (#970 A8), the signature then carrying ``"archive"``.
+    """
+    sig = _rc.observe_watch_sig(path)
+    if sig is not None:
+        return sig
+    if _rc.archive_name_date(pathlib.Path(str(path)).name) is None:
+        return None
+    archive_dir = _rc.archive_dir_for(
+        path, (locations or _codex_watch_locations)())
+    if archive_dir is None:
+        return None
+    return _rc.observe_watch_sig(path, archive_dir=archive_dir)
+
+
+def _codex_acknowledged_sig(row, locations=None):
     """The live-tail signature one ``codex_conversation_source_files`` row
     acknowledges (#968 spec 5.9).
 
@@ -463,15 +534,20 @@ def _codex_acknowledged_sig(row):
     it, and rescheduling it on every poll is the non-convergence I9 forbids.
     Otherwise the accepted container's signature: ``("plain", size)`` for
     plain, which is today's committed size, or the container identity for a
-    zstd container.
+    zstd container. #970: either carries the container's location exactly as
+    the observation does (``"archive"`` appended only outside the dated
+    location), derived from the recorded container path.
     """
-    _path, size, kind, csize, mtime_ns, device, inode, pending = row
+    path, size, kind, csize, mtime_ns, device, inode, pending, stored = row
+    locations = locations or _codex_lazy_locations()
     if pending:
         fingerprint = _rc.ContainerFingerprint.from_json(pending)
         if fingerprint is not None:
-            return fingerprint.watch_sig()
+            return fingerprint.watch_sig(
+                _codex_sig_location(fingerprint.path, path, locations))
     return _codex_watch_kernel().committed_watch_sig(
-        kind, size, csize, mtime_ns, device, inode)
+        kind, size, csize, mtime_ns, device, inode,
+        location=_codex_sig_location(stored, path, locations))
 
 
 def _codex_cached_file_sigs(conn, paths):
@@ -494,8 +570,9 @@ def _codex_cached_file_sigs(conn, paths):
             f"WHERE path IN ({placeholders})", list(paths)).fetchall()
     except sqlite3.OperationalError:
         return out
+    locations = _codex_lazy_locations()
     for row in rows:
-        out[row[0]] = _codex_acknowledged_sig(row)
+        out[row[0]] = _codex_acknowledged_sig(row, locations)
     return out
 
 
@@ -511,7 +588,8 @@ def _codex_all_committed_sizes(conn):
             "FROM codex_conversation_source_files").fetchall()
     except sqlite3.OperationalError:
         return {}
-    return {row[0]: _codex_acknowledged_sig(row) for row in rows}
+    locations = _codex_lazy_locations()
+    return {row[0]: _codex_acknowledged_sig(row, locations) for row in rows}
 
 
 def _codex_seal_token(conn):
@@ -586,6 +664,9 @@ def _codex_watch_probes(conn):
     deferred: dict = {}     # path -> (pre-ingest signature, seal token)
     accounting_wait: dict = {}  # path -> observed container awaiting accounting
     rearmed: set = set()
+    # #970: resolved once per stream, and only when an archived container
+    # is actually met.
+    locations = _codex_lazy_locations()
 
     def accounting_accepted(path, sig):
         try:
@@ -595,7 +676,8 @@ def _codex_watch_probes(conn):
                 "WHERE path=? AND container_state='accepted'", (path,)).fetchone()
         except sqlite3.Error:
             return False
-        return row is not None and _codex_acknowledged_sig(row) == sig
+        return (row is not None
+                and _codex_acknowledged_sig(row, locations) == sig)
 
     def executor_owns_observations(paths):
         # Publication-unit planning can encounter the same pending container
@@ -620,12 +702,13 @@ def _codex_watch_probes(conn):
             before = observed.get(path)
             if (fingerprint is None or before is None
                     or before[0] != _rc.ZSTD
-                    or fingerprint.watch_sig() != before):
+                    or fingerprint.watch_sig(_codex_sig_location(
+                        fingerprint.path, path, locations)) != before):
                 return False
         return True
 
     def stat_fn(path):
-        sig = _rc.observe_watch_sig(path)
+        sig = _codex_observe_watch_sig(path, locations)
         observed[path] = sig
         waiting = accounting_wait.get(path)
         if waiting is not None:
@@ -741,11 +824,13 @@ def _codex_classified_paths(conn, paths):
 
 
 def _codex_walk_root_for_conversation(conn, conversation_key):
-    """The configured ``walk_root`` of the conversation's OWN provider root (the
-    frontier's scope — §5.4). Resolves the conversation's ``source_root_key`` via
-    its thread facts, then matches it to a currently-configured provider root.
-    ``None`` when the conversation has no thread row or its root is no longer
-    configured (the frontier is then skipped — DB re-resolve alone still runs)."""
+    """The container locations of the conversation's OWN provider root (the
+    frontier's scope — §5.4): its configured ``walk_root`` and, for a native
+    home, its ``archive_root`` (#970), as ``_rc.CodexLocations``. Resolves the
+    conversation's ``source_root_key`` via its thread facts, then matches it to
+    a currently-configured provider root. ``None`` when the conversation has no
+    thread row or its root is no longer configured (the frontier is then
+    skipped — DB re-resolve alone still runs)."""
     cq = _conversation_query_impl_codex()
     thread = cq._thread_facts(conn, conversation_key)
     if thread is None:
@@ -753,7 +838,7 @@ def _codex_walk_root_for_conversation(conn, conversation_key):
     source_root_key = thread[3]
     for root in _codex_provider_roots():
         if root.source_root_key == source_root_key:
-            return str(root.walk_root)
+            return _rc.CodexLocations(root.walk_root, root.archive_root)
     return None
 
 
@@ -1748,11 +1833,12 @@ def _make_codex_discovery_step(handler, conn, conversation_key, cq_codex):
     frontier is then skipped — the DB re-resolve of layer 1 still runs). The
     frontier is constructed ONCE per SSE connection so its directory index,
     pending-candidate set, and rotation cursors accumulate across cycles."""
-    walk_root = _codex_walk_root_for_conversation(conn, conversation_key)
-    if walk_root is None:
+    locations = _codex_walk_root_for_conversation(conn, conversation_key)
+    if locations is None:
         return None
     fw = sys.modules["cctally"]._load_sibling("_lib_codex_conversation_watch")
-    frontier = fw.CodexChildFrontier(walk_root)
+    frontier = fw.CodexChildFrontier(
+        str(locations.walk_root), archive_root=locations.archive_root)
 
     def _discovery(files, seen):
         # Diff brand-new *.jsonl against every tracked Codex file; the same

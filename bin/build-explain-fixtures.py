@@ -181,8 +181,11 @@ ORACLE_CONVERSATION_NORMALIZE_BUDGET_ROWS = 2_000
 
 # A model that IS priced and publishes NO context window. Every Claude id
 # carrying `sonnet`, `opus` or `haiku` resolves to 200,000 through the family
-# default, so an unknown capacity needs an id outside those families.
-CAPACITY_LESS_MODEL = "claude-fable-5"
+# default, so an unknown capacity needs an id outside those families — and
+# outside the statusline's verified registry, which since #1002 gives
+# `claude-fable-5` its 1,000,000-token window. Mythos Preview has no
+# published window and no registry entry.
+CAPACITY_LESS_MODEL = "claude-mythos-preview"
 if CAPACITY_LESS_MODEL not in CLAUDE_MODEL_PRICING:
     raise SystemExit(
         f"{CAPACITY_LESS_MODEL} is no longer priced; the unknown-context-window "
@@ -2279,11 +2282,11 @@ def _control_s3_zero_match() -> Seed:
 def _unknown_context_window() -> Seed:
     """One short conversation whose only request publishes no context window.
 
-    The class still MEASURES, because two other conversations are evaluable —
-    which is what makes this a rendered `unknown_context_window` gap and a
-    fallen `evaluabilityCoverage` rather than a withheld class. A conversation
-    with no known capacity for any reply is never guessed at and never
-    silently treated as small.
+    The class still MEASURES, because the eight other conversations are
+    evaluable — which is what makes this a rendered `unknown_context_window`
+    gap and a fallen `evaluabilityCoverage` rather than a withheld class. A
+    conversation with no known capacity for any reply is never guessed at and
+    never silently treated as small.
     """
     seed = Seed()
     # Eight evaluable conversations, so the class clears `min_priced_entries`

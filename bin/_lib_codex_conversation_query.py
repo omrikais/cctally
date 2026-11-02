@@ -5116,11 +5116,40 @@ class _CodexPayloadContainmentError(RuntimeError):
     """Internal 404 signal: the selected physical container escaped its root."""
 
 
-def _select_codex_payload_container(logical):
+def _codex_payload_archive_dir(logical, root_path):
+    """The archive directory holding ``logical``'s archive containers (#970).
+
+    Only a row whose stored provider root is a native home, and whose logical
+    path is dated under that home's ``sessions/``, has one. The root is the
+    stored canonical path, so the logical path is compared canonically too
+    when its own spelling differs (only its directory is resolved: the
+    rollout itself may be gone).
+    """
+    if not root_path:
+        return None
+    locations = _rc.home_locations(root_path)
+    if locations is None or locations.archive_root is None:
+        return None
+    found = _rc.archive_dir_for(logical, (locations,))
+    if found is not None:
+        return found
+    try:
+        canonical = os.path.join(
+            os.path.realpath(os.path.dirname(os.fspath(logical))),
+            os.path.basename(os.fspath(logical)))
+    except (OSError, ValueError):
+        return None
+    return _rc.archive_dir_for(canonical, (locations,))
+
+
+def _select_codex_payload_container(logical, *, archive_dir=None):
     # The discovery leaf deliberately treats stat failures as absent. A payload
     # request must distinguish a missing container (410) from inaccessible data
     # (500), including an inaccessible plain file beside a readable zstd twin.
-    for candidate in (logical, _rc.zstd_twin(logical)):
+    # #970: the archive candidates follow in the leaf's selection order, with
+    # the same strictness (an unreadable archive is 500, never gone).
+    for _kind, _location, candidate in _rc.container_candidates(
+            logical, archive_dir=archive_dir):
         try:
             info = os.stat(candidate)
         except (FileNotFoundError, NotADirectoryError):
@@ -5129,10 +5158,10 @@ def _select_codex_payload_container(logical):
             raise CodexContainerReadError("read-error", str(logical)) from exc
         if not stat.S_ISREG(info.st_mode):
             raise CodexContainerReadError("read-error", str(logical))
-        selected = _rc.select_container(logical)
+        selected = _rc.select_container(logical, archive_dir=archive_dir)
         if selected is not None:
             return selected
-        # It disappeared between the strict stat and selection; try the twin.
+        # It disappeared between the strict stat and selection; try the next.
     return None
 
 
@@ -5152,20 +5181,26 @@ def _reread_codex_full_content(conn: sqlite3.Connection, row, *, streams: "dict 
 
     #968: select plain first, else zstd, and seek in decoded offsets. Streams are
     request-local and reusable; no decoded copies persist. Present unreadable
-    containers raise CodexContainerReadError, never a false gone result."""
+    containers raise CodexContainerReadError, never a false gone result.
+    #970: then the archive containers of a native home's dated rollout, the
+    archive directory derived from the row's stored provider root; the
+    provider-root containment and the reselect-on-``OSError`` retry cover an
+    archive move exactly as they cover a compression."""
     stored = conn.execute(
         "SELECT payload_json FROM codex_conversation_events "
         "WHERE source_path = ? AND line_offset = ?",
         (row.source_path, row.line_offset)).fetchone()
     if stored is None:
         return None
+    root_path = _codex_source_root_path(conn, row.source_root_key)
+    archive_dir = _codex_payload_archive_dir(row.source_path, root_path)
     for attempt in range(2):
-        selected = _select_codex_payload_container(row.source_path)
+        selected = _select_codex_payload_container(
+            row.source_path, archive_dir=archive_dir)
         if selected is None:
             return None
         # Validate exactly the descriptor we open, including after a compression
         # race. The caller has already checked the logical path and known root.
-        root_path = _codex_source_root_path(conn, row.source_root_key)
         if not _within_root(str(selected.path), root_path):
             raise _CodexPayloadContainmentError()
         try:
@@ -5184,11 +5219,12 @@ def _reread_codex_full_content(conn: sqlite3.Connection, row, *, streams: "dict 
         except OSError as exc:
             # ContainerError subclasses OSError; preserve its approved leaf
             # category instead of flattening decoder/integrity errors.
-            replacement = _select_codex_payload_container(row.source_path)
+            replacement = _select_codex_payload_container(
+                row.source_path, archive_dir=archive_dir)
             if replacement is None:
                 return None
             if replacement.path != selected.path and attempt == 0:
-                continue  # plain vanished during Codex's compression window
+                continue  # moved during Codex's compression or archive window
             category = exc.category if isinstance(exc, _rc.ContainerError) else "read-error"
             raise CodexContainerReadError(category, str(row.source_path)) from exc
     try:

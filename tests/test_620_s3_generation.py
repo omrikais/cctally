@@ -227,14 +227,17 @@ def test_pairing_precomputed_component_digests_is_byte_identical():
 
 def test_conversations_opens_read_only_and_never_attaches_cache(
         conversation_store):
-    conn = _sources().open_read_only("conversations")
+    # #1000: conversations opens only under the bundle's read admission.
+    scope = _scope()
+    bundle = _sources().StoreBundle(scope, _visible_plan())
     try:
+        conn = bundle.connection("conversations")
         dbs = [row[1] for row in conn.execute("PRAGMA database_list")]
         assert dbs == ["main"]
         with pytest.raises(sqlite3.OperationalError):
             conn.execute("CREATE TABLE t (x)")
     finally:
-        conn.close()
+        bundle.close()
 
 
 def test_a_denied_plan_never_opens_the_conversations_store(tmp_path,
@@ -252,6 +255,11 @@ def test_a_denied_plan_never_opens_the_conversations_store(tmp_path,
     monkeypatch.setattr(
         sources, "open_read_only",
         lambda kind: (opened.append(kind), real_open(kind))[1])
+    real_conversations = sources.StoreBundle._open_conversations
+    monkeypatch.setattr(
+        sources.StoreBundle, "_open_conversations",
+        lambda self: (opened.append("conversations"),
+                      real_conversations(self))[1])
     bundle = sources.StoreBundle(scope, denied)
     try:
         sources._establish(scope, bundle)

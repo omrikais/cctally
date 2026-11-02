@@ -29,6 +29,7 @@ import pathlib
 import sys
 import time
 
+import _lib_oauth_samples as samples_lib
 import _outcome_quarantine_trace as T
 
 UTC = dt.timezone.utc
@@ -42,6 +43,7 @@ FIVE_END = "2026-10-22T12:00:00Z"
 
 def epoch(text: str) -> int:
     return T.epoch(text)
+
 
 
 def iso(value: int) -> str:
@@ -86,9 +88,14 @@ class Session:
 
 
 class Trace:
-    """One scenario's store, clock and inspectors."""
+    """One scenario's store, clock and inspectors.
 
-    def __init__(self, monkeypatch, tmp_path, *, account="A"):
+    ``week_resets_at`` (#1019) places the scenarios' weekly window: the
+    epoch every render and OAuth reading advertises unless a step names its
+    own ``week_end``."""
+
+    def __init__(self, monkeypatch, tmp_path, *, account="A",
+                 week_resets_at: int = epoch(WEEK_END)):
         self.mp = monkeypatch
         self.root = tmp_path
         self.app = T.make_app(monkeypatch, tmp_path)
@@ -99,10 +106,16 @@ class Trace:
         # scenario's explicit steps.
         monkeypatch.setattr(self.sl, "_statusline_oauth_tick", lambda *a, **k: None)
         self.account_name = account
-        for name in ("A", "B", "unattributed"):
+        self.week_end = iso(int(week_resets_at))
+        for name in dict.fromkeys(("A", "B", "unattributed", account)):
             T.retain_session_input(self.app, name)
         self.account = T.identity(account)
         self.log: list = []
+        # The unpatched request-start clock, restored for a reading without
+        # an exact ``requested_at``.
+        self._request_started = sys.modules["_cctally_refresh"]._oauth_request_started_now
+        #: Each published below-baseline reduction's route (`track_routes`).
+        self.routes: list = []
 
     # --- steps ---------------------------------------------------------------
 
@@ -119,10 +132,11 @@ class Trace:
         return Session(self.root, name)
 
     def render(self, session: Session, percent: float, *, at: str,
-               week_end: str = WEEK_END, five: "float | None" = None,
+               week_end: "str | None" = None, five: "float | None" = None,
                five_end: str = FIVE_END) -> None:
         """One real status-line render of ``session`` reporting ``percent``
         (and the five-hour ``five`` when given)."""
+        week_end = self.week_end if week_end is None else week_end
         self.clock(at)
         T.identity(self.account_name)
         limits = {"seven_day": {"used_percentage": percent, "resets_at": week_end}}
@@ -139,13 +153,30 @@ class Trace:
                          None if five is None else float(five), at))
 
     def oauth(self, weekly: float, *, at: str, lead: int = 2,
-              week_end: str = WEEK_END, five: "float | None" = None,
-              five_end: str = FIVE_END) -> str:
+              week_end: "str | None" = None, five: "float | None" = None,
+              five_end: str = FIVE_END, requested_at: "str | None" = None) -> str:
         """One real forced OAuth refresh whose request starts ``lead`` seconds
         before its response is captured at ``at``; returns its ``q``. The
-        response carries a five-hour window only when ``five`` is given."""
+        response carries a five-hour window only when ``five`` is given.
+
+        ``requested_at`` (#1019) is an exact request instant, fractional
+        digits kept, in place of ``lead``: ``q`` is then that instant, and
+        the request's clock is its whole second."""
+        week_end = self.week_end if week_end is None else week_end
         T.identity(self.account_name)
         captured = epoch(at)
+        refresh = sys.modules["_cctally_refresh"]
+        if requested_at is not None:
+            exact = samples_lib.canonical_instant(requested_at)
+            assert exact is not None, requested_at
+            whole = int(dt.datetime.fromisoformat(
+                exact.replace("Z", "+00:00")).timestamp())
+            assert whole <= captured, (requested_at, at)
+            lead = captured - whole
+            self.mp.setattr(refresh, "_oauth_request_started_now", lambda _c: exact)
+        else:
+            self.mp.setattr(refresh, "_oauth_request_started_now",
+                            self._request_started)
         T.set_clock(self.mp, iso(captured - lead))
         response = {"seven_day": {"utilization": weekly, "resets_at": week_end}}
         if five is not None:
@@ -159,6 +190,8 @@ class Trace:
         result = self.app._refresh_usage_inproc()
         assert result.status == "ok", result
         self.log.append(("oauth", float(weekly), five, at))
+        if requested_at is not None:
+            return exact
         return dt.datetime.fromtimestamp(captured - lead, UTC).strftime(
             "%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -172,6 +205,62 @@ class Trace:
         args = self.app.build_parser().parse_args(argv)
         assert args.func(args) == 0
         self.log.append(("manual", float(to), at))
+
+    def track_routes(self) -> None:
+        """Record the route of every published drop (#1019): each frozen
+        publication plan whose weekly or five-hour value lies below the
+        same window's baseline is named ``unanimous`` (every pending
+        contributor satisfied), ``deadline`` (the expired retained low
+        despite unsatisfied contributors) or ``hold`` (`_hold_pending`, no
+        live candidate on the axis), as ``(instant, axis, percent, route)``
+        in `routes`."""
+        lib = sys.modules["_lib_statusline_candidates"]
+        real_axis, real_hold, real_plan = (
+            lib._reduce_axis, lib._hold_pending, self.sl._bound_publication_plan)
+        held: list = []
+        decided: dict = {}
+
+        def hold(*args, **kwargs):
+            decision = real_hold(*args, **kwargs)
+            held.append(decision)
+            return decision
+
+        def axis(name, candidates, db_axis, pending, tombstone, now_epoch, **kwargs):
+            held.clear()
+            decision = real_axis(name, candidates, db_axis, pending, tombstone,
+                                 now_epoch, **kwargs)
+            value = decision.candidate
+            if (decision.action == "PUBLISH_DB" and value is not None
+                    and db_axis is not None
+                    and value.canonical_key == db_axis.canonical_key
+                    and value.percent < db_axis.percent):
+                if any(h is decision for h in held):
+                    route = "hold"
+                elif (decision.pending is not None and decision.pending.contributors
+                      and all(c.satisfied
+                              for c in decision.pending.contributors.values())):
+                    route = "unanimous"
+                else:
+                    route = "deadline"
+                decided.setdefault((int(now_epoch), name, float(value.percent)), route)
+            return decision
+
+        def plan(decision, projection, candidates, binding, **kwargs):
+            frozen = real_plan(decision, projection, candidates, binding, **kwargs)
+            if frozen is not None:
+                at_ = int(kwargs["now_epoch"])
+                for name in ("sevenDay", "fiveHour"):
+                    value = frozen.get(name)
+                    route = None if value is None else decided.get(
+                        (at_, name, float(value["percent"])))
+                    if route is not None:
+                        self.routes.append((iso(at_), name, float(value["percent"]),
+                                            route))
+            return frozen
+
+        self.mp.setattr(lib, "_hold_pending", hold)
+        self.mp.setattr(lib, "_reduce_axis", axis)
+        self.mp.setattr(self.sl, "_bound_publication_plan", plan)
 
     # --- inspectors ------------------------------------------------------------
 
@@ -262,6 +351,14 @@ class Trace:
             "SELECT week_start_date, percent_threshold FROM percent_milestones "
             "WHERE account_key = ? ORDER BY id", (account or self.account,))
 
+    def milestone_rows(self, account=None) -> list:
+        """The account's weekly milestones with their segment and cost:
+        (threshold, reset event id, cumulative cost), in order."""
+        return self._rows(
+            "SELECT percent_threshold, reset_event_id, cumulative_cost_usd "
+            "FROM percent_milestones WHERE account_key = ? ORDER BY id",
+            (account or self.account,))
+
     def resets(self, account=None) -> list:
         """Every weekly credit of the account: (old end, new end, pre-credit %)."""
         return self._rows(
@@ -331,23 +428,29 @@ def _mutate(monkeypatch, name: str) -> None:
     import dataclasses
 
     if name == "domination-alone":
-        # Refusal on proof alone, without a receipt.
+        # Refusal on proof alone, without a receipt (the drop facts, #1019,
+        # are kept as the real glue computes them).
+        real_facts = sl._stale_member_facts
+
         def facts(stale, receipts, candidates):
             if stale is None:
                 return None
-            out = {}
+            out = {axis: dict(f) for axis, f in
+                   (real_facts(stale, receipts, candidates) or {}).items()}
             for axis, window, samples, _credits, _supports in sl._stale_axes(stale):
                 if window is None:
                     continue
                 members = [m for m in sl._axis_members(candidates, axis)
                            if m.sigma.window == window]
-                refused = {m.sigma.token: sp.MemberFacts(True, p.observation_id, False)
-                           for m in members
-                           if (p := sp.proven_stale(m.sigma, samples,
-                                                    after_utc=m.sigma.activity_at_utc))}
-                if refused:
-                    out[axis] = refused
-            return out or None
+                for m in members:
+                    p = sp.proven_stale(m.sigma, samples,
+                                        after_utc=m.sigma.activity_at_utc)
+                    if p is not None:
+                        merged = out.setdefault(axis, {})
+                        merged[m.sigma.token] = dataclasses.replace(
+                            merged.get(m.sigma.token, sp.ALL_ELIGIBLE), refused=True,
+                            proof_observation_id=p.observation_id, receipt_valid=False)
+            return {a: f for a, f in out.items() if f} or None
         monkeypatch.setattr(sl, "_stale_member_facts", facts)
     elif name == "numerical-domination":
         # A receipt earned because another value dominates the member.
@@ -422,6 +525,83 @@ def _mutate(monkeypatch, name: str) -> None:
             return dataclasses.replace(stale, samples=stale.samples + extra,
                                        five_samples=stale.five_samples + five_extra)
         monkeypatch.setattr(sl, "_read_stale_inputs", read)
+    elif name in ("drop-bound-ignored", "drop-no-tolerance"):
+        # #1019: a higher sample proves a low regardless of request order
+        # (`drop-bound-ignored`), or any higher sample does, without the
+        # 1 pp tolerance (`drop-no-tolerance`).
+        def low(bound_utc, samples, *, axis, window, percent,
+                advertised_reset_epoch=None):
+            if axis not in sp.AXES or sp._interval(bound_utc) is None:
+                return None
+            reset = int(window) if advertised_reset_epoch is None else int(
+                advertised_reset_epoch)
+            margin = 0.0 if name == "drop-no-tolerance" else sp.TOLERANCE_PP
+            return sp._latest([
+                s for s in sp._axis_window(samples, axis, window)
+                if sp._axis_value(s, axis) > float(percent) + margin
+                and (name == "drop-bound-ignored"
+                     or sp.after(s.requested_at_utc, bound_utc))
+                and sp._before_epoch(s.captured_at_utc, reset)])
+        monkeypatch.setattr(sp, "proven_stale_low", low)
+        if name == "drop-bound-ignored":
+            # ...and the partition reads every sample of the window, not
+            # only those requested after its earliest bound.
+            real_scope = sl._stale_scope
+
+            def scope(account_key, candidates, transition):
+                _after, receipts_held, work = real_scope(account_key, candidates,
+                                                         transition)
+                return sl._EVERY_SAMPLE, receipts_held, work
+            monkeypatch.setattr(sl, "_stale_scope", scope)
+    elif name == "drop-received-at-as-sigma":
+        # #1019: the received_at fallback treated as a known t_m, so a
+        # member without supported activity enters the sigma-based (rise
+        # refusal and receipt) paths.
+        real_members = sl._axis_members
+
+        def members(candidates, axis):
+            out = list(real_members(candidates, axis))
+            have = {m.sigma.token for m in out}
+            revision = sorted(sp.SUPPORTED_REVISIONS)[0]
+            for candidate in candidates:
+                value = sl._candidates._candidate_axis(candidate, axis)
+                if value is None or candidate.token in have:
+                    continue
+                window = sl._member_window(value, axis)
+                bound = sp.drop_bound(candidate.token, None, int(candidate.received_at),
+                                      axis=axis, percent=value.percent, window=window)
+                out.append(sp.Member(sp.SampleIdentity(
+                    candidate.token, bound, axis, float(value.percent), window,
+                    *revision), int(value.raw_resets_at)))
+            return out
+        monkeypatch.setattr(sl, "_axis_members", members)
+    elif name == "samples-cross-account":
+        # #1019 (A3): the provider-sample read ignores the account, so
+        # another account's samples of the same window decide this
+        # account's members (both axes, both refusals).
+        import _cctally_oauth_samples as projection
+        import sqlite3
+        real_read = projection.read_samples
+
+        def read_any(conn, *, account_key, **kwargs):
+            try:
+                keys = [row[0] for row in conn.execute(
+                    "SELECT DISTINCT account_key FROM claude_oauth_samples")]
+            except sqlite3.Error:
+                keys = []
+            merged = {}
+            for key in dict.fromkeys([account_key, *keys]):
+                for s in real_read(conn, account_key=key, **kwargs):
+                    merged.setdefault(s.observation_id,
+                                      dataclasses.replace(s, account_key=account_key))
+            return tuple(sorted(merged.values(),
+                                key=lambda s: (s.requested_at_utc, s.observation_id)))
+        monkeypatch.setattr(projection, "read_samples", read_any)
+    elif name == "drop-refused-may-rise":
+        # #1019 (P-R2): a drop-refused member stays rise-eligible.
+        lib = sys.modules["_lib_statusline_candidates"]
+        monkeypatch.setattr(lib, "rise_ineligible_tokens", lambda member_facts: frozenset(
+            token for token, facts in (member_facts or {}).items() if facts.refused))
     elif name == "provider-floor-before-receipt":
         # A receipt kept across a provider credit requested before e_sigma.
         real = sp.receipt_valid
@@ -435,5 +615,11 @@ def _mutate(monkeypatch, name: str) -> None:
         raise ValueError(name)
 
 
-MUTATIONS = ("domination-alone", "numerical-domination", "capture-instant",
-             "statusline-sample", "provider-floor-before-receipt")
+#: The receipt-based rise refusal's mutations (#797).
+RECEIPT_MUTATIONS = ("domination-alone", "numerical-domination", "capture-instant",
+                     "statusline-sample", "provider-floor-before-receipt")
+#: The drop refusal's mutations (#1019 spec 6 L12).
+DROP_MUTATIONS = ("drop-bound-ignored", "drop-no-tolerance",
+                  "drop-received-at-as-sigma", "drop-refused-may-rise",
+                  "samples-cross-account")
+MUTATIONS = RECEIPT_MUTATIONS + DROP_MUTATIONS

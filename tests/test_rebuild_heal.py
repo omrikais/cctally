@@ -564,6 +564,119 @@ def test_corrupt_stats_db_defers_the_heal_and_the_worker_recovers_it(
     assert request["healId"] in log
 
 
+# ==========================================================================
+# #949 — a replace publication keeps the incremental selector advancing
+# ==========================================================================
+
+def _publication_identity(path):
+    """The destination's publication stamp rows and its durable selector
+    generation identity, read on a fresh read-only connection."""
+    jr = _jr()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        stamp = [tuple(r) for r in conn.execute(
+            "SELECT record_path, stamped_at_utc FROM stats_publication_stamp")]
+        state = jr._read_selector_state(conn)
+    finally:
+        conn.close()
+    return stamp, (state.generation_record_path, state.generation_stamped_at_utc)
+
+
+def _publish_by(mode, no_spawn):
+    """Republish the live index through one publication mechanism."""
+    jr = _jr()
+    import _cctally_core
+    import _cctally_db
+    import _cctally_store as st
+    if mode == "corruption_heal":
+        with open(_cctally_core.DB_PATH, "r+b") as f:
+            f.write(b"not a database " * 200)
+        with pytest.raises(_cctally_db.StatsHealDeferred):
+            _cctally_core.open_db()
+        assert st.cmd_stats_corruption_heal_internal(types.SimpleNamespace()) == 0
+        return
+    if mode == "missing_destination":
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            stale = pathlib.Path(str(_cctally_core.DB_PATH) + suffix)
+            if stale.exists():
+                stale.unlink()
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="db-rebuild"))
+
+
+def _count_selections(monkeypatch):
+    jr = _jr()
+    counts = {"incremental_none": 0, "incremental_ok": 0,
+              "generation_mismatch": 0, "full_selection": 0}
+    real_inc = jr._incremental_selection
+    real_gen = jr._selector_generation_matches
+    real_full = jr._full_effective_selection
+
+    def incremental(*a, **k):
+        result = real_inc(*a, **k)
+        counts["incremental_none" if result is None else "incremental_ok"] += 1
+        return result
+
+    def generation(*a, **k):
+        result = real_gen(*a, **k)
+        if not result:
+            counts["generation_mismatch"] += 1
+        return result
+
+    def full(*a, **k):
+        counts["full_selection"] += 1
+        return real_full(*a, **k)
+
+    monkeypatch.setattr(jr, "_incremental_selection", incremental)
+    monkeypatch.setattr(jr, "_selector_generation_matches", generation)
+    monkeypatch.setattr(jr, "_full_effective_selection", full)
+    return counts
+
+
+@pytest.mark.parametrize(
+    "mode", ["in_place", "corruption_heal", "missing_destination"])
+def test_a_replace_publication_keeps_the_incremental_selector_advancing(
+    ns, tmp_path, monkeypatch, no_spawn, mode,
+):
+    """#949. Detects a replace publication (the corruption heal, or a rebuild
+    onto a missing stats.db) installing an index with no publication stamp and
+    no selector generation identity. Every later ingest then fails the
+    generation check, the durable selector stops advancing, a correction-bearing
+    pass would read the whole journal prefix, and the next rebuild reports
+    `selectorDesynchronized` with the bytes ingested since the replace.
+    `in_place` is the control: that mechanism already stamped both."""
+    jr, J = _jr(), _jlib()
+    import _cctally_core
+    jr.append_record(_claude_obs(J, at="2026-01-04T09:00:00Z", pct=5.0))
+    jr.run_stats_ingest(mode="authoritative")
+    jr.append_record(_claude_obs(J, at="2026-01-04T10:00:00Z", pct=6.0))
+    jr.run_stats_ingest(mode="authoritative")
+
+    _publish_by(mode, no_spawn)
+
+    stamp, generation = _publication_identity(_cctally_core.DB_PATH)
+    assert len(stamp) == 1, f"{mode}: the publication must stamp the index"
+    assert generation == stamp[0], (
+        f"{mode}: the selector generation identity must equal the stamp")
+
+    counts = _count_selections(monkeypatch)
+    for i in range(3):
+        jr.append_record(_claude_obs(
+            J, at=f"2026-01-05T{10 + i:02d}:00:00Z", pct=7.0 + i))
+        jr.run_stats_ingest(mode="authoritative")
+    assert counts["generation_mismatch"] == 0, (mode, counts)
+    assert counts["incremental_none"] == 0, (mode, counts)
+    assert counts["incremental_ok"] >= 3, (mode, counts)
+    assert counts["full_selection"] == 0, (mode, counts)
+
+    # The ingested state still equals a clean rebuild of the same journal.
+    _assert_converges(ns, jr, tmp_path)
+
+    result = jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="db-rebuild"))
+    assert result.selector_desynchronized is None, (
+        f"{mode}: {result.selector_desynchronized}")
+
+
 def _readable_but_quick_check_corrupt(core):
     """Damage one index B-tree page: the file opens, `quick_check` does not.
 
@@ -1006,27 +1119,288 @@ def test_stale_crashed_owner_is_terminalized_and_replaced(
 def test_heal_admission_refreshes_while_a_long_worker_holds_its_flock(
     ns, tmp_path, no_spawn,
 ):
-    """A real rebuild outliving the marker TTL must not spawn a duplicate."""
-    import fcntl
+    """A real rebuild outliving the marker TTL must not spawn a duplicate.
+
+    #1012: the running worker is identified by its records, not by probing
+    its flock."""
     import _cctally_store as st
     import _cctally_core
+    from test_997_worker_lifecycle import _SyntheticOwner
 
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     marker = st._stats_heal_marker_path()
     assert st.reserve_stats_corruption_heal({"healId": "held"}) == "reserved"
     stale = time.time() - st._STATS_HEAL_RETRY_SECONDS - 1
     os.utime(marker, (stale, stale))
-    held = os.open(st._stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600)
-    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    try:
+    with _SyntheticOwner("heal"):
         assert st.defer_stats_corruption_heal({"healId": "z"}) == "pending"
-    finally:
-        fcntl.flock(held, fcntl.LOCK_UN)
-        os.close(held)
     assert no_spawn == []
     assert time.time() - marker.stat().st_mtime < 5
     assert st._read_stats_heal_request()["healId"] == "held"
     assert st._read_stats_heal_request()["coalescedDetections"] == 1
+
+
+def _age_heal_marker(st):
+    stale = time.time() - st._STATS_HEAL_RETRY_SECONDS - 1
+    os.utime(st._stats_heal_marker_path(), (stale, stale))
+
+
+@pytest.mark.parametrize("identity,owner_end", [
+    ("null-birth", "finalized"),
+    ("identity-timeout", "finalized"),
+    ("null-birth", "failed"),
+])
+def test_an_uncertain_heal_owner_keeps_its_request(
+    ns, tmp_path, monkeypatch, identity, owner_end,
+):
+    """#1012 T8. Detects the heal admission invalidating a live heal whose
+    identity it cannot confirm: replacing the request (`stale-retried`, a new
+    `healId`) makes the live worker's persist and finalize refuse it. The
+    admission now keeps request A, refreshes its marker and launches one
+    same-request contender, which never records `busy` while the owner's
+    identity is unconfirmed and takes over once the owner releases: a
+    no-op when A was finalized, a real retry of A when it was not."""
+    import types as _types
+    import _cctally_db
+    import _cctally_store as st
+    import _cctally_update
+    from test_997_worker_lifecycle import (
+        _Run, _SyntheticOwner, _flock_barrier, _ps_times_out_for,
+        _refusals_by, _until)
+
+    request_a = {"healId": "A", "probeKind": "readability",
+                 "forensicsDisposition": "confirmed"}
+    assert st._reserve_stats_corruption_heal(request_a)[0] == "reserved"
+    if identity == "null-birth":
+        owner = _SyntheticOwner("heal", birth=None)
+    else:
+        owner = _SyntheticOwner("heal")
+    owner.start()
+    contender = None
+    try:
+        if identity == "identity-timeout":
+            _ps_times_out_for(monkeypatch, os.getpid())
+        _age_heal_marker(st)
+        launches = []
+        monkeypatch.setattr(
+            _cctally_update, "_spawn_detached_with_pid",
+            lambda command, *, env=None: launches.append(
+                (env or {}).get(st.REBUILD_LAUNCH_ENV)) or os.getpid())
+        unlinks = []
+        real_unlink = st._unlink_stats_heal_marker_under_admission
+        monkeypatch.setattr(
+            st, "_unlink_stats_heal_marker_under_admission",
+            lambda *a, **k: unlinks.append(a) or real_unlink(*a, **k))
+        status, elected = st._reserve_stats_corruption_heal(
+            {"healId": "B", "probeKind": "readability"})
+        assert (status, elected["healId"]) == ("retry-elected", "A")
+        assert st.complete_stats_corruption_heal(status) == "spawned"
+        assert len(launches) == 1 and unlinks == []
+        assert st._read_stats_heal_request()["healId"] == "A"
+        assert time.time() - st._stats_heal_marker_path().stat().st_mtime < 5
+        assert not [e for e in st.read_stats_heal_events()
+                    if e["outcome"] == "stale-retried"]
+        assert st._stats_open_maintenance_timeout_message() == str(
+            _cctally_db.StatsHealDeferred("pending"))
+
+        ran = []
+
+        def run_heal(request):
+            ran.append(request.get("healId"))
+            return "declined-readable"
+
+        monkeypatch.setattr(st, "_run_stats_corruption_heal", run_heal)
+        answers = []
+        real_ownership = st._rebuild_worker_ownership
+        monkeypatch.setattr(
+            st, "_rebuild_worker_ownership",
+            lambda worker: answers.append(real_ownership(worker))
+            or answers[-1])
+        contender_ids: list = []
+        bar = _flock_barrier(
+            _types.SimpleNamespace(app=pathlib.Path(st._cctally_core.APP_DIR)),
+            monkeypatch, "heal", holder_ids=[], claimant_ids=contender_ids)
+        monkeypatch.setenv(st.REBUILD_LAUNCH_ENV, launches[0])
+        contender = _Run(
+            lambda: st.cmd_stats_corruption_heal_internal(
+                _types.SimpleNamespace()),
+            register=contender_ids, name="contender")
+        contender.start()
+        _until(lambda: (_refusals_by(bar, contender.ident, "claim") >= 2
+                        and "uncertain" in answers)
+               or not contender.is_alive(),
+               "the contender never waited on the uncertain owner")
+        assert contender.is_alive(), "the contender gave up on an uncertain owner"
+        assert "owned" not in answers
+        ledger = st.read_launch_ledger("heal")["ledger"]
+        assert not [e for e in ledger["entries"] if e["outcome"] == "busy"]
+        if owner_end == "finalized":
+            current = dict(st._read_stats_heal_request())
+            assert st._persist_stats_heal_request(current) is True
+            assert st._finalize_stats_heal_request("A") is True
+            owner.finish("success")
+        else:
+            owner.finish("failed")
+        contender.finish()
+    finally:
+        owner.release()
+        if contender is not None:
+            contender.finish()
+    assert contender.result == 0
+    ledger = st.read_launch_ledger("heal")["ledger"]
+    (entry,) = [e for e in ledger["entries"] if e["launchId"] == launches[0]]
+    if owner_end == "finalized":
+        assert entry["outcome"] == "finished:no-request" and ran == []
+    else:
+        assert entry["outcome"] == "finished:declined-readable"
+        assert ran == ["A"], "the contender did not retry request A"
+        assert st._read_stats_heal_request() is None
+    assert not [e for e in ledger["entries"] if e["outcome"] == "busy"]
+
+
+def test_an_uncertain_heal_record_without_a_request_still_admits(
+    ns, tmp_path, no_spawn,
+):
+    """#1012. Detects an uncertain heal record blocking recovery forever:
+    with no marker there is no request to preserve, so an unreadable run
+    state must not turn every detection into a failed admission (the worker
+    that would archive that state is never launched). It admits the new
+    request and spawns its worker, as the lock probe's "no worker" did."""
+    import _cctally_store as st
+
+    st._cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    st._worker_state_path("heal").write_bytes(b"{not json")
+    assert st._rebuild_worker_ownership("heal") == "uncertain"
+    status, elected = st._reserve_stats_corruption_heal(
+        {"healId": "fresh", "probeKind": "readability"})
+    assert (status, elected["healId"]) == ("reserved", "fresh")
+    assert st.complete_stats_corruption_heal(status) == "spawned"
+    assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
+
+
+def test_an_unreadable_marker_under_an_uncertain_heal_record_still_admits(
+    ns, tmp_path, no_spawn,
+):
+    """#1012 C3. Detects an unreadable heal marker stranding recovery while
+    the owner is uncertain: every detection returned `failed` and nothing
+    ever launched the worker. A corrupt marker carries no healId a live
+    worker could still persist or finalize against, so the admission
+    proceeds exactly as with no marker."""
+    import _cctally_store as st
+
+    st._cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    st._worker_state_path("heal").write_bytes(b"{not json")
+    st._stats_heal_marker_path().write_bytes(b"{not json")
+    _age_heal_marker(st)
+    assert st._rebuild_worker_ownership("heal") == "uncertain"
+    status, elected = st._reserve_stats_corruption_heal(
+        {"healId": "fresh", "probeKind": "readability"})
+    assert (status, elected["healId"]) == ("reserved", "fresh")
+    assert st.complete_stats_corruption_heal(status) == "spawned"
+    assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
+    assert st._read_stats_heal_request()["healId"] == "fresh"
+
+
+def test_a_retry_elected_spawn_failure_keeps_request_a(
+    ns, tmp_path, monkeypatch,
+):
+    """#1012 C2 (G9/G10). Detects a failed contender launch for an uncertain
+    owner dropping that owner's request: removing A's marker, or marking A
+    `spawn-failed`, makes the possibly live worker's persist and finalize
+    refuse A. The failed start is recorded in the launch ledger only, and A
+    stays pending."""
+    import _cctally_store as st
+    from test_997_worker_lifecycle import _SyntheticOwner
+
+    assert st._reserve_stats_corruption_heal(
+        {"healId": "A", "probeKind": "readability",
+         "forensicsDisposition": "confirmed"})[0] == "reserved"
+    owner = _SyntheticOwner("heal", birth=None).start()
+    try:
+        _age_heal_marker(st)
+        launches = []
+        monkeypatch.setattr(
+            st, "_spawn_rebuild_worker",
+            lambda command, launch_id: launches.append(launch_id) or None)
+        status, elected = st._reserve_stats_corruption_heal(
+            {"healId": "B", "probeKind": "readability"})
+        assert (status, elected["healId"]) == ("retry-elected", "A")
+        assert st.complete_stats_corruption_heal(status) == "pending"
+        assert len(launches) == 1
+        assert st._read_stats_heal_request()["healId"] == "A"
+        ledger = st.read_launch_ledger("heal")["ledger"]
+        (entry,) = [e for e in ledger["entries"]
+                    if e["launchId"] == launches[0]]
+        assert entry["outcome"] == "spawn-failed"
+        assert not [e for e in st.read_stats_heal_events()
+                    if e["healId"] == "A" and e["outcome"] == "spawn-failed"]
+    finally:
+        owner.finish("failed")
+
+
+def test_a_retry_elected_detection_reports_request_a(ns, tmp_path, no_spawn):
+    """#1012 C2 (F9). Detects the auto-heal hook naming the new detection's
+    healId on a `retry-elected` admission: the user would be told of a heal
+    that no worker runs or finalizes, while request A is the one kept. The
+    deferral it raises names A."""
+    jr, J = _jr(), _jlib()
+    import _cctally_db
+    import _cctally_store as st
+    from test_997_worker_lifecycle import _SyntheticOwner
+
+    _seed_one_snapshot(jr, J)
+    assert st._reserve_stats_corruption_heal(
+        {"healId": "A", "probeKind": "readability"})[0] == "reserved"
+    owner = _SyntheticOwner("heal", birth=None).start()
+    try:
+        _age_heal_marker(st)
+        with pytest.raises(_cctally_db.StatsHealDeferred) as raised:
+            st._stats_heal_hook(
+                "stats", sqlite3.DatabaseError("file is not a database"))
+        assert raised.value.heal_id == "A"
+        assert raised.value.outcome == "spawned"
+        assert no_spawn == [st.STATS_CORRUPTION_HEAL_COMMAND]
+        assert st._read_stats_heal_request()["healId"] == "A"
+    finally:
+        owner.finish("failed")
+
+
+def test_a_dead_heal_owner_takes_the_stale_retry_path(
+    ns, tmp_path, no_spawn,
+):
+    """#1012 T8. Detects the uncertain path swallowing a confirmed death: a
+    heal owner whose pid is gone is absent, so its stale request is retried
+    under a new id exactly as before."""
+    import subprocess
+    import sys as _sys
+    import _cctally_db
+    import _cctally_store as st
+    from test_997_worker_lifecycle import _SyntheticOwner
+
+    assert st._reserve_stats_corruption_heal(
+        {"healId": "A", "probeKind": "readability",
+         "forensicsDisposition": "confirmed"})[0] == "reserved"
+    sleeper = subprocess.Popen([_sys.executable, "-c",
+                                "import time; time.sleep(600)"])
+    owner = _SyntheticOwner("heal", pid=sleeper.pid)
+    owner.start()
+    try:
+        sleeper.kill()
+        sleeper.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
+        assert st._rebuild_worker_ownership("heal") == "absent"
+        assert st._stats_open_maintenance_timeout_message() == (
+            st._STATS_OPEN_MAINTENANCE_TIMEOUT_MSG)
+        _age_heal_marker(st)
+        status, elected = st._reserve_stats_corruption_heal(
+            {"healId": "B", "probeKind": "readability"})
+        assert (status, elected["healId"]) == ("reserved", "B")
+        events = {e["healId"]: e for e in st.read_stats_heal_events()}
+        assert events["A"]["outcome"] == "stale-retried"
+    finally:
+        owner.finish("failed")
+        if sleeper.poll() is None:
+            sleeper.kill()
+            sleeper.wait(timeout=PRESENCE_BACKSTOP_SECONDS)
 
 
 def test_heal_admission_and_epoch_admission_cannot_suppress_each_other(
@@ -1055,25 +1429,24 @@ def test_heal_admission_and_epoch_admission_cannot_suppress_each_other(
 def test_deferred_heal_worker_flock_prevents_a_concurrent_rebuild(
     ns, tmp_path, no_spawn, monkeypatch,
 ):
-    import fcntl
+    """A heal worker started while another heal worker runs never enters
+    the heal (#1012: it loses the claim and records `busy` against the
+    running owner)."""
     import types as _types
     import _cctally_store as st
     import _cctally_core
+    from test_997_worker_lifecycle import _SyntheticOwner, _in_thread
 
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     st._stats_heal_marker_path().write_text('{"healId": "held"}')
-    held = os.open(st._stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600)
-    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     monkeypatch.setattr(
         st,
         "_run_stats_corruption_heal",
         lambda _request: pytest.fail("a duplicate worker entered the heal"),
     )
-    try:
-        assert st.cmd_stats_corruption_heal_internal(_types.SimpleNamespace()) == 0
-    finally:
-        fcntl.flock(held, fcntl.LOCK_UN)
-        os.close(held)
+    with _SyntheticOwner("heal"):
+        assert _in_thread(_types.SimpleNamespace(st=st), "heal",
+                          "duplicate heal worker") == 0
 
 
 def test_deleted_stats_db_recovers_via_reingest(ns):

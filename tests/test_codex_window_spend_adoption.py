@@ -660,38 +660,51 @@ def test_the_ladder_segment_reports_the_spend_behind_its_own_crossing(ns):
 
 def test_sync_codex_cache_runs_the_adoption_pass(ns, monkeypatch, tmp_path):
     """The pass is wired into ``sync_codex_cache`` under the cache writer lock,
-    after the walk commits."""
+    after the walk commits, and consumes the persisted debt (#980 D3): each
+    unit reads the candidate range ``[low - 7d, high]`` of the root's item."""
     import _cctally_cache
 
     calls: list[dict] = []
-    real = _cctally_cache.apply_codex_window_spend_adoption
+    real = _cctally_cache.apply_codex_window_spend_adoption_unit
 
     def _spy(conn, **kwargs):
         calls.append(kwargs)
         return real(conn, **kwargs)
 
     monkeypatch.setattr(
-        _cctally_cache, "apply_codex_window_spend_adoption", _spy)
+        _cctally_cache, "apply_codex_window_spend_adoption_unit", _spy)
     conn = ns["open_cache_db"]()
-    _cctally_cache.sync_codex_cache(conn)
-    assert calls, "sync_codex_cache never invoked the adoption pass"
-    assert "touched" in calls[0]
-    conn.close()
+    try:
+        _cctally_cache.add_codex_finalization_debt(
+            conn, spans={ROOT: (CROSSING, CROSSING + dt.timedelta(hours=1))})
+        conn.commit()
+        _cctally_cache.sync_codex_cache(conn)
+        assert calls, "sync_codex_cache never invoked the adoption pass"
+        assert calls[0]["root_key"] == ROOT
+        assert calls[0]["candidate_range"] == (
+            CROSSING - dt.timedelta(days=7), CROSSING + dt.timedelta(hours=1))
+        assert _cctally_cache.load_codex_finalization_debt(conn).empty
+    finally:
+        conn.close()
 
 
 def test_post_walk_maintenance_failure_withholds_the_full_walk_sentinel(
     ns, monkeypatch,
 ):
-    """A best-effort rederivation failure is retryable, never certifiable."""
+    """A best-effort rederivation failure is retryable, never certifiable,
+    and its work stays owed (#980: a failed adoption is revisited)."""
     import _cctally_cache
 
     def _fail(*_args, **_kwargs):
         raise sqlite3.OperationalError("synthetic adoption failure")
 
     monkeypatch.setattr(
-        _cctally_cache, "apply_codex_window_spend_adoption", _fail)
+        _cctally_cache, "apply_codex_window_spend_adoption_unit", _fail)
     conn = ns["open_cache_db"]()
     try:
+        _cctally_cache.add_codex_finalization_debt(
+            conn, spans={ROOT: (CROSSING, CROSSING)})
+        conn.commit()
         stats = _cctally_cache.sync_codex_cache(conn)
         assert stats.maintenance_failed is True
         assert stats.full_walk_complete is False
@@ -699,5 +712,535 @@ def test_post_walk_maintenance_failure_withholds_the_full_walk_sentinel(
             "SELECT COUNT(*) FROM cache_meta "
             "WHERE key='dashboard_codex_full_walk_complete'"
         ).fetchone() == (0,)
+        debt = _cctally_cache.load_codex_finalization_debt(conn)
+        assert [item.span for item in debt.items[ROOT]] == [(CROSSING, CROSSING)]
     finally:
         conn.close()
+
+
+# --------------------------------------------------------------------------
+# #980 Part D: durable, cancellable finalization (spec §4.4 D3-D5, T-D1)
+# --------------------------------------------------------------------------
+
+#: The unit's candidate read; its start flips the trace-driven clock.
+_UNIT_READ = "ORDER BY timestamp_utc, id LIMIT"
+
+
+def _seed_window_with_entries(cache, count, *, start=CROSSING, offset=0):
+    """One identified weekly window and ``count`` unattributed entries inside
+    its nominal range, one second apart."""
+    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                   source_path="/s/quota.jsonl", line_offset=offset + 1)
+    cache.executemany(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model,"
+        " input_tokens, cached_input_tokens, output_tokens,"
+        " reasoning_output_tokens, total_tokens, source_root_key,"
+        " conversation_key, account_key) "
+        "VALUES ('/s/a.jsonl',?,?,'s',?,1,0,0,0,1,?,NULL,NULL)",
+        [(offset + 10 + index, _z(start + dt.timedelta(seconds=index)),
+          MODEL, ROOT) for index in range(count)])
+
+
+def _span(count, *, start=CROSSING):
+    return (start, start + dt.timedelta(seconds=max(0, count - 1)))
+
+
+class _TraceClock:
+    """Reads 0.0 until a statement containing ``marker`` starts (or ``flip``
+    is called), then 100.0: a deadline that passes while that read runs."""
+
+    def __init__(self, cache, marker=None):
+        self.late = False
+        self.statements: list[str] = []
+
+        def trace(sql):
+            self.statements.append(sql)
+            if marker is not None and marker in sql:
+                self.late = True
+        cache.set_trace_callback(trace)
+
+    def flip(self):
+        self.late = True
+
+    def __call__(self):
+        return 100.0 if self.late else 0.0
+
+
+def _items(cc, cache):
+    debt = cc.load_codex_finalization_debt(cache)
+    return {root: [(item.span, item.cursor) for item in entries]
+            for root, entries in debt.items.items()}
+
+
+def _control_accounts(ns, cache):
+    """The unbudgeted control on the same final data: every row unattributed
+    again, then the whole-history pass."""
+    import _cctally_cache as cc
+    cache.execute("UPDATE codex_session_entries SET account_key = NULL")
+    cc.apply_codex_window_spend_adoption(cache)
+    cache.commit()
+    return _accounts(cache)
+
+
+def test_finalization_unit_read_interrupted_rolls_back(ns):
+    """A real SQLite progress-handler interrupt of a unit's read is a
+    cancellation: the unit's savepoint rolls back (debt and cursor unchanged),
+    the enclosing transaction survives with the earlier steps' writes, and the
+    outcome is never a success-shaped zero."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 2500)
+        cc.add_codex_finalization_debt(cache, spans={ROOT: _span(2500)})
+        cache.commit()
+        before = _items(cc, cache)
+        cache.execute("INSERT OR REPLACE INTO cache_meta(key, value) "
+                      "VALUES ('t_earlier_step', '1')")
+        clock = _TraceClock(cache, _UNIT_READ)
+        outcome = cc.settle_codex_finalization(cache, deadline=10.0, clock=clock)
+        cache.set_trace_callback(None)
+        assert clock.late, "non-vacuity: the unit read started"
+        assert outcome.cancelled and outcome.cancel_cause == "interrupt"
+        assert outcome.units_done == 0 and outcome.adopted == 0
+        assert cache.in_transaction, "an interrupted read ended the transaction"
+        assert cache.execute("SELECT value FROM cache_meta "
+                             "WHERE key='t_earlier_step'").fetchone() == ("1",)
+        assert _items(cc, cache) == before
+        assert cc.load_codex_finalization_debt(cache).strikes == 1
+        assert set(_accounts(cache).values()) == {None}
+        cache.commit()
+    finally:
+        cache.close()
+
+
+def test_finalization_near_deadline_read_then_expensive_plan_stops_before_writes(
+    ns, monkeypatch,
+):
+    """A read that finishes just before the threshold, followed by planning
+    that crosses it, stops before the first write batch."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 3)
+        cc.add_codex_finalization_debt(cache, spans={ROOT: _span(3)})
+        cache.commit()
+        before = _items(cc, cache)
+        clock = _TraceClock(cache)
+        real_plan = cc._lib_codex_account_adoption.build_spend_adoption_plan
+
+        def expensive_plan(*args, **kwargs):
+            plan = real_plan(*args, **kwargs)
+            clock.flip()
+            return plan
+
+        monkeypatch.setattr(cc._lib_codex_account_adoption,
+                            "build_spend_adoption_plan", expensive_plan)
+        outcome = cc.settle_codex_finalization(cache, deadline=10.0, clock=clock)
+        cache.set_trace_callback(None)
+        assert clock.late, "non-vacuity: planning ran"
+        assert outcome.cancelled and outcome.cancel_cause == "deadline"
+        assert not [sql for sql in clock.statements
+                    if sql.lstrip().upper().startswith(
+                        "UPDATE CODEX_SESSION_ENTRIES")]
+        assert _items(cc, cache) == before
+        assert set(_accounts(cache).values()) == {None}
+        cache.commit()
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("helper", [
+    "apply_codex_window_spend_adoption",
+    "reconcile_codex_window_attribution_spend",
+])
+def test_adoption_cancellation_not_swallowed_as_zero(ns, helper):
+    """A SQLite interrupt inside the non-strict best-effort helpers raises
+    ``CodexFinalizationCancelled``; it used to be swallowed as a zero."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 3)
+        cache.commit()
+        cache.set_progress_handler(lambda: 1, 1)
+        try:
+            with pytest.raises(Exception) as info:
+                getattr(cc, helper)(cache)
+        finally:
+            cache.set_progress_handler(None, 0)
+        assert type(info.value).__name__ == "CodexFinalizationCancelled"
+        cache.rollback()
+        assert set(_accounts(cache).values()) == {None}
+    finally:
+        cache.close()
+
+
+def test_restart_resumes_persisted_debt_and_cursor(ns, monkeypatch):
+    """A committed unit persists its cursor; a new connection (a restarted
+    process) resumes from it, budgeted or not, and the result equals the
+    unbudgeted control."""
+    import _cctally_cache as cc
+    monkeypatch.setattr(cc, "_CODEX_ADOPTION_UNIT_CAP", 2)
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 5)
+        cc.add_codex_finalization_debt(cache, spans={ROOT: _span(5)})
+        cache.commit()
+        cc._codex_settle_finalization(cache, deadline=None, max_units=1)
+        cache.commit()
+    finally:
+        cache.close()
+    cache = ns["open_cache_db"]()
+    try:
+        assert _items(cc, cache) == {ROOT: [(
+            _span(5), (_z(CROSSING + dt.timedelta(seconds=1)), 2))]}
+        assert list(_accounts(cache).values()).count(ACCT_A) == 2
+        outcome = cc.settle_codex_finalization(
+            cache, deadline=time_monotonic() + 5.0)
+        cache.commit()
+        assert outcome.units_done >= 1 and not outcome.cancelled
+        outcome = cc.settle_codex_finalization(cache, deadline=None)
+        cache.commit()
+        assert cc.load_codex_finalization_debt(cache).empty
+        settled = _accounts(cache)
+        assert set(settled.values()) == {ACCT_A}
+        assert _control_accounts(ns, cache) == settled
+    finally:
+        cache.close()
+
+
+def time_monotonic() -> float:
+    import time
+    return time.monotonic()
+
+
+def test_full_debt_expands_and_drains(ns):
+    """An unexpanded ``full`` is model-pending; its expansion is one unit that
+    replaces it by one item per root over the root's whole range (setting
+    ``model`` and ``attribution``), and the items drain to the control."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 4)
+        _seed_entry(cache, timestamp=NOMINAL_START - dt.timedelta(days=3),
+                    account_key=None, source_path="/s/old.jsonl",
+                    line_offset=1)
+        cc.add_codex_finalization_debt(cache, full=True)
+        cache.commit()
+        assert cc.codex_model_resolution_pending(cache)
+        outcome = cc._codex_settle_finalization(cache, deadline=None,
+                                                max_units=1)
+        cache.commit()
+        assert outcome.units_done == 1
+        debt = cc.load_codex_finalization_debt(cache)
+        assert not debt.full and debt.model and debt.attribution
+        assert list(debt.items) == [ROOT] and len(debt.items[ROOT]) == 1
+        low, high = debt.items[ROOT][0].span
+        assert low <= NOMINAL_START - dt.timedelta(days=3) and high >= RESET
+        assert cc.codex_model_resolution_pending(cache)
+        cc.settle_codex_finalization(cache, deadline=None)
+        cache.commit()
+        assert cc.load_codex_finalization_debt(cache).empty
+        assert not cc.codex_model_resolution_pending(cache)
+        settled = _accounts(cache)
+        assert list(settled.values()).count(ACCT_A) == 4
+        assert _control_accounts(ns, cache) == settled
+    finally:
+        cache.close()
+
+
+def test_work_behind_committed_cursor_is_reprocessed(ns, monkeypatch):
+    """Quota evidence and an earlier accounting row added behind a started
+    item's committed cursor become a new item, so the final attribution
+    equals the unbudgeted control."""
+    import _cctally_cache as cc
+    monkeypatch.setattr(cc, "_CODEX_ADOPTION_UNIT_CAP", 2)
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 4)
+        cc.add_codex_finalization_debt(cache, spans={ROOT: _span(4)})
+        cache.commit()
+        cc._codex_settle_finalization(cache, deadline=None, max_units=1)
+        cache.commit()
+        assert _items(cc, cache)[ROOT][0][1] is not None, "a started item"
+        # Behind the cursor: an earlier row in the identified window, and an
+        # older window whose evidence (another account) arrives only now.
+        earlier = CROSSING - dt.timedelta(hours=1)
+        older_reset = RESET - dt.timedelta(days=7)
+        older_row = NOMINAL_START - dt.timedelta(days=2)
+        _seed_entry(cache, timestamp=earlier, account_key=None,
+                    source_path="/s/b.jsonl", line_offset=1)
+        _seed_entry(cache, timestamp=older_row, account_key=None,
+                    source_path="/s/b.jsonl", line_offset=2)
+        _seed_snapshot(cache, captured=older_row, reset=older_reset,
+                       account_key=ACCT_B, source_path="/s/quota-old.jsonl")
+        cc.add_codex_finalization_debt(
+            cache, spans={ROOT: (older_row, earlier)})
+        cc.add_codex_finalization_debt(
+            cache, spans={ROOT: (older_reset, older_reset)})
+        cache.commit()
+        items = _items(cc, cache)[ROOT]
+        assert len(items) == 2 and items[1][1] is None
+        cc.settle_codex_finalization(cache, deadline=None)
+        cache.commit()
+        assert cc.load_codex_finalization_debt(cache).empty
+        settled = _accounts(cache)
+        assert ACCT_B in settled.values(), "non-vacuity: the older window"
+        assert list(settled.values()).count(None) == 0
+        assert _control_accounts(ns, cache) == settled
+    finally:
+        cache.close()
+
+
+def test_oversized_unit_strikes_hand_off_to_worker(ns):
+    """A unit cancelled on two consecutive budgeted calls is not attempted
+    again by a budgeted call; the maintenance executor settles it."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_window_with_entries(cache, 2500)
+        cc.add_codex_finalization_debt(cache, spans={ROOT: _span(2500)})
+        cache.commit()
+        for strike in (1, 2):
+            clock = _TraceClock(cache, _UNIT_READ)
+            outcome = cc.settle_codex_finalization(
+                cache, deadline=10.0, clock=clock)
+            cache.commit()
+            assert outcome.cancelled, strike
+            assert cc.load_codex_finalization_debt(cache).strikes == strike
+        clock = _TraceClock(cache, _UNIT_READ)
+        outcome = cc.settle_codex_finalization(cache, deadline=10.0, clock=clock)
+        cache.commit()
+        cache.set_trace_callback(None)
+        assert outcome.deferred_to_worker and outcome.units_done == 0
+        assert not clock.late, "a struck unit was attempted again"
+    finally:
+        cache.close()
+    result = cc.run_codex_prune_drain(wait_for_requests=False)
+    assert result.finalization_units >= 1
+    cache = ns["open_cache_db"]()
+    try:
+        assert cc.load_codex_finalization_debt(cache).empty
+        assert set(_accounts(cache).values()) == {ACCT_A}
+    finally:
+        cache.close()
+
+
+def test_applier_produces_debt(ns):
+    """The journal ``_cache_applier`` records finalization work in its own
+    transaction: a span per root for changed quota rows (plus ``model`` while
+    a row is unresolved), and ``attribution`` ONLY for applied file-account
+    and window-attribution records.
+
+    Detects: an attribution-only apply arming ``model`` while a permanently
+    unresolvable NULL ``observed_model`` row exists (the settled production
+    copy has six), which fenced the quota projection after every
+    ``cctally account attribute`` -- resolution never reads the account."""
+    import _cctally_cache as cc
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    ns["open_cache_db"]().close()
+    observation = jl.make_obs(
+        at="2026-07-28T10:00:00Z", src="codex-quota", provider="codex",
+        account=None,
+        payload={
+            "kind": "quota_window_snapshot", "source": "codex",
+            "source_root_key": "root-a", "source_path": "/codex/root-a/r.jsonl",
+            "line_offset": 10, "captured_at_utc": "2026-07-28T10:00:00Z",
+            "observed_slot": "primary",
+            "logical_limit_key": '{"limitId":"native-primary"}',
+            "limit_id": "native-primary", "limit_name": "Primary",
+            "window_minutes": 300, "used_percent": 42.0,
+            "resets_at_utc": "2026-07-28T15:00:00+00:00", "plan_type": "pro",
+            "individual_limit_json": None, "reached_type": None,
+            "observed_model": None,
+        })
+    assert jr._cache_applier([(observation, "seg", 0)]) is None
+    cache = ns["open_cache_db"]()
+    try:
+        debt = cc.load_codex_finalization_debt(cache)
+        assert debt.model and not debt.attribution
+        (low, high), = [item.span for item in debt.items["root-a"]]
+        assert low <= dt.datetime(2026, 7, 28, 15, tzinfo=UTC) <= high
+        assert cc.codex_model_resolution_pending(cache)
+        cache.execute("DELETE FROM cache_meta WHERE key=?",
+                      (cc.CODEX_FINALIZATION_DEBT_KEY,))
+        cache.commit()
+    finally:
+        cache.close()
+    account_op = jl.make_codex_file_account(
+        at="2026-07-28T10:00:01Z", root_scope="root-a", file_identity="fid-1",
+        incarnation=1, from_offset=0, account_key=ACCT_A)
+    assert jr._cache_applier([(account_op, "seg", 100)]) is None
+    cache = ns["open_cache_db"]()
+    try:
+        assert cc._codex_unresolved_quota_model_exists(cache), (
+            "non-vacuity: a NULL observed_model row is present")
+        debt = cc.load_codex_finalization_debt(cache)
+        assert debt.attribution and not debt.model
+        assert not cc.codex_model_resolution_pending(cache)
+        cache.execute("DELETE FROM cache_meta WHERE key=?",
+                      (cc.CODEX_FINALIZATION_DEBT_KEY,))
+        cache.commit()
+        asserted, _retracted, _skipped = jr._apply_window_attribution_records(
+            cache, [jl.make_codex_window_attribution(
+                at="2026-07-28T10:00:02Z", account_key=ACCT_A,
+                source_root_key="root-a",
+                logical_limit_key="limit-weekly", observed_slot="primary",
+                window_minutes=10080,
+                raw_resets_at_utc=["2026-07-20T09:45:35Z"],
+                canonical_resets_at_utc="2026-07-20T09:40:00Z")])
+        cache.commit()
+        assert asserted == 1
+        debt = cc.load_codex_finalization_debt(cache)
+        assert debt.attribution and not debt.model
+        assert not cc.codex_model_resolution_pending(cache)
+    finally:
+        cache.close()
+    import _cctally_quota as quota
+    result = quota.reconcile_codex_quota_projection()
+    assert result.status != quota.PROJECTION_DEFERRED_MODEL, (
+        "an attribution-only apply fenced the quota projection")
+
+
+# --------------------------------------------------------------------------
+# #980 F1: model resolution is a prerequisite of every dependent unit
+# --------------------------------------------------------------------------
+
+SPARK_MODEL = "gpt-5.3-codex-spark"
+_SPARK_PATH = "/s/spark.jsonl"
+
+
+def _seed_resolvable_spark_window(cache):
+    """A weekly window that IS the Spark pool but was materialized before its
+    model was stamped: a NULL ``observed_model``, an unlabelled raw key, and
+    the rollout's own accounting row that model resolution reads (same
+    ``source_path``, earlier ``line_offset``). Until resolution runs, the
+    window reads as account-level weekly quota naming ``ACCT_A``."""
+    cache.execute(
+        "INSERT INTO codex_session_entries "
+        "(source_path, line_offset, timestamp_utc, session_id, model,"
+        " input_tokens, cached_input_tokens, output_tokens,"
+        " reasoning_output_tokens, total_tokens, source_root_key,"
+        " conversation_key, account_key) "
+        "VALUES (?,1,?,'s',?,1,0,0,0,1,?,NULL,NULL)",
+        (_SPARK_PATH, _z(BLOCK_START), SPARK_MODEL, ROOT))
+    _seed_snapshot(cache, captured=BLOCK_START, account_key=ACCT_A,
+                   source_path=_SPARK_PATH, line_offset=5,
+                   observed_model=None)
+    _seed_entry(cache, timestamp=CROSSING, account_key=None,
+                source_path="/s/a.jsonl", line_offset=10)
+
+
+def _spark_model(cache):
+    return cache.execute(
+        "SELECT observed_model FROM quota_window_snapshots "
+        "WHERE source_path=?", (_SPARK_PATH,)).fetchone()[0]
+
+
+def _spy_dependent_units(cc, monkeypatch):
+    """Record the Spark row's ``observed_model`` whenever an adoption unit or
+    a reconciliation pass starts."""
+    seen: list = []
+    for name in ("apply_codex_window_spend_adoption_unit",
+                 "reconcile_codex_window_attribution_spend"):
+        real = getattr(cc, name)
+
+        def spy(conn, *args, _real=real, **kwargs):
+            seen.append(_spark_model(conn))
+            return _real(conn, *args, **kwargs)
+
+        monkeypatch.setattr(cc, name, spy)
+    return seen
+
+
+def _debt_text(cc, cache):
+    return cc._encode_codex_finalization_debt(
+        cc.load_codex_finalization_debt(cache))
+
+
+def test_prewalk_settlement_never_adopts_before_model_resolution(
+    ns, monkeypatch,
+):
+    """Detects: a budgeted sync's pre-walk settlement (stages expand + adopt)
+    ran adoption over inherited debt while model resolution was still owed, so
+    a resolvable NULL Spark window was filed as account-level quota and
+    stamped unrelated unattributed spend -- a stamp later resolution never
+    undoes (adoption skips attributed rows)."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_resolvable_spark_window(cache)
+        cache.commit()
+        assert cc.apply_codex_window_spend_adoption(cache) >= 1, (
+            "non-vacuity: the unresolved Spark window adopts as account quota")
+        cache.rollback()
+        cc.add_codex_finalization_debt(
+            cache, spans={ROOT: (CROSSING, CROSSING)}, model=True)
+        cache.commit()
+        seen = _spy_dependent_units(cc, monkeypatch)
+        cc.sync_codex_cache(cache, budget_seconds=5.0)
+        assert None not in seen, "a dependent unit ran over an unresolved model"
+        cc.sync_codex_cache(cache)
+        assert seen and None not in seen
+        assert _spark_model(cache) == SPARK_MODEL
+        assert cc.load_codex_finalization_debt(cache).empty
+        settled = _accounts(cache)
+        assert set(settled.values()) == {None}, "the Spark window adopted"
+        assert _control_accounts(ns, cache) == settled
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("path", ["settle_unbudgeted", "budgeted_sync",
+                                  "executor_unit"])
+def test_failed_model_resolution_holds_dependent_units(ns, monkeypatch, path):
+    """Detects: model resolution failing inside a settlement while the same
+    settlement still ran adoption and reconciliation, over a window whose
+    pool classification depends on the unresolved model. The dependent units
+    must not run; their items, cursors and ``attribution`` stay exactly as
+    they were, and a later successful settlement reaches the unbudgeted
+    control with the Spark window demoted."""
+    import _cctally_cache as cc
+    cache = ns["open_cache_db"]()
+    try:
+        _seed_resolvable_spark_window(cache)
+        cc.add_codex_finalization_debt(
+            cache, spans={ROOT: (CROSSING, CROSSING)}, model=True,
+            attribution=True)
+        cache.commit()
+        before = _debt_text(cc, cache)
+        seen = _spy_dependent_units(cc, monkeypatch)
+
+        def failing_resolution(_conn):
+            raise sqlite3.OperationalError("injected model resolution failure")
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(cc._cctally_db_sib,
+                          "backfill_codex_quota_observed_model",
+                          failing_resolution)
+            if path == "settle_unbudgeted":
+                outcome = cc.settle_codex_finalization(cache, deadline=None)
+                cache.commit()
+                assert outcome.model_failed and not outcome.completed
+            elif path == "budgeted_sync":
+                stats = cc.sync_codex_cache(cache, budget_seconds=5.0)
+                assert stats.maintenance_failed
+                assert not stats.full_walk_complete
+            else:
+                succeeded, cleared = cc._run_codex_executor_unit(
+                    cache, "finalization")
+                assert not succeeded and not cleared
+        assert seen == [], "a dependent unit ran after resolution failed"
+        assert set(_accounts(cache).values()) == {None}
+        assert _debt_text(cc, cache) == before, "the dependent debt changed"
+        assert _spark_model(cache) is None
+        cc.settle_codex_finalization(cache, deadline=None)
+        cache.commit()
+        assert seen and None not in seen
+        assert cc.load_codex_finalization_debt(cache).empty
+        settled = _accounts(cache)
+        assert set(settled.values()) == {None}, "the Spark window adopted"
+        assert _control_accounts(ns, cache) == settled
+    finally:
+        cache.close()

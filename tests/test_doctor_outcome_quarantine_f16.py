@@ -1,11 +1,13 @@
-"""#825/#832 Task 3.7 — the doctor leg `accounting.outcome_quarantine`, case F16
-(spec section 8).
+"""#948 (spec 7, T9) — the doctor leg `accounting.outcome_quarantine`.
 
-OK with no quarantine. WARN per account, naming the paused outcome classes and
-since when, in the operator-approved wording. `journal.legacy_writer` is OK
-after seven quiet days while this leg still WARNs. Unavailable — never OK — on
-an unvalidated index. Recovery clears the account; `--json` carries the same
-states.
+Rewritten from the #825/#832 F16 certificate cases. Per account and per limit
+the leg renders the journal-derived recovery barrier in the operator-approved
+spec 7.3 wording: WARN while any limit of any account is paused, naming per
+limit what it waits for (with a "not before" lower bound only when one exists
+and is still ahead); OK otherwise, carrying the recovered note for seven days
+after an account's last limit recovered; unavailable — never OK — on an
+unvalidated index. `journal.legacy_writer` is OK after seven quiet days while
+this leg may still WARN. `--json` carries the same states.
 """
 import datetime as dt
 import json
@@ -14,24 +16,51 @@ import pytest
 
 import _outcome_quarantine_trace as T
 
-ACCOUNTING_TEXT = (
-    "Automatic credit and reset detection is paused for {account} since {time} "
-    "because an older cctally process wrote data after the upgrade. It resumes "
-    "only after cctally verifies a clean reading for this account, typically "
-    "the first one after an idle period spanning a weekly reset; there is no "
-    "guaranteed time. If your usage was reset in place meanwhile, record it "
+#: Spec 7.3, operator-approved 2026-11-01 ("Per-limit detail", "Note for 7
+#: days"), verbatim.
+PAUSED_TEXT = (
+    "Automatic credit, early-reset and status-line drop detection is paused "
+    "for {account} since {time} because {reason}. It resumes on its own, "
+    "separately for each limit. Usage recording continues; no command is "
+    "needed. If your usage was reset in place meanwhile, you can record it "
     "with `cctally record-credit`.")
-CONTROL_TEXT = ("Status-line drop detection also waits for a successful usage "
-                "refresh for this account.")
-CONTROL_ONLY_TEXT = (
-    "Status-line drop detection is paused for {account} since {time}. It "
-    "resumes after a successful usage refresh for this account.")
+PAUSE_REASONS = {
+    "legacy-spool-activity":
+        "an older cctally process wrote status-line data after the upgrade",
+    "inventory-incomplete":
+        "cctally could not read the status-line files an older cctally "
+        "release used",
+    "excluded-write": "an older cctally process wrote data after the upgrade",
+}
+RECOVERED_TEXT = ("Automatic detection resumed for {account} on {time} after "
+                  "a pause {reason}.")
+RECOVERED_REASONS = {
+    "legacy-spool-activity": "caused by an older cctally process",
+    "excluded-write": "caused by an older cctally process",
+    "inventory-incomplete":
+        "while cctally could not read the status-line files an older cctally "
+        "release used",
+}
+REFRESH = "paused - waiting for an automatic usage refresh"
 UNAVAILABLE_SUMMARY = "unavailable (no validated stats index)"
 UNAVAILABLE_REMEDIATION = ("Run any cctally command to bring the stats index "
                            "up to date, then run `cctally doctor` again.")
 
 E0 = "2026-10-12T12:00:00Z"
 F0 = "2026-10-09T14:00:00Z"
+TRIGGER_AT = "2026-10-09T10:05:00Z"
+W_END = "2026-10-19T13:00:00Z"
+W_FIVE = "2026-10-12T18:00:00Z"
+WITNESS_AT = "2026-10-12T13:00:00Z"
+B_WITNESS_AT = "2026-10-12T13:01:00Z"
+NOW = dt.datetime(2026, 10, 9, 12, tzinfo=dt.timezone.utc)
+
+
+def paused_message(account, since, cause, five, weekly):
+    return "\n".join([
+        PAUSED_TEXT.format(account=account, time=since,
+                           reason=PAUSE_REASONS[cause]),
+        f"five-hour: {five}", f"weekly: {weekly}"])
 
 
 @pytest.fixture
@@ -45,16 +74,128 @@ def _leg(app, now=None):
     state = _cctally_doctor._gather_outcome_quarantine()
     from dataclasses import fields
     kwargs = {f.name: None for f in fields(_lib_doctor.DoctorState)}
-    kwargs.update(outcome_quarantine=state,
-                  now_utc=now or dt.datetime(2026, 10, 9, 12, tzinfo=dt.timezone.utc))
+    kwargs.update(outcome_quarantine=state, now_utc=now or NOW)
     return _lib_doctor._check_accounting_outcome_quarantine(
         _lib_doctor.DoctorState(**kwargs))
+
+
+def _rows(result):
+    return {row["accountLabel"]: row for row in result.details["accounts"]}
+
+
+def _json_leg(app):
+    import contextlib
+    import io
+    args = app.build_parser().parse_args(["doctor", "--json"])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        args.func(args)
+    report = json.loads(out.getvalue())
+    checks = [c for cat in report["categories"] for c in cat["checks"]
+              if c["id"] == "accounting.outcome_quarantine"]
+    assert len(checks) == 1
+    return checks[0]
+
+
+def _states(result):
+    """The per-account states, without the time-dependent message."""
+    details = result["details"] if isinstance(result, dict) else result.details
+    return [{k: v for k, v in row.items() if k != "message"}
+            for row in details["accounts"]]
 
 
 def _seed(app, monkeypatch):
     T.current(app, monkeypatch, at="2026-10-09T10:00:00Z", weekly=10,
               week_end=E0, five=30, five_end=F0, account="A")
 
+
+def _trigger(app, monkeypatch):
+    T.legacy(app, monkeypatch, at=TRIGGER_AT, weekly=50, week_end=E0,
+             five=60, five_end=F0)
+    T.ingest(app)
+
+
+def _cover(app, monkeypatch):
+    """The automatic OAuth reconciliation after the trigger: both axes."""
+    T.oauth(app, monkeypatch, at="2026-10-09T10:10:00Z", weekly=11,
+            week_end=E0, five=31, five_end=F0)
+
+
+def _witness(app, monkeypatch):
+    """The first entry of a fresh weekly period and five-hour window."""
+    T.current(app, monkeypatch, at=WITNESS_AT, weekly=5, week_end=W_END,
+              five=5, five_end=W_FIVE)
+
+
+# --------------------------------------------------------------------------
+# the rendering kernel: every line, cause, bound and the seven-day note
+# --------------------------------------------------------------------------
+
+def _row(cause="excluded-write", five=None, weekly=None):
+    paused = {"state": "paused", "waitingFor": "usage-refresh",
+              "notBefore": None, "since": TRIGGER_AT, "recoveredAt": None,
+              "revocation": None}
+    return {"account": "acct-a", "accountLabel": "A", "cause": cause,
+            "axes": {"fiveHour": {**paused, **(five or {})},
+                     "sevenDay": {**paused, **(weekly or {})}}}
+
+
+@pytest.mark.parametrize("five,weekly,lines", [
+    ({"waitingFor": "inventory"}, {"waitingFor": "inventory"},
+     ("paused - waiting until cctally can read /data/legacy.json",
+      "paused - waiting until cctally can read /data/legacy.json")),
+    ({"waitingFor": "expiry"}, {"waitingFor": "usage-refresh"},
+     (REFRESH, REFRESH)),
+    ({"waitingFor": "fresh-period", "notBefore": "2026-10-09T14:00:00Z"},
+     {"waitingFor": "fresh-period", "notBefore": "2026-10-12T12:00:00Z"},
+     ("paused - waiting for the next five-hour window (not before "
+      "2026-10-09T14:00:00Z)",
+      "paused - waiting for the next weekly period (not before 2026-10-12)")),
+    # Spec 7.1: the clause is omitted when the bound is null or already past.
+    ({"waitingFor": "fresh-period", "notBefore": None},
+     {"waitingFor": "fresh-period", "notBefore": "2026-10-09T11:00:00Z"},
+     ("paused - waiting for the next five-hour window",
+      "paused - waiting for the next weekly period")),
+    ({"state": "recovered", "waitingFor": None,
+      "recoveredAt": "2026-10-09T11:30:00Z"},
+     {"waitingFor": "fresh-period", "notBefore": "2026-10-12T12:00:00Z"},
+     ("resumed 2026-10-09T11:30:00Z",
+      "paused - waiting for the next weekly period (not before 2026-10-12)")),
+], ids=["inventory", "refresh", "not-before", "bound-null-or-past",
+        "partial-recovery"])
+def test_each_limit_line_is_rendered_in_the_approved_wording(five, weekly, lines):
+    """Detects a limit line that names the wrong wait, an estimated or past
+    "not before" time, or a recovered limit still shown paused."""
+    import _lib_doctor
+    message = _lib_doctor._outcome_quarantine_message(
+        _row(five=five, weekly=weekly), now=NOW,
+        inventory_path="/data/legacy.json")
+    assert message == paused_message("A", TRIGGER_AT, "excluded-write", *lines)
+
+
+@pytest.mark.parametrize("cause", sorted(PAUSE_REASONS))
+def test_each_cause_has_its_reason_and_its_recovered_note(cause):
+    """Detects a pause blamed on an older process when cctally only could not
+    read the old status-line files, and a recovered note that outlives its
+    seven days."""
+    import _lib_doctor
+    message = _lib_doctor._outcome_quarantine_message(_row(cause), now=NOW)
+    assert message == paused_message("A", TRIGGER_AT, cause, REFRESH, REFRESH)
+    recovered = {"state": "recovered", "waitingFor": None}
+    row = _row(cause, five={**recovered, "recoveredAt": "2026-10-10T09:00:00Z"},
+               weekly={**recovered, "recoveredAt": "2026-10-12T13:00:00Z"})
+    last = dt.datetime(2026, 10, 12, 13, tzinfo=dt.timezone.utc)
+    note = RECOVERED_TEXT.format(account="A", time="2026-10-12T13:00:00Z",
+                                 reason=RECOVERED_REASONS[cause])
+    for now in (last, last + dt.timedelta(days=7, seconds=-1)):
+        assert _lib_doctor._outcome_quarantine_message(row, now=now) == note
+    assert _lib_doctor._outcome_quarantine_message(
+        row, now=last + dt.timedelta(days=7)) is None
+
+
+# --------------------------------------------------------------------------
+# through the real writers
+# --------------------------------------------------------------------------
 
 def test_ok_with_no_quarantine(app, monkeypatch):
     _seed(app, monkeypatch)
@@ -63,27 +204,173 @@ def test_ok_with_no_quarantine(app, monkeypatch):
     assert result.severity == "ok"
     assert result.details["available"] is True
     assert result.details["accounts"] == []
+    assert result.remediation is None
 
 
-def test_warn_per_account_with_the_approved_wording(app, monkeypatch):
+def test_a_recovery_is_rendered_limit_by_limit_until_the_note_expires(
+        app, monkeypatch):
+    """Detects a doctor that claims an account recovered while one of its
+    limits is still paused, names the wrong wait, or keeps warning once
+    every limit resumed (spec 7.2): paused waiting for a usage refresh, then
+    for fresh periods with their lower bounds, then five-hour resumed alone,
+    then OK with the recovered note for seven days, then plain OK."""
     _seed(app, monkeypatch)
     T.current(app, monkeypatch, at="2026-10-09T10:01:00Z", weekly=12,
               week_end=E0, five=40, five_end=F0, account="B")
-    T.legacy(app, monkeypatch, at="2026-10-09T10:05:00Z", weekly=50,
-             week_end=E0, five=60, five_end=F0)
-    T.ingest(app)
+    _trigger(app, monkeypatch)
     result = _leg(app)
     assert result.severity == "warn"
-    rows = {row["accountLabel"]: row for row in result.details["accounts"]}
+    rows = _rows(result)
     assert set(rows) == {"A@example.test", "B@example.test"}
     for label, row in rows.items():
-        assert row["accountingPaused"] and row["controlPaused"]
-        assert row["accountingSince"] == "2026-10-09T10:05:00Z"
-        assert row["message"] == (
-            ACCOUNTING_TEXT.format(account=label, time="2026-10-09T10:05:00Z")
-            + " " + CONTROL_TEXT)
-    # The leg never claims when recovery will happen.
-    assert "will resume" not in result.summary
+        assert row["cause"] == "excluded-write"
+        assert {a: (d["state"], d["waitingFor"], d["since"])
+                for a, d in row["axes"].items()} == {
+            "fiveHour": ("paused", "usage-refresh", TRIGGER_AT),
+            "sevenDay": ("paused", "usage-refresh", TRIGGER_AT)}
+        assert row["message"] == paused_message(
+            label, TRIGGER_AT, "excluded-write", REFRESH, REFRESH)
+    assert result.remediation == "\n".join(
+        row["message"] for row in result.details["accounts"])
+    assert result.details["inventoryEpisode"] is None
+    assert result.details["cause"] == "excluded-write"
+
+    _cover(app, monkeypatch)
+    T.oauth(app, monkeypatch, at="2026-10-09T10:11:00Z", weekly=13,
+            week_end=E0, five=41, five_end=F0, account="B")
+    message = _rows(_leg(app))["A@example.test"]["message"]
+    assert message == paused_message(
+        "A@example.test", TRIGGER_AT, "excluded-write",
+        f"paused - waiting for the next five-hour window (not before {F0})",
+        "paused - waiting for the next weekly period (not before 2026-10-12)")
+
+    # A stale weekly reading opening a fresh five-hour window: five-hour
+    # resumes on its own while weekly still waits.
+    T.current(app, monkeypatch, at="2026-10-09T15:00:00Z", weekly=12,
+              week_end=E0, five=10, five_end="2026-10-09T20:00:00Z")
+    after = dt.datetime(2026, 10, 9, 15, 30, tzinfo=dt.timezone.utc)
+    result = _leg(app, after)
+    assert result.severity == "warn"
+    assert _rows(result)["A@example.test"]["message"] == paused_message(
+        "A@example.test", TRIGGER_AT, "excluded-write",
+        "resumed 2026-10-09T15:00:00Z",
+        "paused - waiting for the next weekly period (not before 2026-10-12)")
+
+    _witness(app, monkeypatch)
+    T.current(app, monkeypatch, at=B_WITNESS_AT, weekly=6, week_end=W_END,
+              five=6, five_end=W_FIVE, account="B")
+    last = dt.datetime(2026, 10, 12, 13, 1, tzinfo=dt.timezone.utc)
+    rows = _rows(_leg(app, last))
+    recovered = {label: max(d["recoveredAt"] for d in row["axes"].values())
+                 for label, row in rows.items()}
+    assert recovered == {"A@example.test": WITNESS_AT,
+                         "B@example.test": B_WITNESS_AT}, rows
+    result = _leg(app, last)
+    assert result.severity == "ok", result
+    notes = {label: RECOVERED_TEXT.format(
+                 account=label, time=recovered[label],
+                 reason=RECOVERED_REASONS["excluded-write"])
+             for label in recovered}
+    assert result.remediation == "\n".join(
+        notes[row["accountLabel"]] for row in result.details["accounts"])
+    json_leg = _json_leg(app)
+    assert _states(json_leg) == _states(result)
+    # The recovered note reaches `--json`, and with it the dashboard modal,
+    # although the check is OK (spec 7.2: the OK result carries the note).
+    assert json_leg.get("remediation") == result.remediation
+    # Seven days after A's last limit recovered its note expires; B's stays.
+    a_expired = T.epoch(WITNESS_AT) + 7 * 86400
+    result = _leg(app, dt.datetime.fromtimestamp(a_expired, dt.timezone.utc))
+    assert result.severity == "ok"
+    assert result.remediation == notes["B@example.test"]
+    result = _leg(app, last + dt.timedelta(days=7))
+    assert result.severity == "ok" and result.remediation is None
+    assert result.summary == "no account is quarantined"
+
+
+def test_a_witness_awaiting_its_resumed_release_shows_no_future_bound(
+        app, monkeypatch):
+    """Detects a "not before" time after the witness that the next writer's
+    resumed release will beat (spec 7.1: computed before that witness)."""
+    import _cctally_quarantine as G
+    _seed(app, monkeypatch)
+    _trigger(app, monkeypatch)
+    _cover(app, monkeypatch)
+    real = G.run_release_step
+    calls = []
+
+    def crash_after_witness(account_key):
+        # The record path runs the step before each append (resume) and
+        # after it (live); the process dies before the live release.
+        calls.append(account_key)
+        if len(calls) % 2 == 0:
+            return []   # the process died before the release append
+        return real(account_key)
+
+    monkeypatch.setattr(G, "run_release_step", crash_after_witness)
+    _witness(app, monkeypatch)
+    witnessed = dt.datetime(2026, 10, 12, 13, tzinfo=dt.timezone.utc)
+    result = _leg(app, witnessed)
+    assert result.severity == "warn"
+    assert _rows(result)["A@example.test"]["message"] == paused_message(
+        "A@example.test", TRIGGER_AT, "excluded-write",
+        "paused - waiting for the next five-hour window",
+        "paused - waiting for the next weekly period")
+
+
+def test_an_account_idle_for_seven_days_is_not_listed(app, monkeypatch):
+    """Detects a doctor that WARNs forever for an account nobody uses any
+    more (operator decision F7, 2026-11-02: "Hide after 7 idle days"): an
+    account with no reading in the last seven days is left out of the leg,
+    while its limits stay paused (it resumes on its own when used again),
+    and an account in use is still listed."""
+    _seed(app, monkeypatch)
+    T.current(app, monkeypatch, at="2026-10-09T10:01:00Z", weekly=12,
+              week_end=E0, five=40, five_end=F0, account="B")
+    _trigger(app, monkeypatch)
+    assert set(_rows(_leg(app))) == {"A@example.test", "B@example.test"}
+    # A keeps recording a week later (no usage refresh yet, so still paused);
+    # B's last reading is now more than seven days old.
+    T.current(app, monkeypatch, at="2026-10-16T09:00:00Z", weekly=12,
+              week_end=W_END, five=5, five_end="2026-10-16T12:00:00Z")
+    later = dt.datetime(2026, 10, 16, 10, 30, tzinfo=dt.timezone.utc)
+    result = _leg(app, later)
+    assert result.severity == "warn"
+    assert set(_rows(result)) == {"A@example.test"}
+    assert result.summary == "automatic outcomes paused for 1 account(s)"
+    assert "B@example.test" not in (result.remediation or "")
+    assert T.account_quarantined(app, "B")
+    # Once A is idle for seven days as well, nothing is listed: OK.
+    idle = dt.datetime(2026, 10, 23, 9, 1, tzinfo=dt.timezone.utc)
+    result = _leg(app, idle)
+    assert result.severity == "ok", result
+    assert result.details["accounts"] == []
+    assert result.summary == "no account is quarantined"
+    assert result.remediation is None
+
+
+def test_a_revocation_pauses_the_limit_again(app, monkeypatch):
+    """Detects a revoked limit still reported resumed: a backdated weekly
+    reading after the recovery pauses weekly again, with its reason in
+    `--json`, while five-hour stays resumed."""
+    _seed(app, monkeypatch)
+    _trigger(app, monkeypatch)
+    _cover(app, monkeypatch)
+    _witness(app, monkeypatch)
+    T.current(app, monkeypatch, at="2026-10-12T13:05:00Z", weekly=30,
+              week_end=E0, five=5, five_end=W_FIVE)
+    later = dt.datetime(2026, 10, 12, 13, 10, tzinfo=dt.timezone.utc)
+    result = _leg(app, later)
+    assert result.severity == "warn"
+    row = _rows(result)["A@example.test"]
+    assert row["axes"]["sevenDay"]["state"] == "paused"
+    assert row["axes"]["sevenDay"]["revocation"] == "backward-key"
+    lines = row["message"].split("\n")
+    assert lines[0] == PAUSED_TEXT.format(
+        account="A@example.test", time=row["axes"]["sevenDay"]["since"],
+        reason=PAUSE_REASONS["excluded-write"])
+    assert lines[1] == f"five-hour: resumed {WITNESS_AT}"
+    assert lines[2].startswith("weekly: paused - ")
 
 
 def test_legacy_writer_quiet_for_seven_days_while_this_leg_still_warns(
@@ -91,10 +378,14 @@ def test_legacy_writer_quiet_for_seven_days_while_this_leg_still_warns(
     import _cctally_doctor
     import _lib_doctor
     _seed(app, monkeypatch)
-    T.legacy(app, monkeypatch, at="2026-10-09T10:05:00Z", weekly=50,
-             week_end=E0, five=60, five_end=F0)
-    T.ingest(app)
+    _trigger(app, monkeypatch)
     later = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=8)
+    # A keeps recording (no usage refresh yet, so it stays paused): an
+    # account idle for seven days would not be listed at all (F7).
+    recent = int((later - dt.timedelta(days=1)).timestamp()) // 3600 * 3600
+    T.current(app, monkeypatch, at=T.iso(recent), weekly=12,
+              week_end=T.iso(recent + 5 * 86400), five=5,
+              five_end=T.iso(recent + 3 * 3600))
     from dataclasses import fields
     kwargs = {f.name: None for f in fields(_lib_doctor.DoctorState)}
     kwargs.update(
@@ -122,74 +413,6 @@ def test_unavailable_never_ok_on_an_unvalidated_index(app, monkeypatch):
     assert result.remediation == UNAVAILABLE_REMEDIATION
 
 
-def test_control_only_row_uses_the_operator_approved_standalone_wording():
-    """An account whose accounting certificate is back but whose control
-    certificate is still missing gets a standalone sentence. The approved
-    control sentence starts with "also" and is only an addendum to the
-    accounting one (operator decision dec-5d2a9c2b004a)."""
-    import _lib_doctor
-    row = {"account": "acct-a", "accountLabel": "A", "accountingPaused": False,
-           "controlPaused": True, "controlSince": F0}
-    assert _lib_doctor._outcome_quarantine_message(row) == (
-        CONTROL_ONLY_TEXT.format(account="A", time=F0))
-    both = {**row, "accountingPaused": True, "accountingSince": F0}
-    assert _lib_doctor._outcome_quarantine_message(both) == (
-        ACCOUNTING_TEXT.format(account="A", time=F0) + " " + CONTROL_TEXT)
-
-
-def test_recovery_clears_the_account_and_json_carries_the_states(
-        app, monkeypatch):
-    _seed(app, monkeypatch)
-    T.legacy(app, monkeypatch, at="2026-10-09T10:05:00Z", weekly=50,
-             week_end=E0, five=60, five_end=F0)
-    T.ingest(app)
-    # An idle gap spanning the weekly reset and the five-hour window end; a
-    # bound two-axis OAuth publication certifies accounting, witnesses control
-    # in the index AND records its commit in A's reconciled control
-    # transition — the combined predicate doctor's "recovered" claim needs
-    # (#825/#832 fix-round-1 Q6).
-    import argparse
-    import _cctally_statusline as sl
-    T.set_clock(monkeypatch, "2026-10-12T13:00:00Z")
-    T.identity("A")
-    published = sl._authoritative_record_usage(
-        argparse.Namespace(
-            percent=5, resets_at=str(T.epoch("2026-10-19T13:00:00Z")),
-            five_hour_percent=5,
-            five_hour_resets_at=str(T.epoch("2026-10-12T18:00:00Z")),
-            source="api"),
-        ("sevenDay", "fiveHour"),
-        binding=sl._capture_binding(credential="token-A"),
-        nudge_dashboard=False)
-    assert published.status == "ok", published
-    result = _leg(app)
-    labels = {row["accountLabel"] for row in result.details["accounts"]}
-    assert "A@example.test" not in labels
-    import _cctally_doctor
-    args = app.build_parser().parse_args(["doctor", "--json"])
-    import contextlib
-    import io
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        args.func(args)
-    report = json.loads(out.getvalue())
-    checks = [c for cat in report["categories"] for c in cat["checks"]
-              if c["id"] == "accounting.outcome_quarantine"]
-    assert len(checks) == 1
-    assert checks[0]["details"]["accounts"] == result.details["accounts"]
-
-
-#: Spec revision 3 (section 8): the operator-approved wording for an account
-#: paused by an unresolved spool marker, verbatim.
-MARKER_TEXT = (
-    "Automatic credit, reset and status-line drop detection is paused for "
-    "{account} since {time} because an older cctally process wrote "
-    "status-line data after the upgrade. This version of cctally cannot yet "
-    "confirm a safe point to resume, so the pause does not end on its own; "
-    "usage recording continues. If your usage was reset in place meanwhile, "
-    "record it with `cctally record-credit`.")
-
-
 def _spool_trigger(app, monkeypatch, at):
     """A legacy render's spool write, journaled by the current reducer as a
     digest-only `legacy_spool_activity` op, then ingested."""
@@ -205,80 +428,43 @@ def _spool_trigger(app, monkeypatch, at):
     T.ingest(app)
 
 
-def _json_leg(app):
-    import contextlib
-    import io
-    args = app.build_parser().parse_args(["doctor", "--json"])
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        args.func(args)
-    report = json.loads(out.getvalue())
-    checks = [c for cat in report["categories"] for c in cat["checks"]
-              if c["id"] == "accounting.outcome_quarantine"]
-    assert len(checks) == 1
-    return checks[0]
-
-
-def _assert_marker_warn(app, count, labels, first=None):
-    """The WARN in the marker wording; returns the rows and the markers. The
-    op's `at` is its append time, so the pause dates from the first marker
-    (``first``, once known)."""
-    result = _leg(app)
-    assert result.severity == "warn", result
-    markers = result.details["unresolvedSpoolMarkers"]
-    assert len(markers) == count, markers
-    assert all(m["segment"] and isinstance(m["offset"], int) and m["at"]
-               for m in markers), markers
-    if first is not None:
-        assert markers[0] == first, (markers, first)
-    since = markers[0]["at"]
-    rows = {row["accountLabel"]: row for row in result.details["accounts"]}
-    assert set(rows) == set(labels), rows
-    for label, row in rows.items():
-        assert row["accountingPaused"] and row["unresolvedSpoolMarker"], row
-        assert row["accountingSince"] == since, row
-        assert row["message"] == MARKER_TEXT.format(account=label, time=since)
-    assert result.remediation == " ".join(
-        MARKER_TEXT.format(account=label, time=since)
-        for label in [row["accountLabel"]
-                      for row in result.details["accounts"]])
-    # `--json` carries the same state.
-    assert _json_leg(app)["details"] == result.details
-    return rows, markers[0]
-
-
-def test_an_unresolved_spool_marker_keeps_the_warn_in_the_revision_3_wording(
+def test_a_spool_trigger_names_its_cause_and_survives_a_rebuild(
         app, monkeypatch):
-    """Spec revision 3 (F16, F15 (f)): after a spool-only trigger the WARN
-    persists through the recovery schedule that clears an excluded-write
-    quarantine — an idle gap spanning the weekly reset and the five-hour end
-    and a bound two-axis OAuth publication — and through `db rebuild`, in the
-    section 8 marker wording. A later trigger keeps the earlier marker."""
-    import argparse
-    import _cctally_statusline as sl
+    """Detects a spool-only pause blamed on a data write, or rendered
+    differently by `--json` or after `db rebuild` (the barrier is
+    journal-only)."""
     _seed(app, monkeypatch)
-    _spool_trigger(app, monkeypatch, "2026-10-09T10:05:00Z")
-    _rows, first = _assert_marker_warn(app, 1, {"A@example.test"})
-    T.set_clock(monkeypatch, "2026-10-12T13:00:00Z")
-    T.identity("A")
-    published = sl._authoritative_record_usage(
-        argparse.Namespace(
-            percent=5, resets_at=str(T.epoch("2026-10-19T13:00:00Z")),
-            five_hour_percent=5,
-            five_hour_resets_at=str(T.epoch("2026-10-12T18:00:00Z")),
-            source="api"),
-        ("sevenDay", "fiveHour"),
-        binding=sl._capture_binding(credential="token-A"),
-        nudge_dashboard=False)
-    assert published.status == "ok", published
-    rows, _first = _assert_marker_warn(app, 1, {"A@example.test"}, first)
-    # The control certificate reconciled independently; the marker still
-    # pauses drop detection, which needs the accounting certificate too.
-    assert rows["A@example.test"]["controlPaused"] is False
+    _spool_trigger(app, monkeypatch, TRIGGER_AT)
+    result = _leg(app)
+    assert result.severity == "warn"
+    row = _rows(result)["A@example.test"]
+    since = row["axes"]["sevenDay"]["since"]
+    assert row["cause"] == "legacy-spool-activity"
+    assert row["message"] == paused_message(
+        "A@example.test", since, "legacy-spool-activity", REFRESH, REFRESH)
+    assert _states(_json_leg(app)) == _states(result)
     T.rebuild(app)
-    _assert_marker_warn(app, 1, {"A@example.test"}, first)
-    # A later trigger starts a new generation and keeps the earlier marker.
-    _spool_trigger(app, monkeypatch, "2026-10-12T13:05:00Z")
-    _assert_marker_warn(app, 2, {"A@example.test"}, first)
-    T.rebuild(app)
-    _assert_marker_warn(app, 2, {"A@example.test"}, first)
+    assert _leg(app).details == result.details
+
+
+def test_an_account_waiting_for_the_inventory_names_that_cause(
+        app, monkeypatch):
+    """Review finding F8: the cause is derived per account. An account whose
+    limits wait for the spool inventory is paused because the inventory is
+    incomplete, even when a later excluded write is the generation's latest
+    trigger; the report-level cause stays that latest trigger's. Detects a
+    paused account told the wrong reason (and so the wrong remedy)."""
+    import errno
+    import _cctally_core as core
+    import _cctally_journal as jr
+    _seed(app, monkeypatch)
+    T.set_clock(monkeypatch, "2026-10-09T10:02:00Z")
+    jr.record_legacy_spool_inventory_incomplete(jr.LegacySpoolInventoryIncomplete(
+        errno.EIO, "injected", str(core.STATUSLINE_CANDIDATE_DIR),
+        operation="list", path=core.STATUSLINE_CANDIDATE_DIR))
+    _trigger(app, monkeypatch)
+    result = _leg(app)
+    assert result.details["cause"] == "excluded-write"
+    row = _rows(result)["A@example.test"]
+    assert {axis["waitingFor"] for axis in row["axes"].values()} == {"inventory"}
+    assert row["cause"] == "inventory-incomplete"

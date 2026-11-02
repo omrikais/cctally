@@ -590,6 +590,18 @@ def test_doctor_warns_with_seeded_unpriced_model(tmp_path):
     models = [g["model"] for g in c["details"]["unpriced"]]
     assert "claude-totally-made-up-9000" in models
     assert c["details"]["unpriced"][0]["token_total"] == 12345
+    # The same payload carries the Claude cache freshness read
+    # (`SELECT COUNT(*), MAX(timestamp_utc) FROM session_entries`), whose
+    # OperationalError is swallowed as "table missing — treat as zero". A broken
+    # query would render this populated cache as `0 entries`, a wrong-but-OK
+    # freshness verdict; this is the only end-to-end detector of that read now
+    # that the 18-pricing-unpriced-model golden is gone (protection map §12).
+    sync = _doctor_check(payload, "data.cache_sync_state")
+    assert sync["details"]["entries"] == 1, sync
+    # The entry was seeded one day before the wall clock doctor reads, so the
+    # age is a day plus this test's own runtime (bounded well under 10 minutes).
+    age_s = sync["details"]["cache_last_entry_age_s"]
+    assert isinstance(age_s, int) and 86_400 <= age_s < 86_400 + 600, sync
 
 
 def test_doctor_coverage_scan_emits_no_cost_warning_on_stderr(tmp_path):

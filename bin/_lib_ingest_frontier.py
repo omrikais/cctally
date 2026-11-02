@@ -435,6 +435,8 @@ class ObservedFile(NamedTuple):
     container_known: bool = False
     kind: str = "plain"
     mtime_ns: "int | None" = None
+    #: #970: ``"dated"`` or ``"archive"`` — where the selected container is.
+    location: str = _rc.DATED
 
 
 class ContainerEvidence(NamedTuple):
@@ -448,6 +450,30 @@ class ContainerEvidence(NamedTuple):
     inode: "int | None"
     state: str
     pending_fingerprint: "str | None"
+    #: #970 spec 5.5: the stored ``container_path`` — None means the accepted
+    #: container is the logical path; otherwise the container's path.
+    location: "str | None" = None
+
+    def accepted_location(self, logical, archive_dir) -> str:
+        """``"archive"`` when the accepted container sits in ``archive_dir``.
+
+        The stored path's DIRECTORY is compared, canonically when the
+        spellings differ, so a symlinked file in the archive is still an
+        archive container — exactly as selection names its location. No
+        archive directory, or an uncontained stored path, is ``"dated"``.
+        """
+        if self.location is None or archive_dir is None:
+            return _rc.DATED
+        parent = pathlib.Path(self.location).parent
+        if parent == pathlib.Path(logical).parent:
+            return _rc.DATED
+        if parent == pathlib.Path(archive_dir):
+            return _rc.ARCHIVE
+        try:
+            same = os.path.realpath(parent) == os.path.realpath(archive_dir)
+        except (OSError, ValueError):
+            return _rc.DATED
+        return _rc.ARCHIVE if same else _rc.DATED
 
     def _same_container(self, kind: str, st) -> bool:
         if kind != self.kind or source_identity_replaced(
@@ -479,7 +505,8 @@ class ContainerEvidence(NamedTuple):
 
 _CONTAINER_EVIDENCE_COLUMNS = (
     "path, container_kind, container_size_bytes, decoded_size_bytes, "
-    "mtime_ns, device_id, inode, container_state, pending_container_fingerprint")
+    "mtime_ns, device_id, inode, container_state, pending_container_fingerprint, "
+    "container_path")
 
 
 def _container_evidence_for(conn, table: str, paths) -> "dict[str, ContainerEvidence]":
@@ -502,43 +529,61 @@ def _container_evidence_for(conn, table: str, paths) -> "dict[str, ContainerEvid
                     f"WHERE path IN ({placeholders})", chunk):
                 out[str(row[0])] = ContainerEvidence(
                     row[1] or _rc.PLAIN, row[2], row[3], row[4], row[5],
-                    row[6], row[7] or "accepted", row[8])
+                    row[6], row[7] or "accepted", row[8], row[9])
     except sqlite3.OperationalError:
         return {}
     return out
 
 
-def _observe_logical(path: str, evidence: "ContainerEvidence | None"):
+def _observe_logical(path: str, evidence: "ContainerEvidence | None", *,
+                     archive_dir=None):
     """Restat one LOGICAL rollout through its selected container (5.2, 5.9).
 
     Plain wins and keeps today's single ``pathlib`` stat, so a plain estate
     is observed exactly as before; the ``.zst`` twin is statted only when the
-    plain file is absent.
+    plain file is absent, and — #970 — the archive candidates only when neither dated
+    container exists and the caller names the archive directory, in the
+    leaf's selection order.
+
+    #970 A8: location is observed separately from content. A container at a
+    different location than the cursor accepted is pending location
+    adoption — never a cursor gap or a vanished file. When the stat evidence
+    otherwise accepts it, the walk adopts the location on its next pass, so
+    the hold is ``container_known`` (the move itself changes certified
+    directory evidence, which is what schedules that pass); any other
+    relocation is a new container transition and is requested once.
     """
-    kind = _rc.PLAIN
-    try:
-        st = pathlib.Path(path).stat()
-    except OSError:
+    st = None
+    for kind, location, candidate in _rc.container_candidates(
+            path, archive_dir=archive_dir):
         try:
-            st = pathlib.Path(_rc.zstd_twin(path)).stat()
+            st = candidate.stat()
         except OSError:
-            return None
-        kind = _rc.ZSTD
+            continue
+        break
+    if st is None:
+        return None
+    if (evidence is not None and evidence.state == "accepted"
+            and evidence.accepted_location(path, archive_dir) != location):
+        return ObservedFile(
+            0, st.st_dev, st.st_ino, container_pending=True,
+            container_known=evidence.accepts(kind, st),
+            kind=kind, mtime_ns=st.st_mtime_ns, location=location)
     if evidence is not None and evidence.accepts(kind, st):
         size = (st.st_size if kind == _rc.PLAIN
                 else int(evidence.decoded_size))
         return ObservedFile(size, st.st_dev, st.st_ino, kind=kind,
-                            mtime_ns=st.st_mtime_ns)
+                            mtime_ns=st.st_mtime_ns, location=location)
     if kind == _rc.PLAIN and (evidence is None or (
             evidence.state == "accepted" and evidence.kind == _rc.PLAIN)):
         # Today's plain evidence: append, shrink and replacement are decided
         # by the existing classifier from size and identity.
         return ObservedFile(st.st_size, st.st_dev, st.st_ino, kind=kind,
-                            mtime_ns=st.st_mtime_ns)
+                            mtime_ns=st.st_mtime_ns, location=location)
     return ObservedFile(
         0, st.st_dev, st.st_ino, container_pending=True,
         container_known=evidence is not None and evidence.holds(kind, st),
-        kind=kind, mtime_ns=st.st_mtime_ns)
+        kind=kind, mtime_ns=st.st_mtime_ns, location=location)
 
 
 def source_identity_replaced(
@@ -781,9 +826,10 @@ def _bump_counter(name: str, amount: int = 1) -> None:
 
 
 def _observe_file(path: str, table: str,
-                  evidence: "ContainerEvidence | None" = None) -> "ObservedFile | None":
+                  evidence: "ContainerEvidence | None" = None, *,
+                  archive_dir=None) -> "ObservedFile | None":
     _bump_counter(f"retained_file_visits.{table}")
-    return _observe_logical(path, evidence)
+    return _observe_logical(path, evidence, archive_dir=archive_dir)
 
 
 #: The two Codex cursor tables the restat may read, and whether each carries
@@ -820,7 +866,7 @@ def _ingest_source_table(provider: str) -> str:
 
 
 def plan_recent_active_restat(
-    conn, *, table: str = "codex_session_files", extra_paths=(),
+    conn, *, table: str = "codex_session_files", extra_paths=(), roots=(),
 ):
     """Restat the bounded recent set and return ``(targets, escalation)``.
 
@@ -829,7 +875,9 @@ def plan_recent_active_restat(
     targeted work at all, in which case the caller must walk exhaustively.
 
     An empty recent set performs ZERO stats, which is the whole shape of an
-    idle caught-up tick on the production store.
+    idle caught-up tick on the production store. ``roots`` are the plan's
+    frontier roots; their archive directories are the candidates an archived
+    rollout is observed in (#970).
     """
     try:
         candidates = select_recently_active_codex_paths(
@@ -847,7 +895,8 @@ def plan_recent_active_restat(
     for path, (size, offset, complete, device, inode) in sorted(
         candidates.items()
     ):
-        observed = _observe_file(path, table, evidence.get(path))
+        observed = _observe_file(path, table, evidence.get(path),
+                                 archive_dir=_archive_dir_for(path, roots))
         verdict = classify_recent_active_path(
             committed_size=size,
             committed_offset=offset,
@@ -968,12 +1017,27 @@ def _configuration_generation_reason(
     return "configuration_generation_changed"
 
 
+def _codex_ticket_logical(path, roots) -> str:
+    """One Codex ticket's logical target (#968 5.9, #970 5.8).
+
+    Either container spelling names one logical rollout; an archive spelling
+    of a native home names its dated logical path. Anything else keeps its
+    own logical spelling, which containment then judges.
+    """
+    dated = _rc.dated_logical_for_archive(path, _codex_locations_of(roots))
+    if dated is not None:
+        return os.fspath(dated)
+    return os.fspath(_rc.logical_path(path))
+
+
 def _ticket_target_paths(provider: str, records, roots):
     """The ticketed paths this plan may target, or a refusal reason.
 
     #968 spec 5.9: a Codex ticket may name either spelling; it is
     normalized to ONE logical target, and containment is enforced on the
-    selected physical container.
+    selected physical container. #970 spec 5.8: an archive spelling is
+    normalized to its dated logical path BEFORE de-duplication, so the
+    archive pathname never becomes a second target.
     """
     provider_paths = tuple(
         path for kind, path, _e, _s, _c in records if kind == provider)
@@ -981,7 +1045,7 @@ def _ticket_target_paths(provider: str, records, roots):
         return None, "ambiguous_activity"
     if provider == "codex":
         provider_paths = tuple(
-            os.fspath(_rc.logical_path(path)) for path in provider_paths)
+            _codex_ticket_logical(path, roots) for path in provider_paths)
     paths = frozenset(provider_paths)
     if any(not _target_in_roots(path, roots,
                                 allow_compressed=provider == "codex")
@@ -992,7 +1056,7 @@ def _ticket_target_paths(provider: str, records, roots):
 
 def _restat_and_return(
     provider: str, conn, *, cursor_table: str, paths, marker_end: int,
-    ledger_epoch, ledger_sequence: int,
+    ledger_epoch, ledger_sequence: int, roots=(),
 ):
     """#724's bounded restat, then the caught-up or targeted plan it implies.
 
@@ -1012,7 +1076,7 @@ def _restat_and_return(
     restat_paths = frozenset()
     if provider == "codex":
         restat_paths, escalation = plan_recent_active_restat(
-            conn, table=cursor_table, extra_paths=paths)
+            conn, table=cursor_table, extra_paths=paths, roots=roots)
         if escalation is not None:
             return FrontierPlan(provider, "full", reason=escalation)
     combined = paths | restat_paths
@@ -1687,6 +1751,70 @@ def _write_generation_stamp(conn, provider: str, generation: str) -> None:
         pass
 
 
+def codex_frontier_roots(configured_homes) -> "tuple[_rc.CodexLocations, ...]":
+    """The Codex frontier roots for the configured homes (#970 spec 5.1, 5.8).
+
+    One ``CodexLocations`` per configured entry, by the leaf's native-home
+    recognition: a home with ``sessions/`` or ``archived_sessions/`` walks
+    ``<home>/sessions`` and owns ``<home>/archived_sessions``; any other
+    existing directory is walked directly with no archive; anything else is
+    not a root. De-duplicated by walk root in configured order, exactly as the
+    walk's own roots are. Both the dashboard and the TUI build their frontier
+    roots here, so the two planners and the walk agree on the scope.
+    """
+    out: "list[_rc.CodexLocations]" = []
+    seen: set = set()
+    for configured in configured_homes:
+        locations = _rc.home_locations(configured)
+        if locations is None or locations.walk_root in seen:
+            continue
+        seen.add(locations.walk_root)
+        out.append(locations)
+    # #970 N4: an archive another configured root walks belongs to that root,
+    # exactly as in the walk's own roots.
+    return tuple(_rc.release_walked_archives(out))
+
+
+def _codex_locations_of(roots) -> "tuple[_rc.CodexLocations, ...]":
+    """The ``CodexLocations`` among frontier roots (a bare path has none)."""
+    return tuple(root for root in roots if isinstance(root, _rc.CodexLocations))
+
+
+def _flatten_frontier_roots(roots) -> tuple:
+    """The directory roots the certificate and containment are stated over.
+
+    A ``CodexLocations`` contributes its walk root and, when it exists, its
+    archive directory (#970 spec 5.8: an archive directory is certified
+    directory evidence and a permitted container location). A bare path — the
+    Claude roots, and a caller that predates #970 — contributes itself. A home
+    without an archive therefore flattens to exactly the pre-#970 root, so its
+    certificate identity is unchanged; an archive appearing later changes the
+    root set, which is itself a reason to walk.
+    """
+    flat: list = []
+    for root in roots:
+        if isinstance(root, _rc.CodexLocations):
+            flat.append(root.walk_root)
+            archive = root.archive_root
+            if archive is not None:
+                try:
+                    if pathlib.Path(archive).is_dir():
+                        flat.append(archive)
+                except OSError:
+                    pass
+        else:
+            flat.append(root)
+    return tuple(flat)
+
+
+def _archive_dir_for(path, roots):
+    """The archive directory holding ``path``'s archive candidates, or None."""
+    locations = _codex_locations_of(roots)
+    if not locations:
+        return None
+    return _rc.archive_dir_for(path, locations)
+
+
 def normalized_root_membership(roots) -> tuple[str, ...]:
     """The configured root SET, as certificate identity.
 
@@ -1694,10 +1822,12 @@ def normalized_root_membership(roots) -> tuple[str, ...]:
     while adding or removing an entry is. Without this a configured root could
     be added or removed with no filesystem change anywhere and an old
     certificate would still look caught up, because plan-time roots were used
-    only to validate ticket targets.
+    only to validate ticket targets. Codex roots are flattened first, so an
+    existing archive directory is a member (#970).
     """
     return tuple(sorted({
-        str(pathlib.Path(root).absolute()) for root in roots
+        str(pathlib.Path(root).absolute())
+        for root in _flatten_frontier_roots(roots)
     }))
 
 
@@ -1831,7 +1961,8 @@ def _source_directory_closure(read_sources, roots) -> tuple[pathlib.Path, ...]:
     the seed path treats as a non-certifiable walk rather than behind a store
     error.
     """
-    normalized_roots = tuple(pathlib.Path(root).absolute() for root in roots)
+    normalized_roots = tuple(
+        pathlib.Path(root).absolute() for root in _flatten_frontier_roots(roots))
     root_strings = tuple(str(root) for root in normalized_roots)
     # A canonical parent strictly below root `r` starts with `r + "/"`; the
     # filesystem root is already its own prefix. A root anchored at `//` can
@@ -1984,7 +2115,8 @@ def _validate_marker_prefix(marker: pathlib.Path, cutoff: "MarkerCutoff") -> Non
     _decode_marker_records(raw)
 
 
-def _target_has_cursor_gap(conn, provider: str, source_path: str) -> bool:
+def _target_has_cursor_gap(conn, provider: str, source_path: str, *,
+                           roots=()) -> bool:
     table = "session_files" if provider == "claude" else "codex_session_files"
     row = conn.execute(
         f"SELECT size_bytes, last_byte_offset FROM {table} WHERE path=?",
@@ -1996,7 +2128,8 @@ def _target_has_cursor_gap(conn, provider: str, source_path: str) -> bool:
     if provider == "codex":
         observed = _observe_logical(
             source_path,
-            _container_evidence_for(conn, table, [source_path]).get(source_path))
+            _container_evidence_for(conn, table, [source_path]).get(source_path),
+            archive_dir=_archive_dir_for(source_path, roots))
         if observed is None:
             return True
         if observed.container_pending:
@@ -2011,13 +2144,26 @@ def _target_has_cursor_gap(conn, provider: str, source_path: str) -> bool:
 
 def _target_in_roots(source_path: str, roots, *,
                      allow_compressed: bool = False) -> bool:
+    """Whether a ticketed path's selected container lies inside the roots.
+
+    #970 spec 5.8 (A7): a Codex logical path is selected through its archive
+    candidates too, and the container is bounded by the union of the walk
+    roots and the existing archive directories. A logical path spelled
+    INSIDE an archive directory has no dated identity (an unmappable or
+    nested archive name) and is refused, because discovery never ingests it.
+    """
     path = pathlib.Path(source_path)
     if not path.is_absolute():
         return False
     if allow_compressed:
         if not _rc.is_container_name(path.name):
             return False
-        selected = _rc.select_container(path)
+        for location in _codex_locations_of(roots):
+            archive = location.archive_root
+            if archive is not None and path.is_relative_to(archive):
+                return False
+        selected = _rc.select_container(
+            path, archive_dir=_archive_dir_for(path, roots))
         if selected is None:
             return False
         physical = selected.path
@@ -2031,7 +2177,7 @@ def _target_in_roots(source_path: str, roots, *,
         return False
     if not resolved.is_file():
         return False
-    for root in roots:
+    for root in _flatten_frontier_roots(roots):
         try:
             resolved.relative_to(pathlib.Path(root).resolve(strict=True))
         except (OSError, ValueError):
@@ -2084,6 +2230,57 @@ def provider_sync_certifiable(mode: str, stats: object) -> bool:
     if mode == "full":
         return bool(getattr(stats, "full_walk_complete", False))
     return False
+
+
+
+#: #939 D5: what an accounting tick could not finish, per provider. A refusal
+#: or a per-file leftover keeps ``drained`` from releasing writeIo's admission
+#: hold, and a change in it between two counted conversation passes keeps the
+#: second from settling.
+ACCOUNTING_RESIDUAL_FIELDS = (
+    "deferred_reason", "rebuild_refused", "prune_refused",
+    "finalization_deferred", "maintenance_failed", "files_failed",
+    "files_deferred_torn", "container_pending",
+)
+
+
+def accounting_census_complete(
+    mode: str, stats: object, *, expected_paths: int = 0,
+) -> bool:
+    """Whether one accounting result visited its whole census (#939 D5).
+
+    A frontier-certified ``caught_up`` plan covers its census; a missing result
+    in any other mode does not. Otherwise only what cut the walk short fails
+    it (lock contention, an exhausted budget, a drain yield, Codex backlog
+    files), and a targeted census must be exactly its plan. It deliberately
+    reads neither ``full_walk_complete`` nor ``targeted_clean``: one
+    persistently unreadable file clears both, and a refusal or a leftover is
+    the tick's residual (``accounting_residual``), not an unvisited census.
+    """
+    if mode == "caught_up":
+        return True
+    if stats is None:
+        return False
+    if any((
+        getattr(stats, "lock_contended", False),
+        getattr(stats, "budget_exhausted", False),
+        getattr(stats, "drain_yielded", False),
+        getattr(stats, "backlog_files", 0),
+    )):
+        return False
+    if mode == "targeted":
+        return int(getattr(stats, "files_total", 0) or 0) == expected_paths
+    return mode == "full"
+
+
+def accounting_residual(stats: object) -> tuple:
+    """The ``(name, value)`` pairs of what one accounting result left
+    unfinished (#939 D5); ``()`` when nothing."""
+    if stats is None:
+        return ()
+    return tuple(
+        (name, value) for name in ACCOUNTING_RESIDUAL_FIELDS
+        if (value := getattr(stats, name, None)))
 
 
 class DashboardIngestFrontier:
@@ -2295,12 +2492,13 @@ class DashboardIngestFrontier:
         if reason is not None:
             return FrontierPlan(
                 provider, "full", marker_end=marker_end, reason=reason)
-        if any(_target_has_cursor_gap(conn, provider, path) for path in paths):
+        if any(_target_has_cursor_gap(conn, provider, path, roots=roots)
+               for path in paths):
             return FrontierPlan(provider, "full", reason="cursor_gap")
         return _restat_and_return(
             provider, conn, cursor_table=_ingest_source_table(provider),
             paths=paths, marker_end=marker_end, ledger_epoch=ledger_epoch,
-            ledger_sequence=ledger_sequence,
+            ledger_sequence=ledger_sequence, roots=roots,
         )
 
     def commit_provider(
@@ -2392,7 +2590,8 @@ def _conversation_directory_identity(conn, provider: str, roots):
     }
 
 
-def _conversation_target_risk(conn, provider: str, source_path: str) -> str | None:
+def _conversation_target_risk(conn, provider: str, source_path: str, *,
+                              roots=()) -> str | None:
     """Classify a ticketed path that cannot use ordinary append ingest."""
     table = _conversation_source_table(provider)
     row = conn.execute(
@@ -2408,7 +2607,8 @@ def _conversation_target_risk(conn, provider: str, source_path: str) -> str | No
         # planner, so the two planners converge.
         observed = _observe_logical(
             source_path,
-            _container_evidence_for(conn, table, [source_path]).get(source_path))
+            _container_evidence_for(conn, table, [source_path]).get(source_path),
+            archive_dir=_archive_dir_for(source_path, roots))
         if observed is None:
             return "cursor_gap"
         if observed.container_pending:
@@ -2468,6 +2668,39 @@ def conversation_sync_certifiable(
         # is therefore the proof that the exhaustive discovery actually drained.
         return completed == total and not getattr(stats, "prune_debt_pending", 0)
     return False
+
+
+
+def conversation_census_complete(
+    mode: str, stats: object, *, expected_paths: int = 0,
+) -> bool:
+    """Whether one transcript pass visited every file of its census (#939 D5).
+
+    `conversation_sync_certifiable` without the predicates and the
+    completed-count equality that describe per-file leftovers (failed, torn,
+    pending, held and deferred files, refused prunes and prune debt,
+    ``barrier_retry``): those are the pass's residual, which writeIo's
+    admission hold compares between passes. Only what cut the walk short and
+    finishes on its own fails it (lock contention, an exhausted budget), and a
+    targeted census must be exactly its plan. A deferred reason (a refused
+    pricing write, a pending rebuild, an unavailable barrier, too little free
+    space) and a maintenance failure can repeat for the dashboard's whole
+    life, so they join the residual instead
+    (`_lib_write_io.conversation_residual`): a changed one restarts the
+    settled chain and an identical one settles.
+    """
+    if mode == "caught_up":
+        return True
+    if stats is None:
+        return False
+    if any((
+        getattr(stats, "lock_contended", False),
+        getattr(stats, "budget_exhausted", False),
+    )):
+        return False
+    if mode == "targeted":
+        return int(getattr(stats, "files_total", 0) or 0) == expected_paths
+    return mode == "full"
 
 
 def _codex_publication_backlog(conn) -> "tuple[bool, frozenset[str]]":
@@ -2692,7 +2925,7 @@ class ConversationSyncFrontier:
             return FrontierPlan(
                 provider, "full", marker_end=marker_end, reason=reason)
         target_risks = {
-            _conversation_target_risk(conn, provider, path)
+            _conversation_target_risk(conn, provider, path, roots=roots)
             for path in paths
         }
         if "source_replaced" in target_risks:
@@ -2702,7 +2935,7 @@ class ConversationSyncFrontier:
         plan = _restat_and_return(
             provider, conn, cursor_table=_conversation_source_table(provider),
             paths=paths, marker_end=marker_end, ledger_epoch=ledger_epoch,
-            ledger_sequence=ledger_sequence,
+            ledger_sequence=ledger_sequence, roots=roots,
         )
         if provider == "codex" and plan.mode in ("caught_up", "targeted"):
             due, backlog = _codex_publication_backlog(conn)

@@ -46,89 +46,51 @@ def _user_facing_wrappers() -> str:
 USER_FACING_WRAPPERS = _user_facing_wrappers()
 
 SCENARIOS = {
+    # Test regime reset, session 5 (Task 5.8): the doctor goldens keep the
+    # representative cases only. A scenario whose rows another scenario
+    # already renders byte for byte, or whose gather leg and check branch a
+    # pytest test already drives, was deleted; section 12 of
+    # docs/superpowers/plans/2026-10-20-test-regime-reset-protection-map.md
+    # names the retained detector of each.
     "01-all-ok":                 "all_ok",
-    "02-hooks-missing":          "hooks_missing",
-    "03-stale-snapshot-1h":      "stale_snapshot_1h",
-    "04-stale-snapshot-30m":     "stale_snapshot_30m",
-    "05-migration-failed":       "migration_failed",
-    "06-dashboard-bind-lan":     "dashboard_bind_lan",
     "07-corrupt-update-state":   "corrupt_update_state",
-    "08-oauth-token-missing":    "oauth_token_missing",
     "09-codex-cache-present":    "codex_cache_present",
-    "10-legacy-hooks-detected":  "legacy_hooks_detected",
+    # The mixed report: hooks missing, OAuth missing, a failed migration and
+    # a snapshot stale past an hour, each row as its single-failure scenario
+    # rendered it before those were cut.
     "11-multi-fail-mixed":       "multi_fail_mixed",
     "12-corrupt-config-json":    "corrupt_config_json",
-    "13-corrupt-update-suppress": "corrupt_update_suppress",
-    "14-legacy-snippet-in-comment-ignored": "legacy_snippet_in_comment",
-    # Issue #119: brew ~/.local/bin policy + availability-aware install
-    # checks. These rely on the harness's per-scenario input.env PATH knobs
-    # (DOCTOR_INCLUDE_PREFIX_BIN / DOCTOR_OMIT_LOCAL_BIN_FROM_PATH); see
-    # bin/cctally-doctor-test::compute_fake_path.
-    "15-brew-stale-links":       "brew_stale_links",
-    "16-path-ok-local-bin-off":  "path_ok_local_bin_off",
+    # Issue #119: brew ~/.local/bin policy. The only end-to-end detector of
+    # the gather's `symlinks_path_pinned` predicate; see
+    # bin/cctally-doctor-test::compute_fake_path for the PATH knobs.
     "17-brew-pinned-only-path":  "brew_pinned_only_path",
-    # Pricing-freshness check (spec 2026-05-29): an in-window unpriced
-    # Claude model seeds the cache so `pricing.coverage` WARNs.
-    "18-pricing-unpriced-model": "pricing_unpriced_model",
     # Version-ahead check: cache.db ahead auto-heals. A stats epoch mismatch
     # rebuilds only when journal bytes exist; the no-journal case reports the
     # restoration requirement instead of promising an impossible auto-heal.
     "19-cache-version-ahead":    "cache_version_ahead",
     "20-stats-version-ahead":    "stats_version_ahead",
     "21-codex-quota-fresh-stale": "codex_quota_fresh_stale",
-    "22-codex-quota-fresh-future": "codex_quota_fresh_future",
-    "23-codex-lifecycle-recent-never": "codex_lifecycle_recent_never",
-    "24-codex-lifecycle-recent-stale": "codex_lifecycle_recent_stale",
-    # #311: a recognized cctally statusLine command with NO refreshInterval →
-    # the only WARN is hooks.statusline_refresh_interval (all_ok otherwise).
-    "25-statusline-refresh-missing": "statusline_refresh_missing",
-    # #318: a write-ahead authoritative tombstone survived a prior writer,
-    # so doctor must surface the bounded repair action without mutating it.
-    "26-statusline-authority-repair": "statusline_authority_repair",
-    # #315: cache.db with a deliberately high free-page ratio. The doctor
-    # check must WARN and point at the guarded explicit vacuum command.
-    "27-cache-reclaimable":          "cache_reclaimable",
-    # #411: paired real-output fixtures for a rebuildable stats mismatch and
-    # a data dir resolved inside an unexcluded file-level sync root.
+    # #411: a rebuildable stats mismatch (journal bytes present).
     "28-stats-mismatch-with-journal": "stats_mismatch_with_journal",
-    "29-backup-sync-included":        "backup_sync_included",
-    # #421: post-migration Codex quota row missing its ingest-time anchor.
-    "30-codex-null-reset-anchor":      "codex_null_reset_anchor",
-    # #496 S6 §7.6: four scenarios reaching the new WARN and FAIL branches.
-    # No existing fixture reaches any of them, and the FAIL fixture is split
-    # in three so each failure mode is covered separately rather than one of
-    # them standing in for the others.
+    # #496 S6 §7.6: the scenarios reaching `db.retained_artifacts`'s WARN and
+    # protected-evidence FAIL, and `journal.auto_heal`'s repeated-shape FAIL,
+    # through the real retention gather. The malformed-policy FAIL is reached
+    # end to end by 12-corrupt-config-json.
     "31-retained-artifacts-over-budget": "retained_artifacts_over_budget",
     "32-retained-artifacts-protected":   "retained_artifacts_protected",
     "33-heal-repeated-shape":            "heal_repeated_shape",
-    "34-retention-policy-malformed":     "retention_policy_malformed",
-    # #583 S4 (F39): the only fixture that reaches the new
-    # `db.conversations_wal_size` WARN branch. Every other scenario leaves the
-    # sidecar absent, which the check reports as OK.
+    # #583 S4 (F39): the only fixture that reaches the
+    # `db.conversations_wal_size` WARN branch through the gather's stat of the
+    # sidecar. Every other scenario leaves the sidecar absent (OK).
     "35-conversations-wal-oversized":    "conversations_wal_oversized",
-    # #719: the four scenarios that reach the new Codex hook-state severities
-    # and the seven-day liveness leg. No existing fixture reaches any of them,
-    # and each failure mode gets its own scenario rather than one standing in
-    # for the others.
+    # #719: a healthy sibling root must never mask a disabled Codex root.
     "36-codex-hooks-disabled-mixed-roots":     "codex_hooks_disabled_mixed_roots",
-    "37-codex-hooks-untrusted":                "codex_hooks_untrusted",
-    "38-codex-hooks-config-unparseable":       "codex_hooks_config_unparseable",
-    "39-codex-hooks-liveness-stale-multi-account":
-        "codex_hooks_liveness_stale_multi_account",
     # #825/#832 (spec section 8, F9, F16): every other scenario carries no
     # current account-bound index, so `accounting.outcome_quarantine` reads
-    # "unavailable" and `journal.legacy_writer` "unavailable" everywhere. These
-    # two build a current, validated epoch-1018 store through the real bound
-    # recording kernel: one with no legacy write (both legs OK) and one where
-    # an older process wrote a reading after the cutover (both legs WARN, the
-    # quarantine row in the approved accounting wording plus the control
-    # sentence).
+    # "unavailable" and `journal.legacy_writer` "unavailable" everywhere. This
+    # one builds a current, validated store through the real bound recording
+    # kernel with no legacy write, so both legs are OK.
     "40-account-bound-clear":       "account_bound_clear",
-    "41-account-bound-legacy-write": "account_bound_legacy_write",
-    # #997 D10: `db.rebuild_worker` WARN from settled records only (no live
-    # pid is probed, so the golden is host-independent): the newest epoch
-    # launch died before its start, and the last heal failed.
-    "42-rebuild-workers-died-failed": "rebuild_workers_died_failed",
 }
 
 # user_version sentinel bumped well past either registry head so the
@@ -139,13 +101,7 @@ _VERSION_AHEAD_SENTINEL = 99
 
 CODEX_HOMES = {
     "21-codex-quota-fresh-stale": ("codex-a", "codex-b"),
-    "22-codex-quota-fresh-future": ("codex-a", "codex-b"),
-    "23-codex-lifecycle-recent-never": ("codex-a", "codex-b"),
-    "24-codex-lifecycle-recent-stale": ("codex-a", "codex-b"),
     "36-codex-hooks-disabled-mixed-roots": ("codex-a", "codex-b"),
-    "37-codex-hooks-untrusted": ("codex-a", "codex-b"),
-    "38-codex-hooks-config-unparseable": ("codex-a", "codex-b"),
-    "39-codex-hooks-liveness-stale-multi-account": ("codex-a", "codex-b"),
 }
 
 
@@ -240,8 +196,7 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
-    if slug in ("account_bound_clear", "account_bound_legacy_write"):
-        variant = slug[len("account_bound_"):]
+    if slug == "account_bound_clear":
         return textwrap.dedent("""\
             for name in {USER_FACING_WRAPPERS}; do
                 ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/.local/bin/$name"
@@ -250,73 +205,14 @@ def _scenario_body(slug: str) -> str:
             write_oauth_credentials
             # A current account-bound store, built by the real bound recording
             # kernel under pinned clocks (see `_emit_account_bound`).
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-account-bound VARIANT \\
+            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-account-bound clear \\
                 "$HARNESS_FAKE_HOME"
-            """).replace("VARIANT", variant)
-    if slug == "hooks_missing":
-        return textwrap.dedent("""\
-            echo '{"hooks":{}}' > "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "stale_snapshot_1h":
-        return textwrap.dedent("""\
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot stale_1h \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "stale_snapshot_30m":
-        return textwrap.dedent("""\
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot stale_30m \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "migration_failed":
-        return textwrap.dedent("""\
-            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/logs"
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            # Write a migration-errors.log entry the dispatcher would have written.
-            # Deterministic timestamp (not `date -u`) so the golden is byte-stable.
-            # Format must match the canonical migration-errors.log block shape:
-            # `[ts] db:name` + indented error/trace lines + blank line separator.
-            # _db_status_failed_names_from_log picks up the qualified name; the
-            # name must be in _STATS_MIGRATIONS for the status to be reported.
-            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/logs/migration-errors.log" <<'LOG'
-            [2026-05-13T14:00:00Z] stats.db:001_five_hour_block_models_backfill_v1
-              RuntimeError: synthetic test failure
-              Traceback (most recent call last):
-                File "<fixture>", line 1, in <module>
-
-            LOG
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "dashboard_bind_lan":
-        return textwrap.dedent("""\
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/config.json" <<'JSON'
-            {"dashboard":{"bind":"lan"},"collector":{"token":"abc"}}
-            JSON
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
     if slug == "corrupt_update_state":
         return textwrap.dedent("""\
             write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
             write_oauth_credentials
             echo '{not valid json' > "$HARNESS_FAKE_HOME/.local/share/cctally/update-state.json"
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "oauth_token_missing":
-        return textwrap.dedent("""\
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            # No oauth-token file.
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
@@ -331,18 +227,7 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-cache \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
         """)
-    if slug == "codex_null_reset_anchor":
-        return _scenario_body("all_ok") + textwrap.dedent("""\
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-codex-null-anchor \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
-        """)
-    if slug in {
-        "codex_quota_fresh_stale", "codex_quota_fresh_future",
-        "codex_lifecycle_recent_never", "codex_lifecycle_recent_stale",
-        "codex_hooks_disabled_mixed_roots", "codex_hooks_untrusted",
-        "codex_hooks_config_unparseable",
-        "codex_hooks_liveness_stale_multi_account",
-    }:
+    if slug in {"codex_quota_fresh_stale", "codex_hooks_disabled_mixed_roots"}:
         case = slug.removeprefix("codex_").replace("_", "-")
         return _scenario_body("all_ok") + textwrap.dedent(f"""\
             write_codex_hooks "$HARNESS_FAKE_HOME/codex-a"
@@ -352,54 +237,11 @@ def _scenario_body(slug: str) -> str:
                 "$HARNESS_FAKE_HOME/.local/share/cctally" \\
                 "$HARNESS_FAKE_HOME/codex-a" "$HARNESS_FAKE_HOME/codex-b"
         """)
-    if slug == "pricing_unpriced_model":
-        # Reuse the clean all_ok baseline (install/hooks/oauth/snapshot all
-        # OK), then seed cache.db with one in-window Claude model cctally
-        # cannot price → the only WARN is pricing.coverage.
-        pricing_cache = textwrap.dedent("""\
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-pricing-cache \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
-            """)
-        return _scenario_body("all_ok") + pricing_cache
-    if slug == "statusline_authority_repair":
-        # A valid inflight 7d tombstone is an intentional crash-recovery
-        # signal.  Keep the clean all_ok baseline so the generated golden
-        # proves the new statusline pipeline check is the only added WARN.
-        # #825/#832 section 7: the current fence is per exact account and
-        # window under the account-bound root; a far-future week keeps the
-        # window live whatever CCTALLY_AS_OF the harness pins.
-        return _scenario_body("all_ok") + textwrap.dedent("""\
-            mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v2/accounts/unattributed/tombstones"
-            cat > "$HARNESS_FAKE_HOME/.local/share/cctally/statusline-account-bound-v2/accounts/unattributed/tombstones/sevenDay-4102444800.json" <<'JSON'
-            {"schemaVersion":1,"protocolGeneration":"account-bound-v1","accountKey":"unattributed","canonicalWindowKey":4102444800,"axis":"sevenDay","state":"inflight","startedAt":0,"priorBlockReceivedAtThrough":null}
-            JSON
-        """)
     if slug in (
         "retained_artifacts_over_budget", "retained_artifacts_protected",
-        "heal_repeated_shape", "retention_policy_malformed",
+        "heal_repeated_shape",
     ):
         return _scenario_body("all_ok") + _retention_scenario_body(slug)
-    if slug == "cache_reclaimable":
-        return _scenario_body("all_ok") + textwrap.dedent("""\
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-empty-codex-project-metadata \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db"
-            python3 - "$HARNESS_FAKE_HOME/.local/share/cctally/cache.db" <<'PY'
-            import sqlite3, sys
-            conn = sqlite3.connect(sys.argv[1])
-            conn.execute("CREATE TABLE reclaimable_payload (payload BLOB)")
-            conn.executemany(
-                "INSERT INTO reclaimable_payload(payload) VALUES (?)",
-                [(b"x" * 8192,) for _ in range(64)],
-            )
-            conn.commit()
-            conn.execute("DELETE FROM reclaimable_payload")
-            conn.commit()
-            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
-            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-            assert page_count > 0 and freelist_count / page_count >= 0.25
-            conn.close()
-            PY
-        """)
     if slug == "conversations_wal_oversized":
         # #583 S4 (F39). The check reads ONLY the size of the
         # `conversations.db-wal` sidecar, so the sidecar alone is what this
@@ -415,51 +257,6 @@ def _scenario_body(slug: str) -> str:
                 fh.truncate(256 * 1024 * 1024 + 4096)   # sparse; > DOCTOR_WAL_WARN_BYTES
             PY
         """)
-    if slug == "legacy_hooks_detected":
-        return textwrap.dedent("""\
-            mkdir -p "$HARNESS_FAKE_HOME/.claude/hooks"
-            # A canonical legacy filename triggers legacy_bespoke_hooks
-            # detection regardless of settings.json contents.
-            touch "$HARNESS_FAKE_HOME/.claude/hooks/record-usage-stop.py"
-            # Canonical cctally hooks for all 3 events PLUS a legacy
-            # bespoke command string in settings so both detectors fire.
-            cat > "$HARNESS_FAKE_HOME/.claude/settings.json" <<'JSON'
-            {
-              "hooks": {
-                "PostToolBatch": [
-                  {"matcher": "*", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
-                ],
-                "Stop": [
-                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]},
-                  {"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/record-usage-stop.py"}]}
-                ],
-                "SubagentStop": [
-                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
-                ]
-              }
-            }
-            JSON
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "legacy_snippet_in_comment":
-        # Issue #115: reuse the clean all_ok seed verbatim (single source of
-        # truth for the symlink/hooks/oauth/snapshot baseline), then drop in a
-        # statusline-command.sh whose only `cctally record-usage` references
-        # live inside shell comments. The detector must NOT flag it — doctor
-        # stays fully OK. The heredoc body mirrors the real-world trigger: the
-        # lean #86 Session G script that pipes to `cctally statusline` with a
-        # trailing NOTE comment documenting the removed `cctally record-usage`.
-        statusline = textwrap.dedent("""\
-            cat > "$HARNESS_FAKE_HOME/.claude/statusline-command.sh" <<'SH'
-            #!/bin/bash
-            # NOTE: the prior `cctally record-usage` background invocation was removed.
-            # Persistence now flows via `cctally hook-tick` from the PostToolBatch hook.
-            exec cctally statusline "$@"
-            SH
-            """)
-        return _scenario_body("all_ok") + statusline
     if slug == "multi_fail_mixed":
         return textwrap.dedent("""\
             mkdir -p "$HARNESS_FAKE_HOME/.local/share/cctally/logs"
@@ -484,73 +281,18 @@ def _scenario_body(slug: str) -> str:
             python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
                 "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
             """)
-    if slug == "corrupt_update_suppress":
-        return textwrap.dedent("""\
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            echo '{not valid' > "$HARNESS_FAKE_HOME/.local/share/cctally/update-suppress.json"
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
     # ── Issue #119 brew scenarios ─────────────────────────────────────
     # A faithful Homebrew install symlinks every USER_FACING_BIN into
     # <prefix>/bin (cctally.rb.template: `bin.install_symlink`). The
     # _setup_symlink_is_retired predicate keys off the symlink TARGET
     # containing `/Cellar/cctally/`, NOT off repo_root — so doctor fixtures
-    # only need a ~/.local/bin link whose target carries that token, plus a
-    # <prefix>/bin on PATH (via input.env) for reachability. No keg COPY is
-    # required (unlike the setup harness): doctor runs the dev binary.
-    if slug == "brew_stale_links":
-        # spec §5.3 b: dangling AND live Cellar ~/.local/bin links → the
-        # `stale` symlink state. <prefix>/bin (all 14 cmds) on PATH makes
-        # every command reachable elsewhere, so the leftover keg links are
-        # cleanable cruft (`stale`), not broken (`wrong`). Expect:
-        # "15/15 available; 2 stale link(s) to clean" (cctally + cctally-tui).
-        return textwrap.dedent("""\
-            # Faithful brew: <prefix>/bin holds all USER_FACING_BINS.
-            # Reachability source for the empty ~/.local/bin slots → `ok`.
-            mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in {USER_FACING_WRAPPERS}; do
-                ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
-            done
-            # A LIVE old-keg file + a ~/.local/bin link pointing at it (the
-            # dangerous shadow case): target exists AND carries /Cellar/cctally/.
-            KEG="$HARNESS_FAKE_HOME/opt/homebrew/Cellar/cctally/1.20.0/libexec/bin"
-            mkdir -p "$KEG"
-            cp "$REPO_ROOT/bin/cctally" "$KEG/cctally"
-            ln -sf "$KEG/cctally" "$HARNESS_FAKE_HOME/.local/bin/cctally"
-            # A DANGLING keg link (older keg already `brew cleanup`-ed away):
-            # target does not exist → retired via the dangling branch.
-            ln -sf "$HARNESS_FAKE_HOME/opt/homebrew/Cellar/cctally/1.19.0/libexec/bin/cctally-tui" \\
-                "$HARNESS_FAKE_HOME/.local/bin/cctally-tui"
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
-    if slug == "path_ok_local_bin_off":
-        # spec §5.3 c: install.path OK when cctally is reachable on PATH but
-        # ~/.local/bin is OFF PATH (DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1 +
-        # DOCTOR_INCLUDE_PREFIX_BIN=1). cctally lives on <prefix>/bin only;
-        # path_includes_local_bin is False yet cctally_reachable_on_path is
-        # True → install.path passes ("cctally reachable on $PATH"). All 15
-        # cmds on <prefix>/bin so install.symlinks is a clean "15/15 available"
-        # (empty ~/.local/bin slots reachable-elsewhere → ok).
-        return textwrap.dedent("""\
-            mkdir -p "$HARNESS_FAKE_HOME/opt/homebrew/bin"
-            for name in {USER_FACING_WRAPPERS}; do
-                ln -sf "$REPO_ROOT/bin/$name" "$HARNESS_FAKE_HOME/opt/homebrew/bin/$name"
-            done
-            write_canonical_settings "$HARNESS_FAKE_HOME/.claude/settings.json"
-            write_oauth_credentials
-            python3 "$REPO_ROOT/bin/build-doctor-fixtures.py" --emit-snapshot all_ok \\
-                "$HARNESS_FAKE_HOME/.local/share/cctally/stats.db"
-            """)
+    # only need a ~/.local/bin link whose target carries that token. No keg
+    # COPY is required (unlike the setup harness): doctor runs the dev binary.
     if slug == "brew_pinned_only_path":
         # spec §5.3 g (doctor half): the ONLY path to cctally is a LIVE
         # Cellar ~/.local/bin link; <prefix>/bin is OFF the scrubbed PATH
-        # (input.env has NEITHER knob set → default PATH keeps ~/.local/bin
-        # but no <prefix>/bin). _reachable_elsewhere(cctally) is False, so the
+        # (the harness's PATH keeps ~/.local/bin but never a <prefix>/bin).
+        # _reachable_elsewhere(cctally) is False, so the
         # slot classes `wrong` and symlinks_path_pinned is True → doctor emits
         # the PATH-fix remediation (NOT the generic "Run `cctally setup`").
         # The keg file MUST exist (a dangling link would also be `wrong` but
@@ -584,34 +326,6 @@ def _scenario_body(slug: str) -> str:
             PY
             """)
         return _scenario_body("all_ok") + bump
-    if slug == "statusline_refresh_missing":
-        # #311: reuse the clean all_ok baseline (install/hooks/oauth/snapshot
-        # all OK), then overwrite settings.json with the canonical hooks PLUS a
-        # recognized cctally statusLine command that lacks `refreshInterval`.
-        # The direct-form recognizer parses the command string (no PATH lookup),
-        # so `hooks.statusline_refresh_interval` is the one NEW warn this
-        # scenario adds over the all_ok baseline (which itself carries the
-        # usual fresh-install WARNs: recent-activity, last-fire, cache.db
-        # absent, pending migrations, update-state).
-        statusline = textwrap.dedent("""\
-            cat > "$HARNESS_FAKE_HOME/.claude/settings.json" <<'JSON'
-            {
-              "hooks": {
-                "PostToolBatch": [
-                  {"matcher": "*", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
-                ],
-                "Stop": [
-                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
-                ],
-                "SubagentStop": [
-                  {"matcher": "", "hooks": [{"type": "command", "command": "cctally hook-tick"}]}
-                ]
-              },
-              "statusLine": {"type": "command", "command": "cctally statusline"}
-            }
-            JSON
-            """)
-        return _scenario_body("all_ok") + statusline
     if slug == "stats_version_ahead":
         # Reuse the all_ok baseline, then create an epoch mismatch without any
         # journal bytes. Doctor must not promise that a rebuild can self-heal.
@@ -651,76 +365,7 @@ def _scenario_body(slug: str) -> str:
             PY
             """)
         return _scenario_body("all_ok") + journal
-    if slug == "rebuild_workers_died_failed":
-        workers = textwrap.dedent("""\
-            APP="$HARNESS_FAKE_HOME/.local/share/cctally"
-            cat > "$APP/stats-epoch-rebuild.state.json" <<'JSON'
-            {"schemaVersion": 1, "deaths": [], "previousUnreadable": null,
-             "run": {"runId": "20260513T120000Z-0000aaaa", "launchId": "launch-a",
-                     "pid": 4242, "birth": "Wed May 13 12:00:00 2026",
-                     "status": "finished", "phase": "rebuild:publish",
-                     "startedAt": "2026-05-13T12:00:00Z",
-                     "progressAt": "2026-05-13T12:05:00Z",
-                     "finishedAt": "2026-05-13T12:06:00Z", "wallSeconds": 360.0,
-                     "outcome": "success", "peakResidentBytes": 524288000}}
-            JSON
-            cat > "$APP/stats-epoch-rebuild.launches.json" <<'JSON'
-            {"schemaVersion": 1, "lastDeathAt": "2026-05-13T14:00:00Z",
-             "counts": {"finished:success": 1, "died-pre-start": 1},
-             "entries": [
-              {"launchId": "launch-a", "at": "2026-05-13T12:00:00Z", "pid": 4242,
-               "birth": "Wed May 13 12:00:00 2026", "spawn": "ok",
-               "ack": {"kind": "started", "runId": "20260513T120000Z-0000aaaa",
-                       "at": "2026-05-13T12:00:00Z"},
-               "outcome": "finished:success", "settledAt": "2026-05-13T12:06:00Z"},
-              {"launchId": "launch-b", "at": "2026-05-13T13:59:00Z", "pid": 4343,
-               "birth": "Wed May 13 13:59:00 2026", "spawn": "ok", "ack": null,
-               "outcome": "died-pre-start", "settledAt": "2026-05-13T14:00:00Z"}]}
-            JSON
-            cat > "$APP/stats-heal.state.json" <<'JSON'
-            {"schemaVersion": 1, "deaths": [], "previousUnreadable": null,
-             "run": {"runId": "20260513T130000Z-0000bbbb", "launchId": "launch-h",
-                     "pid": 4444, "birth": "Wed May 13 13:00:00 2026",
-                     "status": "finished", "phase": "starting",
-                     "startedAt": "2026-05-13T13:00:00Z",
-                     "progressAt": "2026-05-13T13:00:00Z",
-                     "finishedAt": "2026-05-13T13:00:05Z", "wallSeconds": 5.0,
-                     "outcome": "failed", "finalization": null,
-                     "peakResidentBytes": 104857600}}
-            JSON
-            cat > "$APP/stats-heal.launches.json" <<'JSON'
-            {"schemaVersion": 1, "lastDeathAt": null,
-             "counts": {"finished:failed": 1},
-             "entries": [
-              {"launchId": "launch-h", "at": "2026-05-13T13:00:00Z", "pid": 4444,
-               "birth": "Wed May 13 13:00:00 2026", "spawn": "ok",
-               "ack": {"kind": "started", "runId": "20260513T130000Z-0000bbbb",
-                       "at": "2026-05-13T13:00:00Z"},
-               "outcome": "finished:failed", "settledAt": "2026-05-13T13:00:05Z"}]}
-            JSON
-            """)
-        return _scenario_body("all_ok") + workers
-    if slug == "backup_sync_included":
-        relocate = textwrap.dedent("""\
-            SYNC_ROOT="$HARNESS_FAKE_HOME/Library/Mobile Documents/com~apple~CloudDocs"
-            mkdir -p "$SYNC_ROOT"
-            mv "$HARNESS_FAKE_HOME/.local/share/cctally" "$SYNC_ROOT/cctally"
-            ln -s "$SYNC_ROOT/cctally" "$HARNESS_FAKE_HOME/.local/share/cctally"
-            """)
-        return _scenario_body("all_ok") + relocate
     raise SystemExit(f"unknown scenario slug: {slug}")
-
-
-# Per-scenario PATH-shape knobs for the harness (issue #119). Mirrors the
-# setup harness's input.env convention. Only scenarios needing a non-default
-# PATH appear here; absent → default scrubbed PATH.
-INPUT_ENV = {
-    "15-brew-stale-links":      "DOCTOR_INCLUDE_PREFIX_BIN=1\n",
-    "16-path-ok-local-bin-off": ("DOCTOR_INCLUDE_PREFIX_BIN=1\n"
-                                 "DOCTOR_OMIT_LOCAL_BIN_FROM_PATH=1\n"),
-    # 17-brew-pinned-only-path: NO knobs — ~/.local/bin on PATH (default),
-    # <prefix>/bin OFF PATH, so the keg link is the only reachable copy.
-}
 
 
 def _gitignore() -> str:
@@ -744,21 +389,16 @@ def _gitignore() -> str:
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h", "stale_30m"])
+    p.add_argument("--emit-snapshot", choices=["all_ok", "stale_1h"])
     p.add_argument("--emit-codex-cache", action="store_true")
-    p.add_argument("--emit-account-bound", choices=["clear", "legacy_write"])
-    p.add_argument("--emit-codex-null-anchor", action="store_true")
-    p.add_argument("--emit-pricing-cache", action="store_true")
+    p.add_argument("--emit-account-bound", choices=["clear"])
     p.add_argument("--emit-empty-codex-project-metadata", action="store_true")
     p.add_argument("--emit-retention", choices=[
         "retained_artifacts_over_budget", "retained_artifacts_protected",
-        "heal_repeated_shape", "retention_policy_malformed",
+        "heal_repeated_shape",
     ])
     p.add_argument("--emit-codex-doctor-case", choices=[
-        "quota-fresh-stale", "quota-fresh-future",
-        "lifecycle-recent-never", "lifecycle-recent-stale",
-        "hooks-disabled-mixed-roots", "hooks-untrusted",
-        "hooks-config-unparseable", "hooks-liveness-stale-multi-account",
+        "quota-fresh-stale", "hooks-disabled-mixed-roots",
     ])
     p.add_argument(
         "--out", type=pathlib.Path, default=None,
@@ -776,16 +416,10 @@ def main():
         _emit_snapshot(args.emit_snapshot, pathlib.Path(args.path))
         return
     if args.emit_account_bound and args.path:
-        _emit_account_bound(args.emit_account_bound, pathlib.Path(args.path))
+        _emit_account_bound(pathlib.Path(args.path))
         return
     if args.emit_codex_cache and args.path:
         _emit_codex_cache(pathlib.Path(args.path))
-        return
-    if args.emit_codex_null_anchor and args.path:
-        _emit_codex_null_anchor(pathlib.Path(args.path))
-        return
-    if args.emit_pricing_cache and args.path:
-        _emit_pricing_cache(pathlib.Path(args.path))
         return
     if args.emit_empty_codex_project_metadata and args.path:
         _emit_empty_codex_project_metadata(pathlib.Path(args.path))
@@ -816,14 +450,6 @@ def main():
         )
         (d / "setup.sh").chmod(0o755)
         (d / ".gitignore").write_text(_gitignore())
-        # Issue #119: emit the per-scenario PATH-shape knobs the harness
-        # reads (compute_fake_path). Idempotent — overwrite or remove so a
-        # rename never strands a stale input.env.
-        env_path = d / "input.env"
-        if dir_name in INPUT_ENV:
-            env_path.write_text(INPUT_ENV[dir_name])
-        elif env_path.exists():
-            env_path.unlink()
         homes_path = d / ".codex-homes"
         homes = CODEX_HOMES.get(dir_name)
         if homes:
@@ -864,21 +490,6 @@ def _emit_retention(slug: str, app_dir) -> None:
     logs = app_dir / "logs"
     quarantine.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
-
-    if slug == "retention_policy_malformed":
-        # A VALID JSON document carrying an INVALID retention block, which is
-        # the second of §6.5's two malformed cases and the one a user is far
-        # more likely to produce than unparseable JSON.
-        config = app_dir / "config.json"
-        loaded = {}
-        if config.exists():
-            try:
-                loaded = json.loads(config.read_text(encoding="utf-8"))
-            except ValueError:
-                loaded = {}
-        loaded["storage.artifact_retention"] = {"max_age_days": 0}
-        config.write_text(json.dumps(loaded, indent=2), encoding="utf-8")
-        return
 
     classified = slug != "retained_artifacts_protected"
     shape = "1702f06a27" if slug == "heal_repeated_shape" else None
@@ -929,23 +540,19 @@ def _emit_retention(slug: str, app_dir) -> None:
 #: runs doctor at 2026-05-13T14:22:31Z; the last current reading is two
 #: seconds before it, so `freshness.latest_snapshot` stays fresh.
 _AB_FIRST_READING = "2026-05-13T14:00:00Z"
-_AB_LEGACY_WRITE = "2026-05-13T14:10:00Z"
 _AB_EVIDENCE_SEEN = "2026-05-13T14:20:00Z"
 _AB_LAST_READING = "2026-05-13T14:22:29Z"
 _AB_WEEK_RESET = "2026-05-16T00:00:00Z"
 
 
-def _emit_account_bound(variant: str, home: pathlib.Path) -> None:
+def _emit_account_bound(home: pathlib.Path) -> None:
     """Build a current, validated epoch-1018 store under ``home`` through the
     REAL bound recording kernel, deterministically.
 
     Every clock the store records is pinned: `CCTALLY_AS_OF` with
     `CCTALLY_TEST_PIN_CAPTURE` for the readings, and the journal's append,
     op-time and legacy-writer-evidence clocks for the segment name, the
-    cutover op and `firstObservedAt`. ``legacy_write`` then appends the
-    previous release's unstamped reading after the cutover (paused before its
-    own ingest), and the next current reading's ingest excludes it — the
-    quarantine trigger and the excluded population the two legs report."""
+    cutover op and `firstObservedAt`."""
     import datetime as dt
     import importlib.machinery
     import importlib.util
@@ -977,7 +584,6 @@ def _emit_account_bound(variant: str, home: pathlib.Path) -> None:
     core._init_paths_from_env()
     import _cctally_journal as jr
     import _cctally_statusline as sl
-    import _lib_journal as J
     import argparse
 
     clock = {"now": _AB_FIRST_READING}
@@ -1005,17 +611,6 @@ def _emit_account_bound(variant: str, home: pathlib.Path) -> None:
             raise SystemExit(f"record_usage_bound exited {rc}")
 
     record(_AB_FIRST_READING, 1.0, 2.0)
-    if variant == "legacy_write":
-        clock["now"] = _AB_LEGACY_WRITE
-        legacy = J.unstamped_record(J.make_obs(
-            at=_AB_LEGACY_WRITE, src="record-usage", provider="claude",
-            payload={"weekly_percent": 1.5,
-                     "resets_at": epoch(_AB_WEEK_RESET),
-                     "source": "record-usage",
-                     "captured_at": _AB_LEGACY_WRITE}))
-        segment = jr.list_segments()[-1]
-        with open(core.JOURNAL_DIR / segment, "ab") as fh:
-            fh.write(J.encode_line(legacy))
     record(_AB_LAST_READING, 2.0, 3.0)
     # The recordings' Claude cache sync stamps its parse-health record with the
     # real wall clock (`_update_parse_health_meta`); doctor's verbose and JSON
@@ -1056,53 +651,12 @@ def _emit_snapshot(slug: str, db_path: pathlib.Path) -> None:
     as_of = os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")
     import datetime as dt
     now = dt.datetime.fromisoformat(as_of).astimezone(dt.timezone.utc)
-    offsets = {"all_ok": 2, "stale_30m": 1800, "stale_1h": 7200}
+    offsets = {"all_ok": 2, "stale_1h": 7200}
     captured = now - dt.timedelta(seconds=offsets[slug])
     conn.execute(
         "INSERT INTO weekly_usage_snapshots(captured_at_utc, week_start_date, used_percent) VALUES (?, ?, ?)",
         (captured.isoformat().replace("+00:00", "Z"), "2026-05-11", 12.5),
     )
-    conn.commit()
-    conn.close()
-
-
-def _emit_pricing_cache(db_path: pathlib.Path) -> None:
-    """Seed cache.db with ONE Claude session entry for a model cctally does
-    not price (resolves to $0), timestamped inside the 30-day coverage window.
-    Drives the `pricing.coverage` WARN. Columns mirror
-    bin/_cctally_db.py::_apply_cache_schema (cache_create_tokens, NOT
-    cache_creation_tokens)."""
-    import sqlite3
-    import os, datetime as dt
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS session_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_path TEXT NOT NULL,
-            line_offset INTEGER NOT NULL,
-            timestamp_utc TEXT NOT NULL,
-            model TEXT NOT NULL,
-            msg_id TEXT, req_id TEXT,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_create_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            usage_extra_json TEXT, cost_usd_raw REAL, speed TEXT
-        )
-    """)
-    as_of = os.environ.get("CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00")
-    # 2 days before CCTALLY_AS_OF — comfortably inside the trailing-30d window.
-    now = dt.datetime.fromisoformat(as_of).astimezone(dt.timezone.utc) - dt.timedelta(days=2)
-    conn.execute(
-        "INSERT INTO session_entries(source_path, line_offset, timestamp_utc, "
-        "model, input_tokens, output_tokens, cache_create_tokens, "
-        "cache_read_tokens) VALUES (?, 0, ?, ?, ?, ?, ?, ?)",
-        ("/fixture/unpriced.jsonl", now.isoformat(),
-         "claude-fixture-unpriced-9000", 1000, 200, 50, 10),
-    )
-    _ensure_empty_codex_project_metadata_schema(conn)
     conn.commit()
     conn.close()
 
@@ -1179,59 +733,6 @@ def _emit_codex_cache(db_path: pathlib.Path) -> None:
     conn.close()
 
 
-def _emit_codex_null_anchor(db_path: pathlib.Path) -> None:
-    """Seed one fresh Codex quota observation with a NULL canonical anchor."""
-    import datetime as dt
-    import os
-    import sqlite3
-
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        _ensure_empty_codex_project_metadata_schema(conn)
-        conn.execute("""
-            CREATE TABLE quota_window_snapshots (
-                source TEXT NOT NULL, source_root_key TEXT,
-                source_path TEXT NOT NULL, line_offset INTEGER NOT NULL,
-                captured_at_utc TEXT NOT NULL, observed_slot TEXT,
-                logical_limit_key TEXT NOT NULL, limit_id TEXT, limit_name TEXT,
-                window_minutes INTEGER NOT NULL, used_percent REAL NOT NULL,
-                resets_at_utc TEXT NOT NULL, plan_type TEXT,
-                individual_limit_json TEXT, reached_type TEXT,
-                observed_model TEXT, account_key TEXT,
-                canonical_resets_at_utc TEXT,
-                UNIQUE(source, source_path, line_offset, logical_limit_key)
-            )
-        """)
-        as_of = dt.datetime.fromisoformat(
-            os.environ.get(
-                "CCTALLY_AS_OF", "2026-05-13T14:22:31+00:00"
-            )
-        ).astimezone(dt.timezone.utc)
-        captured = (as_of - dt.timedelta(seconds=20)).isoformat().replace(
-            "+00:00", "Z"
-        )
-        conn.execute(
-            "INSERT INTO quota_window_snapshots "
-            "(source, source_root_key, source_path, line_offset, "
-            " captured_at_utc, observed_slot, logical_limit_key, limit_id, "
-            " limit_name, window_minutes, used_percent, resets_at_utc, "
-            " plan_type, individual_limit_json, reached_type, observed_model, "
-            " account_key, canonical_resets_at_utc) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "codex", "fixture-root", "/fixture/codex-null-anchor.jsonl", 1,
-                captured, "primary", "fixture-weekly", "fixture-weekly",
-                "Fixture weekly", 10080, 12.0, "2026-05-18T14:00:00Z",
-                None, None, None, "gpt-5", None, None,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def _emit_codex_doctor_case(
     case: str, app_dir: pathlib.Path, first_root: pathlib.Path,
     second_root: pathlib.Path,
@@ -1255,14 +756,14 @@ def _emit_codex_doctor_case(
     log_path = app_dir / "logs" / "hook-tick.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def log_line(at: dt.datetime, key: str, *, result: str = "success") -> str:
+    def log_line(at: dt.datetime, key: str) -> str:
         return (
             f"{at.isoformat().replace('+00:00', 'Z')} provider=codex "
             f"source_root_key={key} event=Stop sync=ok blocks=1 milestones=1 "
-            f"alert_eligible_roots=1 dur_ms=12 result={result}\n"
+            f"alert_eligible_roots=1 dur_ms=12 result=success\n"
         )
 
-    def write_trust(root: pathlib.Path, *, enabled=None, unparseable=False):
+    def write_trust(root: pathlib.Path, *, enabled=None):
         """Record a Codex `[hooks.state]` trust decision for this root.
 
         The key's file component is the RESOLVED hooks.json path, because
@@ -1273,30 +774,26 @@ def _emit_codex_doctor_case(
         """
         hooks_path = (root / "hooks.json").resolve()
         config = root / "config.toml"
-        if unparseable:
-            config.write_text("= = this is not toml\n", encoding="utf-8")
-        else:
-            lines = []
-            for token in ("stop", "subagent_stop"):
-                lines.append(f'[hooks.state."{hooks_path}:{token}:0:0"]')
-                lines.append(f'trusted_hash = "fixture-hash-{token}"')
-                if enabled is not None:
-                    lines.append(f"enabled = {str(enabled).lower()}")
-            config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines = []
+        for token in ("stop", "subagent_stop"):
+            lines.append(f'[hooks.state."{hooks_path}:{token}:0:0"]')
+            lines.append(f'trusted_hash = "fixture-hash-{token}"')
+            if enabled is not None:
+                lines.append(f"enabled = {str(enabled).lower()}")
+        config.write_text("\n".join(lines) + "\n", encoding="utf-8")
         stamp = as_of.timestamp()
         os.utime(config, (stamp, stamp))
         os.utime(hooks_path, (stamp - 3600, stamp - 3600))
 
-    def write_marker(root_key: str, age_seconds: float, account=None):
+    def write_marker(root_key: str, age_seconds: float):
         base = app_dir / "codex-hook-tick"
         base.mkdir(parents=True, exist_ok=True)
-        suffix = f".{account}" if account else ""
-        marker = base / f"{root_key}{suffix}.last-success"
+        marker = base / f"{root_key}.last-success"
         marker.write_text("", encoding="utf-8")
         stamp = as_of.timestamp() - age_seconds
         os.utime(marker, (stamp, stamp))
 
-    if case in {"quota-fresh-stale", "quota-fresh-future"}:
+    if case == "quota-fresh-stale":
         db_path = app_dir / "cache.db"
         conn = sqlite3.connect(str(db_path))
         try:
@@ -1311,11 +808,7 @@ def _emit_codex_doctor_case(
                     reached_type TEXT
                 )
             """)
-            unhealthy_capture = (
-                as_of - dt.timedelta(seconds=901)
-                if case == "quota-fresh-stale"
-                else as_of + dt.timedelta(seconds=301)
-            )
+            unhealthy_capture = as_of - dt.timedelta(seconds=901)
             conn.executemany("""
                 INSERT INTO quota_window_snapshots(
                     source, source_root_key, source_path, line_offset, captured_at_utc,
@@ -1335,9 +828,9 @@ def _emit_codex_doctor_case(
             conn.commit()
         finally:
             conn.close()
-        # 21/22 exercise quota freshness, so they carry a valid enabled trust
-        # record and fresh success markers for the same reason 23/24 do: an
-        # unrelated Codex hook FAIL would otherwise own their exit code.
+        # 21 exercises quota freshness, so it carries a valid enabled trust
+        # record and fresh success markers: an unrelated Codex hook FAIL would
+        # otherwise own its exit code.
         for _key, root in roots:
             write_trust(root)
         for key, _root in roots:
@@ -1348,57 +841,12 @@ def _emit_codex_doctor_case(
         )
         return
 
-    if case == "lifecycle-recent-never":
-        # 23/24 carry a valid enabled trust record and fresh success markers,
-        # so they stay dedicated to the 24-hour LOG check that names them.
-        for _key, root in roots:
-            write_trust(root)
-        for key, _root in roots:
-            write_marker(key, 120)
-        log_path.write_text(log_line(as_of - dt.timedelta(seconds=30), roots[0][0]))
-        return
-    if case == "lifecycle-recent-stale":
-        for _key, root in roots:
-            write_trust(root)
-        for key, _root in roots:
-            write_marker(key, 120)
-        log_path.write_text(
-            log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
-            + log_line(as_of - dt.timedelta(seconds=10), roots[0][0], result="error")
-            + log_line(as_of - dt.timedelta(seconds=24 * 3600 + 1), roots[1][0])
-        )
-        return
     if case == "hooks-disabled-mixed-roots":
         # #719 acceptance 5: a healthy sibling must never mask a disabled root.
         write_trust(roots[0][1])
         write_trust(roots[1][1], enabled=False)
         write_marker(roots[0][0], 120)
         log_path.write_text(log_line(as_of - dt.timedelta(seconds=30), roots[0][0]))
-        return
-    if case == "hooks-untrusted":
-        # hooks.json is installed and no trust decision exists at all.
-        log_path.write_text("")
-        return
-    if case == "hooks-config-unparseable":
-        for _key, root in roots:
-            write_trust(root, unparseable=True)
-        log_path.write_text("")
-        return
-    if case == "hooks-liveness-stale-multi-account":
-        # Both roots are enabled and the 24-hour LOG is fresh; only the
-        # success MARKERS are old, which is the evidence split the new leg
-        # exists for. Account-suffixed markers reduce to the newest.
-        for _key, root in roots:
-            write_trust(root)
-        write_marker(roots[0][0], 7 * 24 * 3600 + 1,
-                     account="0123456789abcdef0123456789abcdef")
-        write_marker(roots[0][0], 30 * 24 * 3600,
-                     account="fedcba9876543210fedcba9876543210")
-        write_marker(roots[1][0], 3600)
-        log_path.write_text(
-            log_line(as_of - dt.timedelta(seconds=30), roots[0][0])
-            + log_line(as_of - dt.timedelta(seconds=20), roots[1][0])
-        )
         return
     raise ValueError(f"unsupported Codex doctor fixture case: {case}")
 

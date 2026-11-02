@@ -19,6 +19,28 @@ Covers the Codex-side reroute onto the 6a ingest machinery:
     whose ``activated_at_utc`` survives replay; a reconcile over the replayed
     arming honors it (no historical re-fire).
 
+#977 / #981 Part C (bounded quota-index recovery) adds the section at the end
+of this file. Writer census, verified for spec C2 against the tree at
+`f61413cc6`: exactly two production code paths write a Codex quota
+observation (`t=obs`, `provider=codex`, `payload.kind=quota_window_snapshot`)
+into the journal.
+
+  * ``_cctally_cache._append_codex_quota_obs`` — the ingest path, through
+    ``append_record(dedupe_codex_quota=True)``: journal first, key second, under
+    one leaf-lock hold. Every growth of a valid index comes from here.
+  * ``_cctally_journal._export_quota_obs`` — the one-time stats cutover, which
+    publishes a bootstrap segment by rename (``_write_bootstrap_segment``)
+    without appending keys. That publication now deletes the index sidecar
+    under the leaf lock, so the next load sees an invalid index and rebuilds,
+    as C2 requires of any writer that does not append its keys.
+
+No other producer constructs that payload kind (``bin/build-journal-benchmark-
+fixture.py`` writes one only into a fixture). The stats-side projection reads
+quota rows from cache.db, whose UNIQUE ``(source, source_path, line_offset,
+logical_limit_key)`` absorbs a duplicate journal record (``INSERT OR IGNORE``,
+or for a decision-covered row a deterministic, convergent ``DO UPDATE`` of the
+account key), so the duplicate allowances C2 names stay harmless.
+
 Isolation mirrors tests/test_quota_alerts.py + tests/test_journal_ingest.py:
 ``load_script()`` drops cached ``_cctally_*`` siblings and reloads fresh, so the
 journal/quota siblings are imported AFTER it; ``redirect_paths`` sets the tmp
@@ -27,6 +49,7 @@ JOURNAL_DIR / data dir and ``sys.modules["cctally"]``.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import fcntl
 import importlib
@@ -3676,3 +3699,751 @@ def test_the_reconciliation_path_emits_no_conflict_line(
     loud_result = jr.recover_quota_cache_from_journal(quiet=False)
     assert loud_result["status"] == "recovered", loud_result
     assert "codex attribution conflict" in capsys.readouterr().err
+
+
+# ==========================================================================
+# #977 / #981 Part C — bounded quota-index recovery (spec §4.3 C0–C7)
+# ==========================================================================
+
+QUOTA_KEYS_NAME = ".quota-observation-keys"
+QUOTA_META_NAME = ".quota-observation-keys.meta"
+AUGUST = dt.datetime(2026, 8, 1, 0, 0, 1, tzinfo=UTC)
+
+
+def _quota_index_paths():
+    core = importlib.import_module("_cctally_core")
+    return core.JOURNAL_DIR / QUOTA_KEYS_NAME, core.JOURNAL_DIR / QUOTA_META_NAME
+
+
+def _forget_quota_index(jr):
+    """Model the next short-lived process: drop the process-local key set."""
+    jr._QUOTA_DEDUP_DIR = None
+    jr._QUOTA_DEDUP_KEYS.clear()
+    jr._QUOTA_DEDUP_LOADED = False
+
+
+def _quota_row(line_offset):
+    return (
+        "codex", "root-a", "/codex/root-a/r.jsonl", line_offset, _iso(10),
+        "primary", "limit-primary", "native-primary", "Primary", 300,
+        42.0, RESET, "pro", None, None, "gpt-5.3-codex", None, None,
+    )
+
+
+def _quota_obs_at(jl, line_offset):
+    return _codex_quota_obs(
+        jl, source_root_key="root-a", source_path="/codex/root-a/r.jsonl",
+        line_offset=line_offset, captured_at_utc=_iso(10))
+
+
+def _journal_quota_multiplicity(jr, jl):
+    """Natural key -> number of journal records carrying it (spec T-C2)."""
+    return collections.Counter(
+        jr._codex_quota_natural_key(record)
+        for record in _journal_lines(jr, jl)
+        if jr._is_codex_quota_obs(record))
+
+
+def _segment_sizes():
+    core = importlib.import_module("_cctally_core")
+    return {
+        path.name: path.stat().st_size
+        for path in sorted(core.JOURNAL_DIR.glob("*.jsonl"))
+    }
+
+
+def _remove_index(path):
+    path.unlink()
+
+
+def _malform_index(path):
+    with open(path, "ab") as handle:
+        handle.write(b"not-a-key\n")
+
+
+def _tear_index(path):
+    with open(path, "ab") as handle:
+        handle.write(b"o:0123")
+
+
+def _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, damage):
+    """Shared body of the three T-C1 budgeted cases.
+
+    The RED evidence is the first assertion: on the base tree a budgeted
+    (hook) sync that meets a damaged index rebuilds it by scanning every
+    journal segment inside the append's leaf lock, which cost 16-21 s on the
+    measured store against the hook's 5 s budget (#977).
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    cache_mod = importlib.import_module("_cctally_cache")
+    update = importlib.import_module("_cctally_update")
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+    provider_root = tmp_path / "fake-codex-home"
+    rollout = provider_root / "sessions" / "2026" / "07" / "15" / "rollout-s1.jsonl"
+    rollout.parent.mkdir(parents=True)
+    shutil.copyfile(CODEX_S1_FIXTURE, rollout)
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+    ns["open_db"]().close()
+
+    # A retained observation from an earlier (unbudgeted) sync, with its index.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T12:00:00Z")
+    cache_mod._append_codex_quota_obs([_quota_row(10)])
+    monkeypatch.delenv("CCTALLY_AS_OF")
+    keys_path, _meta_path = _quota_index_paths()
+    assert keys_path.exists()
+    damage(keys_path)
+    _forget_quota_index(jr)
+    before = _journal_quota_multiplicity(jr, jl)
+
+    reads_inside_append: list[str] = []
+    inside = {"append": False}
+    real_open = jr._open_segment_for_read
+    real_append = jr.append_record
+
+    def counting_open(path):
+        if inside["append"]:
+            reads_inside_append.append(Path(path).name)
+        return real_open(path)
+
+    def tracking_append(*args, **kwargs):
+        inside["append"] = True
+        try:
+            return real_append(*args, **kwargs)
+        finally:
+            inside["append"] = False
+
+    monkeypatch.setattr(jr, "_open_segment_for_read", counting_open)
+    monkeypatch.setattr(jr, "append_record", tracking_append)
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](
+            cache, budget_seconds=60.0, quota_reconcile="defer")
+    finally:
+        cache.close()
+
+    assert reads_inside_append == [], (
+        "a budgeted quota append scanned the journal to rebuild its index")
+    assert stats.deferred_reason == "quota_index_pending"
+    conn = ns["open_cache_db"]()
+    try:
+        offset = conn.execute(
+            "SELECT last_byte_offset FROM codex_session_files WHERE path=?",
+            (str(rollout),)).fetchone()
+        materialized = conn.execute(
+            "SELECT COUNT(*) FROM quota_window_snapshots "
+            "WHERE source='codex'").fetchone()[0]
+    finally:
+        conn.close()
+    assert offset is None or offset[0] == 0, "the deferred file's offset advanced"
+    assert materialized == 0
+    assert _journal_quota_multiplicity(jr, jl) == before
+    assert "_quota-index-rebuild" in spawned, "nobody was asked to rebuild"
+
+    # The append itself refuses before writing a byte.
+    sizes = _segment_sizes()
+    with pytest.raises(jr.QuotaIndexUnavailable):
+        real_append(_quota_obs_at(jl, 99), now_utc=FIXED,
+                    dedupe_codex_quota=True, quota_index_policy="budgeted")
+    assert _segment_sizes() == sizes
+
+
+def test_budgeted_append_missing_index_raises_without_scan(tmp_path, monkeypatch):
+    _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, _remove_index)
+
+
+def test_budgeted_append_malformed_index_raises_without_scan(
+    tmp_path, monkeypatch,
+):
+    _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, _malform_index)
+
+
+def test_budgeted_append_torn_index_raises_without_scan(tmp_path, monkeypatch):
+    _assert_budgeted_sync_defers_without_scan(tmp_path, monkeypatch, _tear_index)
+
+
+@pytest.mark.parametrize("damage", [
+    "legacy", "replaced", "shrunk",
+    "segment-replaced", "segment-shrunk", "uncovered-before-covered",
+])
+def test_index_validity_rejects_legacy_replaced_shrunk(
+    tmp_path, monkeypatch, damage,
+):
+    """C1: an index a fresh process cannot prove complete must fail closed.
+
+    Trusting any of these would let a dedupe check skip an observation whose
+    natural key the keys file holds but whose journal record is gone, or miss
+    one it never covered: a legacy index has no coverage proof, a replaced or
+    shrunk keys file and a replaced or shrunk segment no longer match their
+    publication, and an uncovered segment that sorts before a covered one was
+    written outside the appender protocol (the cutover bootstrap).
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    core = importlib.import_module("_cctally_core")
+    for offset in (10, 11):
+        jr.append_record(_quota_obs_at(jl, offset), now_utc=FIXED)
+    assert jr.rebuild_quota_index() == "published"
+    keys_path, meta_path = _quota_index_paths()
+    assert jr.quota_index_valid()
+    meta = json.loads(meta_path.read_text())
+    assert meta["v"] == 1 and meta["key_count"] == 2
+    assert meta["index_bytes"] == 2 * 19
+
+    # Growth by the appender protocol and a later segment keep it valid.
+    jr.append_record(_quota_obs_at(jl, 12), now_utc=FIXED, dedupe_codex_quota=True)
+    jr.append_record(_quota_obs_at(jl, 13), now_utc=AUGUST, dedupe_codex_quota=True)
+    assert jr.quota_index_valid()
+
+    july = core.JOURNAL_DIR / "observations-2026-07.jsonl"
+    if damage == "legacy":
+        meta_path.unlink()
+    elif damage == "replaced":
+        copy = keys_path.with_name("replacement")
+        shutil.copyfile(keys_path, copy)
+        os.replace(copy, keys_path)
+    elif damage == "shrunk":
+        os.truncate(keys_path, meta["index_bytes"] - 19)
+    elif damage == "segment-replaced":
+        copy = july.with_name("replacement")
+        shutil.copyfile(july, copy)
+        os.replace(copy, july)
+    elif damage == "segment-shrunk":
+        first_line = july.read_bytes().index(b"\n") + 1
+        os.truncate(july, first_line)
+    else:
+        (core.JOURNAL_DIR / "bootstrap-20260101T000000_000000.jsonl").write_bytes(
+            b"{}\n")
+    assert not jr.quota_index_valid()
+
+    _forget_quota_index(jr)
+    with pytest.raises(jr.QuotaIndexUnavailable):
+        jr.ensure_quota_index(budgeted=True)
+    assert jr.rebuild_quota_index() == "published"
+    assert jr.quota_index_valid()
+
+
+def test_process_local_set_detects_shrink_and_foreign_growth(tmp_path, monkeypatch):
+    """C3: a long-lived process must follow the keys file, not a stale copy.
+
+    Missing foreign growth re-journals an observation another process already
+    retained; reading growth from a stale offset after a shrink parses keys
+    from the middle of the file.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    first, foreign, later = (_quota_obs_at(jl, n) for n in (10, 11, 12))
+    assert jr.append_record(first, now_utc=FIXED, dedupe_codex_quota=True)
+    keys_path, _meta_path = _quota_index_paths()
+
+    # Another process appends `foreign` by the appender protocol.
+    jr.append_record(foreign, now_utc=FIXED)
+    foreign_key = jr._codex_quota_natural_key(foreign)
+    with open(keys_path, "ab") as handle:
+        handle.write(f"{foreign_key}\n".encode("ascii"))
+    assert jr.append_record(
+        foreign, now_utc=FIXED, dedupe_codex_quota=True) is None, (
+        "the loaded set missed a key another process appended")
+    assert _journal_quota_multiplicity(jr, jl)[foreign_key] == 1
+
+    # An external shrink below what this process consumed.
+    os.truncate(keys_path, keys_path.stat().st_size - 19)
+    assert jr.append_record(later, now_utc=FIXED, dedupe_codex_quota=True)
+    assert foreign_key not in jr._QUOTA_DEDUP_KEYS, (
+        "the shrink was not detected; the stale set survived")
+    assert {jr._codex_quota_natural_key(first),
+            jr._codex_quota_natural_key(later)} <= jr._QUOTA_DEDUP_KEYS
+
+
+class _InjectedCrash(Exception):
+    """A process death at an injected point."""
+
+
+def _full_scan_oracle(jr, jl):
+    return set(_journal_quota_multiplicity(jr, jl))
+
+
+def test_rebuild_concurrent_appends_rollover_torn_tail_crash_between_renames(
+    tmp_path, monkeypatch,
+):
+    """T-C2: the rebuild's key set equals a full scan under every schedule.
+
+    An extra key (from a torn line) would make a later retry skip an
+    observation whose record is not durable; a missing key (appended during
+    the lock-free scan, at rollover, or in the publication race) re-journals an
+    observation. Journal multiplicity is counted in the journal itself, and
+    only C2's two named allowances may exceed one.
+    """
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    core = importlib.import_module("_cctally_core")
+    update = importlib.import_module("_cctally_update")
+    spawned: list[str] = []
+    monkeypatch.setattr(
+        update, "_spawn_detached",
+        lambda command: spawned.append(command) or True)
+    observations = [_quota_obs_at(jl, n) for n in range(12)]
+    key = [jr._codex_quota_natural_key(obs) for obs in observations]
+    july = core.JOURNAL_DIR / "observations-2026-07.jsonl"
+
+    # A legacy journal that predates the index; then a published index that a
+    # torn keys file has invalidated, so the sidecar of the crashed publication
+    # below is an OLD one.
+    for obs in observations[:5]:
+        jr.append_record(obs, now_utc=FIXED)
+    assert jr.rebuild_quota_index() == "published"
+    keys_path, meta_path = _quota_index_paths()
+    _tear_index(keys_path)
+    _forget_quota_index(jr)
+    assert not jr.quota_index_valid()
+
+    fired: dict[str, int] = collections.Counter()
+
+    def phase(name):
+        fired[name] += 1
+        if name == "captured" and fired[name] == 1:
+            # Concurrent growth during the lock-free scan, then a writer that
+            # crashed mid-line.
+            jr.append_record(observations[5], now_utc=FIXED)
+            with open(july, "ab") as handle:
+                handle.write(b'{"t":"obs","torn":')
+        elif name == "scanned" and fired[name] == 1:
+            # The next append repairs the torn tail; then a month rollover.
+            jr.append_record(observations[6], now_utc=FIXED)
+            jr.append_record(observations[7], now_utc=AUGUST)
+        elif name == "before_lock" and fired[name] == 1:
+            # The publication race: growth after the last catch-up round.
+            jr.append_record(observations[8], now_utc=AUGUST)
+        elif name == "between_renames" and fired[name] == 1:
+            raise _InjectedCrash
+
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", phase)
+    with pytest.raises(_InjectedCrash):
+        jr.rebuild_quota_index()
+    assert meta_path.exists()
+    assert not jr.quota_index_valid(), (
+        "a keys file renamed under an old sidecar was accepted")
+
+    assert jr.rebuild_quota_index() == "published"
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
+    assert jr.quota_index_valid()
+    lines = keys_path.read_text(encoding="ascii").splitlines()
+    assert set(lines) == _full_scan_oracle(jr, jl) == set(key[:9])
+    assert len(lines) == len(set(lines))
+    assert json.loads(meta_path.read_text())["key_count"] == len(lines)
+
+    # A second contender finds it valid; every retry of a retained
+    # observation, in a fresh process, is skipped.
+    assert jr.rebuild_quota_index() == "already_valid"
+    _forget_quota_index(jr)
+    for obs in observations[:9]:
+        assert jr.append_record(obs, now_utc=AUGUST, dedupe_codex_quota=True) is None
+
+    # Allowance 1: a crash between the journal fsync and the key fsync.
+    real_key_append = jr._append_quota_dedup_key
+    crashes = {"left": 1}
+
+    def crashing_key_append(natural_key):
+        if crashes["left"]:
+            crashes["left"] -= 1
+            raise _InjectedCrash
+        return real_key_append(natural_key)
+
+    monkeypatch.setattr(jr, "_append_quota_dedup_key", crashing_key_append)
+    with pytest.raises(_InjectedCrash):
+        jr.append_record(observations[9], now_utc=AUGUST, dedupe_codex_quota=True)
+    assert jr.append_record(
+        observations[9], now_utc=AUGUST, dedupe_codex_quota=True) is not None
+
+    # Allowance 2: an older binary's stale loaded set re-appends a key that
+    # another process added after its load (it never re-reads the file).
+    jr.append_record(observations[10], now_utc=AUGUST, dedupe_codex_quota=True)
+    jr.append_record(observations[10], now_utc=AUGUST)
+    with open(keys_path, "ab") as handle:
+        handle.write(f"{key[10]}\n".encode("ascii"))
+    # This binary re-reads the file, so it does not.
+    assert jr.append_record(
+        observations[10], now_utc=AUGUST, dedupe_codex_quota=True) is None
+
+    multiplicity = _journal_quota_multiplicity(jr, jl)
+    assert {k for k, n in multiplicity.items() if n > 1} == {key[9], key[10]}
+    assert max(multiplicity.values()) == 2
+
+    # Repeated loss: a segment replaced on every attempt ends in a recorded
+    # failure, the index stays invalid, and a later request retries.
+    _tear_index(keys_path)
+    _forget_quota_index(jr)
+
+    def replace_segment(name):
+        if name == "captured":
+            copy = july.with_name("replacement")
+            shutil.copyfile(july, copy)
+            os.replace(copy, july)
+
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", replace_segment)
+    assert jr.rebuild_quota_index(max_attempts=3) == "failed"
+    assert not jr.quota_index_valid()
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
+
+    # Duplicate contenders: while a worker holds the rebuild lock a request
+    # spawns nothing; once it is free one request spawns, and an immediate
+    # second one is throttled.
+    holder = os.open(str(jr._quota_index_rebuild_lock_path()),
+                     os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        assert jr.request_quota_index_rebuild() is True
+        assert spawned == []
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    jr._quota_index_rebuild_marker_path().unlink(missing_ok=True)
+    assert jr.request_quota_index_rebuild() is True
+    assert jr.request_quota_index_rebuild() is True
+    assert spawned == ["_quota-index-rebuild"]
+
+    assert jr.rebuild_quota_index() == "published"
+    lines = keys_path.read_text(encoding="ascii").splitlines()
+    assert set(lines) == _full_scan_oracle(jr, jl)
+
+
+@pytest.mark.parametrize("population,catchup", [
+    (20, 5), (200, 5), (20, 50), (200, 50),
+])
+def test_rebuild_locked_work_independent_of_population_and_catchup(
+    tmp_path, monkeypatch, population, catchup,
+):
+    """C7: appenders wait on the leaf lock, so the rebuild's locked section
+    must read and fsync only the uncovered suffix. A locked section that grew
+    with the index or with catch-up volume would stall every hook's journal
+    append for a history-sized interval (#977)."""
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    core = importlib.import_module("_cctally_core")
+    july = core.JOURNAL_DIR / "observations-2026-07.jsonl"
+    for n in range(population):
+        jr.append_record(_quota_obs_at(jl, n), now_utc=FIXED)
+
+    suffix = {"bytes": 0}
+    fired: dict[str, int] = collections.Counter()
+
+    def phase(name):
+        fired[name] += 1
+        if name == "scanned" and fired[name] == 1:
+            for n in range(catchup):
+                jr.append_record(_quota_obs_at(jl, 10_000 + n), now_utc=FIXED)
+        elif name == "before_lock" and fired[name] == 1:
+            start = july.stat().st_size
+            for n in range(3):
+                jr.append_record(_quota_obs_at(jl, 20_000 + n), now_utc=FIXED)
+            suffix["bytes"] = july.stat().st_size - start
+
+    held = {"on": False}
+    measured = collections.Counter()
+    unsynced_keys: dict[int, int] = collections.defaultdict(int)
+    real_acquire, real_release = jr._acquire_leaf_lock, jr._release_leaf_lock
+    real_write_all, real_fsync = jr._write_all, os.fsync
+    real_scan = jr._scan_quota_keys_range
+
+    def acquire():
+        fd = real_acquire()
+        held["on"] = True
+        return fd
+
+    def release(fd):
+        held["on"] = False
+        real_release(fd)
+
+    def write_all(fd, data):
+        if bytes(data[:2]) == b"o:":
+            unsynced_keys[fd] += len(data)
+            if held["on"]:
+                measured["locked_key_bytes_written"] += len(data)
+        real_write_all(fd, data)
+
+    def fsync(fd):
+        if held["on"]:
+            measured["locked_key_bytes_fsynced"] += unsynced_keys.get(fd, 0)
+        unsynced_keys[fd] = 0
+        return real_fsync(fd)
+
+    def scan(segment, start, end, *args, **kwargs):
+        if held["on"]:
+            measured["locked_bytes_read"] += end - start
+        return real_scan(segment, start, end, *args, **kwargs)
+
+    monkeypatch.setattr(jr, "_acquire_leaf_lock", acquire)
+    monkeypatch.setattr(jr, "_release_leaf_lock", release)
+    monkeypatch.setattr(jr, "_write_all", write_all)
+    monkeypatch.setattr(jr.os, "fsync", fsync)
+    monkeypatch.setattr(jr, "_scan_quota_keys_range", scan)
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", phase)
+
+    assert jr.rebuild_quota_index() == "published"
+    assert fired["catchup"] >= 1
+    assert suffix["bytes"] > 0
+    assert measured["locked_bytes_read"] == suffix["bytes"]
+    assert measured["locked_key_bytes_written"] == 3 * 19
+    assert measured["locked_key_bytes_fsynced"] == 3 * 19
+
+    monkeypatch.setattr(jr, "_QUOTA_INDEX_REBUILD_PHASE_HOOK", None)
+    keys_path, _meta_path = _quota_index_paths()
+    assert set(keys_path.read_text(encoding="ascii").splitlines()) == (
+        _full_scan_oracle(jr, jl))
+
+
+def _codex_home_with_rollouts(tmp_path, monkeypatch, *names):
+    provider_root = tmp_path / "fake-codex-home"
+    paths = []
+    for name in names:
+        rollout = provider_root / "sessions" / "2026" / "07" / "15" / name
+        rollout.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(CODEX_S1_FIXTURE, rollout)
+        paths.append(rollout)
+    monkeypatch.setenv("CODEX_HOME", str(provider_root))
+    return paths
+
+
+def _file_offsets(ns, paths):
+    conn = ns["open_cache_db"]()
+    try:
+        return {
+            path.name: (conn.execute(
+                "SELECT last_byte_offset FROM codex_session_files WHERE path=?",
+                (str(path),)).fetchone() or (0,))[0]
+            for path in paths
+        }
+    finally:
+        conn.close()
+
+
+def test_unbudgeted_sync_rebuilds_the_index_before_taking_producer_locks(
+    tmp_path, monkeypatch,
+):
+    """C6: an explicit sync repairs a damaged index BEFORE it takes the cache
+    writer flocks. Scanning the journal inside a quota append instead holds
+    both flocks for the whole scan, so every concurrent hook loses its sync."""
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    cache_mod = importlib.import_module("_cctally_cache")
+    (rollout,) = _codex_home_with_rollouts(tmp_path, monkeypatch, "rollout-s1.jsonl")
+    ns["open_db"]().close()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-07-15T12:00:00Z")
+    cache_mod._append_codex_quota_obs([_quota_row(10)])
+    monkeypatch.delenv("CCTALLY_AS_OF")
+    keys_path, _meta_path = _quota_index_paths()
+    _remove_index(keys_path)
+    _forget_quota_index(jr)
+
+    reads_inside_append: list[str] = []
+    inside = {"append": False}
+    real_open, real_append = jr._open_segment_for_read, jr.append_record
+
+    def counting_open(path):
+        if inside["append"]:
+            reads_inside_append.append(Path(path).name)
+        return real_open(path)
+
+    def tracking_append(*args, **kwargs):
+        inside["append"] = True
+        try:
+            return real_append(*args, **kwargs)
+        finally:
+            inside["append"] = False
+
+    monkeypatch.setattr(jr, "_open_segment_for_read", counting_open)
+    monkeypatch.setattr(jr, "append_record", tracking_append)
+    core = importlib.import_module("_cctally_core")
+    flock_free_during_rebuild: list[bool] = []
+    real_rebuild = getattr(jr, "rebuild_quota_index", None)
+
+    def probing_rebuild(*args, **kwargs):
+        fd = os.open(str(core.CACHE_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            flock_free_during_rebuild.append(True)
+        except BlockingIOError:
+            flock_free_during_rebuild.append(False)
+        finally:
+            os.close(fd)
+        return real_rebuild(*args, **kwargs)
+
+    if real_rebuild is not None:
+        monkeypatch.setattr(jr, "rebuild_quota_index", probing_rebuild)
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](cache, quota_reconcile="defer")
+    finally:
+        cache.close()
+
+    assert reads_inside_append == [], (
+        "the explicit sync rebuilt the index inside a quota append, under the "
+        "cache writer flocks")
+    assert flock_free_during_rebuild == [True]
+    assert stats.deferred_reason is None
+    assert jr.quota_index_valid()
+    assert _file_offsets(ns, [rollout])[rollout.name] > 0
+    assert len(_journal_quota_multiplicity(jr, jl)) > 1
+
+
+def test_mid_sync_index_loss_defers_and_keeps_committed_predecessors(
+    tmp_path, monkeypatch,
+):
+    """C5/C6: an index that becomes invalid mid-walk stops ingest at the next
+    quota-bearing file with its offset unadvanced, keeps the files already
+    prepared and journaled, and requests the worker after the flocks are
+    released. Advancing past the refused file would drop its observations
+    from the journal for good once the rollout evaporates."""
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    update = importlib.import_module("_cctally_update")
+    core = importlib.import_module("_cctally_core")
+    paths = _codex_home_with_rollouts(
+        tmp_path, monkeypatch, "rollout-a.jsonl", "rollout-b.jsonl")
+    ns["open_db"]().close()
+    assert jr.rebuild_quota_index() == "published"
+    spawned: list[tuple[str, bool]] = []
+
+    def spawn(command):
+        fd = os.open(str(core.CACHE_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            free = True
+        except BlockingIOError:
+            free = False
+        finally:
+            os.close(fd)
+        spawned.append((command, free))
+        return True
+
+    monkeypatch.setattr(update, "_spawn_detached", spawn)
+    keys_path, _meta_path = _quota_index_paths()
+    prepared: list[str] = []
+
+    def lose_index(path_str):
+        prepared.append(path_str)
+        if len(prepared) == 1:
+            copy = keys_path.with_name("replacement")
+            shutil.copyfile(keys_path, copy)
+            os.replace(copy, keys_path)
+
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](
+            cache, quota_reconcile="defer", _on_file_prepared=lose_index)
+    finally:
+        cache.close()
+
+    assert stats.deferred_reason == "quota_index_pending"
+    offsets = _file_offsets(ns, paths)
+    advanced = sorted(name for name, offset in offsets.items() if offset > 0)
+    assert advanced == [Path(prepared[0]).name], offsets
+    assert ("_quota-index-rebuild", True) in spawned
+
+
+@pytest.mark.parametrize("hazard", ["history_sized", "rebuild_in_progress"])
+def test_a_segment_appearing_after_the_pre_lock_check_never_rebuilds_under_flocks(
+    tmp_path, monkeypatch, hazard,
+):
+    """C6 (#977, review R6): an explicit sync skips the pre-lock index repair
+    when the journal has no segment, but another process can append the
+    first segment before the sync's first quota append. That append then ran
+    the process's first-use rebuild inline, under both cache writer flocks:
+    a scan of whatever history is there (``history_sized``, the bound
+    lowered below the raced segment), or a wait on the rebuild lock the
+    worker holds (``rebuild_in_progress``) -- and every hook's sync waits
+    behind both flocks meanwhile. It must defer (``quota_index_pending``)
+    and request the worker after the flocks are released instead. A fresh
+    store's own small first rebuild stays inline (covered by the sync tests
+    above)."""
+    import threading
+    ns, _quota, jr, jl = _load(tmp_path, monkeypatch)
+    update = importlib.import_module("_cctally_update")
+    core = importlib.import_module("_cctally_core")
+    cache_mod = importlib.import_module("_cctally_cache")
+    (rollout,) = _codex_home_with_rollouts(
+        tmp_path, monkeypatch, "rollout-s1.jsonl")
+    ns["open_cache_db"]().close()
+    _forget_quota_index(jr)
+    assert jr.list_segments() == [], "non-vacuity: the pre-lock check skips"
+
+    def flocks_free() -> bool:
+        fd = os.open(str(core.CACHE_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    # (under the writer flocks, willing to wait on the rebuild lock)
+    rebuilds: list[tuple[bool, bool]] = []
+    real_rebuild = jr.rebuild_quota_index
+
+    def probing_rebuild(*args, **kwargs):
+        rebuilds.append((not flocks_free(), kwargs.get("wait", True)))
+        return real_rebuild(*args, **kwargs)
+
+    monkeypatch.setattr(jr, "rebuild_quota_index", probing_rebuild)
+    if hazard == "history_sized":
+        monkeypatch.setattr(jr, "_QUOTA_PRODUCER_LOCKED_REBUILD_BYTES", 0,
+                            raising=False)
+    real_append = cache_mod._append_codex_quota_obs
+    raced = []
+
+    def racing_append(quota_rows, **kwargs):
+        if quota_rows and not raced:
+            # Another process's first journal line lands now.
+            raced.append(jr.append_record(_codex_quota_obs(
+                jl, source_root_key="root-other",
+                source_path="/codex/root-other/r.jsonl", line_offset=1,
+                captured_at_utc=_iso(9))))
+        return real_append(quota_rows, **kwargs)
+
+    monkeypatch.setattr(cache_mod, "_append_codex_quota_obs", racing_append)
+    spawned: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        update, "_spawn_detached",
+        lambda command: spawned.append((command, flocks_free())) or True)
+    requests: list[bool] = []
+    real_request = jr.request_quota_index_rebuild
+
+    def requesting():
+        requests.append(flocks_free())
+        return real_request()
+
+    monkeypatch.setattr(jr, "request_quota_index_rebuild", requesting)
+    holder = None
+    release = None
+    if hazard == "rebuild_in_progress":
+        core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        holder = os.open(str(jr._quota_index_rebuild_lock_path()),
+                         os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        # Bounded: a sync that waits is released (and fails the assertions)
+        # rather than hanging the run.
+        release = threading.Timer(3.0, fcntl.flock, (holder, fcntl.LOCK_UN))
+        release.start()
+    cache = ns["open_cache_db"]()
+    try:
+        stats = ns["sync_codex_cache"](cache, quota_reconcile="defer")
+    finally:
+        cache.close()
+        if release is not None:
+            release.cancel()
+            release.join()
+            os.close(holder)
+
+    assert raced, "non-vacuity: a segment appeared before the quota append"
+    assert (True, True) not in rebuilds, (
+        "the first quota append rebuilt the index under the writer flocks, "
+        "willing to wait on the rebuild lock")
+    if hazard == "history_sized":
+        assert rebuilds == [], "a history-sized rebuild ran under the flocks"
+    assert stats.deferred_reason == "quota_index_pending"
+    assert _file_offsets(ns, [rollout])[rollout.name] == 0
+    # Requested once both flocks are released. A rebuild already running
+    # (``rebuild_in_progress``) is not duplicated: that worker finishes it.
+    assert requests and all(requests), requests
+    if hazard == "history_sized":
+        assert ("_quota-index-rebuild", True) in spawned

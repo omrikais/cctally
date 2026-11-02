@@ -850,16 +850,17 @@ reconcile_invariant "diff_projects_sum_eq_overall" \
     "$INVARIANT_D3_PY"
 
 # ─── Invariant FHB1: per-block totalCost vs range-cost ──────────────────
-# For one API-anchored 5h block, block.totalCost (recomputed at every
-# record-usage tick by _compute_block_totals) must equal
+# For one API-anchored OPEN 5h block, block.totalCost (recomputed at
+# every record-usage tick by _compute_block_totals while the block is open;
+# a closed block is a frozen fact since #956) must equal
 # range-cost -s <first_observed_at_utc> -e <last_observed_at_utc>
 # --total-only within 1e-9 USD. Both paths sum the same per-entry costs;
 # the tolerance absorbs IEEE-754 ULP drift across different aggregation
 # orders (CLAUDE.md float-tolerance gotcha — never == on cost sums).
 #
 # This scenario uses its own scratch HOME (no fixture builder needed):
-# it seeds session_entries directly into cache.db, inserts a 5h-blocks
-# row, then drives `record-usage` to recompute totals.
+# it seeds session_entries directly into cache.db, inserts an open
+# 5h-blocks row, then drives `record-usage` to recompute totals.
 fhb_perblock_vs_range_cost () {
     local name="fhb-perblock-vs-range-cost"
     local home
@@ -899,8 +900,11 @@ VALUES
 EOF
 
     # Insert the block row covering the same [first_observed, last_observed]
-    # window the entries land in. _compute_block_totals will recompute
-    # totals on the next record-usage tick.
+    # window the entries land in, OPEN (is_closed = 0): the next
+    # record-usage tick's end projection recomputes an open block's totals.
+    # It is not seeded closed because since #956 a closed block is a frozen
+    # journaled fact that no tick refreshes, so a closed seed with a zero
+    # total would compare that frozen zero, not the projection.
     sqlite3 "$home/.local/share/cctally/stats.db" <<EOF
 INSERT INTO five_hour_blocks (
     five_hour_window_key, five_hour_resets_at, block_start_at,
@@ -910,7 +914,7 @@ INSERT INTO five_hour_blocks (
     created_at_utc, last_updated_at_utc
 ) VALUES (1777563000, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00',
           '2026-04-30T11:00:00+00:00', '2026-04-30T13:30:00+00:00',
-          5.0, 0.0, 0, 1,
+          5.0, 0.0, 0, 0,
           '2026-04-30T11:00:00+00:00', '2026-04-30T13:30:00+00:00');
 EOF
 
@@ -927,20 +931,23 @@ EOF
         --five-hour-percent 5 --five-hour-resets-at 1777563000 \
         >>"$home/stdout.log" 2>>"$home/stderr.log" || true
 
-    # Read back block.totalCost via --json.
-    local block_cost
-    block_cost=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --json 2>/dev/null \
+    # Read back block.totalCost and the block's projected
+    # lastObservedAtUtc (the tick moves it to its own capture) via --json.
+    local block_json block_cost block_last
+    block_json=$(HOME="$home" TZ=Etc/UTC "$BIN" five-hour-blocks --json 2>/dev/null \
                  | python3 -c "import json,sys
 d = json.load(sys.stdin)
-print(next((b['totalCost'] for b in d['blocks']
-            if b['blockStartAt'] == '2026-04-30T10:30:00+00:00'),
-           0.0))")
+b = next((b for b in d['blocks']
+          if b['blockStartAt'] == '2026-04-30T10:30:00+00:00'), None)
+print(b['totalCost'] if b else 0.0, b['lastObservedAtUtc'] if b else '')")
+    block_cost=${block_json%% *}
+    block_last=${block_json#* }
 
-    # range-cost over the exact [first_observed, last_observed] window.
+    # range-cost over the block's [first_observed, last_observed] window.
     local rc_cost
     rc_cost=$(HOME="$home" TZ=Etc/UTC "$BIN" range-cost \
                   -s "2026-04-30T11:00:00+00:00" \
-                  -e "2026-04-30T13:30:00+00:00" --total-only 2>/dev/null)
+                  -e "${block_last:-2026-04-30T13:30:00+00:00}" --total-only 2>/dev/null)
 
     # Compare with 1e-9 tolerance — never == (CLAUDE.md float-tolerance gotcha).
     # Three-way exit: 0 = equal, 1 = mismatch, 2 = both zero (data path broken
@@ -968,7 +975,7 @@ sys.exit(0 if abs(b - r) < 1e-9 else 1)
             fail_count=$((fail_count + 1))
             ;;
         *)
-            echo "RECONCILE FAIL $name: block.totalCost=$block_cost range-cost=$rc_cost diff=$diff (scratch=$home)"
+            echo "RECONCILE FAIL $name: block.totalCost=$block_cost range-cost=$rc_cost diff=$diff lastObserved=$block_last (scratch=$home)"
             fail_count=$((fail_count + 1))
             ;;
     esac
@@ -1965,10 +1972,14 @@ credit_invariants
 #         for that key (e.g. heuristic-only history) skips this check
 #         gracefully via the LEFT JOIN — there is no body to compare to.
 #
-# R-5HC3: UNIQUE(five_hour_window_key, effective_reset_at_utc) is enforced
-#         at the schema level; this is a belt-and-suspenders runtime
-#         check that catches data imported via raw INSERT bypassing the
-#         constraint (e.g. operator restore from a pre-UNIQUE backup).
+# R-5HC3: UNIQUE(account_key, five_hour_window_key, effective_reset_at_utc)
+#         is enforced at the schema level; this is a belt-and-suspenders
+#         runtime check that catches data imported via raw INSERT bypassing
+#         the constraint (e.g. operator restore from a pre-UNIQUE backup).
+#         It is account-scoped like the constraint (#943): two accounts may
+#         each hold a credit in the same window and slot, and the
+#         `five_hour_credit_boundaries` companion joins a credit by exactly
+#         this natural key.
 #
 # All three run against a synthesized DB inside a scratch HOME so the
 # harness can be re-run on any clone without requiring a real credited
@@ -2028,6 +2039,16 @@ try:
         " post_percent, effective_reset_at_utc) VALUES (?, ?, ?, ?, ?)",
         ("2026-05-16T21:30:00Z", window_key, 15.0, 5.0, effective_b),
     )
+    # A second account's credit in the SAME window and slot as the first
+    # (#943): distinct natural keys, so R-5HC3 must accept it.
+    conn.execute(
+        "INSERT INTO five_hour_reset_events "
+        "(detected_at_utc, five_hour_window_key, prior_percent, "
+        " post_percent, effective_reset_at_utc, account_key) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("2026-05-16T21:00:00Z", window_key, 20.0, 6.0, effective_a,
+         "second-account"),
+    )
     conn.commit()
 
     # R-5HC1: prior_percent - post_percent >= 5.0 AND prior > post for every row.
@@ -2061,21 +2082,24 @@ try:
     )
 
     # R-5HC3: no two five_hour_reset_events rows share
-    # (five_hour_window_key, effective_reset_at_utc). The UNIQUE constraint
-    # at the schema level handles inserts via the normal path; this catches
-    # raw-INSERT imports that bypass UNIQUE (e.g. operator restore).
+    # (account_key, five_hour_window_key, effective_reset_at_utc). The UNIQUE
+    # constraint at the schema level handles inserts via the normal path;
+    # this catches raw-INSERT imports that bypass UNIQUE (e.g. operator
+    # restore).
     row = conn.execute(
         """
         SELECT COUNT(*) AS c FROM (
-          SELECT five_hour_window_key, effective_reset_at_utc, COUNT(*) AS n
+          SELECT account_key, five_hour_window_key, effective_reset_at_utc,
+                 COUNT(*) AS n
             FROM five_hour_reset_events
-           GROUP BY five_hour_window_key, effective_reset_at_utc
+           GROUP BY account_key, five_hour_window_key, effective_reset_at_utc
           HAVING n > 1
         )
         """,
     ).fetchone()
     assert row["c"] == 0, (
-        f"R-5HC3 fail: {row['c']} duplicate (window_key, effective_iso) pairs"
+        f"R-5HC3 fail: {row['c']} duplicate "
+        f"(account, window_key, effective_iso) triples"
     )
 
     print("OK")

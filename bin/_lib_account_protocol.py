@@ -33,6 +33,16 @@ codec; after it, a Claude-scoped record without ``wpr == 2`` is excluded
 exactly as an unstamped record is after the original cutover. The revision
 boundary never re-admits a record the original rule excludes.
 
+#1019/#1014 (spec section 4.7, C1-C8): revision 3 of the fence. ``wpg`` and
+``wpr`` keep their values (1.116.1's exact-equality checks must keep
+admitting what the current binary writes), and a third reserved top-level
+field ``wpx`` carries the successor revision. A durable
+``account_bound_revision_v3`` op records a third physical boundary with the
+same codec plus the revision-2 op's coordinate; after it, a Claude-scoped
+record admitted by its stamps is excluded unless it also carries
+``wpx == 3`` (``revision-3-unstamped``). No boundary re-admits what an
+earlier rule excludes, and the Codex-only exemptions are unchanged.
+
 Pure: no I/O, no clock, no SQLite.
 """
 from __future__ import annotations
@@ -54,6 +64,12 @@ REVISION_KEY = "wpr"
 PROTOCOL_REVISION = 2
 REVISION_OP_KIND = "account_bound_revision"
 REVISION_OP_ID = "account-bound-revision-2"
+#: #1019/#1014 (spec 4.7 C1, C2): the successor-revision stamp and the
+#: durable op that records where revision 3 begins.
+SUCCESSOR_REVISION_KEY = "wpx"
+SUCCESSOR_REVISION = 3
+REVISION3_OP_KIND = "account_bound_revision_v3"
+REVISION3_OP_ID = "account-bound-revision-3"
 #: Spec revision 5 (section 7, operator decision on Codex design-fix-round-5
 #: Q4): the `legacy_spool_activity` reason of an incomplete inventory. Such an
 #: op records typed failure evidence and no digest, so it anchors no baseline.
@@ -67,6 +83,17 @@ INVENTORY_INCOMPLETE_REASON = "inventory-incomplete"
 INVENTORY_COMPLETE_REASON = "inventory-complete"
 #: The reasons whose unresolved markers an incomplete inventory left.
 INVENTORY_REASONS = (INVENTORY_INCOMPLETE_REASON, INVENTORY_COMPLETE_REASON)
+#: #948 spec 6.2: the three non-trigger recovery ops of the outcome
+#: quarantine. An inventory-episode completion (a complete scan found the
+#: spool unchanged while the journal shows the episode open), an OAuth
+#: authority completion (appended after its reconciliation committed) and a
+#: per-axis release (appended right after its witness). The previous release
+#: ignores an unknown op kind.
+INVENTORY_COMPLETION_OP_KIND = "legacy_spool_inventory_completion"
+AUTHORITY_COMPLETION_OP_KIND = "outcome_authority_completion"
+AXIS_RELEASE_OP_KIND = "outcome_axis_release"
+RECOVERY_OP_KINDS = (INVENTORY_COMPLETION_OP_KIND,
+                     AUTHORITY_COMPLETION_OP_KIND, AXIS_RELEASE_OP_KIND)
 #: The operations an inventory can fail at (the evidence's ``operation``).
 INVENTORY_OPERATIONS = ("list", "stat", "read")
 
@@ -79,6 +106,11 @@ PROTOCOL_RESOLUTION_V2_KIND = "journal_protocol_resolution_v2"
 #: binary emits repair acknowledgements under this successor kind, which the
 #: previous release ignores as an unknown op.
 PROTOCOL_RESOLUTION_V3_KIND = "journal_protocol_resolution_v3"
+#: #1019/#1014 (spec 4.7 C5): 1.116.1's strict validator of the v3
+#: acknowledgement has an exact key set and an identity core without
+#: ``wpx``, so the current binary emits repair acknowledgements under this
+#: successor kind, which 1.116.1 ignores as an unknown op.
+PROTOCOL_RESOLUTION_V4_KIND = "journal_protocol_resolution_v4"
 WEEKLY_OBSERVATION_DECISION_V2_KIND = "claude_weekly_observation_decision_v2"
 
 #: Admission families. ``codex`` is the only family admitted without a stamp.
@@ -93,15 +125,20 @@ FAMILIES = (
 )
 
 ADMISSION_REASONS = ("no-cutover", "historical", "stamped", "codex-only",
-                     "excluded", "revision-unstamped")
+                     "excluded", "revision-unstamped",
+                     "revision-3-unstamped")
 #: The reasons that exclude a record.
-EXCLUDED_REASONS = frozenset(("excluded", "revision-unstamped"))
+EXCLUDED_REASONS = frozenset(("excluded", "revision-unstamped",
+                              "revision-3-unstamped"))
 
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 _CLAUDE_OP_KINDS = frozenset((
     "account_observe", "account_label", "accounts_cutover",
     "weekly_credit_floor", "sync_week",
+    # #944 spec 5.10: a Claude cost attribution decision is Claude-scoped
+    # accounting truth, so an unstamped post-boundary one is excluded.
+    "claude_cost_account",
 ))
 _CODEX_OP_KINDS = frozenset((
     "codex_file_account", "codex_window_attribution",
@@ -110,15 +147,17 @@ _CODEX_OP_KINDS = frozenset((
 _ADMIN_OP_KINDS = frozenset((
     "journal_protocol_resolution", "claude_weekly_observation_decision",
     PROTOCOL_RESOLUTION_V2_KIND, PROTOCOL_RESOLUTION_V3_KIND,
-    WEEKLY_OBSERVATION_DECISION_V2_KIND,
+    PROTOCOL_RESOLUTION_V4_KIND, WEEKLY_OBSERVATION_DECISION_V2_KIND,
 ))
 _PROTOCOL_OP_KINDS = frozenset((CUTOVER_OP_KIND, LEGACY_SPOOL_ACTIVITY_KIND,
-                                REVISION_OP_KIND))
+                                REVISION_OP_KIND, REVISION3_OP_KIND,
+                                *RECOVERY_OP_KINDS))
 _ADMIN_RECORD_TYPES = frozenset(("correction", "correction_batch"))
 _CLAUDE_EVT_KINDS = frozenset((
     "snapshot_accept", "weekly_cost_snapshot", "week_reset", "five_hour_credit",
     "five_hour_block_close", "percent_milestone", "five_hour_milestone",
     "weekly_credit_effects", "projected", "project_budget", "meter_rate_change",
+    "meter_rate_change_supersession",
 ))
 #: Evt kinds admitted without a stamp only when their payload proves a Codex
 #: quota source (``payload.source == "codex"``, the source every Codex quota
@@ -165,6 +204,10 @@ class CutoverBoundary:
     #: the admission summary records the revision separately.
     revision: "RevisionBoundary | None" = dataclasses.field(
         default=None, compare=False)
+    #: #1019/#1014 (spec 4.7 C3): the revision-3 boundary a lookup found
+    #: after ``revision``, carried the same way and for the same reason.
+    revision3: "Revision3Boundary | None" = dataclasses.field(
+        default=None, compare=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +240,30 @@ class RevisionBoundary:
 
 
 @dataclasses.dataclass(frozen=True)
+class Revision3Boundary:
+    """The revision-3 boundary recorded by the ``account_bound_revision_v3``
+    op (#1019/#1014 spec 4.7 C2): the `RevisionBoundary` fields plus the
+    revision-2 op it extends (``revision2_segment`` and ``revision2_offset``,
+    the coordinate of that op).
+
+    ``legacy_spool_baseline_digest`` is the baseline digest of the inventory
+    that also covers the retired v2 directory's coordination state (C4), or
+    None with ``legacy_spool_inventory_failure`` when that inventory could
+    not complete; ``continued_inventory_episode`` as for revision 2."""
+
+    segment: str
+    end_offset: int
+    frozen_extents: Mapping[str, int]
+    legacy_spool_baseline_digest: "str | None"
+    cutover_segment: str
+    cutover_offset: int
+    revision2_segment: str
+    revision2_offset: int
+    legacy_spool_inventory_failure: "Mapping[str, object] | None" = None
+    continued_inventory_episode: "tuple[str, int] | None" = None
+
+
+@dataclasses.dataclass(frozen=True)
 class Admission:
     admitted: bool
     family: str
@@ -209,10 +276,11 @@ class Admission:
 
 def stamp(record: dict) -> dict:
     """Return a shallow copy of ``record`` carrying the current writer
-    generation and protocol revision (spec 4.6 B1). Idempotent; refuses a
-    record that already names a DIFFERENT generation or revision (a caller
-    must never relabel another protocol's record). The payload is never
-    touched: both stamps are transport metadata."""
+    generation, protocol revision and successor revision (spec 4.6 B1;
+    #1019/#1014 spec 4.7 C1). Idempotent; refuses a record that already
+    names a DIFFERENT value of any of them (a caller must never relabel
+    another protocol's record). The payload is never touched: the stamps
+    are transport metadata."""
     if not isinstance(record, dict):
         raise ValueError("journal record must be a dict")
     existing = record.get(WRITER_GENERATION_KEY)
@@ -223,9 +291,14 @@ def stamp(record: dict) -> dict:
         raise ValueError(
             f"record already carries protocol revision "
             f"{record[REVISION_KEY]!r}")
+    if SUCCESSOR_REVISION_KEY in record and not has_successor_revision(record):
+        raise ValueError(
+            f"record already carries successor revision "
+            f"{record[SUCCESSOR_REVISION_KEY]!r}")
     out = dict(record)
     out[WRITER_GENERATION_KEY] = PROTOCOL_GENERATION
     out[REVISION_KEY] = PROTOCOL_REVISION
+    out[SUCCESSOR_REVISION_KEY] = SUCCESSOR_REVISION
     return out
 
 
@@ -245,15 +318,29 @@ def has_current_revision(record: dict) -> bool:
     return type(value) is int and value == PROTOCOL_REVISION
 
 
+def has_successor_revision(record: dict) -> bool:
+    """Whether ``record`` carries exactly successor revision 3 (#1019/#1014
+    spec 4.7 C1), the writer-authority check after the revision-3 boundary.
+    Only an ``int`` equal to 3: never ``True``, ``"3"``, ``3.0`` or a later
+    revision."""
+    if not isinstance(record, dict):
+        return False
+    value = record.get(SUCCESSOR_REVISION_KEY)
+    return type(value) is int and value == SUCCESSOR_REVISION
+
+
+_STAMP_KEYS = (WRITER_GENERATION_KEY, REVISION_KEY, SUCCESSOR_REVISION_KEY)
+
+
 def strip_stamp(record: dict) -> dict:
-    """``record`` without its writer-generation and protocol-revision fields
-    — the comparison shape for semantic event duplicate/conflict
-    classification."""
-    if not isinstance(record, dict) or (
-            WRITER_GENERATION_KEY not in record and REVISION_KEY not in record):
+    """``record`` without its writer-generation, protocol-revision and
+    successor-revision fields — the comparison shape for semantic event
+    duplicate/conflict classification. Comparison only: a content id is
+    computed over the stamped core."""
+    if not isinstance(record, dict) or not any(
+            key in record for key in _STAMP_KEYS):
         return record
-    return {k: v for k, v in record.items()
-            if k not in (WRITER_GENERATION_KEY, REVISION_KEY)}
+    return {k: v for k, v in record.items() if k not in _STAMP_KEYS}
 
 
 # --------------------------------------------------------------------------
@@ -364,7 +451,45 @@ def with_revision(boundary: "CutoverBoundary | None",
             (revision.cutover_segment, revision.cutover_offset)
             != (boundary.segment, boundary.end_offset)):
         raise ValueError("revision boundary names a different cutover")
-    return dataclasses.replace(boundary, revision=revision)
+    revision3 = boundary.revision3
+    if revision3 is not None and (
+            revision is None
+            or (revision3.revision2_segment, revision3.revision2_offset)
+            != (revision.segment, revision.end_offset)):
+        # A revision-3 boundary never outlives the revision-2 boundary it
+        # extends.
+        revision3 = None
+    return dataclasses.replace(boundary, revision=revision,
+                               revision3=revision3)
+
+
+def with_revision3(boundary: "CutoverBoundary | None",
+                   revision3: "Revision3Boundary | None"):
+    """``boundary`` carrying ``revision3`` (#1019/#1014 spec 4.7 C3), or None
+    when there is no cutover. A revision 3 that names a different cutover or
+    revision-2 op (or arrives without a revision 2) is malformed and never
+    attached."""
+    if boundary is None:
+        return None
+    if revision3 is not None:
+        revision = boundary.revision
+        if ((revision3.cutover_segment, revision3.cutover_offset)
+                != (boundary.segment, boundary.end_offset)):
+            raise ValueError("revision-3 boundary names a different cutover")
+        if revision is None or (
+                (revision3.revision2_segment, revision3.revision2_offset)
+                != (revision.segment, revision.end_offset)):
+            raise ValueError(
+                "revision-3 boundary names a different revision-2 op")
+    return dataclasses.replace(boundary, revision3=revision3)
+
+
+def original_boundary(boundary: "CutoverBoundary | None"):
+    """``boundary`` with neither revision attached: the cutover op's own
+    boundary."""
+    if boundary is None:
+        return None
+    return dataclasses.replace(boundary, revision=None, revision3=None)
 
 
 def revision_boundary_payload(boundary: RevisionBoundary) -> dict:
@@ -439,6 +564,76 @@ def revision_boundary_from_op(op_record: dict) -> RevisionBoundary:
     )
 
 
+def revision3_boundary_payload(boundary: Revision3Boundary) -> dict:
+    """The camelCase payload fields of the revision-3 op (without ``kind``):
+    the revision-2 codec with ``revision: 3`` and the revision-2 op's
+    coordinate beside the cutover's."""
+    payload = {
+        "revision": SUCCESSOR_REVISION,
+        "cutover": {"segment": boundary.cutover_segment,
+                    "offset": boundary.cutover_offset},
+        "revision2": {"segment": boundary.revision2_segment,
+                      "offset": boundary.revision2_offset},
+        "segment": boundary.segment,
+        "endOffset": boundary.end_offset,
+        "frozenExtents": {k: boundary.frozen_extents[k]
+                          for k in sorted(boundary.frozen_extents)},
+        "legacySpoolBaselineDigest": boundary.legacy_spool_baseline_digest,
+    }
+    if boundary.legacy_spool_inventory_failure is not None:
+        payload["legacySpoolInventoryFailure"] = dict(
+            boundary.legacy_spool_inventory_failure)
+        if boundary.continued_inventory_episode is not None:
+            segment, offset = boundary.continued_inventory_episode
+            payload["inventoryEpisode"] = {"segment": segment,
+                                           "offset": offset}
+    return payload
+
+
+def _coordinate_member(value) -> bool:
+    return (isinstance(value, dict) and set(value) == {"segment", "offset"}
+            and isinstance(value.get("segment"), str) and value["segment"]
+            and _nonneg_int(value.get("offset")))
+
+
+def revision3_boundary_from_op(op_record: dict) -> Revision3Boundary:
+    """Decode the revision-3 boundary from an ``account_bound_revision_v3``
+    op. Raises ``ValueError`` on any shape failure, including a revision
+    other than exactly 3. Whether the op itself carries ``wpx == 3`` is the
+    caller's check (as `revision_boundary_from_op` leaves ``wpr``)."""
+    if not isinstance(op_record, dict) or op_record.get("t") != "op":
+        raise ValueError("revision-3 boundary must come from an op record")
+    payload = op_record.get("payload")
+    if (not isinstance(payload, dict)
+            or payload.get("kind") != REVISION3_OP_KIND):
+        raise ValueError("record is not an account_bound_revision_v3 op")
+    if type(payload.get("revision")) is not int or (
+            payload["revision"] != SUCCESSOR_REVISION):
+        raise ValueError("revision-3 boundary revision is invalid")
+    revision2 = payload.get("revision2")
+    if not _coordinate_member(revision2):
+        raise ValueError("revision-3 boundary revision-2 coordinate is invalid")
+    base = revision_boundary_from_op({
+        "t": "op",
+        "payload": {**{k: v for k, v in payload.items()
+                       if k != "revision2"},
+                    "kind": REVISION_OP_KIND,
+                    "revision": PROTOCOL_REVISION},
+    })
+    return Revision3Boundary(
+        segment=base.segment,
+        end_offset=base.end_offset,
+        frozen_extents=base.frozen_extents,
+        legacy_spool_baseline_digest=base.legacy_spool_baseline_digest,
+        cutover_segment=base.cutover_segment,
+        cutover_offset=base.cutover_offset,
+        revision2_segment=revision2["segment"],
+        revision2_offset=revision2["offset"],
+        legacy_spool_inventory_failure=base.legacy_spool_inventory_failure,
+        continued_inventory_episode=base.continued_inventory_episode,
+    )
+
+
 # --------------------------------------------------------------------------
 # admission
 # --------------------------------------------------------------------------
@@ -498,6 +693,7 @@ def record_family(record: dict) -> str:
 def classify_admission(record: dict, coord: Coordinate,
                        boundary: CutoverBoundary | None,
                        revision_boundary: "RevisionBoundary | None" = None,
+                       revision3_boundary: "Revision3Boundary | None" = None,
                        ) -> Admission:
     """The single admission predicate (spec 5.3; #797/#823/#840 spec 4.6 B3).
 
@@ -511,7 +707,12 @@ def classify_admission(record: dict, coord: Coordinate,
     a record the original rule admitted only by its writer generation unless
     it also carries ``wpr == 2`` (``revision-unstamped``). The revision never
     re-admits what the original rule excludes, and the Codex-only exemptions
-    are unchanged."""
+    are unchanged.
+
+    Composed with revision 3 (#1019/#1014 spec 4.7 C3): ``revision3_boundary``
+    (default: ``boundary.revision3``) excludes, after its own frozen extents,
+    a record the earlier rules admitted only by its stamps unless it also
+    carries ``wpx == 3`` (``revision-3-unstamped``)."""
     family, codex_only = _family(record)
     if boundary is None:
         return Admission(True, family, "no-cutover")
@@ -520,12 +721,19 @@ def classify_admission(record: dict, coord: Coordinate,
     if is_stamped(record):
         revision = (revision_boundary if revision_boundary is not None
                     else boundary.revision)
-        if (revision is None or is_historical(coord, revision)
+        if not (revision is None or is_historical(coord, revision)
                 or has_current_revision(record)):
+            if codex_only:
+                return Admission(True, family, "codex-only")
+            return Admission(False, family, "revision-unstamped")
+        revision3 = (revision3_boundary if revision3_boundary is not None
+                     else boundary.revision3)
+        if (revision3 is None or is_historical(coord, revision3)
+                or has_successor_revision(record)):
             return Admission(True, family, "stamped")
         if codex_only:
             return Admission(True, family, "codex-only")
-        return Admission(False, family, "revision-unstamped")
+        return Admission(False, family, "revision-3-unstamped")
     if codex_only:
         return Admission(True, family, "codex-only")
     return Admission(False, family, "excluded")

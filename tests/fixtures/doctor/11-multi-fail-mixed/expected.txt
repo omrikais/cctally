@@ -31,7 +31,7 @@ Database
   ✓ Rebuild worker           no stats.db upgrade rebuild has run; no stats.db auto-heal has run
   ✗ Migrations               1 failed
       → Run `cctally db status`; see ~/.local/share/cctally/logs/migration-errors.log
-  ⚠ Pending migrations       61 pending
+  ⚠ Pending migrations       63 pending
       → Run any cctally command — opens the DB and applies pending migrations
   ✓ Locks                    free
   ✓ cache.db WAL size        within limit
@@ -72,6 +72,7 @@ Accounts
   ✓ Account registry         no accounts observed yet
   ✓ Account attribution freshness no attribution activity recorded
   ✓ Account attribution      usage attribution healthy
+  ✓ Claude cost attribution  Claude cost decided in the last 7 days was attributed from write-time account evidence (0 rows)
   ✓ Codex reset anchors      Codex reset anchors complete
   ✓ Codex window attribution no operator window attribution recorded
 Accounting
@@ -97,4 +98,4 @@ Telemetry
 Performance
   ✓ Dashboard disk writes    No dashboard is running.
 
-Summary: 59 OK · 9 WARN · 3 FAIL
+Summary: 60 OK · 9 WARN · 3 FAIL

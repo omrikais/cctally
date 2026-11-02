@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 
 import pytest
 
@@ -396,3 +397,145 @@ def test_null_period_row_does_not_refire(ns, monkeypatch):
     assert all(p["threshold"] != 90 for p, _ in captured), captured
     rows = [r for r in _rows(ns) if r["threshold"] == 90]
     assert len(rows) == 1, _rows(ns)
+
+
+# ── #981 Part A: the hook's budget reads on a pinned snapshot ────────────────
+
+
+def _two_account_store(h):
+    """Two attributed rollouts with distinct nonzero spend."""
+    import _lib_accounts
+    acct_a = _lib_accounts.account_key("codex", "acct-a")
+    acct_b = _lib_accounts.account_key("codex", "acct-b")
+    path_a = h.rollout("a", 3)
+    path_b = h.rollout("b", 1)
+    h.seed_sync()
+    conn = h.cache_conn()
+    try:
+        for path, acct in ((path_a, acct_a), (path_b, acct_b)):
+            conn.execute(
+                "UPDATE codex_session_entries SET account_key=? "
+                "WHERE source_path=?", (acct, str(path)))
+        conn.commit()
+    finally:
+        conn.close()
+    return acct_a, acct_b
+
+
+def test_vendor_crossing_with_debt_pending_accounts_deferred_then_evaluated(
+    tmp_path, monkeypatch,
+):
+    """#981 T-A2. Detects: per-account ladders evaluated while finalization
+    debt can still move `account_key` (a mislabeled per-account total), the
+    vendor-wide crossing withheld for debt that cannot change any row's cost,
+    and per-account ladders that never evaluate once the debt drains."""
+    from test_968_gate_reader_contracts import (
+        BUDGET_PERIOD_START, BudgetHarness)
+    import _lib_accounts
+    acct_a = _lib_accounts.account_key("codex", "acct-a")
+    acct_b = _lib_accounts.account_key("codex", "acct-b")
+    h = BudgetHarness(tmp_path, monkeypatch, codex_budget={
+        "amount_usd": 0.001, "period": "calendar-month",
+        "alerts_enabled": True, "alert_thresholds": [50],
+        "accounts": {acct_a: 1000.0, acct_b: 1000.0}})
+    assert _two_account_store(h) == (acct_a, acct_b)
+    cache = h.cache
+    # Adoption work the budgeted hook may not attempt: a unit already
+    # cancelled on two consecutive budgeted calls belongs to the worker.
+    conn = h.cache_conn()
+    try:
+        cache.add_codex_finalization_debt(conn, spans={
+            h.root_key: (BUDGET_PERIOD_START, BUDGET_PERIOD_START)})
+        debt = cache.load_codex_finalization_debt(conn)
+        debt.strikes = cache._CODEX_FINALIZATION_STRIKE_LIMIT
+        cache._store_codex_finalization_debt(conn, debt)
+        conn.commit()
+    finally:
+        conn.close()
+    vendor_total = h.oracle()
+    totals = {acct: h.oracle(account_key=acct) for acct in (acct_a, acct_b)}
+    assert vendor_total > 0 and 0 < totals[acct_b] < totals[acct_a]
+
+    h.hook()
+    rows = h.budget_rows()
+    assert [(r[0], r[2]) for r in rows] == [("*", 50)], rows
+    assert rows[0][3] == pytest.approx(vendor_total, abs=1e-12)
+    assert [s for s in h.spend if s[1] is not None] == [], (
+        "a per-account ladder evaluated while debt was pending")
+    fields = h.log()[-1]
+    assert (fields["sync"], fields["result"], fields["reason"]) == (
+        "deferred", "noop", "budget_finalization_debt")
+    assert not h.marker().exists()
+
+    assert cache.run_codex_prune_drain(wait_for_requests=False) is not None
+    conn = h.ns["open_cache_db"]()
+    try:
+        assert cache.load_codex_finalization_debt(conn).empty
+    finally:
+        conn.close()
+    h.spend.clear()
+    h.hook()
+    evaluated = {acct: total for _start, acct, total in h.spend if acct}
+    assert evaluated == pytest.approx(totals, abs=1e-12)
+    assert h.syncs == ["budgeted", "budgeted"] and h.direct_parses == []
+    assert (h.log()[-1]["result"]) == "success"
+    assert h.marker().is_file()
+
+
+def test_pending_claude_obs_reaches_run_dollar_axes_codex_axis_snapshot_or_deferred(
+    tmp_path, monkeypatch,
+):
+    """#981 T-A4. A pending Claude observation consumed inside the hook's
+    ingest cycle reaches `_run_dollar_axes`, whose projected Codex leg reads
+    Codex spend. Detects: that indirect read running an implicit Codex sync
+    inside the cycle, and a Codex deferral that suppresses the Claude axes."""
+    import _cctally_journal as jr
+    import _lib_journal as jl
+    from test_968_gate_reader_contracts import (
+        BUDGET_PERIOD_START, BudgetHarness)
+    h = BudgetHarness(tmp_path, monkeypatch, codex_budget={
+        "amount_usd": 1000.0, "period": "calendar-month",
+        "alerts_enabled": True, "projected_enabled": True,
+        "alert_thresholds": [90]}, claude={
+        "weekly_usd": 1000.0, "period": "calendar-month",
+        "alerts_enabled": True, "projected_enabled": True,
+        "alert_thresholds": [90]})
+    h.rollout("seed", 3)
+    h.seed_sync()
+    claude_sums: list = []
+    monkeypatch.setitem(
+        h.ns, "_sum_cost_for_range",
+        lambda start, end, **kw: claude_sums.append((start, end)) or 5.0)
+    record = sys.modules["_cctally_record"]
+    reached: list = []
+    real_axes = record._run_dollar_axes
+
+    def axes(*args, **kwargs):
+        active = getattr(h.cache, "_active_hook_codex_read_policy", None)
+        reached.append(active is not None and active() is not None)
+        return real_axes(*args, **kwargs)
+
+    monkeypatch.setattr(record, "_run_dollar_axes", axes)
+    jr.append_record(jl.make_obs(
+        at="2026-07-25T11:59:00Z", src="record-usage", provider="claude",
+        payload={"weekly_percent": 12.0, "source": "statusline",
+                 "resets_at": int(dt.datetime(
+                     2026, 7, 28, tzinfo=dt.timezone.utc).timestamp())},
+        account=None))
+    oracle = h.oracle()
+
+    h.hook()
+
+    assert h.syncs == ["budgeted"], (
+        "a Codex read inside the hook's ingest cycle ran an implicit sync")
+    assert h.direct_parses == []
+    assert reached and all(reached), (
+        "the pending Claude observation did not reach the dollar axes inside "
+        "the hook's read policy")
+    assert claude_sums, "the Claude budget axes did not evaluate"
+    assert h.log()[-1]["result"] == "success"
+    codex_full = [t for start, acct, t in h.spend
+                  if acct is None and start == BUDGET_PERIOD_START]
+    assert codex_full and all(
+        t == pytest.approx(oracle, abs=1e-12) for t in codex_full), h.spend
+    assert oracle > 0

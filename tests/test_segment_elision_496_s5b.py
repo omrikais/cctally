@@ -430,6 +430,10 @@ def _dump(path):
             if table == "stats_publication_stamp":
                 continue
             rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            if table == "journal_selector_state":
+                # The generation identity names the publication, which every
+                # pass writes afresh (#949: replace publications too).
+                rows = [(row[0], None, None, *row[3:]) for row in rows]
             if table == "schema_migrations":
                 # Rebuilds stamp the same migration set at their own wall-clock
                 # second.  Keep every migration name in the comparison while

@@ -34,6 +34,7 @@ Spec: docs/superpowers/specs/2026-08-19-620-s2-on-demand-diagnosis.md §3, §5
 """
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -231,7 +232,17 @@ def open_read_only(kind: str) -> sqlite3.Connection:
     connection cannot write, so migration, legacy import, contract repair and
     replay cannot run behind our back and change the very bytes whose digest
     we are about to publish.
+
+    #1000 §5.10: `conversations` is not served here. A `mode=ro` open still
+    creates `-wal`/`-shm` beside the store, so its only opener is
+    `StoreBundle.connection`, under the diagnostic read admission held for
+    the connection's life.
     """
+    if kind == "conversations":
+        raise EstablishmentFailure(
+            EstablishmentError.STORE_UNAVAILABLE.value,
+            "conversations store opens only under the read admission",
+        )
     path = _store_path(kind)
     if not path.exists():
         raise EstablishmentFailure(
@@ -732,12 +743,57 @@ class StoreBundle:
         # Memoized schema-gap answer. `_UNPROBED` rather than `None`, because
         # `None` is the answer "this store can serve every statement".
         self._conversations_gap: Any = _UNPROBED
+        # #1000 §5.10: the conversations read admission, held exactly as long
+        # as the conversations connection and released by `close()`.
+        self._admissions = contextlib.ExitStack()
 
     def connection(self, kind: str) -> sqlite3.Connection:
         conn = self._connections.get(kind)
         if conn is None:
-            conn = open_read_only(kind)
+            if kind == "conversations":
+                conn = self._open_conversations()
+            else:
+                conn = open_read_only(kind)
             self._connections[kind] = conn
+        return conn
+
+    def _open_conversations(self) -> sqlite3.Connection:
+        """Open `conversations.db` under the diagnostic read admission.
+
+        The admission (`_cctally_cache.conversation_ro_guarded`) holds the
+        conversation maintenance flock SHARED for the connection's life, so
+        the pre-rebuild probe's in-place read and recovery's quarantine
+        cannot run under this reader, and it declines rather than open the
+        family while they, or a repair, own it (#1000 §5.10).
+        """
+        import _cctally_cache
+
+        unavailable = EstablishmentError.STORE_UNAVAILABLE.value
+        admission = contextlib.ExitStack()
+        try:
+            conn = admission.enter_context(
+                _cctally_cache.conversation_ro_guarded(
+                    timeout=READ_BUSY_TIMEOUT_MS / 1000))
+        except (sqlite3.Error, OSError) as exc:
+            # OSError: the admission's lock file cannot be opened (an
+            # unwritable data folder), which is unavailability, not a crash.
+            admission.close()
+            raise EstablishmentFailure(
+                unavailable,
+                f"conversations store could not be opened read-only: {exc}",
+            ) from exc
+        if conn is None:
+            admission.close()
+            if not os.path.lexists(_store_path("conversations")):
+                raise EstablishmentFailure(
+                    unavailable, "conversations store is not present")
+            raise EstablishmentFailure(
+                unavailable,
+                "conversations store could not be opened read-only: "
+                + _cctally_cache.conversation_ro_decline_reason(),
+            )
+        self._admissions.enter_context(admission)
+        conn.row_factory = sqlite3.Row
         return conn
 
     def conversations_schema_gap(self) -> str | None:
@@ -753,12 +809,15 @@ class StoreBundle:
         return self._conversations_gap
 
     def close(self) -> None:
-        for conn in self._connections.values():
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-        self._connections.clear()
+        try:
+            for conn in self._connections.values():
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._connections.clear()
+        finally:
+            self._admissions.close()
 
     def __enter__(self) -> "StoreBundle":
         return self
@@ -4451,6 +4510,16 @@ def _finish_forked_provider(worker: tuple[int, int]):
     return payload[1]
 
 
+# The `_cctally_core` paths a spawned or forkserver worker takes from its
+# parent. The worker reloads cctally, which re-derives every other path from
+# the forkserver's environment, frozen when that server started. The
+# conversation maintenance lock must be the parent's own: the transcript read
+# admission excludes the pre-rebuild probe and recovery on that file and on
+# no other (#1000 §5.10).
+_WORKER_CORE_PATHS = ("CACHE_DB_PATH", "DB_PATH", "CONVERSATIONS_DB_PATH",
+                      "CONVERSATIONS_LOCK_MAINTENANCE_PATH", "CONFIG_PATH")
+
+
 def _spawn_worker_init(cctally_path: str,
                        store_paths: Mapping[str, str]) -> None:
     """Initialize a safe spawned/forkserver dashboard worker."""
@@ -4590,9 +4659,7 @@ def build_diagnosis_bounded(scope: DiagnosisScope, *,
     """Build one dashboard diagnosis in a process retired at TIMEOUT_SECONDS."""
     c = _cctally()
     paths = {
-        name: str(getattr(_cctally_core, name))
-        for name in ("CACHE_DB_PATH", "DB_PATH",
-                     "CONVERSATIONS_DB_PATH", "CONFIG_PATH")
+        name: str(getattr(_cctally_core, name)) for name in _WORKER_CORE_PATHS
     }
     return _run_process_with_deadline(
         _build_diagnosis_process_task,
@@ -4610,9 +4677,7 @@ def _build_isolated_provider(args):
 
     c = _cctally()
     paths = {
-        name: str(getattr(_cctally_core, name))
-        for name in ("CACHE_DB_PATH", "DB_PATH",
-                     "CONVERSATIONS_DB_PATH", "CONFIG_PATH")
+        name: str(getattr(_cctally_core, name)) for name in _WORKER_CORE_PATHS
     }
     methods = multiprocessing.get_all_start_methods()
     method = "forkserver" if "forkserver" in methods else "spawn"

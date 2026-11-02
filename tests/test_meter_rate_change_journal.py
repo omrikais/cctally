@@ -1093,6 +1093,19 @@ def test_c2_a_recorded_row_suppresses_recovery(ns):
 # --------------------------------------------------------------------------
 # The persistence trigger (§6.5 steps 1-2)
 # --------------------------------------------------------------------------
+def _frozen_lineage(previous=2_442_620.0, new=1_685_000.0):
+    import _lib_quota_lineage as L
+    return L.transition_lineage(
+        windows=[L.window(None, NOW, until_inclusive=True)], scope="*",
+        basis=[], descriptor={
+            "provider": "claude", "account_key": "unattributed",
+            "effective_from": BOUNDARY, "previous_units_per_point": previous,
+            "new_units_per_point": new, "severity": "alarm",
+            "detected_at": NOW.isoformat(), "withholding_status": None,
+            "detector_input_causes": None, "composition_provenance": None,
+            "baseline_withheld_days": None})
+
+
 def test_c2_the_descriptor_is_returned_rather_than_acted_on_under_the_lock(
         ns, monkeypatch):
     """Step 2 requires the calibration leaf lock to be released before any
@@ -1113,8 +1126,11 @@ def test_c2_the_descriptor_is_returned_rather_than_acted_on_under_the_lock(
     """
     glue = ns["_load_sibling"]("_cctally_quota_model")
     before_regimes = [_regime(effectiveUntil=BOUNDARY, status="ok")]
+    # #1015 spec 5.6: recovery trusts only a successor carrying a verifying
+    # frozen `transitionLineage`, which the reducer writes at detection.
     after_regimes = before_regimes + [
-        _regime(effectiveFrom=BOUNDARY, unitsPerPoint=1_685_000.0)]
+        _regime(effectiveFrom=BOUNDARY, unitsPerPoint=1_685_000.0,
+                transitionLineage=_frozen_lineage())]
 
     def _state(regimes):
         return {"version": 1,
@@ -1931,3 +1947,202 @@ def test_690_the_regime_recovery_route_carries_no_fabricated_evidence(ns):
         assert t.detector_input_causes is None
         assert t.composition_provenance is None
         assert t.baseline_withheld_days is None
+
+
+# --------------------------------------------------------------------------
+# #1015 spec 5.7 — transition supersession: the event, its fold, the lineage
+# column, and the handoff recheck
+# --------------------------------------------------------------------------
+def _supersede(ns, transition, *, at=NOW, corrections=(("op-1", 2),)):
+    import _cctally_journal as jr
+    return jr.run_stats_ingest(
+        mode="authoritative",
+        meter_rate_change={
+            "supersessions": [{
+                "provider": transition.provider,
+                "account_key": transition.account_key,
+                "effective_from": transition.effective_from,
+                "target_event_id": None,
+                "fit_lineage": {"legacy": True},
+                "corrections": [{"opId": op, "observations": n}
+                                for op, n in corrections],
+                "superseded_at_utc": at.isoformat()}],
+            "created_at": at.isoformat()})
+
+
+def _supersession_rows(ns):
+    conn = ns["open_db"]()
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT provider, account_key, effective_from, reason, "
+            "corrections, superseded_at_utc FROM "
+            "meter_rate_change_supersessions")]
+    finally:
+        conn.close()
+
+
+def _supersession_lines():
+    import json
+    total = []
+    for path in sorted((_cctally_core.APP_DIR / "journal").glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            if '"meter_rate_change_supersession"' in line:
+                total.append(json.loads(line))
+    return total
+
+
+def test_1015_a_supersession_is_journalled_once_and_survives_a_rebuild(ns):
+    """Detects a supersession that is lost on rebuild (the applier is
+    missing) or that grows a second line per invocation, and pins the
+    one-id-per-identity rule (spec 5.7)."""
+    import hashlib
+    import _cctally_journal as jr
+    _seed_journal()
+    t = _transition(ns)
+    _record(ns, t)
+    _supersede(ns, t)
+    _supersede(ns, t, at=NOW + dt.timedelta(hours=1),
+               corrections=(("op-2", 1),))
+    lines = _supersession_lines()
+    assert len(lines) == 1
+    digest = hashlib.sha256(
+        f"claude|unattributed|{BOUNDARY}".encode()).hexdigest()[:16]
+    assert lines[0]["id"] == f"mrcs:{digest}"
+    expected = [("claude", "unattributed", BOUNDARY, "reviewed-correction",
+                 '[{"observations":2,"opId":"op-1"}]', NOW.isoformat())]
+    assert _supersession_rows(ns) == expected
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    assert _supersession_rows(ns) == expected
+    # The transition row itself is retained, with its historical values.
+    conn = ns["open_db"]()
+    try:
+        assert _events(conn) == [("claude", "unattributed", BOUNDARY)]
+    finally:
+        conn.close()
+
+
+def test_1015_a_superseded_identity_is_never_emitted_or_owed(ns,
+                                                              monkeypatch):
+    """Detects enforcement holes: the emitter on the fresh and the owed
+    route, the presence check and the owed sweep must all treat a
+    superseded identity as terminal (spec 5.7)."""
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    _seed_journal()
+    delivery = glue.seed_delivery_state()
+    t = _transition(ns)
+    _supersede(ns, t)
+    # Fresh route: no row, no journal line.
+    result = _record(ns, t, notify=True)
+    assert result.meter_rate_change_result.row_created is False
+    assert list(result.deferred_alerts) == []
+    conn = ns["open_db"]()
+    try:
+        assert _events(conn) == []
+    finally:
+        conn.close()
+    assert glue.unrecorded_rate_change_transitions((t,)) == ()
+    # Owed route over a row recorded before the supersession: settled with
+    # no notification queued.
+    other = _transition(ns, effective_from="2026-08-26T00:00:00+00:00")
+    _record(ns, other)
+    assert [o.identity() for o in glue._owed_rate_change_transitions(
+        ["unattributed"], delivery, now=NOW)] == [other.identity()]
+    _supersede(ns, other)
+    assert glue._owed_rate_change_transitions(
+        ["unattributed"], delivery, now=NOW) == ()
+    owed = _record(ns, other, notify=True, notification_owed=True)
+    assert owed.meter_rate_change_result.notification_decided is True
+    assert owed.meter_rate_change_result.notification_queued is False
+    assert list(owed.deferred_alerts) == []
+
+
+def test_1015_a_supersession_landing_before_handoff_suppresses_dispatch(
+        ns, monkeypatch):
+    """Detects a notification handed off for an identity superseded after
+    its recording committed: the ledger is claimed, then supersession is
+    rechecked, and the decision stays recorded (spec 5.7, R4)."""
+    import _cctally_journal as jr
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    monkeypatch.setattr(glue, "rate_change_notifications_enabled",
+                        lambda: True)
+    _seed_journal()
+    delivery = glue.seed_delivery_state()
+    t = _transition(ns)
+    outcome = glue.record_rate_change_transition(t, now=NOW)
+    assert outcome[1], "the recording queued nothing; the test is vacuous"
+    _supersede(ns, t)
+    claim = glue._settle_rate_change(t, outcome, delivery)
+    assert claim == glue._rate_change_delivery().CLAIM_WON
+    assert dispatched == []
+    assert t.identity() in {tuple(i) for i in glue._rate_change_delivery()
+                            .decided_set(glue.load_delivery_state().state)}
+
+
+def test_1015_a_handoff_under_maintenance_defers_and_stays_owed(
+        ns, monkeypatch):
+    """Detects a notification handed off without its supersession recheck
+    (spec 5.7): while a maintenance owner holds the stats maintenance lock
+    exclusively the recheck cannot take its read guard, so the handoff is
+    deferred — nothing is dispatched and the identity stays owed — and a
+    later run with the lock free and no supersession dispatches it."""
+    import fcntl
+    import pathlib
+    import _cctally_core
+    import _cctally_journal as jr
+    glue = ns["_load_sibling"]("_cctally_quota_model")
+    dispatched: list = []
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER", dispatched.extend)
+    monkeypatch.setattr(glue, "rate_change_notifications_enabled",
+                        lambda: True)
+    _seed_journal()
+    delivery = glue.seed_delivery_state()
+    t = _transition(ns)
+    outcome = glue.record_rate_change_transition(t, now=NOW)
+    assert outcome[1], "the recording queued nothing; the test is vacuous"
+    lock_path = pathlib.Path(_cctally_core.STATS_LOCK_MAINTENANCE_PATH)
+    with open(lock_path, "a+") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        glue._settle_rate_change(t, outcome, delivery)
+    assert dispatched == []
+    # Owed on the ledger as it now stands on disk, not a stale snapshot.
+    owed = glue._owed_rate_change_transitions(
+        ["unattributed"], glue.load_delivery_state(), now=NOW)
+    assert [o.identity() for o in owed] == [t.identity()]
+    # The owed sweep's later run, the lock free: dispatched once, decided.
+    [descriptor] = owed
+    later = glue.load_delivery_state()
+    glue._settle_rate_change(
+        descriptor, glue.record_rate_change_transition(
+            descriptor, now=NOW, notification_owed=True), later)
+    assert len(dispatched) == 1
+    assert glue._owed_rate_change_transitions(
+        ["unattributed"], glue.load_delivery_state(), now=NOW) == ()
+
+
+def test_1015_the_lineage_is_folded_and_never_erased(ns):
+    """Detects a v2 payload whose frozen lineage is not projected, or a v1
+    replay that erases it (spec 5.7: `fit_lineage` column)."""
+    import json
+    import _cctally_journal as jr
+    _seed_journal()
+    lineage = _frozen_lineage()
+    t = _transition(ns, fit_lineage=lineage)
+    conn = ns["open_db"]()
+    try:
+        ctx = _ingest_context(ns, conn)
+        jr.record_meter_rate_change(ctx, t, notify=False,
+                                    created_at=NOW.isoformat())
+        # A v1 replay of the same identity carries no lineage.
+        jr._insert_meter_rate_change(
+            conn, _mrc_evt(ns, t, created_at=NOW.isoformat()))
+        [(stored,)] = conn.execute(
+            "SELECT fit_lineage FROM meter_rate_change_events").fetchall()
+    finally:
+        conn.close()
+    assert json.loads(stored) == lineage
+    payload = _mrc(ns).event_payload_v2(t, created_at=NOW.isoformat())
+    assert payload["fit_lineage"] == lineage
+    assert "fit_lineage" not in _mrc(ns).event_payload(
+        t, created_at=NOW.isoformat())

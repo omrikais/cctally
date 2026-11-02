@@ -948,14 +948,15 @@ def test_the_new_db_leg_is_registered_in_the_db_category():
     ]
 
 
-# ── §7.6 the four new fixtures must actually reach their branches ─────────
+# ── §7.6 the retention and heal fixtures must actually reach their branches ─
 #
 # A tripwire, not a duplicate of the golden harness. The gather's failure path
 # degrades to "retention scan unavailable", which reads exactly like a healthy
 # install with nothing retained — and one `NameError` in the gather made all
-# four of these fixtures report that instead of the branch they exist to
-# cover, with the harness still green because the goldens had been
-# regenerated from the broken output.
+# four fixtures this tripwire was written for (31 to 34) report that instead
+# of the branch they exist to cover, with the harness still green because the
+# goldens had been regenerated from the broken output. 34 was cut in the test
+# regime reset; 12 now stands in for its doctor gather.
 #
 # The literals are hardcoded rather than imported, so a change to the leg's
 # wording cannot make this pass by construction.
@@ -972,7 +973,13 @@ _DOCTOR_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "docto
      "✗ Retained evidence", "2"),
     ("33-heal-repeated-shape",
      "✗ Auto-heal", "2"),
-    ("34-retention-policy-malformed",
+    # An unparseable config.json reaches the malformed-policy FAIL through the
+    # same doctor gather, but by `read_retention_policy`'s JSON-error branch.
+    # The deleted 34's path (valid JSON whose retention block is invalid,
+    # through `resolve_retention_policy`) is pinned by
+    # tests/test_retention_worker.py::test_a_malformed_policy_skips_deletion_entirely
+    # and the block validation by tests/test_artifact_retention_kernel.py.
+    ("12-corrupt-config-json",
      "✗ Retained evidence", "2"),
 ])
 def test_each_new_doctor_fixture_reaches_the_branch_it_covers(

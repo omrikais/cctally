@@ -1295,9 +1295,34 @@ def _attribute_apply(planned, *, account_key, mode, since, until, at,
                 conn.execute("BEGIN IMMEDIATE")
                 _landed, skipped = _cache_mod.rehydrate_codex_window_attributions(
                     conn)
+                # #980 F1: the reconciliation's adoption demotes Spark windows
+                # through the RESOLVED `observed_model` (#373), so owed model
+                # resolution runs first, on this transaction and under the
+                # writer flocks this command holds. When it still cannot
+                # resolve, nothing is reconciled over an unresolved model: the
+                # apply aborts (`recordedPending` once records were appended)
+                # and a rerun finishes it.
+                if _cache_mod.codex_model_resolution_pending(conn):
+                    _cache_mod._codex_settle_finalization(
+                        conn, deadline=None, stages=("expand", "model"))
+                    if _cache_mod.codex_model_resolution_pending(conn):
+                        raise sqlite3.DatabaseError(
+                            _quota.PROJECTION_DEFERRED_MODEL)
                 restored, adopted = (
                     _cache_mod.reconcile_codex_window_attribution_spend(
                         conn, strict=True))
+                # #980 R7: the rehydrate above armed `attribution` debt for
+                # exactly the reconciliation that just succeeded, on this
+                # transaction; settle it here, or every account-scoped hook
+                # read defers until a later settlement repeats it. Kept while
+                # adoption items remain: the reconcile runs after them (D4).
+                # A later failure rolls this back with everything else.
+                debt = _cache_mod.load_codex_finalization_debt(conn)
+                if (debt.attribution and not debt.malformed
+                        and not debt.full and debt.first_item() is None):
+                    debt.attribution = False
+                    debt.strikes = 0
+                    _cache_mod._store_codex_finalization_debt(conn, debt)
                 # Verify the applied record set against the plan we locked,
                 # BEFORE the commit: a silent partial application must abort the
                 # transaction rather than be reported as success (spec §8.2).
@@ -1365,18 +1390,47 @@ def _attribute_apply(planned, *, account_key, mode, since, until, at,
     # rerun completes it, because the certificate's attribution revision is
     # still behind the derived table's (`_attribute_tail_pending`).
     try:
-        _quota.reconcile_codex_quota_projection()
+        deferred = _attribute_publish_projection()
     except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        deferred = str(exc)
+    if deferred is not None:
         return ("recordedPending", actions, [{
             "code": "recordedPending",
             "message": (
                 f"the attribution was recorded and applied but the quota "
-                f"projection did not finish ({exc}); rerun the same command "
-                f"to complete it"),
+                f"projection did not finish ({deferred}); rerun the same "
+                f"command to complete it"),
         }], fresh)
     status = ("recovered" if ((recovered or completion) and not appended)
               else "applied")
     return (status, actions, [], fresh)
+
+
+def _attribute_publish_projection() -> "str | None":
+    """Publish the quota projection; return None, or why it is still refused.
+
+    #980 D6: every projection publisher refuses while model resolution is
+    owed, returning a ``deferred_model`` status rather than raising, so a bare
+    reconcile here reported success over an unpublished projection. Owed
+    resolution is therefore settled first, unbudgeted, through the cache
+    writer flocks an unbudgeted sync takes; when the projection still refuses
+    (those flocks were contended) the caller reports ``recordedPending``.
+    """
+    import _cctally_cache as _cache_mod
+    import _cctally_quota as _quota
+
+    settled = False
+    if _cache_mod.codex_model_resolution_pending_now():
+        _cache_mod.settle_codex_finalization_unbudgeted()
+        settled = True
+    result = _quota.reconcile_codex_quota_projection()
+    if (getattr(result, "status", None) == _quota.PROJECTION_DEFERRED_MODEL
+            and not settled):
+        _cache_mod.settle_codex_finalization_unbudgeted()
+        result = _quota.reconcile_codex_quota_projection()
+    if getattr(result, "status", None) == _quota.PROJECTION_DEFERRED_MODEL:
+        return _quota.PROJECTION_DEFERRED_MODEL
+    return None
 
 
 def _cmd_account_attribute(args: argparse.Namespace) -> int:

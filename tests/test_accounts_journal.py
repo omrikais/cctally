@@ -624,3 +624,189 @@ def test_window_attribution_registration_requires_a_rederive_classification(ns):
         op_kinds=planner_op_kinds | {"codex_window_attribution_unclassified"})
     assert "codex_window_attribution_unclassified" in (
         unregistered.unclassified_op_kinds)
+
+
+# --------------------------------------------------------------------------
+# #944: claude_cost_account (durable Claude cost attribution decisions)
+# --------------------------------------------------------------------------
+
+_LOC = "0123456789abcdef0123456789abcdef"
+
+
+def _cost_account_kwargs(**over):
+    import _lib_claude_attribution as K
+    kwargs = dict(
+        basis=K.BASIS_AGREEMENT, reason=None, account_key="a" * 32,
+        decided_at="2026-10-09T10:03:00.000000Z",
+        journal_hw=["observations-2026-10.jsonl", 4096],
+        closing_capture={"at": "2026-10-09T10:03:00.000000Z",
+                         "account_key": "a" * 32},
+        evidence=[["2026-10-09T10:00:30Z", "observations-2026-10.jsonl", 0]],
+        items=[["k1", "m-1", "r-1", "2026-10-09T10:01:00Z"],
+               ["p1", _LOC, 12, "f" * 64, "2026-10-09T10:01:01Z"]])
+    kwargs.update(over)
+    return kwargs
+
+
+def test_claude_cost_account_round_trips_through_the_validator(ns):
+    """A built op re-validates and carries the shared batch fields once.
+    Detects: a decision batch the replay would skip as malformed."""
+    _jr, J, _acc = _siblings()
+    op = J.make_claude_cost_account(**_cost_account_kwargs())
+    assert op["t"] == "op" and op["src"] == J.CLAUDE_COST_ACCOUNT_SRC
+    payload = op["payload"]
+    assert payload["kind"] == J.CLAUDE_COST_ACCOUNT_KIND
+    assert "reason" not in payload
+    J.validate_claude_cost_account(payload)
+    decoded = J.decode_line(J.encode_line(op))
+    assert decoded["payload"] == payload
+
+
+def test_claude_cost_account_null_decision_omits_the_stamp(ns):
+    """A NULL decision omits `account_key` (two-shaped stamp rule); a fallback
+    keeps its reason. Detects: a NULL decision journaled as a real account."""
+    import _lib_claude_attribution as K
+    _jr, J, _acc = _siblings()
+    op = J.make_claude_cost_account(**_cost_account_kwargs(
+        basis=K.BASIS_FALLBACK, reason="pre_timeline", account_key=None,
+        closing_capture=None, evidence=[]))
+    assert "account_key" not in op["payload"]
+    assert op["payload"]["reason"] == "pre_timeline"
+    assert "evidence" not in op["payload"]
+
+
+@pytest.mark.parametrize("over", [
+    # the literal sentinel is never journaled as an account
+    {"account_key": "unattributed"},
+    # only a fallback carries a reason
+    {"reason": "pre_timeline"},
+    # a fallback needs a known reason
+    {"basis": "fallback", "reason": "because", "closing_capture": None,
+     "evidence": []},
+    # a clear-text path never stands in for the location digest
+    {"items": [["p1", "/Users/x/.claude/projects/p/s.jsonl", 0, "f" * 64,
+                None]]},
+    # a decided item never uses the legacy form
+    {"items": [["l1", _LOC, 0, "f" * 64, []]]},
+    # only an agreement uses a closing capture
+    {"basis": "fallback", "reason": "switch_window", "evidence": []},
+    {"items": []},
+], ids=["sentinel", "reason-on-agreement", "unknown-reason", "clear-text-path",
+        "legacy-decided", "capture-on-fallback", "no-items"])
+def test_claude_cost_account_rejects_malformed_batches(ns, over):
+    """Detects: a decision the replay must never apply being journaled."""
+    _jr, J, _acc = _siblings()
+    with pytest.raises(ValueError):
+        J.make_claude_cost_account(**_cost_account_kwargs(**over))
+
+
+def test_claude_cost_account_preserved_history_shapes(ns):
+    """Preserved history carries keyed or legacy items, the legacy digest must
+    match its projection, and it never carries evidence. Detects: a preserved
+    stamp whose legacy identity cannot be re-matched to its row."""
+    import _lib_claude_attribution as K
+    _jr, J, _acc = _siblings()
+    projection = ["2026-10-09T10:01:00+00:00", "claude-sonnet-4-5", 1, 2, 0,
+                  0, None, None, None, None]
+    sha = K.projection_sha256(projection)
+    base = dict(basis=K.BASIS_PRESERVED, closing_capture=None, evidence=[])
+    op = J.make_claude_cost_account(**_cost_account_kwargs(
+        **base, items=[["k1", "m", "r"], ["l1", _LOC, 3, sha, projection]]))
+    J.validate_claude_cost_account(op["payload"])
+    with pytest.raises(ValueError):
+        J.make_claude_cost_account(**_cost_account_kwargs(
+            **base, items=[["l1", _LOC, 3, "0" * 64, projection]]))
+    with pytest.raises(ValueError):
+        J.make_claude_cost_account(**_cost_account_kwargs(
+            basis=K.BASIS_PRESERVED, closing_capture=None,
+            items=[["k1", "m", "r"]]))
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_claude_cost_account_is_machinery_and_never_legacy(ns, stamped):
+    """Registered as accounts machinery with a retained rederive
+    classification, and never classified as a legacy Claude record (either
+    stamp shape). Detects: a decision re-stamped to the cutover account by a
+    rebuild, or a rederive that refuses the journal."""
+    jr, J, _acc = _siblings()
+    import _cctally_rederive as rederive
+    import _lib_account_protocol as ap
+    import _lib_rederive as lr
+    kind = J.CLAUDE_COST_ACCOUNT_KIND
+    assert kind in jr._ACCOUNTS_MACHINERY_KINDS
+    assert kind in rederive._planner_op_kinds()
+    assert lr._OP_CLASSIFICATIONS[kind].mode == "retained"
+    assert kind in ap._CLAUDE_OP_KINDS
+    rec = J.make_claude_cost_account(**_cost_account_kwargs(
+        account_key="a" * 32 if stamped else None))
+    assert jr.classify_legacy_provider(rec) is None
+    before = dict(rec["payload"])
+    jr._normalize_legacy_account_stamp(rec, "some-claude-legacy-key")
+    assert rec["payload"] == before
+
+
+def test_claude_cost_account_ops_leave_the_rebuilt_stats_unchanged(ns):
+    """#944 spec 7 test 6 (F17): ``db rebuild --db stats`` reproduces the
+    frozen events when the journal also holds ``claude_cost_account`` ops
+    (stamped, NULL and preserved-history batches, after the account-bound
+    boundary). Detects: a decision op folded into, or re-stamping, a stats.db
+    table, or classified as a protocol violation or conflict that quarantines
+    the rebuild."""
+    import _lib_claude_attribution as K
+    jr, J, acc = _siblings()
+    cutover = acc.account_key("claude", "uuid-CUT")
+    key = acc.account_key("claude", "uuid-A")
+    jr.append_accounts_cutover_op(cutover)
+    jr.append_record(_legacy_block_close_evt(J, window_key=222),
+                     now_utc=FIXED)
+    jr.append_record(
+        J.make_account_observe(at="2026-07-22T12:00:00Z", account_key=key,
+                               provider="claude", natural_id="uuid-A",
+                               email="a@x.com"),
+        now_utc=FIXED)
+    jr.append_record(
+        J.make_account_label(at="2026-07-22T12:05:00Z", account_key=key,
+                             label="Personal", provider="claude"),
+        now_utc=FIXED)
+    jr.ensure_account_bound_cutover()
+
+    def rebuild():
+        result = jr.rebuild_stats_index(
+            context=jr.RebuildContext(trigger="test-fixture"))
+        conn = ns["open_db"]()
+        try:
+            dump = {table: sorted(repr(tuple(r)) for r in conn.execute(
+                f"SELECT * FROM {table}").fetchall())
+                for table in result.rows_by_table}
+        finally:
+            conn.close()
+        return result, dump
+
+    frozen_result, frozen = rebuild()
+    assert frozen["accounts"] and frozen["five_hour_blocks"]
+    projection = ["2026-07-22T11:00:00+00:00", "claude-sonnet-4-5", 1, 2, 0,
+                  0, None, None, None, None]
+    for kwargs in (
+            dict(basis=K.BASIS_AGREEMENT, reason=None, account_key=key,
+                 closing_capture={"at": "2026-07-22T12:10:00Z",
+                                  "account_key": key},
+                 evidence=[["2026-07-22T12:00:00Z",
+                            "observations-2026-07.jsonl", 0]],
+                 items=[["k1", "m-1", "r-1", "2026-07-22T12:01:00Z"]]),
+            dict(basis=K.BASIS_FALLBACK, reason="pre_timeline",
+                 account_key=None, closing_capture=None, evidence=[],
+                 items=[["p1", _LOC, 12, "f" * 64, "2026-07-22T11:00:00Z"]]),
+            dict(basis=K.BASIS_PRESERVED, reason=None, account_key=cutover,
+                 closing_capture=None, evidence=[],
+                 items=[["k1", "m-2", "r-2"],
+                        ["l1", _LOC, 3, K.projection_sha256(projection),
+                         projection]])):
+        jr.append_record(J.make_claude_cost_account(
+            decided_at="2026-07-22T12:10:00Z",
+            journal_hw=["observations-2026-07.jsonl", 0], **kwargs),
+            now_utc=FIXED)
+    result, rebuilt = rebuild()
+    assert rebuilt == frozen
+    assert result.rows_by_table == frozen_result.rows_by_table
+    assert (result.conflicts, result.protocol_violations,
+            result.quarantine_dir) == ((), (), None)

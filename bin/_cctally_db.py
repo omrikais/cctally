@@ -64,6 +64,7 @@ import contextlib
 import contextvars
 import datetime as dt
 import enum
+import errno
 import fcntl
 import json
 import os
@@ -71,6 +72,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1068,6 +1070,8 @@ def write_corruption_forensics(
     trigger_origin: "str | None" = None,
     trigger_exception: "BaseException | None" = None,
     return_result: bool = False,
+    probe_immutable: bool = False,
+    before_publish: "Callable[[], None] | None" = None,
 ) -> "pathlib.Path | None | CorruptionForensicsResult":
     """Write the #336-defense-2 corruption forensics bundle FIRST — before any
     quarantine/rebuild disturbs the evidence (spec §6.3). Captures the file family
@@ -1083,6 +1087,15 @@ def write_corruption_forensics(
     isolated family snapshot while the bundle still identifies the live
     ``db_path``. Probe/write unavailability is always unconfirmed. Confirmed
     bundles are atomically replaced and fsynced before this function returns.
+
+    #1000: ``probe_immutable=True`` opens the integrity connection on
+    ``probe_db_path`` as ``mode=ro&immutable=1`` through an escaped absolute
+    URI, for a caller that checks a live main file in place: a plain
+    ``mode=ro`` open of a WAL-mode store creates ``-wal``/``-shm`` beside it.
+    ``before_publish``, when given, runs after the integrity probe and the
+    damage scan and immediately before the bundle is published; an exception
+    it raises propagates (it is outside every handler here) and nothing is
+    published for that attempt.
     """
     if (trigger_origin is None) != (trigger_exception is None):
         raise ValueError(
@@ -1157,8 +1170,15 @@ def write_corruption_forensics(
             }
         except OSError:
             bundle["family"][p.name] = None
+    if probe_immutable:
+        probe_uri = (
+            pathlib.Path(os.path.abspath(probe_db_path)).as_uri()
+            + "?mode=ro&immutable=1"
+        )
+    else:
+        probe_uri = f"file:{probe_db_path}?mode=ro"
     try:
-        c = sqlite3.connect(f"file:{probe_db_path}?mode=ro", uri=True)
+        c = sqlite3.connect(probe_uri, uri=True)
         try:
             c.execute("PRAGMA busy_timeout=2000")
             bundle["integrityCheck"] = [
@@ -1214,6 +1234,8 @@ def write_corruption_forensics(
                 bundle["holders"].append(line.strip())
     except Exception as exc:
         bundle["holders"] = [f"error: {exc}"]
+    if before_publish is not None:
+        before_publish()
     try:
         _atomic_write_private_json(out, bundle)
     except OSError:
@@ -4380,6 +4402,210 @@ def _apply_codex_accounting_change_ledger(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+# ── #927 (#981 Part B): the retained-identity inventory (spec §4.2 B1) ───────
+#
+# The pre-walk prune inventory used to read every retained Codex source
+# identity from four history-sized families on every hook (13.2-13.5 s cold on
+# the measured store). This table holds each distinct ``(source_path,
+# source_root_key)`` those families have carried, maintained by INSERT and
+# identity-UPDATE triggers in the same transaction as the write. There are no
+# DELETE triggers: deletion owners reconcile the table themselves, and every
+# other deletion leaves a SUPERSET, which the planner confirms with indexed
+# existence probes before an identity becomes protection evidence.
+#
+# A NULL root is distinct from every non-NULL root, and ``''`` from NULL, so
+# the uniqueness is an expression index rather than a plain UNIQUE. Each
+# trigger body inserts only when the identity is absent: an outer
+# statement's conflict policy propagates into trigger-body INSERTs (the #582
+# ledger note above), so the ``NOT EXISTS`` keeps a conflict from ever being
+# raised whatever that policy is.
+#
+# ``cache_meta.codex_identity_inventory`` is ``ready`` or
+# ``bootstrap:<family>:<last_rowid>``; any other value reads as
+# ``bootstrap:files:0``. Only ``ready`` lets the planner read the table.
+
+CODEX_IDENTITY_INVENTORY_KEY = "codex_identity_inventory"
+CODEX_IDENTITY_INVENTORY_READY = "ready"
+#: The bootstrap's fixed family order, each with its rowid source query.
+CODEX_IDENTITY_INVENTORY_FAMILIES: "tuple[tuple[str, str, str, str], ...]" = (
+    # (state token, table, path column, extra WHERE)
+    ("files", "codex_session_files", "path", ""),
+    ("entries", "codex_session_entries", "source_path", ""),
+    ("quota", "quota_window_snapshots", "source_path", " AND source = 'codex'"),
+    ("threads", "codex_conversation_threads", "source_path", ""),
+)
+
+_CODEX_RETAINED_IDENTITY_OBJECTS = (
+    ("table", "codex_retained_identities"),
+    ("index", "idx_codex_retained_identities_key"),
+    ("trigger", "trg_codex_identity_files_ins"),
+    ("trigger", "trg_codex_identity_files_upd"),
+    ("trigger", "trg_codex_identity_entries_ins"),
+    ("trigger", "trg_codex_identity_entries_upd"),
+    ("trigger", "trg_codex_identity_quota_ins"),
+    ("trigger", "trg_codex_identity_quota_upd"),
+    ("trigger", "trg_codex_identity_threads_ins"),
+    ("trigger", "trg_codex_identity_threads_upd"),
+)
+
+
+def _codex_retained_identity_ddl() -> "tuple[str, ...]":
+    def add(path: str) -> str:
+        return f"""
+            INSERT OR IGNORE INTO codex_retained_identities
+                (source_path, source_root_key)
+            SELECT NEW.{path}, NEW.source_root_key
+             WHERE NOT EXISTS (
+                SELECT 1 FROM codex_retained_identities
+                 WHERE source_path = NEW.{path}
+                   AND IFNULL(source_root_key, char(0))
+                       = IFNULL(NEW.source_root_key, char(0))
+             );
+        """
+    files, entries = add("path"), add("source_path")
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS codex_retained_identities (
+            source_path     TEXT NOT NULL,
+            source_root_key TEXT
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_codex_retained_identities_key "
+        "ON codex_retained_identities"
+        "(source_path, IFNULL(source_root_key, char(0)))",
+        "DROP TRIGGER IF EXISTS trg_codex_identity_files_ins",
+        f"""
+        CREATE TRIGGER trg_codex_identity_files_ins
+        AFTER INSERT ON codex_session_files
+        BEGIN {files} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_files_upd",
+        f"""
+        CREATE TRIGGER trg_codex_identity_files_upd
+        AFTER UPDATE OF path, source_root_key ON codex_session_files
+        BEGIN {files} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_entries_ins",
+        f"""
+        CREATE TRIGGER trg_codex_identity_entries_ins
+        AFTER INSERT ON codex_session_entries
+        BEGIN {entries} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_entries_upd",
+        f"""
+        CREATE TRIGGER trg_codex_identity_entries_upd
+        AFTER UPDATE OF source_path, source_root_key ON codex_session_entries
+        BEGIN {entries} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_quota_ins",
+        f"""
+        CREATE TRIGGER trg_codex_identity_quota_ins
+        AFTER INSERT ON quota_window_snapshots
+        WHEN NEW.source = 'codex'
+        BEGIN {entries} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_quota_upd",
+        f"""
+        CREATE TRIGGER trg_codex_identity_quota_upd
+        AFTER UPDATE OF source, source_path, source_root_key
+          ON quota_window_snapshots
+        WHEN NEW.source = 'codex'
+        BEGIN {entries} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_threads_ins",
+        f"""
+        CREATE TRIGGER trg_codex_identity_threads_ins
+        AFTER INSERT ON codex_conversation_threads
+        BEGIN {entries} END
+        """,
+        "DROP TRIGGER IF EXISTS trg_codex_identity_threads_upd",
+        f"""
+        CREATE TRIGGER trg_codex_identity_threads_upd
+        AFTER UPDATE OF source_path, source_root_key
+          ON codex_conversation_threads
+        BEGIN {entries} END
+        """,
+    )
+
+
+def _codex_identity_families_empty(conn: sqlite3.Connection) -> bool:
+    """True when none of the four families holds a Codex row (O(1) each)."""
+    return not any(
+        conn.execute(
+            f"SELECT 1 FROM {table} WHERE 1{extra} LIMIT 1").fetchone()
+        for _token, table, _path, extra in CODEX_IDENTITY_INVENTORY_FAMILIES
+    )
+
+
+def _apply_codex_retained_identity_inventory(conn: sqlite3.Connection) -> None:
+    """Install the retained-identity inventory on every delivery path (B1).
+
+    Shared by ``_apply_cache_schema`` and migration 051 so fresh and upgraded
+    stores converge. Atomic like the #901 latest summary: the table, its
+    index, the eight triggers and the state key commit together, as a
+    savepoint inside the caller's transaction or as an IMMEDIATE transaction
+    of their own. Triggers come first, so no write can land between the
+    state decision and the maintenance that keeps it true.
+
+    The state key is decided only when any of the ten objects was missing
+    before this call (a store carrying all ten has been maintained since they
+    were created, so its recorded state stands): ``ready`` when the four
+    families hold no Codex row, else ``bootstrap:files:0`` for the off-hook
+    backfill. A history scan never runs here. Guarded on the identity columns,
+    which a legacy-shape cache whose schema apply returned early can lack.
+    """
+    def _columns(table: str) -> "set[str]":
+        return {
+            str(row[0]) for row in conn.execute(
+                "SELECT name FROM pragma_table_info(?)", (table,))
+        }
+
+    if not (
+        {"path", "source_root_key"} <= _columns("codex_session_files")
+        and {"source_path", "source_root_key"} <= _columns(
+            "codex_session_entries")
+        and {"source", "source_path", "source_root_key"} <= _columns(
+            "quota_window_snapshots")
+        and {"source_path", "source_root_key"} <= _columns(
+            "codex_conversation_threads")
+    ):
+        return
+    own_transaction = not conn.in_transaction
+    conn.execute(
+        "BEGIN IMMEDIATE" if own_transaction
+        else "SAVEPOINT codex_retained_identity_apply")
+    try:
+        present = {
+            (str(row[0]), str(row[1])) for row in conn.execute(
+                "SELECT type, name FROM sqlite_master "
+                "WHERE type IN ('table', 'index', 'trigger')")
+        }
+        complete = all(
+            item in present for item in _CODEX_RETAINED_IDENTITY_OBJECTS)
+        for statement in _codex_retained_identity_ddl():
+            conn.execute(statement)
+        if not complete:
+            state = (
+                CODEX_IDENTITY_INVENTORY_READY
+                if _codex_identity_families_empty(conn)
+                else "bootstrap:files:0")
+            conn.execute(
+                "INSERT INTO cache_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (CODEX_IDENTITY_INVENTORY_KEY, state))
+    except BaseException:
+        if own_transaction:
+            conn.rollback()
+        else:
+            conn.execute("ROLLBACK TO codex_retained_identity_apply")
+            conn.execute("RELEASE codex_retained_identity_apply")
+        raise
+    if own_transaction:
+        conn.commit()
+    else:
+        conn.execute("RELEASE codex_retained_identity_apply")
+
+
 # ── #901 W1: the maintained raw-partition maxima (spec §5.1, T1) ─────────────
 #
 # `load_codex_quota_observations(latest_per_identity=True)` computed
@@ -4808,6 +5034,46 @@ _CODEX_CONTAINER_CURSOR_COLUMNS: "tuple[tuple[str, str], ...]" = (
 _CODEX_CONTAINER_CACHE_ONLY_COLUMNS: "tuple[tuple[str, str], ...]" = (
     ("container_resume_strikes", "INTEGER NOT NULL DEFAULT 0"),
 )
+#: #944 spec 5.1/5.4: the derived tables of write-time Claude cost
+#: attribution. Both are journal-backed and disposable: the decisions replay
+#: from `claude_cost_account` ops, the timeline from admitted Claude
+#: `record-usage` observations.
+_CLAUDE_ATTRIBUTION_CACHE_TABLES = (
+    "claude_account_timeline", "claude_cost_decisions",
+)
+_CLAUDE_ATTRIBUTION_CACHE_DDL = (
+    "CREATE TABLE IF NOT EXISTS claude_account_timeline ("
+    " captured_at_utc TEXT NOT NULL,"
+    " precision_us INTEGER NOT NULL,"
+    " account_key TEXT NULL,"
+    " journal_segment TEXT NOT NULL,"
+    " journal_offset INTEGER NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS idx_claude_account_timeline_captured "
+    "ON claude_account_timeline(captured_at_utc)",
+    "CREATE TABLE IF NOT EXISTS claude_cost_decisions ("
+    " decision_key TEXT PRIMARY KEY,"
+    " form TEXT NOT NULL,"
+    " msg_id TEXT,"
+    " req_id TEXT,"
+    " loc TEXT,"
+    " byte_offset INTEGER,"
+    " digest TEXT,"
+    " account_key TEXT NULL,"
+    " basis TEXT NOT NULL,"
+    " reason TEXT NULL,"
+    " rule INTEGER NOT NULL,"
+    " decided_at_utc TEXT NOT NULL,"
+    " record_ts_utc TEXT NULL,"
+    " projection_json TEXT NULL,"
+    " journal_segment TEXT NOT NULL,"
+    " journal_offset INTEGER NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS idx_claude_cost_decisions_decided "
+    "ON claude_cost_decisions(decided_at_utc)",
+    "CREATE INDEX IF NOT EXISTS idx_claude_cost_decisions_loc "
+    "ON claude_cost_decisions(loc, byte_offset)",
+)
+
+
 _CODEX_968_CACHE_TABLES = (
     "codex_prune_debt", "codex_barrier_membership", "codex_barrier_targets",
     "codex_barrier_population", "codex_barrier_certificates",
@@ -5209,6 +5475,28 @@ CACHE_REDERIVABLE_OBJECTS: "tuple[SchemaDeliveryObject, ...]" = (
         "index", "idx_codex_window_attributions_read_order",
         "_apply_codex_window_attribution_read_index",
         "047_spill_free_read_paths"),
+    # #944 spec 5.7: migration 050's handler calls the shared ensure helper.
+    *(SchemaDeliveryObject(
+        "table", table, "_apply_claude_attribution_schema",
+        "050_preserve_claude_cost_attribution")
+      for table in _CLAUDE_ATTRIBUTION_CACHE_TABLES),
+    SchemaDeliveryObject(
+        "column", "session_entries.attribution_decision_key",
+        "_apply_claude_attribution_schema",
+        "050_preserve_claude_cost_attribution"),
+    *(SchemaDeliveryObject(
+        "index", index, "_apply_claude_attribution_schema",
+        "050_preserve_claude_cost_attribution")
+      for index in ("idx_claude_account_timeline_captured",
+                    "idx_claude_cost_decisions_decided",
+                    "idx_claude_cost_decisions_loc",
+                    "idx_entries_attr_unlinked",
+                    "idx_entries_attr_nonkeyed")),
+    # #927 spec §4.2 B1: migration 051's handler calls the shared helper.
+    *(SchemaDeliveryObject(
+        kind, name, "_apply_codex_retained_identity_inventory",
+        "051_codex_retained_identities")
+      for kind, name in _CODEX_RETAINED_IDENTITY_OBJECTS),
 )
 
 
@@ -5249,6 +5537,51 @@ def _apply_codex_container_cache_schema(conn: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0")
     for statement in _CODEX_968_CACHE_DDL:
         conn.execute(statement)
+
+
+def _apply_claude_attribution_schema(conn: sqlite3.Connection) -> None:
+    """#944 spec 5.1/5.4: deliver the write-time Claude cost attribution
+    schema -- the two derived tables, the ``session_entries`` link column and
+    its two partial indexes.
+
+    Shared by ``_apply_cache_schema`` and the migration that delivers it to an
+    already-current store, so both shapes converge. The link column goes
+    through ``add_column_if_missing`` only, never the CREATE TABLE body
+    (ALTER TABLE ADD COLUMN appends, so a column in both places sits at a
+    different ordinal on a fresh store than on a migrated one -- the #195
+    hazard). Idempotent.
+    """
+    for statement in _CLAUDE_ATTRIBUTION_CACHE_DDL:
+        conn.execute(statement)
+    if _table_exists(conn, "session_entries"):
+        # Literal column name keeps the schema-delivery AST guard complete.
+        add_column_if_missing(
+            conn, "session_entries", "attribution_decision_key", "TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_attr_unlinked "
+            "ON session_entries(id) WHERE attribution_decision_key IS NULL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_attr_nonkeyed "
+            "ON session_entries(attribution_decision_key) "
+            "WHERE msg_id IS NULL OR req_id IS NULL")
+
+
+def claude_attribution_schema_present(conn: sqlite3.Connection) -> bool:
+    """Whether this store carries the #944 attribution schema (both tables
+    and the link column). A direct handler call on a historical
+    ``pre.sqlite`` lacks it; every production store has it, because schema
+    delivery precedes every handler (spec 5.6)."""
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('claude_account_timeline', 'claude_cost_decisions')")}
+        if len(tables) != 2:
+            return False
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(session_entries)")}
+    except sqlite3.Error:
+        return False
+    return "attribution_decision_key" in columns
 
 
 def _apply_codex_conversation_container_schema(conn: sqlite3.Connection) -> None:
@@ -5924,6 +6257,10 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
             "ON session_entries(source_path, line_offset)")
     except sqlite3.IntegrityError:
         pass
+    # #944: write-time Claude cost attribution (derived tables, the link
+    # column and its partial indexes). After the session_entries column adds
+    # and BEFORE the legacy-FTS early return, like the indexes above.
+    _apply_claude_attribution_schema(conn)
     # Existing-DB guard for the skill-content fold link (cctally-dev
     # skill-content-nesting): the message-level sourceToolUseID. Idempotent
     # column-add (no marker, no version); cache migration 006 then re-ingests
@@ -5995,6 +6332,8 @@ def _apply_cache_schema(conn: sqlite3.Connection) -> None:
     _apply_codex_quota_unresolved_model_index(conn)
     _apply_codex_quota_change_ledger(conn)
     _apply_codex_accounting_change_ledger(conn)
+    # #927: after cache_meta and the four families exist (spec §4.2 B1).
+    _apply_codex_retained_identity_inventory(conn)
     # #901 (spec §5.1-§5.3): the latest-capture summary, the general loader's
     # ordering index, the W2 lookup indexes, the pricing model indexes and the
     # window-attribution read order (Amendment 1 item 1). BEFORE the
@@ -6194,6 +6533,13 @@ def _apply_conversations_schema(conn: sqlite3.Connection) -> None:
         -- quota_window_snapshots, which was dropped above together with its
         -- triggers and seek index. Drop the table as well.
         DROP TABLE IF EXISTS codex_quota_partition_latest;
+        -- #944: the Claude cost attribution tables are cache.db accounting
+        -- state; conversation code reads them through the cache_db attachment.
+        DROP TABLE IF EXISTS claude_account_timeline;
+        DROP TABLE IF EXISTS claude_cost_decisions;
+        -- #927: the retained-identity inventory is cache.db prune state. Its
+        -- triggers went with the four family tables dropped above.
+        DROP TABLE IF EXISTS codex_retained_identities;
 
         CREATE TABLE IF NOT EXISTS conversation_source_files (
             path             TEXT PRIMARY KEY,
@@ -8280,6 +8626,11 @@ def _001_dedup_highest_wins_locked(conn: sqlite3.Connection) -> None:
             "corrected dedup (one-time; may take 10-30s depending on "
             "JSONL volume)..."
         )
+    # #944 spec 5.6: no row is deleted before it is linked. Every unlinked
+    # row's stamp (NULL included, whatever the population: a pending 029 is no
+    # proof that NULLs predate account stamping) is aligned or exported first;
+    # an unwritable journal defers 001 with nothing wiped.
+    _link_claude_rows_before_001_wipe(conn)
     # D3 — BEGIN IMMEDIATE so the destructive DELETEs are race-guarded,
     # not just the marker insert. The dispatcher snapshots the applied
     # set ONCE before its registry walk (``_run_pending_migrations``),
@@ -8340,6 +8691,48 @@ def _001_dedup_highest_wins_locked(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+#: #944 spec 5.7: unlinked rows one migration-050 invocation links (and the
+#: round size migration 001's preserve-before-wipe commits per round).
+_CLAUDE_PRESERVATION_CHUNK_ROWS = 50_000
+
+
+def _link_claude_rows_before_001_wipe(conn: sqlite3.Connection) -> None:
+    """Link every unlinked ``session_entries`` row before cache 001 wipes the
+    table (#944 spec 5.6): replay pending decisions, then align or export in
+    committed rounds. A store without the attribution schema (a direct handler
+    call on a historical ``pre.sqlite``) holds no decisions and behaves
+    exactly as before. ``MigrationGateNotMet`` when the journal cannot be read
+    or written, so 001 stays pending with nothing wiped."""
+    if not claude_attribution_schema_present(conn):
+        return
+    if conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1",
+        ("001_dedup_highest_wins",),
+    ).fetchone() is not None:
+        return  # a concurrent opener already wiped; nothing left to link
+    import _cctally_claude_attribution as G
+    try:
+        hw = G.rehydrate_claude_attribution(conn, authoritative=False)
+        if hw is None:
+            raise G.AttributionJournalUnavailable(
+                "the journal could not be read")
+        conn.commit()
+        after = 0
+        while True:
+            result = G.preserve_unlinked_rows(
+                conn, journal_hw=hw, after_id=after,
+                limit=_CLAUDE_PRESERVATION_CHUNK_ROWS)
+            conn.commit()
+            if not result.remaining:
+                return
+            after = result.last_id
+    except G.AttributionJournalUnavailable as exc:
+        conn.rollback()
+        raise MigrationGateNotMet(
+            f"Claude cost attribution could not be made durable before the "
+            f"cache 001 wipe ({exc}); deferring") from exc
 
 
 # === Region 7c: Cache migration 002_conversation_messages_backfill ===
@@ -9339,16 +9732,24 @@ def _029_backfill_claude_account(conn: sqlite3.Connection) -> None:
     resolved (not pending) outcome → no-op (leave NULL). Idempotent: only touches
     ``account_key IS NULL`` rows. Central stamp via the dispatcher (#140); the
     handler does NOT self-stamp.
+
+    #944 spec 5.6: a row linked to a durable Claude cost decision (a decided
+    NULL included) is never overwritten, whatever the skip/unskip order. A
+    store without the attribution schema (a direct call on a historical
+    ``pre.sqlite``) has no links, so the predicate is omitted there.
     """
     import _cctally_journal as _jr
     import _lib_accounts as _acc
 
+    unlinked = (" AND attribution_decision_key IS NULL"
+                if claude_attribution_schema_present(conn) else "")
     op_value = _accounts_cutover_value_or_defer("Claude account backfill")
     if op_value is None:
         # Cutover hasn't appended its op yet. Defer only if there is legacy Claude
         # history to attribute; a fresh install (no such rows) proceeds as a no-op.
         pending = conn.execute(
-            "SELECT 1 FROM session_entries WHERE account_key IS NULL LIMIT 1"
+            "SELECT 1 FROM session_entries WHERE account_key IS NULL"
+            + unlinked + " LIMIT 1"
         ).fetchone()
         if pending is not None:
             raise MigrationGateNotMet(
@@ -9361,7 +9762,8 @@ def _029_backfill_claude_account(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
-            "UPDATE session_entries SET account_key=? WHERE account_key IS NULL",
+            "UPDATE session_entries SET account_key=? WHERE account_key IS NULL"
+            + unlinked,
             (op_value,),
         )
         conn.execute(
@@ -10265,6 +10667,144 @@ def _049_codex_rollout_containers(conn: sqlite3.Connection) -> None:
     dispatcher central-stamps on a clean return (#140).
     """
     _apply_codex_container_cache_schema(conn)
+    conn.commit()
+
+
+@cache_migration("050_preserve_claude_cost_attribution")
+def _050_preserve_claude_cost_attribution(conn: sqlite3.Connection) -> None:
+    """#944 spec 5.7 (U1): make every existing Claude cost stamp durable.
+
+    Delivers the attribution schema (the shared helper every fresh store
+    gets through ``_apply_cache_schema``), then links up to
+    ``_CLAUDE_PRESERVATION_CHUNK_ROWS`` unlinked ``session_entries`` rows per
+    invocation, in ``id`` order past the recorded cursor: a row whose
+    identity already holds a decision is aligned to it, every other row's
+    CURRENT stamp (NULL included, orphan sources included) is exported as a
+    ``preserved_history`` decision -- keyed form, or the legacy projection
+    form for a row lacking an id. Never consults the kernel and never reads
+    a transcript.
+
+    Gate: migration 029 applied or skipped, because 029 backfills NULL stamps
+    U1 then preserves as they stand. Each chunk appends (fsync) and then, in
+    one transaction, inserts the decisions, sets the links and records
+    ``claude_cost_preservation``; while an unlinked row remains past the
+    cursor the handler raises ``MigrationGateNotMet`` so the migration stays
+    pending with its committed chunks kept. An unwritable journal records
+    ``lastError``/``lastErrorAt`` in a separate small transaction (doctor's
+    stall WARN) and defers; nothing is wiped and nothing is stamped.
+
+    Takes the cache writer flock on a direct call (the dispatcher already
+    holds it). Re-running is a no-op once every row is linked. NO
+    self-stamp -- the dispatcher central-stamps on a clean return (#140).
+    """
+    _apply_claude_attribution_schema(conn)
+    conn.commit()
+    gate = conn.execute(
+        "SELECT 1 FROM schema_migrations WHERE name = ? UNION ALL "
+        "SELECT 1 FROM schema_migrations_skipped WHERE name = ? LIMIT 1",
+        ("029_backfill_claude_account", "029_backfill_claude_account"),
+    ).fetchone() if _table_exists(conn, "schema_migrations_skipped") else (
+        conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1",
+            ("029_backfill_claude_account",)).fetchone())
+    if gate is None:
+        raise MigrationGateNotMet(
+            "cache 029 is neither applied nor skipped; deferring the Claude "
+            "cost attribution export until its NULL backfill has run")
+    lock_path = (
+        None
+        if _CACHE_DISPATCH_WRITER_LOCK_HELD.get()
+        else _cache_db_lock_path_for_conn(conn)
+    )
+    lock_fh = None
+    if lock_path is not None:
+        lock_fh = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_fh.close()
+            raise MigrationGateNotMet(
+                "cache.db.lock held by a concurrent sync_cache; deferring "
+                "cache 050 Claude cost attribution export (#944)")
+    try:
+        _050_export_one_chunk(conn)
+    finally:
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+def _050_export_one_chunk(conn: sqlite3.Connection) -> None:
+    import _cctally_claude_attribution as G
+
+    def unlinked_count() -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM session_entries "
+            "WHERE attribution_decision_key IS NULL").fetchone()[0]
+
+    progress = G.read_preservation(conn)
+    if progress is None:
+        progress = {"afterId": 0, "saved": 0, "total": unlinked_count(),
+                    "lastError": None, "lastErrorAt": None,
+                    "lastChunkAt": None}
+    after = int(progress.get("afterId") or 0)
+    try:
+        hw = G.rehydrate_claude_attribution(conn, authoritative=False)
+        if hw is None:
+            raise G.AttributionJournalUnavailable(
+                "the journal could not be read")
+        conn.commit()
+        result = G.preserve_unlinked_rows(
+            conn, journal_hw=hw, after_id=after,
+            limit=_CLAUDE_PRESERVATION_CHUNK_ROWS)
+    except G.AttributionJournalUnavailable as exc:
+        conn.rollback()
+        if not exc.contended:
+            progress["lastError"] = str(exc)
+            progress["lastErrorAt"] = now_utc_iso()
+            G.write_preservation(conn, progress)
+            conn.commit()
+        raise MigrationGateNotMet(
+            f"Claude cost attribution export deferred: {exc}") from exc
+    total = int(progress.get("total") or 0)
+    progress.update({
+        "afterId": max(after, result.last_id),
+        # Aligned rows and rows ingest linked meanwhile count as saved.
+        "saved": max(0, min(total, total - unlinked_count())),
+        "lastError": None, "lastErrorAt": None,
+        "lastChunkAt": now_utc_iso(),
+    })
+    G.write_preservation(conn, progress)
+    conn.commit()
+    if result.remaining:
+        raise MigrationGateNotMet(
+            f"Claude cost attribution export saved {progress['saved']} of "
+            f"{total} rows; resuming on the next open")
+
+
+@cache_migration("051_codex_retained_identities")
+def _051_codex_retained_identities(conn: sqlite3.Connection) -> None:
+    """#927 spec §4.2 B1: deliver the retained-identity inventory.
+
+    The schema apply that declares the table, its expression unique index and
+    the eight INSERT/identity-UPDATE triggers is version-gated, so only a
+    registered migration reaches an already-current store (the reason 046
+    gives). The shared helper creates the triggers first and then records
+    ``ready`` when the four families hold no Codex row, else
+    ``bootstrap:files:0``: an existing history is backfilled off the hook by
+    ``_codex-inventory-bootstrap`` (or inline by ``cache-sync``), never here,
+    so an ordinary open pays no history scan.
+
+    Takes no provider flock: the helper's IMMEDIATE transaction makes the
+    trigger creation and the state decision atomic against every writer.
+    Re-running is a no-op once all ten objects exist (the recorded state, and
+    any bootstrap progress, stand). NO self-stamp — the dispatcher
+    central-stamps on a clean return (#140).
+    """
+    _apply_codex_retained_identity_inventory(conn)
     conn.commit()
 
 
@@ -11342,15 +11882,30 @@ def cmd_db_status(args: argparse.Namespace) -> int:
             "migrations": [],
             "_open_error": str(exc),
         }
+    # #1000 §5.10: the conversations leg opens under the diagnostic read
+    # admission and DECLINES while the probe, recovery or another maintenance
+    # holder owns the family; report that the same way.
+    try:
+        conversations_status = _db_status_for(
+            _cctally_core.CONVERSATIONS_DB_PATH, _CONVERSATIONS_MIGRATIONS,
+            "conversations.db",
+        )
+    # An admission whose lock file cannot be opened (an unwritable data
+    # folder) is a decline as well, never a traceback.
+    except (sqlite3.DatabaseError, OSError) as exc:
+        conversations_status = {
+            "path": str(_cctally_core.CONVERSATIONS_DB_PATH),
+            "user_version": 0,
+            "registry_size": len(_CONVERSATIONS_MIGRATIONS),
+            "migrations": [],
+            "_open_error": str(exc),
+        }
     payload = {
         "schema_version": 1,
         "databases": {
             "stats.db": stats_status,
             "cache.db": _db_status_for(_cctally_core.CACHE_DB_PATH, _CACHE_MIGRATIONS, "cache.db"),
-            "conversations.db": _db_status_for(
-                _cctally_core.CONVERSATIONS_DB_PATH, _CONVERSATIONS_MIGRATIONS,
-                "conversations.db",
-            ),
+            "conversations.db": conversations_status,
         },
     }
     # #997 D10: additive — each detached rebuild worker's state and its
@@ -11428,15 +11983,7 @@ def _db_status_for(
     except sqlite3.OperationalError.
     """
     if not db_path.exists():
-        return {
-            "path": str(db_path),
-            "user_version": 0,
-            "registry_size": len(registry),
-            "migrations": [
-                {"seq": m.seq, "name": m.name, "status": "pending"}
-                for m in registry
-            ],
-        }
+        return _db_status_absent(db_path, registry)
     if db_path == _cctally_core.DB_PATH:
         # #386: participate in the replacement protocol, and connect `mode=rw`
         # so this diagnostic can never MATERIALISE the very stats.db a
@@ -11452,33 +11999,76 @@ def _db_status_for(
                 f"file:{p}?mode=rw", uri=True, **kw),
             recover_interruptions=recover_interrupted_stats,
         )
+    elif db_label == "conversations.db":
+        # #1000 §5.10: the diagnostic read admission (maintenance SHARED for
+        # the connection's life, `mode=ro`), so this diagnostic can neither
+        # open the family under the pre-rebuild probe's in-place read nor
+        # recreate a main file a quarantine just renamed: the `exists()`
+        # check above is a TOCTOU, and a plain `sqlite3.connect` recreates a
+        # file removed in the gap. A decline raises `sqlite3.DatabaseError`
+        # with the readers' existing text, which `cmd_db_status` renders as
+        # this leg's `_open_error`.
+        import _cctally_cache
+
+        with _cctally_cache.conversation_ro_guarded(timeout=5.0) as conn:
+            if conn is None:
+                if not os.path.lexists(db_path):
+                    return _db_status_absent(db_path, registry)
+                raise sqlite3.DatabaseError(
+                    _cctally_cache.conversation_ro_decline_reason())
+            return _db_status_rows(conn, db_path, registry, db_label)
     else:
         conn = sqlite3.connect(db_path)
     try:
-        user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-        # Tolerate missing tables (e.g., cache.db never opened by framework).
-        # Alias legacy unprefixed names to their NNN_ equivalents so a
-        # `db status` that runs before any open_db()-via-bootstrap rename
-        # still reports legacy-marker DBs as applied, not pending.
-        aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
-        applied_rows: dict[str, str] = {}
-        try:
-            for row in conn.execute(
-                "SELECT name, applied_at_utc FROM schema_migrations"
-            ).fetchall():
-                applied_rows[aliases.get(row[0], row[0])] = row[1]
-        except sqlite3.OperationalError:
-            pass
-        skipped_rows: dict[str, tuple[str, str | None]] = {}
-        try:
-            for row in conn.execute(
-                "SELECT name, skipped_at_utc, reason FROM schema_migrations_skipped"
-            ).fetchall():
-                skipped_rows[row[0]] = (row[1], row[2])
-        except sqlite3.OperationalError:
-            pass
+        return _db_status_rows(conn, db_path, registry, db_label)
     finally:
         conn.close()
+
+
+def _db_status_absent(
+    db_path: pathlib.Path, registry: list[Migration],
+) -> dict:
+    """The status dict for an absent store: every migration pending."""
+    return {
+        "path": str(db_path),
+        "user_version": 0,
+        "registry_size": len(registry),
+        "migrations": [
+            {"seq": m.seq, "name": m.name, "status": "pending"}
+            for m in registry
+        ],
+    }
+
+
+def _db_status_rows(
+    conn: sqlite3.Connection,
+    db_path: pathlib.Path,
+    registry: list[Migration],
+    db_label: str,
+) -> dict:
+    """The status dict for ``db_path`` read through the open ``conn``."""
+    user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    # Tolerate missing tables (e.g., cache.db never opened by framework).
+    # Alias legacy unprefixed names to their NNN_ equivalents so a
+    # `db status` that runs before any open_db()-via-bootstrap rename
+    # still reports legacy-marker DBs as applied, not pending.
+    aliases = _LEGACY_MARKER_ALIASES_BY_DB.get(db_label, {})
+    applied_rows: dict[str, str] = {}
+    try:
+        for row in conn.execute(
+            "SELECT name, applied_at_utc FROM schema_migrations"
+        ).fetchall():
+            applied_rows[aliases.get(row[0], row[0])] = row[1]
+    except sqlite3.OperationalError:
+        pass
+    skipped_rows: dict[str, tuple[str, str | None]] = {}
+    try:
+        for row in conn.execute(
+            "SELECT name, skipped_at_utc, reason FROM schema_migrations_skipped"
+        ).fetchall():
+            skipped_rows[row[0]] = (row[1], row[2])
+    except sqlite3.OperationalError:
+        pass
 
     failed_names = _db_status_failed_names_from_log(db_label)
     migrations_out: list[dict] = []
@@ -11631,6 +12221,12 @@ def _acquire_db_admin_writer_flocks(
     ``PRAGMA user_version = 0`` against the live stats index. stats.db now takes
     its maintenance lock EXCLUSIVE, which is the regime spec section 3.1 puts
     administrative mutation in.
+
+    #1000 §5.8: conversations.db takes, in the conversation-writer lock order
+    (maintenance before the providers, Claude then Codex), its maintenance
+    lock SHARED and both provider locks EXCLUSIVE, as every conversation
+    writer does, so `db skip` / `db unskip` can neither write the store under
+    the pre-rebuild probe's in-place read nor across recovery's quarantine.
     """
     from _lib_cache_writer_lock import acquire_ordered_flocks
 
@@ -11650,6 +12246,16 @@ def _acquire_db_admin_writer_flocks(
         if held is not None:
             _cctally_core.note_stats_maintenance_acquired()
         return held
+    if db_label == "conversations.db":
+        return acquire_ordered_flocks(
+            [
+                (_cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH,
+                 fcntl.LOCK_SH),
+                (_cctally_core.CONVERSATIONS_LOCK_PATH, fcntl.LOCK_EX),
+                (_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, fcntl.LOCK_EX),
+            ],
+            timeout=timeout,
+        )
     return []
 
 
@@ -11976,11 +12582,49 @@ def _encode_repair_owner(
     ) + "\n"
 
 
-def _read_repair_owner(marker: pathlib.Path) -> "dict[str, Any] | None":
+#: #1020: the record file inside a directory-form owner record, and how many
+#: times a reader resolves and reads it before reporting it unreadable.
+_OWNER_RECORD_FILE_NAME = "owner"
+_OWNER_RECORD_READ_ATTEMPTS = 3
+
+
+def _owner_record_file(marker: pathlib.Path) -> pathlib.Path:
+    """Return the file that holds ``marker``'s owner record (#1020).
+
+    A marker published where hard links work is the record itself; one
+    published on a volume without them is a directory holding ``owner``. A
+    failed ``lstat`` resolves to the marker, so the read fails as before."""
     try:
-        raw = marker.read_text().strip()
+        st = os.lstat(marker)
     except OSError:
-        return None
+        return marker
+    if stat.S_ISDIR(st.st_mode):
+        return marker / _OWNER_RECORD_FILE_NAME
+    return marker
+
+
+def _read_owner_record_text(
+    marker: pathlib.Path,
+) -> "tuple[str, pathlib.Path] | None":
+    """Read ``marker``'s owner record; return its stripped text and the file
+    read, or ``None`` when it cannot be read.
+
+    A read that finds the other form (``IsADirectoryError`` /
+    ``NotADirectoryError``) means one owner released the record and another
+    published it in the other form between the ``lstat`` and the read, so the
+    record is resolved and read again, a bounded number of times."""
+    for _attempt in range(_OWNER_RECORD_READ_ATTEMPTS):
+        record = _owner_record_file(marker)
+        try:
+            return record.read_text().strip(), record
+        except (IsADirectoryError, NotADirectoryError):
+            continue
+        except OSError:
+            return None
+    return None
+
+
+def _decode_repair_owner(raw: str) -> "dict[str, Any] | None":
     def legacy_owner() -> "dict[str, Any] | None":
         # Legacy markers contained only a PID. They remain live for a bounded
         # lease when that PID exists, preventing a reused PID from wedging the
@@ -12012,8 +12656,22 @@ def _read_repair_owner(marker: pathlib.Path) -> "dict[str, Any] | None":
     return decoded
 
 
+def _read_repair_owner_record(
+    marker: pathlib.Path,
+) -> "tuple[dict[str, Any] | None, pathlib.Path | None]":
+    read = _read_owner_record_text(marker)
+    if read is None:
+        return None, None
+    raw, record = read
+    return _decode_repair_owner(raw), record
+
+
+def _read_repair_owner(marker: pathlib.Path) -> "dict[str, Any] | None":
+    return _read_repair_owner_record(marker)[0]
+
+
 def _repair_marker_is_live(marker: pathlib.Path) -> "tuple[bool, str]":
-    owner = _read_repair_owner(marker)
+    owner, record = _read_repair_owner_record(marker)
     if owner is None:
         return False, "malformed owner record"
     pid = int(owner["pid"])
@@ -12026,8 +12684,11 @@ def _repair_marker_is_live(marker: pathlib.Path) -> "tuple[bool, str]":
             if actual_start == expected_start:
                 return True, f"pid {pid}"
             return False, f"pid {pid} was reused"
+    # #1020: the lease is the age of the record file that was read, never a
+    # directory marker's own mtime (an AppleDouble companion moves it); a
+    # record file gone since the read was released and is not live.
     try:
-        age_seconds = max(0.0, time.time() - marker.stat().st_mtime)
+        age_seconds = max(0.0, time.time() - record.stat().st_mtime)
     except OSError:
         return False, "owner record disappeared"
     if age_seconds <= _REPAIR_OWNER_UNKNOWN_IDENTITY_LEASE_SECONDS:
@@ -12035,21 +12696,94 @@ def _repair_marker_is_live(marker: pathlib.Path) -> "tuple[bool, str]":
     return False, f"pid {pid} owner identity lease expired"
 
 
+def _remove_owner_record(marker: pathlib.Path) -> None:
+    """Remove ``marker``'s owner record in either form (#1020).
+
+    A file (by ``lstat``, so a symlink is never followed) is unlinked. A
+    directory is renamed to a unique private tomb, the one step readers
+    observe; the parent is fsynced; only then is the tomb deleted, best effort.
+    An already-absent marker is not an error. An error at the parent fsync
+    propagates after the name is gone and leaves the tomb, so cleanup never
+    precedes the barrier."""
+    try:
+        st = os.lstat(marker)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    tomb = None
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            tomb = marker.with_name(
+                f".{marker.name}.{os.getpid()}-{time.time_ns()}-"
+                f"{os.urandom(4).hex()}.removed"
+            )
+            os.rename(marker, tomb)
+        else:
+            os.unlink(marker)
+    except FileNotFoundError:
+        return
+    _fsync_directory(marker.parent)
+    if tomb is not None:
+        shutil.rmtree(tomb, ignore_errors=True)
+
+
+def _open_owner_record_lock_fd(marker: pathlib.Path) -> int:
+    """Open (creating) ``<marker>.lock``, the removal lock's file (#1020),
+    with the maintenance-lock idiom of
+    ``_cctally_cache._open_maintenance_lock_fd``; the caller owns the fd."""
+    lock_path = marker.with_name(f"{marker.name}.lock")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(lock_path, flags, 0o666)
+    except FileNotFoundError:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        return os.open(lock_path, flags, 0o666)
+
+
+@contextlib.contextmanager
+def _owner_record_removal_lock(marker: pathlib.Path) -> "Iterator[None]":
+    """Hold ``<marker>.lock`` exclusive for one removal of ``marker`` (#1020).
+
+    Every remover (both stale reclaimers, both releases) holds it across its
+    absence check, read, judgment and removal, so the record it judged is the
+    one it removes: while a record is present only a removal (which waits
+    here) or nothing can change it, because publication needs the name
+    absent. Publication never takes it. It is a leaf: nothing is acquired
+    under it, and no caller holding it calls anything that takes it again
+    (``flock`` conflicts between two descriptors of one process). Opened with
+    the maintenance-lock idiom of ``_cctally_cache._open_maintenance_lock_fd``,
+    on its own descriptor per acquisition."""
+    fd = _open_owner_record_lock_fd(marker)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _owner_record_absent(marker: pathlib.Path) -> bool:
+    """Whether ``marker``'s name is absent, by ``lstat`` (a dangling symlink
+    is present). Only ``FileNotFoundError`` / ``NotADirectoryError`` prove
+    absence; every other lookup error propagates, never read as absence."""
+    try:
+        os.lstat(marker)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    return False
+
+
 def _remove_stale_repair_marker(path: pathlib.Path) -> "tuple[bool, str]":
     """Remove a provably stale marker; the caller owns maintenance-exclusive."""
     marker = _repair_marker_path(path)
-    if not marker.exists():
-        return True, ""
-    live, reason = _repair_marker_is_live(marker)
-    if live:
-        return False, f"another {path.name} repair owns {marker} ({reason})"
     try:
-        marker.unlink()
-    except FileNotFoundError:
-        return True, ""
+        with _owner_record_removal_lock(marker):
+            if _owner_record_absent(marker):
+                return True, ""
+            live, reason = _repair_marker_is_live(marker)
+            if live:
+                return False, f"another {path.name} repair owns {marker} ({reason})"
+            _remove_owner_record(marker)
     except OSError as exc:
         return False, f"could not remove stale repair marker {marker}: {exc}"
-    _fsync_directory(marker.parent)
     return True, reason
 
 
@@ -12065,6 +12799,96 @@ def _claim_repair_marker(
     )
 
 
+def _publish_owner_record_link(temp: pathlib.Path, marker: pathlib.Path) -> None:
+    """Hard-link the private record ``temp`` onto ``marker`` (#1020).
+
+    While ``PYTEST_CURRENT_TEST`` is set, ``CCTALLY_TEST_OWNER_RECORD_LINK_ERRNO``
+    names an errno the link raises instead, so a child-process test can stand
+    in for a volume without hard links through the same classification a real
+    ``link(2)`` refusal takes. Production never reads it."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        name = os.environ.get("CCTALLY_TEST_OWNER_RECORD_LINK_ERRNO")
+        if name:
+            code = getattr(errno, name)
+            raise OSError(code, os.strerror(code), str(temp), None, str(marker))
+    os.link(temp, marker)
+
+
+def _trace_owner_record_publication(marker: pathlib.Path, form: str) -> None:
+    """Test-only (#1020): record which form (``file`` or ``directory``)
+    published ``marker``, as ``<marker name> <form>`` lines appended to the
+    file ``CCTALLY_TEST_OWNER_RECORD_TRACE`` names, only while
+    ``PYTEST_CURRENT_TEST`` is set."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    trace = os.environ.get("CCTALLY_TEST_OWNER_RECORD_TRACE")
+    if not trace:
+        return
+    with open(trace, "a", encoding="utf-8") as fh:
+        fh.write(f"{marker.name} {form}\n")
+
+
+#: #1020: a directory-form publication whose rename finds the marker name
+#: taken — a populated directory (``EEXIST`` / ``ENOTEMPTY``) or a file
+#: (``ENOTDIR``) — is contention, handled as ``FileExistsError`` on a link.
+_OWNER_RECORD_RENAME_CONTENTION = frozenset({
+    errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR,
+})
+
+
+def _owner_record_link_unsupported(exc: OSError) -> bool:
+    """Whether the publishing link failed because the volume has no hard
+    links (#1020): ``ENOTSUP`` / ``EOPNOTSUPP`` anywhere, and ``EPERM`` on
+    Linux, where ``link(2)`` documents it for filesystems without hard links
+    (vfat, exfat). Every other errno, macOS ``EPERM`` included, is a real
+    failure."""
+    if exc.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+        return True
+    return exc.errno == errno.EPERM and sys.platform.startswith("linux")
+
+
+def _publish_owner_record_directory(
+    marker: pathlib.Path, payload: bytes, claim_id: str,
+) -> bool:
+    """Publish ``payload`` at ``marker`` as a directory holding ``owner``
+    (#1020), for a volume without hard links; ``False`` when the name is taken.
+
+    The record is written and fsynced inside a private directory, which is
+    fsynced and renamed onto the marker: rename(2) never replaces a populated
+    directory, so the record is complete or absent and exactly one claimant
+    wins, as with the hard link. The private directory never outlives the
+    attempt."""
+    private = marker.with_name(f".{marker.name}.{claim_id}.d")
+    os.mkdir(private, 0o700)
+    try:
+        fd = os.open(
+            private / _OWNER_RECORD_FILE_NAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        _fsync_directory(private)
+        try:
+            os.rename(private, marker)
+        except OSError as exc:
+            if exc.errno in _OWNER_RECORD_RENAME_CONTENTION:
+                return False
+            raise
+        _fsync_directory(marker.parent)
+        return True
+    finally:
+        try:
+            os.lstat(private)
+        except OSError:
+            pass
+        else:
+            shutil.rmtree(private, ignore_errors=True)
+
+
 def _claim_owner_record(
     marker: pathlib.Path,
     remove_stale: "Callable[[], tuple[bool, str]]",
@@ -12077,10 +12901,18 @@ def _claim_owner_record(
     The repair marker's discipline, shared with #901's keeper-yield request:
     the record is written and fsynced under a private name and linked into
     place, so it is complete or absent; an existing record is replaced only
-    when ``remove_stale`` proves its owner dead or its pid reused."""
+    when ``remove_stale`` proves its owner dead or its pid reused. Where the
+    volume has no hard links (#1020) the same record is published as a
+    directory holding it (`_publish_owner_record_directory`); the hard link
+    is tried first on every claim."""
     process_start = _process_start_identity(os.getpid())
     if process_start is None:
         raise OSError(f"could not establish {owner} process identity")
+    # #1020: the removal lock's file exists before the record does, so this
+    # claim's release never needs a new directory entry (a full disk would
+    # otherwise leave this process's own record behind). Creating it is not
+    # taking the lock; publication never takes it.
+    os.close(_open_owner_record_lock_fd(marker))
     for _attempt in range(3):
         claim_id = f"{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}"
         temp = marker.with_name(f".{marker.name}.{claim_id}.tmp")
@@ -12096,14 +12928,32 @@ def _claim_owner_record(
         finally:
             os.close(fd)
         try:
+            link_unsupported = False
             try:
-                os.link(temp, marker)
+                _publish_owner_record_link(temp, marker)
             except FileExistsError:
                 removed, reason = remove_stale()
                 if not removed:
                     return None, reason
                 continue
-            _fsync_directory(marker.parent)
+            except OSError as exc:
+                if not _owner_record_link_unsupported(exc):
+                    raise
+                link_unsupported = True
+            if link_unsupported:
+                # #1020: no hard links here (exFAT); publish the same
+                # complete record as a directory, by an exclusive rename.
+                if not _publish_owner_record_directory(
+                    marker, payload.encode("utf-8"), claim_id,
+                ):
+                    removed, reason = remove_stale()
+                    if not removed:
+                        return None, reason
+                    continue
+                _trace_owner_record_publication(marker, "directory")
+            else:
+                _fsync_directory(marker.parent)
+                _trace_owner_record_publication(marker, "file")
             return RepairMarkerClaim(marker=marker, claim_id=claim_id), ""
         finally:
             try:
@@ -12115,14 +12965,15 @@ def _claim_owner_record(
 
 def _release_repair_marker(path: pathlib.Path, claim: RepairMarkerClaim) -> None:
     marker = _repair_marker_path(path)
-    owner = _read_repair_owner(marker)
-    if owner is not None and owner.get("claim_id") != claim.claim_id:
-        raise OSError(f"repair marker ownership changed before cleanup: {marker}")
-    try:
-        marker.unlink()
-    except FileNotFoundError:
-        return
-    _fsync_directory(marker.parent)
+    with _owner_record_removal_lock(marker):
+        # #1020: an absent name was already reclaimed; a newer owner may
+        # publish there at any moment, so it is neither read nor removed.
+        if _owner_record_absent(marker):
+            return
+        owner = _read_repair_owner(marker)
+        if owner is not None and owner.get("claim_id") != claim.claim_id:
+            raise OSError(f"repair marker ownership changed before cleanup: {marker}")
+        _remove_owner_record(marker)
 
 
 #: #901 W9 (Q15): the one monotonic deadline a process that needs a
@@ -12141,18 +12992,16 @@ def _remove_stale_keeper_yield_request(
     """Remove a provably stale keeper-yield request (dead or reused-pid
     owner), as `_remove_stale_repair_marker` does for the repair marker."""
     request = _keeper_yield_request_path(path)
-    if not request.exists():
-        return True, ""
-    live, reason = _repair_marker_is_live(request)
-    if live:
-        return False, f"another {path.name} keeper-yield request owns {request} ({reason})"
     try:
-        request.unlink()
-    except FileNotFoundError:
-        return True, ""
+        with _owner_record_removal_lock(request):
+            if _owner_record_absent(request):
+                return True, ""
+            live, reason = _repair_marker_is_live(request)
+            if live:
+                return False, f"another {path.name} keeper-yield request owns {request} ({reason})"
+            _remove_owner_record(request)
     except OSError as exc:
         return False, f"could not remove stale keeper-yield request {request}: {exc}"
-    _fsync_directory(request.parent)
     return True, reason
 
 
@@ -12175,17 +13024,16 @@ def _release_keeper_yield_request(
     owns is left alone. Best effort: a request left behind fences keepers
     only while this process lives, and it is stale once the process exits."""
     request = _keeper_yield_request_path(path)
-    owner = _read_repair_owner(request)
-    if owner is not None and owner.get("claim_id") != claim.claim_id:
-        return
     try:
-        request.unlink()
+        with _owner_record_removal_lock(request):
+            if _owner_record_absent(request):
+                return
+            owner = _read_repair_owner(request)
+            if owner is not None and owner.get("claim_id") != claim.claim_id:
+                return
+            _remove_owner_record(request)
     except OSError:
         return
-    try:
-        _fsync_directory(request.parent)
-    except OSError:
-        pass
 
 
 @contextlib.contextmanager

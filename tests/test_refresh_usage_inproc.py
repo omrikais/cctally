@@ -157,6 +157,9 @@ def test_refresh_inproc_writes_source_api(monkeypatch, tmp_path):
 
 
 def test_refresh_inproc_ok(monkeypatch, tmp_path):
+    # #948 spec 6.4: the OAuth ingress bands are checked before any fence,
+    # so the fake API's fixed resets must be plausible at the command clock.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-03T00:00:00Z")
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
 
@@ -247,6 +250,9 @@ def test_refresh_inproc_five_hour_inactive_null_resets(monkeypatch, tmp_path):
     value null). Must NOT raise AttributeError from _iso_to_epoch(None) — the 5h
     segment is dropped cleanly and the 7d data still records. Regression for the
     'NoneType object has no attribute strip' crash on `cctally refresh-usage`."""
+    # #948 spec 6.4: the OAuth ingress bands are checked before any fence,
+    # so the fake API's fixed resets must be plausible at the command clock.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-03T00:00:00Z")
     ns = load_script()
     redirect_paths(ns, monkeypatch, tmp_path)
     monkeypatch.setitem(ns, "_resolve_oauth_token", lambda: "tok")

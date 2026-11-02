@@ -44,6 +44,11 @@ def test_family_registry_exhaustively_classifies_current_journal_kinds(cctally_m
     assert report.classification_for_op("weekly_credit_floor").mode == "retained_input"
     assert report.classification_for_op("account_label").mode == "retained_input"
     assert report.classification_for_op("accounts_cutover").mode == "retained_input"
+    # #943/#956 spec 4.4: both new kinds are re-derived with their credit and
+    # block; an unowned kind would never be planned, so a historical journal
+    # could not gain its boundary companions or opening facts.
+    for kind in ("five_hour_credit_boundary", "five_hour_block_open"):
+        assert report.classification_for_evt(kind).mode == "rederived", kind
 
 
 def test_plan_classifies_retain_supersede_tombstone_and_add_stably(cctally_module):
@@ -2902,11 +2907,29 @@ def _875_priced_close(journal, total):
     )
 
 
+_884_FROM_FOLD = object()
+
+
 def _875_plan(rederive, journal, current, desired, *, preserved=(),
-              **kwargs):
+              milestone_lineage=_884_FROM_FOLD, **kwargs):
+    """One plan over ``current``, through the production lineage path.
+
+    #884: the milestone lineage is built from the selector's own fold, as
+    ``plan_claude_usage`` builds it, unless ``milestone_lineage`` overrides it
+    (``None`` reproduces #875's plan).
+    """
+    accumulators: dict = {}
+    selection = journal.resolve_effective_events(
+        list(current), accumulators=accumulators)
+    if milestone_lineage is _884_FROM_FOLD:
+        milestone_lineage = rederive.build_five_hour_lineage(
+            accumulators["fold"], selection=selection,
+            physical_revisions=kwargs.get("physical_revisions") or {},
+        )
     return rederive.build_claude_usage_plan(
-        selection=journal.resolve_effective_events(list(current)),
+        selection=selection,
         desired_events=list(desired),
+        milestone_lineage=milestone_lineage,
         journal_high_water=("observations-2026-07.jsonl", 10),
         cache_fingerprint="sha256:cache",
         config_fingerprint="sha256:config",
@@ -3690,8 +3713,17 @@ def _875_run_passes(planner, journal, records, desired, *, limit=5, **kwargs):
     records = list(records)
     plans = []
     for number in range(1, limit + 1):
+        accumulators: dict = {}
+        selection = journal.resolve_effective_events(
+            records, accumulators=accumulators)
+        if hasattr(planner, "build_five_hour_lineage"):
+            # #884: the current planner runs the production lineage path;
+            # the pinned pre-#875 planner has no such keyword.
+            kwargs["milestone_lineage"] = planner.build_five_hour_lineage(
+                accumulators["fold"], selection=selection,
+                physical_revisions=kwargs.get("physical_revisions") or {})
         plan = planner.build_claude_usage_plan(
-            selection=journal.resolve_effective_events(records),
+            selection=selection,
             desired_events=list(desired),
             journal_high_water=("observations-2026-07.jsonl", 10),
             cache_fingerprint="sha256:cache",
@@ -4366,10 +4398,18 @@ def test_875_close_corrected_again_takes_no_milestone_pass_of_its_own(
 def _875_causal_plans(rederive, journal, records, baseline_desired,
                       reviewed_desired, *, preserved=(),
                       reviewed_hold_ids=(), conflicted_event_ids=()):
-    """Baseline and reviewed plans over one current graph, and their subset."""
-    selection = journal.resolve_effective_events(list(records))
+    """Baseline and reviewed plans over one current graph, and their subset.
+
+    #884: both plans carry the production lineage, as both reviewed-path
+    plans of the command build their own.
+    """
+    accumulators: dict = {}
+    selection = journal.resolve_effective_events(
+        list(records), accumulators=accumulators)
     common = dict(
         selection=selection,
+        milestone_lineage=rederive.build_five_hour_lineage(
+            accumulators["fold"], selection=selection, physical_revisions={}),
         journal_high_water=("observations-2026-07.jsonl", 10),
         cache_fingerprint="sha256:cache",
         preserved_events=tuple(preserved), enforce_guard=False,
@@ -4641,7 +4681,17 @@ def test_875_hold_supported_close_tombstoned_next_takes_no_extra_pass(
         _875_milestone(journal, 1, 3.0, None),
         _875_milestone(journal, 2, 6.0, 3.0),
     ]
+    # #956: the replay that keeps the window's milestones creates its block,
+    # so it carries the block's opening fact (a target graph without it is
+    # refused by parent validation, spec 4.4).
+    opening = journal.make_evt(
+        kind="five_hour_block_open",
+        id=f"fhbo:{_875_ACCOUNT}:{_875_WINDOW}", at=AT,
+        payload={"account_key": _875_ACCOUNT,
+                 "five_hour_window_key": _875_WINDOW,
+                 "first_observed_at_utc": "2026-07-26T12:00:00Z"})
     desired = [
+        opening,
         _875_milestone(journal, 1, 7.0, None),
         _875_milestone(journal, 2, 14.0, 7.0),
     ]
@@ -4656,11 +4706,11 @@ def test_875_hold_supported_close_tombstoned_next_takes_no_extra_pass(
     }
 
     assert [(a.disposition, a.event_id) for a in fixed[0].actions] == [
-        ("tombstone", _875_CLOSE_ID),
+        ("tombstone", _875_CLOSE_ID), ("add", opening["id"]),
         ("supersede", _875_ONE), ("supersede", _875_TWO),
         ("tombstone", held["id"]),
     ], summary
-    assert [_875_money(a) for a in fixed[0].actions[1:3]] == [
+    assert [_875_money(a) for a in fixed[0].actions[2:4]] == [
         (7.0, None), (14.0, 7.0),
     ], summary
     assert fixed[1].actions == (), summary
@@ -5307,3 +5357,2729 @@ def test_885_hold_merge_does_not_hide_historical_population_drift(cctally_module
     assert "_pricing" not in action.payload
     assert plans[0].uncertain_cost_fact_count == 1
     assert plans[1].actions == ()
+
+
+# --------------------------------------------------------------------------
+# #943/#956 spec 4.4, test 6.8: a five-hour credit with its boundary
+# companion, and a five-hour milestone with the block its `block_id` resolves.
+# --------------------------------------------------------------------------
+
+_943_ACCOUNT = "acct-943"
+_943_WINDOW = 1785009600
+_943_SLOT = "2026-07-25T12:20:00+00:00"
+
+
+def _943_credit(journal, *, slot=_943_SLOT, suppression=(), prior=38.0):
+    return journal.make_evt(
+        kind="five_hour_credit",
+        id=journal.evt_id("fhc", _943_ACCOUNT, _943_WINDOW, slot), at=AT,
+        payload={
+            "account_key": _943_ACCOUNT, "five_hour_window_key": _943_WINDOW,
+            "effective_reset_at_utc": slot,
+            "detected_at_utc": "2026-07-25T12:26:00+00:00",
+            "prior_percent": prior, "post_percent": 2.0,
+            "suppression": list(suppression),
+        },
+    )
+
+
+def _943_companion(journal, *, slot=_943_SLOT,
+                   boundary="2026-07-25T12:24:00+00:00",
+                   revision="sha256:revision"):
+    return journal.make_evt(
+        kind="five_hour_credit_boundary",
+        id=journal.evt_id("fhcb", _943_ACCOUNT, _943_WINDOW, slot), at=AT,
+        payload={
+            "account_key": _943_ACCOUNT, "five_hour_window_key": _943_WINDOW,
+            "effective_reset_at_utc": slot, "boundary_at_utc": boundary,
+            "arming_observation_id": "o:943-arming",
+            "credit_revision": revision,
+            "detected_at_utc": "2026-07-25T12:26:00+00:00",
+        },
+    )
+
+
+def _956_opening(journal, window=_943_WINDOW, *,
+                 first="2026-07-25T12:13:00+00:00",
+                 start="2026-07-25T11:00:00+00:00"):
+    return journal.make_evt(
+        kind="five_hour_block_open",
+        id=journal.evt_id("fhbo", _943_ACCOUNT, window), at=AT,
+        payload={
+            "account_key": _943_ACCOUNT, "five_hour_window_key": window,
+            "five_hour_resets_at": "2026-07-25T16:00:00+00:00",
+            "block_start_at": start,
+            "first_observed_at_utc": first, "created_at_utc": first,
+            "opening_record_id": "o:943-opening", "creation_kind": "snapshot",
+            "five_hour_percent": 30.0, "seven_day_pct_at_block_start": 10.0,
+            "weekly_observation_held": 0,
+            "weekly_basis_captured_at_utc": None,
+        },
+    )
+
+
+def _956_close(journal, window=_943_WINDOW):
+    return journal.make_evt(
+        kind="five_hour_block_close",
+        id=journal.evt_id("fhbc", _943_ACCOUNT, window), at=AT,
+        payload={
+            "account_key": _943_ACCOUNT, "five_hour_window_key": window,
+            "five_hour_resets_at": "2026-07-25T16:00:00+00:00",
+            "block_start_at": "2026-07-25T11:00:00+00:00",
+            "is_closed": 1, "total_cost_usd": 1.0,
+            "_models": [], "_projects": [],
+        },
+    )
+
+
+def _956_milestone(journal, window=_943_WINDOW, threshold=31, **overrides):
+    payload = {
+        "account_key": _943_ACCOUNT, "five_hour_window_key": window,
+        "percent_threshold": threshold, "reset_event_ref": "0",
+        "captured_at_utc": "2026-07-25T12:13:00+00:00",
+        "usage_snapshot_ref": f"sa:o:956-{window}-{threshold}",
+        "block_cost_usd": None, "marginal_cost_usd": None,
+        "seven_day_pct_at_crossing": 10.0, "alerted_at": None,
+    }
+    payload.update(overrides)
+    return journal.make_evt(
+        kind="five_hour_milestone",
+        id=f"fhm:{_943_ACCOUNT}:{window}:0:{threshold}", at=AT,
+        payload=payload,
+    )
+
+
+def _943_dispositions(plan):
+    return {(action.disposition, action.event_id) for action in plan.actions}
+
+
+def test_943_a_credit_companion_follows_its_credit_through_the_diff(
+        cctally_module):
+    """Detects the planner splitting a five-hour credit from its boundary
+    companion (spec 4.4): a same-id credit whose suppression changes is
+    superseded and gains its companion; a credit the replay no longer
+    reproduces is tombstoned with its companion; a current companion whose
+    desired twin is absent is tombstoned; and a credit whose payload is
+    unchanged is never superseded just to gain its companion."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    slots = ["2026-07-25T12:20:00+00:00", "2026-07-25T13:20:00+00:00",
+             "2026-07-25T14:20:00+00:00", "2026-07-25T15:20:00+00:00"]
+    changed, removed, orphaned, unchanged = slots
+    current = [
+        _943_credit(journal, slot=changed, suppression=["sa:peak", "sa:copy"]),
+        _943_credit(journal, slot=removed),
+        _943_companion(journal, slot=removed),
+        _943_credit(journal, slot=orphaned),
+        _943_companion(journal, slot=orphaned),
+        _943_credit(journal, slot=unchanged),
+    ]
+    desired = [
+        _943_credit(journal, slot=changed, suppression=["sa:copy"]),
+        _943_companion(journal, slot=changed),
+        _943_credit(journal, slot=orphaned),
+        _943_credit(journal, slot=unchanged),
+        _943_companion(journal, slot=unchanged),
+    ]
+    plan = _875_plan(rederive, journal, current, desired)
+
+    def ids(prefix, slot):
+        return journal.evt_id(prefix, _943_ACCOUNT, _943_WINDOW, slot)
+
+    assert _943_dispositions(plan) == {
+        ("supersede", ids("fhc", changed)), ("add", ids("fhcb", changed)),
+        ("tombstone", ids("fhc", removed)), ("tombstone", ids("fhcb", removed)),
+        ("tombstone", ids("fhcb", orphaned)),
+        ("add", ids("fhcb", unchanged)),
+    }
+    assert plan.action_counts_by_event_kind["five_hour_credit_boundary"] == {
+        "retain": 0, "supersede": 0, "tombstone": 2, "add": 2}
+
+
+def test_943_a_reviewed_hold_keeps_a_kept_credits_current_companion(
+        cctally_module):
+    """Detects a reviewed hold splitting a credit from its companion: the
+    hold keeps the held reading's five-hour milestone with its CURRENT credit
+    (a historical fact), so that credit's current companion must stay too —
+    replaced by the replay's companion (bound to the replay's credit content)
+    or tombstoned, the kept credit would read a boundary it never had."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    credit = _943_credit(journal)
+    companion = _943_companion(journal, revision="sha256:current")
+    held = journal.make_evt(
+        kind="snapshot_accept", id="sa:o:943-held", at=AT,
+        payload={
+            "account_key": _943_ACCOUNT, "five_hour_window_key": _943_WINDOW,
+            "captured_at_utc": "2026-07-25T12:13:00+00:00",
+            "five_hour_percent": 31.0, "weekly_percent": 10.0,
+            "weekly_observation_held": 0,
+        },
+    )
+    milestone = _956_milestone(
+        journal, reset_event_ref=credit["id"],
+        usage_snapshot_ref=held["id"])
+    replayed = _943_companion(journal, revision="sha256:replayed")
+    for desired in ([], [replayed]):
+        plan = _875_plan(
+            rederive, journal, [credit, companion, held, milestone], desired,
+            reviewed_weekly_hold_ids=("o:943-held",))
+        assert plan.actions == (), (desired, _943_dispositions(plan))
+
+
+def test_943_a_filtered_plan_keeps_a_credit_with_its_companion(cctally_module):
+    """Detects the baseline/reviewed filter splitting a credit from its
+    companion: when only the credit's correction is caused by the reviewed
+    decision, its companion's addition is common to both plans and the
+    filter dropped it, leaving the corrected credit without its exact
+    boundary (and the reverse: a caused companion change keeps its
+    credit's correction)."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = [_943_credit(journal, suppression=["sa:peak", "sa:copy"])]
+    credit_id = current[0]["id"]
+    companion_id = _943_companion(journal)["id"]
+    cases = {
+        "credit caused": (
+            [_943_credit(journal, suppression=["sa:copy"]),
+             _943_companion(journal)],
+            [_943_credit(journal, suppression=[]), _943_companion(journal)]),
+        "companion caused": (
+            [_943_credit(journal, suppression=["sa:copy"]),
+             _943_companion(journal)],
+            [_943_credit(journal, suppression=["sa:copy"]),
+             _943_companion(journal, boundary="2026-07-25T12:25:00+00:00")]),
+    }
+    for label, (baseline_desired, reviewed_desired) in cases.items():
+        _baseline, reviewed, causal, _current = _875_causal_plans(
+            rederive, journal, current, baseline_desired, reviewed_desired)
+        assert _943_dispositions(causal) == {
+            ("supersede", credit_id), ("add", companion_id)}, label
+        assert _943_dispositions(causal) <= _943_dispositions(reviewed), label
+
+
+def test_956_an_opening_follows_its_window_through_the_diff(cctally_module):
+    """Detects a seed outliving its removed block or a revised opening not
+    being corrected (spec 4.4): an opening is compared by its window key —
+    superseded on its own diff, added for a window the replay creates — and
+    when the replay has no block for a window, its close and its opening are
+    tombstoned together, in the full plan and in a filtered one where only
+    the close's tombstone is caused by the reviewed decision."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    gone, revised, added = _943_WINDOW, _943_WINDOW + 18000, _943_WINDOW + 36000
+    current = [_956_opening(journal, gone), _956_close(journal, gone),
+               _956_opening(journal, revised)]
+    desired = [_956_opening(journal, revised,
+                            first="2026-07-25T17:14:00+00:00"),
+               _956_opening(journal, added)]
+    plan = _875_plan(rederive, journal, current, desired)
+    assert _943_dispositions(plan) == {
+        ("tombstone", _956_opening(journal, gone)["id"]),
+        ("tombstone", _956_close(journal, gone)["id"]),
+        ("supersede", _956_opening(journal, revised)["id"]),
+        ("add", _956_opening(journal, added)["id"]),
+    }
+
+    current = [_956_opening(journal, gone), _956_close(journal, gone)]
+    _baseline, _reviewed, causal, _current = _875_causal_plans(
+        rederive, journal, current,
+        [_956_close(journal, gone)], [])
+    assert _943_dispositions(causal) == {
+        ("tombstone", _956_opening(journal, gone)["id"]),
+        ("tombstone", _956_close(journal, gone)["id"])}
+
+
+def test_956_an_opening_respelled_in_another_zone_is_retained(
+        cctally_module):
+    """Detects a rederive run under another time zone superseding every
+    opening fact: the live writer spells ``block_start_at`` in the host's
+    zone, so a replay elsewhere names the same boundary with another offset.
+    That opening is retained byte-for-byte, while an opening whose boundary
+    names a different instant is still superseded."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    same, moved = _943_WINDOW, _943_WINDOW + 18000
+    local = "2026-07-25T14:00:00+03:00"
+    current = [_956_opening(journal, same, start=local),
+               _956_opening(journal, moved, start=local)]
+    desired = [_956_opening(journal, same),
+               _956_opening(journal, moved,
+                            start="2026-07-25T12:00:00+00:00")]
+    plan = _875_plan(rederive, journal, current, desired)
+    assert _943_dispositions(plan) == {
+        ("supersede", _956_opening(journal, moved)["id"])}
+    assert plan.action_counts_by_event_kind["five_hour_block_open"][
+        "retain"] == 1
+
+
+def test_956_parent_validation_completes_refuses_and_reports(cctally_module):
+    """Detects a plan leaving a five-hour milestone without the block its
+    `block_id` resolves (spec 4.4, parent validation over the resulting
+    effective graph): a filtered plan removing a window's opening while the
+    window's unchanged milestone survives takes the milestone's reviewed
+    tombstone (the replay lacks it); with no such tombstone, the full and
+    the filtered plan are refused; and a milestone whose window resolved no
+    block before the plan (pre-existing damage) is reported, not refused."""
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    opening, milestone = _956_opening(journal), _956_milestone(journal)
+    _baseline, _reviewed, causal, _current = _875_causal_plans(
+        rederive, journal, [opening, milestone], [opening], [])
+    assert _943_dispositions(causal) == {
+        ("tombstone", opening["id"]), ("tombstone", milestone["id"])}
+
+    with pytest.raises(rederive.RederiveConflict, match="orphan"):
+        _875_causal_plans(rederive, journal, [opening, milestone],
+                          [opening, milestone], [milestone])
+    close = _956_close(journal)
+    with pytest.raises(rederive.RederiveConflict, match="orphan"):
+        _875_plan(rederive, journal, [close, milestone], [milestone])
+
+    damaged = _956_milestone(journal, _943_WINDOW + 18000, 40)
+    plan = _875_plan(rederive, journal, [damaged, opening],
+                     [damaged, _956_opening(journal, first=AT)])
+    assert _943_dispositions(plan) == {("supersede", opening["id"])}
+    assert plan.orphaned_milestone_ids == {damaged["id"]}
+    _baseline, _reviewed, causal, _current = _875_causal_plans(
+        rederive, journal, [damaged, opening],
+        [damaged, opening], [damaged, _956_opening(journal, first=AT)])
+    assert causal.orphaned_milestone_ids == {damaged["id"]}
+
+
+def _943_rederive(app, capsys, *, apply):
+    """`cctally db rederive --family claude-usage --json [--yes]` through the
+    real parser: its JSON payload."""
+    argv = ["db", "rederive", "--family", "claude-usage", "--json"]
+    if apply:
+        argv.append("--yes")
+    capsys.readouterr()
+    args = app.build_parser().parse_args(argv)
+    assert args.func(args) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line]
+    return json.loads(lines[-1])
+
+
+def _943_correction_count(payload):
+    counts = payload["actionCounts"]
+    return counts["supersede"] + counts["tombstone"] + counts["add"]
+
+
+def _943_rewrite_journal(transform):
+    """Rewrite every journal segment through ``transform`` (a record, or None
+    to drop it): the journal an earlier binary wrote for the same history."""
+    import _cctally_core as core
+    import _cctally_journal as jr
+    import _lib_journal as J
+    for segment in jr.list_segments():
+        path = core.JOURNAL_DIR / segment
+        out = []
+        for line in path.read_bytes().splitlines():
+            record = J.decode_line(line)
+            if record is None:
+                out.append(line + b"\n")
+                continue
+            record = transform(record)
+            if record is not None:
+                out.append(J.encode_line(record))
+        path.write_bytes(b"".join(out))
+
+
+def test_943_rederive_of_a_historical_journal_keeps_trace_ds_genuine_peak(
+        monkeypatch, tmp_path, capsys):
+    """A4, the rederive half (spec 4.4): a historical-policy journal written
+    before #943 holds trace D's credit with no boundary companion and a
+    suppression banded from the floored slot, which names the genuine 00:21
+    peak. Detects a `db rederive` that cannot correct it: its plan must
+    supersede that credit's suppression and add the companion, and after
+    apply and rebuild the 00:21 reading keeps its 38, no 00:24 replica is
+    left, 00:26/00:34 read 3/7, and a re-preview plans nothing."""
+    import test_milestone_rebuild_after_five_hour_credit as m943
+
+    app = _943_trace_d_app(m943, monkeypatch, tmp_path)
+    m943._record_historical_policy(monkeypatch)
+    sink = []
+    import _cctally_journal as jr
+    monkeypatch.setattr(jr, "ALERT_DISPATCHER",
+                        lambda alerts: sink.extend(list(alerts)))
+    peak_ref = m943._trace_d(app, monkeypatch, tmp_path, sink)
+    assert m943._drive(app, monkeypatch, tmp_path, 34, 12.0, 7.0) == 0
+    # `db rederive` re-prices only entries whose cache-write TTL split is
+    # known; the fixture's JSONL carries no 1h breakdown (all 5-minute).
+    cache = app.open_cache_db()
+    try:
+        cache.execute("UPDATE session_entries SET cache_create_1h_tokens = 0 "
+                      "WHERE cache_create_1h_tokens IS NULL")
+        cache.commit()
+    finally:
+        cache.close()
+
+    def before_943(record):
+        payload = record.get("payload") or {}
+        if payload.get("kind") == "five_hour_credit_boundary":
+            return None
+        if payload.get("kind") == "five_hour_credit":
+            record = dict(record, payload=dict(
+                payload,
+                suppression=[peak_ref, *(payload.get("suppression") or [])]))
+        return record
+
+    _943_rewrite_journal(before_943)
+    # Apply-only, as the earlier binary's own index: a completing rebuild
+    # would re-derive the rewritten prefix (its derivation frontier no longer
+    # names these offsets) and so repair it before the planner sees it.
+    jr.rebuild_stats_index(
+        context=jr.RebuildContext(trigger="test-fixture"))
+    rows = m943._snapshot_rows(app)
+    assert rows.get(m943.PEAK_MINUTE, (None, None, None))[1] != 38.0, (
+        "non-vacuity: the historical suppression retired the genuine peak",
+        rows)
+
+    preview = _943_rederive(app, capsys, apply=False)
+    kinds = preview["actionCountsByEventKind"]
+    assert kinds["five_hour_credit"]["supersede"] == 1, kinds
+    assert kinds["five_hour_credit_boundary"]["add"] == 1, kinds
+    assert _943_rederive(app, capsys, apply=True)["status"] == "applied"
+    m943._assert_trace_d_rows(app, peak_ref, "rederived", later=(34, 7.0))
+    assert _943_correction_count(
+        _943_rederive(app, capsys, apply=False)) == 0
+    assert m943._rebuild(app) == 0
+    m943._assert_trace_d_rows(app, peak_ref, "rebuilt", later=(34, 7.0))
+
+
+def _943_trace_d_app(m943, monkeypatch, tmp_path):
+    """`tests/test_milestone_rebuild_after_five_hour_credit.py`'s app."""
+    import sys
+
+    from conftest import load_script, redirect_paths
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    m943._tick(monkeypatch, 0)
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    app = sys.modules["cctally"]
+    monkeypatch.setattr(app, "_nudge_dashboard_repaint", lambda *a, **k: None,
+                        raising=False)
+    app.open_db().close()
+    return app
+
+
+def _956_legacy_heal(monkeypatch, tmp_path):
+    """A historical-policy journal written before opening facts: a manual
+    reading of W0, then a rollover heal opening W1 with no snapshot. A
+    rebuild loses W1's block (class 2, F5) and its five-hour milestones
+    resolve to `block_id = 0`."""
+    import test_account_bound_replay_m19 as m19
+    import test_five_hour_backfill_rebuild as backfill
+    from conftest import load_script
+    ns = load_script()
+    app, recorder, key = backfill._start(ns, monkeypatch, tmp_path,
+                                         historical=True)
+    with monkeypatch.context() as patch:
+        backfill._without_openings(patch)
+        backfill._heal_cli(recorder)
+    assert not backfill._evts("five_hour_block_open"), "a legacy journal"
+    m19._drive_replay(app, monkeypatch, "rebuild")
+    window = backfill._key(backfill._SUCCESSOR)
+    assert backfill._block(app, key, backfill._SUCCESSOR) is None
+    lost = backfill._rows(
+        app, "SELECT journal_id, block_id FROM five_hour_milestones "
+             "WHERE account_key = ? AND five_hour_window_key = ?",
+        (key, window))
+    assert lost and {row["block_id"] for row in lost} == {0}, lost
+    return app, key, window, lost
+
+
+def test_956_rederive_of_a_historical_journal_adds_its_opening_facts(
+        monkeypatch, tmp_path, capsys):
+    """A9, the rederive half (spec 4.6.4): `db rederive` of a journal written
+    before opening facts adds one for every block creation its replay
+    performs, so after apply and rebuild the heal-opened window's milestones
+    join their real block. Detects a planner that drops the opening facts or
+    refuses the plan over milestones that were already parentless before it
+    (reported, never a reason to refuse); a re-preview plans nothing."""
+    import test_five_hour_backfill_rebuild as backfill
+    app, key, window, lost = _956_legacy_heal(monkeypatch, tmp_path)
+    preview = _943_rederive(app, capsys, apply=False)
+    assert preview["actionCountsByEventKind"]["five_hour_block_open"][
+        "add"] == 2, preview["actionCountsByEventKind"]
+    assert preview["orphanedFiveHourMilestoneCount"] == len(lost)
+    assert _943_rederive(app, capsys, apply=True)["status"] == "applied"
+    backfill._assert_joined(app, key, backfill._SUCCESSOR, "rederived")
+    again = _943_rederive(app, capsys, apply=False)
+    assert _943_correction_count(again) == 0, again["actionCounts"]
+    assert "orphanedFiveHourMilestoneCount" not in again
+    backfill._rebuild(app, monkeypatch)
+    backfill._assert_joined(app, key, backfill._SUCCESSOR, "rebuilt")
+
+
+def test_956_a_filtered_plan_keeps_the_opening_its_milestone_resolves(
+        monkeypatch, tmp_path):
+    """The derived-FK parent closure over the final filtered plan (spec
+    4.4): an opening addition common to the baseline and the reviewed plan
+    beside a reviewed-only correction of a five-hour milestone of the same
+    window. Detects the filter dropping the opening as baseline drift: the
+    corrected milestone then folds with no block and resolves `block_id = 0`
+    after apply and rebuild."""
+    import _cctally_journal as jr
+    import _cctally_rederive as command
+    import _lib_journal as J
+    import _lib_rederive as rederive
+    import test_account_bound_replay_m19 as m19
+    import test_five_hour_backfill_rebuild as backfill
+    app, key, window, lost = _956_legacy_heal(monkeypatch, tmp_path)
+    records = command._normalized_planning_view(m19._journal_records())
+    selection = J.resolve_effective_events(records)
+    current = {event_id: selected.record
+               for event_id, selected in selection.by_id.items()
+               if selected.status == "active" and selected.record is not None}
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cache = app.open_cache_db()
+    try:
+        derived = command._derive_desired_events(records, cache, scratch)
+    finally:
+        cache.close()
+    [opening] = [event for event in derived
+                 if event["payload"]["kind"] == "five_hour_block_open"
+                 and event["payload"]["account_key"] == key
+                 and event["payload"]["five_hour_window_key"] == window]
+    milestone_id = lost[0]["journal_id"]
+    owned = [record for record in current.values()
+             if rederive._is_owned_event(record)]
+    corrected = dict(current[milestone_id])
+    corrected["payload"] = dict(corrected["payload"],
+                                seven_day_pct_at_crossing=77.0)
+    common = dict(
+        selection=selection,
+        journal_high_water=("observations-2026-10.jsonl", 10),
+        cache_fingerprint="sha256:cache", preserved_events=(),
+        enforce_guard=False)
+    baseline = rederive.build_claude_usage_plan(
+        desired_events=[*owned, opening],
+        config_fingerprint="sha256:baseline", **common)
+    reviewed = rederive.build_claude_usage_plan(
+        desired_events=[corrected if record["id"] == milestone_id else record
+                        for record in owned] + [opening],
+        config_fingerprint="sha256:reviewed", **common)
+    causal = rederive.causal_delta_plan(baseline, reviewed,
+                                        current_events=current)
+    assert _943_dispositions(causal) == {
+        ("add", opening["id"]), ("supersede", milestone_id)}
+    jr.append_records(J.make_correction_batch(
+        batch_id="batch:test-956-closure", family="test-956",
+        at=m19._iso(m19.NOW + 30), actions=causal.to_correction_actions()))
+    backfill._rebuild(app, monkeypatch)
+    block = backfill._block(app, key, backfill._SUCCESSOR)
+    assert block is not None, "the retained opening materializes the block"
+    [row] = backfill._rows(
+        app, "SELECT block_id, seven_day_pct_at_crossing "
+             "FROM five_hour_milestones WHERE journal_id = ?", (milestone_id,))
+    assert (row["block_id"], row["seven_day_pct_at_crossing"]) == (
+        block["id"], 77.0), row
+
+
+# ---------------------------------------------------------------------------
+# #884: lineage repair of milestones an earlier rederive repriced
+# ---------------------------------------------------------------------------
+
+_884_ONE = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:1"
+_884_TWO = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:2"
+_884_THREE = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:3"
+_884_LATCH = "2026-07-26T12:01:30Z"
+
+
+def _884_replace(record, rev, *, at=None, **changes):
+    """A correction action replacing ``record`` at ``rev`` with ``changes``."""
+    return {"action": "replace", "id": record["id"], "rev": rev,
+            "at": record["at"] if at is None else at,
+            "payload": dict(record["payload"], **changes)}
+
+
+def _884_tombstone(record, rev):
+    return {"action": "tombstone", "id": record["id"], "rev": rev,
+            "at": record["at"], "payload": None}
+
+
+def _884_batch(journal, name, actions):
+    """One completed ``claude-usage`` correction batch, as a rederive writes it."""
+    return journal.make_correction_batch(
+        batch_id=f"rederive:claude-usage:884-{name}", family="claude-usage",
+        at=AT, actions=list(actions),
+    )
+
+
+def _884_rewritten(journal):
+    """Test 1's history: a price-only rewrite under an unchanged closed close.
+
+    Rev 0 is the live writer's crossing at $34.014890; a pre-#875 rederive
+    repriced it to $37.303985 at rev 1 (and its successor's marginal with
+    it) while the close kept $107.29015.
+    """
+    close = _875_priced_close(journal, 107.29015)
+    one = _875_milestone(journal, 1, 34.014890, None, alerted_at=_884_LATCH)
+    two = _875_milestone(journal, 2, 50.0, 15.98511)
+    records = [close, one, two, *_884_batch(journal, "rewrite", [
+        _884_replace(one, 1, block_cost_usd=37.303985),
+        _884_replace(two, 1, marginal_cost_usd=12.696015),
+    ])]
+    desired = [
+        _875_priced_close(journal, 120.0),
+        _875_milestone(journal, 1, 38.5, None),
+        _875_milestone(journal, 2, 56.25, 17.75),
+    ]
+    return records, desired
+
+
+def _884_converged(rederive, journal, records, desired, plan, *, name="apply",
+                   **kwargs):
+    """Append ``plan`` as a real correction batch and plan again."""
+    records = [*records, *_884_batch(
+        journal, name, plan.to_correction_actions())]
+    return records, _875_plan(rederive, journal, records, desired, **kwargs)
+
+
+def test_884_price_only_rewrite_restores_and_converges(cctally_module):
+    """Spec §7 test 1 (A1, A4, A6): a frozen block's repriced crossing.
+
+    Detects: a frozen block keeping a later card's price forever. The
+    restored amount is the anchor's exact parsed value, the successor's
+    marginal follows it, and the second plan is empty.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, desired = _884_rewritten(journal)
+    plan = _875_plan(rederive, journal, records, desired)
+    actions = _875_milestone_actions(plan)
+    assert sorted(actions) == [_884_ONE, _884_TWO], _875_action_summary(plan)
+    assert not any(a.kind == "five_hour_block_close" for a in plan.actions)
+    one = actions[_884_ONE]
+    assert one.disposition == "supersede" and one.revision == 2
+    assert one.payload["block_cost_usd"] == 34.014890
+    assert type(one.payload["block_cost_usd"]) is float
+    assert one.payload["marginal_cost_usd"] is None
+    assert one.payload["alerted_at"] == _884_LATCH
+    assert one.at == AT
+    selected = journal.resolve_effective_events(records).by_id[_884_ONE]
+    assert rederive._milestone_identity(one.payload) == \
+        rederive._milestone_identity(selected.record["payload"])
+    two = actions[_884_TWO]
+    assert _875_money(two) == (50.0, pytest.approx(50.0 - 34.014890))
+
+    _records, second = _884_converged(rederive, journal, records, desired, plan)
+    assert second.actions == (), _875_action_summary(second)
+
+
+def _884_close(journal, total, *, event_id=_875_CLOSE_ID, **overrides):
+    """A close of ``total`` (its model child stays priced when unusable)."""
+    usable = isinstance(total, (int, float)) and not isinstance(total, bool)
+    record = _875_close(
+        journal, total=total,
+        models=[{"model": "m", "cost_usd": total if usable else 6.0,
+                 "input_tokens": 300}],
+        **overrides,
+    )
+    record["id"] = event_id
+    return record
+
+
+def _884_replay(journal, records, *, costs=None, changes=None, drop=()):
+    """Replay's desired set over ``records``' final state.
+
+    Closes and other events are reproduced as they stand, so every closed
+    block stays frozen. Milestones take replay's block cost (``costs``,
+    default $99 + threshold) and lose the alert latch, as scratch replay
+    does; ``changes`` edits named payloads, ``drop`` omits ids.
+    """
+    costs = dict(costs or {})
+    changes = dict(changes or {})
+    desired = []
+    for record in journal.resolve_effective_events(list(records)).active:
+        if record["id"] in drop:
+            continue
+        payload = dict(record["payload"])
+        if payload["kind"] == "five_hour_milestone":
+            payload["block_cost_usd"] = costs.get(
+                record["id"], 99.0 + payload["percent_threshold"])
+            if payload.get("marginal_cost_usd") is not None:
+                payload["marginal_cost_usd"] = 1.0
+            payload["alerted_at"] = None
+        payload.update(changes.get(record["id"], {}))
+        desired.append({**record, "payload": payload})
+    return desired
+
+
+def _884_block_cost(plan, event_id):
+    """The block cost ``plan`` writes for ``event_id``, or None."""
+    action = _875_milestone_actions(plan).get(event_id)
+    return None if action is None else (action.payload or {})["block_cost_usd"]
+
+
+def _884_two_passes(rederive, journal, records, desired, **kwargs):
+    """The plan, and the plan after appending it as a real batch."""
+    first = _875_plan(rederive, journal, records, desired, **kwargs)
+    _records, second = _884_converged(
+        rederive, journal, records, desired, first, **kwargs)
+    return first, second
+
+
+def _884_assert_withheld(rederive, journal, records, desired, event_id, *,
+                         codes, candidates, **kwargs):
+    """Kept money, one reported block, one more count, in two passes."""
+    current = journal.resolve_effective_events(list(records)).by_id[event_id]
+    kept = current.record["payload"]["block_cost_usd"]
+    baseline = _875_plan(rederive, journal, records, desired,
+                         milestone_lineage=None, **kwargs)
+    first, second = _884_two_passes(rederive, journal, records, desired,
+                                    **kwargs)
+    for plan in (first, second):
+        summary = (_875_action_summary(plan), plan.withheld_milestone_repairs)
+        assert _884_block_cost(plan, event_id) in (None, kept), summary
+        [block] = plan.withheld_milestone_repairs
+        [milestone] = block.milestones
+        assert (milestone.event_id, milestone.current_revision,
+                milestone.reason_codes, milestone.candidate_revisions) == (
+            event_id, current.rev, tuple(codes), tuple(candidates)), summary
+        assert block.close_event_ids
+        assert plan.uncertain_cost_fact_count == \
+            baseline.uncertain_cost_fact_count + 1, summary
+    assert second.actions == (), _875_action_summary(second)
+    return first
+
+
+def _884_unpaired_replacement(journal):
+    """Review P1-1: a price-only rewrite, then a replacing close batch that
+    left the milestone alone (replay already agreed with it)."""
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    return [close, one,
+            *_884_batch(journal, "rewrite", [_884_replace(one, 1,
+                                                          block_cost_usd=7.0)]),
+            *_884_batch(journal, "replace", [_884_replace(close, 1,
+                                                          total_cost_usd=20.0)])]
+
+
+def _884_unpaired_between_rewrites(journal):
+    """Verification N1: $3 → $7, the close $10 → $20 alone, then $7 → $9."""
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    return [close, one,
+            *_884_batch(journal, "a", [_884_replace(one, 1, block_cost_usd=7.0)]),
+            *_884_batch(journal, "b", [_884_replace(close, 1,
+                                                    total_cost_usd=20.0)]),
+            *_884_batch(journal, "c", [_884_replace(one, 2, block_cost_usd=9.0)])]
+
+
+@pytest.mark.parametrize("case", ["replacement", "between-rewrites"])
+def test_884_unpaired_monetary_close_event_withholds(cctally_module, case):
+    """Spec §7 test 2 (a), (b) (A3, A6): an unpaired monetary close event.
+
+    Detects: a second rederive undoing the amount a legitimate close
+    replacement left, or writing an amount no evidence proves ($7 or $3).
+    Both passes keep the current amount, write nothing and report the block.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    if case == "replacement":
+        records, candidates = _884_unpaired_replacement(journal), (0,)
+    else:
+        records, candidates = _884_unpaired_between_rewrites(journal), (0, 1)
+    _884_assert_withheld(
+        rederive, journal, records, _884_replay(journal, records), _884_ONE,
+        codes=["unpaired-close-change"], candidates=candidates,
+    )
+
+
+def test_884_live_writer_close_after_the_crossing_does_not_block_repair(
+    cctally_module,
+):
+    """Spec §7 test 2 (c) (A3, A6): the ordinary live history.
+
+    Detects: the live writer's own close, written after the block's
+    crossings, blocking every ordinary repair. It agrees with the anchor's
+    amount, so a later price-only rewrite is restored.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    one = _875_milestone(journal, 1, 3.0, None)
+    records = [one, _884_close(journal, 10.0),
+               *_884_batch(journal, "rewrite", [_884_replace(
+                   one, 1, block_cost_usd=7.0)])]
+    first, second = _884_two_passes(
+        rederive, journal, records, _884_replay(journal, records))
+    assert _884_block_cost(first, _884_ONE) == 3.0, _875_action_summary(first)
+    assert first.withheld_milestone_repairs == ()
+    assert second.actions == (), _875_action_summary(second)
+
+
+def _884_marked_case(journal, case):
+    """(records, candidate revisions) for one spec §7 test 2(d) history: an
+    unpaired close correction that left the crossing alone, then a
+    price-only rewrite."""
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    if case == "closed-total-replaced":
+        return [close, one,
+                *_884_batch(journal, "replace", [_884_replace(
+                    close, 1, total_cost_usd=20.0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_cost_usd=7.0)])], (0,)
+    if case == "closed-absent-closed":
+        return [close, one,
+                *_884_batch(journal, "retired", [_884_tombstone(close, 1)]),
+                *_884_batch(journal, "revived", [_884_replace(close, 2)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_cost_usd=7.0)])], (0,)
+    if case == "revival-after-a-paired-removal":
+        return [close, one,
+                *_884_batch(journal, "retired", [
+                    _884_replace(one, 1, block_cost_usd=5.0),
+                    _884_tombstone(close, 1)]),
+                *_884_batch(journal, "revived", [_884_replace(close, 2)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 2, block_cost_usd=7.0)])], (1,)
+    if case == "first-close-added-by-a-correction":
+        return [one,
+                *_884_batch(journal, "added", [_884_replace(close, 0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_cost_usd=7.0)])], (0,)
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "closed-total-replaced", "closed-absent-closed",
+    "revival-after-a-paired-removal", "first-close-added-by-a-correction",
+])
+def test_884_unpaired_close_correction_marks_a_later_rewrite(cctally_module,
+                                                              case):
+    """Spec §7 test 2(d) (A3, A6), findings D1 and R7-1.
+
+    Detects: undoing the legitimate catch-up of a crossing whose repricing
+    an unpaired close correction's causal subset dropped (before #883). A
+    replaced total, a retire-and-revive, a revival after a paired removal
+    and a correction's first close each leave the crossing's amount equal
+    to its anchor's, yet the later price-only rewrite is not proven #875
+    damage: both passes keep $7, write nothing and report the block. The
+    live writer's own first close stays exempt (test 2(c)).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, candidates = _884_marked_case(journal, case)
+    _884_assert_withheld(
+        rederive, journal, records, _884_replay(journal, records), _884_ONE,
+        codes=["unpaired-close-change"], candidates=candidates,
+    )
+
+
+def _884_anchor_case(journal, case):
+    """(records, restored value) for one spec §7 test 3 history; ``None``
+    when the history withholds instead (finding R7-1)."""
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    if case == "rev0-correction-addition":
+        added = _884_replace(one, 0, block_cost_usd=4.0)
+        return [close, *_884_batch(journal, "add", [added]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_cost_usd=7.0)])], 4.0
+    if case == "q13-identity-change":
+        return [close, one,
+                *_884_batch(journal, "q13", [_884_replace(
+                    one, 1, block_input_tokens=110, block_cost_usd=4.0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 2, block_input_tokens=110, block_cost_usd=7.0)])], 4.0
+    if case == "identity-returns-to-older-spelling":
+        return [close, one,
+                *_884_batch(journal, "q13", [_884_replace(
+                    one, 1, block_input_tokens=110, block_cost_usd=4.0)]),
+                *_884_batch(journal, "back", [_884_replace(
+                    one, 2, block_cost_usd=5.0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 3, block_cost_usd=8.0)])], 5.0
+    if case == "closed-to-closed-monetary-pairing":
+        return [close, one,
+                *_884_batch(journal, "paired", [
+                    _884_replace(one, 1, block_cost_usd=7.0),
+                    _884_replace(close, 1, total_cost_usd=20.0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 2, block_cost_usd=9.0)])], 7.0
+    if case == "metadata-close-change-in-the-batch":
+        return [close, one,
+                *_884_batch(journal, "rewrite", [
+                    _884_replace(one, 1, block_cost_usd=7.0),
+                    _884_replace(close, 1, final_five_hour_percent=43.0)]),
+                ], 3.0
+    if case == "open-to-closed-in-the-batch":
+        opened = _884_close(journal, 5.0, is_closed=0)
+        return [opened, one,
+                *_884_batch(journal, "closing", [
+                    _884_replace(one, 1, block_cost_usd=7.0),
+                    _884_replace(opened, 1, is_closed=1, total_cost_usd=20.0)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 2, block_cost_usd=9.0)])], 7.0
+    if case == "closed-to-tombstoned-in-the-batch":
+        return [close, one,
+                *_884_batch(journal, "retired", [
+                    _884_replace(one, 1, block_cost_usd=7.0),
+                    _884_tombstone(close, 1)]),
+                *_884_batch(journal, "revived", [_884_replace(close, 2)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 2, block_cost_usd=9.0)])], None
+    if case == "marginal-only-revision":
+        two = _875_milestone(journal, 2, 6.0, 3.0)
+        return [close, one, two,
+                *_884_batch(journal, "marginal", [_884_replace(
+                    two, 1, marginal_cost_usd=2.5)]),
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    two, 2, block_cost_usd=9.0)])], 6.0
+    if case == "numeric-identity-spelling":
+        return [close, one,
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_input_tokens=100.0, block_cost_usd=7.0)]),
+                ], 3.0
+    if case == "latch-and-price":
+        return [close, one,
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, alerted_at=_884_LATCH, block_cost_usd=7.0)]),
+                ], 3.0
+    if case == "latch-key-presence":
+        bare = dict(one, payload={key: value for key, value
+                                  in one["payload"].items()
+                                  if key != "alerted_at"})
+        return [close, bare,
+                *_884_batch(journal, "rewrite", [_884_replace(
+                    one, 1, block_cost_usd=7.0)])], 3.0
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "rev0-correction-addition", "q13-identity-change",
+    "identity-returns-to-older-spelling",
+    "closed-to-closed-monetary-pairing",
+    "metadata-close-change-in-the-batch", "open-to-closed-in-the-batch",
+    "closed-to-tombstoned-in-the-batch", "marginal-only-revision",
+    "numeric-identity-spelling", "latch-and-price", "latch-key-presence",
+])
+def test_884_anchor_boundaries(cctally_module, case):
+    """Spec §7 test 3 (A3, A7): where the anchor stands.
+
+    Detects: a semantic (metadata) close change blessing a price rewrite,
+    or a legitimate repricing (a life start, a Q13 identity change, a
+    monetary close correction in the same batch) being undone. A numeric
+    respelling of the identity and the alert latch are the same crossing.
+    A close tombstoned in the repricing batch anchors there (the candidate
+    revisions start at it), and its later unpaired revival withholds the
+    price-only rewrite that follows (finding R7-1).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, restored = _884_anchor_case(journal, case)
+    if restored is None:
+        _884_assert_withheld(
+            rederive, journal, records, _884_replay(journal, records),
+            _884_ONE, codes=["unpaired-close-change"], candidates=(1,),
+        )
+        return
+    target = _884_TWO if case == "marginal-only-revision" else _884_ONE
+    first, second = _884_two_passes(
+        rederive, journal, records, _884_replay(journal, records))
+    assert _884_block_cost(first, target) == restored, \
+        _875_action_summary(first)
+    assert first.withheld_milestone_repairs == ()
+    assert second.actions == (), _875_action_summary(second)
+
+
+_884_OTHER_WINDOW = _875_WINDOW + 18000
+
+
+@pytest.mark.parametrize("move", ["out-of-the-block", "into-the-block"])
+def test_884_close_membership_follows_the_winning_payload(cctally_module, move):
+    """Spec §7 test 4 (A2): review P1-2, a close moved by correction.
+
+    Detects: borrowing another block's boundary. A close moved out of K
+    leaves K without a closed close, so a rewrite made then withholds (and
+    K's later natural close is unpaired); a close moved into K is a
+    monetary transition that pairs with the rewrite in its batch.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    one = _875_milestone(journal, 1, 3.0, None)
+    if move == "out-of-the-block":
+        close = _884_close(journal, 10.0)
+        natural = _884_close(journal, 12.0,
+                             event_id=f"{_875_CLOSE_ID}:natural")
+        records = [close, one,
+                   *_884_batch(journal, "moved", [_884_replace(
+                       close, 1, five_hour_window_key=_884_OTHER_WINDOW)]),
+                   *_884_batch(journal, "rewrite", [_884_replace(
+                       one, 1, block_cost_usd=7.0)]),
+                   natural]
+        _884_assert_withheld(
+            rederive, journal, records, _884_replay(journal, records),
+            _884_ONE, candidates=(0,), codes=[
+                "rewrite-without-closed-boundary", "unpaired-close-change"],
+        )
+        return
+    close = _884_close(journal, 10.0, five_hour_window_key=_884_OTHER_WINDOW)
+    records = [close, one,
+               *_884_batch(journal, "moved-in", [
+                   _884_replace(close, 1, five_hour_window_key=_875_WINDOW,
+                                total_cost_usd=20.0),
+                   _884_replace(one, 1, block_cost_usd=7.0)]),
+               *_884_batch(journal, "rewrite", [_884_replace(
+                   one, 2, block_cost_usd=9.0)])]
+    first, second = _884_two_passes(
+        rederive, journal, records, _884_replay(journal, records))
+    assert _884_block_cost(first, _884_ONE) == 7.0, _875_action_summary(first)
+    assert second.actions == (), _875_action_summary(second)
+
+
+def _884_uncertain_case(journal, case):
+    """(records, plan kwargs, codes, candidate revisions) per §7 test 5."""
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    seven = _884_replace(one, 1, block_cost_usd=7.0)
+    if case == "superseded-same-revision-divergence":
+        return [close, one, *_884_batch(journal, "a", [seven]),
+                *_884_batch(journal, "b", [_884_replace(
+                    one, 1, block_cost_usd=8.0)]),
+                *_884_batch(journal, "c", [_884_replace(
+                    one, 2, block_cost_usd=7.0)])], {}, \
+            ["divergent-revision"], (0, 1)
+    if case == "active-tombstone-divergence":
+        return [close, one, *_884_batch(journal, "a", [seven]),
+                *_884_batch(journal, "b", [_884_tombstone(one, 1)]),
+                *_884_batch(journal, "c", [_884_replace(
+                    one, 2, block_cost_usd=9.0)])], {}, \
+            ["divergent-revision"], (0, 1)
+    if case == "revision-gap":
+        return [close, one, *_884_batch(journal, "a", [_884_replace(
+            one, 2, block_cost_usd=7.0)])], {}, ["revision-gap"], (0,)
+    if case == "admission-hidden-revision":
+        return [close, one, *_884_batch(journal, "a", [_884_replace(
+            one, 2, block_cost_usd=7.0)]),
+                ], {"physical_revisions": {_884_ONE: 1}}, \
+            ["hidden-revision", "revision-gap"], (0,)
+    if case == "two-active-closes":
+        second = _884_close(journal, 10.0, event_id="b:five_hour_blocks:884")
+        return [close, second, one, *_884_batch(journal, "a", [seven])], {}, \
+            ["rewrite-without-closed-boundary"], (0,)
+    if case == "unusable-close-total-in-the-pairing-batch":
+        return [close, one, *_884_batch(journal, "a", [
+            seven, _884_replace(close, 1, total_cost_usd=None)])], {}, \
+            ["close-pairing-uncertain"], (0,)
+    if case == "rewrite-while-the-block-was-open":
+        opened = _884_close(journal, 5.0, is_closed=0)
+        return [opened, one, *_884_batch(journal, "a", [seven]),
+                *_884_batch(journal, "b", [_884_replace(
+                    opened, 1, is_closed=1, total_cost_usd=10.0)])], {}, \
+            ["rewrite-without-closed-boundary", "unpaired-close-change"], (0,)
+    if case == "close-divergence-before-the-milestone":
+        # The divergence is in the close's money: since finding F1 one
+        # confined to observation fields is not ambiguity (§5.2).
+        return [close,
+                *_884_batch(journal, "a", [_884_replace(
+                    close, 1, total_cost_usd=20.0)]),
+                *_884_batch(journal, "b", [_884_replace(
+                    close, 1, total_cost_usd=21.0)]),
+                *_884_batch(journal, "c", [_884_replace(close, 2)]),
+                one, *_884_batch(journal, "d", [seven])], {}, \
+            ["close-lineage-uncertain"], (0,)
+    if case == "uncertain-pairing-then-reversed":
+        return [close, one,
+                *_884_batch(journal, "a", [
+                    seven, _884_replace(close, 1, total_cost_usd=None)]),
+                *_884_batch(journal, "b", [_884_replace(close, 2)]),
+                *_884_batch(journal, "c", [_884_replace(
+                    one, 2, block_cost_usd=3.0)])], {}, \
+            ["close-pairing-uncertain"], (1,)
+    if case == "pairing-close-revision-made-divergent":
+        return [close, one,
+                *_884_batch(journal, "a", [
+                    seven, _884_replace(close, 1, total_cost_usd=20.0)]),
+                *_884_batch(journal, "b", [_884_replace(close, 1)]),
+                *_884_batch(journal, "c", [_884_replace(
+                    close, 2, total_cost_usd=20.0)])], {}, \
+            ["close-lineage-uncertain"], (0,)
+    if case == "kinds-disagree":
+        other = dict(one, payload=dict(one["payload"],
+                                       kind="percent_milestone"))
+        return [close, other,
+                *_884_batch(journal, "a", [_884_replace(
+                    one, 1, block_cost_usd=3.0)]),
+                *_884_batch(journal, "b", [_884_replace(
+                    one, 2, block_cost_usd=7.0)])], {}, \
+            ["invalid-payload"], (1,)
+    if case == "order-inversion":
+        a = _884_batch(journal, "a", [_884_replace(
+            one, 1, block_cost_usd=5.0)])
+        b = _884_batch(journal, "b", [_884_replace(
+            one, 2, block_cost_usd=7.0)])
+        # Rev 2's batch commits before rev 1's.
+        return [close, one, a[0], b[0], *a[1:-1], *b[1:-1], b[-1], a[-1]], \
+            {}, ["order-inversion"], (0, 1)
+    # §5.3 no-boundary: the rewrite rides a close change with no closed
+    # state on either side; the block's later correction close is unpaired.
+    opened = _884_close(journal, 5.0, is_closed=0)
+    closing = _884_replace(opened, 2, is_closed=1, total_cost_usd=10.0)
+    if case == "no-boundary-open-to-open":
+        return [opened, one,
+                *_884_batch(journal, "a", [seven, _884_replace(
+                    opened, 1, total_cost_usd=6.0)]),
+                *_884_batch(journal, "b", [closing])], {}, \
+            ["rewrite-without-closed-boundary", "unpaired-close-change"], (0,)
+    if case == "no-boundary-absent-to-open":
+        return [one,
+                *_884_batch(journal, "a", [_884_replace(opened, 0), seven]),
+                *_884_batch(journal, "b", [_884_replace(
+                    opened, 1, is_closed=1, total_cost_usd=10.0)])], {}, \
+            ["rewrite-without-closed-boundary", "unpaired-close-change"], (0,)
+    if case == "no-boundary-open-to-absent":
+        return [opened, one,
+                *_884_batch(journal, "a", [_884_tombstone(opened, 1), seven]),
+                *_884_batch(journal, "b", [closing])], {}, \
+            ["rewrite-without-closed-boundary", "unpaired-close-change"], (0,)
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "superseded-same-revision-divergence", "active-tombstone-divergence",
+    "revision-gap", "admission-hidden-revision", "two-active-closes",
+    "unusable-close-total-in-the-pairing-batch",
+    "rewrite-while-the-block-was-open",
+    "close-divergence-before-the-milestone",
+    "uncertain-pairing-then-reversed",
+    "pairing-close-revision-made-divergent",
+    "kinds-disagree", "order-inversion",
+    "no-boundary-open-to-open", "no-boundary-absent-to-open",
+    "no-boundary-open-to-absent",
+])
+def test_884_certainty_and_provenance(cctally_module, case):
+    """Spec §7 test 5 (A2, A5, A7): an ambiguous history fails closed.
+
+    Detects: a guessed restoration from an ambiguous history (a divergent,
+    gapped or hidden revision, an id whose occurrences disagree on kind, a
+    revision effective before its predecessor, two active closes, an
+    unprovable close event, a rewrite under an open block or riding a close
+    change with no closed state on either side, a close history uncertain
+    before the crossing existed, or one an anchor would read past), or a
+    missing disclosure. Each keeps the money, reports the block once with the
+    exact reason codes and repair candidates, and adds one count.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, kwargs, codes, candidates = _884_uncertain_case(journal, case)
+    _884_assert_withheld(
+        rederive, journal, records, _884_replay(journal, records), _884_ONE,
+        codes=codes, candidates=candidates, **kwargs,
+    )
+
+
+def test_884_unhashable_close_block_key_is_invalid_payload(cctally_module):
+    """Spec §5.2 ``invalid-payload``, finding D6: a malformed close row.
+
+    Detects: one historical close revision whose ``account_key`` is a list
+    aborting every plan with ``TypeError``. The close id is uncertain
+    (``invalid-payload``), its valid revisions still place it in the block,
+    so the block's crossing withholds (``close-lineage-uncertain``) with its
+    money kept and the block reported.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    records = [close,
+               *_884_batch(journal, "listed", [_884_replace(
+                   close, 1, account_key=[_875_ACCOUNT])]),
+               *_884_batch(journal, "restored", [_884_replace(close, 2)]),
+               one,
+               *_884_batch(journal, "rewrite", [_884_replace(
+                   one, 1, block_cost_usd=7.0)])]
+    accumulators: dict = {}
+    selection = journal.resolve_effective_events(
+        list(records), accumulators=accumulators)
+    lineage = rederive.build_five_hour_lineage(
+        accumulators["fold"], selection=selection, physical_revisions={})
+    assert "invalid-payload" in lineage.uncertain[_875_CLOSE_ID]
+    assert _875_CLOSE_ID in lineage.close_ids_ever_in_block[
+        (_875_ACCOUNT, _875_WINDOW)]
+    _884_assert_withheld(
+        rederive, journal, records, _884_replay(journal, records), _884_ONE,
+        codes=["close-lineage-uncertain"], candidates=(0,),
+    )
+
+
+_884_BIG = 2 ** 53
+
+
+def _884_reemission(journal, case, divergence, *, swap):
+    """Finding F1: a close whose rev 0 the live writer emitted twice.
+
+    The copies differ in their observation fields, as the live writer's
+    re-emissions do, plus ``divergence`` (copy A's and copy B's values of
+    one field). ``swap`` lists copy B first in the fold. ``paired``: a later
+    batch reprices the close and the crossing together. ``rewrite``: a
+    metadata-only close correction (it settles the selected close, whichever
+    copy the fold lists first), then a price-only rewrite of the crossing.
+    """
+    first, second = divergence or ({}, {})
+    copy_a = _884_close(journal, 10.0, **{
+        "last_updated_at_utc": "2026-07-26T16:10:05Z",
+        "created_at_utc": "2026-07-26T12:00:01Z",
+        "seven_day_pct_at_block_start": 30.0, **first})
+    copy_b = _884_close(journal, 10.0, **{
+        "last_updated_at_utc": "2026-07-26T16:14:41Z",
+        "created_at_utc": "2026-07-26T12:00:07Z",
+        "first_observed_at_utc": "2026-07-26T12:00:06Z",
+        "seven_day_pct_at_block_start": 31.0, **second})
+    one = _875_milestone(journal, 1, 3.0, None)
+    records = [copy_b, copy_a] if swap else [copy_a, copy_b]
+    if case == "paired":
+        return [*records, one, *_884_batch(journal, "paired", [
+            _884_replace(one, 1, block_cost_usd=7.0),
+            _884_replace(copy_a, 1, total_cost_usd=20.0)])]
+    return [*records, one,
+            *_884_batch(journal, "settle", [_884_replace(copy_a, 1)]),
+            *_884_batch(journal, "rewrite", [_884_replace(
+                one, 1, block_cost_usd=7.0)])]
+
+
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("case,divergence", [
+    ("paired", None),
+    ("rewrite", None),
+    ("rewrite", ({}, {"total_cost_usd": 11.0})),
+    ("rewrite", ({}, {"is_closed": 0})),
+    ("rewrite", ({}, {"five_hour_window_key": _884_OTHER_WINDOW})),
+    ("rewrite", ({"total_cost_usd": 1}, {"total_cost_usd": True})),
+    ("rewrite", ({}, {"is_closed": True})),
+    ("rewrite", ({"total_cost_usd": _884_BIG},
+                 {"total_cost_usd": float(_884_BIG)})),
+], ids=["paired", "rewrite", "total", "is-closed", "block-key",
+        "total-bool-int", "is-closed-bool-int", "total-int-float"])
+def test_884_close_reemission_certainty(cctally_module, case, divergence,
+                                         swap):
+    """Spec §7 test 5, finding F1: the live writer's close re-emissions.
+
+    Detects: an ordinary live-writer close history raising a permanent
+    false disclosure (and a count) over a crossing whose money is proven,
+    or a divergence in what the close timeline reads (total, closed flag,
+    block key, or only the JSON type of an equal value) slipping through
+    and letting a repair read one copy's money. A metadata-only
+    re-emission is certain: beside a paired repricing nothing is written,
+    reported or counted, and a price-only rewrite restores. Any other
+    divergence keeps the money and reports the block, whichever copy the
+    fold lists first.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records = _884_reemission(journal, case, divergence, swap=swap)
+    desired = _884_replay(journal, records)
+    if divergence is not None:
+        _884_assert_withheld(rederive, journal, records, desired, _884_ONE,
+                             codes=["close-lineage-uncertain"],
+                             candidates=(0,))
+        return
+    baseline = _875_plan(rederive, journal, records, desired,
+                         milestone_lineage=None)
+    first, second = _884_two_passes(rederive, journal, records, desired)
+    summary = (_875_action_summary(first), first.withheld_milestone_repairs)
+    assert first.withheld_milestone_repairs == (), summary
+    assert first.uncertain_cost_fact_count == \
+        baseline.uncertain_cost_fact_count, summary
+    if case == "paired":
+        assert first.actions == (), summary
+    else:
+        assert _884_block_cost(first, _884_ONE) == 3.0, summary
+    assert second.actions == (), _875_action_summary(second)
+    assert second.withheld_milestone_repairs == ()
+
+
+def _884_interleaved(journal, *, paired_name, plain_name, paired_first):
+    """One rev-1 crossing in two batches with interleaved commits.
+
+    The paired batch also moves the close's money; the plain one does not.
+    Batch names decide the order the fold lists them, the later-committing
+    batch's actions come first, and only the commits decide effectiveness.
+    """
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    seven = _884_replace(one, 1, block_cost_usd=7.0)
+    paired = _884_batch(journal, paired_name, [
+        seven, _884_replace(close, 1, total_cost_usd=20.0)])
+    plain = _884_batch(journal, plain_name, [seven])
+    first, second = (paired, plain) if paired_first else (plain, paired)
+    return [close, one, first[0], second[0], *second[1:-1], *first[1:-1],
+            first[-1], second[-1]]
+
+
+@pytest.mark.parametrize("paired_first", [True, False])
+def test_884_identical_duplicates_follow_commit_order(cctally_module,
+                                                      paired_first):
+    """Spec §7 test 5 (A2): identical duplicates, interleaved commits.
+
+    Detects: a lineage decided by the fold's batch-id order or by action
+    line order rather than by commit coordinates. Whichever batch the fold lists first, the paired
+    batch committing first anchors at rev 1 (nothing to repair), and the
+    plain one committing first leaves the paired close change unpaired
+    (withheld, rev 0 a candidate).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    results = []
+    for names in (("p", "q"), ("q", "p")):
+        records = _884_interleaved(
+            journal, paired_name=names[0], plain_name=names[1],
+            paired_first=paired_first)
+        plan = _875_plan(rederive, journal, records,
+                         _884_replay(journal, records))
+        results.append((plan.plan_hash, plan.actions,
+                        plan.withheld_milestone_repairs))
+    assert results[0] == results[1]
+    _hash, actions, withheld = results[0]
+    assert actions == ()
+    if paired_first:
+        assert withheld == ()
+    else:
+        [block] = withheld
+        assert [(m.reason_codes, m.candidate_revisions)
+                for m in block.milestones] == [(("unpaired-close-change",),
+                                                (0,))]
+
+
+def test_884_disclosure_predicate_and_coordinate_groups(cctally_module):
+    """Spec §7 test 6 (A5): what a withhold reports, and N5's grouping.
+
+    Detects: counting a divergence that only an older identity holds, or a
+    price below one (a Q13 correction is a proven boundary, so nothing is
+    reported and the plan equals #875's), and a batch carrying a Q13 change at rev 1, a
+    price change at rev 2 and a monetary close correction anchoring at the
+    wrong revision (it anchors at rev 2).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    old_identity = [close, one,
+                    *_884_batch(journal, "a", [_884_replace(
+                        one, 1, block_cost_usd=7.0)]),
+                    *_884_batch(journal, "b", [_884_replace(
+                        one, 1, block_cost_usd=8.0)]),
+                    *_884_batch(journal, "c", [_884_replace(
+                        one, 2, block_input_tokens=110, block_cost_usd=5.0)])]
+    desired = _884_replay(journal, old_identity)
+    plan = _875_plan(rederive, journal, old_identity, desired)
+    unaware = _875_plan(rederive, journal, old_identity, desired,
+                        milestone_lineage=None)
+    assert plan.withheld_milestone_repairs == ()
+    assert plan.plan_hash == unaware.plan_hash
+
+    # The selected identity returns to rev 0's spelling, but rev 1 (another
+    # identity in every occurrence) is a proven boundary: rev 0's $3 is no
+    # repair candidate of an uncertain history.
+    returned = [close, one,
+                *_884_batch(journal, "d", [_884_replace(
+                    one, 1, block_input_tokens=110, block_cost_usd=4.0)]),
+                *_884_batch(journal, "e", [_884_replace(
+                    one, 1, block_input_tokens=110, block_cost_usd=4.5)]),
+                *_884_batch(journal, "f", [_884_replace(
+                    one, 2, block_cost_usd=5.0)])]
+    plan = _875_plan(rederive, journal, returned,
+                     _884_replay(journal, returned))
+    assert plan.withheld_milestone_repairs == ()
+    assert plan.actions == (), _875_action_summary(plan)
+
+    grouped = [close, one,
+               *_884_batch(journal, "n5", [
+                   _884_replace(one, 1, block_input_tokens=110,
+                                block_cost_usd=4.0),
+                   _884_replace(one, 2, block_input_tokens=110,
+                                block_cost_usd=6.0),
+                   _884_replace(close, 1, total_cost_usd=20.0)]),
+               *_884_batch(journal, "rewrite", [_884_replace(
+                   one, 3, block_input_tokens=110, block_cost_usd=9.0)])]
+    first, second = _884_two_passes(
+        rederive, journal, grouped, _884_replay(journal, grouped))
+    assert _884_block_cost(first, _884_ONE) == 6.0, _875_action_summary(first)
+    assert second.actions == (), _875_action_summary(second)
+
+
+def test_884_life_boundaries(cctally_module):
+    """Spec §7 test 7 (A2, A7): tombstone and revival.
+
+    Detects: borrowing an earlier life's money. A later price-only rewrite
+    after the revival restores the revival's value, never the first life's.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    records = [close, one,
+               *_884_batch(journal, "retired", [_884_tombstone(one, 1)]),
+               *_884_batch(journal, "revived", [_884_replace(
+                   one, 2, block_cost_usd=5.0)]),
+               *_884_batch(journal, "rewrite", [_884_replace(
+                   one, 3, block_cost_usd=8.0)])]
+    first, second = _884_two_passes(
+        rederive, journal, records, _884_replay(journal, records))
+    assert _884_block_cost(first, _884_ONE) == 5.0, _875_action_summary(first)
+    assert second.actions == (), _875_action_summary(second)
+
+
+_884_HELD = "o:875-held"
+
+
+def _884_resolver_case(journal, case):
+    """(records, desired, plan kwargs, target id, expected block cost) for
+    one spec §7 test 8 boundary; every history rewrote $3 to $7."""
+    if case == "carried-whole-by-reconciliation":
+        fx = _875_reconciled_predecessor(journal)
+        crossing = fx["old_predecessor"]
+        records = [fx["old"], crossing, fx["close"],
+                   *_884_batch(journal, "rewrite", [_884_replace(
+                       crossing, 1, block_cost_usd=3.1)])]
+        desired = [fx["new"], fx["new_predecessor"], fx["close"]]
+        return records, desired, {
+            "raw_observations": [fx["new_raw"], fx["old_raw"]]}, \
+            crossing["id"], 2.5
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    rewrite = _884_batch(journal, "rewrite", [_884_replace(
+        one, 1, block_cost_usd=7.0)])
+    records = [close, one, *rewrite]
+    replay = {_884_ONE: 11.0}
+    if case == "replaced-block":
+        desired = _884_replay(journal, records, costs=replay, changes={
+            _875_CLOSE_ID: {"final_five_hour_percent": 43.0,
+                            "total_cost_usd": 14.0}})
+        return records, desired, {}, _884_ONE, 11.0
+    if case == "unsettled-open-block":
+        opened = _884_close(journal, 10.0, is_closed=0)
+        records = [opened, one, *rewrite]
+        return records, _884_replay(journal, records, costs=replay), {}, \
+            _884_ONE, 11.0
+    if case == "corrected-crossing":
+        return records, _884_replay(journal, records, costs=replay, changes={
+            _884_ONE: {"block_input_tokens": 120}}), {}, _884_ONE, 11.0
+    if case == "addition-after-a-tombstone":
+        records = [close, one, *_884_batch(journal, "retired", [
+            _884_tombstone(one, 1)])]
+        desired = [*_884_replay(journal, records),
+                   _875_milestone(journal, 1, 11.0, None)]
+        return records, desired, {}, _884_ONE, 11.0
+    if case == "preserved-only-milestone":
+        exported = _875_milestone(journal, 1, 3.0, None,
+                                  event_id="b:five_hour_milestones:884")
+        records = [close, exported, *_884_batch(journal, "rewrite", [
+            _884_replace(exported, 1, block_cost_usd=7.0)])]
+        kept = journal.resolve_effective_events(records).by_id[
+            exported["id"]].record
+        return records, _884_replay(journal, records, drop={exported["id"]}), \
+            {"preserved": [kept]}, exported["id"], None
+    if case == "preserved-close":
+        exported = _884_close(journal, 10.0, event_id=_875_PRESERVED_CLOSE_ID)
+        records = [exported, one, *rewrite]
+        return records, _884_replay(journal, records, costs=replay, drop={
+            exported["id"]}), {"preserved": [exported]}, _884_ONE, 3.0
+    if case == "carried-whole-by-a-reviewed-hold":
+        held = _875_snapshot(journal, _884_HELD, window=_875_NEIGHBOUR_WINDOW)
+        crossing = _875_referencing(_875_milestone(journal, 1, 3.0, None),
+                                    held)
+        records = [close, held, crossing, *_884_batch(journal, "rewrite", [
+            _884_replace(crossing, 1, block_cost_usd=7.0)])]
+        desired = _884_replay(journal, records, costs=replay, changes={
+            _884_ONE: {"block_input_tokens": 110}})
+        return records, desired, {"reviewed_weekly_hold_ids": (_884_HELD,)}, \
+            _884_ONE, 3.0
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "replaced-block", "unsettled-open-block", "corrected-crossing",
+    "addition-after-a-tombstone", "preserved-only-milestone",
+    "preserved-close", "carried-whole-by-a-reviewed-hold",
+    "carried-whole-by-reconciliation",
+])
+def test_884_resolver_boundaries(cctally_module, case):
+    """Spec §7 test 8 (A3, A10): restoration applies only to an unchanged
+    crossing of a frozen block.
+
+    Detects: a history-based amount leaking into a replaced or unsettled
+    block, a corrected crossing or an addition (all take replay's $11), or
+    into a preserved-only milestone (#426 keeps it as it stands); and a
+    frozen block under a preserved close, or a crossing a reviewed hold
+    or snapshot reconciliation carries whole, missing its repair ($3, or
+    the reconciled crossing's recorded $2.50).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, desired, kwargs, target, expected = _884_resolver_case(
+        journal, case)
+    first, second = _884_two_passes(rederive, journal, records, desired,
+                                    **kwargs)
+    assert _884_block_cost(first, target) == expected, \
+        _875_action_summary(first)
+    assert first.withheld_milestone_repairs == ()
+    assert second.actions == (), _875_action_summary(second)
+
+
+def _884_marginal_case(journal, case):
+    """(records, {id: expected (block, marginal) or None}) per §7 test 9."""
+    close = _884_close(journal, 10.0)
+    if case == "restored-lowest-crossing-keeps-its-marginal":
+        one = _875_milestone(journal, 1, 3.0, 1.0)
+        return [close, one, *_884_batch(journal, "a", [_884_replace(
+            one, 1, block_cost_usd=7.0)])], {_884_ONE: (3.0, 1.0)}
+    if case == "absent-marginal-stays-absent":
+        one = _875_milestone(journal, 1, 3.0, None)
+        return [close, one, *_884_batch(journal, "a", [_884_replace(
+            one, 1, block_cost_usd=7.0)])], {_884_ONE: (3.0, None)}
+    if case == "successor-within-tolerance-keeps-its-bytes":
+        one = _875_milestone(journal, 1, 3.0, None)
+        two = _875_milestone(journal, 2, 6.0, 3.0000000004)
+        return [close, one, two, *_884_batch(journal, "a", [_884_replace(
+            one, 1, block_cost_usd=7.0)])], {_884_ONE: (3.0, None),
+                                             _884_TWO: None}
+    if case == "int-anchor-stays-int":
+        one = _875_milestone(journal, 1, 3, None)
+        return [close, one, *_884_batch(journal, "a", [_884_replace(
+            one, 1, block_cost_usd=7.5)])], {_884_ONE: (3, None)}
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "restored-lowest-crossing-keeps-its-marginal",
+    "absent-marginal-stays-absent",
+    "successor-within-tolerance-keeps-its-bytes", "int-anchor-stays-int",
+])
+def test_884_restored_marginals(cctally_module, case):
+    """Spec §7 test 9 (A4): marginals around a restored crossing.
+
+    Detects: the no-predecessor fallback overwriting a restored block cost
+    with the damaged one, an invented or copied historical marginal, a
+    float-spelling correction of a successor within 1e-9 USD, or a restored
+    ``int`` amount rewritten as a float.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, expected = _884_marginal_case(journal, case)
+    first, second = _884_two_passes(
+        rederive, journal, records, _884_replay(journal, records))
+    actions = _875_milestone_actions(first)
+    for event_id, money in expected.items():
+        if money is None:
+            assert event_id not in actions, _875_action_summary(first)
+            continue
+        assert _875_money(actions[event_id]) == money, \
+            _875_action_summary(first)
+        assert [type(value) for value in _875_money(actions[event_id])] == \
+            [type(value) for value in money]
+    assert second.actions == (), _875_action_summary(second)
+
+
+def _884_divergent(journal, record, *, name):
+    """Batches that leave ``record`` at $7 over a superseded divergence."""
+    return [
+        *_884_batch(journal, f"{name}-a", [_884_replace(
+            record, 1, block_cost_usd=7.0)]),
+        *_884_batch(journal, f"{name}-b", [_884_replace(
+            record, 1, block_cost_usd=8.0)]),
+        *_884_batch(journal, f"{name}-c", [_884_replace(
+            record, 2, block_cost_usd=7.0)]),
+    ]
+
+
+def _884_in_window(record, window):
+    """``record`` moved to another five-hour window (id and payload)."""
+    payload = dict(record["payload"], five_hour_window_key=window)
+    return {**record, "id": record["id"].replace(str(_875_WINDOW), str(window)),
+            "payload": payload}
+
+
+def test_884_withheld_blocks_count_once_and_sort(cctally_module):
+    """Spec §7 test 9 (A5): counting and ordering of withheld blocks.
+
+    Detects: a block counted once per withheld milestone, counted beside a
+    close that already counts, or listed in a nondeterministic order. The
+    list is sorted by account and the window key's string form.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 3.0)
+    records = [close, one, two, *_884_divergent(journal, one, name="one"),
+               *_884_divergent(journal, two, name="two")]
+    desired = _884_replay(journal, records)
+    plan = _875_plan(rederive, journal, records, desired)
+    unaware = _875_plan(rederive, journal, records, desired,
+                        milestone_lineage=None)
+    [block] = plan.withheld_milestone_repairs
+    assert [m.event_id for m in block.milestones] == [_884_ONE, _884_TWO]
+    assert plan.uncertain_cost_fact_count == \
+        unaware.uncertain_cost_fact_count + 1
+
+    # The block's uncertain close is not its smallest close id: the block
+    # still adds nothing beside it.
+    uncertain_close = _875_close(journal, total=0.0, models=[
+        {"model": "m", "cost_usd": 0.0, "input_tokens": 300}])
+    exported = _884_close(journal, 10.0, event_id="b:five_hour_blocks:884")
+    beside = [uncertain_close, exported, one,
+              *_884_divergent(journal, one, name="one")]
+    desired = _884_replay(journal, beside)
+    plan = _875_plan(rederive, journal, beside, desired)
+    unaware = _875_plan(rederive, journal, beside, desired,
+                        milestone_lineage=None)
+    [block] = plan.withheld_milestone_repairs
+    assert block.close_event_ids == (exported["id"], _875_CLOSE_ID)
+    assert unaware.uncertain_cost_fact_count == 1
+    assert plan.uncertain_cost_fact_count == 1
+
+    # A nine-digit window key sorts after the ten-digit one as a string.
+    window = 999999000
+    other_close = _884_in_window(close, window)
+    other_one = _884_in_window(one, window)
+    records = [other_close, other_one, close, one,
+               *_884_divergent(journal, other_one, name="other"),
+               *_884_divergent(journal, one, name="one")]
+    plan = _875_plan(rederive, journal, records, _884_replay(journal, records))
+    assert [block.to_dict() for block in plan.withheld_milestone_repairs] == [
+        {"accountKey": _875_ACCOUNT, "fiveHourWindowKey": key,
+         "closeEventIds": [close_id],
+         "milestones": [{"eventId": milestone_id, "currentRevision": 2,
+                         "candidateRevisions": [0, 1],
+                         "reasonCodes": ["divergent-revision"]}]}
+        for key, close_id, milestone_id in (
+            (_875_WINDOW, _875_CLOSE_ID, _884_ONE),
+            (window, other_close["id"], other_one["id"]),
+        )
+    ]
+    assert plan.uncertain_cost_fact_count == 2
+
+
+def test_884_milestone_lineage_none_is_875_plan(cctally_module):
+    """Spec §7 test 9 (A10): the ``milestone_lineage=None`` default.
+
+    Detects: the compatibility default restoring anything, or an explicit
+    ``None`` and an absent keyword building different plans. Over test 1's
+    restorable history ``None`` keeps the damaged amount and writes nothing,
+    byte for byte the plan the keyword's absence builds. Both sides run the
+    current planner, so this pins the default only; #875's tests 1–25 carry
+    the evidence that the marginal fallback change leaves #875's plans as
+    they were.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, desired = _884_rewritten(journal)
+    unaware = _875_plan(rederive, journal, records, desired,
+                        milestone_lineage=None)
+    absent = rederive.build_claude_usage_plan(
+        selection=journal.resolve_effective_events(list(records)),
+        desired_events=list(desired),
+        journal_high_water=("observations-2026-07.jsonl", 10),
+        cache_fingerprint="sha256:cache",
+        config_fingerprint="sha256:config",
+        preserved_events=(),
+    )
+    assert unaware.actions == (), _875_action_summary(unaware)
+    assert unaware.withheld_milestone_repairs == ()
+    assert unaware.to_bytes() == absent.to_bytes()
+
+
+def _884_causal_inputs(journal, records, *, reviewed_changes):
+    """Baseline and reviewed replay sets that differ only by
+    ``reviewed_changes``; an unrelated snapshot rides along, and the
+    crossings' own snapshots exist so a causal milestone keeps its
+    reference."""
+    records = [*records, *(
+        _875_snapshot(journal, raw_id)
+        for raw_id in ("o:875-0-1", "o:875-0-2", "o:884-other"))]
+    baseline = _884_replay(journal, records)
+    reviewed = _884_replay(journal, records, changes=reviewed_changes)
+    return records, baseline, reviewed
+
+
+@pytest.mark.parametrize("case", ["unrelated", "dependent"])
+def test_884_causal_path(cctally_module, case):
+    """Spec §7 test 10 (A10): restorations on the reviewed causal path.
+
+    Detects: an unrelated restoration riding a reviewed decision (both
+    plans restore it, so the subset drops it), a dependent one left behind
+    (the reviewed successor's marginal needs the restored predecessor, so
+    ``_monetary_chain_closure`` re-includes it), and a causal subset that
+    does not converge (the second causal preview is empty).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    history, _desired = _884_rewritten(journal)
+    changes = (
+        {"sa:o:884-other": {"weekly_percent": 64.0}} if case == "unrelated"
+        else {_884_TWO: {"block_input_tokens": 210}}
+    )
+    records, baseline_desired, reviewed_desired = _884_causal_inputs(
+        journal, history, reviewed_changes=changes)
+    baseline, reviewed, causal, current = _875_causal_plans(
+        rederive, journal, records, baseline_desired, reviewed_desired)
+    summary = [_875_action_summary(plan)
+               for plan in (baseline, reviewed, causal)]
+    for plan in (baseline, reviewed):
+        assert _884_block_cost(plan, _884_ONE) == 34.014890, summary
+    if case == "unrelated":
+        assert _875_ids(causal) == ["sa:o:884-other"], summary
+    else:
+        assert _875_ids(causal) == [_884_ONE, _884_TWO], summary
+        assert _875_applied(current, causal.actions, [_884_ONE]) == \
+            _875_applied(current, reviewed.actions, [_884_ONE])
+
+    records = [*records, *_884_batch(
+        journal, "causal", causal.to_correction_actions())]
+    _b, _r, again, _c = _875_causal_plans(
+        rederive, journal, records, baseline_desired, reviewed_desired)
+    assert again.actions == (), _875_action_summary(again)
+
+
+def test_884_withheld_blocks_survive_the_causal_subset(cctally_module):
+    """Spec §7 test 10 (A5): the reviewed plan's disclosure is kept.
+
+    Detects: a reviewed decision's preview losing the withheld-repair
+    diagnostic when ``causal_delta_plan`` filters its actions.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _884_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    history = [close, one, *_884_divergent(journal, one, name="one")]
+    records, baseline_desired, reviewed_desired = _884_causal_inputs(
+        journal, history,
+        reviewed_changes={"sa:o:884-other": {"weekly_percent": 64.0}})
+    _baseline, reviewed, causal, _current = _875_causal_plans(
+        rederive, journal, records, baseline_desired, reviewed_desired)
+    assert reviewed.withheld_milestone_repairs
+    assert causal.withheld_milestone_repairs == \
+        reviewed.withheld_milestone_repairs
+    assert causal.uncertain_cost_fact_count == \
+        reviewed.uncertain_cost_fact_count
+
+
+# ---------------------------------------------------------------------------
+# #1040: derivation completion keeps closed five-hour money frozen
+# ---------------------------------------------------------------------------
+
+_1040_CLOSE = _875_CLOSE_ID
+_1040_SECOND_CLOSE = f"fhbc:{_875_ACCOUNT}:{_875_WINDOW}:second"
+
+
+def _1040_close(journal, total, *, tokens=300, event_id=_1040_CLOSE,
+                pricing=None, observed="2026-07-26T12:00:00Z", **overrides):
+    """A closed close of ``total`` over ``tokens`` input tokens of model m."""
+    usable = isinstance(total, (int, float)) and not isinstance(total, bool)
+    child = total if usable else 6.0
+    record = _875_close(
+        journal, total=total, pricing=pricing,
+        models=[{"model": "m", "cost_usd": child, "input_tokens": tokens,
+                 "account_key": _875_ACCOUNT, "entry_count": 2}],
+        _projects=[{"project_path": "/repo", "cost_usd": child,
+                    "input_tokens": tokens, "account_key": _875_ACCOUNT,
+                    "entry_count": 2}],
+        total_input_tokens=tokens, first_observed_at_utc=observed,
+        **overrides,
+    )
+    record["id"] = event_id
+    return record
+
+
+def _1040_with(record, **changes):
+    """``record`` with payload ``changes`` (a None value removes the key)."""
+    payload = dict(record["payload"])
+    for key, value in changes.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return {**record, "payload": payload}
+
+
+def _1040_map(*records):
+    return {record["id"]: record for record in records}
+
+
+def _1040_inert(journal, name, actions):
+    """An incomplete batch: its actions occupy their revisions inertly."""
+    return journal.make_correction_batch(
+        batch_id=f"rederive:claude-usage:1040-inert-{name}",
+        family="claude-usage", at=AT, actions=list(actions))[:-1]
+
+
+def _1040_context(journal, rederive, records, *, excluded=None, inert=None):
+    accumulators: dict = {}
+    selection = journal.resolve_effective_events(
+        list(records), accumulators=accumulators)
+    lineage = rederive.build_five_hour_lineage(
+        accumulators["fold"], selection=selection,
+        physical_revisions=dict(excluded or {}))
+    return selection, lineage
+
+
+def _1040_run(journal, rederive, records, with_gap, without_gap, *,
+              excluded=None, inert=None):
+    """One planner call, its inputs computed exactly as completion does."""
+    selection, lineage = _1040_context(
+        journal, rederive, records, excluded=excluded)
+    current = {
+        event_id: item.record for event_id, item in selection.by_id.items()
+        if item.status == "active"
+        and item.record["payload"]["kind"] in rederive._LINEAGE_KINDS}
+    acted = frozenset(
+        event_id for event_id in set(with_gap) | set(without_gap)
+        if not (event_id in with_gap and event_id in without_gap
+                and rederive._semantic_event(with_gap[event_id])
+                == rederive._semantic_event(without_gap[event_id])))
+    physical: dict = {}
+    for table in (excluded or {}, inert or {}):
+        for event_id, rev in table.items():
+            physical[event_id] = max(rev, physical.get(event_id, rev))
+    for event_id, item in selection.by_id.items():
+        physical[event_id] = max(item.rev, physical.get(event_id, item.rev))
+    retirements = [
+        {"action": "tombstone", "id": event_id,
+         "rev": physical[event_id] + 1, "at": current[event_id]["at"],
+         "payload": None}
+        for event_id in sorted(acted)
+        if event_id not in with_gap and event_id in current]
+    plan = rederive.plan_completion_five_hour(
+        current=current, with_gap=with_gap, without_gap=without_gap,
+        acted=acted, physical=physical, selection=selection,
+        lineage=lineage, retirements=retirements)
+    return plan, dict(selection=selection, lineage=lineage, physical=physical,
+                      retirements=retirements, current=current)
+
+
+def _1040_append(journal, records, plan, context, name):
+    """``records`` after completion appends ``plan`` by the append policy."""
+    physical = context["physical"]
+    actions, plain = [], []
+    for event_id, record in plan.targets.items():
+        if event_id in physical:
+            actions.append({"action": "replace", "id": event_id,
+                            "rev": physical[event_id] + 1,
+                            "at": record["at"],
+                            "payload": dict(record["payload"])})
+        else:
+            plain.append(record)
+    actions.extend(context["retirements"])
+    batch = journal.make_correction_batch(
+        batch_id=f"derivation-completion:1040-{name}",
+        family="derivation-completion", at=AT,
+        actions=sorted(actions, key=lambda action: action["id"]),
+    ) if actions else []
+    return [*records, *batch, *plain]
+
+
+def _1040_decision(plan, block=(_875_ACCOUNT, _875_WINDOW)):
+    [decision] = [item for item in plan.decisions if item.block == block]
+    return decision
+
+
+def _1040_decisions_after(journal, rederive, records, ids, **kwargs):
+    selection, lineage = _1040_context(journal, rederive, records, **kwargs)
+    return {event_id: lineage.restoration(
+        event_id, selection.by_id[event_id].record) for event_id in ids}
+
+
+# ── Task 1: the close and the block class (spec §5.2) ───────────────────────
+
+def _1040_close_case(journal, rederive, case):
+    """(C, D, R, kwargs, expected class, expected T, expected T0)."""
+    current = _1040_close(journal, 10.0)
+    metadata = dict(observed="2026-07-26T11:58:00Z")
+    acted = dict(acted=True, has_physical=True, several_close_ids=False)
+    if case == "metadata-revised-card":
+        desired = _1040_close(journal, 20.0, **metadata)
+        reference = _1040_close(journal, 20.0,
+                                observed="2026-07-26T12:30:00Z")
+        overlay = rederive.close_money_overlay(desired, current)
+        return current, desired, reference, acted, "FROZEN", overlay, overlay
+    if case == "replay-drift":
+        desired = _1040_close(journal, 20.0, tokens=400, **metadata)
+        reference = _1040_close(journal, 20.0, tokens=400,
+                                observed="2026-07-26T12:30:00Z")
+        overlay = rederive.close_money_overlay(desired, current)
+        return current, desired, reference, acted, "FROZEN", overlay, overlay
+    if case == "population-equal-total":
+        desired = _1040_close(journal, 10.0, tokens=400)
+        reference = _1040_close(journal, 7.0)
+        return current, desired, reference, acted, "FROZEN", current, current
+    if case == "population-unusable-total":
+        current = _1040_close(journal, None)
+        desired = _1040_close(journal, 20.0, tokens=400)
+        reference = _1040_close(journal, 7.0)
+        return current, desired, reference, acted, "FROZEN", current, current
+    if case == "population-change":
+        desired = _1040_close(journal, 20.0, tokens=400)
+        reference = _1040_close(journal, 7.0)
+        return current, desired, reference, acted, "REPLACED", desired, current
+    if case == "population-change-structure":
+        desired = _1040_close(journal, 20.0, tokens=400, **metadata)
+        reference = _1040_close(journal, 7.0)
+        return (current, desired, reference, acted, "REPLACED", desired,
+                rederive.close_money_overlay(desired, current))
+    missing = dict(pricing={"version": 1, "unpricedModels": ["m"]})
+    priced = dict(pricing={"version": 1, "unpricedModels": []})
+    if case == "missing-card-direct":
+        current = _1040_close(journal, 0.0, **missing)
+        desired = _1040_close(journal, 20.0, **priced)
+        reference = _1040_close(journal, 20.0, observed="2026-07-26T12:30:00Z",
+                                **priced)
+        corrected = rederive._preserve_non_derivable_state(current, desired)
+        return (current, desired, reference, acted, "REPLACED", corrected,
+                current)
+    if case == "missing-card-after-metadata":
+        current = _1040_close(journal, 0.0, **missing)
+        desired = _1040_close(journal, 20.0, **metadata, **priced)
+        reference = _1040_close(journal, 20.0, observed="2026-07-26T12:30:00Z",
+                                **priced)
+        overlay = rederive.close_money_overlay(desired, current)
+        second = rederive._preserve_non_derivable_state(overlay, desired)
+        return (current, desired, reference, acted, "REPLACED", second,
+                overlay)
+    if case == "reference-absent":
+        desired = _1040_close(journal, 20.0, **metadata)
+        overlay = rederive.close_money_overlay(desired, current)
+        return current, desired, None, acted, "FROZEN", overlay, overlay
+    if case == "several-close-ids":
+        desired = _1040_close(journal, 20.0, tokens=400, **metadata)
+        reference = _1040_close(journal, 7.0)
+        overlay = rederive.close_money_overlay(desired, current)
+        return (current, desired, reference, dict(acted, several_close_ids=True),
+                "FROZEN", overlay, overlay)
+    if case == "added":
+        desired = _1040_close(journal, 20.0)
+        return (None, desired, None, dict(acted, has_physical=False),
+                "ADDED", desired, None)
+    if case == "revival":
+        desired = _1040_close(journal, 20.0)
+        return None, desired, None, acted, "REPLACED", desired, None
+    if case == "several-close-ids-revival":
+        desired = _1040_close(journal, 20.0)
+        return (None, desired, None, dict(acted, several_close_ids=True),
+                "FROZEN", desired, None)
+    if case == "not-acted":
+        return (current, _1040_close(journal, 20.0), _1040_close(journal, 20.0),
+                dict(acted, acted=False), "FROZEN", current, None)
+    if case == "desired-open":
+        desired = _1040_close(journal, 20.0, is_closed=0)
+        return current, desired, None, acted, "OPEN", desired, None
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "metadata-revised-card", "replay-drift", "population-equal-total",
+    "population-unusable-total", "population-change",
+    "population-change-structure", "missing-card-direct",
+    "missing-card-after-metadata", "reference-absent", "several-close-ids",
+    "added", "revival", "several-close-ids-revival", "not-acted",
+    "desired-open",
+])
+def test_1040_close_class(cctally_module, case):
+    """#1040 spec §5.2, planner cases 1, 2, 4, 5, 11 and 17: the close rules.
+
+    Detects: a close completion would re-journal at the binary's current
+    card although the gap did not change its population (FROZEN keeps C's
+    money group with D's metadata, T₀), a gap-caused population change or a
+    #869 missing-card correction (direct P, or P₂ after a metadata change)
+    left unpaired, and a block with several close ids or an unusable total
+    classified REPLACED.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current, desired, reference, kwargs, block_class, target, frozen = \
+        _1040_close_case(journal, rederive, case)
+    result = rederive.classify_completion_close(
+        current, desired, reference, **kwargs)
+    assert result.block_class == block_class
+    assert result.target == target
+    assert result.frozen_form == frozen
+    if block_class == "FROZEN" and current is not None and target is not None:
+        assert rederive._close_money_keys(target["payload"]) == \
+            rederive._close_money_keys(current["payload"])
+        for key in rederive._close_money_keys(current["payload"]):
+            assert target["payload"][key] == current["payload"][key]
+    if case.startswith("missing-card"):
+        assert result.target["payload"]["total_cost_usd"] == 20.0
+        assert result.target["payload"]["_pricing"]["basis"] == \
+            rederive.RECORDED_CLOSE_CORRECTION_BASIS
+
+
+def test_1040_preservation_partition_is_unchanged(cctally_module):
+    """#1040 G4: the money-group helper the close rules share leaves
+    `_preserve_non_derivable_state` returning what it returned before.
+
+    Detects: a refactor of the money partition that changes which closes
+    preservation keeps, adopts or corrects (a frozen close repriced, or a
+    missing-card correction lost). One close per branch: a structure change
+    returns D, an equal structure returns C, a recorded missing card returns
+    a corrected marker, and a drifted population keeps C.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    current = _1040_close(journal, 10.0)
+    moved = _1040_close(journal, 20.0, observed="2026-07-26T11:58:00Z")
+    assert rederive._preserve_non_derivable_state(current, moved) is moved
+    same = _1040_close(journal, 20.0)
+    assert rederive._preserve_non_derivable_state(current, same) is current
+    missing = _1040_close(journal, 0.0, pricing={
+        "version": 1, "unpricedModels": ["m"]})
+    priced = _1040_close(journal, 20.0, pricing={
+        "version": 1, "unpricedModels": []})
+    corrected = rederive._preserve_non_derivable_state(missing, priced)
+    assert corrected["payload"]["total_cost_usd"] == 20.0
+    assert corrected["payload"]["_pricing"]["basis"] == \
+        rederive.RECORDED_CLOSE_CORRECTION_BASIS
+    drifted = _1040_close(journal, 20.0, tokens=400, pricing={
+        "version": 1, "unpricedModels": []})
+    seen: set = set()
+    assert rederive._preserve_non_derivable_state(
+        missing, drifted, drifted_ids=seen) is missing
+    assert seen == {_1040_CLOSE}
+    payload = dict(moved["payload"], total_extra_usd=1.0)
+    assert rederive._close_money_keys(payload) == frozenset({
+        key for key in payload
+        if key.startswith("total_") or key in {
+            "_models", "_projects", "_pricing", "pricing_provenance_json"}})
+
+
+# ── Task 2: FiveHourLineage.extended (spec §5.4, planner case 14) ──────────
+
+_1040_OTHER_WINDOW = _875_WINDOW + 18000
+
+
+def _1040_extension_case(journal, case):
+    """(retained records, batch actions, plain events, excluded revisions)."""
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 3.0)
+    records = [close, one, two, *_884_batch(journal, "rewrite", [
+        _884_replace(one, 1, block_cost_usd=4.0)])]
+    if case == "batch":
+        return records, [
+            _884_replace(close, 1, total_cost_usd=20.0),
+            _884_replace(one, 2, block_cost_usd=5.0),
+            _884_tombstone(two, 1),
+        ], [], {}
+    if case == "plain":
+        three = _875_milestone(journal, 3, 9.0, 3.0)
+        other = _1040_close(
+            journal, 7.0, event_id=f"fhbc:{_875_ACCOUNT}:{_1040_OTHER_WINDOW}",
+            five_hour_window_key=_1040_OTHER_WINDOW)
+        return records, [_884_replace(two, 1, marginal_cost_usd=2.0)], [
+            three, other], {}
+    if case == "above-inert":
+        records.extend(_1040_inert(journal, "two", [
+            _884_replace(two, 1, block_cost_usd=6.5)]))
+        return records, [_884_replace(two, 2, marginal_cost_usd=2.0)], [], {}
+    if case == "above-excluded":
+        return records, [_884_replace(two, 2, marginal_cost_usd=2.0)], [], {
+            two["id"]: 1}
+    if case == "moved-close":
+        records.extend(_884_batch(journal, "moved", [_884_replace(
+            close, 1, five_hour_window_key=_1040_OTHER_WINDOW)]))
+        return records, [_884_replace(
+            close, 2, five_hour_window_key=_1040_OTHER_WINDOW,
+            first_observed_at_utc="2026-07-26T11:58:00Z")], [], {}
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize("case", [
+    "batch", "plain", "above-inert", "above-excluded", "moved-close",
+])
+def test_1040_extended_matches_rebuilt_lineage(cctally_module, case):
+    """#1040 planner case 14: the simulated lineage reads like a real append.
+
+    Detects: a lineage check that accepts or refuses the wrong completion
+    proposal because its simulation diverges from the lineage `db rederive`
+    builds over a journal that really holds the appended records (selected
+    pairs, history uncertainty above inert or excluded revisions, a close id
+    moved between blocks, close timelines and restoration decisions).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, actions, plain, excluded = _1040_extension_case(journal, case)
+    before_selection, before = _1040_context(
+        journal, rederive, records, excluded=excluded)
+    extended = before.extended(batch_actions=actions, plain=plain)
+    appended = [*records]
+    if actions:
+        appended.extend(journal.make_correction_batch(
+            batch_id="derivation-completion:1040-real",
+            family="derivation-completion", at=AT, actions=list(actions)))
+    appended.extend(plain)
+    selection, rebuilt = _1040_context(
+        journal, rederive, appended, excluded=excluded)
+
+    assert extended.uncertain == rebuilt.uncertain
+    assert extended.selected == rebuilt.selected
+    assert extended.close_ids_ever_in_block == rebuilt.close_ids_ever_in_block
+    assert extended.hidden_ids == rebuilt.hidden_ids
+    for block in rebuilt.close_ids_ever_in_block:
+        if any(close_id in rebuilt.uncertain for close_id in
+               rebuilt.close_ids_ever_in_block[block]):
+            continue
+        ours = extended._block_timeline(block)
+        theirs = rebuilt._block_timeline(block)
+        assert ours[1:] == theirs[1:], block
+        assert len(ours[0]) == len(theirs[0]), block
+    for event_id in rebuilt.milestones:
+        item = selection.by_id[event_id]
+        if item.status != "active":
+            continue
+        assert extended.restoration(event_id, item.record) == \
+            rebuilt.restoration(event_id, item.record), event_id
+    # The original instance is unchanged and its cache untouched.
+    assert before == _1040_context(
+        journal, rederive, records, excluded=excluded)[1]
+    if case == "above-inert":
+        assert "revision-gap" in extended.uncertain[_884_TWO]
+    if case == "above-excluded":
+        assert "hidden-revision" in extended.uncertain[_884_TWO]
+    if case == "moved-close":
+        assert _1040_CLOSE in extended.close_ids_ever_in_block[
+            (_875_ACCOUNT, _875_WINDOW)]
+
+
+# ── Task 3: milestone treatments (spec §5.3) ────────────────────────────────
+
+def _1040_milestones(journal, rederive, records, with_gap, acted, *,
+                     treatment, block_class="FROZEN", retired=frozenset()):
+    selection, lineage = _1040_context(journal, rederive, records)
+    current = {
+        event_id: item.record for event_id, item in selection.by_id.items()
+        if item.status == "active"
+        and item.record["payload"]["kind"] == "five_hour_milestone"}
+    return rederive.completion_block_milestones(
+        treatment=treatment, block_class=block_class, current=current,
+        with_gap=with_gap, acted=frozenset(acted), retired=frozenset(retired),
+        lineage=lineage, selection=selection), current
+
+
+def _1040_payload_money(record):
+    payload = record["payload"]
+    return payload["block_cost_usd"], payload["marginal_cost_usd"]
+
+
+@pytest.mark.parametrize("case", [
+    "frozen-keeps-money", "replaced-takes-replay", "added-crossing",
+    "frozen-corrected-restore", "main-is-today",
+])
+def test_1040_milestones(cctally_module, case):
+    """#1040 spec §5.3, planner cases 1, 3, 9 and 13: milestone treatments.
+
+    Detects: a frozen block's acted crossing repriced at the current card
+    (case 1), a REPLACED block's milestones left at the old card or a
+    retired predecessor kept in the marginal chain (case 3), a gap-added
+    crossing whose unacted successor keeps a stale marginal (case 9), a
+    corrected crossing that drops a proven historical amount (case 13), and
+    the ``main`` treatment drifting from today's completion records.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 3.0)
+    three = _875_milestone(journal, 3, 9.0, 3.0)
+    if case == "frozen-keeps-money":
+        records = [close, one, three]
+        with_gap = _1040_map(
+            _875_milestone(journal, 1, 7.0, None),
+            _1040_with(_875_milestone(journal, 3, 21.0, 14.0),
+                       seven_day_pct_at_crossing=2.0))
+        targets, current = _1040_milestones(
+            journal, rederive, records, with_gap, {_884_ONE, _884_THREE},
+            treatment="frozen")
+        assert sorted(targets) == [_884_THREE]
+        assert _1040_payload_money(targets[_884_THREE]) == (9.0, 6.0)
+        assert targets[_884_THREE]["payload"][
+            "seven_day_pct_at_crossing"] == 2.0
+    elif case == "replaced-takes-replay":
+        four = _875_milestone(journal, 4, 12.0, 3.0)
+        records = [close, one, two, three, four]
+        with_gap = _1040_map(
+            _875_milestone(journal, 1, 3.0, None),
+            _875_milestone(journal, 3, 9.0, 3.0),
+            _875_milestone(journal, 4, 13.0, 4.0))
+        targets, current = _1040_milestones(
+            journal, rederive, records, with_gap, {_884_TWO, _884_THREE},
+            treatment="replaced", block_class="REPLACED",
+            retired={_884_TWO})
+        four_id = f"fhm:{_875_ACCOUNT}:{_875_WINDOW}:0:4"
+        assert sorted(targets) == [_884_THREE, four_id]
+        assert _1040_payload_money(targets[_884_THREE]) == (9.0, 6.0)
+        assert _1040_payload_money(targets[four_id]) == (13.0, 4.0)
+    elif case == "added-crossing":
+        records = [close, one, _875_milestone(journal, 3, 9.0, 6.0)]
+        with_gap = _1040_map(_875_milestone(journal, 2, 5.0, 2.0),
+                             _875_milestone(journal, 3, 30.0, 10.0))
+        targets, current = _1040_milestones(
+            journal, rederive, records, with_gap, {_884_TWO},
+            treatment="frozen", block_class="ADDED")
+        assert sorted(targets) == [_884_TWO, _884_THREE]
+        assert _1040_payload_money(targets[_884_TWO]) == (5.0, 2.0)
+        assert _1040_payload_money(targets[_884_THREE]) == (9.0, 4.0)
+    elif case == "frozen-corrected-restore":
+        records, _desired = _884_rewritten(journal)
+        corrected = _1040_with(_875_milestone(journal, 1, 38.5, None),
+                               captured_at_utc="2026-07-26T12:01:10Z")
+        targets, current = _1040_milestones(
+            journal, rederive, records, _1040_map(corrected), {_884_ONE},
+            treatment="frozen")
+        assert targets[_884_ONE]["payload"]["block_cost_usd"] == 34.014890
+        assert targets[_884_ONE]["payload"]["alerted_at"] == _884_LATCH
+        assert targets[_884_ONE]["payload"]["captured_at_utc"] == \
+            "2026-07-26T12:01:10Z"
+        selection, lineage = _1040_context(journal, rederive, records)
+        assert lineage.restoration(
+            _884_ONE, current[_884_ONE]).action == "restore"
+        after = lineage.extended(batch_actions=[{
+            "action": "replace", "id": _884_ONE, "rev": 2,
+            "at": targets[_884_ONE]["at"],
+            "payload": dict(targets[_884_ONE]["payload"])}])
+        assert after.restoration(
+            _884_ONE, targets[_884_ONE]).action == "keep"
+    else:
+        records = [close, _875_milestone(journal, 1, 3.0, None,
+                                         alerted_at=_884_LATCH), two]
+        with_gap = _1040_map(_875_milestone(journal, 1, 7.0, None),
+                             _875_milestone(journal, 2, 14.0, 7.0),
+                             _875_milestone(journal, 3, 21.0, 7.0))
+        targets, current = _1040_milestones(
+            journal, rederive, records, with_gap, {_884_ONE, _884_THREE},
+            treatment="main")
+        assert sorted(targets) == [_884_ONE, _884_THREE]
+        assert targets[_884_ONE] == rederive._preserve_non_derivable_state(
+            current[_884_ONE], with_gap[_884_ONE])
+        assert targets[_884_ONE]["payload"]["alerted_at"] == _884_LATCH
+        assert targets[_884_THREE] == with_gap[_884_THREE]
+
+
+# ── Task 4: candidates, violations, components, decision (spec §5.4) ───────
+
+_1040_OBSERVED = "2026-07-26T11:58:00Z"
+_1040_LATER = "2026-07-26T12:30:00Z"
+_1040_B_BLOCK = (_875_ACCOUNT, _1040_OTHER_WINDOW)
+
+
+def _1040_corrected(journal, threshold, cost, marginal, **changes):
+    """A crossing replay corrects outside its money (a later capture)."""
+    return _1040_with(_875_milestone(journal, threshold, cost, marginal),
+                      captured_at_utc=f"2026-07-26T12:{threshold:02d}:30Z",
+                      **changes)
+
+
+def _1040_in_b(record, event_id):
+    """``record`` moved to block B under ``event_id``."""
+    moved = _1040_with(record, five_hour_window_key=_1040_OTHER_WINDOW)
+    moved["id"] = event_id
+    return moved
+
+
+def _1040_decision_case(journal, case):
+    """Spec §6 planner cases 6–8, 10, 12, 15, 16 and 18–22."""
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 3.0)
+    spec: dict = dict(excluded={}, inert={}, second=False)
+    if case == "6-pending-restore-lands-F":
+        records = [close, one, two, *_884_batch(journal, "rewrite", [
+            _884_replace(two, 1, block_cost_usd=7.0, marginal_cost_usd=4.0)])]
+        kept_two = _1040_with(two, block_cost_usd=7.0, marginal_cost_usd=4.0)
+        spec.update(
+            records=records,
+            with_gap=_1040_map(_1040_close(journal, 20.0, tokens=400),
+                               _1040_corrected(journal, 1, 4.0, None),
+                               kept_two),
+            without_gap=_1040_map(_1040_close(journal, 9.0),
+                                  _875_milestone(journal, 1, 3.5, None),
+                                  kept_two),
+            block_class="REPLACED", landed="F", targets={_884_ONE: (3.0, None)},
+            second=True, unchanged={_884_TWO: "restore"},
+            class_keys={(_884_TWO, "reason", "unpaired-close-change")})
+    elif case == "7-unusable-total-lands-K":
+        spec.update(
+            records=[_1040_close(journal, None), one],
+            with_gap=_1040_map(_1040_close(journal, 20.0,
+                                           observed=_1040_OBSERVED)),
+            without_gap=_1040_map(_1040_close(journal, 20.0,
+                                              observed=_1040_LATER)),
+            block_class="FROZEN", landed="K", targets={},
+            unchanged={_884_ONE: "keep"},
+            class_keys={(_884_ONE, "reason", "close-pairing-uncertain")})
+    elif case == "8-inert-successor-lands-A":
+        three = _875_milestone(journal, 3, 9.0, 6.0)
+        spec.update(
+            records=[close, one, three, *_1040_inert(journal, "three", [
+                _884_replace(three, 1, block_cost_usd=9.5)])],
+            inert={_884_THREE: 1},
+            with_gap=_1040_map(_875_milestone(journal, 2, 5.0, 2.0)),
+            without_gap={},
+            block_class="FROZEN", landed="A", targets={_884_TWO: (5.0, 2.0)},
+            class_keys={(_884_THREE, "reason", "revision-gap")})
+    elif case == "10-clean-revival-lands-class":
+        spec.update(
+            records=[close, one, *_884_batch(journal, "retire", [
+                _884_tombstone(close, 1)])],
+            with_gap=_1040_map(_1040_close(journal, 20.0),
+                               _875_milestone(journal, 1, 5.0, None)),
+            without_gap=_1040_map(_1040_close(journal, 20.0,
+                                              observed=_1040_LATER),
+                                  _875_milestone(journal, 1, 4.0, None)),
+            block_class="REPLACED", landed="class",
+            targets={_1040_CLOSE: 20.0, _884_ONE: (5.0, None)},
+            unchanged={_884_ONE: "keep"})
+    elif case == "12-two-close-ids-lands-K":
+        second = _1040_close(journal, 10.0, event_id=_1040_SECOND_CLOSE)
+        spec.update(
+            records=[close, second, one],
+            with_gap=_1040_map(_1040_close(journal, 20.0,
+                                           observed=_1040_OBSERVED),
+                               _1040_corrected(journal, 1, 4.0, None)),
+            without_gap=_1040_map(_1040_close(journal, 20.0,
+                                              observed=_1040_LATER),
+                                  _875_milestone(journal, 1, 3.5, None)),
+            block_class="FROZEN", landed="K", targets={_884_ONE: (3.0, None)},
+            second=True, unchanged={_884_ONE: "keep"},
+            class_keys={(_884_ONE, "reason", "close-pairing-uncertain")})
+    elif case == "15-revival-over-rewrites-lands-K":
+        records = [close, *_884_batch(journal, "retire", [
+            _884_tombstone(close, 1)]), one, two,
+            *_884_batch(journal, "rewrite", [
+                _884_replace(one, 1, block_cost_usd=4.0),
+                _884_replace(two, 1, block_cost_usd=8.0,
+                             marginal_cost_usd=4.0)])]
+        kept_two = _1040_with(two, block_cost_usd=8.0, marginal_cost_usd=4.0)
+        corrected = _1040_with(_875_milestone(journal, 1, 5.0, None),
+                               usage_snapshot_ref="sa:o:875-0-1-later")
+        spec.update(
+            records=records,
+            with_gap=_1040_map(_1040_close(journal, 20.0), corrected,
+                               kept_two),
+            without_gap=_1040_map(_1040_close(journal, 20.0,
+                                              observed=_1040_LATER),
+                                  _875_milestone(journal, 1, 3.5, None),
+                                  kept_two),
+            block_class="REPLACED", landed="K", targets={_884_ONE: (4.0, None)},
+            second=True, unchanged={_884_ONE: "keep", _884_TWO: "withhold"},
+            class_keys={(_884_TWO, "reason", "unpaired-close-change")})
+    elif case == "16-inert-addition-lands-class":
+        added = _875_milestone(journal, 2, 12.0, 6.0)
+        spec.update(
+            records=[close, one, *_1040_inert(journal, "two", [
+                _884_replace(added, 0)])],
+            inert={_884_TWO: 0},
+            with_gap=_1040_map(_1040_close(journal, 20.0, tokens=400),
+                               _875_milestone(journal, 1, 6.0, None), added),
+            without_gap=_1040_map(_1040_close(journal, 9.0),
+                                  _875_milestone(journal, 1, 4.0, None)),
+            block_class="REPLACED", landed="class",
+            targets={_1040_CLOSE: 20.0, _884_ONE: (6.0, None),
+                     _884_TWO: (12.0, 6.0)},
+            class_keys={(_884_TWO, "reason", "revision-gap")})
+    elif case in ("18-inert-close-population-lands-K",
+                  "18-inert-close-missing-card-lands-K"):
+        if case.endswith("population-lands-K"):
+            current = close
+            desired = _1040_close(journal, 20.0, tokens=400,
+                                  observed=_1040_OBSERVED)
+            reference = _1040_close(journal, 9.0)
+        else:
+            current = _1040_close(journal, 0.0, pricing={
+                "version": 1, "unpricedModels": ["m"]})
+            priced = {"version": 1, "unpricedModels": []}
+            desired = _1040_close(journal, 20.0, observed=_1040_OBSERVED,
+                                  pricing=priced)
+            reference = _1040_close(journal, 20.0, observed=_1040_LATER,
+                                    pricing=priced)
+        spec.update(
+            records=[current, one, *_1040_inert(journal, "close", [
+                _884_replace(current, 1, total_cost_usd=11.0)])],
+            inert={_1040_CLOSE: 1},
+            with_gap=_1040_map(desired, _1040_corrected(journal, 1, 6.0, None)),
+            without_gap=_1040_map(reference,
+                                  _875_milestone(journal, 1, 4.0, None)),
+            block_class="REPLACED", landed="K", targets={_884_ONE: (3.0, None)},
+            second=True, unchanged={_884_ONE: "keep"},
+            class_keys={(_884_ONE, "reason", "close-lineage-uncertain")})
+    elif case in ("19-return-to-anchor-lands-P", "20-unpaired-lands-class"):
+        successor = _875_milestone(journal, 2, 9.0, 6.0 if case.startswith(
+            "19") else 2.0)
+        records = [one, successor, *_884_batch(journal, "rewrite", [
+            _884_replace(one, 1, block_cost_usd=7.0)]),
+            *_1040_inert(journal, "successor", [
+                _884_replace(successor, 1, marginal_cost_usd=2.0)])]
+        crossing = 3.0 if case.startswith("19") else 5.0
+        spec.update(
+            records=records, inert={_884_TWO: 1},
+            with_gap=_1040_map(_1040_close(journal, 20.0),
+                               _875_milestone(journal, 1, crossing, None)),
+            without_gap=_1040_map(_875_milestone(journal, 1, 3.5, None)),
+            block_class="ADDED", second=True,
+            unchanged={_884_TWO: "keep"})
+        if case.startswith("19"):
+            spec.update(landed="P",
+                        targets={_1040_CLOSE: 20.0, _884_ONE: (3.0, None)},
+                        class_keys={
+                            (_884_ONE, "reason", "unpaired-close-change"),
+                            (_884_TWO, "reason", "revision-gap")})
+        else:
+            spec.update(landed="class", targets={_1040_CLOSE: 20.0},
+                        class_keys={
+                            (_884_ONE, "reason", "unpaired-close-change")})
+    elif case == "21-harms-are-not-interchangeable":
+        records = [one, *_884_batch(journal, "rewrite", [
+            _884_replace(one, 1, block_cost_usd=7.0)]),
+            *_1040_inert(journal, "one", [_884_replace(one, 2)])]
+        spec.update(
+            records=records, inert={_884_ONE: 2},
+            with_gap=_1040_map(_1040_close(journal, 20.0),
+                               _1040_corrected(journal, 1, 3.0, None)),
+            without_gap=_1040_map(_875_milestone(journal, 1, 3.5, None)),
+            block_class="ADDED", landed="M", targets={_1040_CLOSE: 20.0})
+    elif case == "22-moved-close-lands-K":
+        moved = _1040_in_b(close, _1040_CLOSE)
+        b_one = _1040_in_b(one, f"fhm:{_875_ACCOUNT}:{_1040_OTHER_WINDOW}:0:1")
+        spec.update(
+            records=[close, one, b_one, *_884_batch(journal, "moved", [
+                _884_replace(close, 1,
+                             five_hour_window_key=_1040_OTHER_WINDOW)]),
+                *_1040_inert(journal, "close", [_884_replace(
+                    moved, 2, total_cost_usd=11.0)])],
+            inert={_1040_CLOSE: 2},
+            with_gap=_1040_map(_1040_with(
+                moved, first_observed_at_utc=_1040_OBSERVED)),
+            without_gap=_1040_map(_1040_with(
+                moved, first_observed_at_utc=_1040_LATER)),
+            block=_1040_B_BLOCK, block_class="FROZEN", landed="K", targets={},
+            component=tuple(sorted([(_875_ACCOUNT, _875_WINDOW),
+                                    _1040_B_BLOCK], key=repr)),
+            unchanged={_884_ONE: "keep"},
+            class_keys={(_884_ONE, "reason", "close-lineage-uncertain")})
+    else:
+        raise AssertionError(case)
+    return spec
+
+
+_1040_DECISION_CASES = [
+    "6-pending-restore-lands-F", "7-unusable-total-lands-K",
+    "8-inert-successor-lands-A", "10-clean-revival-lands-class",
+    "12-two-close-ids-lands-K", "15-revival-over-rewrites-lands-K",
+    "16-inert-addition-lands-class", "18-inert-close-population-lands-K",
+    "18-inert-close-missing-card-lands-K", "19-return-to-anchor-lands-P",
+    "20-unpaired-lands-class", "21-harms-are-not-interchangeable",
+    "22-moved-close-lands-K",
+]
+
+
+def _1040_target_value(record):
+    payload = record["payload"]
+    if payload["kind"] == "five_hour_block_close":
+        return payload["total_cost_usd"]
+    return payload["block_cost_usd"], payload["marginal_cost_usd"]
+
+
+@pytest.mark.parametrize("case", _1040_DECISION_CASES)
+def test_1040_decision(cctally_module, case):
+    """#1040 spec §5.4, planner cases 6–8, 10, 12, 15, 16 and 18–22.
+
+    Detects: a completion batch that makes a #884 milestone decision worse
+    than the block's required additions alone would (a new withhold, a
+    ``keep`` turned ``restore``, an exchanged harm), a legitimate change
+    dropped when a candidate could land it without harm, a cross-block
+    withhold missed because the component left out a block a moved close
+    once belonged to, and a landed candidate that the next completion round
+    would append again.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    spec = _1040_decision_case(journal, case)
+    records = spec["records"]
+    plan, context = _1040_run(
+        journal, rederive, records, spec["with_gap"], spec["without_gap"],
+        excluded=spec["excluded"], inert=spec["inert"])
+    decision = _1040_decision(
+        plan, spec.get("block", (_875_ACCOUNT, _875_WINDOW)))
+    summary = (decision, {k: _1040_target_value(v)
+                          for k, v in plan.targets.items()})
+    assert decision.block_class == spec["block_class"], summary
+    assert decision.landed == spec["landed"], summary
+    assert {event_id: _1040_target_value(record)
+            for event_id, record in plan.targets.items()} == \
+        spec["targets"], summary
+    assert spec.get("class_keys", set()) <= decision.violations["class"], \
+        summary
+    landed = decision.violations[decision.landed]
+    alone = decision.violations["A"] if "A" in decision.violations else landed
+    assert landed <= alone, summary
+    assert not any(other < landed for other in decision.violations.values())
+    if "component" in spec:
+        assert decision.component == spec["component"], summary
+    if decision.violations["class"] == frozenset():
+        assert list(decision.violations) == ["class"], summary
+    appended = _1040_append(journal, records, plan, context, "first")
+    after = _1040_decisions_after(
+        journal, rederive, appended, sorted(spec.get("unchanged", {})),
+        excluded=spec["excluded"])
+    assert {event_id: item.action for event_id, item in after.items()} == \
+        spec.get("unchanged", {}), (summary, after)
+    if spec["second"]:
+        again, _context = _1040_run(
+            journal, rederive, appended, spec["with_gap"],
+            spec["without_gap"], excluded=spec["excluded"],
+            inert=spec["inert"])
+        assert again.targets == {}, {
+            k: _1040_target_value(v) for k, v in again.targets.items()}
+
+
+def _1040_two_block_case(journal):
+    """Spec §6 case 22's variant: close x moved from block A to block B, A
+    holding its own close y; the gap corrects x's metadata in B and one of
+    A's crossings, so both blocks are touched in one component."""
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    moved = _1040_in_b(close, _1040_CLOSE)
+    records = [close, one, *_884_batch(journal, "moved", [_884_replace(
+        close, 1, five_hour_window_key=_1040_OTHER_WINDOW)]),
+        _1040_close(journal, 10.0, event_id=_1040_SECOND_CLOSE)]
+    with_gap = _1040_map(_1040_with(moved, first_observed_at_utc=_1040_OBSERVED),
+                         _1040_corrected(journal, 1, 4.0, None))
+    without_gap = _1040_map(_1040_with(moved, first_observed_at_utc=_1040_LATER),
+                            _875_milestone(journal, 1, 3.5, None))
+    return records, with_gap, without_gap
+
+
+@pytest.mark.parametrize("union_harm", [False, True])
+def test_1040_component_with_two_touched_blocks(cctally_module, monkeypatch,
+                                                union_harm):
+    """#1040 spec §5.4 (G13, G14), planner case 22's two-block variant.
+
+    Detects: two touched blocks of one component deciding independently, so
+    that records each block would land harmlessly alone land together and
+    worsen a decision. Without such harm the union of the blocks' choices
+    lands (real lineage). With it every touched block lands its additions
+    alone; the union harm is injected through the violation function,
+    because no real record pair found harms only together (each block's
+    candidates are simulated over the whole component with the other's
+    additions carried).
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    records, with_gap, without_gap = _1040_two_block_case(journal)
+    if union_harm:
+        real = rederive._violation_keys
+
+        def harmful_together(before, after, milestone_ids, simulated):
+            keys = real(before, after, milestone_ids, simulated)
+            if {_1040_CLOSE, _884_ONE} <= set(simulated):
+                keys |= {(_884_ONE, "reason", "union")}
+            return frozenset(keys)
+
+        monkeypatch.setattr(rederive, "_violation_keys", harmful_together)
+    plan, _context = _1040_run(journal, rederive, records, with_gap,
+                               without_gap)
+    blocks = [(_875_ACCOUNT, _875_WINDOW), _1040_B_BLOCK]
+    by_block = {decision.block: decision for decision in plan.decisions}
+    assert sorted(by_block, key=repr) == sorted(blocks, key=repr)
+    for decision in by_block.values():
+        assert decision.component == tuple(sorted(blocks, key=repr))
+        assert decision.block_class == "FROZEN"
+    if union_harm:
+        assert {d.landed for d in by_block.values()} == {"A"}
+        assert plan.targets == {}
+    else:
+        assert {d.landed for d in by_block.values()} == {"class"}
+        assert sorted(plan.targets) == [_1040_CLOSE, _884_ONE]
+        close = plan.targets[_1040_CLOSE]["payload"]
+        assert (close["total_cost_usd"], close["first_observed_at_utc"]) == \
+            (10.0, _1040_OBSERVED)
+        assert _1040_target_value(plan.targets[_884_ONE]) == (3.0, None)
+
+
+# ── Fix round: required additions, block class, ownership (spec §5.2, §5.4) ─
+
+@pytest.mark.parametrize("gap", [False, True])
+def test_1040_tombstoned_milestone_revival_is_optional(cctally_module, gap):
+    """#1040 spec §5.4 "Required additions": a revival is not required.
+
+    Detects: a revival of a tombstoned milestone (its id is in
+    ``selection.by_id``) treated as a required addition, so the additions
+    alone (A) carry it and an optional rewrite that writes above an inert
+    revision lands with a new ``withhold``. Without the inert revision the
+    revival is harmless and the class proposal still lands it.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 3.0)
+    records = [close, one, two,
+               *_884_batch(journal, "retire", [_884_tombstone(two, 1)])]
+    inert = {}
+    if gap:
+        records += _1040_inert(journal, "two", [_884_replace(two, 2)])
+        inert = {_884_TWO: 2}
+    with_gap = _1040_map(_875_milestone(journal, 2, 6.0, 3.0))
+    plan, context = _1040_run(journal, rederive, records, with_gap, {},
+                              inert=inert)
+    assert context["selection"].by_id[_884_TWO].status == "tombstone"
+    decision = _1040_decision(plan)
+    summary = (decision, {k: _1040_target_value(v)
+                          for k, v in plan.targets.items()})
+    assert decision.block_class == "FROZEN", summary
+    assert _884_TWO in plan.handled, summary
+    if gap:
+        assert decision.violations["A"] == frozenset(), summary
+        assert decision.violations[decision.landed] == frozenset(), summary
+        assert plan.targets == {}, summary
+    else:
+        assert decision.landed == "class", summary
+        assert {k: _1040_target_value(v) for k, v in plan.targets.items()} \
+            == {_884_TWO: (6.0, 3.0)}, summary
+
+
+@pytest.mark.parametrize("case", [
+    "second-close-unrecorded", "second-close-open-retained",
+    "only-close-open-retained", "revival-among-several",
+])
+def test_1040_block_class_reads_the_final_state(cctally_module, case):
+    """#1040 spec §5.2 rule 2: a block is OPEN only when no close id stays
+    closed in the final state.
+
+    Detects: a block that keeps a closed close sent down today's path
+    because another close id of it is not closed (unrecorded, or retained
+    open and corrected open by the gap), which journals the gap's crossing
+    at replay's money under the closed close; the converse, a block whose
+    only close is retained open decided by the planner; and a revival among
+    several close ids classified other than FROZEN with D as its target.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    corrected_one = _1040_with(_875_milestone(journal, 1, 7.0, None),
+                               captured_at_utc="2026-07-26T12:01:30Z")
+    plain_one = _875_milestone(journal, 1, 3.5, None)
+    if case == "second-close-unrecorded":
+        second = _1040_close(journal, 20.0, event_id=_1040_SECOND_CLOSE)
+        records = [close, one]
+        with_gap = _1040_map(second, corrected_one)
+        without_gap = _1040_map(second, plain_one)
+    elif case == "second-close-open-retained":
+        records = [close, _1040_close(journal, 5.0, is_closed=0,
+                                      event_id=_1040_SECOND_CLOSE), one]
+        with_gap = _1040_map(_1040_close(
+            journal, 20.0, is_closed=0, event_id=_1040_SECOND_CLOSE,
+            observed=_1040_OBSERVED), corrected_one)
+        without_gap = _1040_map(_1040_close(
+            journal, 20.0, is_closed=0, event_id=_1040_SECOND_CLOSE,
+            observed=_1040_LATER), plain_one)
+    elif case == "only-close-open-retained":
+        records = [_1040_close(journal, 5.0, is_closed=0), one]
+        with_gap = _1040_map(_1040_close(journal, 20.0,
+                                         observed=_1040_OBSERVED),
+                             corrected_one)
+        without_gap = _1040_map(_1040_close(journal, 20.0,
+                                            observed=_1040_LATER), plain_one)
+    else:
+        second = _1040_close(journal, 10.0, event_id=_1040_SECOND_CLOSE)
+        records = [close, second,
+                   *_884_batch(journal, "retire", [_884_tombstone(second, 1)])]
+        with_gap = _1040_map(_1040_close(
+            journal, 20.0, event_id=_1040_SECOND_CLOSE,
+            observed=_1040_OBSERVED))
+        without_gap = _1040_map(_1040_close(
+            journal, 20.0, event_id=_1040_SECOND_CLOSE,
+            observed=_1040_LATER))
+    plan, _context = _1040_run(journal, rederive, records, with_gap,
+                               without_gap)
+    summary = (plan.decisions, sorted(plan.handled),
+               {k: _1040_target_value(v) for k, v in plan.targets.items()})
+    assert set(plan.targets) <= plan.handled, summary
+    if case == "only-close-open-retained":
+        assert plan.decisions == (), summary
+        assert plan.handled == frozenset(), summary
+        return
+    decision = _1040_decision(plan)
+    assert decision.block_class == "FROZEN", summary
+    if case == "revival-among-several":
+        assert decision.landed == "class", summary
+        assert {k: _1040_target_value(v) for k, v in plan.targets.items()} \
+            == {_1040_SECOND_CLOSE: 20.0}, summary
+        return
+    assert _884_ONE in plan.handled, summary
+    assert {k: _1040_target_value(v) for k, v in plan.targets.items()} == \
+        {_884_ONE: (3.0, None)}, summary
+    if case == "second-close-open-retained":
+        # The open close keeps today's path: the planner neither owns nor
+        # writes it.
+        assert _1040_SECOND_CLOSE not in plan.handled, summary
+
+
+def test_1040_milestone_moved_to_an_open_block_keeps_todays_path(
+        cctally_module):
+    """#1040 (targets ⊆ handled): an id the planner does not own alone.
+
+    Detects: a milestone the gap moves from a decided block X to an OPEN
+    block Y (no close) rewritten by X's candidates in X while today's path
+    owns it, so completion journals a record in the block the replay moved
+    it out of. X's other crossing is still decided with its money frozen.
+    """
+    import _lib_journal as journal
+    import _lib_rederive as rederive
+
+    close = _1040_close(journal, 10.0)
+    one = _875_milestone(journal, 1, 3.0, None)
+    two = _875_milestone(journal, 2, 6.0, 2.0)  # a stale marginal
+    records = [close, one, two]
+    with_gap = _1040_map(
+        _1040_with(_875_milestone(journal, 1, 7.0, None),
+                   captured_at_utc="2026-07-26T12:01:30Z"),
+        _1040_in_b(two, _884_TWO))
+    without_gap = _1040_map(_875_milestone(journal, 1, 3.5, None), two)
+    plan, _context = _1040_run(journal, rederive, records, with_gap,
+                               without_gap)
+    summary = (plan.decisions, sorted(plan.handled),
+               {k: _1040_target_value(v) for k, v in plan.targets.items()})
+    assert set(plan.targets) <= plan.handled, summary
+    assert _884_TWO not in plan.handled, summary
+    decision = _1040_decision(plan)
+    assert decision.block_class == "FROZEN", summary
+    assert {k: _1040_target_value(v) for k, v in plan.targets.items()} == \
+        {_884_ONE: (3.0, None)}, summary
+    assert [d.block for d in plan.decisions] == [(_875_ACCOUNT, _875_WINDOW)]

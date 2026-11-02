@@ -13,6 +13,8 @@ Owner A's final commit (tests/fixtures/901/doctor-baseline/). Required:
   adds after that commit (§5.3a), and by nothing else;
 - #968 adds exactly the Compressed Codex rollouts check and one OK count;
 - #997 adds exactly the Rebuild worker check and one OK count.
+- #944 adds exactly the Claude cost attribution check (OK, zero rows) and
+  one OK count.
 A whole-golden refresh cannot pass this: any other byte difference fails.
 """
 
@@ -69,13 +71,13 @@ NEW_CATEGORY = {
 # final commit. The doctor's registry views must grow by exactly that entry.
 #: #825/#832 (spec section 6, 8) authorizes two further differences, each
 #: asserted exactly: the stats epoch moves 1017 -> 1018, and since #797/#823/#840
-#: (spec 4.6 B6) to 1019 (the `db.version_ahead`
+#: (spec 4.6 B6) to 1019 and #1019/#1014 (spec 4.7 C6) to 1020, then #943 to 1021 and #1015 to 1022 and #948 to 1023 (the `db.version_ahead`
 #: details and summary), and the journal category gains `journal.legacy_writer`
 #: right after `journal.protocol`. On every fixture that leg is OK and reports
 #: either an unavailable summary or no cutover yet.
 # #968 adds cache migration 049; the registry views grow by that entry too.
 BASE_STATS_EPOCH = 1017
-ACCOUNT_BOUND_STATS_EPOCH = 1019
+ACCOUNT_BOUND_STATS_EPOCH = 1023
 LEGACY_WRITER_ID = "journal.legacy_writer"
 LEGACY_WRITER_AFTER = "journal.protocol"
 LEGACY_WRITER_SUMMARIES = (
@@ -216,10 +218,41 @@ def _split_quarantine_category(categories):
     return categories[:index] + categories[index + 1:]
 
 
+#: #944 (spec 5.9) adds `accounts.claude_cost_attribution` right after
+#: `accounts.attribution`. No doctor fixture holds a Claude cost decision, so
+#: it reports OK with zero rows (after any export sentence) on every one.
+CLAUDE_COST_ID = "accounts.claude_cost_attribution"
+CLAUDE_COST_AFTER = "accounts.attribution"
+
+
+def _split_claude_cost_attribution(categories):
+    """``categories`` without the #944 check, and that check."""
+    out, found = [], []
+    for cat in categories:
+        checks = []
+        for chk in cat["checks"]:
+            if chk["id"] == CLAUDE_COST_ID:
+                assert checks and checks[-1]["id"] == CLAUDE_COST_AFTER
+                found.append(chk)
+            else:
+                checks.append(chk)
+        out.append(dict(cat, checks=checks))
+    assert len(found) == 1
+    (chk,) = found
+    assert (chk["title"], chk["severity"]) == ("Claude cost attribution", "ok")
+    assert chk["summary"].endswith(
+        "Claude cost decided in the last 7 days was attributed from "
+        "write-time account evidence (0 rows)")
+    assert chk["details"]["totalRows"] == 0
+    return out, chk
+
+
 BASE_CACHE_REGISTRY_SIZE = 47
 ADDED_CACHE_MIGRATIONS = (
     "048_codex_quota_physical_group_order",
     "049_codex_rollout_containers",
+    "050_preserve_claude_cost_attribution",
+    "051_codex_retained_identities",
 )
 
 
@@ -284,13 +317,13 @@ def _report(doc):
 #: Doctor scenarios added after the #901 baseline was frozen. Each is pinned by
 #: its own goldens and has no baseline to differ from; naming them here keeps
 #: an undeclared new scenario failing below.
-#: #825/#832 (spec section 8, F9/F16): the two scenarios with a current
-#: account-bound store, the only fixtures where `journal.legacy_writer` and
+#: #825/#832 (spec section 8, F9/F16): the scenario with a current
+#: account-bound store, the only fixture where `journal.legacy_writer` and
 #: `accounting.outcome_quarantine` report real states rather than unavailable.
-#: #997: the scenario whose rebuild and auto-heal workers died and failed, the
-#: only fixture where `db.rebuild_worker` reports a real state.
-POST_BASELINE_SCENARIOS = ("40-account-bound-clear", "41-account-bound-legacy-write",
-                           "42-rebuild-workers-died-failed")
+#: (The test regime reset's doctor cut deleted the legacy-write and
+#: rebuild-worker scenarios with their baselines; section 12 of its protection
+#: map names their retained detectors.)
+POST_BASELINE_SCENARIOS = ("40-account-bound-clear",)
 
 
 def test_baseline_covers_every_doctor_scenario():
@@ -305,9 +338,11 @@ def test_only_the_authorized_doctor_differences(scenario):
     base = _load(BASELINE / f"{scenario}.json")
     cur_full = _load(CURRENT / scenario / "expected.json")
     cur = dict(cur_full)
+    without_claude_cost, claude_cost = _split_claude_cost_attribution(
+        cur_full["categories"])
     cur["categories"], legacy_writer = _split_legacy_writer(
         _split_quarantine_category(_split_compressed_rollouts(
-            _split_rebuild_worker(cur_full["categories"]))))
+            _split_rebuild_worker(without_claude_cost))))
     assert legacy_writer["severity"] == "ok"
     assert legacy_writer["title"] == "Legacy writer"
     assert legacy_writer["summary"] in LEGACY_WRITER_SUMMARIES
@@ -341,7 +376,7 @@ def test_only_the_authorized_doctor_differences(scenario):
 
     # Counts, severity and the identity slice follow from those verdicts alone.
     expected_counts = dict(base["overall"]["counts"])
-    expected_counts["ok"] = expected_counts.get("ok", 0) + 4
+    expected_counts["ok"] = expected_counts.get("ok", 0) + 5
     expected_counts["warn"] = expected_counts.get("warn", 0) + 1
     assert cur["overall"]["counts"] == expected_counts
     # Every fixture already carries a WARN or FAIL, so the roll-up holds.
@@ -358,6 +393,8 @@ def test_only_the_authorized_doctor_differences(scenario):
                 checks.append(COMPRESSED_CHECK)
             if chk["id"] == REBUILD_WORKER_AFTER:
                 checks.append(REBUILD_WORKER_CHECK)
+            if chk["id"] == CLAUDE_COST_AFTER:
+                checks.append(claude_cost)
         expected_categories.append(dict(cat, checks=checks))
         if cat["id"] == QUARANTINE_AFTER:
             expected_categories.append(QUARANTINE_CATEGORY)

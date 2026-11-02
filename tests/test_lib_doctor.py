@@ -1249,8 +1249,8 @@ def test_safety_dashboard_bind_lan_with_expose_surfaces_detail():
 
 def test_safety_dashboard_bind_lan_without_expose_no_detail():
     """LAN bind, expose off (the default): the LAN-bind WARN is unchanged —
-    NO transcript detail, NO summary mention. This is the case the
-    `06-dashboard-bind-lan` golden pins, so the goldens stay byte-identical."""
+    NO transcript detail, NO summary mention. (The stored `lan` value's gather
+    is pinned by tests/test_doctor_gather.py::test_gather_state_with_runtime_bind.)"""
     s = _state(dashboard_bind_stored="lan")  # expose_transcripts defaults False
     r = L._check_safety_dashboard_bind(s)
     assert r.severity == "warn"

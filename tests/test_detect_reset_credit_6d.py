@@ -174,14 +174,18 @@ def _five_hour_setup(conn, *, journal_id="sa:seed5h", captured="2026-01-04T12:00
     # followed by a distinct same-source confirmation. These tests call
     # `detect_reset_and_credit` directly with no `source`, so the descent is
     # seeded under the `unknown` bucket that such callers are filed in, at the
-    # same instant `_expected_fhc_key` floors.
+    # same instant `_expected_fhc_key` floors. #943 spec 4.2.1: the arming
+    # observation's capture second is its own column (the credit's exact
+    # boundary); it is seeded at the top of the slot, before the seeded
+    # replica, so that replica stays inside the stale-replica band.
     conn.execute(
         "INSERT INTO five_hour_credit_confirmation_state "
         "(account_key, five_hour_window_key, source, baseline_pct, "
-        " pending_low_pct, pending_at_utc, pending_observation_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " pending_low_pct, pending_at_utc, pending_observation_id, "
+        " pending_captured_at_utc) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ("unattributed", _5H_KEY, "unknown", 28.0, 4.0, _AS_OF,
-         "o:seeded-descent"),
+         "o:seeded-descent", "2026-01-04T12:00:00Z"),
     )
 
 
@@ -247,18 +251,26 @@ def test_detect_5h_suppression_empty_on_replay(ns):
         # credit that fired and whose INSERT collided produces one, and so does
         # a credit that never fired at all. A COUNT over
         # `five_hour_reset_events` cannot tell them apart either, because this
-        # test pre-inserts an event row. The stale-replica DELETE does, because
-        # it runs only on the credit path and unconditionally once there — the
-        # same pivot `test_detect_5h_legacy_no_ctx_still_fires_and_deletes`
-        # already asserts. (#825/#832 fix round K15: the seeded row is an
-        # UNHELD stale replica, so the cleanup retires its five-hour effect
-        # in place rather than deleting it.)
+        # test pre-inserts an event row. The confirmation state does: the
+        # CONFIRM leg alone retires the pending descent and restarts the
+        # source's baseline at the confirming reading.
         assert tuple(conn.execute(
-            "SELECT five_hour_percent, five_hour_resets_at, five_hour_window_key "
-            "FROM weekly_usage_snapshots WHERE journal_id = 'sa:seed5h'"
-        ).fetchone() or ()) == (None, None, None), (
+            "SELECT baseline_pct, pending_low_pct, pending_captured_at_utc "
+            "FROM five_hour_credit_confirmation_state "
+            "WHERE source = 'unknown'").fetchone()) == (4.0, None, None), (
             "the credit did not fire at all, so the empty suppression map "
             "proves nothing about the crash-replay path")
+        # #943 spec 4.2.3: and the collided insert ran NO cleanup and installed
+        # no boundary companion. Detects a cleanup that is not gated on the
+        # insert's rowcount: it would retire this replica live, while no evt
+        # (and so no suppression) is journaled for the absorbed credit, so a
+        # rebuild would restore it — a live-only mutation.
+        assert tuple(conn.execute(
+            "SELECT five_hour_percent, five_hour_window_key "
+            "FROM weekly_usage_snapshots WHERE journal_id = 'sa:seed5h'"
+        ).fetchone()) == (28.0, _5H_KEY)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_credit_boundaries").fetchone()[0] == 0
     finally:
         conn.close()
 

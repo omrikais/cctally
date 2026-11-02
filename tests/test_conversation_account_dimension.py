@@ -1981,3 +1981,228 @@ def test_a_path_still_on_disk_survives_a_walk_that_missed_it(store,
     assert conn.execute(
         "SELECT COUNT(*) FROM conversation_source_files WHERE path=?",
         (str(b),)).fetchone()[0] == 1
+
+
+# --- #944 spec 5.8: the conversations twin's fresh case ----------------------
+#
+# A record first observed now takes its write-time account, read from the
+# attached cache: the accounting decision, else (while 050 is pending) the
+# accounting row's stamp, else the shared kernel over the attached timeline.
+# Each case pins the active identity to "acct-b", so the pre-#944 behaviour
+# (the conversations-ingest identity) is the failing value.
+
+def _t944_cache(ns):
+    return sqlite3.connect(ns["_cctally_core"].CACHE_DB_PATH)
+
+
+def _t944_obs(cache_conn, at, account):
+    import _lib_claude_attribution as K
+    cache_conn.execute(
+        "INSERT INTO claude_account_timeline (captured_at_utc, precision_us,"
+        " account_key, journal_segment, journal_offset) VALUES (?,?,?,?,?)",
+        (K.iso_from_us(K.us_from_iso(at)), 1_000_000, account,
+         "observations-2026-06.jsonl", 0))
+
+
+def _t944_sync(ns, conn, projects, ts="2026-06-01T00:00:00Z"):
+    a = projects / "a.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one", ts=ts))
+    ns["sync_claude_conversations"](conn)
+    (account,) = _s3_accounts(conn).values()
+    assert [row[4] for row in _s3_stamps(conn)] == [account]
+    return account
+
+
+def test_a_fresh_record_consumes_the_accounting_decision(store, monkeypatch):
+    """Detects: a conversation message filed under the conversations-ingest
+    identity when accounting already decided the record's account."""
+    import _lib_claude_attribution as K
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    cache_conn = _t944_cache(ns)
+    try:
+        cache_conn.execute(
+            "INSERT INTO claude_cost_decisions (decision_key, form, msg_id,"
+            " req_id, account_key, basis, rule, decided_at_utc,"
+            " journal_segment, journal_offset) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (K.keyed_key("m1", "r1"), K.FORM_KEYED, "m1", "r1", "acct-dec",
+             K.BASIS_FALLBACK, K.RULE_VERSION, "2026-06-01T00:00:01Z",
+             "observations-2026-06.jsonl", 0))
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    assert _t944_sync(ns, conn, projects) == "acct-dec"
+
+
+@pytest.mark.parametrize("msg_id,req_id", [("m1", ""), (7, "r1")],
+                         ids=["empty-requestId", "numeric-message-id"])
+def test_an_invalid_id_record_finds_the_physical_decision(
+        store, monkeypatch, msg_id, req_id):
+    """#944 F1: accounting identifies a record whose id is empty or not a
+    string by its bytes (physical form). Detects: the twin keying the same
+    record on the invalid ids, missing accounting's decision and filing the
+    message under the conversations-ingest identity instead."""
+    import _lib_claude_attribution as K
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    line = _s3_asst_line("u1", msg_id, req_id, "one")
+    raw = line.rstrip("\n").encode("utf-8")
+    loc = K.loc_for(str(projects / "a.jsonl"))
+    cache_conn = _t944_cache(ns)
+    try:
+        cache_conn.execute(
+            "INSERT INTO claude_cost_decisions (decision_key, form, loc,"
+            " byte_offset, digest, account_key, basis, rule, decided_at_utc,"
+            " journal_segment, journal_offset)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (K.physical_key(loc, 0, raw), K.FORM_PHYSICAL, loc, 0,
+             K.record_sha256(raw), "acct-dec", K.BASIS_FALLBACK,
+             K.RULE_VERSION, "2026-06-01T00:00:01Z",
+             "observations-2026-06.jsonl", 0))
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    (projects / "a.jsonl").write_text(line)
+    ns["sync_claude_conversations"](conn)
+    assert list(_s3_accounts(conn).values()) == ["acct-dec"]
+
+
+@pytest.mark.parametrize("export", ["pending", "applied"])
+def test_a_fresh_record_takes_the_row_stamp_only_while_050_is_pending(
+        store, monkeypatch, export):
+    """Detects: a message ignoring an upgraded store's existing accounting
+    stamp before 050 has exported it, or consulting that stamp after 050 has
+    made the decisions authoritative."""
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    cache_conn = _t944_cache(ns)
+    try:
+        cache_conn.execute(
+            "INSERT INTO session_entries (source_path, line_offset,"
+            " timestamp_utc, model, msg_id, req_id, input_tokens,"
+            " output_tokens, cache_create_tokens, cache_read_tokens,"
+            " account_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (str(projects / "a.jsonl"), 0, "2026-06-01T00:00:00Z",
+             "claude-opus-4-8", "m1", "r1", 10, 5, 0, 0, "acct-row"))
+        if export == "pending":
+            cache_conn.execute(
+                "DELETE FROM schema_migrations WHERE name="
+                "'050_preserve_claude_cost_attribution'")
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    expected = "acct-row" if export == "pending" else "acct-b"
+    assert _t944_sync(ns, conn, projects) == expected
+
+
+@pytest.mark.parametrize("ts,expected", [
+    ("2026-06-01T00:00:00Z", "acct-a"),
+    # Later than the resolution clock: contradicts the write order, so it
+    # falls back (clock_order) despite A on both sides.
+    ("2099-06-01T00:00:00Z", "acct-b"),
+])
+def test_a_fresh_record_resolves_through_the_attached_timeline(
+        store, monkeypatch, ts, expected):
+    """Detects: a delayed conversation ingest filing a message written while
+    A was active under the account active at ingest (B), or a timestamp that
+    contradicts the write order being attributed from its neighbours."""
+    import _lib_claude_attribution as K
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    at = K.us_from_iso(ts)
+    cache_conn = _t944_cache(ns)
+    try:
+        _t944_obs(cache_conn, K.iso_from_us(at - 60_000_000), "acct-a")
+        _t944_obs(cache_conn, K.iso_from_us(at + 60_000_000), "acct-a")
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+    assert _t944_sync(ns, conn, projects, ts=ts) == expected
+
+
+def test_an_unavailable_cache_attachment_falls_back_to_the_ingest_identity():
+    """Detects: a conversation ingest failing, or guessing an account, when
+    the cache is not attached."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        fresh = cache._ConversationFreshAccount(conn, "acct-b")
+        assert not fresh.usable
+        mrow = SimpleNamespace(msg_id="m1", req_id="r1", byte_offset=0,
+                               timestamp_utc="2026-06-01T00:00:00Z")
+        assert fresh.resolve(mrow, b"{}\n", "a.jsonl") == "acct-b"
+    finally:
+        conn.close()
+
+
+def test_the_fresh_account_memo_holds_only_the_current_file(store,
+                                                            monkeypatch):
+    """The conversations resolver's timeline-neighbour memo is scoped to the
+    source file being ingested. Detects: a memo that grew with every interval
+    one conversations ingest resolved, so a cold ingest of a large history
+    held every record's neighbours in memory at once."""
+    import _cctally_cache as cc
+    ns, conn, projects = store
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    (projects / "a.jsonl").write_text(
+        _s3_asst_line("u1", "m1", "r1", "one", ts="2026-06-01T00:00:00Z"))
+    (projects / "b.jsonl").write_text(
+        _s3_asst_line("u2", "m2", "r2", "two", sid="s2",
+                      ts="2026-06-02T00:00:00Z"))
+    real = cc._ConversationFreshAccount.resolve
+    seen = []
+
+    def spy(self, mrow, raw, source_path):
+        out = real(self, mrow, raw, source_path)
+        seen.append((pathlib.Path(source_path).name, set(self.memo)))
+        return out
+    monkeypatch.setattr(cc._ConversationFreshAccount, "resolve", spy)
+    ns["sync_claude_conversations"](conn)
+    assert sorted(name for name, _keys in seen) == ["a.jsonl", "b.jsonl"]
+    first, second = seen[0][1], seen[1][1]
+    assert first and second
+    assert not first & second
+
+
+@pytest.mark.parametrize("bounds", [None, (1, 1)],
+                         ids=["batched", "one-file-control"])
+def test_claude_decision_committed_between_preparations_is_stamped(
+        store, monkeypatch, bounds):
+    """#939 D1: an accounting decision committed after file A was prepared and
+    before file B is the one B's stamp names, in a batch exactly as in the
+    one-file control. Detects: a batched pass reading accounting state from a
+    snapshot older than the file it prepares, which files the record under
+    the ingest identity although accounting had decided it."""
+    import _lib_claude_attribution as K
+    import _cctally_cache as cc
+    ns, conn, projects = store
+    if bounds is not None:
+        monkeypatch.setattr(cc, "CLAUDE_CONVERSATION_BATCH_FILES", bounds[0])
+        monkeypatch.setattr(cc, "CLAUDE_CONVERSATION_BATCH_BYTES", bounds[1])
+    _s3_pin_account(monkeypatch, ns, "acct-b")
+    a = projects / "a.jsonl"
+    b = projects / "b.jsonl"
+    a.write_text(_s3_asst_line("u1", "m1", "r1", "one"))
+    b.write_text(_s3_asst_line("u2", "m2", "r2", "two", sid="s2"))
+    real = cc._iter_sync_entries
+
+    def walking(fh, path_str, *args, **kwargs):
+        if path_str == str(b):
+            cache_conn = _t944_cache(ns)
+            try:
+                cache_conn.execute(
+                    "INSERT INTO claude_cost_decisions (decision_key, form,"
+                    " msg_id, req_id, account_key, basis, rule, decided_at_utc,"
+                    " journal_segment, journal_offset)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (K.keyed_key("m2", "r2"), K.FORM_KEYED, "m2", "r2",
+                     "acct-dec", K.BASIS_FALLBACK, K.RULE_VERSION,
+                     "2026-06-01T00:00:01Z", "observations-2026-06.jsonl", 0))
+                cache_conn.commit()
+            finally:
+                cache_conn.close()
+        yield from real(fh, path_str, *args, **kwargs)
+    monkeypatch.setattr(cc, "_iter_sync_entries", walking)
+    ns["sync_claude_conversations"](conn)
+    assert _s3_accounts(conn) == {(str(a), 0): "acct-b", (str(b), 0): "acct-dec"}
+    assert {row[0]: row[4] for row in _s3_stamps(conn)} == {
+        str(a): "acct-b", str(b): "acct-dec"}

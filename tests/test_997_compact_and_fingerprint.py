@@ -724,9 +724,40 @@ def _published_index_digest(dump) -> str:
 #: `claude_weekly_observation_decisions` tables. No row's content otherwise
 #: changed. (The previous pin was
 #: `sha256:444d70cc633488c366c003610a38ee8823be7c454380447170f466ce993e298d`.)
+#: Re-pinned for #1019/#1014 (epoch 1020): every replayed Model-A `evt` line
+#: also carries the revision-3 successor stamp `"wpx":3`, which adds those
+#: bytes to each effective event's record and moves the journal cursor, the
+#: selector state and the admission summary by the same 48 bytes. A dump diff
+#: against the parent showed no other change: same tables, same rows. (The
+#: previous pin was
+#: `sha256:7ff3eb10b29d15f6e029b3c1fa50ed1ef515e4b30f42af3df0d6681de679865c`.)
+#: Re-pinned for #943/#956 (epoch 1021): the index gains the empty
+#: `five_hour_credit_boundaries` (the credit's exact-boundary companion) and
+#: `five_hour_block_openings` (the block-opening fact) tables. A dump diff of
+#: both passes against `c5419d209`, whose index still published the previous
+#: pin, showed no other change: every other table holds the same rows. (The
+#: previous pin was
+#: `sha256:2f4a670d963ed7ca3576001c32c735decd2f94939063ca4d3ebd42da8dc9868f`.)
+#: Re-pinned for #1015 (epoch 1022): the index gains the correction-to-fit
+#: lineage projections. On this fixture they hold the two Claude readings in
+#: `claude_weekly_observation_index` (account `acct-a`), the completed
+#: `batch:valid` in `correction_batch_lineage` with its commit coordinate and
+#: its one footprint row `('claude', 'unattributed')`, and nothing in the
+#: history, ops and `meter_rate_change_supersessions` tables;
+#: `meter_rate_change_events` (empty here) gains the NULLABLE `fit_lineage`
+#: column. Both passes publish the same digest. (The previous pin was
+#: `sha256:56b81b3cfb24d67b724e73640c36e5e5edb5428e59654fd715b96024e26d4a2e`.)
+#: Re-pinned for #948 (epoch 1023): `outcome_quarantine_envelope` and
+#: `outcome_quarantine_certificates` are gone, and the whole-prefix
+#: `outcome_quarantine_bounds` table holds the fixture's per-scope weekly and
+#: five-hour bounds plus the fold's meta row (its wall-clock-dependent
+#: `maxAdmittedAt` is normalized by `_index_dump`); no trigger exists, so
+#: the episodes and axis-state tables are empty. Both passes publish the same
+#: digest. (The previous pin was
+#: `sha256:9201c404f013935f6d30f02ea2293b7f3da50720cdd9798862c62e0458aaab8a`.)
 RELEASE_FIXTURE_INDEX_DIGESTS = (
-    "sha256:7ff3eb10b29d15f6e029b3c1fa50ed1ef515e4b30f42af3df0d6681de679865c",
-    "sha256:7ff3eb10b29d15f6e029b3c1fa50ed1ef515e4b30f42af3df0d6681de679865c",
+    "sha256:baab738b026377fc333e9e5892feedc7549f391ff2fcfa7e91af92aed295f7b1",
+    "sha256:baab738b026377fc333e9e5892feedc7549f391ff2fcfa7e91af92aed295f7b1",
 )
 
 

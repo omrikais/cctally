@@ -504,6 +504,22 @@ def test_gather_state_codex_present_via_codex_home_multiroot(tmp_path):
     assert st["codex_jsonl_present"] is True
 
 
+def test_doctor_presence_and_census_include_archive(tmp_path):
+    """#970 spec 5.9: an archive-only native home holds real Codex history;
+    doctor must report it present and count its compressed rollout, or it
+    would call a populated install empty and hide unread archived history."""
+    sys.path.insert(0, str(REPO / "tests"))
+    from _codex_zstd_fixtures import zstd_bytes  # noqa: PLC0415
+    archive = tmp_path / ".codex" / "archived_sessions"
+    archive.mkdir(parents=True)
+    name = "rollout-2026-07-20T10-00-00-0199aaaa-bbbb-7ccc-8ddd-eeeeffff0a01.jsonl"
+    (archive / (name + ".zst")).write_bytes(zstd_bytes(b"{}\n"))
+    st = _run_gather(tmp_path)
+    assert st["codex_jsonl_present"] is True
+    census = st["codex_compressed_census"]
+    assert census["compressedOnly"] == 1 and census["neverIngested"] == 1
+
+
 def test_gather_state_codex_absent_under_custom_codex_home(tmp_path):
     # $CODEX_HOME points at a root with NO session JSONL → absent (the bug:
     # the old probe glob'd ~/.codex/sessions and could miss/misreport this).
@@ -514,8 +530,15 @@ def test_gather_state_codex_absent_under_custom_codex_home(tmp_path):
 
 
 def test_gather_state_with_runtime_bind(tmp_path):
+    # A stored `dashboard.bind = lan` reaches the LAN-exposure WARN only
+    # through this raw config read (the doctor golden that pinned it was cut
+    # in the test regime reset; the check's branches are in test_lib_doctor).
+    cdir = tmp_path / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True)
+    (cdir / "config.json").write_text('{"dashboard": {"bind": "lan"}}')
     st = _run_gather(tmp_path, runtime_bind="0.0.0.0")
     assert st["runtime_bind"] == "0.0.0.0"
+    assert st["dashboard_bind_stored"] == "lan"
 
 
 def test_gather_state_detects_claude_jsonl(tmp_path):
@@ -824,3 +847,200 @@ def test_gather_marks_an_unreadable_cache_db_refusal_record(tmp_path):
         tmp_path, conversation_sessions_pricing_write_refused="{not json")
     st = _run_gather(tmp_path)
     assert st["cache_rollup_pricing_refusal"] == {"__malformed__": True}
+
+
+# --- #944 spec 5.9: accounts.claude_cost_attribution gather -----------------
+
+def _seed_claude_cost_cache(home: pathlib.Path):
+    """A cache.db with decisions covering every population boundary of the
+    doctor's 7-day count, and migration 050 stalled mid-export."""
+    sys.path.insert(0, str(REPO / "bin"))
+    import _cctally_db as db  # noqa: PLC0415
+    cdir = home / ".local" / "share" / "cctally"
+    cdir.mkdir(parents=True, exist_ok=True)
+    # doctor_gather_state gates every cache probe on this lock existing.
+    (cdir / "cache.db.maintenance.lock").touch()
+    conn = sqlite3.connect(str(cdir / "cache.db"))
+    try:
+        db._apply_cache_schema(conn)
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                     "(name TEXT PRIMARY KEY, applied_at_utc TEXT)")
+        a = "a" * 32
+        decisions = [
+            # key, form, msg, req, loc, off, account, basis, reason, at
+            ("k-1", "k1", "m1", "r1", None, None, a, "timeline_agreement",
+             None, "2026-05-12T10:00:00Z"),
+            ("k-2", "k1", "m2", "r2", None, None, a, "fallback",
+             "switch_window", "2026-05-12T11:00:00Z"),
+            ("k-3", "k1", "m3", "r3", None, None, None, "fallback",
+             "pre_timeline", "2026-05-13T01:00:00Z"),
+            # A keyed decision the retained row does not link to.
+            ("k-4", "k1", "m4", "r4", None, None, a, "fallback",
+             "open_tail", "2026-05-12T12:00:00Z"),
+            # Outside the window.
+            ("k-5", "k1", "m5", "r5", None, None, a, "fallback",
+             "open_tail", "2026-04-01T00:00:00Z"),
+            # A replaced physical record: two decisions at one location and
+            # offset, one linked.
+            ("p-a", "p1", None, None, "L" * 32, 0, a, "fallback",
+             "open_tail", "2026-05-12T13:00:00Z"),
+            ("p-b", "p1", None, None, "L" * 32, 0, a, "timeline_agreement",
+             None, "2026-05-12T14:00:00Z"),
+            ("k-8", "k1", "m8", "r8", None, None, a, "preserved_history",
+             None, "2026-05-12T15:00:00Z"),
+            # Decided in the second the window ends (#944 F10).
+            ("k-10", "k1", "m10", "r10", None, None, a, "timeline_agreement",
+             None, "2026-05-13T14:22:31Z"),
+            # One second before the window starts.
+            ("k-11", "k1", "m11", "r11", None, None, a, "fallback",
+             "open_tail", "2026-05-06T14:22:30Z"),
+        ]
+        conn.executemany(
+            "INSERT INTO claude_cost_decisions (decision_key, form, msg_id,"
+            " req_id, loc, byte_offset, account_key, basis, reason, rule,"
+            " decided_at_utc, journal_segment, journal_offset)"
+            " VALUES (?,?,?,?,?,?,?,?,?,1,?,'observations-2026-05.jsonl',0)",
+            decisions)
+        rows = [("m1", "r1", "k-1"), ("m2", "r2", "k-2"), ("m3", "r3", "k-3"),
+                ("m4", "r4", "k-other"), ("m5", "r5", "k-5"),
+                (None, None, "p-a"), ("m8", "r8", "k-8"), ("m9", "r9", None),
+                ("m10", "r10", "k-10"), ("m11", "r11", "k-11")]
+        conn.executemany(
+            "INSERT INTO session_entries (source_path, line_offset,"
+            " timestamp_utc, model, msg_id, req_id, input_tokens,"
+            " output_tokens, cache_create_tokens, cache_read_tokens,"
+            " account_key, attribution_decision_key)"
+            " VALUES ('s.jsonl', ?, '2026-05-12T00:00:00Z', 'claude-opus-4-8',"
+            " ?, ?, 1, 1, 0, 0, ?, ?)",
+            [(i * 100, m, r, a, link) for i, (m, r, link) in enumerate(rows)])
+        conn.execute(
+            "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)",
+            ("claude_cost_preservation", json.dumps({
+                "afterId": 2, "saved": 2, "total": 5,
+                "lastError": "journal append failed",
+                "lastErrorAt": "2026-05-13T10:00:00Z",
+                "lastChunkAt": "2026-05-13T09:00:00Z"})))
+        conn.execute("DELETE FROM schema_migrations WHERE name="
+                     "'050_preserve_claude_cost_attribution'")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_gather_counts_the_linked_claude_cost_population(tmp_path):
+    """Detects: the doctor counting decisions no retained row links to (a
+    replaced physical record twice, an orphan), out-of-window or preserved
+    decisions as evidence, or misreading a stalled export. Seeds decided_at
+    in the production format (seconds, ``Z``) with ``now`` inside a second
+    (#944 F10): a decision of the window's last second was dropped when the
+    bounds were compared in microsecond format."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    _seed_claude_cost_cache(tmp_path)
+    st = _run_gather(tmp_path, now_iso="2026-05-13T14:22:31.500000+00:00")
+    d = st["accounts_state"]["claude_cost_attribution"]
+    assert set(d) == {
+        "windowStart", "windowEnd", "population", "totalRows",
+        "fallbackRows", "fallbackRealAccountRows",
+        "fallbackUnattributedRows", "byReason", "firstFallbackAt",
+        "lastFallbackAt", "preservedRows", "unlinkedRows", "preservation",
+        "decisionConflicts", "alignedRows", "lastDeferral"}
+    assert (d["windowStart"], d["windowEnd"]) == (
+        "2026-05-06T14:22:31.500000Z", "2026-05-13T14:22:31.500000Z")
+    assert d["population"] == "deduplicatedClaudeCostRows"
+    assert (d["totalRows"], d["fallbackRows"], d["fallbackRealAccountRows"],
+            d["fallbackUnattributedRows"], d["preservedRows"],
+            d["unlinkedRows"]) == (5, 3, 2, 1, 1, 1)
+    assert d["byReason"] == {"open_tail": 1, "pre_timeline": 1,
+                             "switch_window": 1}
+    assert (d["firstFallbackAt"], d["lastFallbackAt"]) == (
+        "2026-05-12T11:00:00Z", "2026-05-13T01:00:00Z")
+    assert d["preservation"] == {
+        "state": "stalled", "saved": 2, "total": 5,
+        "lastError": "journal append failed",
+        "lastErrorAt": "2026-05-13T10:00:00Z"}
+    assert (d["decisionConflicts"], d["alignedRows"], d["lastDeferral"]) == (
+        0, 0, None)
+
+
+def test_gather_claude_cost_attribution_is_present_without_a_cache(tmp_path):
+    """Detects: the check disappearing (or the gather failing) on a fresh
+    install with no cache.db."""
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    d = _run_gather(tmp_path)["accounts_state"]["claude_cost_attribution"]
+    assert (d["totalRows"], d["fallbackRows"]) == (0, 0)
+    assert d["population"] == "deduplicatedClaudeCostRows"
+
+
+def test_preserved_decisions_cost_the_population_query_no_link_probe(
+        tmp_path, monkeypatch):
+    """#944 F4: for a week after an upgrade every existing row is a
+    preserved_history decision in the doctor's window (~700K measured), and
+    the population query probed each one's link before discarding it in
+    Python: ~2.8 s of SQL on every doctor run. Detects: a preserved decision
+    costing the gather as much SQLite work as an evidence decision does
+    (measured in VM steps through the progress handler, in-process)."""
+    import types
+    sys.path.insert(0, str(REPO / "tests"))
+    from conftest import load_script, redirect_paths  # noqa: PLC0415
+    import datetime as dt  # noqa: PLC0415
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _cctally_core as core  # noqa: PLC0415
+    import _cctally_db as db  # noqa: PLC0415
+    import _cctally_doctor as doctor  # noqa: PLC0415
+    core.APP_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(core.CACHE_DB_PATH))
+    db._apply_cache_schema(conn)
+    conn.commit()
+    steps = [0]
+
+    def connect(*args, **kwargs):
+        handle = sqlite3.connect(*args, **kwargs)
+        handle.set_progress_handler(
+            lambda: steps.__setitem__(0, steps[0] + 1) or 0, 10)
+        return handle
+    proxy = types.SimpleNamespace(**{
+        name: getattr(sqlite3, name) for name in dir(sqlite3)
+        if not name.startswith("__")})
+    proxy.connect = connect
+    monkeypatch.setattr(doctor, "sqlite3", proxy)
+    now = dt.datetime(2026, 5, 13, 14, 22, 31, tzinfo=dt.timezone.utc)
+
+    def gather_steps():
+        steps[0] = 0
+        doctor._gather_claude_cost_attribution(now)
+        return steps[0]
+
+    def add(prefix, basis, count):
+        conn.executemany(
+            "INSERT INTO claude_cost_decisions (decision_key, form, msg_id,"
+            " req_id, account_key, basis, rule, decided_at_utc,"
+            " journal_segment, journal_offset)"
+            " VALUES (?,'k1',?,?,?,?,1,'2026-05-12T10:00:00Z',"
+            " 'observations-2026-05.jsonl',0)",
+            [(f"{prefix}-{i}", f"{prefix}m{i}", f"{prefix}r{i}", "a" * 32,
+              basis) for i in range(count)])
+        conn.executemany(
+            "INSERT INTO session_entries (source_path, line_offset,"
+            " timestamp_utc, model, msg_id, req_id, input_tokens,"
+            " output_tokens, cache_create_tokens, cache_read_tokens,"
+            " account_key, attribution_decision_key)"
+            " VALUES (?, 0, '2026-05-12T00:00:00Z', 'claude-opus-4-8',"
+            " ?, ?, 1, 1, 0, 0, ?, ?)",
+            [(f"/p/{prefix}{i}.jsonl", f"{prefix}m{i}", f"{prefix}r{i}",
+              "a" * 32, f"{prefix}-{i}") for i in range(count)])
+        conn.commit()
+
+    count = 2000
+    base = gather_steps()
+    add("pres", "preserved_history", count)
+    with_preserved = gather_steps()
+    add("evid", "timeline_agreement", count)
+    with_evidence = gather_steps()
+    conn.close()
+    d = doctor._gather_claude_cost_attribution(now)
+    assert (d["preservedRows"], d["totalRows"]) == (count, count)
+    preserved_cost = with_preserved - base
+    evidence_cost = with_evidence - with_preserved
+    assert preserved_cost < 0.6 * evidence_cost, (preserved_cost,
+                                                  evidence_cost)

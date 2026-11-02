@@ -777,7 +777,8 @@ def _snapshot_columns(conn) -> set:
     return {str(row[1]) for row in rows}
 
 
-def _dpp_candidate_regime(current_week_start, *, account_key):
+def _dpp_candidate_regime(current_week_start, *, account_key,
+                          stats_conn=None):
     """The S1 regime the TARGET week sits in, or None when there is none.
 
     None means "no regime restriction is knowable", which is the inert state
@@ -817,7 +818,8 @@ def _dpp_candidate_regime(current_week_start, *, account_key):
     c = _cctally()
     try:
         qcg = c._load_sibling("_cctally_quota_calibration")
-        read = qcg.read_calibration_file(account_key=account_key)
+        read = qcg.read_calibration_file(account_key=account_key,
+                                         stats_conn=stats_conn)
     except Exception:                                  # noqa: BLE001
         return None
     regime = getattr(read, "regime", None)
@@ -1032,7 +1034,8 @@ def _select_dollars_per_percent(
     # marked `detection-only`, so on an install with no calibration there is
     # no regime information and the restriction is inert. Applying it anyway
     # would exclude every candidate rather than the incomparable ones.
-    regime = _dpp_candidate_regime(current_week_start, account_key=account_key)
+    regime = _dpp_candidate_regime(current_week_start, account_key=account_key,
+                                   stats_conn=conn)
     eligible: list[tuple[dt.datetime, dt.datetime, float]] = []
     drifted = False
     unverified = False
@@ -1250,6 +1253,11 @@ def _pick_p_24h_ago(
 _CALIBRATION_REJECTION_CODES: dict = {
     "calibration-fingerprint-mismatch": "stale",
     "calibration-revision-mismatch": "stale",
+    # #1015 spec 5.4: a correction to the regime's inputs. Its attempt status
+    # (when current) is stated instead, exactly as the detection-only branch
+    # states the stored status. `calibration-lineage-unavailable` falls to
+    # `unavailable` with every other rejection.
+    "recalibration-needed": "recalibration-needed",
 }
 
 #: The cause a `detection-only` refusal states when the stored regime's own
@@ -1283,6 +1291,7 @@ def _calibrated_projection(
     week_end_at: dt.datetime,
     *,
     account_key: "str | None",
+    stats_conn=None,
 ) -> "tuple[float | None, str | None]":
     """`(projected_end_of_week_percent, withheld_code)` from the S1 model.
 
@@ -1290,7 +1299,8 @@ def _calibrated_projection(
     `_calibrated_week_detail` is the one implementation.
     """
     detail = _calibrated_week_detail(
-        now_utc, week_start_at, week_end_at, account_key=account_key)
+        now_utc, week_start_at, week_end_at, account_key=account_key,
+        stats_conn=stats_conn)
     return detail.projection_pct, detail.code
 
 
@@ -1300,6 +1310,7 @@ def _calibrated_week_detail(
     week_end_at: dt.datetime,
     *,
     account_key: "str | None",
+    stats_conn=None,
 ) -> CalibratedWeek:
     """The S1 model's view of THIS week, or the typed cause it has none.
 
@@ -1324,9 +1335,21 @@ def _calibrated_week_detail(
         # of the function. That function now returns THREE values, which is why
         # its unreadable-state path returns `None, (), ()`.
         return CalibratedWeek(code="unavailable")
-    read = qcg.read_calibration_file(account_key=account_key)
+    # #1015: the stats connection the caller holds, when it holds one, so the
+    # lineage assessment reads the same index; otherwise the reader's
+    # fail-fast opener.
+    read = qcg.read_calibration_file(account_key=account_key,
+                                     stats_conn=stats_conn)
     if read.regime is None:
         rejection = getattr(read.rejection, "value", None)
+        if rejection == "recalibration-needed":
+            # #1015 spec 5.4: the sweep's withheld attempt over the current
+            # basis names its own status; otherwise the refusal itself.
+            qm = c._load_sibling("_lib_quota_model")
+            stored = read.regime_status
+            return CalibratedWeek(code=(
+                stored if stored in qm.EVIDENCE_CODES
+                else qm.RECALIBRATION_NEEDED))
         if rejection == "calibration-detection-only":
             # S1 held this successor fit below its prediction gate, and the
             # regime records which blocking status it carried. State that
@@ -1522,7 +1545,8 @@ def _load_forecast_inputs(
     p_24h_ago_corrected = corrected_percent_point(p_24h_ago)
     right_censored = p_now_corrected is None
     calibrated = _calibrated_week_detail(
-        now_utc, week_start_at, week_end_at, account_key=account_key)
+        now_utc, week_start_at, week_end_at, account_key=account_key,
+        stats_conn=conn)
 
     # Cache is warm for this invocation after the spent_usd lookup. Suppress
     # re-syncs in downstream cost lookups (trailing-4wk-median loop hits

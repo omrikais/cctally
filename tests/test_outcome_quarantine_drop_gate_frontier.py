@@ -164,3 +164,85 @@ def test_an_append_after_the_check_defers_and_keeps_the_publication_identity(
     sl._statusline_reduce_and_publish(nudge_sink=lambda: None)
     published = [p for p in _publications("A") if p["weekly_percent"] == 20.0]
     assert [p["publication_id"] for p in published] == interfered
+
+
+# --------------------------------------------------------------------------
+# #948 spec 6.8: the drop gate is per axis
+# --------------------------------------------------------------------------
+
+def _spool_two_axis(app, clock, name, session, weekly, week_reset, five,
+                    five_reset):
+    import json
+    import _cctally_statusline as sl
+    T.identity(name)
+    parsed = app._lib_statusline.parse_statusline_stdin(json.dumps({
+        "session_id": session,
+        "rate_limits": {
+            "seven_day": {"used_percentage": weekly,
+                          "resets_at": T.iso(week_reset)},
+            "five_hour": {"used_percentage": five,
+                          "resets_at": T.iso(five_reset)}},
+    }).encode())
+    sl._write_candidate(sl._candidate_from_input(parsed, received_at=clock.value))
+
+
+def _drive_two_axis(app, clock, name, reporters, week_reset, five_reset,
+                    ticks):
+    import _cctally_statusline as sl
+    for _ in range(ticks):
+        for session, weekly, five in reporters:
+            _spool_two_axis(app, clock, name, session, weekly, week_reset,
+                            five, five_reset)
+        sl._statusline_reduce_and_publish(nudge_sink=lambda: None)
+        clock.advance(F15.TICK)
+
+
+@pytest.mark.parametrize("coverage", ["weekly-only", "both"])
+def test_a_released_weekly_axis_publishes_its_drop_while_five_hour_withholds(
+        app, monkeypatch, coverage):
+    """Detects an all-or-nothing drop gate after a partial recovery: a
+    weekly-only OAuth coverage and a fresh weekly period release weekly
+    alone, so a weekly drop publishes by consensus while a five-hour drop of
+    the same account stays withheld (its axis has no coverage). The two-axis
+    control proves the five-hour drop publishes once its axis is released."""
+    import argparse
+    import _cctally_statusline as sl
+    clock = F15.Clock(app, monkeypatch, T0)
+    F15._seed(app, clock, "A", 30, week_reset=T0 + 86400, five=10,
+              five_reset=T0 + 3600)
+    F15._excluded_trigger(app, clock, T0 + 86400, T0 + 3600)
+    clock.advance(F15.TICK)
+    T.identity("A")
+    result = sl._authoritative_record_usage(
+        argparse.Namespace(
+            percent=31, resets_at=str(T0 + 86400),
+            five_hour_percent=None if coverage == "weekly-only" else 11,
+            five_hour_resets_at=(None if coverage == "weekly-only"
+                                 else str(T0 + 3600)),
+            source="api"),
+        ("sevenDay",) if coverage == "weekly-only" else ("sevenDay", "fiveHour"),
+        binding=sl._capture_binding(credential="token-A"),
+        nudge_dashboard=False)
+    assert result.status == "ok", result
+    axes = (("sevenDay",) if coverage == "weekly-only"
+            else ("sevenDay", "fiveHour"))
+    assert [tuple(op["payload"]["axes"])
+            for op in T.ops_of_kind("outcome_authority_completion")] == [axes]
+    clock.advance(86400 + 3600)
+    new_week = clock.value + 7 * 86400
+    five_reset = clock.value + 3 * 3600
+    F15._seed(app, clock, "A", 70, week_reset=new_week, five=10,
+              five_reset=five_reset, source="statusline")
+    assert T.axis_allowed(app, "A") == {
+        "sevenDay": True, "fiveHour": coverage == "both"}
+    clock.advance(F15.TICK)
+    # A five-hour-only drop: withheld unless its axis is released.
+    _drive_two_axis(app, clock, "A", (("one", 70, 2), ("two", 70, 2)),
+                    new_week, five_reset, 1 + 2 * F15.DEADLINE // F15.TICK)
+    five_drops = [p for p in _publications("A")
+                  if p.get("five_hour_percent") == 2.0]
+    assert bool(five_drops) == (coverage == "both"), _publications("A")
+    # A weekly drop with the five-hour value unchanged: published.
+    _drive_two_axis(app, clock, "A", (("one", 20, 10), ("two", 20, 10)),
+                    new_week, five_reset, 1 + 2 * F15.DEADLINE // F15.TICK)
+    assert F15._published("A", 20)

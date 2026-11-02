@@ -23,10 +23,35 @@
 // ri_lifetime_max_phys_footprint (RUSAGE_INFO_V4), so the exit snapshot of every
 // process the interposer is loaded into - dashboards, catch-ups, hooks and the
 // workers they launch - records its terminal high-water mark (spec §6.3).
+// It also carries "diskioWritten", the process's ri_diskio_byteswritten at
+// that moment (#939): the exit snapshot is taken in this library's destructor,
+// after the interpreter's own exit handlers (a store's final checkpoint), so a
+// physical-write total read from it ends at the same boundary as the logical
+// per-path totals beside it.
 // The records sit in a bounded ring (WTRACE_FRAME_RING entries, default 1<<20)
 // flushed with every snapshot to $WTRACE_OUT.<pid>.frames (and at exit). A
 // record that finds the ring full is counted in the snapshot's "framesDropped"
 // and its 24 bytes in "dropped", so the evidence is invalid, never lost.
+//
+// Main-database page log (#939, opt-in with WTRACE_DBPAGES=1): for a path that
+// ends in ".db", every write is logged as {t, path, pgno, n} in a second bounded
+// ring (WTRACE_DBPAGE_RING entries, default 1<<21) flushed with every snapshot
+// to $WTRACE_OUT.<pid>.dbpages (and at exit). A write of whole pages at a page
+// boundary (page size $WTRACE_DB_PAGE, default 4096) becomes one record per page
+// (pgno = offset / page + 1, n = page); any other write becomes one record with
+// pgno 0 and its byte count. These are the checkpoint copies (WAL mode) or the
+// in-place page writes (rollback journal) the WAL frame log cannot see. A record
+// that finds the ring full is counted in "dbpagesDropped", which invalidates the
+// per-page attribution; the per-path byte table is unaffected. Without the
+// variable nothing changes: no record, no file, no "dbpagesDropped" key.
+// With it, the WAL frame log also records every page-data write at a frame's
+// data offset (32 + k x (P + 24) + 24, n = P) as {t, path, frame, "data": 1}.
+// SQLite writes a frame as a 24-byte header then its page, but a transaction
+// that outgrows the page cache overwrites an earlier frame's page in place (a
+// data write with no header) and at commit rewrites only the 24-byte headers
+// after the first overwritten frame (`walRewriteChecksums`), so per-object
+// bytes are 24 per header record plus P per data record, never P + 24 per
+// header record (`catchup_attrib.py`).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,17 +72,28 @@
 #define MAXFD 65536
 static _Atomic unsigned long long fd_bytes[MAXFD];
 static _Atomic unsigned long long fd_calls[MAXFD];
-static volatile char fd_kind[MAXFD];  // 0 unknown, 1 sqlite temp, 2 other, 3 WAL
+static volatile char fd_kind[MAXFD];  // 0 unknown, 1 sqlite temp, 2 other, 3 WAL, 4 main DB (#939, opt-in)
 static volatile signed char fd_wal[MAXFD];  // WAL path slot of a kind-3 descriptor
+static volatile signed char fd_db[MAXFD];   // DB path slot of a kind-4 descriptor (#939)
 
 #define NWAL 32
-struct frec { double t; unsigned int frame, pgno, commit, salt; int wal; };
+struct frec { double t; unsigned int frame, pgno, commit, salt; int wal; int data; };
 static char wal_paths[NWAL][MAXPATHLEN];   // guarded by fmu
 static unsigned int wal_page[NWAL];        // page size learnt from the header
 static int nwal;
 static struct frec *ring;                  // guarded by fmu
 static size_t ring_cap, ring_len;
 static unsigned long long frames_dropped;  // guarded by fmu
+// #939 main-database page log (opt-in, WTRACE_DBPAGES=1); all guarded by fmu.
+#define NDB 32
+struct drec { double t; unsigned int pgno, n; int db; };
+static int dbpages_on;
+static char db_paths[NDB][MAXPATHLEN];
+static int ndb;
+static unsigned int db_page = 4096;
+static struct drec *dring;
+static size_t dring_cap, dring_len;
+static unsigned long long dbpages_dropped;
 static pthread_mutex_t fmu = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int default_wal_page = 4096;
 static __thread unsigned long long t_temp, t_other;
@@ -105,7 +141,34 @@ static void classify(int fd) {
     pthread_mutex_unlock(&fmu);
     if (slot >= 0) { fd_wal[fd] = (signed char)slot; fd_kind[fd] = 3; return; }
   }
+  if (dbpages_on && len > 3 && strcmp(p + len - 3, ".db") == 0) {
+    pthread_mutex_lock(&fmu);
+    int slot = -1;
+    for (int i = 0; i < ndb; i++) if (strcmp(db_paths[i], p) == 0) { slot = i; break; }
+    if (slot < 0 && ndb < NDB) { slot = ndb++; strncpy(db_paths[slot], p, MAXPATHLEN - 1); }
+    pthread_mutex_unlock(&fmu);
+    if (slot >= 0) { fd_db[fd] = (signed char)slot; fd_kind[fd] = 4; return; }
+  }
   fd_kind[fd] = 2;
+}
+
+// #939: log one main-database write: one record per whole page at a page
+// boundary, else one record with pgno 0 and the byte count.
+static void dbrec(int fd, size_t n, off_t off) {
+  int slot = fd_db[fd];
+  double t = now_s();
+  pthread_mutex_lock(&fmu);
+  if (off >= 0 && n % db_page == 0 && off % db_page == 0) {
+    for (size_t i = 0; i < n / db_page; i++) {
+      if (dring && dring_len < dring_cap)
+        dring[dring_len++] = (struct drec){t, (unsigned)(off / db_page) + 1 + (unsigned)i, db_page, slot};
+      else dbpages_dropped++;
+    }
+  } else {
+    if (dring && dring_len < dring_cap) dring[dring_len++] = (struct drec){t, 0, (unsigned)n, slot};
+    else dbpages_dropped++;
+  }
+  pthread_mutex_unlock(&fmu);
 }
 
 // Log one WAL frame header (24 bytes) or WAL header (32 bytes at offset 0).
@@ -118,10 +181,14 @@ static void walrec(int fd, const void *buf, size_t n, off_t off) {
   int keep = 0;
   if (n == 32 && off == 0) {
     wal_page[slot] = be32(b + 8);
-    r = (struct frec){now_s(), 0, be32(b + 8), be32(b + 12), be32(b + 16), slot};
+    r = (struct frec){now_s(), 0, be32(b + 8), be32(b + 12), be32(b + 16), slot, 0};
     keep = 1;
   } else if (n == 24 && off >= 32 && (off - 32) % (page + 24) == 0) {
-    r = (struct frec){now_s(), (unsigned)((off - 32) / (page + 24)) + 1, be32(b), be32(b + 4), be32(b + 8), slot};
+    r = (struct frec){now_s(), (unsigned)((off - 32) / (page + 24)) + 1, be32(b), be32(b + 4), be32(b + 8), slot, 0};
+    keep = 1;
+  } else if (dbpages_on && n == page && off >= 56 && (off - 56) % (page + 24) == 0) {
+    // #939: a frame's page data; logged only with WTRACE_DBPAGES=1.
+    r = (struct frec){now_s(), (unsigned)((off - 56) / (page + 24)) + 1, 0, 0, 0, slot, 1};
     keep = 1;
   }
   if (keep) {
@@ -136,7 +203,8 @@ static inline void wacct_at(int fd, const void *buf, ssize_t n, off_t off) {
     atomic_fetch_add(&fd_bytes[fd], (unsigned long long)n); atomic_fetch_add(&fd_calls[fd], 1ULL);
     if (!fd_kind[fd]) classify(fd);
     if (fd_kind[fd] == 1) t_temp += (unsigned long long)n; else t_other += (unsigned long long)n;
-    if (fd_kind[fd] == 3 && buf && off >= 0 && (n == 24 || n == 32)) walrec(fd, buf, (size_t)n, off);
+    if (fd_kind[fd] == 3 && buf && off >= 0 && (n == 24 || n == 32 || (dbpages_on && n > 32))) walrec(fd, buf, (size_t)n, off);
+    if (fd_kind[fd] == 4) dbrec(fd, (size_t)n, off);
   }
 }
 
@@ -161,7 +229,7 @@ ssize_t my_write(int fd, const void *buf, size_t n) {
 ssize_t my_pwrite(int fd, const void *buf, size_t n, off_t o) { ssize_t r = pwrite(fd, buf, n, o); wacct_at(fd, buf, r, o); return r; }
 ssize_t my_writev(int fd, const struct iovec *v, int c) { ssize_t r = writev(fd, v, c); wacct(fd, r); return r; }
 ssize_t my_pwritev(int fd, const struct iovec *v, int c, off_t o) { ssize_t r = pwritev(fd, v, c, o); wacct(fd, r); return r; }
-int my_close(int fd) { fold(fd); if (fd >= 0 && fd < MAXFD) { fd_kind[fd] = 0; fd_wal[fd] = 0; } return close(fd); }
+int my_close(int fd) { fold(fd); if (fd >= 0 && fd < MAXFD) { fd_kind[fd] = 0; fd_wal[fd] = 0; fd_db[fd] = 0; } return close(fd); }
 DYLD_INTERPOSE(my_write, write)
 DYLD_INTERPOSE(my_pwrite, pwrite)
 DYLD_INTERPOSE(my_writev, writev)
@@ -185,11 +253,15 @@ static void dump(FILE *f) {
   struct timeval tv; gettimeofday(&tv, NULL);
   pthread_mutex_lock(&fmu);
   unsigned long long fdrop = frames_dropped;
+  unsigned long long ddrop = dbpages_dropped;
   pthread_mutex_unlock(&fmu);
   struct rusage_info_v4 ri;
-  long long peak = proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0
-                   ? (long long)ri.ri_lifetime_max_phys_footprint : -1;
-  fprintf(f, "{\"t\":%ld.%06d,\"pid\":%d,\"dropped\":%llu,\"framesDropped\":%llu,\"footprintPeak\":%lld,\"paths\":{", (long)tv.tv_sec, (int)tv.tv_usec, getpid(), drop, fdrop, peak);
+  int ri_ok = proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) == 0;
+  long long peak = ri_ok ? (long long)ri.ri_lifetime_max_phys_footprint : -1;
+  long long diskio = ri_ok ? (long long)ri.ri_diskio_byteswritten : -1;
+  fprintf(f, "{\"t\":%ld.%06d,\"pid\":%d,\"dropped\":%llu,\"framesDropped\":%llu,", (long)tv.tv_sec, (int)tv.tv_usec, getpid(), drop, fdrop);
+  if (dbpages_on) fprintf(f, "\"dbpagesDropped\":%llu,", ddrop);
+  fprintf(f, "\"footprintPeak\":%lld,\"diskioWritten\":%lld,\"paths\":{", peak, diskio);
   int first = 1;
   for (int i = 0; i < NPATH; i++) if (snap[i].used) {
     fprintf(f, "%s\"%s\":[%llu,%llu]", first ? "" : ",", snap[i].path, snap[i].bytes, snap[i].calls); first = 0;
@@ -205,10 +277,27 @@ static void flush_frames(FILE *f) {
   pthread_mutex_lock(&fmu);
   for (size_t i = 0; i < ring_len; i++) {
     struct frec *r = &ring[i];
-    fprintf(f, "{\"t\":%.6f,\"path\":\"%s\",\"frame\":%u,\"pgno\":%u,\"commit\":%u,\"salt\":%u}\n",
-            r->t, wal_paths[r->wal], r->frame, r->pgno, r->commit, r->salt);
+    if (r->data)
+      fprintf(f, "{\"t\":%.6f,\"path\":\"%s\",\"frame\":%u,\"data\":1}\n",
+              r->t, wal_paths[r->wal], r->frame);
+    else
+      fprintf(f, "{\"t\":%.6f,\"path\":\"%s\",\"frame\":%u,\"pgno\":%u,\"commit\":%u,\"salt\":%u}\n",
+              r->t, wal_paths[r->wal], r->frame, r->pgno, r->commit, r->salt);
   }
   ring_len = 0;
+  pthread_mutex_unlock(&fmu);
+  fflush(f);
+}
+
+// #939: append the DB page ring's records to `f` (JSON lines) and empty it.
+static void flush_dbpages(FILE *f) {
+  pthread_mutex_lock(&fmu);
+  for (size_t i = 0; i < dring_len; i++) {
+    struct drec *r = &dring[i];
+    fprintf(f, "{\"t\":%.6f,\"path\":\"%s\",\"pgno\":%u,\"n\":%u}\n",
+            r->t, db_paths[r->db], r->pgno, r->n);
+  }
+  dring_len = 0;
   pthread_mutex_unlock(&fmu);
   fflush(f);
 }
@@ -236,10 +325,12 @@ static void *dumper(void *arg) {
   if (period <= 0) period = 5.0;
   char path[MAXPATHLEN]; snprintf(path, sizeof path, "%s.%d", out, getpid());
   char fpath[MAXPATHLEN]; snprintf(fpath, sizeof fpath, "%s.%d.frames", out, getpid());
+  char dpath[MAXPATHLEN]; snprintf(dpath, sizeof dpath, "%s.%d.dbpages", out, getpid());
   FILE *f = fopen(path, "a");
   FILE *ff = fopen(fpath, "a");
-  if (!f || !ff) return NULL;  // no trace file: the analyzer refuses the run
-  for (;;) { usleep((useconds_t)(period * 1e6)); flush_frames(ff); dump(f); }
+  FILE *df = dbpages_on ? fopen(dpath, "a") : NULL;
+  if (!f || !ff || (dbpages_on && !df)) return NULL;  // no trace file: the analyzer refuses the run
+  for (;;) { usleep((useconds_t)(period * 1e6)); flush_frames(ff); if (df) flush_dbpages(df); dump(f); }
   return NULL;
 }
 
@@ -247,6 +338,10 @@ __attribute__((destructor)) static void fini(void) {
   const char *out = getenv("WTRACE_OUT"); if (!out) return;
   char fpath[MAXPATHLEN]; snprintf(fpath, sizeof fpath, "%s.%d.frames", out, getpid());
   FILE *ff = fopen(fpath, "a"); if (ff) { flush_frames(ff); fclose(ff); }
+  if (dbpages_on) {
+    char dpath[MAXPATHLEN]; snprintf(dpath, sizeof dpath, "%s.%d.dbpages", out, getpid());
+    FILE *df = fopen(dpath, "a"); if (df) { flush_dbpages(df); fclose(df); }
+  }
   char path[MAXPATHLEN]; snprintf(path, sizeof path, "%s.%d.exit", out, getpid());
   FILE *f = fopen(path, "a"); if (!f) return; dump(f); fclose(f);
 }
@@ -268,6 +363,14 @@ __attribute__((constructor)) static void init(void) {
   ring_cap = getenv("WTRACE_FRAME_RING") ? (size_t)atol(getenv("WTRACE_FRAME_RING")) : ((size_t)1 << 20);
   ring = calloc(ring_cap ? ring_cap : 1, sizeof(struct frec));
   if (!ring) ring_cap = 0;
+  dbpages_on = getenv("WTRACE_DBPAGES") && strcmp(getenv("WTRACE_DBPAGES"), "1") == 0;
+  if (dbpages_on) {
+    if (getenv("WTRACE_DB_PAGE")) db_page = (unsigned)atol(getenv("WTRACE_DB_PAGE"));
+    if (!db_page) db_page = 4096;
+    dring_cap = getenv("WTRACE_DBPAGE_RING") ? (size_t)atol(getenv("WTRACE_DBPAGE_RING")) : ((size_t)1 << 21);
+    dring = calloc(dring_cap ? dring_cap : 1, sizeof(struct drec));
+    if (!dring) dring_cap = 0;
+  }
   ready = 1;
   if (getenv("WTRACE_OUT")) { pthread_t t; pthread_create(&t, NULL, dumper, NULL); pthread_detach(t); }
 }

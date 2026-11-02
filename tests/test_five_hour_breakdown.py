@@ -1201,8 +1201,22 @@ _R8_DERIVED_COLUMN_SITES = {
     # credit-aware: see the gotcha's two reasons.
     ("_cctally_record.py", "maybe_update_five_hour_block"): "writer",
     ("_cctally_five_hour.py", "_backfill_five_hour_blocks"): "writer",
+    # #956 class 1: the capture-order end projection (the end axis, from the
+    # selected reading's stored weekly value) and the rebuild's open-candidate
+    # insert (the start axis from the first writer, the end from the selection).
+    ("_cctally_five_hour.py", "project_open_block_end"): "writer",
+    ("_cctally_five_hour.py", "_materialize_open_candidate"): "writer",
     ("_cctally_db.py", "_migration_merge_5h_block_duplicates_v1"): "writer",
     ("_cctally_journal.py", "freeze_five_hour_block_close"): "writer",
+    # #956 class 2: the opening fact stores the creating upsert's opening
+    # weekly value (`_insert_five_hour_block_opening`), its fold materializes
+    # the open block with both axes from it (`_materialize_opened_block`), and
+    # the end projection's selection half reads it for a window with no
+    # surviving reading (`select_open_block_end`, origin `opening`). All three
+    # carry what the fold observed, like every writer above.
+    ("_cctally_record.py", "_insert_five_hour_block_opening"): "writer",
+    ("_cctally_journal.py", "_materialize_opened_block"): "writer",
+    ("_cctally_five_hour.py", "select_open_block_end"): "writer",
     # THE ONE READ-TIME FILTER.
     ("_cctally_five_hour.py", "_credit_aware_block_weekly_axes"): "filter",
     # CREDIT-AWARE CONSUMERS. Each replaces both axes with the filter's answers
@@ -1317,6 +1331,15 @@ _R8_STAR_SELECT = re.compile(
     re.IGNORECASE | re.DOTALL)
 
 
+def _r8_scan_sources():
+    """The files `_r8_walk_derived_column_sites` reads: `bin/cctally` and the
+    direct `bin/*.py` children, minus `build-*`, `*-test` and `_fixture_builders.py`."""
+    return [path for path in sorted((REPO / "bin").iterdir())
+            if path.is_file() and path.name != "_fixture_builders.py"
+            and not path.name.endswith("-test") and not path.name.startswith("build-")
+            and (path.name == "cctally" or path.name.endswith(".py"))]
+
+
 def _r8_walk_derived_column_sites():
     """Every production function that names either derived column or takes the
     whole block row, as ``{(module, function)}``.
@@ -1329,13 +1352,7 @@ def _r8_walk_derived_column_sites():
     cannot read a column and a documentation edit must not move this set."""
     import ast
     sites = set()
-    for path in sorted((REPO / "bin").iterdir()):
-        if not path.is_file() or path.name == "_fixture_builders.py":
-            continue
-        if path.name.endswith("-test") or path.name.startswith("build-"):
-            continue
-        if path.name != "cctally" and not path.name.endswith(".py"):
-            continue
+    for path in _r8_scan_sources():
         try:
             text = path.read_text()
             tree = ast.parse(text)

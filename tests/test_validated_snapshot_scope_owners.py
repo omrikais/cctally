@@ -62,8 +62,8 @@ def _cursor():
 
 
 def test_epoch_is_current():
-    # #797/#823/#840 (spec 4.6 B6) moved the epoch from 1018 to 1019.
-    assert _cctally_core.STATS_INDEX_EPOCH == 1019
+    # #797/#823/#840 (spec 4.6 B6) moved the epoch from 1018 to 1019, and #1019/#1014 (spec 4.7 C6) to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023.
+    assert _cctally_core.STATS_INDEX_EPOCH == 1023
     assert _cctally_core.LEGACY_STATS_HEAD == 13
 
 
@@ -146,7 +146,7 @@ def test_rebuild_never_requires_a_valid_live_index(ns):
     jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
     conn = sqlite3.connect(str(_cctally_core.DB_PATH))
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1019
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1023
         assert conn.execute(
             "SELECT name FROM sqlite_schema WHERE name = "
             "'journal_admission_summary'").fetchone() is not None

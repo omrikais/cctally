@@ -337,3 +337,52 @@ describe('#690 — the modal renders the baseline count and the typed provenance
     expect(el.querySelector('.alerts-rate-change-evidence')).toBeNull();
   });
 });
+
+// #1015 spec 5.7, U2 — a transition fitted from corrected inputs stays in the
+// history, labelled, and never raises a toast.
+describe('#1015 — a superseded transition', () => {
+  const superseded = {
+    reason: 'reviewed-correction',
+    superseded_at: '2026-10-25T00:00:00+00:00',
+    corrections: ['op-1'],
+  } as const;
+
+  function section(entry: MeterRateChangeEntry): HTMLElement {
+    seed([entry]);
+    const { container } = render(<RecentAlertsModal />);
+    return container.querySelector(
+      '[data-testid="alerts-rate-change"]',
+    ) as HTMLElement;
+  }
+
+  it('keeps the row and labels it Status: superseded by a correction', () => {
+    const el = section(rateChange({ supersession: { ...superseded, corrections: ['op-1'] } }));
+    const items = [...el.querySelectorAll('.alerts-rate-change-evidence-item')];
+    const status = items.find((item) => item.textContent?.startsWith('Status:'));
+    expect(status?.textContent).toBe('Status: superseded by a correction');
+    // The historical values stay visible.
+    expect(el.textContent).toContain('31% less usage');
+  });
+
+  it('labels a derived supersession (no sweep yet) the same way', () => {
+    const el = section(rateChange({
+      supersession: { reason: 'reviewed-correction', superseded_at: null, corrections: ['op-1'] },
+    }));
+    expect(el.textContent).toContain('Status:');
+    expect(el.textContent).toContain('superseded by a correction');
+  });
+
+  it('carries no Status line on an ordinary or older-server row', () => {
+    expect(section(rateChange({ supersession: null })).textContent).not.toContain('Status:');
+    expect(section(rateChange()).textContent).not.toContain('Status:');
+  });
+
+  it('raises no toast when it arrives superseded', () => {
+    seed([]);
+    seed([rateChange({ supersession: { ...superseded, corrections: ['op-1'] } })], { firstTick: false });
+    const { container } = render(<Toast />);
+    expect(
+      container.querySelector('[data-testid="toast-meter-rate-change"]'),
+    ).toBeNull();
+  });
+});

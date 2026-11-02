@@ -1867,6 +1867,29 @@ def _meter_rate_change_relation(provider: str) -> tuple[str, str]:
     )
 
 
+# #1015 spec 5.4/5.7. A supersession relabels a published rate-change row
+# ("superseded by a correction") without touching `meter_rate_change_events`,
+# so the explicit `meter_rate_change_supersession` event needs its own relation
+# beside the events one: otherwise it moved neither provider digest, and
+# `data_version` and the provider reuse identity stayed put. Every column is
+# selected because the table is exactly the projection of that event; the
+# derived (not yet journalled) supersession is covered by the dispatch key's
+# `calibration_dependency` instead, which digests the correction lineage.
+_METER_RATE_CHANGE_SUPERSESSION_COLUMNS = (
+    "provider, account_key, effective_from, reason, corrections, "
+    "superseded_at_utc, created_at_utc"
+)
+
+
+def _meter_rate_change_supersession_relation(provider: str) -> tuple[str, str]:
+    return (
+        "meter_rate_change_supersessions",
+        f"SELECT {_METER_RATE_CHANGE_SUPERSESSION_COLUMNS} "
+        f"FROM meter_rate_change_supersessions WHERE provider='{provider}' "
+        f"ORDER BY {_METER_RATE_CHANGE_SUPERSESSION_COLUMNS}",
+    )
+
+
 # The column order is the approved cross-database identity contract.  Keep the
 # relation sequence and tuples fixed: neither SQLite insertion order nor
 # surrogate/provenance/reconciliation-only fields may perturb the digest.
@@ -1921,6 +1944,7 @@ _CODEX_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
         "projected_value, denominator, crossed_at_utc, alerted_at",
     ),
     _meter_rate_change_relation("codex"),
+    _meter_rate_change_supersession_relation("codex"),
 )
 
 
@@ -1979,6 +2003,7 @@ _CLAUDE_STATS_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
         "budget_usd, spent_usd, consumption_pct, crossed_at_utc, alerted_at",
     ),
     _meter_rate_change_relation("claude"),
+    _meter_rate_change_supersession_relation("claude"),
 )
 
 
@@ -2074,9 +2099,50 @@ def _stats_relations_digest_memoizable(
     )
 
 
+def _sqlite_order_row_key(row) -> tuple:
+    """Sort key giving SQLite's ``ORDER BY`` over every column of ``row``
+    (#1046 spec 5.1): NULL, then numbers by exact value (an ``int`` against a
+    ``float`` compares exactly in Python, as in SQLite, so neither is ever
+    converted), then TEXT in code-point order (BINARY collation of a UTF-8
+    store), then BLOB by bytes."""
+    key = []
+    for value in row:
+        if value is None:
+            key.append((0, 0))
+        elif isinstance(value, (int, float)):
+            key.append((1, value))
+        elif isinstance(value, str):
+            key.append((2, value))
+        else:
+            key.append((3, value))
+    return tuple(key)
+
+
+def _stats_relation_rows(
+    stats_conn: sqlite3.Connection,
+    entry: tuple,
+) -> list[list[object]]:
+    """One digest relation's rows: ``entry`` is ``(name, sql)`` or
+    ``(name, sql, row_key)``. A missing table is an empty relation; other
+    SQLite failures propagate. With a row key the statement carries no
+    ``ORDER BY`` and the rows are sorted here, so no history-sized sorter is
+    built on the recurring dashboard path (#1046)."""
+    query = entry[1]
+    row_key = entry[2] if len(entry) > 2 else None
+    try:
+        rows = stats_conn.execute(query).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        rows = []
+    if row_key is not None:
+        rows = sorted(rows, key=row_key)
+    return [list(row) for row in rows]
+
+
 def _stats_relations_digest(
     stats_conn: sqlite3.Connection,
-    relations: tuple[tuple[str, str], ...],
+    relations: tuple[tuple, ...],
     *,
     memo_namespace: "str | None" = None,
 ) -> str:
@@ -2092,15 +2158,9 @@ def _stats_relations_digest(
         cached = _STATS_RELATIONS_DIGEST_MEMO.get(key)
         if cached is not None:
             return cached
-    relation_rows: list[list[list[object]]] = []
-    for _name, query in relations:
-        try:
-            rows = stats_conn.execute(query).fetchall()
-        except sqlite3.OperationalError as exc:
-            if "no such table" not in str(exc).lower():
-                raise
-            rows = ()
-        relation_rows.append([list(row) for row in rows])
+    relation_rows: list[list[list[object]]] = [
+        _stats_relation_rows(stats_conn, entry) for entry in relations
+    ]
     canonical = json.dumps(
         relation_rows,
         allow_nan=False,
@@ -2143,6 +2203,99 @@ def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
         stats_conn,
         _CODEX_STATS_DIGEST_RELATIONS,
         memo_namespace="codex",
+    )
+
+
+# #1015 spec 5.4: the two relation digests of the dashboard dispatch key's
+# `calibration_dependency` component. Neither is a `SnapshotSignature` leg, so
+# the published `data_version` contract is unchanged; both ride the dispatch
+# KEY, as `codex_dependency` does, and each memoizes under its own namespace so
+# an unchanged, settled stats file costs no relation scan on an idle tick.
+#
+# The basis digest covers every input `read_correction_facts` reads: the
+# completed batches with their commit coordinates and footprints, and each
+# reviewed decision row with its op coordinate and the index row it resolves
+# to. The index is joined rather than scanned whole: it grows with every Claude
+# weekly reading, and only the rows a decision references (or a reference that
+# later resolves) can change an assessment.
+#
+# #1046: the lineage and ops relations carry a third element, a row key, and no
+# `ORDER BY`. Each key admits NULL, so its autoindex serves only the first
+# term of the all-column order and SQLite sorted the rest of the whole history
+# in a temp B-tree on every cold dashboard build. `_stats_relation_rows` sorts
+# the rows the digest already materializes, in SQLite's own order, so the
+# digest bytes are unchanged.
+_CALIBRATION_BASIS_DIGEST_RELATIONS: tuple[tuple, ...] = (
+    (
+        "correction_batch_lineage",
+        "SELECT batch_id, commit_segment, commit_offset "
+        "FROM correction_batch_lineage",
+        _sqlite_order_row_key,
+    ),
+    (
+        "correction_batch_footprint",
+        "SELECT batch_id, provider, account_key FROM correction_batch_footprint "
+        "ORDER BY batch_id, provider, account_key",
+    ),
+    (
+        "claude_weekly_correction_history",
+        "SELECT h.decision_op_id, h.observation_id, h.disposition, "
+        "o.op_segment, o.op_offset, i.account_key, i.captured_at_utc "
+        "FROM claude_weekly_correction_history AS h "
+        "LEFT JOIN claude_weekly_correction_ops AS o "
+        "ON o.decision_op_id = h.decision_op_id "
+        "LEFT JOIN claude_weekly_observation_index AS i "
+        "ON i.observation_id = h.observation_id "
+        "ORDER BY h.decision_op_id, h.observation_id, h.disposition, "
+        "o.op_segment, o.op_offset, i.account_key, i.captured_at_utc",
+    ),
+    (
+        "claude_weekly_correction_ops",
+        "SELECT decision_op_id, op_segment, op_offset "
+        "FROM claude_weekly_correction_ops",
+        _sqlite_order_row_key,
+    ),
+)
+
+# The supersession digest: the explicit rows (every provider) and each
+# transition's frozen lineage, the other input of a derived supersession.
+_CALIBRATION_SUPERSESSION_DIGEST_RELATIONS: tuple[tuple[str, str], ...] = (
+    (
+        "meter_rate_change_supersessions",
+        f"SELECT {_METER_RATE_CHANGE_SUPERSESSION_COLUMNS} "
+        "FROM meter_rate_change_supersessions "
+        f"ORDER BY {_METER_RATE_CHANGE_SUPERSESSION_COLUMNS}",
+    ),
+    (
+        "meter_rate_change_events",
+        "SELECT provider, account_key, effective_from, detected_at_utc, "
+        "fit_lineage FROM meter_rate_change_events "
+        "ORDER BY provider, account_key, effective_from, detected_at_utc, "
+        "fit_lineage",
+    ),
+)
+
+
+def calibration_basis_digest(stats_conn: sqlite3.Connection) -> str:
+    """Hash the correction lineage relations (#1015 spec 5.4).
+
+    A missing table is an empty relation, so a store older than epoch 1022
+    has a stable digest; other SQLite failures propagate, like the two
+    provider digests.
+    """
+    return _stats_relations_digest(
+        stats_conn,
+        _CALIBRATION_BASIS_DIGEST_RELATIONS,
+        memo_namespace="calibration_basis",
+    )
+
+
+def calibration_supersession_digest(stats_conn: sqlite3.Connection) -> str:
+    """Hash the supersession rows and the transitions' frozen lineage."""
+    return _stats_relations_digest(
+        stats_conn,
+        _CALIBRATION_SUPERSESSION_DIGEST_RELATIONS,
+        memo_namespace="calibration_supersession",
     )
 
 

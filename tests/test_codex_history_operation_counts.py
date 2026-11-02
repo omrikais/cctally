@@ -54,6 +54,9 @@ def test_history_quota_membership_is_loaded_once_per_identity(
                 counter["quota_membership_reads"] += 1
             elif normalized.startswith("select line_offset, logical_limit_key"):
                 counter["quota_membership_reads"] += 1
+        if (normalized.startswith("select timestamp_utc")
+                and "from codex_session_entries" in normalized):
+            counter["accounting_membership_reads"] += 1
         if normalized == "commit":
             counter["commits"] += 1
 
@@ -144,3 +147,6 @@ def test_history_quota_membership_is_loaded_once_per_identity(
     assert counts["cache-walk"]["quota_membership_reads"] == history_files, (
         "a historical identity must load retained quota membership once, "
         "rather than issue one natural-key seek for every recovered row", counts)
+    # #970 N1: the retained accounting entries of a cursorless identity read
+    # from byte zero are loaded once per identity, not per emitted entry.
+    assert counts["cache-walk"]["accounting_membership_reads"] == history_files, counts

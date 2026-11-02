@@ -18,6 +18,13 @@ for:
 - :func:`copytree` is ``shutil.copytree`` with :func:`copy2` as its file
   copier, so symlink policy, ignore lists, dangling-link errors and
   destination collisions are the stdlib's own code.
+- :func:`clone_regular_file` is the strict clone (#1000): it clones the
+  regular file `src` to the new path `dst` or raises ``OSError`` with the
+  clone's own errno. It never copies, hardlinks or overwrites, never follows
+  a symlinked source (ELOOP), refuses a non-regular source (EINVAL) without
+  blocking on it, raises ENOTSUP where no ``fclonefileat`` exists, and keeps
+  the clone syscall's own metadata (no ``copystat``). It is for a caller that
+  must never write a byte copy, such as the transcript integrity probe.
 
 A clone is attempted only on Darwin. An unsupported filesystem, a
 cross-volume destination, a missing ``fclonefileat`` and any non-Darwin
@@ -122,6 +129,29 @@ def try_clone(src, dst) -> bool:
         return _clone_open_file(fd, src, dst)
     finally:
         os.close(fd)
+
+
+def clone_regular_file(src, dst, *, counts=None):
+    """Clone the regular file `src` to the NEW path `dst`, or raise (#1000).
+
+    Returns `dst`. Raises ``OSError(ENOTSUP)`` when the platform has no
+    ``fclonefileat``, ``OSError(EINVAL)`` when `src` is not a regular file,
+    ELOOP when `src` is a symlink, and the clone syscall's own ``OSError``
+    (ENOTSUP, EXDEV, EEXIST, EIO, ENOSPC, ...) unchanged on any clone failure.
+    Nothing is created on failure, and nothing is ever byte-copied.
+    """
+    if _fclonefileat() is None:
+        raise OSError(errno.ENOTSUP, "fclonefileat is unavailable", str(dst))
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(src))
+        _clone_fd(fd, os.fspath(dst))
+    finally:
+        os.close(fd)
+    _count(counts, "clone")
+    return dst
 
 
 def _count(counts, method: str) -> None:

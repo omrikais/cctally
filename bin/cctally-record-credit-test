@@ -41,6 +41,10 @@ case "${TMPDIR:-}" in ?*/) TMPDIR=${TMPDIR%/} ;; esac
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GOLDEN_DIR="$REPO_ROOT/tests/fixtures/record-credit"
 AS_OF="2026-06-19T14:37:00Z"
+# #943 (O1): the credit's effective instant is the exact `--at` second, so the
+# scenarios that count stale replicas name an `--at` before both seeded
+# replicas (14:10Z and 14:20Z); the AS_OF default would put them before it.
+CREDIT_AT="2026-06-19T14:05:00Z"
 
 # Dedicated golden-diff scratch dir, cleaned independently of the per-scenario
 # scratch HOMEs. Pointing GOLDEN_DIFF_TMPDIR at a per-scenario HOME that the
@@ -113,7 +117,7 @@ assert_eq () {
 # Seed a 46% current week into a fresh scratch HOME, plus the two post-floor
 # stale replicas #834 S1 (#835) needs to make `staleReplaysDeleted` mean
 # something. The 46% peak is captured BEFORE the credit's effective instant
-# (14:00Z, floored from the 14:37 AS_OF), so on its own it is outside the band
+# (the exact `--at` of 14:05Z, CREDIT_AT), so on its own it is outside the band
 # and the count is 0 — a zero that stays zero after the held-row predicate
 # lands proves nothing about that predicate. The two added rows are captured
 # AFTER the effective instant and inside the 1.0-point band of 46, one
@@ -226,7 +230,7 @@ rm -rf "$S1"
 S2="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s2.XXXXXX")" || exit 1
 seed_week "$S2" >/dev/null
 before=$(snap_count "$S2")
-preview=$(rc_cli "$S2" --to 31 --dry-run 2>&1)
+preview=$(rc_cli "$S2" --to 31 --at "$CREDIT_AT" --dry-run 2>&1)
 s2_ec=$?
 after=$(snap_count "$S2")
 assert_eq 3 exit-status-mismatch "0" "$s2_ec"
@@ -243,7 +247,7 @@ rm -rf "$S2"
 # ── S5: --json --yes envelope matches golden ───────────────────────────
 S5="$(mktemp -d "${TMPDIR:-/tmp}/cctally-rc-s5.XXXXXX")" || exit 1
 seed_week "$S5" >/dev/null
-json_out=$(rc_cli "$S5" --to 31 --json --yes 2>/dev/null)
+json_out=$(rc_cli "$S5" --to 31 --at "$CREDIT_AT" --json --yes 2>/dev/null)
 s5_ec=$?
 assert_eq 6 exit-status-mismatch "0" "$s5_ec"
 json_file="$S5/envelope.json"

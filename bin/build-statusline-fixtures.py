@@ -13,7 +13,8 @@ subset that needs:
     ``extensions-no-stdin-rate-limits-db-fallback``).
   * Transcript JSONL files (``message.usage.input_tokens`` for context %
     bands — ``context-green`` / ``context-yellow`` / ``context-red`` /
-    ``context-1m-window``).
+    ``context-1m-window`` / ``context-payload-captured`` /
+    ``context-payload-window-precedence``).
   * ``config.json`` (config persistence + override —
     ``config-persistence`` / ``cli-overrides-config`` /
     ``config-path-override``).
@@ -429,6 +430,43 @@ def build_context_1m_window(out: pathlib.Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def build_context_payload_transcripts(out: pathlib.Path) -> None:
+    """Transcripts behind the two payload-window scenarios (#1002).
+
+    Both ``input.json`` files are a captured Claude Code 2.1.312 payload
+    whose ``context_window`` reports a 1,000,000-token window and a
+    ``current_usage`` input-side sum of 349,814 (35%).
+
+    * ``context-payload-captured`` (``claude-opus-5-5``): the transcript's
+      last usage CONFLICTS with the payload (150,000 input tokens), so a
+      numerator read from the transcript instead of ``current_usage``
+      renders 75% (old 200K table) or 15% (1M) — never the payload's 35%.
+    * ``context-payload-window-precedence`` (bare ``claude-opus-4-7``, a
+      200K id in the model fallback): the transcript carries the payload's
+      own usage (2 / 2,888 / 346,924), so only the denominator can differ —
+      the table's 200K renders 175%, the payload's 1M renders 35%.
+    """
+    seeds = [
+        ("context-payload-captured", "sess-payload.jsonl",
+         {"input_tokens": 150_000, "output_tokens": 0,
+          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
+        ("context-payload-window-precedence", "sess-precedence.jsonl",
+         {"input_tokens": 2, "output_tokens": 467,
+          "cache_read_input_tokens": 346_924,
+          "cache_creation_input_tokens": 2_888}),
+    ]
+    for scenario_name, filename, usage in seeds:
+        scenario = out / scenario_name / "seeds" / "transcripts"
+        scenario.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps({"type": "user", "message": {"role": "user", "content": "..."}}),
+            json.dumps({"type": "assistant", "message": {
+                "role": "assistant", "content": "...", "usage": usage,
+            }}),
+        ]
+        (scenario / filename).write_text("\n".join(lines) + "\n")
+
+
 def build_config_persistence(out: pathlib.Path) -> None:
     """Default config.json under <scratch>/.local/share/cctally/config.json
     sets statusline.visual_burn_rate=emoji + statusline.cctally_extensions=false.
@@ -519,6 +557,7 @@ def main() -> int:
     build_extensions_no_stdin_db_fallback(out)
     build_context_band_transcripts(out)
     build_context_1m_window(out)
+    build_context_payload_transcripts(out)
     build_config_persistence(out)
     build_cli_overrides_config(out)
     build_config_path_override(out)

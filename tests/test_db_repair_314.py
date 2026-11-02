@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import pathlib
 import shutil
@@ -11,6 +12,8 @@ import stat
 import subprocess
 import sys
 import types
+
+import pytest
 
 from conftest import load_script, redirect_paths
 
@@ -115,17 +118,40 @@ def _seed_corrupt_wal_family(path: pathlib.Path, tmp_path: pathlib.Path) -> None
     keeper.close()
 
 
+@pytest.mark.parametrize("form", ["hard_link", "no_hard_link"])
 def test_repair_stats_recovers_and_preserves_irreplaceable_invariants(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, form
 ):
+    """#1020 T7 adds the volume without hard links (exFAT): the repair's
+    marker publishes as a directory and is gone afterwards. Detects: a
+    `db repair` that cannot claim its marker on exFAT."""
     c = _ns(monkeypatch, tmp_path)
     source = c._cctally_core.DB_PATH
     corrupt_bytes = _seed_corrupt_stats(source)
     assert _integrity(source) != "ok"
+    trace = tmp_path / "owner-record-trace.txt"
+    monkeypatch.setenv("CCTALLY_TEST_OWNER_RECORD_TRACE", str(trace))
+    if form == "no_hard_link":
+        db_mod = sys.modules["_cctally_db"]
+        iso = types.SimpleNamespace(**vars(db_mod.os))
+
+        def link(src, dst, *args, **kwargs):
+            raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), str(src))
+
+        iso.link = link
+        monkeypatch.setattr(db_mod, "os", iso)
 
     rc = c.cmd_db_repair(_repair_args())
 
     assert rc == 0, capsys.readouterr().err
+    expected = "directory" if form == "no_hard_link" else "file"
+    assert f"stats.db.repairing {expected}" in trace.read_text().splitlines()
+    marker = source.with_name("stats.db.repairing")
+    assert not os.path.lexists(marker)
+    assert not [
+        item.name for item in source.parent.iterdir()
+        if item.name.startswith(".stats.db.repairing.")
+    ]
     assert _integrity(source) == "ok"
     conn = sqlite3.connect(source)
     try:

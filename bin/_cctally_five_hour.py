@@ -42,6 +42,7 @@ import datetime as dt
 import json
 import sqlite3
 import sys
+from dataclasses import dataclass
 
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel (#341)
 import _lib_rebuild_progress  # #997 D9 progress ticks (stdlib only)
@@ -1779,9 +1780,359 @@ def cmd_five_hour_breakdown(args: argparse.Namespace) -> int:
         conn.close()
 
 
+@dataclass(frozen=True)
+class OpenBlockEnd:
+    """The reading an open five-hour block ends at (#956 class 1, spec
+    4.5.1): its capture, five-hour percent and weekly percent, as stored and
+    fold-effective. ``origin`` names where it came from: ``"snapshot"`` is the
+    window's latest surviving five-hour reading, ``"opening"`` the opening
+    reading of the window's retained opening fact (`five_hour_block_openings`,
+    #956 class 2, spec 4.5.4) when no reading survives."""
+
+    captured_at_utc: str
+    five_hour_percent: float
+    seven_day_percent: "float | None"
+    origin: str
+
+
+def select_open_block_end(
+    conn: sqlite3.Connection, *, account_key: str, five_hour_window_key: int,
+) -> "OpenBlockEnd | None":
+    """The end reading of one open block, read only (#956 class 1): the
+    window's latest surviving five-hour reading in CAPTURE order, held rows
+    included, ties broken by logical identity (`journal_id`, a NULL one
+    lowest), never by journal order or rowid.
+
+    With no surviving reading (a correction removed every one, or `record-
+    credit --force` removed the synthetics that were the window's only
+    readings) it is the window's opening fact's OPENING reading (#956 spec
+    4.5.4): its capture, five-hour percent and weekly start value, retained
+    and immutable, so live, every rebuild and rederive agree. ``None`` only
+    for a legacy window with neither (residual R4); the caller then leaves
+    the end columns as they are.
+
+    Live ingest, derivation completion and the rebuild's Phase 2a all read
+    the end here, so an earlier capture appended later, a credit that
+    suppresses the selected reading and a `record-credit` synthetic move
+    every path identically. `latest_five_hour_reading` (the week-scoped
+    selection forecast, statusline and the dashboard read) is deliberately
+    a different function and is not changed."""
+    # The order `unixepoch(captured_at_utc) DESC, journal_id DESC` (NULLs
+    # lowest on both keys, as SQLite sorts them under DESC) is applied here
+    # over the window's rows rather than by an ORDER BY: this runs on every
+    # live tick, and the window-key index cannot serve an expression order,
+    # so SQL would sort through a temp B-tree each time (#902's recurring-
+    # plan guard). One five-hour window holds a bounded number of readings.
+    rows = conn.execute(
+        """
+        SELECT unixepoch(captured_at_utc) AS captured_epoch, journal_id,
+               captured_at_utc, five_hour_percent, weekly_percent
+          FROM weekly_usage_snapshots
+         WHERE account_key = ? AND five_hour_window_key = ?
+           AND five_hour_percent IS NOT NULL
+        """,
+        (account_key, int(five_hour_window_key)),
+    ).fetchall()
+    if not rows:
+        seed = conn.execute(
+            "SELECT first_observed_at_utc, five_hour_percent, "
+            "       seven_day_pct_at_block_start "
+            "  FROM five_hour_block_openings "
+            " WHERE account_key = ? AND five_hour_window_key = ?",
+            (account_key, int(five_hour_window_key)),
+        ).fetchone()
+        if seed is None:
+            return None
+        return OpenBlockEnd(
+            captured_at_utc=seed[0],
+            five_hour_percent=float(seed[1]),
+            seven_day_percent=None if seed[2] is None else float(seed[2]),
+            origin="opening",
+        )
+    row = max(rows, key=lambda r: (
+        r["captured_epoch"] is not None, r["captured_epoch"] or 0,
+        r["journal_id"] is not None, r["journal_id"] or "",
+    ))
+    return OpenBlockEnd(
+        captured_at_utc=row["captured_at_utc"],
+        five_hour_percent=float(row["five_hour_percent"]),
+        seven_day_percent=(
+            None if row["weekly_percent"] is None
+            else float(row["weekly_percent"])
+        ),
+        origin="snapshot",
+    )
+
+
+def project_open_block_end(
+    conn: sqlite3.Connection, block, end: "OpenBlockEnd | None", *,
+    ownership, journal_ctx, as_of: str,
+) -> None:
+    """Project one OPEN block's end columns and accounting from ``end``
+    (#956 class 1, spec 4.5.1), within the caller's transaction.
+
+    It sets `last_observed_at_utc`, `final_five_hour_percent` and
+    `seven_day_pct_at_block_end` from ``end`` (left as they are when ``end``
+    is None), and recomputes the four token totals, `total_cost_usd`, both
+    child sets, `pricing_provenance_json` and `crossed_seven_day_reset` to
+    the end's capture, the INCLUSIVE observation cutoff. Ownership is
+    `_lib_blocks.resolve_owning_window` over ``ownership`` (OwnedWindow
+    values of the account's block windows, the block's own included), with
+    the half-open ``[start, reset)`` interval. With rederive's
+    `block_source_evidence` sink present it records the owned entries behind
+    these totals. It never touches start columns, never refreshes a closed
+    block (a journaled fact), and stamps `last_updated_at_utc = as_of`.
+
+    Cache inputs are read with ``skip_sync=True``: this runs inside a stats
+    transaction (and inside `open_db()` on the rebuild path), and the live
+    tick's own totals computation already synced the cache."""
+    _c = _cctally()
+    current = conn.execute(
+        "SELECT * FROM five_hour_blocks WHERE id = ?", (int(block["id"]),),
+    ).fetchone()
+    if current is None or int(current["is_closed"]) != 0:
+        return
+    account_key = current["account_key"]
+    window_key = int(current["five_hour_window_key"])
+    block_start_dt = parse_iso_datetime(
+        current["block_start_at"], "five_hour_blocks.block_start_at",
+    )
+    if end is None:
+        last_observed = current["last_observed_at_utc"]
+        final_five_hour = current["final_five_hour_percent"]
+        weekly_end = current["seven_day_pct_at_block_end"]
+    else:
+        last_observed = end.captured_at_utc
+        final_five_hour = float(end.five_hour_percent)
+        weekly_end = end.seven_day_percent
+    cutoff_dt = parse_iso_datetime(
+        last_observed, "five_hour_blocks.last_observed_at_utc",
+    )
+    windows = list(ownership)
+    if not any(w.key == window_key for w in windows):
+        windows.append(_c.OwnedWindow(
+            key=window_key,
+            start=block_start_dt.astimezone(dt.timezone.utc),
+            reset=parse_iso_datetime(
+                current["five_hour_resets_at"],
+                "five_hour_blocks.five_hour_resets_at",
+            ).astimezone(dt.timezone.utc),
+        ))
+    pricing_evidence: dict = {}
+    source_sink = getattr(journal_ctx, "block_source_evidence", None)
+    source_key = (account_key, window_key)
+    owned_entries = (
+        [] if source_sink is not None and source_key in source_sink else None
+    )
+    totals = _c._compute_block_totals(
+        block_start_dt, cutoff_dt, skip_sync=True,
+        owner_key=window_key, windows=windows,
+        pricing_evidence=pricing_evidence, owned_entries=owned_entries,
+    )
+    if owned_entries is not None:
+        source_sink[source_key] = tuple(owned_entries)
+    # The reset-crossing flag over [block_start_at, end], from the same two
+    # sources and predicates as the live sweep
+    # (`_flag_blocks_spanning_week_resets`), computed exactly so an end that
+    # moves backward clears it too.
+    crossed = conn.execute(
+        """
+        SELECT
+          EXISTS (
+            SELECT 1 FROM week_reset_events
+             WHERE account_key = ?
+               AND unixepoch(effective_reset_at_utc)
+                   BETWEEN unixepoch(?) AND unixepoch(?)
+          )
+          OR EXISTS (
+            SELECT 1 FROM weekly_usage_snapshots
+             WHERE week_start_at IS NOT NULL
+               AND account_key = ?
+               AND unixepoch(week_start_at) >  unixepoch(?)
+               AND unixepoch(week_start_at) <= unixepoch(?)
+          )
+        """,
+        (account_key, current["block_start_at"], last_observed,
+         account_key, current["block_start_at"], last_observed),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        UPDATE five_hour_blocks
+           SET last_observed_at_utc       = ?,
+               final_five_hour_percent    = ?,
+               seven_day_pct_at_block_end = ?,
+               total_input_tokens         = ?,
+               total_output_tokens        = ?,
+               total_cache_create_tokens  = ?,
+               total_cache_read_tokens    = ?,
+               total_cost_usd             = ?,
+               pricing_provenance_json    = ?,
+               crossed_seven_day_reset    = ?,
+               last_updated_at_utc        = ?
+         WHERE id = ? AND is_closed = 0
+        """,
+        (
+            last_observed, final_five_hour, weekly_end,
+            totals["input_tokens"], totals["output_tokens"],
+            totals["cache_create_tokens"], totals["cache_read_tokens"],
+            totals["cost_usd"],
+            _c._block_pricing_provenance_json(pricing_evidence),
+            1 if crossed else 0, as_of, int(current["id"]),
+        ),
+    )
+    # Replace-all children, keyed on the window (not block_id) so an orphan
+    # child of an earlier parent rebuild is cleaned up as well.
+    block_id = int(current["id"])
+    conn.execute(
+        "DELETE FROM five_hour_block_models "
+        "WHERE five_hour_window_key = ? AND account_key = ?",
+        (window_key, account_key),
+    )
+    if totals.get("by_model"):
+        conn.executemany(
+            """
+            INSERT INTO five_hour_block_models (
+              block_id, five_hour_window_key, model,
+              input_tokens, output_tokens,
+              cache_create_tokens, cache_read_tokens,
+              cost_usd, entry_count, account_key
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    block_id, window_key, model,
+                    b["input_tokens"], b["output_tokens"],
+                    b["cache_create_tokens"], b["cache_read_tokens"],
+                    b["cost_usd"], b["entry_count"], account_key,
+                )
+                for model, b in totals["by_model"].items()
+            ],
+        )
+    conn.execute(
+        "DELETE FROM five_hour_block_projects "
+        "WHERE five_hour_window_key = ? AND account_key = ?",
+        (window_key, account_key),
+    )
+    if totals.get("by_project"):
+        conn.executemany(
+            """
+            INSERT INTO five_hour_block_projects (
+              block_id, five_hour_window_key, project_path,
+              input_tokens, output_tokens,
+              cache_create_tokens, cache_read_tokens,
+              cost_usd, entry_count, account_key
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    block_id, window_key, project_path,
+                    b["input_tokens"], b["output_tokens"],
+                    b["cache_create_tokens"], b["cache_read_tokens"],
+                    b["cost_usd"], b["entry_count"], account_key,
+                )
+                for project_path, b in totals["by_project"].items()
+            ],
+        )
+
+
+def _materialize_open_candidate(conn, key, acct, start_row) -> int:
+    """Insert one rebuild open-block candidate with its start columns from
+    ``start_row`` (the first writer, else the earliest survivor) and its end
+    from `select_open_block_end`; zero totals and NULL provenance until
+    `_refresh_every_open_block` projects it in the same transaction. Returns
+    the inserted row count."""
+    end = select_open_block_end(
+        conn, account_key=acct, five_hour_window_key=key)
+    if start_row is None or end is None:
+        return 0   # defensive — should be unreachable per the keys query
+    resets_at = start_row["five_hour_resets_at"]
+    block_start_at = (
+        parse_iso_datetime(resets_at, "resets_at backfill")
+        - dt.timedelta(hours=5)
+    ).isoformat(timespec="seconds")
+    # A rebuild's only-missing row is the trailing unjournaled projection,
+    # never a close decision. Wall time may be past its reset, but only a
+    # later retained observation may close and clock it (#399).
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO five_hour_blocks (
+          five_hour_window_key, five_hour_resets_at, block_start_at,
+          first_observed_at_utc, last_observed_at_utc,
+          final_five_hour_percent,
+          seven_day_pct_at_block_start, seven_day_pct_at_block_end,
+          crossed_seven_day_reset,
+          total_input_tokens, total_output_tokens,
+          total_cache_create_tokens, total_cache_read_tokens,
+          total_cost_usd, pricing_provenance_json, is_closed,
+          created_at_utc, last_updated_at_utc, account_key
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, NULL, 0, ?, ?, ?)
+        """,
+        (
+            key, resets_at, block_start_at,
+            start_row["captured_at_utc"], end.captured_at_utc,
+            end.five_hour_percent,
+            start_row["weekly_percent"], end.seven_day_percent,
+            start_row["captured_at_utc"], end.captured_at_utc, acct,
+        ),
+    )
+    return cur.rowcount or 0
+
+
+def _refresh_every_open_block(conn) -> int:
+    """Project every open block through `select_open_block_end` /
+    `project_open_block_end` (#956 class 1, spec 4.5.3), with each account's
+    ownership context built from every `five_hour_blocks` row as it stands
+    now. Runs inside the caller's transaction. Returns the blocks refreshed.
+    A block whose window has no surviving reading keeps its end columns, and
+    its accounting is recomputed to its stored `last_observed_at_utc`."""
+    _c = _cctally()
+    ownership: dict = {}
+    for row in conn.execute(
+        "SELECT five_hour_window_key, block_start_at, "
+        "       five_hour_resets_at, account_key FROM five_hour_blocks"
+    ).fetchall():
+        try:
+            w_start = parse_iso_datetime(
+                row["block_start_at"], "five_hour_blocks.block_start_at",
+            ).astimezone(dt.timezone.utc)
+            w_reset = parse_iso_datetime(
+                row["five_hour_resets_at"],
+                "five_hour_blocks.five_hour_resets_at",
+            ).astimezone(dt.timezone.utc)
+        except ValueError:
+            continue
+        ownership.setdefault(row["account_key"], []).append(_c.OwnedWindow(
+            key=int(row["five_hour_window_key"]), start=w_start,
+            reset=w_reset,
+        ))
+    refreshed = 0
+    for index, block in enumerate(conn.execute(
+        "SELECT id, account_key, five_hour_window_key, last_updated_at_utc "
+        "  FROM five_hour_blocks WHERE is_closed = 0"
+    ).fetchall(), 1):
+        if not index & 1023:
+            _lib_rebuild_progress.tick(blocks=index)
+        end = select_open_block_end(
+            conn, account_key=block["account_key"],
+            five_hour_window_key=int(block["five_hour_window_key"]))
+        project_open_block_end(
+            conn, block, end,
+            ownership=ownership.get(block["account_key"], []),
+            journal_ctx=None,
+            as_of=(end.captured_at_utc if end is not None
+                   else block["last_updated_at_utc"]),
+        )
+        refreshed += 1
+    return refreshed
+
+
 def _backfill_five_hour_blocks(
     conn: sqlite3.Connection, *, only_missing: bool = False,
     journaled_first: "dict | None" = None,
+    retired_openings: frozenset = frozenset(),
 ) -> int:
     """One-shot historical backfill of five_hour_blocks from existing
     weekly_usage_snapshots data. Idempotent via UNIQUE(five_hour_window_key)
@@ -1834,6 +2185,26 @@ def _backfill_five_hour_blocks(
       ordinary (legacy, pre-journal) backfill keeps NULL: its blocks predate
       provenance, which `_lib_cost_provenance.historical_close_marker` reads
       as unproven.
+
+    #956 class 1 (spec 4.5.3): with ``only_missing`` the end columns and the
+    accounting come from the one capture-order projection live ingest uses
+    (`select_open_block_end` / `project_open_block_end`), not from a
+    backfill-local end row. The pass materializes the missing candidates
+    (start columns only, as above), then builds each account's ownership
+    context from EVERY block row after that materialization, and refreshes
+    EVERY open block, not only those it created: a block another path
+    materialized is refreshed against the same window set. The candidate
+    ranking breaks equal-second ties by `journal_id` (logical identity), never
+    by rowid, which a journal correction can reorder.
+
+    #956 class 2 (spec 4.6.3): a window created by a current binary has a
+    retained opening fact whose fold already materialized its block, so it
+    is never a candidate here and its start columns are the seed's. The
+    candidates are the LEGACY open blocks (created before opening facts, R4):
+    each account's latest-captured window with no block row, except a window
+    in ``retired_openings`` — the `(account_key, five_hour_window_key)` pairs
+    whose opening fact a correction tombstoned (`_cctally_journal.
+    retired_block_openings`): its block was removed, never "never seeded".
     """
     _c = _cctally()
     inserted = 0
@@ -1884,7 +2255,7 @@ def _backfill_five_hour_blocks(
                 "           SELECT id, ROW_NUMBER() OVER ("
                 "                      PARTITION BY account_key"
                 "                      ORDER BY unixepoch(captured_at_utc) DESC,"
-                "                               id DESC"
+                "                               journal_id DESC"
                 "                  ) AS rn"
                 "             FROM weekly_usage_snapshots"
                 "            WHERE five_hour_window_key IS NOT NULL"
@@ -1899,6 +2270,9 @@ def _backfill_five_hour_blocks(
                 "   )"
             )
         keys = [(int(r[0]), r[1]) for r in conn.execute(keys_sql).fetchall()]
+        if only_missing and retired_openings:
+            keys = [(key, acct) for key, acct in keys
+                    if (acct, key) not in retired_openings]
 
         now_iso = now_utc_iso()
         now_dt = parse_iso_datetime(now_iso, "now")
@@ -1911,10 +2285,10 @@ def _backfill_five_hour_blocks(
         # pair re-prices its overlap twice.
         ownership: dict[Any, list] = {}
         seen_keys: set = set()
-        for row in conn.execute(
+        for row in ([] if only_missing else conn.execute(
             "SELECT five_hour_window_key, block_start_at, "
             "       five_hour_resets_at, account_key FROM five_hour_blocks"
-        ).fetchall():
+        ).fetchall()):
             try:
                 w_start = parse_iso_datetime(
                     row["block_start_at"], "five_hour_blocks.block_start_at",
@@ -1930,7 +2304,7 @@ def _backfill_five_hour_blocks(
             ownership.setdefault(row["account_key"], []).append(
                 _c.OwnedWindow(key=w_key, start=w_start, reset=w_reset)
             )
-        for key, acct in keys:
+        for key, acct in ([] if only_missing else keys):
             if (acct, key) in seen_keys:
                 continue
             # Same start-row pick the insert loop makes below, so the
@@ -1973,6 +2347,10 @@ def _backfill_five_hour_blocks(
                 # (window_key, account_key) so a shared window's per-account
                 # blocks each read their own account's boundary rows (#341).
                 min_row = _first_row(key, acct)
+                if only_missing:
+                    inserted += _materialize_open_candidate(
+                        conn, key, acct, min_row)
+                    continue
                 max_row = conn.execute(
                     """
                     SELECT captured_at_utc, weekly_percent, five_hour_percent
@@ -2038,26 +2416,16 @@ def _backfill_five_hour_blocks(
                 # reset, but only a later retained observation may close and
                 # clock it (#399). The ordinary legacy backfill keeps its
                 # historical wall-time classification.
-                is_closed = (
-                    0 if only_missing else (1 if resets_dt < now_dt else 0)
-                )
-                projection_created_at = first_obs if only_missing else now_iso
-                projection_updated_at = last_obs if only_missing else now_iso
+                is_closed = 1 if resets_dt < now_dt else 0
 
                 # Token + cost totals — recomputed via the shared helper,
                 # which routes through get_entries() and falls back to
                 # JSONL if cache.db is unreadable.
                 # skip_sync=True: backfill runs inside open_db(); a sync_cache
                 # cascade here would reopen cache.db recursively.
-                pricing_evidence = {} if only_missing else None
                 totals = _c._compute_block_totals(
                     block_start_dt, last_obs_dt, skip_sync=True,
                     owner_key=key, windows=ownership.get(acct, []),
-                    pricing_evidence=pricing_evidence,
-                )
-                pricing_provenance_json = (
-                    _c._block_pricing_provenance_json(pricing_evidence)
-                    if pricing_evidence is not None else None
                 )
 
                 cur = conn.execute(
@@ -2101,10 +2469,10 @@ def _backfill_five_hour_blocks(
                         totals["cache_create_tokens"],
                         totals["cache_read_tokens"],
                         totals["cost_usd"],
-                        pricing_provenance_json,
+                        None,
                         is_closed,
-                        projection_created_at,
-                        projection_updated_at,
+                        now_iso,
+                        now_iso,
                         acct,
                     ),
                 )
@@ -2175,6 +2543,9 @@ def _backfill_five_hour_blocks(
                                 for project_path, b in totals["by_project"].items()
                             ],
                         )
+
+            if only_missing:
+                _refresh_every_open_block(conn)
 
             # Mark child-table migrations done so the upgrade-user gates in
             # open_db() don't re-fire on next open. Inside the same

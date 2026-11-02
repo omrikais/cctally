@@ -24,5 +24,5 @@ migrate. Regenerate ONLY when a deliberate decision requires it (e.g. a new
 migration needs a new legacy column), by running
 `python3 bin/build-ancient-migration-fixtures.py` and hand-reviewing the diff.
 The builder is intentionally NOT a `build_per_migration_*` in
-`build-migrations-fixtures.py`, so the #197 byte-idempotency guard does not
+`build-migrations-fixtures.py`, so the #197 content-idempotency guard does not
 auto-discover it.

@@ -15,7 +15,7 @@ stats.db (<HOME>/.local/share/cctally/stats.db)  version 0 / 14 known
   · 013_codex_quota_projection_state               pending
   · 014_test_failure_injection                     pending
 
-cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 50 known
+cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 52 known
   · 001_dedup_highest_wins                         pending
   · 002_conversation_messages_backfill             pending
   · 003_conversation_reingest_tool_ids             pending
@@ -65,7 +65,9 @@ cache.db (<HOME>/.local/share/cctally/cache.db)  version 0 / 50 known
   · 047_spill_free_read_paths                      pending
   · 048_codex_quota_physical_group_order           pending
   · 049_codex_rollout_containers                   pending
-  · 050_test_cache_migration                       pending
+  · 050_preserve_claude_cost_attribution           pending
+  · 051_codex_retained_identities                  pending
+  · 052_test_cache_migration                       pending
 
 conversations.db (<HOME>/.local/share/cctally/conversations.db)  version 0 / 12 known
   · 001_adopt_schema_version_marker                pending

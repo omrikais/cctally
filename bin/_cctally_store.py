@@ -1784,6 +1784,115 @@ def stats_open_guarded(
         lock_fh.close()
 
 
+#: #1015 spec 5.3: the fail-fast reader's SQLite busy timeout, in
+#: milliseconds — a contended read is "unavailable", never a wait.
+_STATS_FAILFAST_BUSY_TIMEOUT_MS = 50
+
+
+def _stats_failfast_epoch_probe(db_path: pathlib.Path) -> "int | None":
+    """``PRAGMA user_version`` of the main file, read without locks or the
+    wal-index (see `stats_open_readonly_failfast`); None on any error."""
+    try:
+        probe = sqlite3.connect(
+            db_path.as_uri() + "?mode=ro&immutable=1", uri=True,
+            **_STATS_CONNECT_KWARGS)
+    except sqlite3.Error:
+        return None
+    try:
+        return int(probe.execute("PRAGMA user_version").fetchone()[0])
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    finally:
+        probe.close()
+
+
+def stats_open_readonly_failfast() -> "sqlite3.Connection | None":
+    """A read-only connection to the PUBLISHED stats index, or None at once.
+
+    #1015 spec 5.3 (review findings R1-P1-4, R2-P1-4, R3-P1-1, R4-P2-3). For a
+    reader that must never change, recover or wait on the stats family — the
+    calibration lineage facts a forecast or the status line consults. It
+    never calls `stats_open_guarded` (which resumes, resolves and recovers),
+    `open_db`, a migration, ingest, a rebuild or a recovery callback.
+
+    1. The maintenance flock is tried SHARED and NON-blocking; busy -> None.
+    2. None, touching nothing, when the repair marker, a pending quarantine
+       record, an interrupted-rebuild artifact, the durable publication
+       marker (pending or failed), or a ``-wal`` / ``-shm`` side file exists.
+       Side files are found by ``stat`` only: no raw descriptor is ever opened
+       on the database file, so this process's SQLite POSIX locks are never
+       released by closing one, and the maintenance drain scanner never sees
+       a descriptor this reader left open.
+    3. ``file:<path>?mode=ro`` as a URI, ``PRAGMA query_only = 1`` and a
+       ``busy_timeout`` of `_STATS_FAILFAST_BUSY_TIMEOUT_MS`; None when
+       ``PRAGMA user_version`` is not the current stats epoch, or on any
+       SQLite error (a hot rollback journal surfaces as one).
+    4. The shared flock covers the checks and the connect and is released
+       exactly as the guarded opener releases it, so the reader joins the
+       #386 handshake: a destructive maintenance owner drains pre-marker
+       handles.
+
+    R10 (a store last closed by a pre-#538 release keeps a WAL header with no
+    side files) is narrowed by an epoch probe before the real connect: an
+    ``immutable=1`` SQLite connection reads ``user_version`` from the main
+    file without the wal-index, so an old-epoch store is refused before a
+    read-only WAL open could create ``-shm`` (32 KiB) and ``-wal``. The probe
+    is a fast reject only; the locked connection re-checks the epoch. It is
+    an SQLite connection, not a raw descriptor: the unix VFS defers closing
+    its descriptor while another connection of this process holds a lock on
+    the same inode, so it releases no lock (the lock-preservation test pins
+    this)."""
+    db_path = pathlib.Path(_cctally_core.DB_PATH)
+    lock_path = pathlib.Path(_cctally_core.STATS_LOCK_MAINTENANCE_PATH)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(lock_path, "a+")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return None
+        try:
+            if (_stats_repair_marker(db_path).exists()
+                    or _cctally_db._quarantine_pending_path(db_path).exists()
+                    or _stats_rebuild_artifact_bases(db_path)
+                    or _stats_publication_marker(db_path).exists()
+                    or pathlib.Path(str(db_path) + "-wal").exists()
+                    or pathlib.Path(str(db_path) + "-shm").exists()
+                    or not db_path.exists()):
+                return None
+            conn = None
+            try:
+                epoch = int(_cctally_core.STATS_INDEX_EPOCH)
+                if _stats_failfast_epoch_probe(db_path) != epoch:
+                    return None
+                conn = sqlite3.connect(
+                    db_path.as_uri() + "?mode=ro", uri=True,
+                    timeout=_STATS_FAILFAST_BUSY_TIMEOUT_MS / 1000.0,
+                    **_STATS_CONNECT_KWARGS)
+                conn.execute("PRAGMA query_only = 1")
+                # Literal SQL: `_STATS_FAILFAST_BUSY_TIMEOUT_MS` (50).
+                conn.execute("PRAGMA busy_timeout = 50")
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if int(version) != epoch:
+                    conn.close()
+                    return None
+                return conn
+            except (sqlite3.Error, ValueError):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+                return None
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+    finally:
+        lock_fh.close()
+
+
 def _acquire_stats_maintenance_reentrant(path) -> "int | None":
     """Take ``stats.db.maintenance.lock`` EXCLUSIVE unless we already hold it.
 
@@ -2092,11 +2201,12 @@ def _stats_heal_hook(
         )
         if reservation == "reserved":
             active_request = elected_request or request
-        elif reservation == "pending":
+        elif reservation in ("pending", "retry-elected"):
             # The elected request and coalesced count were read and updated
             # while admission was still held. Never reconstruct identity from
             # a marker that the worker may not have written yet or may already
-            # have removed.
+            # have removed. `retry-elected` (#1012) keeps that request too: it
+            # only adds a same-request contender.
             active_request = elected_request or request
         else:
             active_request = request
@@ -2217,6 +2327,11 @@ def _stats_heal_admission_path() -> pathlib.Path:
 
 def _stats_heal_worker_path() -> pathlib.Path:
     return _stats_heal_path("stats-corruption-heal.worker.lock")
+
+
+def _stats_heal_claim_path() -> pathlib.Path:
+    """#1012: taken only by heal workers, before the worker lock."""
+    return _stats_heal_path("stats-corruption-heal.claim.lock")
 
 
 def _stats_heal_log_path() -> pathlib.Path:
@@ -2346,27 +2461,15 @@ def _unlink_stats_heal_marker() -> None:
 
 
 def _stats_heal_worker_active() -> bool:
-    """Probe the worker flock without waiting or disturbing its owner."""
-    try:
-        fd = os.open(
-            _stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600
-        )
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError:
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return False
-    finally:
-        os.close(fd)
+    """Whether a heal worker may be running, decided from its records.
+
+    #1012: true unless ownership is positively ``absent``, so a live heal
+    whose identity cannot be confirmed keeps the maintenance-timeout message
+    it had under the old lock probe. It takes no lock (neither the worker lock
+    nor the claim lock) and writes nothing: the old try-lock, landing at a
+    worker's claim instant, made that worker exit ``busy``.
+    """
+    return _rebuild_worker_ownership("heal") != "absent"
 
 
 def _log_stats_heal(
@@ -2461,14 +2564,30 @@ def _reserve_stats_corruption_heal(
                 coalescedDetections=elected["coalescedDetections"],
             )
             return ("pending", elected)
-        if _stats_heal_worker_active():
-            # A real rebuild outlives the marker retry interval. Refresh the
-            # admission stamp instead of launching a process that can only lose
-            # the worker flock and exit.
-            elected = _read_stats_heal_request()
-            if not elected:
+        ownership = _rebuild_worker_ownership("heal")
+        kept = (_read_stats_heal_request()
+                if ownership == "owned" or (ownership == "uncertain"
+                                            and age is not None) else None)
+        if ownership == "owned" or kept:
+            # `owned`: a real rebuild outlives the marker retry interval.
+            # Refresh the admission stamp instead of launching a process that
+            # can only lose the claim and exit. `uncertain` (#1012): the heal
+            # may still be live (a null recorded birth, a `ps` failure), and
+            # replacing its request would make that worker's persist and
+            # finalize refuse it. Keep the elected request, coalesce onto it,
+            # and launch a same-request contender (`retry-elected`): the claim
+            # protocol makes it hand off to a live owner or take over from a
+            # dead one. With no marker, or an unreadable one, there is no
+            # request to keep (a corrupt marker carries no healId a live
+            # worker could still persist or finalize against), so an
+            # uncertain record admits a new one below (its worker hands off
+            # the same way); otherwise an unreadable state or marker would
+            # fail every admission and nothing would ever launch the worker
+            # that archives it. `owned` keeps failing on an unreadable
+            # marker: its live worker still holds the request.
+            if not kept:
                 return ("failed", None)
-            elected = dict(elected)
+            elected = dict(kept)
             elected["coalescedDetections"] = int(
                 elected.get("coalescedDetections") or 0
             ) + 1
@@ -2481,7 +2600,8 @@ def _reserve_stats_corruption_heal(
                 wait_s=_STATS_HEAL_ADMISSION_RING_WAIT_S,
                 coalescedDetections=elected["coalescedDetections"],
             )
-            return ("pending", elected)
+            return ("pending" if ownership == "owned" else "retry-elected",
+                    elected)
         stale_request = _read_stats_heal_request() if age is not None else None
         if stale_request:
             if not update_stats_heal_event(
@@ -2541,10 +2661,18 @@ def complete_stats_corruption_heal(reservation: str) -> str:
 
     Takes no lock: the spawn need not occur under any, and the maintenance hold
     must already have been released so the worker can take it exclusive. A
-    non-`reserved` reservation is returned unchanged, so a coalesced or failed
-    admission reports exactly what it reported before the split.
+    reservation other than `reserved` or `retry-elected` is returned
+    unchanged, so a coalesced or failed admission reports exactly what it
+    reported before the split.
+
+    `retry-elected` (#1012) launches a contender for the EXISTING request of
+    an owner whose identity could not be confirmed. It differs from
+    `reserved` only on failure: the marker may belong to a live worker, so a
+    failed spawn is recorded in the ledger but the marker is kept, and the
+    result is `pending` (as is a withheld launch: launch capacity, or a
+    contender already waiting on the same owner).
     """
-    if reservation != "reserved":
+    if reservation not in ("reserved", "retry-elected"):
         return reservation
     # #997 D8 launch: the reservation is persisted under the admission flock
     # before the spawn, and the child's identity filled under it after. The
@@ -2557,14 +2685,22 @@ def complete_stats_corruption_heal(reservation: str) -> str:
     _with_heal_admission(lambda: reserve.append(_spawner_reserve(
         "heal", launch_id, _cctally_core.now_utc_iso())))
     if reserve == ["withheld"]:
-        # Launch capacity: the admitted request stays pending (its marker is
-        # kept) and nothing is spawned; a later detection retries it.
+        # Launch capacity, or (#1012) a contender that has not started
+        # already waits on an owner not proven gone: the admitted request
+        # stays pending (its marker is kept) and nothing is spawned; a later
+        # detection retries it.
         return "pending"
     pid = _spawn_rebuild_worker(STATS_CORRUPTION_HEAL_COMMAND, launch_id)
     if pid is not None:
         _with_heal_admission(lambda: _spawner_fill(
             "heal", launch_id, pid, _cctally_core.now_utc_iso()))
         return "spawned"
+    if reservation == "retry-elected":
+        # The elected request may still belong to a live worker: record the
+        # failed start, keep its marker, and leave the request pending.
+        _with_heal_admission(lambda: _spawner_fill(
+            "heal", launch_id, None, _cctally_core.now_utc_iso()))
+        return "pending"
     # Drop our own marker so the next detection is admitted immediately rather
     # than waiting out the retry window. Done under the admission flock, as it
     # was before the split, so no concurrent caller can coalesce onto a marker
@@ -2869,20 +3005,12 @@ def cmd_stats_corruption_heal_internal(args) -> int:
     """Hidden detached worker: heal one corrupt stats index exactly once."""
     del args
     healed = False
-    try:
-        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
-        worker_fd = os.open(
-            _stats_heal_worker_path(), os.O_WRONLY | os.O_CREAT, 0o600
-        )
-    except OSError as exc:
-        _log_stats_heal("error", error=exc)
+    # #1012: the claim lock, then the worker lock; a loser records `busy`
+    # only against a live started owner (spec 5.3).
+    claim = _claim_rebuild_worker("heal")
+    if isinstance(claim, str):
         return 0
     try:
-        try:
-            fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            _record_worker_busy("heal")
-            return 0
         # #997 D8: record the run (and any dead predecessor) before any work;
         # a run that cannot be recorded does none.
         run = _WorkerRun("heal")
@@ -2898,14 +3026,10 @@ def cmd_stats_corruption_heal_internal(args) -> int:
                        finalization=result["finalization"],
                        decline_reason=result["declineReason"])
     finally:
-        try:
-            fcntl.flock(worker_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(worker_fd)
+        _release_rebuild_worker_claim(claim)
         if healed:
             # #825/#832 spec 4.3 revision 2: the healed index posts its
-            # completion wake, with the worker flock released.
+            # completion wake, with the worker and claim locks released.
             import _cctally_completion
             _cctally_completion.post_publication_wake()
 
@@ -3197,6 +3321,11 @@ def _stats_epoch_rebuild_worker_path() -> pathlib.Path:
     return _stats_epoch_rebuild_path("stats-epoch-rebuild.worker.lock")
 
 
+def _stats_epoch_rebuild_claim_path() -> pathlib.Path:
+    """#1012: taken only by epoch workers, before the worker lock."""
+    return _stats_epoch_rebuild_path("stats-epoch-rebuild.claim.lock")
+
+
 def _stats_epoch_rebuild_log_path() -> pathlib.Path:
     return pathlib.Path(_cctally_core.LOG_DIR) / "stats-epoch-rebuild.log"
 
@@ -3209,29 +3338,16 @@ def _unlink_stats_epoch_marker() -> None:
 
 
 def _stats_epoch_rebuild_worker_active() -> bool:
-    """Probe the worker flock without waiting or disturbing its owner."""
-    try:
-        fd = os.open(
-            _stats_epoch_rebuild_worker_path(),
-            os.O_WRONLY | os.O_CREAT,
-            0o600,
-        )
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError:
-            return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return False
-    finally:
-        os.close(fd)
+    """Whether a positively identified epoch worker owns the rebuild.
+
+    #1012: decided from the run state, launch ledger and process identity
+    (``_rebuild_worker_ownership == "owned"``); an uncertain owner reads as
+    inactive, so its caller launches a contender that the claim protocol makes
+    hand off to a live owner. It takes no lock and writes nothing: the old
+    try-lock of the worker flock, landing at a worker's claim instant, made
+    that worker exit ``busy`` and left the pending rebuild unowned.
+    """
+    return _rebuild_worker_ownership("epoch") == "owned"
 
 
 def _log_stats_epoch_rebuild(outcome: str, *, error: Exception | None = None) -> None:
@@ -3313,6 +3429,18 @@ def _worker_admission_path(worker: str) -> pathlib.Path:
     if worker == "epoch":
         return _stats_epoch_rebuild_admission_path()
     return _stats_heal_admission_path()
+
+
+def _worker_claim_path(worker: str) -> pathlib.Path:
+    if worker == "epoch":
+        return _stats_epoch_rebuild_claim_path()
+    return _stats_heal_claim_path()
+
+
+def _worker_lock_path(worker: str) -> pathlib.Path:
+    if worker == "epoch":
+        return _stats_epoch_rebuild_worker_path()
+    return _stats_heal_worker_path()
 
 
 def _read_private_record(path: pathlib.Path):
@@ -3440,12 +3568,13 @@ def read_stats_heal_request_snapshot() -> "dict | None":
     }
 
 
-def process_identity(pid) -> dict:
+def process_identity(pid, *, timeout: float = 10) -> dict:
     """``{"status": "alive"|"gone"|"unknown", "birth": str | None}``.
 
     From ``ps -o stat=,lstart= -p <pid>`` under ``LC_ALL=C``: no such process
     (``ps`` exits 1 with no output) or a zombie (``Z`` in ``stat``) is
-    ``gone``; ``ps`` failing in any other way is ``unknown``. ``birth`` is the
+    ``gone``; ``ps`` failing in any other way, including running past
+    ``timeout`` seconds, is ``unknown``. ``birth`` is the
     one-second-resolution start time, whitespace-normalized.
     """
     import subprocess
@@ -3455,7 +3584,7 @@ def process_identity(pid) -> dict:
     try:
         out = subprocess.run(
             ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True, timeout=timeout, check=False,
             env={**os.environ, "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         return {"status": "unknown", "birth": None}
@@ -3469,6 +3598,91 @@ def process_identity(pid) -> dict:
     if "Z" in stat_field:
         return {"status": "gone", "birth": birth}
     return {"status": "alive", "birth": birth}
+
+
+#: #1012: the ownership check's own bound on its ``ps`` call, well below the
+#: diagnostics' 10 s. An identity that times out is ``unknown``, so the answer
+#: is ``uncertain``; an admission never stalls on ``ps``.
+_OWNERSHIP_IDENTITY_TIMEOUT_S = 2.0
+
+#: Run fields a live worker rewrites as it progresses. A change to these alone
+#: between an ownership check's two reads is not a change of owner.
+_RUN_PROGRESS_FIELDS = frozenset({
+    "phase", "phaseStartedAt", "progressAt", "counters", "residentBytes",
+    "peakResidentBytes",
+})
+
+
+def _ownership_records(worker: str):
+    """One read of the run state, then the ledger, for an ownership check.
+
+    ``(verdict, run, entry)``: ``verdict`` is ``"absent"`` or ``"uncertain"``
+    when the records alone settle the answer, else ``None`` for a well-formed
+    running run whose unresolved ledger entry acknowledges ``started`` with
+    its ``runId``. Never writes.
+    """
+    state = read_worker_state(worker)
+    if state["unreadable"]:
+        return "uncertain", None, None
+    run = (state["state"] or {}).get("run")
+    if run is None or run.get("status") == "finished":
+        return "absent", None, None
+    pid = run.get("pid")
+    if (run.get("status") != "running"
+            or not isinstance(run.get("runId"), str)
+            or not isinstance(run.get("launchId"), str)
+            or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0):
+        return "uncertain", run, None
+    ledger = read_launch_ledger(worker)
+    if ledger["unreadable"]:
+        return "uncertain", run, None
+    entry = _wl.find(ledger["ledger"] or {}, run["launchId"])
+    if entry is not None and entry.get("outcome"):
+        # A recorded terminal is authoritative, as in `_reconcile_prior_run`.
+        return "absent", run, entry
+    ack = (entry or {}).get("ack")
+    if (not isinstance(ack, dict) or ack.get("kind") != "started"
+            or ack.get("runId") != run["runId"]):
+        return "uncertain", run, entry
+    return None, run, entry
+
+
+def _rebuild_worker_ownership(worker: str) -> str:
+    """Who owns the worker's slot, from records alone (#1012).
+
+    ``"owned"`` only on positive evidence: a running run, its unresolved
+    ledger entry acknowledging ``started`` with that ``runId``, and the run's
+    pid alive with the recorded birth, confirmed by a second read of both
+    records after the identity probe (progress-only updates are ignored).
+    ``"absent"`` when no run is running, its entry is terminal, or its process
+    is confirmed gone. ``"uncertain"`` otherwise: unreadable or malformed
+    records, an entry that is missing or acknowledges another run, a null
+    recorded birth, a ``ps`` failure or timeout, or a run that changed under
+    the probe without finishing.
+
+    It never opens a lock file and never writes, so no check can make a
+    starting worker lose its claim. Callers map the three answers (spec 5.2):
+    an uncertain owner may never authorize a ``busy`` exit, and the heal
+    admission never replaces an uncertain owner's request.
+    """
+    verdict, run, entry = _ownership_records(worker)
+    if verdict is not None:
+        return verdict
+    pid = run["pid"]
+    identity = process_identity(pid, timeout=_OWNERSHIP_IDENTITY_TIMEOUT_S)
+    liveness = _wl.liveness(run, {pid: identity})
+    if liveness == "gone":
+        return "absent"
+    if liveness != "alive":
+        return "uncertain"
+    again, run_again, entry_again = _ownership_records(worker)
+    if again is not None:
+        return again
+    unchanged = (
+        {k: v for k, v in run_again.items() if k not in _RUN_PROGRESS_FIELDS}
+        == {k: v for k, v in run.items() if k not in _RUN_PROGRESS_FIELDS}
+        and entry_again.get("ack") == entry.get("ack"))
+    return "owned" if unchanged else "uncertain"
 
 
 def _archive_unreadable_record(path: pathlib.Path, raw) -> "str | None":
@@ -3541,23 +3755,56 @@ def _spawner_classify(worker: str, ledger: dict, now: str) -> dict:
     return _wl.classify(ledger, state, identities, now=now)["ledger"]
 
 
+def _contender_on_standby(ledger: dict, state, now: str) -> bool:
+    """#1012: whether a contender already waits on an unsettled owner.
+
+    True when the run state's run is ``running`` and its launch is not
+    settled in the classified ``ledger`` (an absent entry, or one with no
+    outcome: the owner is not proven gone or finished), AND another
+    unresolved launch has no acknowledgement (it has not started) and was
+    reserved within ``_CONTENDER_STANDBY_S`` before ``now``. An
+    unparseable reservation time never withholds."""
+    run = state.get("run") if isinstance(state, dict) else None
+    if not isinstance(run, dict) or run.get("status") != "running":
+        return False
+    own = run.get("launchId")
+    entry = _wl.find(ledger, own) if isinstance(own, str) else None
+    if entry is not None and entry.get("outcome"):
+        return False
+    now_at = _parse_utc_instant(now)
+    if now_at is None:
+        return False
+    for other in _wl.unresolved(ledger):
+        if other.get("launchId") == own or other.get("ack") is not None:
+            continue
+        at = _parse_utc_instant(other.get("at"))
+        if at is not None and (0 <= (now_at - at).total_seconds()
+                               < _CONTENDER_STANDBY_S):
+            return True
+    return False
+
+
 def _spawner_reserve(worker: str, launch_id: str, now: str) -> str:
     """Classify the ledger and persist this launch's reservation (caller
     holds the admission flock).
 
-    ``"reserved"`` when the reservation is durable; ``"withheld"`` when
+    ``"reserved"`` when the reservation is durable; ``"withheld"`` when the
+    caller must not spawn (the settlements are written, no reservation is,
+    and the request stays pending), for either of two reasons:
     ``LAUNCH_CAPACITY`` entries are still unresolved after classification
-    (the settlements are written, no reservation is, and the caller must not
-    spawn: the request stays pending and `doctor` reports
-    ``details.admission = "launch-capacity"``); ``"unwritten"`` when the
-    ledger could not be written, in which case the caller still spawns and
-    the worker's acknowledgement records the launch."""
+    (`doctor` reports ``details.admission = "launch-capacity"``), or (#1012)
+    a contender that has not started already waits on a recorded owner that
+    is not proven gone or finished (``_contender_on_standby``), so a further
+    one would only wait beside it; ``"unwritten"`` when the ledger could not
+    be written, in which case the caller still spawns and the worker's
+    acknowledgement records the launch."""
     try:
         ledger = _load_ledger_for_update(worker)
         ledger = _spawner_classify(worker, ledger, now)
         state = read_worker_state(worker)["state"]
         protected = _current_run_launch_id(state)
-        if not _wl.has_launch_capacity(ledger):
+        if (not _wl.has_launch_capacity(ledger)
+                or _contender_on_standby(ledger, state, now)):
             _write_ledger(worker, _wl.prune(ledger, protected))
             return "withheld"
         ledger = _wl.reserve(ledger, launch_id=launch_id, at=now)
@@ -3670,6 +3917,194 @@ def _record_worker_busy(worker: str) -> None:
         unrecorded("ledger")
     finally:
         _heal_release_flock(fd)
+
+
+# --------------------------------------------------------------------------
+# #1012 — the claim protocol (spec 5.3)
+# --------------------------------------------------------------------------
+#
+# Only the two worker entry points take a claim lock: no probe, observer or
+# diagnostic may, or a check would again be able to defeat a starting worker.
+# A worker holds its claim lock for as long as it holds its worker lock, so a
+# claimant that finds the worker lock busy is looking at an observer (waited
+# out) or an older binary's worker (identified by its records: `busy`). The
+# one other owner its records can identify is a current worker after a double
+# fault: its `finish()` failed both the state write and the ledger settle,
+# and its process still lives.
+# Lock order: claim lock -> worker lock -> the admission / maintenance /
+# ingest order of docs/journal-gotchas.md.
+
+#: A claimant retries a contended worker lock this often, with no elapsed-time
+#: bound: a non-owner hold delays the claimant and never defeats it.
+_CLAIM_RETRY_S = 0.02
+#: An admission launches no further contender while one that has not started
+#: (no acknowledgement) was reserved this recently for an owner not proven
+#: gone or finished (``_contender_on_standby``). That waiting contender's
+#: body starts after the current obligation and serves it, so a second would
+#: only wait beside it; a dead contender of unknown liveness delays a new
+#: launch by at most this long.
+_CONTENDER_STANDBY_S = 1800.0
+#: ...re-evaluating that lock's ownership at most this often (and at once on
+#: its first refusal). A claim loser's ownership check starts at this period.
+_CLAIM_OWNER_RECHECK_S = 1.0
+#: A claim loser sleeps a jittered first interval in this range, doubling to
+#: the cap; its ownership check backs off to once per the recheck cap.
+_HANDOFF_FIRST_SLEEP_S = (0.01, 0.03)
+_HANDOFF_SLEEP_CAP_S = 1.0
+_HANDOFF_RECHECK_CAP_S = 30.0
+
+
+def _unlock_close(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _hand_off_rebuild_worker_claim(worker: str, claim_fd: int) -> "str | None":
+    """A claim loser's wait (spec 5.3 step 1): ``None`` once ``claim_fd``
+    holds the claim; ``"busy"`` (after ``_record_worker_busy``) once a live
+    worker that has started holds the worker lock; ``"error"`` on an I/O
+    error that is not contention.
+
+    Only positive ownership authorizes ``busy``: a holder between its two
+    flocks or before ``begin()``, a stale record and an unconfirmable
+    identity all keep the loser waiting, so the pending work never loses its
+    last claimant. Its worker-lock try is released at once, it holds no lock
+    while it sleeps, and nothing bounds the wait but the holder's release.
+    """
+    import random
+
+    sleep_s = random.uniform(*_HANDOFF_FIRST_SLEEP_S)
+    recheck_s = _CLAIM_OWNER_RECHECK_S
+    next_check = None
+    while True:
+        try:
+            worker_fd = os.open(_worker_lock_path(worker),
+                                os.O_WRONLY | os.O_CREAT, 0o600)
+        except OSError as exc:
+            _worker_log_error(worker, "claim", exc)
+            return "error"
+        try:
+            try:
+                fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                contended = True
+            except OSError as exc:
+                _worker_log_error(worker, "claim", exc)
+                return "error"
+            else:
+                contended = False
+                # Closing the descriptor releases the try anyway; an unlock
+                # error must not escape the worker.
+                try:
+                    fcntl.flock(worker_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            os.close(worker_fd)
+        if contended:
+            now = time.monotonic()
+            if next_check is None or now >= next_check:
+                if _rebuild_worker_ownership(worker) == "owned":
+                    _record_worker_busy(worker)
+                    return "busy"
+                next_check = now + recheck_s
+                recheck_s = min(recheck_s * 2, _HANDOFF_RECHECK_CAP_S)
+        time.sleep(sleep_s)
+        sleep_s = min(sleep_s * 2, _HANDOFF_SLEEP_CAP_S)
+        try:
+            fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            continue
+        except OSError as exc:
+            _worker_log_error(worker, "claim", exc)
+            return "error"
+        return None
+
+
+def _claim_rebuild_worker(worker: str) -> "tuple[int, int] | str":
+    """Take the worker's claim lock, then its worker lock (spec 5.3).
+
+    Returns the held ``(claim_fd, worker_fd)`` for
+    ``_release_rebuild_worker_claim``, or ``"busy"`` (recorded through
+    ``_record_worker_busy``) or ``"error"`` (logged ``stage=claim``, with no
+    acknowledgement). A claim loser hands off before any ``busy``; a claimant
+    waits out any hold of the worker lock except a positively identified
+    owner. While this process holds the claim that owner is an older
+    binary's worker, or, after a double fault, a current one whose
+    ``finish()`` failed both its state write and its ledger settle while its
+    process lives on: its stale ``running`` record then names a live pid.
+    """
+    fds: list = []  # open descriptors not handed to the caller, claim first
+
+    def release_all() -> None:
+        while fds:
+            _unlock_close(fds.pop())  # the worker lock first, then the claim
+
+    def failed(exc) -> str:
+        release_all()
+        _worker_log_error(worker, "claim", exc)
+        return "error"
+
+    try:
+        try:
+            pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True,
+                                                     exist_ok=True)
+            fds.append(os.open(_worker_claim_path(worker),
+                               os.O_WRONLY | os.O_CREAT, 0o600))
+        except OSError as exc:
+            return failed(exc)
+        claim_fd = fds[0]
+        try:
+            fcntl.flock(claim_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handed = _hand_off_rebuild_worker_claim(worker, claim_fd)
+            if handed is not None:
+                return handed
+        except OSError as exc:
+            return failed(exc)
+        try:
+            fds.append(os.open(_worker_lock_path(worker),
+                               os.O_WRONLY | os.O_CREAT, 0o600))
+        except OSError as exc:
+            return failed(exc)
+        worker_fd = fds[1]
+        next_check = None
+        while True:
+            try:
+                fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                return failed(exc)
+            else:
+                fds.clear()
+                return (claim_fd, worker_fd)
+            now = time.monotonic()
+            if next_check is None or now >= next_check:
+                next_check = now + _CLAIM_OWNER_RECHECK_S
+                if _rebuild_worker_ownership(worker) == "owned":
+                    release_all()
+                    _record_worker_busy(worker)
+                    return "busy"
+            time.sleep(_CLAIM_RETRY_S)
+    finally:
+        release_all()
+
+
+def _release_rebuild_worker_claim(claim: "tuple[int, int]") -> None:
+    """Release a held claim: the worker lock first, then the claim lock, and
+    both before any completion wake. Releasing the claim first would let a
+    second claimant hold it while this process still held the worker lock,
+    and misread this process as an older binary's owner."""
+    claim_fd, worker_fd = claim
+    try:
+        _unlock_close(worker_fd)
+    finally:
+        _unlock_close(claim_fd)
 
 
 def rebuild_worker_snapshot(worker: str) -> dict:
@@ -4060,8 +4495,10 @@ def defer_stats_epoch_rebuild() -> str:
         # launch id, then fill the child's identity (or record the failure).
         launch_id = _new_launch_id()
         if _spawner_reserve("epoch", launch_id, now) == "withheld":
-            # Launch capacity: the marker (just refreshed, so the retry
-            # throttle holds) keeps the request pending; nothing is spawned.
+            # Launch capacity, or (#1012) a contender that has not started
+            # already waits on an owner not proven gone: the marker (just
+            # refreshed, so the retry throttle holds) keeps the request
+            # pending; nothing is spawned.
             return "pending"
         pid = _spawn_rebuild_worker(STATS_EPOCH_REBUILD_COMMAND, launch_id)
         _spawner_fill("epoch", launch_id, pid, _cctally_core.now_utc_iso())
@@ -4083,7 +4520,18 @@ def stats_rebuild_worker_blocks() -> tuple:
     `_cctally_journal.LockBlock` naming the worker lock that refused it,
     whether it was held (contention) or the probe hit an I/O error. A worker
     lock that is free, or whose file does not exist, yields nothing: an
-    unlocked probe proves no release."""
+    unlocked probe proves no release.
+
+    #1012: this stays lock-based, unlike the ownership probes, which never
+    acquire a worker lock. Actual contention (including the window before a
+    worker's run record exists) is what chooses between a release obligation
+    and an inline rebuild, and a stale record must not invent an obligation.
+    This function and the statusline dependency observers take only the
+    worker (compatibility) lock, never a claim lock; the claim protocol keeps
+    their brief holds from defeating a claimant, and a claim loser returns
+    `busy` only while a positively identified live worker holds the worker
+    lock this function observes (a holder may still release between that
+    `busy` and this probe: spec residual R5)."""
     import _cctally_journal
 
     blocks = []
@@ -4134,22 +4582,12 @@ STATS_EPOCH_RESIDUAL_NOT_DURABLE = "success-residual-not-durable"
 def _stats_epoch_rebuild_worker(args) -> str:
     """The worker body; returns its outcome."""
     del args
+    # #1012: the claim lock, then the worker lock; `busy` only against a live
+    # started owner, `error` for a lock I/O failure (spec 5.3).
+    claim = _claim_rebuild_worker("epoch")
+    if isinstance(claim, str):
+        return claim
     try:
-        pathlib.Path(_cctally_core.APP_DIR).mkdir(parents=True, exist_ok=True)
-        worker_fd = os.open(
-            _stats_epoch_rebuild_worker_path(),
-            os.O_WRONLY | os.O_CREAT,
-            0o600,
-        )
-    except OSError as exc:
-        _log_stats_epoch_rebuild("error", error=exc)
-        return "error"
-    try:
-        try:
-            fcntl.flock(worker_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            _record_worker_busy("epoch")
-            return "busy"
         # #997 D8: record the run (and any dead predecessor) before any work;
         # a run that cannot be recorded does none.
         run = _WorkerRun("epoch")
@@ -4162,11 +4600,7 @@ def _stats_epoch_rebuild_worker(args) -> str:
         finally:
             run.finish(outcome)
     finally:
-        try:
-            fcntl.flock(worker_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(worker_fd)
+        _release_rebuild_worker_claim(claim)
 
 
 def _stats_epoch_rebuild_body() -> str:

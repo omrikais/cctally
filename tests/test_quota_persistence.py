@@ -67,7 +67,8 @@ def _detector(glue, *, split=None, qualified=False):
 
 def _analysis(glue, *, status=None, verdict=None, exit_code=0, fitted=None,
               baseline=None, watch=None, detector=None, blocking=(),
-              detector_input_causes=None, composition_provenance=None):
+              detector_input_causes=None, composition_provenance=None,
+              fit_family_shares=None, baseline_fit_family_shares=None):
     """One constructed analysis.
 
     #688: the two typed fields are populated EXPLICITLY and default to the
@@ -92,7 +93,9 @@ def _analysis(glue, *, status=None, verdict=None, exit_code=0, fitted=None,
         detector_input_causes=(frozenset() if detector_input_causes is None
                                else detector_input_causes),
         composition_provenance=(frozenset() if composition_provenance is None
-                                else composition_provenance))
+                                else composition_provenance),
+        fit_family_shares=fit_family_shares,
+        baseline_fit_family_shares=baseline_fit_family_shares)
 
 
 def _mode(glue, kind="automatic", account_key=None, coefficient_era="opus-5",
@@ -492,9 +495,12 @@ def test_688_the_permitted_shape_yields_exactly_one_descriptor(glue):
     # #689: the persisted enumeration is a separate collection, and on this
     # run it names the same pair the freshness comparison just produced.
     assert [c.effective_from for c in candidates] == [SPLIT_ISO]
-    assert all(c.withholding_status is None for c in candidates), (
-        "the enumeration must not carry the disclosure; it sees only stored "
-        "regimes")
+    # #1015 spec 5.6/5.7: recovery emits the transition's FROZEN descriptor,
+    # so a recovered event carries the detection's own disclosure rather
+    # than nulls rebuilt from the stored regimes.
+    assert [c.withholding_status for c in candidates] == [
+        "unsupported-model-mix"]
+    assert candidates[0].fit_lineage == fresh[0].fit_lineage
 
 
 def test_688_a_second_run_yields_no_further_descriptor(glue):
@@ -623,9 +629,11 @@ def test_691_the_admission_condition_has_exactly_one_spelling(glue):
     import inspect
 
     src_reduce = inspect.getsource(glue.reduce_state)
-    src_persist = inspect.getsource(glue.persist_and_detect)
+    # #1015: the descriptor's disclosure is stamped in one helper, which both
+    # `persist_and_detect` and the reducer's transition lineage go through.
+    src_stamp = inspect.getsource(glue._stamp_disclosure)
     for name, src in (("reduce_state", src_reduce),
-                      ("persist_and_detect", src_persist)):
+                      ("_stamp_disclosure", src_stamp)):
         assert "_transition_persistence_admitted" in src, (
             f"{name} does not consult the shared admission helper")
         assert "qm.transition_persistence_permitted(" not in src, (
@@ -841,3 +849,459 @@ def test_a_prior_from_another_era_is_reported_stale(glue, recorded, era_id,
                         fingerprint=glue.qm.QUOTA_MODEL_CONSTANTS_FINGERPRINT)
     era = glue.qm.era_by_id(era_id)
     assert glue.recorded_prior_is_stale(recorded, era) is stale
+
+
+# --------------------------------------------------------------------------
+# #991 spec 4.5 and section 5 test 4: each regime stores the fit-weighted
+# family composition of the fit it records, and a predecessor never takes on
+# its successor's blend.
+# --------------------------------------------------------------------------
+_BASELINE_Q = {"claude-opus-5": 0.97, "claude-sonnet-5": 0.03}
+_SUCCESSOR_Q = {"claude-opus-5": 0.9, "claude-sonnet-5": 0.1}
+_PRIOR_Q = {"claude-opus-5": 0.99, "claude-sonnet-5": 0.01}
+
+
+def _split_analysis(glue, *, successor_q=_SUCCESSOR_Q, baseline_q=_BASELINE_Q,
+                    watch_value=1_700_000.0):
+    return _analysis(
+        glue, status=glue.qm.CalibrationStatus.INSUFFICIENT_HISTORY,
+        verdict=glue.qm.Verdict.RATE_CHANGE_DETECTED, exit_code=1,
+        fitted=_withheld(glue),
+        baseline=_evidence(glue, 2_050_000.0, days=26),
+        watch=_evidence(glue, watch_value, days=3),
+        detector=_detector(glue, split=dt.date(2026, 8, 25), qualified=True),
+        fit_family_shares=successor_q, baseline_fit_family_shares=baseline_q)
+
+
+def test_991_a_split_run_stores_each_regimes_own_fit_family_shares(glue):
+    """The baseline regime records the baseline q, the successor its own.
+
+    A successor blend written onto the baseline would let a closed regime
+    admit consumer populations its own fit never saw.
+    """
+    state = glue.reduce_state(glue.empty_calibration_state(),
+                              _split_analysis(glue), _mode(glue))
+    baseline, successor = _regimes(state, glue)
+    assert baseline["effectiveUntil"] is not None
+    assert baseline["fitFamilyShares"] == _BASELINE_Q
+    assert successor["effectiveUntil"] is None
+    assert successor["fitFamilyShares"] == _SUCCESSOR_Q
+
+
+def test_991_a_no_split_fit_stores_its_fit_family_shares_or_null(glue):
+    state = glue.reduce_state(
+        glue.empty_calibration_state(),
+        _analysis(glue, fit_family_shares=_SUCCESSOR_Q), _mode(glue))
+    assert _regimes(state, glue)[0]["fitFamilyShares"] == _SUCCESSOR_Q
+    state = glue.reduce_state(glue.empty_calibration_state(),
+                              _analysis(glue), _mode(glue))
+    assert _regimes(state, glue)[0]["fitFamilyShares"] is None
+
+
+def test_991_a_later_run_never_rewrites_the_predecessors_fit_family_shares(
+        glue):
+    """The predecessor closed at a split keeps what IT stored, across the
+    run that closes it and every run that re-discovers the same split."""
+    first = glue.reduce_state(
+        glue.empty_calibration_state(),
+        _analysis(glue, fit_family_shares=_PRIOR_Q), _mode(glue))
+    closed = glue.reduce_state(first, _split_analysis(glue), _mode(glue))
+    predecessor, successor = _regimes(closed, glue)
+    assert predecessor["fitFamilyShares"] == _PRIOR_Q
+    assert successor["fitFamilyShares"] == _SUCCESSOR_Q
+    moved = {"claude-opus-5": 0.85, "claude-sonnet-5": 0.15}
+    again = glue.reduce_state(
+        closed, _split_analysis(glue, successor_q=moved,
+                                watch_value=1_710_000.0), _mode(glue))
+    predecessor, successor = _regimes(again, glue)
+    assert len(_regimes(again, glue)) == 2
+    assert predecessor["fitFamilyShares"] == _PRIOR_Q
+    assert successor["fitFamilyShares"] == moved
+
+
+#: The fingerprint every regime written before #991 carries.
+PRE_991_FINGERPRINT = (
+    "5835b430978b2fc556c577d44c9e62d5d7807e62533b32819ed63d37e3af671a")
+
+
+def test_991_a_pre_991_prior_rolls_over_to_stale_without_a_transition(glue):
+    """PRESERVATION. The #991 fingerprint change is a constants rollover,
+    never a metering-rate transition: the open prior is closed as stale and
+    the next fit is appended, exactly as the #978 rollover did."""
+    prior = _open_prior(fingerprint=PRE_991_FINGERPRINT, era="opus-5-5")
+    state = glue.reduce_state(
+        _state(prior), _analysis(glue, fitted=_evidence(glue, 1_000_000.0)),
+        _new_era_mode(glue))
+    _assert_rolled_over(glue, _regimes(state, glue), 2_400_000.0)
+
+
+# --------------------------------------------------------------------------
+# #1015 T4 — the lineage kernel (spec 5.2, 5.3). Each case names the failure
+# it detects: a fit published across a correction to its inputs that keeps
+# steering the forecast (accuracy), or a refusal that fires for a correction
+# that cannot have changed the fit (a needless withheld forecast).
+# --------------------------------------------------------------------------
+_SEG = "observations-2026-10.jsonl"
+_A = dt.datetime(2026, 10, 1, tzinfo=UTC)
+_S = dt.datetime(2026, 10, 10, tzinfo=UTC)
+_T = dt.datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
+
+
+def _lin():
+    import _lib_quota_lineage as L
+    return L
+
+
+def _facts(rows, batches):
+    L = _lin()
+    corrections = tuple(
+        L.CorrectionRow(op, obs, disp, acct, at, (_SEG, op_off))
+        for op, obs, disp, acct, at, op_off in rows)
+    facts = tuple(L.BatchFact(bid, (_SEG, off), frozenset(fp))
+                  for bid, off, fp in batches)
+    return L.CorrectionFacts(corrections, facts,
+                             frozenset(b.batch_id for b in facts))
+
+
+def _lineage(kind="nosplit", *, scope="A", basis=()):
+    L = _lin()
+    windows = L.dependency_windows(kind, a=_A, s=_S, t=_T)
+    return {"basis": list(basis), "accountScope": scope,
+            "dependencyWindows": list(windows)}
+
+
+@pytest.mark.parametrize("captured,kind,state", [
+    # A correction exactly at S belongs to the successor, not the baseline.
+    (_S, "successor", "tainted"),
+    (_S, "baseline", "clean"),
+    # One instant before S is the successor's pre-split dependency.
+    (_S - dt.timedelta(seconds=1), "baseline", "tainted"),
+    (_S - dt.timedelta(seconds=1), "successor", "tainted"),
+    # A correction exactly at T is included; one after it is not.
+    (_T, "nosplit", "tainted"),
+    (_T + dt.timedelta(seconds=1), "nosplit", "clean"),
+    (_A - dt.timedelta(seconds=1), "nosplit", "clean"),
+])
+def test_1015_window_endpoints_at_s_and_t(captured, kind, state):
+    L = _lin()
+    facts = _facts([("o:1", "obs1", "hold", "A", captured.isoformat(), 10)],
+                   [("b:1", 20, {("claude", "A")})])
+    assert L.assess(_lineage(kind), facts).state == state
+
+
+def test_1015_scope_merged_and_account_precise():
+    L = _lin()
+    facts = _facts([("o:1", "obs1", "retract", "B", _S.isoformat(), 10)],
+                   [("b:1", 20, {("claude", "B")})])
+    # A stamped fit for A ignores B's correction; a merged fit does not.
+    assert L.assess(_lineage(scope="A"), facts).state == "clean"
+    assert L.assess(_lineage(scope="*"), facts) == L.Assessment(
+        "tainted", (("o:1", 1),))
+
+
+def test_1015_batch_footprint_basis_and_order_decide_materialization():
+    L = _lin()
+    row = [("o:1", "obs1", "hold", "A", _S.isoformat(), 10)]
+    # Another account's batch, a Codex-only batch and an empty batch never
+    # invalidate.
+    for fp in ({("claude", "B")}, {("codex", "A")}, set()):
+        assert L.assess(_lineage(), _facts(row, [("b", 20, fp)])).state \
+            == "clean", fp
+    # An unknowable owner and an account-blind Claude batch do.
+    for fp in ({("*", "*")}, {("claude", "*")}):
+        assert L.assess(_lineage(), _facts(row, [("b", 20, fp)])).state \
+            == "tainted", fp
+    # A batch committed before the op cannot materialize it.
+    assert L.assess(_lineage(), _facts(
+        row, [("b", 5, {("claude", "A")})])).state == "clean"
+    # A batch already in the fit's basis is reflected in its inputs.
+    assert L.assess(_lineage(basis=["b"]), _facts(
+        row, [("b", 20, {("claude", "A")})])).state == "clean"
+    # The basis holding every batch is clean without a probe, whatever the
+    # corrections say.
+    assert L.assess(_lineage(basis=["b"]), _facts(
+        [("o:1", "x", "hold", None, None, 10)],
+        [("b", 20, {("*", "*")})])).state == "clean"
+
+
+def test_1015_an_accept_is_a_correction():
+    L = _lin()
+    facts = _facts([("o:1", "obs1", "accept", "A", _S.isoformat(), 10)],
+                   [("b:1", 20, {("claude", "A")})])
+    assert L.assess(_lineage(), facts).state == "tainted"
+
+
+def test_1015_an_unresolved_reference_is_unavailable_never_clean():
+    L = _lin()
+    facts = _facts([("o:1", "obs1", "hold", None, None, 10)],
+                   [("b:1", 20, {("claude", "B")})])
+    assert L.assess(_lineage(), facts).state == "unavailable"
+    # No later batch: it materializes nothing yet.
+    assert L.assess(_lineage(), _facts(
+        [("o:1", "obs1", "hold", None, None, 30)],
+        [("b:1", 20, {("claude", "B")})])).state == "clean"
+    assert L.assess(_lineage(), None).state == "unavailable"
+
+
+def _fitted_regime():
+    return {"effectiveFrom": _A.isoformat(), "effectiveUntil": None,
+            "fingerprint": "f", "algorithmRevision": 3,
+            "coefficientEra": "opus-5-5", "unitsPerPoint": 100_000.0,
+            "interval": {"lo": 95_000.0, "hi": 105_000.0},
+            "support": {"days": 12, "segments": 2}, "status": "ok",
+            "asOf": _T.isoformat(), "qualifications": [],
+            "familyShares": {"claude-opus-5-5": 1.0}}
+
+
+def test_1015_digest_excludes_lifecycle_fields_and_binds_as_of():
+    L = _lin()
+    regime = _fitted_regime()
+    regime["fitLineage"] = L.fit_lineage(
+        scope="A", basis=["b:1"], windows=L.dependency_windows(
+            "nosplit", a=_A, t=_T), estimator=None, regime=regime)
+    assert L.fit_lineage_verifies(regime)
+    # Closing, stale-marking, the annotations and the writer stamps are not
+    # fits, so the lineage still verifies after each.
+    lifecycle = dict(regime, effectiveUntil=_S.isoformat(), status="stale",
+                     supersededByCorrection={"fitId": "x"},
+                     recalibrationAttempt={"status": "s"},
+                     transitionLineage={"digest": "d"}, wpg=3, wpgDigest="z",
+                     wpr=2, wprDigest="z", wpx=3, wpxDigest="z")
+    assert L.fit_lineage_verifies(lifecycle)
+    # A previous release's in-place update writes a new `asOf` even with
+    # identical coefficients: the digest no longer verifies, so the fit is
+    # assessed as legacy over [era start, new asOf].
+    later = dict(regime, asOf=(_T + dt.timedelta(days=2)).isoformat())
+    assert not L.fit_lineage_verifies(later)
+    era_start = dt.datetime(2026, 9, 22, tzinfo=UTC)
+    legacy = L.regime_lineage(later, scope="A", era_start=era_start)
+    assert legacy["legacy"] is True and legacy["basis"] == []
+    assert legacy["dependencyWindows"] == [L.window(
+        era_start, later["asOf"], until_inclusive=True)]
+    for changed in ({"unitsPerPoint": 1.0}, {"effectiveFrom": "x"},
+                    {"fingerprint": "g"}):
+        assert not L.fit_lineage_verifies(dict(regime, **changed)), changed
+
+
+def test_1015_transition_lineage_digest_is_frozen():
+    L = _lin()
+    tl = L.transition_lineage(
+        windows=L.dependency_windows("successor", a=_A, s=_S, t=_T),
+        scope="A", basis=["b:1"], descriptor={"new_units_per_point": 2.0})
+    assert L.transition_lineage_verifies(tl)
+    edited = dict(tl, descriptor={"new_units_per_point": 3.0})
+    assert not L.transition_lineage_verifies(edited)
+    legacy = L.legacy_transition_lineage(
+        account_key="unattributed", detected_at=_T.isoformat())
+    assert legacy["accountScope"] == "*"
+    assert legacy["dependencyWindows"][0]["from"] is None
+
+
+# --------------------------------------------------------------------------
+# #1015 T6 — the sweep assesses the locked state: annotation, attempt,
+# archive, pairing over clean regimes only (spec 5.5, 5.6)
+# --------------------------------------------------------------------------
+_IN_SUCCESSOR = "2026-08-26T09:00:00+00:00"   # inside [SPLIT, NOW]
+_IN_BASELINE = "2026-08-01T09:00:00+00:00"    # inside [REGIME_START, SPLIT)
+
+
+def _no_facts():
+    return _facts((), ())
+
+
+def _tainting(captured=_IN_SUCCESSOR, account="acct-a"):
+    """One retract of one observation, then its completed batch."""
+    return _facts(
+        [("op-1", "obs-1", "retract", account, captured, 100)],
+        [("batch-1", 200, {("claude", account)})])
+
+
+def _lmode(glue, facts, **kw):
+    import dataclasses
+    return dataclasses.replace(_mode(glue, **kw), correction_facts=facts,
+                               correction_basis=facts.basis)
+
+
+def _split_change(glue, *, baseline=2_050_000.0, watch=1_700_000.0):
+    qm = glue.qm
+    return _analysis(
+        glue, status=qm.CalibrationStatus.INSUFFICIENT_HISTORY,
+        verdict=qm.Verdict.RATE_CHANGE_DETECTED, exit_code=1,
+        fitted=_withheld(glue),
+        baseline=(_evidence(glue, baseline, days=26) if baseline is not None
+                  else _withheld(glue)),
+        watch=_evidence(glue, watch, days=3),
+        detector=_detector(glue, split=SPLIT, qualified=True))
+
+
+def _withheld_analysis(glue):
+    return _analysis(glue, status=glue.qm.CalibrationStatus.INSUFFICIENT_HISTORY,
+                     fitted=_withheld(glue))
+
+
+def _assess(glue, regime, facts, scope="*"):
+    import _cctally_quota_calibration as qcg
+    return qcg.assess_regime(regime, facts, scope=scope).state
+
+
+def test_1015_every_fit_carries_its_lineage_and_a_closed_one_keeps_it(glue):
+    """Detects a fit published with no lineage, or with the wrong windows:
+    the predicate could then never see the corrections its inputs depend on
+    (spec 5.2)."""
+    L = _lin()
+    first = glue.reduce_state(glue.empty_calibration_state(), _analysis(glue),
+                              _lmode(glue, _no_facts()))
+    [nosplit] = _regimes(first, glue)
+    assert L.fit_lineage_verifies(nosplit)
+    assert nosplit["fitLineage"]["dependencyWindows"] == list(
+        L.dependency_windows("nosplit", a=REGIME_START, t=NOW))
+    assert nosplit["fitLineage"]["accountScope"] == "*"
+    split = glue.reduce_state(first, _split_change(glue),
+                              _lmode(glue, _no_facts()))
+    closed, successor = _regimes(split, glue)
+    # Closing is not a fit: the predecessor keeps its lineage byte for byte.
+    assert closed["fitLineage"] == nosplit["fitLineage"]
+    assert L.fit_lineage_verifies(closed)
+    assert successor["fitLineage"]["dependencyWindows"] == list(
+        L.dependency_windows("successor", a=REGIME_START, s=SPLIT_ISO, t=NOW))
+    cold = glue.reduce_state(glue.empty_calibration_state(),
+                             _split_change(glue), _lmode(glue, _no_facts()))
+    baseline, _succ = _regimes(cold, glue)
+    assert baseline["fitLineage"]["dependencyWindows"] == list(
+        L.dependency_windows("baseline", a=REGIME_START, s=SPLIT_ISO))
+
+
+def test_1015_a_withheld_sweep_annotates_and_records_the_attempt(glue):
+    """Detects A2: a withheld sweep that leaves a tainted fit unannotated
+    and records no attempt, so the refusal could never state the status."""
+    stored = glue.reduce_state(glue.empty_calibration_state(),
+                               _analysis(glue), _lmode(glue, _no_facts()))
+    facts = _tainting()
+    [before] = _regimes(stored, glue)
+    assert _assess(glue, before, facts) == "tainted"
+    later = NOW + dt.timedelta(days=1)
+    reduced = glue.reduce_state(stored, _withheld_analysis(glue),
+                                _lmode(glue, facts, now=later))
+    [after] = _regimes(reduced, glue)
+    assert after["unitsPerPoint"] == before["unitsPerPoint"]
+    assert after["fitLineage"] == before["fitLineage"]
+    assert after["supersededByCorrection"] == {
+        "fitId": before["fitLineage"]["fitId"],
+        "corrections": [{"opId": "op-1", "observations": 1}],
+        "assessedAt": later.isoformat()}
+    assert after["recalibrationAttempt"] == {
+        "status": "insufficient-history", "basis": ["batch-1"],
+        "asOf": later.isoformat()}
+    # The annotation restamps the writer provenance without a new fitId.
+    stamped = glue.stamp_current_writes(stored, reduced, None)
+    [restamped] = _regimes(stamped, glue)
+    assert glue.regime_writer_is_current(restamped)
+    assert restamped["fitLineage"]["fitId"] == before["fitLineage"]["fitId"]
+    # A second withheld sweep over the same basis owes nothing.
+    again = glue.reduce_state(
+        reduced, _withheld_analysis(glue),
+        _lmode(glue, facts, now=later + dt.timedelta(hours=1)))
+    assert again is reduced
+
+
+def test_1015_nothing_owed_keeps_the_stored_identity(glue):
+    """Detects a sweep that rewrites the sidecar on every run although no
+    correction touches the fit (the common install, spec 5.8)."""
+    stored = glue.reduce_state(glue.empty_calibration_state(),
+                               _analysis(glue), _lmode(glue, _no_facts()))
+    other = _facts([("op-1", "obs-1", "retract", "acct-b", _IN_SUCCESSOR, 1)],
+                   [("batch-1", 2, {("codex", "acct-b")})])
+    for facts in (_no_facts(), other):
+        assert glue.reduce_state(stored, _withheld_analysis(glue),
+                                 _lmode(glue, facts)) is stored
+
+
+def test_1015_a_trustworthy_refit_archives_and_preserves_the_bucket(glue):
+    """Detects A3: a refit over a tainted open regime that loses the old fit,
+    its transition lineage, or another bucket key."""
+    split = glue.reduce_state(glue.empty_calibration_state(),
+                              _split_change(glue), _lmode(glue, _no_facts()))
+    split["accounts"]["*"]["futureKey"] = {"kept": True}
+    facts = _tainting()
+    annotated = glue.reduce_state(split, _withheld_analysis(glue),
+                                  _lmode(glue, facts))
+    tainted = _regimes(annotated, glue)[1]
+    frozen = tainted["transitionLineage"]
+    later = NOW + dt.timedelta(days=2)
+    refit = glue.reduce_state(
+        annotated, _analysis(glue, fitted=_evidence(glue, 1_400_000.0)),
+        _lmode(glue, facts, now=later))
+    bucket = refit["accounts"]["*"]
+    assert bucket["futureKey"] == {"kept": True}
+    assert bucket["archivedFits"] == [
+        {"regime": tainted, "archivedAt": later.isoformat()}]
+    closed, fresh = _regimes(refit, glue)
+    assert fresh["effectiveFrom"] == tainted["effectiveFrom"]
+    assert fresh["unitsPerPoint"] == 1_400_000.0
+    assert "supersededByCorrection" not in fresh
+    assert "recalibrationAttempt" not in fresh
+    assert fresh["transitionLineage"] == frozen
+    assert fresh["fitLineage"]["basis"] == ["batch-1"]
+    assert fresh["fitLineage"]["fitId"] != tainted["fitLineage"]["fitId"]
+    assert _assess(glue, fresh, facts) == "clean"
+    # The baseline the correction did not touch keeps its lineage (A5).
+    assert _assess(glue, closed, facts) == "clean"
+
+
+@pytest.mark.parametrize("builder", ["ordinary", "permitted"])
+def test_1015_a_tainted_open_regime_is_never_a_predecessor(glue, builder):
+    """Detects a transition derived from a rate fitted before a correction:
+    the tainted regime is closed with its status unchanged and excluded from
+    pairing, and this run's own clean baseline is the predecessor. The #688
+    gate itself is unchanged (spec 5.5 items 4-5)."""
+    first = glue.reduce_state(
+        glue.empty_calibration_state(),
+        _analysis(glue, fitted=_evidence(glue, 9_000_000.0)),
+        _lmode(glue, _no_facts()))
+    glue.save_calibrations(glue.stamp_current_writes(
+        glue.empty_calibration_state(), first, None))
+    facts = _tainting(captured=_IN_BASELINE)
+    analysis = (_split_change(glue) if builder == "ordinary"
+                else _permitted_analysis(glue))
+    _q, fresh, _c = glue.persist_and_detect(analysis, _lmode(glue, facts))
+    regimes = glue.stored_regimes(glue.load_calibrations(now=NOW).state, None)
+    poisoned = next(r for r in regimes if r["unitsPerPoint"] == 9_000_000.0)
+    assert poisoned["effectiveUntil"] == SPLIT_ISO
+    assert poisoned["status"] == "ok"
+    assert poisoned["supersededByCorrection"]["corrections"] == [
+        {"opId": "op-1", "observations": 1}]
+    assert [t.previous_units_per_point for t in fresh] == [
+        analysis.baseline_fit.value]
+    assert all(t.previous_units_per_point != 9_000_000.0 for t in fresh)
+
+
+def test_1015_with_no_clean_baseline_no_transition_is_derived(glue):
+    first = glue.reduce_state(
+        glue.empty_calibration_state(),
+        _analysis(glue, fitted=_evidence(glue, 9_000_000.0)),
+        _lmode(glue, _no_facts()))
+    glue.save_calibrations(glue.stamp_current_writes(
+        glue.empty_calibration_state(), first, None))
+    _q, fresh, candidates = glue.persist_and_detect(
+        _split_change(glue, baseline=None),
+        _lmode(glue, _tainting(captured=_IN_BASELINE)))
+    assert fresh == () and candidates == ()
+
+
+def test_1015_the_assessment_reads_the_state_under_the_lock(glue):
+    """Detects an assessment carried from the unlocked read: a regime another
+    process refitted (clean, current basis) between that read and this
+    run's locked reduction must be assessed as refitted, so nothing is
+    annotated and the file is not rewritten."""
+    facts = _tainting()
+    stale_view = glue.reduce_state(glue.empty_calibration_state(),
+                                   _analysis(glue), _lmode(glue, _no_facts()))
+    assert _assess(glue, _regimes(stale_view, glue)[0], facts) == "tainted"
+    refitted = glue.reduce_state(
+        glue.empty_calibration_state(), _analysis(glue),
+        _lmode(glue, facts))
+    glue.save_calibrations(glue.stamp_current_writes(
+        glue.empty_calibration_state(), refitted, None))
+    before = glue.calibration_path().read_bytes()
+    glue.persist_and_detect(_withheld_analysis(glue), _lmode(glue, facts))
+    assert glue.calibration_path().read_bytes() == before

@@ -605,6 +605,21 @@ _REVIEWED_WEEKLY_KIND = _lib_account_protocol.WEEKLY_OBSERVATION_DECISION_V2_KIN
 _REVIEWED_WEEKLY_LEGACY_KIND = "claude_weekly_observation_decision"
 _REVIEWED_WEEKLY_KINDS = frozenset((
     _REVIEWED_WEEKLY_LEGACY_KIND, _REVIEWED_WEEKLY_KIND))
+#: #944: a Claude cost attribution decision is an ingest byproduct. Any sync or
+#: cache open appends one when it decides rows, including rows a previous
+#: release ingested across a downgrade, so it can land after an unfinished
+#: reviewed decision with no new evidence behind it. It is `retained` outside
+#: the claude-usage derivation, which reads only the attribution the cache
+#: materialized, and the reviewed plan hashes already refuse any material
+#: effect; the reviewed-decision suffix checks therefore skip it rather than
+#: demand a fresh manifest.
+_REVIEW_NEUTRAL_OP_KINDS = frozenset(("claude_cost_account",))
+
+
+def _is_review_neutral(record) -> bool:
+    return (record.get("t") == "op"
+            and (record.get("payload") or {}).get("kind")
+            in _REVIEW_NEUTRAL_OP_KINDS)
 _REVIEWED_MANIFEST_KEYS_V1 = frozenset({
     "schemaVersion", "journalHighWater", "journalPrefixHash",
     "reviewedAt", "reason", "decisions",
@@ -987,6 +1002,9 @@ def _validate_retained_reviewed_op(record, prior_high_water, hasher) -> None:
                 # #797/#823/#840 (spec 4.6 B1): the protocol revision is part
                 # of a current decision's content-id core.
                 writer_revision=record.get("wpr"),
+                # #1019/#1014 (spec 4.7 C5): and so is the successor
+                # revision; a 1.116.1 decision has none.
+                writer_successor=record.get("wpx"),
             )):
         raise _lib_rederive.RederiveConflict(
             "malformed retained reviewed weekly decision op"
@@ -1261,6 +1279,11 @@ def replay_scratch_records(
                 try:
                     for hook in hooks:
                         hook(ctx, record)
+                    # Flush point (b), #956 class 1: the end of a complete
+                    # observation or op, before its harvest.
+                    import _cctally_record
+                    _cctally_record.flush_five_hour_dirty_windows(
+                        conn, ctx, as_of=ctx.as_of_for(record))
                     _journal._harvest(ctx)
                 finally:
                     if retention is not None:
@@ -1376,9 +1399,11 @@ def plan_claude_usage(
                 "payload": logical["payload"],
             })
     config_fingerprint = _fingerprint(config_basis)
+    accumulators: dict = {}
     selection = _lib_journal.resolve_effective_events(
         records,
         protocol_prefix_evidence=protocol_prefix_evidence,
+        accumulators=accumulators,
     )
     tainted = [
         *selection.protocol_violations,
@@ -1392,6 +1417,15 @@ def plan_claude_usage(
         raise _lib_rederive.RederiveConflict(
             "journal contains tainted correction batch(es): " + summary
         )
+    # #884 spec §5.1: the five-hour milestone lineage, compacted from the
+    # selector's own fold. The fold is released here, before the scratch
+    # replay; the lineage holds summaries only.
+    physical = _excluded_physical_revisions(records)
+    lineage = _lib_rederive.build_five_hour_lineage(
+        accumulators.pop("fold"), selection=selection,
+        physical_revisions=physical,
+    )
+    del accumulators
     # Only an unmarked close with a zero-cost model can need the historical
     # proof, so the scratch replay keeps retained entries for those blocks
     # alone rather than for every block in the journal.
@@ -1421,7 +1455,8 @@ def plan_claude_usage(
     )
     return _lib_rederive.build_claude_usage_plan(
         selection=selection,
-        physical_revisions=_excluded_physical_revisions(records),
+        physical_revisions=physical,
+        milestone_lineage=lineage,
         desired_events=desired,
         journal_high_water=journal_high_water,
         cache_fingerprint=cache_fingerprint,
@@ -1864,6 +1899,56 @@ def _latest_completed_family_batch(
     return latest_id, latest_high_water
 
 
+def _decision_batch_completed(records, index, completed_batches, family) -> bool:
+    """Whether the reviewed decision op at ``records[index]`` has its own
+    completed decision batch: the first non-review-neutral record after it
+    is the begin marker of a completed ``family`` correction batch.
+
+    An op resumed after a torn batch begin (its begin marker written, its
+    commit never) is treated as abandoned here. That is safe only because
+    the op's corrective actions re-enter the fresh decision's delta and
+    apply idempotently: re-applying an action the torn batch already
+    materialized changes nothing."""
+    for record in records[index + 1:]:
+        if _is_review_neutral(record):
+            continue
+        return (
+            record.get("t") == "correction_batch"
+            and record.get("phase") == "begin"
+            and record.get("family") == family
+            and record.get("id") in completed_batches
+        )
+    return False
+
+
+def _fresh_manifest_baseline(records, completed_batches, family, *,
+                             exclude_index=None) -> list:
+    """The baseline of a fresh reviewed manifest (#1015 R8): the journal
+    prefix without any earlier reviewed decision op whose own decision batch
+    never completed. Replaying such an op in the baseline put its corrective
+    actions in the baseline plan, so `causal_delta_plan` dropped them from
+    the fresh decision's batch and the held inputs stayed uncorrected until
+    an unrelated plain rederive. The fresh manifest supersedes the abandoned
+    op, so its actions belong in the fresh delta. The plain path that
+    resumes or re-checks a retained decision (``exclude_index``) builds the
+    same baseline, so its plan hashes equal the reviewed preview's.
+
+    Dropping an op whose batch was torn after its begin assumes the
+    idempotence stated on `_decision_batch_completed`: the op's actions
+    re-enter the delta and apply idempotently over anything the torn batch
+    already wrote."""
+    return [
+        record for index, record in enumerate(records)
+        if index != exclude_index and not (
+            record.get("t") == "op"
+            and (record.get("payload") or {}).get("kind")
+            in _REVIEWED_WEEKLY_KINDS
+            and not _decision_batch_completed(
+                records, index, completed_batches, family)
+        )
+    ]
+
+
 def _preview_from_snapshot(
     family: str,
     *,
@@ -1903,7 +1988,7 @@ def _preview_from_snapshot(
                 "reviewed weekly decision journalPrefixHash drifted"
             )
         planning_records = [*records, reviewed_op]
-        baseline_records = records
+        baseline_records = None    # #1015 R8: resolved after the selection
     else:
         decision_indexes = [
             index for index, record in enumerate(records)
@@ -1919,16 +2004,17 @@ def _preview_from_snapshot(
         records,
         protocol_prefix_evidence=protocol_evidence,
     )
+    if reviewed_op is not None:
+        baseline_records = _fresh_manifest_baseline(
+            records, selection.completed_batches, family)
     if retained_decision is not None:
-        suffix = records[retained_decision_index + 1:]
-        first = suffix[0] if suffix else None
-        completed_decision_batch = (
-            first is not None
-            and first.get("t") == "correction_batch"
-            and first.get("phase") == "begin"
-            and first.get("family") == family
-            and first.get("id") in selection.completed_batches
-        )
+        suffix = [
+            record for record in records[retained_decision_index + 1:]
+            if not _is_review_neutral(record)
+        ]
+        completed_decision_batch = _decision_batch_completed(
+            records, retained_decision_index, selection.completed_batches,
+            family)
         correction_only_suffix = all(
             record.get("t") in {"correction", "correction_batch"}
             for record in suffix
@@ -1937,10 +2023,9 @@ def _preview_from_snapshot(
             decision_op = retained_decision
             decision_from_journal = not completed_decision_batch
             decision_batch_completed = completed_decision_batch
-            baseline_records = [
-                *records[:retained_decision_index],
-                *records[retained_decision_index + 1:],
-            ]
+            baseline_records = _fresh_manifest_baseline(
+                records, selection.completed_batches, family,
+                exclude_index=retained_decision_index)
         elif not completed_decision_batch:
             raise _lib_rederive.RederiveConflict(
                 "unfinished reviewed weekly decision has new journal records "
@@ -2525,6 +2610,7 @@ def apply_db_rederive(
                             and record.get("batch") == original_batch_id)
                     )
                     for record in preview.records[op_index + 1:]
+                    if not _is_review_neutral(record)
                 ):
                     raise _lib_rederive.RederiveConflict(
                         "reviewed weekly decision retry has new journal records "
@@ -2812,6 +2898,16 @@ def _command_payload(
         body["reviewedWeeklyDecisionCounts"] = reviewed_decision_counts
     if plan is not None and plan.uncertain_cost_fact_count:
         body["uncertainCostFactCount"] = plan.uncertain_cost_fact_count
+    if plan is not None and plan.withheld_milestone_repairs:
+        # #884 spec §5.7: the five-hour blocks whose milestone repair the
+        # lineage withheld (their money kept), outside the plan body.
+        body["withheldMilestoneRepairs"] = [
+            block.to_dict() for block in plan.withheld_milestone_repairs]
+    if plan is not None and plan.orphaned_milestone_ids:
+        # #943/#956 spec 4.4: five-hour milestones that resolved no block
+        # before this plan (pre-existing damage), reported, never refused.
+        body["orphanedFiveHourMilestoneCount"] = len(
+            plan.orphaned_milestone_ids)
     if preview is not None and preview.baseline_plan is not None:
         body["baselinePlanHash"] = preview.baseline_plan.plan_hash
         body["baselineActionCounts"] = dict(preview.baseline_plan.counts)
@@ -2862,6 +2958,14 @@ def _emit_command_payload(payload: dict, *, as_json: bool) -> None:
         print(
             f"cctally: {payload['family']} is already current; "
             "no correction batch was appended."
+        )
+    withheld = payload.get("withheldMilestoneRepairs")
+    if withheld and status in {"preview", "applied", "recovered", "no-op"}:
+        # #884 operator decision O2: one line, right after the status line.
+        print(
+            f"Milestone repair withheld for {len(withheld)} five-hour "
+            "block(s) with ambiguous history; rerun with --json and see "
+            "withheldMilestoneRepairs."
         )
     if "baselinePlanHash" in payload:
         def _counts_text(counts):

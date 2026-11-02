@@ -17,6 +17,13 @@ confirmation rechecks it, so
 * a correction or tombstone of the generation's event makes dependent state
   obsolete;
 * two credits in one ten-minute slot stay one;
+* #943: every credit records its exact boundary (the arming observation's
+  capture second) in a `five_hour_credit_boundaries` companion that does not
+  move its generation, a same-slot collision installs no second companion,
+  the confirmation state carries the arming capture with its pending
+  descent, and a crash between the companion and credit appends or between
+  the appends and the commit converges on the credit, its companion and the
+  exact-band suppression;
 * an observation without `detector_policy` keeps the pair check, and an
   unsupported or malformed value withholds that observation's detector step.
 
@@ -165,6 +172,18 @@ def _credits(app) -> collections.Counter:
         for r in rows)
 
 
+def _boundaries(app) -> collections.Counter:
+    rows = T._rows(app, "SELECT account_key, effective_reset_at_utc, "
+                        "boundary_at_utc FROM five_hour_credit_boundaries")
+    return collections.Counter(
+        (r["account_key"], r["effective_reset_at_utc"], r["boundary_at_utc"])
+        for r in rows)
+
+
+def _credits_and_boundaries(app):
+    return _credits(app), _boundaries(app)
+
+
 def _weekly_resets(app) -> collections.Counter:
     rows = T._rows(app, "SELECT account_key, observed_pre_credit_pct, "
                         "effective_reset_at_utc FROM week_reset_events")
@@ -175,7 +194,8 @@ def _state(app, source):
     rows = T._rows(
         app, "SELECT baseline_pct, pending_low_pct, pending_at_utc, "
              "pending_observation_id, baseline_observation_id, "
-             "baseline_generation, pending_generation, pending_position "
+             "baseline_generation, pending_generation, pending_position, "
+             "pending_captured_at_utc "
              "FROM five_hour_credit_confirmation_state "
              f"WHERE source = '{source}'")
     return rows[0] if rows else None
@@ -351,6 +371,18 @@ def test_generation_is_event_identity_at_content_revision(app, monkeypatch):
             conn, _five_key(app), account_key=_key())
         identity = J.evt_id("fhc", _key(), _five_key(app), _slot(0))
         assert generation.startswith(identity + "@")
+        # #943: the companion is not part of the generation. Detects a
+        # boundary write (or its absence) re-labelling the credit, which
+        # would make every source's dependent state obsolete.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM five_hour_credit_boundaries").fetchone()[0] == 1
+        conn.execute("UPDATE five_hour_credit_boundaries "
+                     "SET boundary_at_utc = '2026-10-08T00:05:00+00:00'")
+        assert rec.five_hour_credit_generation(
+            conn, _five_key(app), account_key=_key()) == generation
+        conn.execute("DELETE FROM five_hour_credit_boundaries")
+        assert rec.five_hour_credit_generation(
+            conn, _five_key(app), account_key=_key()) == generation
         conn.execute("UPDATE five_hour_reset_events SET post_percent = 4")
         changed = rec.five_hour_credit_generation(
             conn, _five_key(app), account_key=_key())
@@ -368,8 +400,12 @@ def test_t12_genuine_same_pair_second_credit_is_minted(app, monkeypatch):
     _run(app, monkeypatch, [
         (0, 20.0, "api"), (60, 5.0, "api"), (120, 6.0, "api"),
         (300, 20.0, "api"), (660, 5.0, "api"), (720, 6.0, "api")])
-    _assert_worlds(_worlds(app), _expected(
-        (20.0, 5.0, _slot(0)), (20.0, 5.0, _slot(600))))
+    # #943: each stacked credit gets its own companion, bounded at its own
+    # arming capture (detects a second credit sharing or lacking one).
+    _assert_worlds(_worlds(app, _credits_and_boundaries), (
+        _expected((20.0, 5.0, _slot(0)), (20.0, 5.0, _slot(600))),
+        collections.Counter({(_key(), _slot(0), _slot(60)): 1,
+                             (_key(), _slot(600), _slot(660)): 1})))
 
 
 def test_t12_literal_replay_of_one_descent_reuses_its_decision(
@@ -455,7 +491,12 @@ def test_t12_two_credits_in_one_ten_minute_slot_stay_one(app, monkeypatch):
     _run(app, monkeypatch, [
         (0, 20.0, "api"), (60, 5.0, "api"), (120, 6.0, "api"),
         (180, 20.0, "api"), (240, 5.0, "api"), (300, 6.0, "api")])
-    _assert_worlds(_worlds(app), _expected((20.0, 5.0, _slot(0))))
+    # #943: the absorbed second confirm installs no companion, so the one
+    # companion keeps the first arming capture (detects a collision moving
+    # the boundary to the second descent).
+    _assert_worlds(_worlds(app, _credits_and_boundaries), (
+        _expected((20.0, 5.0, _slot(0))),
+        collections.Counter({(_key(), _slot(0), _slot(60)): 1})))
 
 
 def test_t12_observations_without_detector_policy_keep_the_pair_check(
@@ -558,3 +599,187 @@ def test_t13_completion_executes_the_same_policy(app, monkeypatch):
             path.unlink()
     T.rebuild(app)
     assert _credits(app) == _expected((20.0, 5.0, _slot(0)))
+
+
+# --------------------------------------------------------------------------
+# #943: the arming capture and the exact boundary
+# --------------------------------------------------------------------------
+
+def test_943_the_arming_capture_travels_with_the_pending_descent(
+        app, monkeypatch):
+    """Detects the new `pending_captured_at_utc` column dropped or split
+    from `pending_at_utc` / `pending_position` by a state rewrite: the
+    historical contributor's pending descent is carried across a v2 credit
+    by the mixed rebase (it was recorded without a generation, so it is
+    stamped with the old one), and a later confirmation of it would then
+    have no boundary and be withheld as no pending descent at all."""
+    historical = {"plan": {"detector": MISSING}}
+    _run(app, monkeypatch, [
+        (0, 20.0, "statusline", historical), (30, 20.0, "api"),
+        (60, 5.0, "statusline", historical), (90, 4.0, "api")])
+    armed = _state(app, "statusline")
+    assert armed["pending_low_pct"] == 5.0
+    assert armed["pending_captured_at_utc"] == _slot(60)
+    assert _state(app, "api")["pending_captured_at_utc"] == _slot(90)
+    _run(app, monkeypatch, [(150, 5.0, "api")])
+    assert _credits(app) == _expected((20.0, 4.0, _slot(0)))
+    carried = _state(app, "statusline")
+    for column in ("pending_low_pct", "pending_at_utc", "pending_position",
+                   "pending_captured_at_utc"):
+        assert carried[column] == armed[column], column
+    # The rebase's second branch ran: the generation-less historical state
+    # was stamped with the old generation (the no-credit sentinel).
+    assert armed["baseline_generation"] is None
+    assert carried["baseline_generation"] == "none"
+    confirmed = _state(app, "api")
+    assert (confirmed["pending_at_utc"], confirmed["pending_position"],
+            confirmed["pending_captured_at_utc"]) == (None, None, None)
+
+
+def _snapshot_rows(app):
+    return {
+        int(dt.datetime.fromisoformat(
+            r["captured_at_utc"].replace("Z", "+00:00")).timestamp()) - NOW:
+        (r["five_hour_percent"], r["journal_id"])
+        for r in T._rows(app, "SELECT captured_at_utc, five_hour_percent, "
+                              "journal_id FROM weekly_usage_snapshots")}
+
+
+def _credit_suppressions():
+    return [(r.get("payload") or {}).get("suppression") or []
+            for r in T.journal_records() if r.get("t") == "evt"
+            and (r.get("payload") or {}).get("kind") == "five_hour_credit"]
+
+
+def _crash_between_companion_and_credit(jr):
+    """Raise as the credit's evt is about to be appended, after its `fhcb`
+    companion (order 29) was appended and fsync'd."""
+    original = jr._emit_harvest_row
+
+    def emit(ctx, spec, row):
+        if spec.kind == "five_hour_credit":
+            raise RuntimeError("simulated crash between fhcb and fhc")
+        return original(ctx, spec, row)
+    return "_emit_harvest_row", emit
+
+
+def _crash_between_appends_and_commit(jr):
+    """Raise at the cursor advance, after every harvest evt was appended and
+    before the cycle commits."""
+    def boom(conn, segment, offset):
+        raise RuntimeError("simulated crash before commit")
+    return "_write_cursor", boom
+
+
+@pytest.mark.parametrize("crash", [
+    _crash_between_companion_and_credit, _crash_between_appends_and_commit,
+], ids=["fhcb-then-crash", "appends-then-crash"])
+def test_943_a_crashed_confirm_converges_on_credit_companion_and_band(
+        app, monkeypatch, crash):
+    """Detects a crash of the confirming cycle losing the companion, minting
+    a second one, or replaying a suppression that is not the exact band.
+
+    Trace: a genuine 38 at +60 inside the slot, a descent armed at +240
+    (its reading clamped to 38, a stale replica), confirmed at +360. Only
+    the +240 row is in the exact band; the +60 peak is kept. The confirm's
+    cycle crashes (rolled back), then an ordinary ingest recovers: step 4a
+    folds the orphaned `fhcb` (and in the second case the `fhc` with its
+    suppression), and the re-run confirm either inserts the credit (first
+    case) or finds it already folded, when its rowcount gate runs no cleanup
+    (second case)."""
+    import _cctally_journal as jr
+    _run(app, monkeypatch, [(0, 30.0, "api", {"weekly": 10.0}),
+                            (60, 38.0, "api", {"weekly": 11.0}),
+                            (240, 2.0, "api", {"weekly": 12.0})])
+    before = _snapshot_rows(app)
+    assert before[60][0] == 38.0 and before[240][0] == 38.0, before
+    peak_ref, replica_ref = before[60][1], before[240][1]
+    _tick(app, monkeypatch, 360, 3.0, weekly=12.5, ingest=False)
+    name, broken = crash(jr)
+    original = getattr(jr, name)
+    setattr(jr, name, broken)
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            T.ingest(app)
+    finally:
+        setattr(jr, name, original)
+    assert _credits(app) == collections.Counter()
+    T.ingest(app)
+
+    expected = (_expected((38.0, 2.0, _slot(0))),
+                collections.Counter({(_key(), _slot(0), _slot(240)): 1}))
+
+    def check(label):
+        assert _credits_and_boundaries(app) == expected, label
+        rows = _snapshot_rows(app)
+        assert rows[60] == (38.0, peak_ref), (label, rows)
+        assert rows.get(240, (None,))[0] is None, (label, rows)
+        assert rows[360][0] == 3.0, (label, rows)
+        suppressions = _credit_suppressions()
+        assert suppressions and all(
+            s == [replica_ref] for s in suppressions), (label, suppressions)
+
+    check("recovered")
+    T.rebuild(app)
+    check("rebuilt")
+
+
+@pytest.mark.parametrize("companion", ["exact", "absent", "mismatched"])
+def test_943_only_a_matching_companion_moves_the_floor_off_the_slot(
+        app, monkeypatch, companion):
+    """Detects the boundary resolver trusting a missing or stale companion:
+    a credit with no companion (an older store, a correction that dropped
+    it) or one whose `credit_revision` no longer matches the credit keeps
+    the floored-slot semantics, and only an exact match moves every
+    post-credit read to the arming capture.
+
+    The genuine 38 at +60 lies inside the slot (+0) but before the arming
+    capture (+240). Under the slot floor it enters the in-window MAX clamp,
+    so a post-credit reading of 5 is raised to 38; under the exact boundary
+    the clamp sees only the post-credit 3 and the 5 stays 5."""
+    import _cctally_journal as jr
+    _run(app, monkeypatch, [(0, 30.0, "api", {"weekly": 10.0}),
+                            (60, 38.0, "api", {"weekly": 11.0}),
+                            (240, 2.0, "api", {"weekly": 12.0}),
+                            (360, 3.0, "api", {"weekly": 12.5})])
+    conn = app.open_db()
+    try:
+        if companion == "absent":
+            conn.execute("DELETE FROM five_hour_credit_boundaries")
+        elif companion == "mismatched":
+            conn.execute("UPDATE five_hour_credit_boundaries "
+                         "SET credit_revision = 'stale-revision'")
+        conn.commit()
+        floor = jr.resolve_five_hour_axis_floor(
+            conn, account_key=_key(), canonical_window_key=_five_key(app))
+    finally:
+        conn.close()
+    expected_floor = _slot(240) if companion == "exact" else _slot(0)
+    assert floor.floor_at_utc == expected_floor, floor
+    assert floor.floor_epoch == int(dt.datetime.fromisoformat(
+        expected_floor).timestamp())
+    _tick(app, monkeypatch, 480, 5.0, weekly=13.0)
+    rows = _snapshot_rows(app)
+    assert rows[480][0] == (5.0 if companion == "exact" else 38.0), rows
+
+
+def test_943_the_statusline_causal_lookup_still_classifies_a_v2_credit(
+        app, monkeypatch):
+    """Detects the companion disturbing the status line's causal-credit
+    resolution, which keys a credit's retained facts by its slot identity
+    and content revision: a v2 credit confirmed by `statusline` must still
+    resolve as a status-line credit, under its unchanged `fhc` identity."""
+    import _cctally_statusline as sl
+    import _lib_journal as J
+    _run(app, monkeypatch, [(0, 20.0, "statusline", CANDIDATE),
+                            (60, 5.0, "statusline", CANDIDATE),
+                            (120, 6.0, "statusline", CANDIDATE)])
+    assert _boundaries(app) == collections.Counter(
+        {(_key(), _slot(0), _slot(60)): 1})
+    conn = app.open_db()
+    try:
+        credits = sl._five_hour_window_credits(conn, _key(), _five_key(app))
+    finally:
+        conn.close()
+    assert [(c.event_id, c.causal_kind) for c in credits] == [
+        (J.evt_id("fhc", _key(), _five_key(app), _slot(0)), "statusline")]

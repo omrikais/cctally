@@ -253,6 +253,76 @@ def test_a3_a_confirm_side_crash_yields_one_event_with_the_first_zero_origin(
     assert _state_rows(ns) == [], "the state was not cleared after the fire"
 
 
+def _crash_between_snapshot_and_reset(jr):
+    """Raise as the credit's `wr` evt (order 30) is about to be appended,
+    after the observation's own `snapshot_accept` (order 10) was appended and
+    fsync'd."""
+    original = jr._emit_harvest_row
+
+    def emit(ctx, spec, row):
+        if spec.kind == "week_reset":
+            raise RuntimeError("simulated crash between sa and wr")
+        return original(ctx, spec, row)
+    return emit
+
+
+def _weekly_rows(ns):
+    conn = ns["open_db"]()
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT captured_at_utc, weekly_percent FROM weekly_usage_snapshots "
+            "ORDER BY captured_at_utc, id")]
+    finally:
+        conn.close()
+
+
+def _credits(ns):
+    conn = ns["open_db"]()
+    try:
+        return [tuple(r) for r in conn.execute(
+            "SELECT effective_reset_at_utc, observed_pre_credit_pct "
+            "FROM week_reset_events ORDER BY id")]
+    finally:
+        conn.close()
+
+
+def test_943_a_crash_between_snapshot_and_credit_appends_keeps_the_credit(
+        ns, monkeypatch):
+    """Detects the weekly twin of the #943 five-hour self-row defect: a
+    crashed credit cycle appended the observation's `snapshot_accept` but not
+    its `wr` credit, step 4a of the next ingest folds that orphaned row
+    before the detector re-runs, and the detector must not read the
+    observation's OWN row as the prior reading (a 60 -> 20 credit would then
+    compare 20 against 20 and be lost, live and after a rebuild)."""
+    end_iso, end_epoch = _future_week_end_iso()
+    jr = _journal()
+    _pin_as_of(monkeypatch, 0)
+    assert ns["cmd_record_usage"](
+        _record_usage_args(percent=60.0, resets_at=end_epoch)) == 0
+    _pin_as_of(monkeypatch, 60)
+    original = jr._emit_harvest_row
+    jr._emit_harvest_row = _crash_between_snapshot_and_reset(jr)
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            ns["cmd_record_usage"](
+                _record_usage_args(percent=20.0, resets_at=end_epoch))
+    finally:
+        jr._emit_harvest_row = original
+    assert _credits(ns) == [], "the credit survived a rolled-back cycle"
+
+    jr.run_stats_ingest(mode="authoritative")
+
+    def check(label):
+        credits = _credits(ns)
+        assert [pct for _, pct in credits] == [60.0], (label, credits)
+        rows = _weekly_rows(ns)
+        assert [pct for _, pct in rows] == [60.0, 20.0], (label, rows)
+
+    check("recovered")
+    jr.rebuild_stats_index(context=jr.RebuildContext(trigger="test-fixture"))
+    check("rebuilt")
+
+
 # --------------------------------------------------------------------------
 # An observation cannot confirm itself
 # --------------------------------------------------------------------------

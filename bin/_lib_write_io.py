@@ -21,6 +21,7 @@ from __future__ import annotations
 import array
 import dataclasses
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import os
@@ -238,6 +239,17 @@ class _State:
         # #901 Q9: the latest reclaim attempt the planner refused, in memory
         # only (a refusal writes nothing durable); None after a chunk runs.
         self.reclaim_refusal = None
+        # #939 D5: the startup admission hold. ``drain`` is the evaluator,
+        # kept only while the hold is placed (its obligations scale with the
+        # backlog, so it is dropped at release and never part of the fixed
+        # state budget); the rest is the fixed-size published state.
+        self.hold_placed = False
+        self.released_by = None
+        self.first_non_cold_ns = None
+        self.accounting_caught_up = False
+        self.residual_counts = None
+        self.last_pass = None
+        self.drain = None
 
 
 _LOCK = threading.Lock()
@@ -412,14 +424,21 @@ def _steady_locked(now_ns):
 
 
 def note_publication(*, cold: bool) -> None:
-    """One completed main publication: count it, sample, admit, evaluate."""
+    """One completed main publication: count it, sample, admit, evaluate.
+
+    #939 D5: while the startup admission hold is placed, a non-cold
+    publication is recorded but does not admit warm; `release_admission`
+    admits at release when one was already seen."""
     state = _STATE
     with _LOCK:
         state.publications += 1
         now, reading = _sample_locked(state)
         if state.warm_admitted_ns is None and not cold:
-            state.warm_admitted_ns = now
-            state.cold_startup_bytes = reading.value
+            if state.first_non_cold_ns is None:
+                state.first_non_cold_ns = now
+            if not state.hold_placed or state.released_by is not None:
+                state.warm_admitted_ns = now
+                state.cold_startup_bytes = reading.value
         if (state.last_hysteresis_ns is None
                 or now - state.last_hysteresis_ns
                 >= HYSTERESIS_EVALUATION_SPACING_NS):
@@ -484,7 +503,8 @@ def state_for_budget() -> tuple:
     state = _STATE
     return (state.t, state.b, state.p, state.ledger, state.ex[0],
             state.ex[1:], state.open, state.hysteresis, state.local_instance,
-            state.cold_startup_bytes, state.last_status, state.reclaim_refusal)
+            state.cold_startup_bytes, state.last_status, state.reclaim_refusal,
+            state.released_by, state.residual_counts, state.last_pass)
 
 
 #: The reason strings a reclaim refusal may publish; anything else is
@@ -644,6 +664,384 @@ def loopback_target(bind_host) -> "str | None":
     return host if address.is_loopback else None
 
 
+# ── #939 D5: the startup admission hold and its evaluator ──────────────────
+#
+# `cmd_dashboard` places the hold before the main sync thread starts (not
+# under --no-sync). While it is placed, `note_publication` does not admit warm
+# samples, so the trailing statistic stays `warming_up` and doctor and
+# dashboard-perf keep printing "no samples yet (needs 5 minutes)". There is no
+# deadline: a time bound would judge a long catch-up as steady state. Only
+# `StartupDrain`'s evidence ("drained", "settled") or the end of the
+# conversation loop ("loopExit") releases it.
+
+RELEASE_REASONS = ("drained", "settled", "loopExit")
+RESIDUAL_COUNT_KEYS = ("failed", "unpublishedDeferred", "obligations",
+                       "containerPending", "keysDeferred")
+#: The Codex conversation counts that are part of a pass's residual.
+_RESIDUAL_COUNT_FIELDS = ("container_pending", "container_reads_held",
+                          "barrier_keys_deferred", "files_deferred_torn",
+                          "prune_refused")
+
+
+def conversation_residual(stats) -> tuple:
+    """One provider pass's residual as canonical ``(name, value)`` pairs.
+
+    The failed paths, the deferrals no unit of the same pass published (with
+    the keys each named), the causes of ``barrier_retry``, the existing
+    leftover counts, and the pass's deferred reason and maintenance failure
+    (a refusal that repeats identically settles; one that changes restarts the
+    chain). ``()`` when the pass left nothing unfinished."""
+    if stats is None:
+        return ()
+    reason = getattr(stats, "deferred_reason", None)
+    failed = tuple(sorted(str(path) for path in
+                          (getattr(stats, "failed_paths", None) or ())))
+    deferred = getattr(stats, "barrier_deferred_keys", None) or {}
+    published = {str(path) for path in
+                 (getattr(stats, "barrier_published_paths", None) or ())}
+    unpublished = tuple(sorted(
+        (str(path), tuple(sorted(keys))) for path, keys in deferred.items()
+        if str(path) not in published))
+    causes = tuple(sorted(getattr(stats, "barrier_retry_causes", None) or ()))
+    items = [("failed_paths", failed), ("unpublished_deferred", unpublished),
+             ("barrier_retry_causes", causes)]
+    items += [(name, getattr(stats, name, 0) or 0)
+              for name in _RESIDUAL_COUNT_FIELDS]
+    items += [("deferred_reason", str(reason) if reason else None),
+              ("maintenance_failed",
+               bool(getattr(stats, "maintenance_failed", False)))]
+    return tuple((name, value) for name, value in items if value)
+
+
+def unpublished_deferrals(stats) -> dict:
+    """``{path: (file_identity, covered, keys)}`` for every Codex deferral of
+    the pass that no unit of the same pass published."""
+    if stats is None:
+        return {}
+    deferred = getattr(stats, "barrier_deferred_keys", None) or {}
+    targets = getattr(stats, "barrier_deferred_targets", None) or {}
+    published = {str(path) for path in
+                 (getattr(stats, "barrier_published_paths", None) or ())}
+    out = {}
+    for path, keys in deferred.items():
+        if str(path) in published:
+            continue
+        identity, covered = targets.get(path, (None, False))
+        out[str(path)] = (identity, bool(covered), frozenset(keys))
+    return out
+
+
+def residual_digest(provider_results: dict, deferral_facts: dict) -> tuple:
+    """Canonical, hashable: equal iff every residual component is equal.
+
+    ``provider_results`` maps a component name (a provider, or "accounting")
+    to its ``(name, value)`` pairs; ``deferral_facts`` maps each unpublished
+    deferral's path to its clipped facts. Never carries the global seal
+    token. ``()`` means empty."""
+    parts = tuple((name, tuple(value))
+                  for name, value in sorted(provider_results.items()) if value)
+    facts = tuple(sorted(deferral_facts.items()))
+    if not parts and not facts:
+        return ()
+    return (parts, facts)
+
+
+def digest_hash(digest) -> "str | None":
+    """A short stable hash of a residual digest; ``None`` for the empty one."""
+    if not digest:
+        return None
+    return hashlib.sha256(repr(digest).encode("utf-8")).hexdigest()[:16]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Anchor:
+    """A deferral's startup work, bound when its anchor resolved."""
+    generation: object
+    end: int
+    required: tuple          # sorted ((key, required_revision), ...)
+
+
+def _resolve_anchor(keys, raw) -> "_Anchor | None":
+    """Resolved only with a complete line end at the target's generation,
+    membership proven there and a population row for every key."""
+    target = (raw or {}).get("target")
+    if target is None:
+        return None
+    generation = target.get("generation")
+    end = target.get("complete_line_end")
+    if end is None or target.get("accepted_generation") != generation:
+        return None
+    facts = (raw or {}).get("keys") or {}
+    required = []
+    for key in sorted(set(keys) | set((raw or {}).get("membership") or ())):
+        revision = (facts.get(key) or {}).get("required")
+        if revision is None:
+            return None
+        required.append((key, int(revision)))
+    return _Anchor(generation, int(end), tuple(required))
+
+
+def _cap(value, limit):
+    return None if value is None else min(int(value), int(limit))
+
+
+def _clipped_facts(keys, anchor, raw) -> tuple:
+    """A deferral's facts, scoped to its startup work: progress on its own
+    keys and the resolution of its anchor change them, input beyond the
+    anchored end and other conversations' seals do not."""
+    target = (raw or {}).get("target")
+    if anchor is not None:
+        same = (target is not None
+                and target.get("generation") == anchor.generation)
+        accepted = None
+        if (same and target.get("accepted_generation") == anchor.generation
+                and target.get("accepted_end") is not None):
+            accepted = min(int(target["accepted_end"]), anchor.end)
+        facts = (raw or {}).get("keys") or {}
+        per_key = tuple(
+            (key, _cap((facts.get(key) or {}).get("certificate"), required),
+             _cap((facts.get(key) or {}).get("published"), required),
+             _cap((facts.get(key) or {}).get("repair"), required))
+            for key, required in anchor.required)
+        return ("resolved", same,
+                None if target is None else target.get("state"),
+                None if target is None else target.get("reason"),
+                accepted, per_key)
+    if target is None:
+        return ("unresolved", None, None, None, False, None,
+                tuple(sorted(keys)))
+    return ("unresolved", target.get("generation"), target.get("state"),
+            target.get("reason"), target.get("complete_line_end") is not None,
+            target.get("accepted_generation"),
+            tuple(sorted(set(keys) | set((raw or {}).get("membership") or ()))))
+
+
+def _discharged(anchor: "_Anchor | None", raw) -> bool:
+    """Every anchored key's publication reached its anchored requirement.
+    Accounting acceptance never counts: a contributor can be fully accepted
+    while its publication group still waits."""
+    if anchor is None or not anchor.required or raw is None:
+        return False
+    facts = raw.get("keys") or {}
+    for key, required in anchor.required:
+        published = (facts.get(key) or {}).get("published")
+        if published is None or int(published) < required:
+            return False
+    return True
+
+
+class StartupDrain:
+    """The pure evaluator behind writeIo's admission hold (#939 D5).
+
+    ``observe_accounting`` records each accounting tick; ``observe`` receives
+    every completed conversation pass and returns ``"drained"``,
+    ``"settled"`` or ``None``. ``pass_info`` carries ``counted`` (the pass
+    started after the first accounting-census-complete tick ended; only a
+    counted pass resolves anchors or discharges obligations),
+    ``census_complete`` (every provider's census complete, or a pass that
+    ended in an error or an unavailable store, and no detached Codex worker
+    in progress at the pass's end), ``certifiable`` (both providers; never an
+    error pass), per-provider ``mode`` and ``residual`` (``None`` or a
+    ``caught_up`` mode carries the previous one forward; the ``"pass"`` entry
+    is the pass's own status, empty for ``ok`` and ``((status, exception
+    class),)`` otherwise, so identical error passes settle and a recovery
+    restarts the chain), ``deferrals``
+    (``{path: (identity, covered, keys)}`` of the unpublished Codex deferrals,
+    ``None`` when Codex did not run) and ``facts`` (the stored facts of every
+    tracked deferral, read at the pass's end).
+    """
+
+    def __init__(self):
+        self.first_complete_end_ns = None
+        self.accounting: dict = {}
+        self._accounting_seen = False
+        self._chain_broken = False
+        self.components: dict = {}
+        self.deferrals: dict = {}
+        self.tracked: dict = {}
+        self.anchors: dict = {}
+        self.obligations: set = set()
+        self.previous_digest = None
+        self.digest: tuple = ()
+        self.counts = None
+
+    def observe_accounting(self, *, ended_ns, census_complete, residuals):
+        merged = dict(self.accounting)
+        for provider, residual in (residuals or {}).items():
+            if residual is not None:            # caught_up carries forward
+                merged[provider] = tuple(residual)
+        if self._accounting_seen and (
+                not census_complete or merged != self.accounting):
+            self._chain_broken = True
+        self._accounting_seen = True
+        self.accounting = merged
+        if census_complete and self.first_complete_end_ns is None:
+            self.first_complete_end_ns = int(ended_ns)
+
+    def watch(self) -> dict:
+        out = {}
+        for path, (identity, keys) in self.tracked.items():
+            anchor = self.anchors.get(path)
+            anchored = (frozenset(key for key, _ in anchor.required)
+                        if anchor is not None else frozenset())
+            out[path] = (identity, frozenset(keys) | anchored)
+        return out
+
+    def _update_deferrals(self, deferrals) -> None:
+        self.deferrals = {str(path): (identity, bool(covered), frozenset(keys))
+                          for path, (identity, covered, keys)
+                          in deferrals.items()}
+        for path, (identity, covered, keys) in self.deferrals.items():
+            prior = self.tracked.get(path)
+            self.tracked[path] = (
+                identity, keys | (prior[1] if prior else frozenset()))
+            if covered and keys:
+                self.obligations.add(path)
+        for path in list(self.tracked):
+            if path not in self.deferrals and path not in self.obligations:
+                self.tracked.pop(path)
+                self.anchors.pop(path, None)
+
+    def _residual_counts(self, unpublished) -> tuple:
+        failed = sum(len(dict(component).get("failed_paths", ()))
+                     for component in self.components.values())
+        codex = dict(self.components.get("codex", ()))
+        return (failed, len(unpublished), len(self.obligations),
+                int(codex.get("container_pending", 0) or 0),
+                int(codex.get("barrier_keys_deferred", 0) or 0))
+
+    def observe(self, pass_info) -> "str | None":
+        info = pass_info or {}
+        for name, entry in (info.get("providers") or {}).items():
+            residual = entry.get("residual")
+            if entry.get("mode") == "caught_up" or residual is None:
+                continue
+            self.components[name] = tuple(residual)
+        if info.get("deferrals") is not None:
+            self._update_deferrals(info["deferrals"])
+        facts = info.get("facts") or {}
+        if info.get("counted"):
+            # Only a counted pass anchors or discharges: one that started
+            # before accounting caught up could freeze an anchor at
+            # accounting's partial progress.
+            for path, (_identity, keys) in self.tracked.items():
+                if path not in self.anchors and path in facts:
+                    anchor = _resolve_anchor(keys, facts[path])
+                    if anchor is not None:
+                        self.anchors[path] = anchor
+            for path in list(self.obligations):
+                if _discharged(self.anchors.get(path), facts.get(path)):
+                    self.obligations.discard(path)
+        unpublished = set(self.deferrals) | self.obligations
+        clipped = {
+            path: _clipped_facts(self.tracked.get(path, (None, frozenset()))[1],
+                                 self.anchors.get(path), facts.get(path))
+            for path in unpublished}
+        results = dict(self.components)
+        results["accounting"] = tuple(sorted(
+            (provider, residual)
+            for provider, residual in self.accounting.items() if residual))
+        self.digest = residual_digest(results, clipped)
+        self.counts = self._residual_counts(unpublished)
+        if self._chain_broken:
+            self.previous_digest = None
+            self._chain_broken = False
+        if not info.get("counted") or not info.get("census_complete"):
+            self.previous_digest = None
+            return None
+        if (info.get("certifiable") and not self.obligations
+                and not any(self.accounting.values())):
+            return "drained"
+        if self.digest and self.digest == self.previous_digest:
+            return "settled"
+        self.previous_digest = self.digest
+        return None
+
+
+def hold_admission() -> None:
+    """Place the startup admission hold (before the main sync thread)."""
+    state = _STATE
+    with _LOCK:
+        state.hold_placed = True
+        state.released_by = None
+        state.drain = StartupDrain()
+
+
+def admission_held() -> bool:
+    state = _STATE
+    return state.hold_placed and state.released_by is None
+
+
+def release_admission(reason: str) -> bool:
+    """Release the hold once; admits warm at once when a non-cold publication
+    was already seen, otherwise at the next one. False when no hold was
+    placed or it was already released."""
+    if reason not in RELEASE_REASONS:
+        raise ValueError(f"unknown release reason: {reason!r}")
+    state = _STATE
+    with _LOCK:
+        if not state.hold_placed or state.released_by is not None:
+            return False
+        state.released_by = reason
+        state.drain = None
+        if (state.warm_admitted_ns is None
+                and state.first_non_cold_ns is not None):
+            now, reading = _sample_locked(state)
+            state.warm_admitted_ns = now
+            state.cold_startup_bytes = reading.value
+        return True
+
+
+def observe_accounting_tick(*, ended_ns, census_complete, residuals) -> None:
+    """One accounting tick of the main sync thread (any process may call
+    this; only a placed hold evaluates it)."""
+    state = _STATE
+    with _LOCK:
+        if census_complete:
+            state.accounting_caught_up = True
+        if state.drain is not None:
+            state.drain.observe_accounting(
+                ended_ns=ended_ns, census_complete=bool(census_complete),
+                residuals=residuals)
+
+
+def observe_conversation_pass(pass_info, *, started_ns, seq) -> "str | None":
+    """Feed one completed conversation pass to the evaluator; returns its
+    release verdict. A pass counts only if it started after the end of the
+    first accounting-census-complete tick (same monotonic clock)."""
+    state = _STATE
+    with _LOCK:
+        drain = state.drain
+        if drain is None or state.released_by is not None:
+            return None
+        first = drain.first_complete_end_ns
+        counted = first is not None and int(started_ns) > first
+        census = bool(pass_info and pass_info.get("census_complete"))
+        info = dict(pass_info or {})
+        info["counted"] = counted
+        info["census_complete"] = census
+        try:
+            verdict = drain.observe(info)
+        except Exception:
+            # A pass the evaluator could not judge breaks the comparison
+            # chain: the next pass must not settle against the one before
+            # it, across an observation that never completed.
+            drain.previous_digest = None
+            raise
+        state.last_pass = (int(seq), census, counted, digest_hash(drain.digest))
+        if counted:
+            state.residual_counts = drain.counts
+        return verdict
+
+
+def startup_watch() -> dict:
+    """``{path: (file_identity, keys)}`` of every deferral the evaluator
+    tracks; empty once released or when no hold was placed."""
+    with _LOCK:
+        drain = _STATE.drain
+        return {} if drain is None else drain.watch()
+
+
 # ── the `/api/debug/backend` `writeIo` object (spec §5.5) ─────────────────
 
 def write_io_payload(*, now_ns=None, now_utc=None, limits=None) -> dict:
@@ -664,6 +1062,11 @@ def write_io_payload(*, now_ns=None, now_utc=None, limits=None) -> dict:
         last_status = state.last_status
         cold = state.cold_startup_bytes
         admitted = state.warm_admitted_ns is not None
+        released_by = state.released_by
+        held = state.hold_placed and released_by is None
+        caught_up = state.accounting_caught_up
+        counts = state.residual_counts
+        last_pass = state.last_pass
         local = None if state.local_instance is None else dict(state.local_instance)
         observed = state.ledger_observed
     verdict, reasons = _budget.steady_verdict(stat, hysteresis, limits)
@@ -690,7 +1093,17 @@ def write_io_payload(*, now_ns=None, now_utc=None, limits=None) -> dict:
             "lastEndedAt": (None if last_wall is None else _budget.iso_z(
                 dt.datetime.fromtimestamp(last_wall, UTC))),
         },
-        "coldStartup": {"bytes": cold, "admitted": admitted},
+        "coldStartup": {
+            "bytes": cold, "admitted": admitted,
+            # #939 D5: the startup admission hold (additive keys).
+            "releasedBy": released_by, "held": held,
+            "accountingCaughtUp": caught_up,
+            "residual": (None if counts is None
+                         else dict(zip(RESIDUAL_COUNT_KEYS, counts))),
+            "lastPass": (None if last_pass is None else {
+                "seq": last_pass[0], "censusComplete": last_pass[1],
+                "counted": last_pass[2], "residualDigest": last_pass[3]}),
+        },
         "maintenance": maintenance,
         "reclaimRefusal": reclaim_refusal(),
         "budget": {

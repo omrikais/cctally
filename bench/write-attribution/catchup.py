@@ -1,11 +1,11 @@
-"""#901 spec §6.3 "Drained admission" (Q11, 901-PA-002; revision 10, `dc8`):
-drain a clone's backlog with the tested tree's ordinary, unbudgeted
-`cache-sync --source all` and admit it only when every certifiable-sync
-predicate holds - or, for Claude accounting alone, the harness-only
-stable-residual exception does.
+"""#901 spec §6.3 "Drained admission", replaced by #939 spec D6's
+tree-independent stability admission: drain a clone's backlog with the tested
+tree's ordinary, unbudgeted `cache-sync --source all` in rounds and admit it
+when two consecutive rounds are census-complete and leave identical
+observations, judged only from evidence main and the branch both provide.
 
 usage: catchup.py --tree TREE --out OUT.json [--deadline-s S]
-                  [--source SRC_ROOT [--prep RECEIPT]]
+                  [--source SRC_ROOT [--prep RECEIPT]] [--round-limit N]
        catchup.py prep --source SRC_ROOT --tree TREE [--out RECEIPT]
   (admission runs with the clone's environment: CCTALLY_DATA_DIR on the
    clone, the real transcript roots read-only plus any scratch root, TMPDIR
@@ -21,41 +21,47 @@ absence is confirmed - the stored strings, unchanged. Only ENOENT confirms
 absence: a permission or I/O error is invalid evidence, never "absent". The
 copy is read through `immutable=1` connections, so nothing is created beside
 it, and only after its WAL and journal are confirmed empty (a nonempty one
-means the copy is not closed, and the receipt is invalid).
+means the copy is not closed, and the receipt is invalid). The receipt is
+identity evidence, kept in the admission receipt.
 
-Admission steps, all inside the deadline (the runner's 900-second admission
-budget, shared with the dashboard's warm admission):
-1. Capture the source watermarks: every transcript file under the Claude and
-   Codex roots the tree reads, with its size now.
-2. Catch up: `cmd_cache_sync(source="all")` in-process, with the four sync
-   calls wrapped to keep their returned statistics, then the stats journal
-   drained by authoritative `run_stats_ingest` cycles until one consumes
-   nothing. Around each `sync_cache` call the harness also records the tracked
-   positive-size `session_files` paths before and after, the paths the tree's
-   `_iter_claude_jsonl_files` actually yields (observed, never changed), and
-   whether cache migration `001_dedup_highest_wins` was applied first.
-3. Verify: a second `cache-sync` pass and one more ingest cycle.
-4. Admit only when the Codex accounting provider passes
-   `provider_sync_certifiable("full", stats)`, both conversation providers
-   `conversation_sync_certifiable("full", stats)`, and Claude accounting its
-   ordinary full-walk predicate or the stable-residual exception
-   (`claude_residual_admission`, evaluated only when `--source` names the
-   copy; its prune evidence comes from the tree's own `--prune-orphans` path
-   on this clone). Both routes also need both cache-syncs to exit 0, every
-   captured watermark consumed, the last ingest cycle consuming nothing
-   without error, no outstanding migration, pending maintenance or incomplete
-   quota projection, and the whole drain inside the deadline. Zero backlog
-   counters alone are never evidence: an unbudgeted Codex call leaves them at
-   zero by construction. The exception never mints or alters a product
-   certificate; the original certification results are kept beside it.
+Admission (spec D6, "Workload admission"):
+1. Capture the source watermarks (every transcript file under the Claude and
+   Codex roots, with its size now) and the logical-identity frontier
+   (`frontier.py`'s capture: one entry per logical rollout with its selected
+   container, generation and byte-derived complete-record end), written to
+   OUT's directory as frontier.json. Neither reads a cursor or a store.
+2. Rounds, at most `--round-limit` (12): `cmd_cache_sync(source="all")`
+   in-process (all four syncs, wrapped to keep their statistics), then every
+   detached Codex worker those syncs requested (`_codex-replay-drain`,
+   `_codex-prune-drain`, `_codex-inventory-bootstrap`) run in-process to
+   completion, as the dashboard's detached worker would (`WorkerRequests`
+   replaces `_spawn_detached`; a #939 D5 tree's attempt id reaches the
+   worker), then authoritative `run_stats_ingest` cycles until one consumes
+   nothing, then one judgement of the frontier (`frontier.judge`, both stores
+   read in one transaction, relative to the previous round's receipt).
+3. A round is census-complete when the cache-sync exited 0, every sync
+   returned statistics with no lock contention, deferred reason, exhausted
+   budget or maintenance failure (CENSUS_FIELDS, fields both trees carry), the
+   journal is drained and no worker failed or is still pending. Two
+   consecutive census-complete rounds with equal leftover counts
+   (LEFTOVER_FIELDS: `files_failed`, `barrier_files_deferred`,
+   `barrier_keys_deferred`, `container_pending`), an equal unconsumed set and
+   unchanged obligation states admit the clone, provided no frontier entry is
+   unconsumed. No stable pair within the limit, a stable pair with an
+   unconsumed entry, an outstanding migration or pending maintenance, or a
+   drain past the deadline refuses it. Certification results are kept per
+   round as evidence only: a production-shaped copy's Codex census never
+   certifies, and the certifiable requirement and the Claude stable-residual
+   exception route are gone.
 
 The receipt keeps the tree and runtime identities, the watermarks, the
-elapsed time, every returned statistic, the per-pass Claude observations, the
-preparation identity and residual, the structured prune result, the original
-certification results, each exception check and its verdict, the pending
-state, the migrations the catch-up applied (setup work, labelled as such and
-never steady state) and this process's lifetime peak physical footprint.
-Exit 0 ADMITTED (prep: PREPARED), 2 INVALID.
+preparation, `stability` (every round's statistics, census problems,
+leftovers, worker runs, ingest cycles and judgement; the admitted pair, its
+two receipts, every deferred entry with its evidence and obligation state;
+the frontier's path and counts; every worker request), the pending state,
+the raw cursor gaps (evidence only), the migrations the catch-up applied
+(setup work, labelled as such and never steady state) and this process's
+lifetime peak physical footprint. Exit 0 ADMITTED (prep: PREPARED), 2 INVALID.
 
 Revision 15 (spec §6.3 "Frozen admission" and "Finite-frontier admission",
 Q16, `dc13` L1/L3), by WRITE_ATTRIBUTION_INPUTS:
@@ -71,16 +77,18 @@ Q16, `dc13` L1/L3), by WRITE_ATTRIBUTION_INPUTS:
   (replay), no re-attribution, and work only on a row whose own pre-drain
   cursor had a frozen suffix (Amendment 14 P2: per row, not the furthest
   cursor across tables; `row_suffixes`), a frozen file the copy did not
-  retain, or the controlled scratch input (`relocation_problems`). The unchanged-input verification
-  and the revision-10 residual exception follow unchanged.
+  retain, or the controlled scratch input (`relocation_problems`); and the
+  unchanged-input verification (`frozen_verification_problems`).
 - live (the live-roots confirmation only) - before the catch-up a frontier of
   every discovered file (identity and byte prefix, torn tails flagged) is
-  captured and written to OUT.frontier.json; every store must consume it;
-  verification may process only files whose per-file evidence shows bytes
-  beyond the frontier or a first discovery after it (`frontier_problems`),
-  and the Claude residual route admits exactly that many processed files.
-  A cursor reset, replay, prune, live discontinuity or torn frontier tail is
-  INVALID; the 900-second deadline is unchanged.
+  captured and written to OUT.frontier.json; the stable pair's second round
+  may process only files whose per-file evidence shows bytes beyond that
+  frontier or a first discovery after it (`frontier_problems`, with its
+  consumption check off: D6's judgement decides consumption). A cursor reset,
+  replay, prune or live discontinuity is INVALID.
+The frozen checks compare every round's work against the copy's pre-drain
+state (relocation) and the stable pair's second round against its first
+(verification).
 The receipt's `frontier` names the mode and its evidence.
 """
 from __future__ import annotations
@@ -106,17 +114,25 @@ HERE = pathlib.Path(__file__).resolve().parent
 DATABASES = ("cache.db", "conversations.db", "stats.db")
 #: Where `prep` writes, beside the copy's data/ directory.
 PREP_RECEIPT = "prep-receipt.json"
-PASSES = ("catchUp", "verify")
-#: `provider_sync_certifiable`'s common_clean block, restated over serialized
-#: statistics (a test pins the two together). A field the statistics do not
-#: carry reads clean, exactly as the product's `getattr(..., default)` does.
-COMMON_CLEAN_FIELDS = ("lock_contended", "barrier_retry", "files_failed",
-                       "files_deferred_torn", "container_pending",
-                       "files_deferred_reset", "deferred_reason",
-                       "prune_refused", "budget_exhausted", "maintenance_failed")
-RESIDUAL_SETS = ("walkMissingBefore", "walkMissingAfter",
-                 "confirmedAbsentBefore", "confirmedAbsentAfter")
-EXCEPTION_ROUTE = "stable-residual exception"
+#: Spec D6 (#939): the statistics fields BOTH trees carry that decide whether
+#: a round's census is complete (a field a tree does not emit reads clean, as
+#: the product's own `getattr(..., default)` does) ...
+CENSUS_FIELDS = ("lock_contended", "deferred_reason", "budget_exhausted",
+                 "maintenance_failed")
+#: ... and the per-file leftover counts two consecutive rounds must repeat.
+LEFTOVER_FIELDS = ("files_failed", "barrier_files_deferred",
+                   "barrier_keys_deferred", "container_pending")
+#: Rounds without a stable pair before the clone is refused.
+ROUND_LIMIT = 12
+#: The detached Codex workers a round runs to completion in-process, as the
+#: dashboard's detached worker would (command -> the tree's handler).
+CODEX_WORKERS = {
+    "_codex-replay-drain": "cmd_codex_replay_drain_internal",
+    "_codex-prune-drain": "cmd_codex_prune_drain_internal",
+    "_codex-inventory-bootstrap": "cmd_codex_inventory_bootstrap_internal",
+}
+#: How many times one round re-runs workers that its workers requested.
+WORKER_PASSES = 8
 
 #: The one filesystem probe that decides absence (a seam for the self-tests).
 _stat = os.stat
@@ -437,162 +453,6 @@ def _observation(walk, before, after) -> dict:
     return out
 
 
-# ── the stable-residual exception (pure) ──────────────────────────────────
-
-def residual_exception_checks(prep, passes, prune, *, identity=None,
-                              justified_claude=None) -> "list[dict]":
-    """Every check of spec §6.3 revision 10's harness-only exception, in
-    order, each {check, ok, detail}. Pure: it reads only its arguments, which
-    are the serialized forms `catchup.json` keeps, so the verdict can be
-    recomputed from the receipt alone."""
-    checks = []
-
-    def check(name, ok, detail):
-        checks.append({"check": name, "ok": bool(ok),
-                       "detail": "" if ok else detail})
-
-    residual = None
-    if not isinstance(prep, dict):
-        check("preparation.present", False,
-              "no preparation receipt for this source copy (run `catchup.py "
-              "prep` on it after its drain, with the tree that measures it)")
-    else:
-        check("preparation.present", True, "")
-        valid = prep.get("valid") is True and not prep.get("problems")
-        check("preparation.valid", valid,
-              "the preparation receipt is invalid: "
-              + ("; ".join(prep.get("problems") or []) or "not marked valid"))
-        listed = prep.get("residual")
-        if valid and isinstance(listed, list):
-            residual = sorted(listed)
-        check("preparation.residual", bool(residual),
-              "the preparation recorded no orphan residual; the exception "
-              "admits only a nonempty one")
-        ident = identity if isinstance(identity, dict) else {}
-        rev = (prep.get("tree") or {}).get("gitRev")
-        check("preparation.tree", bool(rev) and rev == ident.get("gitRev"),
-              f"prepared with tree {rev}, measured with {ident.get('gitRev')}")
-        root = (prep.get("source") or {}).get("root")
-        check("preparation.source",
-              bool(root) and root == ident.get("sourceRoot"),
-              f"prepared for source {root}, run from "
-              f"{ident.get('sourceRoot')}")
-        dbs = (prep.get("source") or {}).get("databases") or {}
-        have = ident.get("userVersions") or {}
-        bad = [db for db in DATABASES
-               if (dbs.get(db) or {}).get("userVersion") is None
-               or (dbs.get(db) or {}).get("userVersion") != have.get(db)]
-        check("preparation.userVersions", not bad, ", ".join(
-            f"{db} prepared at {(dbs.get(db) or {}).get('userVersion')}, "
-            f"clone at {have.get(db)}" for db in bad))
-
-    for phase in PASSES:
-        p = (passes or {}).get(phase) or {}
-        error = f" ({p.get('error')})" if p.get("error") else ""
-        check(f"{phase}.exit", p.get("exit") == 0,
-              f"cache-sync exited {p.get('exit')}{error}")
-        raw = p.get("stats")
-        check(f"{phase}.stats", isinstance(raw, dict),
-              "no sync_cache statistics were captured")
-        stats = raw if isinstance(raw, dict) else {}
-        dirty = [f for f in COMMON_CLEAN_FIELDS if stats.get(f)]
-        check(f"{phase}.commonClean", isinstance(raw, dict) and not dirty,
-              ("dirty: " + ", ".join(f"{f}={stats.get(f)!r}" for f in dirty))
-              if dirty else "no statistics")
-        counts = [stats.get(k) for k in ("files_processed",
-                                         "files_skipped_unchanged",
-                                         "files_total")]
-        complete = (all(isinstance(n, int) for n in counts)
-                    and counts[0] + counts[1] == counts[2])
-        check(f"{phase}.census", complete,
-              "files_processed + files_skipped_unchanged != files_total "
-              f"({counts[0]} + {counts[1]} vs {counts[2]})")
-        claude = p.get("claude")
-        claude = claude if isinstance(claude, dict) else None
-        obs = claude or {}
-        check(f"{phase}.dedupApplied", obs.get("dedupApplied") is True,
-              "cache migration 001_dedup_highest_wins was not applied before "
-              f"the pass (observed {obs.get('dedupApplied')!r})")
-        found = obs.get("discovery")
-        check(f"{phase}.discovery",
-              isinstance(found, dict) and found.get("invocations", 0) >= 1
-              and found.get("complete") is True and not found.get("errors"),
-              "the walk's own discovery was not observed completely"
-              + (f": {found.get('errors')}" if isinstance(found, dict)
-                 and found.get("errors") else ""))
-        check(f"{phase}.snapshot",
-              claude is not None and not obs.get("snapshotErrors"),
-              f"session_files unreadable: {obs.get('snapshotErrors')}")
-        check(f"{phase}.absence",
-              claude is not None and not obs.get("absenceErrors"),
-              f"absence unconfirmed: {obs.get('absenceErrors')}")
-        differ = []
-        for name in RESIDUAL_SETS:
-            got = obs.get(name)
-            if residual is None or not isinstance(got, list) \
-                    or sorted(got) != residual:
-                added = sorted(set(got or []) - set(residual or []))
-                removed = sorted(set(residual or []) - set(got or []))
-                differ.append(f"{name} " + (
-                    "not observed" if not isinstance(got, list) else
-                    f"+{added} -{removed}"))
-        check(f"{phase}.residual", not differ,
-              ("no preparation residual to compare; " if residual is None
-               else "") + "; ".join(differ))
-    verify = ((passes or {}).get("verify") or {}).get("stats")
-    processed = verify.get("files_processed") if isinstance(verify, dict) \
-        else None
-    if justified_claude is None:
-        check("verify.claudeProcessed", processed == 0,
-              f"verification processed {processed} Claude file(s); it must "
-              "process none")
-    else:
-        # Revision 15 (Q16, finite-frontier admission): a live verification
-        # may process exactly the files per-file evidence shows grew beyond
-        # the frontier or appeared after it - never more.
-        check("verify.claudeProcessed",
-              isinstance(processed, int) and processed <= justified_claude,
-              f"verification processed {processed} Claude file(s); per-file "
-              f"evidence beyond the frontier justifies {justified_claude}")
-
-    pr = prune if isinstance(prune, dict) else {}
-    raw = pr.get("result")
-    check("prune.present", pr.get("ran") is True and isinstance(raw, dict),
-          "the tested tree's --prune-orphans helper returned no structured "
-          "result" + (f" ({pr.get('error')})" if pr.get("error") else ""))
-    result = raw if isinstance(raw, dict) else {}
-    check("prune.exit", pr.get("exit") == 0,
-          f"cache-sync --prune-orphans exited {pr.get('exit')}")
-    counts = {k: result.get(k) for k in ("pruned_files", "pruned_entries",
-                                         "pruned_messages")}
-    check("prune.mutation", all(v == 0 for v in counts.values()),
-          ", ".join(f"{k}={v}" for k, v in counts.items()))
-    check("prune.contention", result.get("contended") is False,
-          f"contended={result.get('contended')!r}")
-    check("prune.refusal", result.get("prune_refused") is False,
-          f"prune_refused={result.get('prune_refused')!r}")
-    paths = result.get("residual_paths")
-    check("prune.residual", residual is not None and isinstance(paths, list)
-          and sorted(paths) == residual,
-          f"residual_paths {paths} vs preparation residual {residual}")
-    return checks
-
-
-def claude_residual_admission(prep, passes, prune, *, identity=None,
-                              justified_claude=None) -> "list[str]":
-    """Spec §6.3 revision 10: the problems that keep a Claude walk whose only
-    uncertifiable cause should be a stable, prepared orphan residual from
-    admission; an empty list admits it. Used ONLY as the Claude alternative
-    when `provider_sync_certifiable("full", …)` fails. `justified_claude`
-    (live finite-frontier admission only) is the number of Claude files the
-    frontier evidence lets verification process; None keeps "none"."""
-    return [f"{c['check']}: {c['detail']}"
-            for c in residual_exception_checks(prep, passes, prune,
-                                               identity=identity,
-                                               justified_claude=justified_claude)
-            if not c["ok"]]
-
-
 # ── revision 15 (Q16, `dc13` L1/L3): frozen admission and the live frontier ──
 
 #: The retained cursor rows and the identity columns a relocation or a replay
@@ -892,12 +752,16 @@ def current_files(paths) -> dict:
 
 
 def frontier_problems(frontier: dict, after_catchup: dict, after_verify: dict,
-                      now: dict) -> "tuple[list[str], dict]":
+                      now: dict, *, check_consumption: bool = True
+                      ) -> "tuple[list[str], dict]":
     """Pure. The catch-up must consume the frontier in every store that tracks
     a file; verification may process a file only where per-file evidence
     (`now`, read after it) shows bytes beyond the frontier or a file first
     discovered after it; a cursor reset, a replay, a prune or a live identity
-    change is never admitted. Returns (problems, {provider: justified files})."""
+    change is never admitted. Returns (problems, {provider: justified files}).
+    #939 D6: `run` passes `check_consumption=False`, because consumption is
+    judged by the logical-identity frontier (a covered Codex deferral is not
+    a raw cursor gap's failure)."""
     problems = []
     files = frontier.get("files") or {}
     for path, f in sorted(files.items()):
@@ -906,6 +770,8 @@ def frontier_problems(frontier: dict, after_catchup: dict, after_verify: dict,
                 or cur["size"] < f["size"]:
             problems.append(f"{path}: an unexplained discontinuity after the "
                             "frontier (replaced, shrunk or gone)")
+        if not check_consumption:
+            continue
         for name, row in after_catchup.get("rows", {}).items():
             if row["path"] == path and int(row.get("last_byte_offset") or 0) < f["size"]:
                 problems.append(
@@ -951,31 +817,167 @@ def frontier_problems(frontier: dict, after_catchup: dict, after_verify: dict,
     return problems, justified
 
 
-def admission_problems(frontier, final: dict, gaps, ingest, *,
-                       claude_exception=None) -> "list[str]":
-    """`claude_exception`: None when the exception was not evaluated, [] when
-    it admits the Claude walk, else its problems. Codex accounting and both
-    conversation censuses always keep their ordinary predicates."""
-    problems = []
-    if not frontier.provider_sync_certifiable("full", final.get("sync_cache")):
-        if claude_exception is None:
-            problems.append("sync_cache is not certifiable as a full walk")
-        elif claude_exception:
-            problems.append(
-                "sync_cache is not certifiable as a full walk, and the "
-                "stable-residual exception does not apply: "
-                + "; ".join(claude_exception))
-    if not frontier.provider_sync_certifiable(
-            "full", final.get("sync_codex_cache")):
-        problems.append("sync_codex_cache is not certifiable as a full walk")
-    for name in ("sync_claude_conversations", "sync_codex_conversations"):
-        if not frontier.conversation_sync_certifiable("full", final.get(name)):
-            problems.append(f"{name} is not certifiable as a full census")
-    problems.extend(gaps)
-    if ingest is None or not ingest.get("ran") or ingest.get("consumed") \
-            or ingest.get("error"):
-        problems.append(f"the stats journal is not drained ({ingest})")
-    return problems
+# ── #939 D6: tree-independent stability admission (pure) ──────────────────
+
+def _d6():
+    """The harness's logical-identity frontier (bench/write-attribution)."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import frontier as d6
+    return d6
+
+
+def round_record(syncs: dict, receipt, *, exit_code, error, ingest=None,
+                 workers=None, pending_workers=()) -> dict:
+    """One round: its census problems (from CENSUS_FIELDS only, so main and
+    the branch are judged alike), its leftover counts (LEFTOVER_FIELDS, None
+    where a tree does not report one), its worker runs and its judgement."""
+    census = []
+    if exit_code != 0:
+        census.append(f"census incomplete: the cache-sync exited {exit_code}"
+                      + (f" ({error})" if error else ""))
+    for name in Capture.NAMES:
+        stats = syncs.get(name)
+        if stats is None:
+            census.append(f"census incomplete: {name} returned no statistics")
+            continue
+        for field in CENSUS_FIELDS:
+            if stats.get(field):
+                census.append(f"census incomplete: {name} "
+                              f"{field}={stats.get(field)!r}")
+    if ingest is not None and (not ingest.get("ran") or ingest.get("consumed")
+                               or ingest.get("error")):
+        census.append(f"census incomplete: the stats journal is not drained "
+                      f"({ingest})")
+    for run in workers or []:
+        if run.get("error"):
+            census.append(f"census incomplete: worker {run['command']} "
+                          f"raised {run['error']}")
+    if pending_workers:
+        census.append("census incomplete: requested workers still pending "
+                      f"({sorted(set(pending_workers))})")
+    leftovers = {name: {f: (syncs.get(name) or {}).get(f)
+                        for f in LEFTOVER_FIELDS} for name in Capture.NAMES}
+    return {"exit": exit_code, "error": error, "syncs": syncs,
+            "census": census, "leftovers": leftovers, "ingest": ingest,
+            "workers": list(workers or []), "receipt": receipt}
+
+
+def _leftover_changes(a: dict, b: dict) -> "list[str]":
+    return [f"{name}.{field} {a.get(name, {}).get(field)} -> "
+            f"{b.get(name, {}).get(field)}"
+            for name in sorted(set(a) | set(b)) for field in LEFTOVER_FIELDS
+            if a.get(name, {}).get(field) != b.get(name, {}).get(field)]
+
+
+def stability(rounds: list, limit: int = ROUND_LIMIT) -> dict:
+    """Spec D6 workload admission over the rounds so far. Admitted at the
+    first pair of consecutive rounds that are census-complete and leave
+    identical observations (leftover counts, the unconsumed set, and every
+    deferred entry's obligation state relative to the pair's first round)
+    with no unconsumed entry. `final` says no further round can change the
+    verdict: a stable pair with an unconsumed entry, or the round limit."""
+    d6 = _d6()
+    n = len(rounds)
+    out = {"admitted": False, "final": n >= limit, "pair": None,
+           "receipts": None, "deferred": [], "problems": []}
+    if n < 2:
+        out["problems"] = ([f"no stable pair within {limit} rounds"]
+                           if out["final"] else ["fewer than two rounds"])
+        return out
+    a, b = rounds[-2], rounds[-1]
+    ia, ib = n - 2, n - 1
+    ra, rb = a.get("receipt"), b.get("receipt")
+    problems = ([f"round {ia}: {p}" for p in a["census"]]
+                + [f"round {ib}: {p}" for p in b["census"]])
+    changed = _leftover_changes(a["leftovers"], b["leftovers"])
+    if changed:
+        problems.append(f"leftover counts changed between rounds {ia} and "
+                        f"{ib}: " + "; ".join(changed[:8]))
+    partial = (d6.receipt_problems(ra, f"round {ia}")
+               + d6.receipt_problems(rb, f"round {ib}"))
+    problems += partial
+    unconsumed = []
+    if not partial:
+        ua = sorted(e["logical"] for e in ra["unconsumed"])
+        ub = sorted(e["logical"] for e in rb["unconsumed"])
+        if ua != ub:
+            problems.append(f"the unconsumed entries changed between rounds "
+                            f"{ia} and {ib} ({len(ua)} -> {len(ub)})")
+        problems += d6.obligation_changes(ra, ra, rb)
+        unconsumed = d6.unconsumed_problems(rb, f"round {ib}")
+    if not problems and not unconsumed:
+        ref = {e["logical"]: e for e in ra["deferred"]}
+        out.update({
+            "admitted": True, "final": True, "pair": [ia, ib],
+            "receipts": [ra, rb],
+            "deferred": [dict(e, obligationState=d6.obligation_state(
+                e, ref.get(e["logical"]))) for e in rb["deferred"]]})
+        return out
+    if not problems:
+        out.update({"final": True, "pair": [ia, ib], "receipts": [ra, rb],
+                    "problems": unconsumed})
+        return out
+    if out["final"]:
+        problems.append(f"no stable pair within {limit} rounds")
+    out["problems"] = problems
+    return out
+
+
+class WorkerRequests:
+    """Spec D6: the detached workers a round's syncs request, run in-process
+    to completion as the dashboard's detached worker would. The tree's
+    `_spawn_detached` is replaced for the run: a Codex worker command is
+    recorded with the environment its spawner scoped (a #939 D5 tree's
+    attempt id, so the worker records and retires its own attempt) and is
+    reported spawned; any other command is recorded and reported not spawned
+    (in this process `sys.argv[0]` is this script, never the tree's CLI)."""
+
+    def __init__(self, update_module):
+        self.pending = []
+        self.log = []
+        current = getattr(update_module, "detached_env_current", None)
+
+        def spawn(command, *, env=None):
+            scoped = dict(current() if current is not None else {})
+            scoped.update(env or {})
+            worker = command in CODEX_WORKERS
+            self.log.append({"command": command, "worker": worker})
+            if worker:
+                self.pending.append((command, scoped))
+            return worker
+
+        update_module._spawn_detached = spawn
+
+    def run(self, c) -> "list[dict]":
+        """Run every requested worker, then those they requested, up to
+        WORKER_PASSES times; what is left stays in `pending`."""
+        runs = []
+        for _ in range(WORKER_PASSES):
+            if not self.pending:
+                break
+            batch, self.pending = self.pending, []
+            for command, env in batch:
+                handler = getattr(c, CODEX_WORKERS[command], None)
+                saved = {k: os.environ.get(k) for k in env}
+                os.environ.update({k: str(v) for k, v in env.items()})
+                t0 = time.monotonic()
+                try:
+                    if handler is None:
+                        code, error = None, "the tree has no handler"
+                    else:
+                        code, error = handler(argparse.Namespace()), None
+                except Exception as exc:  # noqa: BLE001 - kept as evidence
+                    code, error = None, f"{type(exc).__name__}: {exc}"
+                finally:
+                    for k, v in saved.items():
+                        if v is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = v
+                runs.append({"command": command, "exit": code, "error": error,
+                             "seconds": round(time.monotonic() - t0, 3)})
+        return runs
 
 
 # ── explicit migration and pending-maintenance state ──────────────────────
@@ -1210,23 +1212,6 @@ def _read_prep(path) -> "tuple[dict | None, str | None]":
 
 # ── admission ─────────────────────────────────────────────────────────────
 
-def _prune_pass(c, capture) -> dict:
-    """The tested tree's `cache-sync --prune-orphans` on this clone, with the
-    helper's structured `PruneResult` (an exit code alone is not evidence)."""
-    capture.prunes.clear()
-    args = argparse.Namespace(source="all", rebuild=False, prune_orphans=True,
-                              prune_conversations=False)
-    t0 = time.monotonic()
-    try:
-        code, error = c.cmd_cache_sync(args), None
-    except Exception as exc:  # noqa: BLE001 - kept as evidence
-        code, error = None, f"{type(exc).__name__}: {exc}"
-    return {"ran": True, "exit": code, "error": error,
-            "calls": len(capture.prunes),
-            "seconds": round(time.monotonic() - t0, 3),
-            "result": _wire(capture.prunes[-1]) if capture.prunes else None}
-
-
 def _input_mode() -> "tuple[str | None, str | None]":
     """(mode, freeze): ("frozen", FREEZE), ("live", None), or (None, None)
     when no input mode is set (the pre-revision-15 behaviour, kept for the
@@ -1237,8 +1222,29 @@ def _input_mode() -> "tuple[str | None, str | None]":
     return ("live", None) if raw == "live" else (None, None)
 
 
+def _ingest_cycles(journal, started, deadline_s) -> "list[dict]":
+    """Authoritative stats-journal ingest until one cycle consumes nothing."""
+    cycles = []
+    while time.monotonic() - started < deadline_s:
+        result = journal.run_stats_ingest(mode="authoritative", timeout_s=60.0)
+        cycles.append({"ran": result.ran, "consumed": result.consumed,
+                       "malformed": result.malformed,
+                       "error": None if result.error is None
+                       else repr(result.error)})
+        if not result.ran or not result.consumed or result.error:
+            break
+    return cycles
+
+
+def _frontier_path(out) -> "pathlib.Path | None":
+    """Spec D6's frontier capture, written beside the receipt (a workload run
+    directory's frontier.json)."""
+    return None if out is None else pathlib.Path(out).parent / "frontier.json"
+
+
 def run(tree: pathlib.Path, deadline_s: float, *, source=None,
-        prep_path=None, out=None) -> "tuple[int, dict]":
+        prep_path=None, out=None, limit: int = ROUND_LIMIT
+        ) -> "tuple[int, dict]":
     import argparse as _argparse
 
     started = time.monotonic()
@@ -1258,6 +1264,15 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
     cache = c._load_sibling("_cctally_cache")
     journal = c._load_sibling("_cctally_journal")
     frontier = c._load_sibling("_lib_ingest_frontier")
+    update = c._load_sibling("_cctally_update")
+    # #939 D6: the logical-identity frontier, captured before any round from
+    # the inputs this process reads (never from a cursor or a store).
+    d6 = _d6()
+    libs = d6.load_libs(tree)
+    d6_frontier = d6.capture(d6.env_roots(os.environ), libs)
+    d6_path = _frontier_path(out)
+    if d6_path is not None:
+        _write_json(d6_path, d6_frontier)
     # Revision 15 (Q16): the frozen identity checks run BEFORE the drain.
     frozen = None
     if mode == "frozen":
@@ -1282,6 +1297,7 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                   "suffixes": row_suffixes(manifest, before_state),
                   "qualification": qualification}
     capture = Capture(cache, data_dir)
+    workers = WorkerRequests(update)
     receipt = {"tree": str(tree), "gitRev": rev,
                "python": sys.version.split()[0],
                "sqlite": sqlite3.sqlite_version,
@@ -1295,49 +1311,56 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                                "error": prep_error, "receipt": prep}}
     args = _argparse.Namespace(source="all", rebuild=False,
                                prune_orphans=False, prune_conversations=False)
-    phases, certification = {}, {}
-    for phase in PASSES:
+    rounds, states, verdict = [], [], None
+    while True:
         t0 = time.monotonic()
+        capture.calls.clear()
         try:
             code, error = c.cmd_cache_sync(args), None
         except Exception as exc:  # noqa: BLE001 - kept as evidence
             code, error = None, f"{type(exc).__name__}: {exc}"
-        cycles = []
-        while time.monotonic() - started < deadline_s:
-            result = journal.run_stats_ingest(mode="authoritative",
-                                              timeout_s=60.0)
-            cycles.append({"ran": result.ran, "consumed": result.consumed,
-                           "malformed": result.malformed,
-                           "error": None if result.error is None
-                           else repr(result.error)})
-            if not result.ran or not result.consumed or result.error:
-                break
-        phases[phase] = {
-            "exit": code, "error": error,
-            "seconds": round(time.monotonic() - t0, 3),
-            "syncs": {name: _wire(capture.last(name))
-                      for name in Capture.NAMES},
-            "claude": capture.last_claude(),
-            "ingestCycles": cycles,
-        }
-        # The original certification results, kept whatever route admits.
-        certification[phase] = {
+        syncs = {name: _wire(capture.last(name)) for name in Capture.NAMES}
+        # The original certification results, kept as evidence only: a
+        # production-shaped copy's Codex census never certifies (D6).
+        certification = {
             name: bool(frontier.provider_sync_certifiable(
                 "full", capture.last(name)))
             for name in ("sync_cache", "sync_codex_cache")}
-        certification[phase].update({
+        certification.update({
             name: bool(frontier.conversation_sync_certifiable(
                 "full", capture.last(name)))
             for name in ("sync_claude_conversations",
                          "sync_codex_conversations")})
-        if phase == "catchUp":
-            capture.calls.clear()
-            after_catchup = retained_state(data_dir)
-    final = {name: capture.last(name) for name in Capture.NAMES}
-    after_verify = retained_state(data_dir)
-    frontier_receipt, mode_problems, justified = None, [], None
+        claude = capture.last_claude()
+        worker_runs = workers.run(c)
+        cycles = _ingest_cycles(journal, started, deadline_s)
+        reference = rounds[-1]["receipt"] if rounds else None
+        try:
+            judgement = d6.judge_dir(d6_frontier, data_dir, libs,
+                                     reference=reference)
+        except Exception as exc:  # noqa: BLE001 - a missing judgement refuses
+            judgement = {"complete": False,
+                         "error": f"{type(exc).__name__}: {exc}"}
+        record = round_record(
+            syncs, judgement, exit_code=code, error=error,
+            ingest=cycles[-1] if cycles else {"ran": False},
+            workers=worker_runs,
+            pending_workers=[cmd for cmd, _ in workers.pending])
+        record.update({"seconds": round(time.monotonic() - t0, 3),
+                       "certification": certification, "claude": claude,
+                       "ingestCycles": cycles})
+        rounds.append(record)
+        states.append(retained_state(data_dir))
+        verdict = stability(rounds, limit)
+        if verdict["final"] or time.monotonic() - started >= deadline_s:
+            break
+    pair = verdict["pair"] or [max(0, len(rounds) - 2), len(rounds) - 1]
+    after_catchup, after_verify = states[pair[0]], states[pair[1]]
+    frontier_receipt, mode_problems = None, []
     if mode == "frozen":
-        relocation = relocation_problems(frozen["before"], after_catchup,
+        # Every round's work against the copy's pre-drain retained state, and
+        # the stable pair's second round against its first (HR-12).
+        relocation = relocation_problems(frozen["before"], states[-1],
                                          frozen["suffixes"])
         verification = frozen_verification_problems(after_catchup, after_verify)
         mode_problems = frozen["identityProblems"] + relocation + verification
@@ -1354,13 +1377,14 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
             "expectedRowSuffixBytes": sum(frozen["suffixes"].values()),
             "identityProblems": frozen["identityProblems"],
             "relocationProblems": relocation,
-            # HR-12: the verification pass against the catch-up's result
+            # HR-12: the stable pair's second round against its first
             "verification": {"checked": True, "problems": verification}}
     elif mode == "live":
         now = current_files(sorted(set(live_frontier["files"]) | {
             row["path"] for row in after_verify["rows"].values()}))
         mode_problems, justified = frontier_problems(
-            live_frontier, after_catchup, after_verify, now)
+            live_frontier, after_catchup, after_verify, now,
+            check_consumption=False)
         frontier_path = None if out is None else pathlib.Path(
             str(out) + ".frontier.json")
         if frontier_path is not None:
@@ -1377,22 +1401,6 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                 1 for p, f in files.items()
                 if (now.get(p) or {}).get("size", 0) > f["size"]),
             "problems": mode_problems}
-    ordinary = bool(frontier.provider_sync_certifiable(
-        "full", final.get("sync_cache")))
-    prune, checks, claude_exception = {"ran": False}, [], None
-    if not ordinary and source_root is not None:
-        if time.monotonic() - started < deadline_s:
-            prune = _prune_pass(c, capture)
-        passes = {phase: {"exit": phases[phase]["exit"],
-                          "error": phases[phase]["error"],
-                          "stats": phases[phase]["syncs"]["sync_cache"],
-                          "claude": phases[phase]["claude"]}
-                  for phase in PASSES}
-        checks = residual_exception_checks(
-            prep, passes, prune, identity=identity,
-            justified_claude=None if justified is None else justified["claude"])
-        claude_exception = [f"{c_['check']}: {c_['detail']}" for c_ in checks
-                            if not c_["ok"]]
     try:
         pending = pending_state(data_dir,
                                 **tree_pending_inputs(c, cache, frontier))
@@ -1402,16 +1410,9 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
                    "errors": [f"pending state unreadable: "
                               f"{type(exc).__name__}: {exc}"]}
     pending_issues = pending_problems(pending)
-    gaps = cursor_gaps(data_dir, marks)
-    last_ingest = (phases["verify"]["ingestCycles"] or [None])[-1]
-    problems = admission_problems(frontier, final, gaps, last_ingest,
-                                  claude_exception=claude_exception)
-    for phase in PASSES:
-        if phases[phase]["exit"] != 0:
-            error = phases[phase]["error"]
-            problems.append(f"the {phase} cache-sync exited "
-                            f"{phases[phase]['exit']}"
-                            + (f" ({error})" if error else ""))
+    problems = list(d6.frontier_problems(d6_frontier))
+    if not verdict["admitted"]:
+        problems.extend(verdict["problems"] or ["no stable pair of rounds"])
     problems.extend(pending_issues)
     problems.extend(mode_problems)
     elapsed = time.monotonic() - started
@@ -1419,21 +1420,18 @@ def run(tree: pathlib.Path, deadline_s: float, *, source=None,
         problems.append(f"the drain took {elapsed:.0f} s, past the "
                         f"{deadline_s:.0f} s admission deadline")
     after_migrations = applied_migrations(data_dir)
-    route = ("ordinary" if ordinary else
-             EXCEPTION_ROUTE if claude_exception == [] else "refused")
     receipt.update({
         "inputMode": mode, "frontier": frontier_receipt,
-        "phases": phases, "elapsedS": round(elapsed, 3),
-        "pendingWork": gaps,
+        "stability": {**verdict, "limit": limit, "rounds": rounds,
+                      "frontierPath": None if d6_path is None
+                      else str(d6_path),
+                      "frontierCounts": d6_frontier["counts"],
+                      "workerRequests": workers.log},
+        "elapsedS": round(elapsed, 3),
+        # Raw cursor gaps against the watermarks: evidence only, because a
+        # covered Codex deferral leaves one by design (D6 judges consumption).
+        "pendingWork": cursor_gaps(data_dir, marks),
         "pendingState": {**pending, "problems": pending_issues},
-        "certification": certification,
-        "prune": prune,
-        "claudeAdmission": {
-            "route": route, "ordinary": ordinary,
-            "exception": {"evaluated": claude_exception is not None,
-                          "admitted": claude_exception == [],
-                          "checks": checks,
-                          "problems": claude_exception or []}},
         # One-time migration and index builds during catch-up are SETUP work
         # (§5.3a): recorded, labelled, never folded into steady state.
         "setupMigrations": {
@@ -1482,18 +1480,21 @@ def main(argv=None) -> int:
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--deadline-s", type=float, default=900.0)
     parser.add_argument("--source", type=pathlib.Path,
-                        help="SRC_ROOT the clone was made from; enables the "
-                             "Claude stable-residual exception")
+                        help="SRC_ROOT the clone was made from (its "
+                             "preparation receipt and frozen qualification)")
     parser.add_argument("--prep", type=pathlib.Path,
                         help=f"default: SRC_ROOT/{PREP_RECEIPT}")
+    parser.add_argument("--round-limit", type=int, default=ROUND_LIMIT)
     args = parser.parse_args(argv)
     code, receipt = run(args.tree.resolve(), args.deadline_s,
-                        source=args.source, prep_path=args.prep, out=args.out)
+                        source=args.source, prep_path=args.prep, out=args.out,
+                        limit=args.round_limit)
     args.out.write_text(json.dumps(receipt, indent=2, sort_keys=True,
                                    default=str) + "\n")
-    print("ADMITTED" + (f" (Claude: {EXCEPTION_ROUTE})"
-                        if receipt["claudeAdmission"]["route"]
-                        == EXCEPTION_ROUTE else "")
+    stab = receipt["stability"]
+    print(f"ADMITTED (stable rounds {stab['pair']}, "
+          f"{len(stab['deferred'])} deferred entr"
+          f"{'y' if len(stab['deferred']) == 1 else 'ies'})"
           if code == 0 else "INVALID: " + "; ".join(receipt["problems"]))
     return code
 

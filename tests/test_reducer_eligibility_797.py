@@ -424,3 +424,202 @@ def test_a_drop_whose_only_matching_member_is_refused_keeps_candidate_provenance
     assert provenance["token"] == _token(refused_name)
     assert provenance["providerActivityStatus"] == "known"
     assert refused == bare
+
+
+# --- #1019: the drop side (spec 4.2, L5, L6, K3) ---------------------------------
+
+
+def _drop_facts(sp, *names):
+    """Facts refusing the LOW of each named member (#1019), rise facts eligible."""
+    return {_token(n): sp.MemberFacts(False, None, False, drop_refused=True,
+                                      drop_proof_observation_id="o:" + n)
+            for n in names}
+
+
+def _witnessed(name, *, low, instant, key=WEEK, received=NOW - 10):
+    import _lib_provider_activity as pa
+    value = lib.AxisValue(float(low), key)
+    return lib.SupportingObservation(
+        observation_id=lib.observation_identity(_token(name), "sevenDay", value),
+        token=_token(name), percent=float(low), raw_resets_at=key,
+        received_at=received,
+        witness=pa.ActivityWitness(1, 1, "known", instant, None, 1, 1, "0" * 64))
+
+
+def _reduce_refuting(candidates, db_axis, pending, refuted, *, facts=None, now=NOW):
+    return lib._reduce_axis(
+        "sevenDay", tuple(candidates), db_axis, pending, None, now,
+        scope=(lib.PROTOCOL_GENERATION, "a" * 32, "sevenDay"),
+        member_facts=facts, refuted_supports=frozenset(refuted))
+
+
+def test_rise_eligible_member_at_baseline_still_dissents(sp):
+    """Accuracy (P-R1, S4's flap): a fresh member's drop stays pending while
+    a rise-eligible member at the baseline is present, then publishes once
+    it leaves the active window; a drop-refused member at the baseline is
+    rise-ineligible and dissents from nothing (P-R2)."""
+    pending = dataclasses.replace(_pending(low=30, supporters="b"), contributors={
+        _token("b"): lib.Contributor(NOW - 20, False)})
+    present = [_cand("a", seven=50), _cand("b", seven=30)]
+    held = _reduce(present, _db_axis(50), pending)
+    assert held.action != "PUBLISH_DB", held
+    assert held.pending is not None and held.pending.deadline_at == pending.deadline_at
+    alone = _reduce([_cand("b", seven=30)], _db_axis(50), pending)
+    assert (alone.action, alone.candidate.percent) == ("PUBLISH_DB", 30.0)
+    refused = _reduce(present, _db_axis(50), pending, facts=_drop_facts(sp, "a"))
+    assert (refused.action, refused.candidate.percent) == ("PUBLISH_DB", 30.0)
+
+
+def test_drop_refused_member_never_rises_or_arms(sp):
+    """Accuracy (P-R2): a drop-refused member is ineligible in both
+    directions — its reading above the baseline is no rise, its reading
+    below arms no drop — while the displayed maximum is unchanged."""
+    above = _reduce([_cand("a", seven=74)], _db_axis(0), facts=_drop_facts(sp, "a"))
+    assert (above.action, above.candidate) == ("NOOP", None)
+    below = _reduce([_cand("a", seven=18)], _db_axis(51), facts=_drop_facts(sp, "a"))
+    assert (below.action, below.pending) == ("NOOP", None)
+    # An eligible peer's rise still publishes beside it.
+    mixed = _reduce([_cand("a", seven=74), _cand("b", seven=10)], _db_axis(0),
+                    facts=_drop_facts(sp, "a"))
+    assert (mixed.action, mixed.candidate.percent) == ("PUBLISH_DB", 10.0)
+
+
+def test_empty_drop_eligible_set_never_unanimous(sp):
+    """Accuracy (spec 4.2): with every present member drop-refused a pending
+    drop neither publishes by consensus nor arms afresh."""
+    pending = dataclasses.replace(_pending(low=30, supporters="b"), contributors={
+        _token("b"): lib.Contributor(NOW - 20, True)})
+    got = _reduce([_cand("b", seven=30)], _db_axis(50), pending,
+                  facts=_drop_facts(sp, "b"))
+    assert got.action != "PUBLISH_DB", got
+
+
+def test_class_floor_excludes_drop_refused_members(sp):
+    """Accuracy (P-R4): the first post-floor reading of a floor-retired axis
+    excludes a drop-refused member as it excludes a receipt-refused one."""
+    got = _reduce([_cand("a", seven=74, at=NOW)], None, evidence=_floor(),
+                  facts=_drop_facts(sp, "a"))
+    assert (got.action, got.candidate) == ("NOOP", None)
+    got = _reduce([_cand("a", seven=74, at=NOW), _cand("b", seven=5, at=NOW)], None,
+                  evidence=_floor(), facts=_drop_facts(sp, "a"))
+    assert (got.action, got.candidate.percent) == ("PUBLISH_DB", 5.0)
+
+
+def test_hold_pending_cancels_refuted_retained_low():
+    """L5 (accuracy: `_hold_pending` publishing a refuted low): the only
+    supporter aged out and a later sample refutes its observation; at the
+    deadline nothing publishes and the pending drop is cancelled."""
+    pending = _pending(low=18, supporters="b", deadline=NOW - 1)
+    refuted = {lib.support_identity(o) for o in pending.retained.observations}
+    kept = _reduce_refuting([], _db_axis(51), pending, ())
+    assert (kept.action, kept.candidate.percent) == ("PUBLISH_DB", 18.0)
+    got = _reduce_refuting([], _db_axis(51), pending, refuted)
+    assert (got.action, got.candidate, got.pending) == ("WRITE_CONTROL", None, None)
+
+
+def test_partial_refutation_keeps_deadline_and_surviving_support():
+    """L5: one refuted and one eligible supporter — the low stays pending
+    with its original deadline and only the surviving observation, and
+    publishes as that support at the deadline."""
+    pending = _pending(low=18, supporters="bc", deadline=NOW + 50)
+    b, c = pending.retained.observations
+    refuted = {lib.support_identity(b if b.token == _token("b") else c)}
+    got = _reduce_refuting([], _db_axis(51), pending, refuted)
+    assert got.action == "WRITE_CONTROL", got
+    assert got.pending.deadline_at == pending.deadline_at
+    assert [o.token for o in got.pending.retained.observations] == [_token("c")]
+    late = _reduce_refuting([], _db_axis(51), got.pending, refuted, now=NOW + 50)
+    assert (late.action, late.candidate.percent) == ("PUBLISH_DB", 18.0)
+    assert [o.token for o in late.pending.retained.observations] == [_token("c")]
+
+
+def test_present_refused_supporter_withdraws_only_its_observation(sp):
+    """L6: a present drop-refused supporter withdraws its own supporting
+    observation, never its genuine peer's; the published drop's provenance
+    names the peer's observation."""
+    import _cctally_statusline as sl
+    pending = dataclasses.replace(
+        _pending(low=18, supporters="bc", deadline=NOW - 1),
+        contributors={_token("b"): lib.Contributor(NOW - 20, False),
+                      _token("c"): lib.Contributor(NOW - 20, False)})
+    stale = next(o for o in pending.retained.observations if o.token == _token("b"))
+    refuted = {lib.support_identity(stale)}
+    candidates = [_cand("b", seven=18), _cand("c", seven=18)]
+    got = _reduce_refuting(candidates, _db_axis(51), pending, refuted,
+                           facts=_drop_facts(sp, "b"))
+    assert (got.action, got.candidate.percent) == ("PUBLISH_DB", 18.0)
+    assert [o.token for o in got.pending.retained.observations] == [_token("c")]
+    db = lib.DbProjection(None, _db_axis(51))
+    candidates = tuple(dataclasses.replace(c, activity=_activity()) for c in candidates)
+    decision = lib.reduce_candidates(
+        candidates, db=db, control=lib.ControlState(
+            db, {"fiveHour": None, "sevenDay": pending}),
+        tombstones={}, now_epoch=NOW, account_key=_Binding.account_key,
+        member_facts={"sevenDay": _drop_facts(sp, "b")},
+        refuted_supports={"sevenDay": frozenset(refuted)})
+    assert decision.action == "PUBLISH_DB"
+    plan = sl._bound_publication_plan(
+        decision, db, candidates, _Binding(), generation=3, now_epoch=NOW,
+        intake_sequence=0, refused={},
+        drop_refused={"sevenDay": frozenset({_token("b")})})
+    source = plan["provenance"]["sevenDay"]
+    assert (source["kind"], source["token"]) == ("candidate", _token("c"))
+
+
+def test_same_observation_different_witness_are_separate_supports():
+    """K3 (accuracy: aliasing discards a fresh same-value support): a
+    repeated observation identity with a later witness is a separate
+    support, kept over the older one, so a sample refuting only the older
+    bound leaves the drop supported; the record stays one support per
+    observation identity, however many responses repeat the reading."""
+    old = _witnessed("b", low=18, instant="2026-10-25T10:12:22.165Z")
+    fresh = _witnessed("b", low=18, instant="2026-10-29T20:30:00.000Z")
+    assert lib.support_identity(old) != lib.support_identity(fresh)
+    assert old.observation_id == fresh.observation_id
+    merged = lib._merged_retained(
+        lib.RetainedLow(18.0, WEEK, WEEK, (old,)), canonical_key=WEEK, low=18.0,
+        observations=(fresh,))
+    assert merged.observations == (fresh,)
+    # An older witness never displaces a later one, and an unchanged one
+    # leaves the record byte-identical.
+    assert lib._merged_retained(merged, canonical_key=WEEK, low=18.0,
+                                observations=(old,)) == merged
+    assert lib._merged_retained(merged, canonical_key=WEEK, low=18.0,
+                                observations=(fresh,)) == merged
+    pending = dataclasses.replace(_pending(low=18, supporters="b", deadline=NOW - 1),
+                                  retained=merged)
+    got = _reduce_refuting([], _db_axis(51), pending, {lib.support_identity(old)})
+    assert (got.action, got.candidate.percent) == ("PUBLISH_DB", 18.0)
+    # Bounded growth: a thousand responses at one reading keep one support.
+    retained = merged
+    for i in range(1000):
+        retained = lib._merged_retained(
+            retained, canonical_key=WEEK, low=18.0, observations=(_witnessed(
+                "b", low=18, instant=f"2026-10-29T21:{i // 60:02d}:{i % 60:02d}.000Z"),))
+    assert len(retained.observations) == 1
+
+
+def test_proof_work_covers_drop_rise_and_floor_retired_readings():
+    """L9 coverage predicate (spec 4.4, P-R3, P-R4; accuracy: an unproven
+    stale reading published as "no proof" over an uncovered projection):
+    a reading below or above the same window's baseline is proof work, an
+    equal one is not; on a floor-retired axis (no baseline) a reading
+    received at or after the floor is work (a potential first post-floor
+    publication) and one received before it is not; retained support and an
+    unappended plan always are."""
+    import _cctally_statusline as sl
+    base = _db_axis(50)
+
+    def work(percent, received=NOW):
+        return sl._DropWork(frozenset({("sevenDay", WEEK, float(percent), received)}))
+
+    assert work(18).needs_samples(WEEK, base)
+    assert work(74).needs_samples(WEEK, base)
+    assert not work(50).needs_samples(WEEK, base)
+    assert not work(74).needs_samples(WEEK + 7 * 86400, base)
+    assert work(74).needs_samples(WEEK, None, NOW - 50)
+    assert work(74, received=NOW - 50).needs_samples(WEEK, None, NOW - 50)
+    assert not work(74, received=NOW - 51).needs_samples(WEEK, None, NOW - 50)
+    assert not work(74).needs_samples(WEEK, None, None)
+    assert sl._DropWork(retained=True).needs_samples(None, None)
+    assert sl._DropWork(plan=True).needs_samples(None, None)

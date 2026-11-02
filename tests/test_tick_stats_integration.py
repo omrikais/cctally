@@ -439,6 +439,41 @@ def test_one_refresh_writes_exactly_one_record(
         "the nested partial opened a standalone context inside a live tick")
 
 
+@pytest.mark.parametrize("outcome", ["finalized", "raised"])
+def test_each_refresh_reports_its_accounting_census_to_write_io(
+    small_corpus, monkeypatch, tmp_path, outcome,
+):
+    """#939 D5. Detects: an accounting tick the admission hold never hears
+    about (conversation passes would never count, a permanent hold), or a tick
+    that failed before finalizing reported as census-complete (passes would
+    count before accounting caught up)."""
+    import _lib_write_io as wio
+    bbf = _load_build_bench()
+    corpus = _private_corpus(small_corpus, tmp_path)
+    ticks = []
+    monkeypatch.setattr(wio, "observe_accounting_tick",
+                        lambda **kw: ticks.append(kw))
+
+    def before(cctally, _tui):
+        if outcome == "raised":
+            frontier_mod = cctally._load_sibling("_lib_ingest_frontier")
+
+            def explode(*_a, **_k):
+                raise RuntimeError("injected before finalization")
+            monkeypatch.setattr(frontier_mod, "provider_sync_certifiable",
+                                explode)
+
+    _run_refresh(corpus, bbf, monkeypatch=monkeypatch, before=before)
+    assert len(ticks) == 1
+    (tick,) = ticks
+    assert isinstance(tick["ended_ns"], int)
+    if outcome == "finalized":
+        assert tick["census_complete"] is True
+        assert set(tick["residuals"]) == {"claude", "codex"}
+    else:
+        assert tick["census_complete"] is False
+
+
 def test_refresh_retains_bounded_ingest_and_final_build_phase_trees(
     small_corpus, monkeypatch, tmp_path,
 ):

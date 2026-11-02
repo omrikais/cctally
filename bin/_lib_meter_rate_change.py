@@ -156,6 +156,16 @@ class RateChangeTransition:
     #: status. Folding it into `withholding_status` is rejected: it would make
     #: an otherwise healthy successor read as currently withheld.
     baseline_withheld_days: "int | None" = None
+    #: #1015 spec 5.7: the frozen `transitionLineage` the detecting reduction
+    #: wrote on the successor regime (the union of both sides' dependency
+    #: windows and the detector coverage, the scope, the basis, the
+    #: descriptor and its digest), or None for a transition with no lineage
+    #: (the owed sweep's identity-only descriptor, a legacy path). It is not
+    #: part of `identity()`, not compared, and never reaches the v1 payload,
+    #: which stays byte-frozen; a version-2 payload journals it as
+    #: `fit_lineage`.
+    fit_lineage: "dict | None" = dataclasses.field(default=None,
+                                                   compare=False)
 
     def identity(self) -> tuple:
         """The §6.3 key: `(provider, account identity, effectiveFrom)`.
@@ -413,6 +423,11 @@ def event_payload_v2(transition: RateChangeTransition, *,
     payload["detector_input_causes"] = transition.detector_input_causes
     payload["composition_provenance"] = transition.composition_provenance
     payload["baseline_withheld_days"] = transition.baseline_withheld_days
+    if transition.fit_lineage is not None:
+        # #1015 spec 5.7: only a newly emitted event carries the lineage, and
+        # only when one was frozen at detection. A key absent rather than
+        # null keeps every pre-#1015 v2 payload byte-identical.
+        payload["fit_lineage"] = transition.fit_lineage
     return payload
 
 
@@ -455,6 +470,63 @@ def rate_change_ratio(transition: RateChangeTransition) -> "float | None":
     if transition.previous_units_per_point <= 0.0:
         return None
     return transition.new_units_per_point / transition.previous_units_per_point
+
+
+def active_pair_among(regimes, keep) -> "tuple | None":
+    """The `(predecessor, successor)` pair `active_rate_change` reads over
+    ``[r for r in regimes if keep(r)]``, or None — asking ``keep`` lazily,
+    newest start first, and only about regimes that can decide the answer
+    (#1015 R6: a lineage assessment per regime is not free, and a closed
+    regime far behind the active pair never decides the marker).
+
+    It restates `_adjacent_pairs` and `active_rate_change` exactly. At each
+    start instant, newest first, that some regime starting there leaves
+    open: the predecessor is the FIRST kept, non-stale regime (in list
+    order) closing at that instant; the pair's successor is the LAST kept
+    regime starting there that is not that predecessor and shares its
+    fingerprint and coefficient era. The newest start whose successor is
+    open is the active pair. ``keep`` is called at most once per regime.
+    """
+    kept: dict = {}
+
+    def keeps(regime) -> bool:
+        if id(regime) not in kept:
+            kept[id(regime)] = bool(keep(regime))
+        return kept[id(regime)]
+
+    regimes = [r for r in (regimes or ()) if isinstance(r, dict)]
+    starts: dict = {}
+    for regime in regimes:
+        start = _instant(regime.get("effectiveFrom"))
+        if start is not None:
+            starts.setdefault(start, []).append(regime)
+    for start in sorted(starts, reverse=True):
+        candidates = starts[start]
+        if not any(r.get("effectiveUntil") in (None, "") for r in candidates):
+            continue
+        predecessor = None
+        for regime in regimes:
+            if str(regime.get("status") or "") == "stale":
+                continue
+            if _instant(regime.get("effectiveUntil")) == start \
+                    and keeps(regime):
+                predecessor = regime
+                break
+        if predecessor is None:
+            continue
+        for regime in reversed(candidates):
+            if regime is predecessor:
+                continue
+            if predecessor.get("fingerprint") != regime.get("fingerprint") \
+                    or predecessor.get("coefficientEra") \
+                    != regime.get("coefficientEra"):
+                continue
+            if not keeps(regime):
+                continue
+            if regime.get("effectiveUntil") in (None, ""):
+                return predecessor, regime
+            break
+    return None
 
 
 def active_rate_change(regimes) -> "dict | None":

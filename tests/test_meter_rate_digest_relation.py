@@ -228,3 +228,71 @@ def test_a_notified_at_only_change_does_not_move_the_digest(ns, provider, index)
     finally:
         stats.close()
     assert before == after
+
+
+# --------------------------------------------------------------------------
+# #1015 spec 5.4/5.7: the supersession rows ride the same alert relation
+# --------------------------------------------------------------------------
+# A supersession relabels a published rate-change row ("superseded by a
+# correction") without touching `meter_rate_change_events`, so without its own
+# relation an explicit supersession event would leave both provider digests,
+# and therefore `data_version` and the provider reuse identity, unchanged.
+SUPERSESSION_COLUMNS = (
+    "provider",
+    "account_key",
+    "effective_from",
+    "reason",
+    "corrections",
+    "superseded_at_utc",
+    "created_at_utc",
+)
+
+
+@pytest.mark.parametrize("relations,expected_filter", [
+    (sources._CLAUDE_STATS_DIGEST_RELATIONS, "provider='claude'"),
+    (sources._CODEX_STATS_DIGEST_RELATIONS, "provider='codex'"),
+])
+def test_1015_both_registries_carry_the_supersession_relation(
+    relations, expected_filter,
+):
+    query = _relation(relations, "meter_rate_change_supersessions")
+    assert query is not None, (
+        "the registry does not list meter_rate_change_supersessions")
+    assert expected_filter in query, query
+    selected = query.split(" FROM ")[0][len("SELECT "):]
+    assert tuple(part.strip() for part in selected.split(",")) == (
+        SUPERSESSION_COLUMNS)
+    assert "ORDER BY" in query, query
+
+
+def _seed_supersession(conn, *, provider,
+                       effective_from="2026-09-01T00:00:00Z"):
+    conn.execute(
+        "INSERT INTO meter_rate_change_supersessions "
+        "(provider, account_key, effective_from, reason, corrections, "
+        " superseded_at_utc, created_at_utc) "
+        "VALUES (?, 'unattributed', ?, 'reviewed-correction', "
+        "        '[{\"observations\":1,\"opId\":\"op-1\"}]', "
+        "        '2026-09-02T00:00:00Z', '2026-09-02T00:00:00Z')",
+        (provider, effective_from),
+    )
+
+
+@pytest.mark.parametrize("provider,index", [("claude", 0), ("codex", 1)])
+def test_1015_an_isolated_supersession_insert_moves_that_providers_digest(
+    ns, provider, index,
+):
+    """Detects a superseded rate change whose dashboard label never appears:
+    the explicit event moves no other relation the digest reads."""
+    stats = ns["open_db"]()
+    try:
+        _seed_rate_change(stats, provider=provider)
+        stats.commit()
+        before = _digests(stats)
+        _seed_supersession(stats, provider=provider)
+        stats.commit()
+        after = _digests(stats)
+    finally:
+        stats.close()
+    assert before[index] != after[index]
+    assert before[1 - index] == after[1 - index]

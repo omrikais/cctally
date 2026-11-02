@@ -476,8 +476,13 @@ def test_41_five_hour_suppression_keeps_accepted_weekly_evidence(
     assert (kept["five_hour_percent"], kept["five_hour_resets_at"],
             kept["five_hour_window_key"]) == (None, None, None), (
         f"the stale replica's five-hour effect was not retired: {kept}")
+    # #943: the band starts at the arming capture (NOW + 60), so no stale
+    # 70 survives from there on, while the genuine 70 captured at NOW, before
+    # the descent was observed, keeps its five-hour reading.
     assert not [r for r in rows if r["five_hour_percent"] == 70.0
-                and r["captured_at_utc"] >= _iso(NOW)], rows
+                and r["captured_at_utc"] >= _iso(NOW + 60)], rows
+    assert [r["five_hour_percent"] for r in rows
+            if r["captured_at_utc"] == _iso(NOW)] == [70.0], rows
     live_view = _weekly_view(app, account, last + 10)
     assert live_view == (21.0, NOW + 120, 20.0), live_view
 
@@ -566,8 +571,11 @@ def test_42_each_observation_keeps_its_recorded_fold_policy(
     fix round K15 a five-hour credit's cleanup retires the stale replica in
     place under every policy, so the historical fold's latest row is that
     retired replica, which carries no five-hour reading, and the historical
-    fold too writes the first post-floor reading. A real rebuild and a real
-    rederive reproduce each history's own decisions."""
+    fold too writes the first post-floor reading. #943: the band starts at
+    the arming capture (+610), so the genuine 80 captured at +608 inside the
+    slot is kept rather than retired, and the post-credit clamp, floored at
+    that boundary, does not raise the 20. A real rebuild and a real rederive
+    reproduce each history's own decisions."""
     if history == "unversioned":
         _unversioned(monkeypatch)
     if schedule == "cross_key":
@@ -590,8 +598,10 @@ def test_42_each_observation_keeps_its_recorded_fold_policy(
     else:
         post_floor = _post_floor_five_hour_rows(app, account)
         assert [(r["captured_at_utc"], r["five_hour_percent"])
-                for r in post_floor] == [(_iso(NOW + 612), 20.0)], (
-            "the first post-floor reading was not written: "
+                for r in post_floor] == [(_iso(NOW + 608), 80.0),
+                                         (_iso(NOW + 612), 20.0)], (
+            "the genuine pre-boundary 80 was not kept or the first "
+            "post-floor reading was not written: "
             f"{_rows(app, account)}")
     # An unversioned observation recorded by the CURRENT binary is an
     # artificial history (production stamps every new observation with

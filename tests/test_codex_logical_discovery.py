@@ -22,6 +22,7 @@ import _lib_codex_rollout_container as rc  # noqa: E402
 
 UUID = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0001"
 NAME = f"rollout-2026-07-20T10-00-00-{UUID}.jsonl"
+ARCH_NAME = f"rollout-2026-07-20T11-30-00-{UUID[:-1]}9.jsonl"
 
 
 @pytest.fixture
@@ -98,6 +99,17 @@ def test_targeted_qualification_takes_either_spelling_and_refuses_escapes(
     qualified = _cc()._qualify_codex_targets({str(zst), str(escaped)})
     # 92e06df85 drops every non-`.jsonl` suffix, so the compressed target is lost.
     assert [str(d.source_path) for d in qualified] == [str(plain)]
+    # #970 spec 5.8: an archive spelling is normalized to its dated logical
+    # path; an archived link escaping the sessions/archive union is refused.
+    archive = _provider / "archived_sessions"
+    archived = archive / ARCH_NAME
+    write_rollout(archived, token_records(2, session_id="s3"))
+    archived_zst = compress_in_place(archived)
+    escaping = archive / ("rollout-2026-07-20T12-00-00-" + UUID + ".jsonl.zst")
+    escaping.symlink_to(outside.with_name(outside.name + ".zst"))
+    qualified = _cc()._qualify_codex_targets({str(archived_zst), str(escaping)})
+    assert [str(d.source_path) for d in qualified] == [str(day / ARCH_NAME)]
+    assert qualified[0].container_location == rc.ARCHIVE
 
 
 def test_filename_facts_are_identical_for_both_spellings(env):
@@ -166,9 +178,15 @@ def test_full_discovery_accepts_outside_file_links_and_ignores_archives(
     (day / ("z-alias.jsonl.zst" if compressed else "z-alias.jsonl")).symlink_to(target)
     archived = provider / "archived_sessions" / NAME
     write_rollout(archived, token_records(1, session_id="archive"))
+    # #970 (SR-09): the same-basename archive stays suppressed (sessions wins),
+    # while a distinct archived rollout is now included under its dated path.
+    distinct = provider / "archived_sessions" / ARCH_NAME
+    write_rollout(distinct, token_records(1, session_id="archive-distinct"))
     if discovery == "files":
         found = _cc()._discover_codex_files_with_roots()
-        assert [f.source_path for f in found] == [walked]
+        assert [f.source_path for f in found] == [walked, day / ARCH_NAME]
+        assert found[1].container_path == distinct
+        assert found[1].physical_path == day.resolve() / ARCH_NAME
         assert found[0].physical_path == outside.resolve()
         assert found[0].container_path == link
         assert found[0].container_kind == (rc.ZSTD if compressed else rc.PLAIN)
@@ -177,6 +195,10 @@ def test_full_discovery_accepts_outside_file_links_and_ignores_archives(
             found[0].source_root_key, str(outside.resolve()))
     else:
         assert list(_cc()._iter_codex_jsonl_paths([provider / "sessions"])) == [walked]
+        # #970 spec 5.9: the direct fallback sees the archive through the
+        # provider locations, under the same dated identity.
+        assert list(_cc()._iter_codex_jsonl_paths(
+            _cc()._codex_home_locations())) == [walked, day / ARCH_NAME]
     assert _cc()._qualify_codex_targets({str(link)}) == []
 
 
@@ -200,3 +222,63 @@ def test_full_discovery_keeps_identity_fallback_but_targeted_refuses_escape(
     else:
         assert list(_cc()._iter_codex_jsonl_paths([provider / "sessions"])) == [walked]
     assert _cc()._qualify_codex_targets({str(walked)}) == []
+
+
+def test_archive_discovery_is_flat_and_skips_unmapped(env):
+    """#970 G4: the archive directory is globbed flat; a nested file is never
+    a rollout, and an unmappable name never mints an archive-path identity
+    (which would count it under a wrong key) but is counted so the census
+    can report partial coverage."""
+    ns, provider, day = env
+    archive = provider / "archived_sessions"
+    write_rollout(archive / ARCH_NAME, token_records(1, session_id="flat"))
+    write_rollout(archive / "nested" / NAME, token_records(1, session_id="nested"))
+    write_rollout(archive / "not-a-rollout.jsonl", token_records(1, session_id="bad"))
+    skipped = {}
+    found = _cc()._discover_codex_files_with_roots(skipped=skipped)
+    assert [f.source_path for f in found] == [day / ARCH_NAME]
+    assert skipped == {"archive-unmapped": 1}
+
+
+def test_direct_directory_root_gets_no_archive(tmp_path, monkeypatch):
+    """#970 G1/A7: a configured directory with neither `sessions/` nor
+    `archived_sessions/` keeps today's direct walk and identities, so a direct
+    configuration is never re-keyed by archive support."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    logs = tmp_path / "logs"
+    write_rollout(logs / NAME, token_records(1, session_id="direct"))
+    monkeypatch.setenv("CODEX_HOME", str(logs))
+    roots = _cc()._codex_provider_roots()
+    assert [(r.walk_root, r.archive_root) for r in roots] == [(logs, None)]
+    found = _cc()._discover_codex_files_with_roots()
+    assert [f.source_path for f in found] == [logs / NAME]
+    assert found[0].physical_path == (logs / NAME).resolve()
+
+
+def test_cache_module_has_no_unwrapped_selection():
+    """#970 review focus: every cache-side container selection must pass
+    through the root-aware wrapper. A direct leaf call misses the archive
+    location, so an archived rollout would be omitted from ingestion or read
+    as absent and its history deleted. Static check of that safety seam."""
+    import ast
+    source = (REPO_ROOT / "bin" / "_cctally_cache.py").read_text()
+    allowed = {"_select_codex_container", "_probe_codex_containers"}
+    offenders = []
+
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name if owner is None else owner)
+                continue
+            if (isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "_rc"
+                    and child.func.attr in {"select_container", "probe_containers"}
+                    and owner not in allowed):
+                offenders.append((owner, child.lineno))
+            visit(child, owner)
+
+    visit(ast.parse(source), None)
+    assert offenders == []

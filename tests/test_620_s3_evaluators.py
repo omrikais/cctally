@@ -265,12 +265,10 @@ def test_claude_candidate_sessions_reuse_the_accounting_population(
     try:
         sources._establish(scope, bundle)
         bundle.claude_window_sessions = None
-        conn = sources.open_read_only("conversations")
-        try:
-            monkeypatch.setattr(sources, "_execute", _spy)
-            sources._evaluate_cache_churn(scope, bundle, conn)
-        finally:
-            conn.close()
+        # #1000: conversations opens only under the bundle's read admission.
+        conn = bundle.connection("conversations")
+        monkeypatch.setattr(sources, "_execute", _spy)
+        sources._evaluate_cache_churn(scope, bundle, conn)
     finally:
         bundle.close()
     assert body_params, "non-vacuity: seed/window body statements must run"
@@ -741,6 +739,57 @@ def test_unknown_capacity_lowers_evaluability_and_never_fabricates_a_fraction(
     facts = _class_facts("short_high_context")
     assert kernel.GAP_UNKNOWN_CONTEXT_WINDOW in facts.population.gap_codes
     assert facts.population.evaluability_coverage < 1.0
+
+
+# #1002: current-generation capacities come from the corrected status-line
+# fallback — Fable 5.1 and Opus 5.5 run in a 1,000,000-token window.
+FABLE_5_1 = "claude-fable-5-1"
+OPUS_5_5 = "claude-opus-5-5"
+
+
+def test_a_fable_request_just_below_the_floor_is_evaluated_and_not_qualifying(
+        tmp_path, monkeypatch):
+    """Detects Fable staying `unknown_context_window` (unevaluable) instead
+    of being measured against its 1M window: 799,999 / 1,000,000 sits just
+    below the 0.80 floor."""
+    ns = _stores(tmp_path, monkeypatch)
+    _seed_context_conversation(ns, session="sess-fable", humans=2,
+                               replies=[(799_999, 0, 0)], model=FABLE_5_1)
+    facts = _class_facts("short_high_context")
+    assert facts.predicate_evaluated is True
+    assert kernel.GAP_UNKNOWN_CONTEXT_WINDOW not in facts.population.gap_codes
+    assert facts.population.evaluability_coverage == 1.0
+    assert facts.evidence["conversationCount"].value == 0
+    assert facts.subjects == ()
+
+
+def test_a_fable_request_at_the_floor_qualifies_at_exactly_its_1m_fraction(
+        tmp_path, monkeypatch):
+    """Detects a Fable conversation carrying 80% of its 1M window being
+    missed (unknown capacity) or measured against the wrong window."""
+    ns = _stores(tmp_path, monkeypatch)
+    _seed_context_conversation(ns, session="sess-fable", humans=2,
+                               replies=[(800_000, 0, 0)], model=FABLE_5_1)
+    facts = _class_facts("short_high_context")
+    assert kernel.GAP_UNKNOWN_CONTEXT_WINDOW not in facts.population.gap_codes
+    assert facts.evidence["conversationCount"].value == 1
+    assert abs(facts.evidence["maxContextWindowFraction"].value - 0.8) < 1e-9
+    assert facts.population.evaluability_coverage == 1.0
+    assert len(facts.subjects) == 1
+    assert facts.subjects[0].subject_key == kernel.SUBJECT_SHORT_HIGH_CONTEXT
+
+
+def test_an_opus_5_5_request_is_measured_against_its_1m_window(
+        tmp_path, monkeypatch):
+    """Detects a 200K denominator for a current-generation request: 300,000
+    tokens is 0.30 of Opus 5.5's 1M window, not a qualifying 1.5."""
+    ns = _stores(tmp_path, monkeypatch)
+    _seed_context_conversation(ns, session="sess-opus55", humans=2,
+                               replies=[(300_000, 0, 0)], model=OPUS_5_5)
+    facts = _class_facts("short_high_context")
+    assert facts.predicate_evaluated is True
+    assert facts.evidence["conversationCount"].value == 0
+    assert facts.subjects == ()
 
 
 def test_a_conversation_exhausting_its_normalize_budget_is_unevaluable(

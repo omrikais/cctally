@@ -362,6 +362,39 @@ def test_a_dedupe_skip_returns_before_validation(jr, monkeypatch):
     assert jr.append_record(_quota_obs(), dedupe_codex_quota=True) is None
 
 
+def test_rollover_dir_fsync_precedes_index_key(jr, monkeypatch):
+    """#977 C0: the index key of an observation that opens a new segment is
+    made durable only after that segment's directory entry is. In the other
+    order a power loss can keep the key and lose the segment, and every later
+    retry of the observation is then skipped as already journaled."""
+    jr.append_record(_quota_obs(0), now_utc=JANUARY, dedupe_codex_quota=True)
+    journal_dir = jr._cctally_core.JOURNAL_DIR
+    events: list[tuple[str, object]] = []
+    real_fsync_dir = jr._fsync_dir
+    real_key_append = jr._append_quota_dedup_key
+
+    def fsync_dir(path):
+        events.append(("dir", pathlib.Path(path)))
+        return real_fsync_dir(path)
+
+    def key_append(natural_key):
+        events.append(("key", natural_key))
+        return real_key_append(natural_key)
+
+    monkeypatch.setattr(jr, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(jr, "_append_quota_dedup_key", key_append)
+
+    segment, _offset = jr.append_record(
+        _quota_obs(1), now_utc=FEBRUARY, dedupe_codex_quota=True)
+
+    assert segment == FEB_SEGMENT
+    assert ("dir", journal_dir) in events
+    assert [kind for kind, _ in events].count("key") == 1
+    assert events.index(("dir", journal_dir)) < next(
+        index for index, (kind, _) in enumerate(events) if kind == "key"), (
+        "the index key became durable before the new segment's directory entry")
+
+
 def test_the_quota_caller_reraises_the_refusal_instead_of_swallowing(
     jr, tmp_path, monkeypatch
 ):

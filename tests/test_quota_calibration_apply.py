@@ -407,7 +407,8 @@ def test_apply_in_era_positive_control():
     assert out.consumed_points == pytest.approx(11908.0 / 2000.0)
 
 
-def _write_era_calibration(app_dir, *, era_id, family, effective_from):
+def _write_era_calibration(app_dir, *, era_id, family, effective_from,
+                           family_radius=0.02, fit_family_shares=None):
     import _lib_quota_model as kernel
 
     payload = {
@@ -426,8 +427,9 @@ def _write_era_calibration(app_dir, *, era_id, family, effective_from):
             "qualifications": [],
             "familyShares": {family: 1.0},
             "classShares": dict(_CLASS_SHARES_FRESH),
-            "familyRadius": 0.02,
+            "familyRadius": family_radius,
             "classRadius": 0.05,
+            "fitFamilyShares": fit_family_shares,
         }]}},
     }
     path = app_dir / "quota-calibrations.json"
@@ -559,3 +561,223 @@ def test_population_units_still_skips_an_unknown_token_split():
     assert qm.weigh_entry(split, era).cause == qm.SPLIT_UNKNOWN
     assert qc.population_units([inside, split], era=era) == pytest.approx(
         qm.weighted_units(inside, era))
+
+
+# --------------------------------------------------------------------------
+# #991 spec 4.6 and section 5 test 5: `apply_regime` decides support with the
+# evidence-bounded evaluator, against the regime's own fit-weighted family
+# composition. Every rejection first shows the population is outside the
+# regime's effective family radius, so TV alone cannot have decided it.
+# --------------------------------------------------------------------------
+_O55 = "claude-opus-5-5"
+_S55 = "claude-sonnet-5-5"
+_H55 = "claude-haiku-5-5"
+
+
+def _mixed(units_by_model, day=24):
+    return [_entry(model=model, fresh=fresh, at=_at(day, 3 + i))
+            for i, (model, fresh) in enumerate(units_by_model.items())]
+
+
+def _bounded_regime(**over):
+    base = dict(coefficient_era="opus-5-5", family_shares={_O55: 1.0},
+                family_radius=0.03, class_radius=0.05,
+                fit_family_shares={_O55: 1.0})
+    base.update(over)
+    return _validated(**base)
+
+
+def _family_distance(regime, entries):
+    family, _classes = qm.aggregate_composition(entries, era=OPUS55_ERA)
+    return qm.tv_distance(family, regime.family_shares)
+
+
+OPUS55_ERA = qm.era_by_id("opus-5-5")
+_INTERVAL55 = (_at(23, 0), _at(30, 0))
+
+
+def test_991_a_sonnet_only_shift_outside_the_radius_is_applied():
+    """RED. A consumer week with 5% Sonnet is modelled (E = 0.0455).
+
+    Rejecting it sends the forecast, project attribution and alerts to their
+    fallbacks for a shift the meter evidence bounds within 5%.
+    """
+    regime = _bounded_regime()
+    entries = _mixed({_O55: 950_000, _S55: 50_000})
+    assert _family_distance(regime, entries) > regime.family_radius
+    out = qc.apply_regime(regime, entries, interval=_INTERVAL55)
+    assert isinstance(out, qc.AppliedQuota), out
+    assert out.units == pytest.approx(1_000_000.0)
+    assert out.consumed_points == pytest.approx(1_000_000.0 / 2_000_000.0)
+
+
+def test_991_an_unevidenced_haiku_shift_outside_the_radius_is_rejected():
+    regime = _bounded_regime()
+    entries = _mixed({_O55: 950_000, _H55: 50_000})
+    assert _family_distance(regime, entries) > regime.family_radius
+    assert qc.apply_regime(regime, entries, interval=_INTERVAL55) is \
+        qc.ApplyRejection.UNSUPPORTED_COMPOSITION
+
+
+def test_991_a_regime_without_a_fit_reference_admits_by_radius_only():
+    """A stored regime with no valid `fitFamilyShares` cannot use the bound.
+
+    Its paired control, inside the radius, is still applied.
+    """
+    regime = _bounded_regime(fit_family_shares=None)
+    outside = _mixed({_O55: 950_000, _S55: 50_000})
+    assert _family_distance(regime, outside) > regime.family_radius
+    assert qc.apply_regime(regime, outside, interval=_INTERVAL55) is \
+        qc.ApplyRejection.UNSUPPORTED_COMPOSITION
+    inside = _mixed({_O55: 980_000, _H55: 20_000})
+    assert _family_distance(regime, inside) <= regime.family_radius
+    assert isinstance(qc.apply_regime(regime, inside, interval=_INTERVAL55),
+                      qc.AppliedQuota)
+
+
+
+def test_991_an_overflowing_fit_reference_degrades_to_radius_only(
+        tmp_path, monkeypatch):
+    """A stored `fitFamilyShares` whose finite shares overflow is no reference.
+
+    Detects `math.fsum` raising `OverflowError` out of `validate_regime` and
+    `read_calibration_file` (the forecast's calibrated week detail does not
+    catch that read, and project attribution would drop the whole
+    calibration) instead of keeping the regime with `fit_family_shares=None`:
+    the regime's fit and its TV references stay usable, so a population
+    inside the radius is still applied and one outside it is rejected.
+    """
+    from conftest import load_isolated_cctally_module
+    import _cctally_core
+
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    _write_era_calibration(_cctally_core.APP_DIR, era_id="opus-5-5",
+                           family=_O55,
+                           effective_from=dt.datetime(2026, 9, 1, tzinfo=UTC),
+                           family_radius=0.03,
+                           fit_family_shares={_O55: 1e308, _S55: 1e308})
+    # #1015: the read assesses the regime's lineage against the stats
+    # store's correction facts, so the store must exist (no facts reads as
+    # `calibration-lineage-unavailable`, not as a usable regime).
+    _cctally_core.open_db().close()
+    read = mod._load_sibling("_cctally_quota_calibration") \
+        .read_calibration_file(account_key=None)
+    assert read.regime is not None
+    assert read.regime.fit_family_shares is None
+    inside = _mixed({_O55: 980_000, _H55: 20_000})
+    assert _family_distance(read.regime, inside) <= read.regime.family_radius
+    assert isinstance(
+        qc.apply_regime(read.regime, inside, interval=_INTERVAL55),
+        qc.AppliedQuota)
+    outside = _mixed({_O55: 950_000, _S55: 50_000})
+    assert _family_distance(read.regime, outside) > read.regime.family_radius
+    assert qc.apply_regime(read.regime, outside, interval=_INTERVAL55) is \
+        qc.ApplyRejection.UNSUPPORTED_COMPOSITION
+
+def _bounded_consumer_store(tmp_path, monkeypatch, second_model):
+    """The cross-era store's shape inside the era: 95% Opus 5.5 and 5% of
+    `second_model` by fresh units, and an `opus-5-5` regime fitted on pure
+    Opus 5.5 at the 0.03 floor radius with its fit-weighted q stored."""
+    from conftest import load_isolated_cctally_module
+    from test_projection_basis_selector import _seed_snapshots
+    import _cctally_core
+
+    week_start = dt.datetime(2026, 9, 22, 6, tzinfo=UTC)
+    mod = load_isolated_cctally_module(tmp_path, monkeypatch)
+    conn = _cctally_core.open_db()
+    cache = mod._load_sibling("_cctally_cache").open_cache_db()
+    try:
+        for index, (at, model, fresh) in enumerate((
+                (_at(23, 2), _O55, 19_000_000),
+                (_at(23, 6), second_model, 1_000_000))):
+            cache.execute(
+                "INSERT INTO session_entries(source_path, line_offset,"
+                " timestamp_utc, model, input_tokens, output_tokens,"
+                " cache_create_tokens, cache_create_1h_tokens,"
+                " cache_read_tokens) VALUES (?,?,?,?,?,?,?,?,?)",
+                (f"/fx/991-{index}.jsonl", index, at.isoformat(), model,
+                 fresh, 0, 0, 0, 0))
+        cache.commit()
+    finally:
+        cache.close()
+    now = _at(23, 12)
+    hours = (now - week_start).total_seconds() / 3600.0
+    _seed_snapshots(conn, [(0, 2.0), (hours - 12, 8.0), (hours - 4, 12.0),
+                           (hours, 40.0)], week_start=week_start)
+    _write_era_calibration(_cctally_core.APP_DIR, era_id="opus-5-5",
+                           family=_O55,
+                           effective_from=dt.datetime(2026, 9, 1, tzinfo=UTC),
+                           family_radius=0.03,
+                           fit_family_shares={_O55: 1.0})
+    monkeypatch.setattr(mod, "_sum_cost_for_range", lambda *a, **k: 20.0)
+    return mod, conn, now, week_start
+
+
+@pytest.mark.parametrize("second_model,admitted", [
+    (_S55, True), (_H55, False)], ids=["sonnet-admitted", "haiku-rejected"])
+def test_991_every_consumer_inherits_the_evaluator(
+        tmp_path, monkeypatch, second_model, admitted):
+    """The real `apply_regime` decides forecast consumption, the projected
+    alert, the historical candidate path and project attribution alike.
+
+    20M units at 2M units per point model 10 points consumed after 30 of the
+    week's 168 hours, projected by span over elapsed to 10 * 168 / 30 = 56;
+    the alert path must receive exactly the forecast's value. A consumer that kept the
+    old radius rule, or a stub, would disagree on the admitted week.
+    """
+    import _lib_forecast as fc
+
+    mod, conn, now, week_start = _bounded_consumer_store(
+        tmp_path, monkeypatch, second_model)
+    week_end = week_start + dt.timedelta(days=7)
+    read = mod._load_sibling("_cctally_quota_calibration") \
+        .read_calibration_file(account_key=None)
+    assert read.regime is not None
+    assert read.regime.fit_family_shares == {_O55: 1.0}
+    forecast = mod._load_sibling("_cctally_forecast")
+    entries = forecast._week_entry_records(week_start, now, account_key=None)
+    family, _ = qm.aggregate_composition(entries, era=OPUS55_ERA)
+    assert qm.tv_distance(family, read.regime.family_shares) > \
+        read.regime.family_radius
+    try:
+        inputs = mod._load_forecast_inputs(conn, now, skip_sync=True)
+        selection = fc.select_projection_basis(inputs)
+        projected = mod._weekly_pct_week_avg_projection(conn, now)
+    finally:
+        conn.close()
+    assert projected is not None
+    assert projected[0] == pytest.approx(selection.value, abs=1e-9)
+    candidate = forecast._dpp_candidate_comparability(
+        read.regime, week_start, week_end, account_key=None)
+    project = mod._load_sibling("_cctally_project")
+
+    class _Joined:
+        input_tokens = 0
+        output_tokens = 0
+        cache_creation_tokens = 0
+        cache_read_tokens = 0
+        cache_1h_tokens = 0
+
+    records = []
+    for model, fresh, at in ((_O55, 19_000_000, _at(23, 2)),
+                             (second_model, 1_000_000, _at(23, 6))):
+        row = _Joined()
+        row.model, row.input_tokens, row.timestamp = model, fresh, at
+        records.append(project._entry_quota_record(row)[0])
+    attribution = project.resolve_week_attribution(
+        read.regime, records, week_start=week_start, week_end=week_end)
+    if admitted:
+        expected = 10.0 * 168.0 / 30.0
+        assert inputs.calibrated_withheld_code is None
+        assert inputs.calibrated_projection_pct == pytest.approx(expected)
+        assert selection.basis is fc.ProjectionBasis.CALIBRATED
+        assert selection.value == pytest.approx(expected)
+        assert candidate == "comparable"
+        assert attribution.basis == "modelled"
+    else:
+        assert inputs.calibrated_projection_pct is None
+        assert inputs.calibrated_withheld_code == "unsupported-composition"
+        assert selection.basis is not fc.ProjectionBasis.CALIBRATED
+        assert candidate == "incomparable"
+        assert attribution.basis == "cost-share"
+        assert attribution.cause == "unsupported-composition"

@@ -519,9 +519,16 @@ def test_688_the_gather_forwards_the_status_on_the_active_shape(ns):
                  "status": WITHHELD_STATUS, "unitsPerPoint": 1_665_096.0},
             ]
 
+    calibration = ns["_load_sibling"]("_cctally_quota_calibration")
+    # #1015 spec 5.6: the gather assesses the regimes against the published
+    # correction facts, so a current stats index must exist to read them.
+    ns["open_db"]().close()
+
     class _Ctx:
         @staticmethod
         def _load_sibling(name):
+            if name == "_cctally_quota_calibration":
+                return calibration
             return mrc if name == "_lib_meter_rate_change" else _Glue
 
     got = gd._gather_quota_rate_change(_Ctx)

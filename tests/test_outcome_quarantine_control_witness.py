@@ -1,16 +1,16 @@
-"""#825/#832 fix round B: the control witness, certificate revocation by a
-current journal-repair acknowledgement, the planned five-hour key bound, and
-the OAuth writer's legacy-spool rescan.
+"""#825/#832 fix round B, rewritten for #948 (spec 6.4, 6.9): the control
+witness, revocation by a current journal-repair acknowledgement, the planned
+five-hour key bound, and the OAuth writer's legacy-spool rescan.
 
 * Q6 / P3-2: only an admitted, current-stamped `record-usage` Claude reading
   of payload source `api` whose validated binding names its effective account
-  with valid credential evidence, carrying both raw axes and no statusline
-  publication, projection, retained-low or reviewed hold, witnesses control in
-  the journal; drop eligibility and doctor's "control recovered" claim also
-  require the account's reconciled transition to record
-  `authorityCommit == observation.id`.
-* P2-1: a `db journal-repair` acknowledgement the current binary emits
-  (`journal_protocol_resolution_v2`) revokes every accounting certificate.
+  with valid credential evidence, observing the axis, and carrying no
+  statusline publication, projection, retained-low or reviewed hold, is the
+  journal half of an authority completion. Since #948 only the authoritative
+  OAuth writer appends the completion, after its reconciliation committed;
+  no selected-state `authorityCommit` link gates anything (BV1).
+* P2-1: a `db journal-repair` acknowledgement the current binary emits is
+  administrative and revokes every released axis.
 * P3-5: a planned five-hour key more than 1,800 s from the raw reset is not
   honored (the recording pipeline rejects it too).
 * P3-3: the authoritative OAuth writer rescans the legacy spool before its
@@ -39,22 +39,6 @@ def _key(name):
     return _lib_accounts.account_key("claude", name)
 
 
-def _status(app, name="A"):
-    import _cctally_quarantine as G
-    conn = app.open_db()
-    try:
-        return G.account_status(conn, _key(name))
-    finally:
-        conn.close()
-
-
-def _doctor_rows():
-    import _cctally_doctor
-    data = _cctally_doctor._gather_outcome_quarantine()
-    assert data["available"], data
-    return {row["account"]: row for row in data["accounts"]}
-
-
 def _journal_records():
     import _cctally_core as core
     import _cctally_journal as jr
@@ -72,50 +56,44 @@ def _journal_records():
 # Q6 / P3-2: the control witness predicate
 # --------------------------------------------------------------------------
 
-def test_a_cli_api_reading_does_not_certify_control(app, monkeypatch):
-    """The CLI adapter captures its binding WITHOUT credential evidence, so
-    an `api`-labelled reading it records is an accounting witness only: the
-    control certificate stays withheld and doctor keeps the control row."""
+def test_a_cli_api_reading_covers_nothing(app, monkeypatch):
+    """The CLI adapter captures its binding WITHOUT credential evidence and
+    is not the OAuth writer, so an `api`-labelled reading it records appends
+    no completion: the witness that follows releases nothing."""
     T.run_steps(app, monkeypatch, F14.PREFIX + [F14.TRIGGER])
-    T.set_clock(monkeypatch, "2026-10-12T13:00:00Z")
+    T.set_clock(monkeypatch, "2026-10-09T10:10:00Z")
     T.identity("A")
     args = argparse.Namespace(
-        percent=20, resets_at=str(T.epoch(F14.W_END)), five_hour_percent=70,
-        five_hour_resets_at=str(T.epoch(F14.W_FIVE)), source="api")
+        percent=31, resets_at=str(T.epoch(F14.E0)), five_hour_percent=41,
+        five_hour_resets_at=str(T.epoch(F14.F0)), source="api")
     assert app.cmd_record_usage(args, nudge_dashboard=False) == 0
-    status = _status(app)
-    assert status["accounting"] is True, "non-vacuity: it is a valid witness"
-    assert status["control"] is False
-    row = _doctor_rows()[_key("A")]
-    assert row["controlPaused"] is True
-    assert row["accountingPaused"] is False
+    T.run_steps(app, monkeypatch, [F14.WITNESS])
+    assert T.ops_of_kind("outcome_authority_completion") == []
+    assert T.ops_of_kind("outcome_axis_release") == []
+    assert T.account_quarantined(app, "A")
 
 
-def test_a_credential_bound_reading_without_the_reconciled_commit_keeps_the_doctor_row(
+def test_a_credential_bound_direct_reading_is_not_authority_but_oauth_is(
         app, monkeypatch):
-    """The journal half alone is not control recovery: until a reconciled
-    authoritative transition records `authorityCommit` equal to the witness,
-    doctor still reports drop detection as paused. The authoritative OAuth
-    publication then completes it."""
-    import _cctally_statusline as sl
+    """A credential-bound reading recorded outside the OAuth writer is a
+    valid control witness in the journal, yet no reconciliation committed for
+    it, so it covers nothing. The authoritative OAuth publication covers, and
+    the next fresh-period entry is then released."""
+    import _cctally_quarantine as G
     T.run_steps(app, monkeypatch, F14.PREFIX + [F14.TRIGGER])
-    T.run_steps(app, monkeypatch, [cur("2026-10-12T13:00:00Z", 20, five=70,
+    T.run_steps(app, monkeypatch, [cur("2026-10-09T10:10:00Z", 31,
+                                       end=F14.E0, five=41, five_end=F14.F0,
                                        credential="token-A")])
-    assert _status(app)["control"] is True, "the journal half holds"
-    row = _doctor_rows()[_key("A")]
-    assert row["controlPaused"] is True
-    assert row["accountingPaused"] is False
-    T.set_clock(monkeypatch, "2026-10-12T13:01:00Z")
-    T.identity("A")
-    args = argparse.Namespace(
-        percent=20, resets_at=str(T.epoch(F14.W_END)), five_hour_percent=71,
-        five_hour_resets_at=str(T.epoch(F14.W_FIVE)), source="api")
-    result = sl._authoritative_record_usage(
-        args, ("sevenDay", "fiveHour"),
-        binding=sl._capture_binding(credential="token-A"),
-        nudge_dashboard=False)
-    assert result.status == "ok", result
-    assert _key("A") not in _doctor_rows()
+    direct = [rec for rec in _journal_records()
+              if (rec.get("payload") or {}).get("captured_at")
+              == "2026-10-09T10:10:00Z"]
+    assert direct and G.is_control_witness(direct[-1])
+    assert T.ops_of_kind("outcome_authority_completion") == []
+    T.run_steps(app, monkeypatch, [F14.COVER])
+    [completion] = T.ops_of_kind("outcome_authority_completion")
+    assert completion["payload"]["axes"] == ["sevenDay", "fiveHour"]
+    T.run_steps(app, monkeypatch, [F14.WITNESS])
+    assert not T.account_quarantined(app, "A")
 
 
 def _witness_record(**overrides):
@@ -158,8 +136,11 @@ def test_the_witness_predicate_clauses():
     tampered = dict(good["payload"]["account_binding"], email="x@example.test")
     assert not G.is_control_witness(
         _witness_record(payload={"account_binding": tampered}))
-    assert not G.is_control_witness(
-        _witness_record(payload={"five_hour_percent": None}))
+    # Axis-aware: a reading without five-hour values witnesses weekly only.
+    weekly_only = _witness_record(payload={"five_hour_percent": None})
+    assert not G.is_control_witness(weekly_only)
+    assert G.is_control_witness(weekly_only, axis="sevenDay")
+    assert not G.is_control_witness(weekly_only, axis="fiveHour")
     assert not G.is_control_witness(
         _witness_record(payload={"weekly_percent": "high"}))
     assert not G.is_control_witness(
@@ -202,15 +183,18 @@ def _cli(app, capsys, argv):
     return rc, capsys.readouterr().out
 
 
-def test_a_real_journal_repair_acknowledgement_revokes_accounting(
+def test_a_real_journal_repair_acknowledgement_revokes_the_release(
         app, monkeypatch, capsys):
     import _cctally_journal as jr
     import _lib_journal as J
     T.run_steps(app, monkeypatch, F14.PREFIX + [F14.TRIGGER])
-    T.set_clock(monkeypatch, "2026-10-11T00:00:00Z")
+    # The conflicting batch lands BEFORE the coverage: an admitted
+    # administrative record voids every coverage that precedes it (spec 6.9),
+    # so only an acknowledgement after the release is what revokes it here.
+    T.set_clock(monkeypatch, "2026-10-09T10:07:00Z")
     jr.append_records(_invalid_marker_conflict())
     T.ingest(app)
-    T.run_steps(app, monkeypatch, [F14.WITNESS])
+    T.run_steps(app, monkeypatch, [F14.COVER, F14.WITNESS])
     assert not T.account_quarantined(app, "A"), "non-vacuity: A recovered"
     rc, out = _cli(app, capsys, ["db", "journal-repair", "--json"])
     assert rc == 0, out
@@ -221,7 +205,7 @@ def test_a_real_journal_repair_acknowledgement_revokes_accounting(
     assert json.loads(out)["status"] == "applied"
     kinds = [(r.get("payload") or {}).get("kind") for r in _journal_records()]
     assert J.PROTOCOL_RESOLUTION_KINDS & set(kinds) == {
-        "journal_protocol_resolution_v3"}
+        "journal_protocol_resolution_v4"}
     assert T.account_quarantined(app, "A")
 
 
@@ -243,11 +227,11 @@ def test_a_planned_key_far_from_the_raw_reset_is_not_honored():
     near = G.reading_from_record(_witness_record(payload={
         "five_hour_window_key": raw - 1800}))
     assert near.five_hour_key == raw - 1800
-    assert near.ineligible_reason is None
+    assert "fiveHour" in near.eligible_axes
     far = G.reading_from_record(_witness_record(payload={
         "five_hour_window_key": raw + 1801}))
     assert far.five_hour_key == raw - raw % 600
-    assert far.ineligible_reason is not None
+    assert "fiveHour" not in far.eligible_axes
     assert not G.is_control_witness(_witness_record(payload={
         "five_hour_window_key": raw + 1801}))
 

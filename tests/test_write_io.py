@@ -563,3 +563,457 @@ def test_a_fork_while_another_thread_samples_leaves_the_child_able_to_sample():
         9: "the child inherited the parent's timeline",
     }.get(code, code)
     wio.reset_for_tests()
+
+
+# ── #939 D5: the startup admission hold and its evaluator ──────────────────
+#
+# Every test below names the failure it detects: a false WARN from catch-up
+# writes judged as steady state (a release too early), or a recurring cost
+# hidden from steady-state judgement (a hold that never releases).
+
+import types  # noqa: E402
+
+P = "/codex/rollout-a.jsonl"
+Q = "/codex/rollout-b.jsonl"
+K, K2 = "conv-k", "conv-k2"
+
+
+def _res(**fields):
+    """A provider's conversation residual, built the way the pass builds it."""
+    return wio.conversation_residual(types.SimpleNamespace(**fields))
+
+
+def _target(gen="g1", end=100, accepted_gen="g1", accepted_end=60,
+            state="required", reason=None):
+    return {"generation": gen, "complete_line_end": end,
+            "accepted_generation": accepted_gen, "accepted_end": accepted_end,
+            "state": state, "reason": reason}
+
+
+def _facts(target=None, membership=(), **keys):
+    """Raw facts of one deferral; ``keys`` maps key -> (required, certificate,
+    published, repair)."""
+    return {"target": _target() if target is None else target,
+            "membership": frozenset(membership),
+            "keys": {key: dict(zip(("required", "certificate", "published",
+                                    "repair"), value))
+                     for key, value in keys.items()}}
+
+
+def _pass(*, counted=True, complete=True, certifiable=False, claude=(),
+          codex=(), codex_mode="full", deferrals=None, facts=None):
+    return {"counted": counted, "census_complete": complete,
+            "certifiable": certifiable,
+            "providers": {"claude": {"mode": "full", "residual": claude},
+                          "codex": {"mode": codex_mode, "residual": codex}},
+            "deferrals": deferrals, "facts": facts or {}}
+
+
+def _drain(*, residuals=None):
+    drain = wio.StartupDrain()
+    drain.observe_accounting(ended_ns=1, census_complete=True,
+                             residuals=residuals or {"claude": (), "codex": ()})
+    return drain
+
+
+def _covered(keys=(K,), covered=True, identity="id-a"):
+    return (identity, covered, frozenset(keys))
+
+
+def test_the_conversation_residual_names_unpublished_deferrals_and_causes():
+    """Detects: a residual that counts a deferral published in the same pass
+    as unfinished, or forgets a failed path or a retry cause."""
+    residual = dict(_res(
+        failed_paths={"/x"}, barrier_deferred_keys={P: frozenset({K}),
+                                                    Q: frozenset({K2})},
+        barrier_published_paths={Q}, barrier_retry_causes={"uncovered"},
+        container_pending=2, barrier_keys_deferred=1, files_processed=5))
+    assert residual == {
+        "failed_paths": ("/x",), "unpublished_deferred": ((P, (K,)),),
+        "barrier_retry_causes": ("uncovered",), "container_pending": 2,
+        "barrier_keys_deferred": 1}
+    assert _res() == ()
+    stats = types.SimpleNamespace(
+        barrier_deferred_keys={P: frozenset({K}), Q: frozenset()},
+        barrier_deferred_targets={P: ("id-a", True), Q: ("id-b", False)},
+        barrier_published_paths=set())
+    assert wio.unpublished_deferrals(stats) == {
+        P: ("id-a", True, frozenset({K})), Q: ("id-b", False, frozenset())}
+
+
+def test_a_certifiable_pass_with_no_obligation_releases_drained():
+    drain = _drain()
+    assert drain.observe(_pass(certifiable=True)) == "drained"
+
+
+def test_a_non_empty_accounting_residual_prevents_drained():
+    """Detects: a drained release while accounting still refuses a rebuild."""
+    drain = _drain(residuals={"claude": (), "codex": (("rebuild_refused", "x"),)})
+    assert drain.observe(_pass(certifiable=True)) is None
+    assert drain.observe(_pass(certifiable=True)) == "settled"
+
+
+def test_a_covered_deferral_stays_an_obligation_across_caught_up_passes():
+    """Detects: the census-complete covered deferral (#968) treated as done,
+    and its later caught_up passes releasing before its publication."""
+    drain = _drain()
+    deferral = {P: _covered()}
+    assert drain.observe(_pass(
+        certifiable=True, deferrals=deferral,
+        facts={P: _facts(**{K: (3, 2, 1, None)})})) is None
+    assert drain.obligations == {P}
+    # caught_up: certificate progress changes the digest, no release
+    assert drain.observe(_pass(
+        certifiable=True, codex_mode="caught_up", codex=None,
+        facts={P: _facts(**{K: (3, 3, 1, None)})})) is None
+    # fully accepted at its generation while publication waits: still owed
+    assert drain.observe(_pass(
+        certifiable=True, codex_mode="caught_up", codex=None,
+        facts={P: _facts(target=_target(accepted_end=100, state="ready"),
+                         **{K: (3, 3, 2, None)})})) is None
+    assert drain.obligations == {P}
+    assert drain.observe(_pass(
+        certifiable=True, codex_mode="caught_up", codex=None,
+        facts={P: _facts(target=_target(accepted_end=100, state="ready"),
+                         **{K: (3, 3, 3, None)})})) == "drained"
+
+
+@pytest.mark.parametrize("target", [
+    _target(end=None),                          # legacy: no complete line end
+    _target(accepted_gen="g0"),                 # membership not proven there
+])
+def test_an_unresolved_anchor_is_never_discharged(target):
+    """Detects: an obligation discharged vacuously over a legacy target whose
+    publication requirement was never bound."""
+    drain = _drain()
+    facts = {P: _facts(target=target, **{K: (3, 3, 9, None)})}
+    for _ in range(3):
+        drain.observe(_pass(certifiable=True, deferrals={P: _covered()},
+                            facts=facts))
+        assert drain.obligations == {P}
+
+
+def test_an_unproven_key_population_keeps_the_anchor_unresolved():
+    drain = _drain()
+    facts = {P: _facts(membership=(K2,), **{K: (3, 3, 3, None)})}   # K2: no row
+    assert drain.observe(_pass(certifiable=True, deferrals={P: _covered()},
+                               facts=facts)) is None
+    assert drain.obligations == {P}
+
+
+def test_an_accepted_empty_census_is_no_obligation():
+    """Detects: a keyless covered deferral (nothing will publish) holding the
+    hold for ever."""
+    drain = _drain()
+    assert drain.observe(_pass(
+        certifiable=True, deferrals={P: _covered(keys=())},
+        facts={P: _facts(membership=())})) == "drained"
+
+
+def test_two_equal_non_empty_digests_settle_and_a_caught_up_provider_carries():
+    """Detects: a stable residual that never releases (a permanent hold), and
+    a caught_up provider read as an empty residual."""
+    drain = _drain()
+    residual = _res(failed_paths={"/bad"})
+    assert drain.observe(_pass(claude=residual)) is None
+    assert drain.observe(_pass(claude=residual, codex_mode="caught_up",
+                               codex=None)) == "settled"
+
+
+def test_a_pass_that_is_not_census_complete_restarts_the_chain():
+    drain = _drain()
+    residual = _res(failed_paths={"/bad"})
+    assert drain.observe(_pass(claude=residual)) is None
+    assert drain.observe(_pass(claude=residual, complete=False)) is None
+    assert drain.observe(_pass(claude=residual)) is None
+    assert drain.observe(_pass(claude=residual)) == "settled"
+
+
+def test_uncounted_passes_never_release():
+    drain = wio.StartupDrain()
+    for _ in range(3):
+        assert drain.observe(_pass(counted=False, certifiable=True)) is None
+
+
+def _base_facts(**overrides):
+    keys = {K: (3, 2, 1, 2)}
+    keys.update(overrides.pop("keys", {}))
+    return {P: _facts(target=overrides.pop("target", _target()), **keys)}
+
+
+@pytest.mark.parametrize("change", [
+    "failed_path", "unpublished_path", "retry_cause", "container_pending",
+    "keys_deferred", "certificate", "published", "target_state",
+    "target_generation"])
+def test_any_changed_component_keeps_the_hold(change):
+    """Detects: a residual digest blind to one kind of startup progress, which
+    would settle while that work still advances."""
+    drain = _drain()
+    codex = dict(failed_paths={"/f"}, barrier_deferred_keys={P: frozenset({K})},
+                 barrier_retry_causes={"uncovered"}, container_pending=2,
+                 barrier_keys_deferred=1)
+    deferrals = {P: _covered()}
+    assert drain.observe(_pass(codex=_res(**codex), deferrals=deferrals,
+                               facts=_base_facts())) is None
+    facts = _base_facts()
+    if change == "failed_path":
+        codex["failed_paths"] = {"/f", "/g"}
+    elif change == "unpublished_path":
+        codex["barrier_deferred_keys"] = {P: frozenset({K}), Q: frozenset()}
+        deferrals = {P: _covered(), Q: _covered(keys=(), covered=False,
+                                                identity="id-b")}
+        facts[Q] = _facts(membership=())
+    elif change == "retry_cause":
+        codex["barrier_retry_causes"] = {"uncovered", "unit_failed"}
+    elif change == "container_pending":
+        codex["container_pending"] = 3
+    elif change == "keys_deferred":
+        codex["barrier_keys_deferred"] = 2
+    elif change == "certificate":
+        facts = _base_facts(keys={K: (3, 3, 1, 2)})
+    elif change == "published":
+        facts = _base_facts(keys={K: (3, 2, 2, 2)})
+    elif change == "target_state":
+        facts = _base_facts(target=_target(state="suspended",
+                                           reason="verification-unverified"))
+    elif change == "target_generation":
+        facts = _base_facts(target=_target(gen="g2", accepted_gen="g2"))
+    assert drain.observe(_pass(codex=_res(**codex), deferrals=deferrals,
+                               facts=facts)) is None
+
+
+def test_appends_beyond_the_anchor_and_unrelated_seals_settle():
+    """Detects: a digest that moves with input beyond the startup backlog (an
+    append past the anchored end, with the repair rows it writes) or with an
+    unrelated conversation's seal, so a blocked key would never settle."""
+    drain = _drain()
+    codex = _res(barrier_deferred_keys={P: frozenset({K})}, container_pending=1)
+    deferrals = {P: _covered()}
+    first = {P: _facts(target=_target(accepted_end=100),
+                       **{K: (3, 2, 1, 3)})}
+    assert drain.observe(_pass(codex=codex, deferrals=deferrals,
+                               facts=first)) is None
+    # The append advances the accepted offset, the requirement and the repair
+    # past the anchor; another conversation's certificate is not in the facts.
+    later = {P: _facts(target=_target(accepted_end=140),
+                       **{K: (9, 2, 1, 9)})}
+    later_codex = _res(barrier_deferred_keys={P: frozenset({K})},
+                       container_pending=1)
+    assert drain.observe(_pass(codex=later_codex, deferrals=deferrals,
+                               facts=later)) == "settled"
+
+
+@pytest.mark.parametrize("tick", ["incomplete", "changed", "identical"])
+def test_an_accounting_tick_between_counted_passes(tick):
+    """Detects: settling across accounting progress, or never settling over a
+    refusal that repeats identically on every tick."""
+    refusal = {"claude": (), "codex": (("rebuild_refused", "x"),)}
+    drain = _drain(residuals=refusal)
+    residual = _res(failed_paths={"/bad"})
+    assert drain.observe(_pass(claude=residual)) is None
+    if tick == "incomplete":
+        drain.observe_accounting(ended_ns=5, census_complete=False,
+                                 residuals={})
+    elif tick == "changed":
+        drain.observe_accounting(ended_ns=5, census_complete=True, residuals={
+            "claude": (), "codex": (("rebuild_refused", "y"),)})
+    else:
+        drain.observe_accounting(ended_ns=5, census_complete=True,
+                                 residuals=refusal)
+    expected = "settled" if tick == "identical" else None
+    assert drain.observe(_pass(claude=residual)) == expected
+
+
+@pytest.mark.parametrize("second,expected", [
+    (dict(deferred_reason="pricing_write_refused"), "settled"),
+    (dict(deferred_reason="rebuild_pending"), None),
+    (dict(deferred_reason="pricing_write_refused", maintenance_failed=True),
+     None),
+])
+def test_a_repeating_refusal_settles_and_a_changed_one_restarts(second,
+                                                               expected):
+    """Detects: a refusal or maintenance failure that repeats for the
+    dashboard's whole life holding admission forever (its writes never
+    judged), or a changed refusal (progress) settling the hold."""
+    drain = _drain()
+    first = _res(deferred_reason="pricing_write_refused")
+    assert dict(first) == {"deferred_reason": "pricing_write_refused"}
+    assert dict(_res(maintenance_failed=True)) == {"maintenance_failed": True}
+    assert drain.observe(_pass(codex=first)) is None
+    assert drain.observe(_pass(codex=_res(**second))) == expected
+
+
+def test_anchors_resolve_and_obligations_discharge_only_on_counted_passes():
+    """Detects: a pass that started before accounting caught up freezing an
+    anchor at accounting's partial progress, or discharging an obligation on
+    facts the counted census never saw."""
+    drain = wio.StartupDrain()
+    early = {P: _facts(target=_target(end=100), **{K: (3, 3, 3, None)})}
+    assert drain.observe(_pass(counted=False, deferrals={P: _covered()},
+                               facts=early)) is None
+    assert P not in drain.anchors
+    assert drain.obligations == {P}
+    drain.observe_accounting(ended_ns=1, census_complete=True,
+                             residuals={"claude": (), "codex": ()})
+    counted = {P: _facts(target=_target(end=120), **{K: (5, 3, 3, None)})}
+    assert drain.observe(_pass(certifiable=True, deferrals={P: _covered()},
+                               facts=counted)) is None
+    anchor = drain.anchors[P]
+    assert (anchor.end, anchor.required) == (120, ((K, 5),))
+    assert drain.obligations == {P}
+
+
+def _hold_clock():
+    clock = _install(*range(0, 400 * MiB, MiB))
+    wio.hold_admission()
+    return clock
+
+
+def _complete_tick(clock):
+    wio.observe_accounting_tick(ended_ns=clock.ns, census_complete=True,
+                                residuals={"claude": (), "codex": ()})
+
+
+def test_the_hold_blocks_warm_admission_until_release():
+    """Detects: the first non-cold publication admitting warm samples while
+    the startup catch-up still writes (a false WARN)."""
+    clock = _hold_clock()
+    wio.note_publication(cold=False)
+    clock.advance(5)
+    wio.note_publication(cold=False)
+    stat, _ = wio.evaluate()
+    assert stat.reasons == ("warming_up",)
+    cold = wio.write_io_payload()["coldStartup"]
+    assert (cold["held"], cold["admitted"], cold["releasedBy"]) == (
+        True, False, None)
+    assert wio.release_admission("settled") is True
+    assert wio.release_admission("drained") is False
+    cold = wio.write_io_payload()["coldStartup"]
+    assert (cold["held"], cold["admitted"], cold["releasedBy"]) == (
+        False, True, "settled")
+
+
+def test_without_a_hold_the_first_non_cold_publication_admits():
+    _install(*range(0, 100 * MiB, MiB))
+    wio.note_publication(cold=True)
+    assert wio.write_io_payload()["coldStartup"]["admitted"] is False
+    wio.note_publication(cold=False)
+    cold = wio.write_io_payload()["coldStartup"]
+    assert (cold["admitted"], cold["releasedBy"], cold["held"]) == (
+        True, None, False)
+    assert wio.release_admission("loopExit") is False
+
+
+def test_a_release_before_any_warm_publication_admits_at_the_next_one():
+    _hold_clock()
+    assert wio.release_admission("loopExit") is True
+    assert wio.write_io_payload()["coldStartup"]["admitted"] is False
+    wio.note_publication(cold=False)
+    assert wio.write_io_payload()["coldStartup"]["admitted"] is True
+
+
+def test_passes_count_only_after_the_first_census_complete_accounting_tick():
+    """Detects: a contended or incomplete accounting tick, which still
+    publishes non-cold snapshots, letting conversation passes release."""
+    clock = _hold_clock()
+    wio.observe_accounting_tick(ended_ns=clock.ns, census_complete=False,
+                                residuals={})
+    wio.note_publication(cold=False)
+    clock.advance(1)
+    assert wio.observe_conversation_pass(
+        _pass(certifiable=True), started_ns=clock.ns, seq=1) is None
+    assert wio.write_io_payload()["coldStartup"]["accountingCaughtUp"] is False
+    started_before = clock.ns + 1
+    clock.advance(5)
+    _complete_tick(clock)
+    assert wio.write_io_payload()["coldStartup"]["accountingCaughtUp"] is True
+    assert wio.observe_conversation_pass(
+        _pass(certifiable=True), started_ns=started_before, seq=2) is None
+    clock.advance(1)
+    assert wio.observe_conversation_pass(
+        _pass(certifiable=True), started_ns=clock.ns, seq=3) == "drained"
+    last = wio.write_io_payload()["coldStartup"]["lastPass"]
+    assert (last["seq"], last["counted"], last["censusComplete"]) == (3, True, True)
+
+
+def test_a_catch_up_longer_than_any_time_bound_keeps_the_hold():
+    """Detects: a time-based release judging a long catch-up as steady."""
+    clock = _hold_clock()
+    _complete_tick(clock)
+    for i in range(6):
+        clock.advance(300)
+        assert wio.observe_conversation_pass(
+            _pass(claude=_res(failed_paths={f"/f{i}"})),
+            started_ns=clock.ns, seq=i + 1) is None
+        wio.note_publication(cold=False)
+    cold = wio.write_io_payload()["coldStartup"]
+    assert cold["held"] is True and cold["admitted"] is False
+    assert cold["residual"]["failed"] == 1
+
+
+def test_a_recurring_late_failure_settles_and_its_writes_are_then_judged():
+    """The true positive: a unit that spills and fails late the same way every
+    pass is a steady-state cost, so the hold releases and samples it."""
+    clock = _hold_clock()
+    _complete_tick(clock)
+    codex = _res(barrier_deferred_keys={P: frozenset({K})},
+                 barrier_retry_causes={"unit_failed"}, barrier_keys_deferred=1)
+    verdicts = []
+    for seq in (1, 2):
+        clock.advance(10)
+        verdicts.append(wio.observe_conversation_pass(
+            _pass(codex=codex, deferrals={P: _covered(covered=False)},
+                  facts={P: _facts(**{K: (3, 3, 2, None)})}),
+            started_ns=clock.ns, seq=seq))
+    assert verdicts == [None, "settled"]
+    assert wio.release_admission(verdicts[-1])
+    wio.note_publication(cold=False)
+    for _ in range(70):
+        clock.advance(5)
+        wio.note_publication(cold=False)
+    stat, _ = wio.evaluate()
+    assert stat.status == "qualified"
+    residual = wio.write_io_payload()["coldStartup"]["residual"]
+    assert residual == {"failed": 0, "unpublishedDeferred": 1,
+                        "obligations": 0, "containerPending": 0,
+                        "keysDeferred": 1}
+
+
+@pytest.mark.parametrize("middle", ["missing", "unjudgeable"])
+def test_a_missing_or_unjudged_pass_breaks_the_chain(middle):
+    """Detects: a pass the evaluator never judged (no status, or one whose
+    observation raised part-way) letting the next pass settle against the
+    pass before it (#939: an evaluator exception is fail-closed)."""
+    clock = _hold_clock()
+    _complete_tick(clock)
+    residual = _res(failed_paths={"/bad"})
+    clock.advance(1)
+    assert wio.observe_conversation_pass(_pass(claude=residual),
+                                         started_ns=clock.ns, seq=1) is None
+    clock.advance(1)
+    if middle == "missing":
+        assert wio.observe_conversation_pass(None, started_ns=clock.ns,
+                                             seq=2) is None
+    else:
+        with pytest.raises(ValueError):
+            wio.observe_conversation_pass(_pass(claude=((1, 2, 3),)),
+                                          started_ns=clock.ns, seq=2)
+    clock.advance(1)
+    assert wio.observe_conversation_pass(_pass(claude=residual),
+                                         started_ns=clock.ns, seq=3) is None
+
+
+def test_the_watch_names_tracked_deferrals_with_their_anchored_keys():
+    """Detects: an obligation whose facts the next pass forgets to re-read,
+    which would freeze it undischarged."""
+    clock = _hold_clock()
+    _complete_tick(clock)
+    clock.advance(1)
+    wio.observe_conversation_pass(
+        _pass(deferrals={P: _covered()},
+              facts={P: _facts(membership=(K2,),
+                               **{K: (3, 2, 1, None), K2: (1, 1, 0, None)})}),
+        started_ns=clock.ns, seq=1)
+    assert wio.startup_watch() == {P: ("id-a", frozenset({K, K2}))}
+    wio.release_admission("loopExit")
+    assert wio.startup_watch() == {}

@@ -101,6 +101,7 @@ import argparse
 import bisect
 import collections
 import contextlib
+import contextvars
 import datetime as dt
 import errno
 import fcntl
@@ -116,7 +117,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace as _dc_replace
 from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 
@@ -135,6 +136,7 @@ from _lib_codex_find_projection import CODEX_FIND_PROJECTION_VERSION
 from _lib_source_identity import source_root_key
 # #416 spec §4.2: the pure tolerance-anchored reset kernel. `_lib_quota` imports
 # only `_lib_accounts` (a stdlib leaf), so binding it here is circular-safe.
+import _lib_codex_worker_lifecycle as _worker_lifecycle
 import _lib_quota
 # #496 S5b §4: the journal-to-cache coverage certificate kernel. Stdlib-only,
 # so it is circular-safe for the same reason.
@@ -147,6 +149,12 @@ import _lib_wal_checkpoint as _wal_checkpoint
 import _lib_codex_metadata
 import _lib_codex_rollout_container as _rc
 import _lib_codex_publication_barrier as _barrier
+# #1000 §5.2: the strict in-process clone for the transcript probe. A public
+# stdlib-only leaf, so it is circular-safe for the same reason.
+import _lib_clone_copy
+# #944 F1/F7: the one record-id rule, from the pure attribution kernel (a
+# stdlib-only leaf), so it is circular-safe for the same reason.
+from _lib_claude_attribution import keyed_ids as _keyed_ids
 
 
 # Module-level back-ref shims for the three out-of-scope JSONL/project
@@ -438,6 +446,28 @@ SESSION_ENTRY_UPSERT_SQL_REWALK = (
     + _SESSION_ENTRY_REWALK_PHYSICAL_SET
     + _SESSION_ENTRY_REWALK_PHYSICAL_GUARD)
 
+# #944 spec 5.4: the same two statements carrying the row's durable
+# attribution link as one more trailing bind. `attribution_decision_key`, like
+# `account_key`, is set on INSERT only and OMITTED from every DO UPDATE SET
+# (both the logical and the physical conflict branch), so a dedup winner
+# update keeps the decided account and its link.
+_SESSION_ENTRY_HEAD_LINKED = _SESSION_ENTRY_HEAD.replace(
+    "mutation_seq, mutation_min_ts, account_key)\n"
+    "                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    "mutation_seq, mutation_min_ts, account_key,\n"
+    "                            attribution_decision_key)\n"
+    "                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+assert _SESSION_ENTRY_HEAD_LINKED != _SESSION_ENTRY_HEAD
+SESSION_ENTRY_UPSERT_SQL_LINKED = (
+    _SESSION_ENTRY_HEAD_LINKED + _SESSION_ENTRY_SET + _SESSION_ENTRY_GUARD)
+SESSION_ENTRY_UPSERT_SQL_REWALK_LINKED = (
+    SESSION_ENTRY_UPSERT_SQL_LINKED
+    + """
+                           ON CONFLICT(source_path, line_offset)
+                           DO UPDATE SET"""
+    + _SESSION_ENTRY_REWALK_PHYSICAL_SET
+    + _SESSION_ENTRY_REWALK_PHYSICAL_GUARD)
+
 
 def _conv_row_tuple(m, path_str, account_key=None, *, include_account=False):
     """Flatten a ``MessageRow`` into the ``_CONV_INSERT_SQL`` column order.
@@ -468,6 +498,7 @@ def _iter_sync_entries(
     include_cost: bool = True,
     include_conversations: bool = True,
     with_raw: bool = False,
+    with_timestamp: bool = False,
 ):
     """Fused single-pass sync walker (#138). Yields
     ``(byte_offset, cost_or_None, msgrow_or_None, aititle_or_None)`` for each
@@ -506,7 +537,15 @@ def _iter_sync_entries(
     it already read and hands both halves to the same classification below.
     ``fh.tell()`` on a binary handle is a true byte offset rather than the text
     layer's cookie, which is the same number the cursor has always stored.
+
+    ``with_timestamp`` (#944, requires ``with_raw``) appends a SIXTH element:
+    the cost record's ``timestamp`` exactly as written (``None`` for a line
+    without a cost entry). Write-time attribution needs the precision the
+    timestamp was written with, which the parsed datetime no longer carries,
+    and reading it here keeps one parse per line.
     """
+    if with_timestamp and not with_raw:
+        raise ValueError("with_timestamp requires with_raw")
     newline = b"\n" if with_raw else "\n"
     while True:
         offset = fh.tell()
@@ -556,7 +595,10 @@ def _iter_sync_entries(
             if include_conversations else None
         )
         if cost is not None or mrow is not None or ai is not None:
-            if with_raw:
+            if with_timestamp:
+                yield (offset, cost, mrow, ai, raw_span,
+                       obj.get("timestamp") if cost is not None else None)
+            elif with_raw:
                 yield offset, cost, mrow, ai, raw_span
             else:
                 yield offset, cost, mrow, ai
@@ -634,6 +676,16 @@ CODEX_REPLAY_DEFERRED_KEY = (
 #: throttle marker or a failure mode (the `_update-check` / `_telemetry-beat`
 #: precedent).
 CODEX_REPLAY_DRAIN_COMMAND = "_codex-replay-drain"
+
+#: #927 spec §4.2 B2: the detached, single-flight retained-identity
+#: inventory bootstrap. Its own throttle marker and worker lock; a minute's
+#: throttle because a hook defers its whole walk until the bootstrap ends.
+CODEX_INVENTORY_BOOTSTRAP_COMMAND = "_codex-inventory-bootstrap"
+CODEX_INVENTORY_BOOTSTRAP_MARKER_NAME = "codex-inventory-bootstrap.last-attempt"
+CODEX_INVENTORY_BOOTSTRAP_SPAWN_THROTTLE_SECONDS = 60
+CODEX_INVENTORY_BOOTSTRAP_LOCK_NAME = "codex-inventory-bootstrap.lock"
+#: Rows per family read by one bootstrap chunk (one admission, one commit).
+_CODEX_INVENTORY_BOOTSTRAP_CHUNK = 5000
 
 #: #968 spec 5.7: the detached, single-flight orphan-prune worker.
 CODEX_PRUNE_DRAIN_COMMAND = "_codex-prune-drain"
@@ -744,6 +796,22 @@ def _run_wal_truncate(conn, db_path, *, db_label: str) -> "CheckpointResult":
     return CheckpointResult(db_label, before, after, frames, busy, truncated)
 
 
+def _cache_wal_trigger_bytes() -> int:
+    trigger = CACHE_WAL_CHECKPOINT_TRIGGER_BYTES
+    test_trigger = os.environ.get("CCTALLY_TEST_CACHE_WAL_TRIGGER_BYTES")
+    if test_trigger is not None:
+        try:
+            trigger = max(0, int(test_trigger))
+        except ValueError:
+            pass
+    return trigger
+
+
+def _cache_wal_truncate_due(db_path) -> bool:
+    """#980 D5: the size gate ``_maybe_truncate_wal`` applies."""
+    return _wal_file_size(db_path) > _cache_wal_trigger_bytes()
+
+
 def _maybe_truncate_wal(conn, db_path) -> None:
     """End-of-sync best-effort WAL drain (#297).
 
@@ -765,14 +833,7 @@ def _maybe_truncate_wal(conn, db_path) -> None:
     policy = (None if _wal_checkpoint.disabled()
               else _wal_checkpoint.policy_for_path(db_path))
     try:
-        trigger = CACHE_WAL_CHECKPOINT_TRIGGER_BYTES
-        test_trigger = os.environ.get("CCTALLY_TEST_CACHE_WAL_TRIGGER_BYTES")
-        if test_trigger is not None:
-            try:
-                trigger = max(0, int(test_trigger))
-            except ValueError:
-                pass
-        if _wal_file_size(db_path) <= trigger:
+        if not _cache_wal_truncate_due(db_path):
             return
         if policy is not None and not policy.shrink_allowed():
             return
@@ -1107,6 +1168,9 @@ class CodexProviderRoot:
     provider_root: pathlib.Path
     walk_root: pathlib.Path
     source_root_key: str
+    #: #970 spec 5.1: a native home's flat ``archived_sessions/`` directory
+    #: (which may not exist yet); None for a direct directory.
+    archive_root: "pathlib.Path | None" = None
 
 
 @dataclass(frozen=True)
@@ -1130,6 +1194,9 @@ class CodexDiscoveredFile:
     container_kind: str = "plain"
     container_path: "pathlib.Path | None" = None
     container_fingerprint: "object | None" = None
+    #: #970: where the selected container sits — ``"dated"`` (beside the
+    #: logical path) or ``"archive"`` (the root's archive directory).
+    container_location: str = "dated"
 
 def _canonical_codex_path(path: pathlib.Path) -> pathlib.Path:
     """Resolve an absolute Codex path, retaining a safe absolute spelling on I/O failure."""
@@ -1607,6 +1674,18 @@ def _parse_anchor_iso(value: object) -> "dt.datetime | None":
     return parsed.astimezone(dt.timezone.utc)
 
 
+class CodexWalkDeadline(Exception):
+    """A budgeted walk's deadline passed inside a bounded walk read (#980 F3).
+
+    Raised by the canonical-anchor group seed (`_components_for`) when a
+    SQLite progress-handler interrupt stops its SELECT, or a cooperative check
+    between folded rows fails. The walk treats it exactly as budget
+    exhaustion before the current file committed. Deliberately NOT a
+    ``sqlite3.Error``: the seed's database-error fallback (per-sync anchors)
+    must never absorb it, or a deadline would silently degrade window
+    identity instead of deferring the file."""
+
+
 class CodexResetAnchorResolver:
     """Resolve one Codex quota observation's canonical reset anchor.
 
@@ -1628,8 +1707,13 @@ class CodexResetAnchorResolver:
     re-fragmenting after the read-path snap.
     """
 
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, *,
+                 deadline: "float | None" = None, clock=None):
         self._conn = conn
+        # #980 F3: a budgeted walk passes its walk deadline and clock, which
+        # bound the group seed read; unbudgeted callers pass neither.
+        self._deadline = deadline
+        self._clock = clock if clock is not None else time.monotonic
         self._groups: "dict[tuple[str, str, str, object], _lib_quota.ResetAnchorComponents]" = {}
         self._pending_merges: list[
             tuple[tuple[str, str, str, object], str, dt.datetime,
@@ -1674,23 +1758,42 @@ class CodexResetAnchorResolver:
             # B-TREE FOR ORDER BY"). `+` removes the column's affinity, which
             # is equivalent here only because the root key is TEXT bound as a
             # `str`.
+            sql = (
+                "SELECT source_path, line_offset, id, resets_at_utc "
+                "FROM quota_window_snapshots "
+                "WHERE source = 'codex' AND +source_root_key = ? "
+                "  AND observed_slot = ? "
+                f"  AND logical_limit_key IN ({placeholders}) "
+                "ORDER BY source_path, line_offset, id")
+            params = (str(group[0]), group[1], *candidates)
             try:
-                rows = self._conn.execute(
-                    "SELECT source_path, line_offset, id, resets_at_utc "
-                    "FROM quota_window_snapshots "
-                    "WHERE source = 'codex' AND +source_root_key = ? "
-                    "  AND observed_slot = ? "
-                    f"  AND logical_limit_key IN ({placeholders}) "
-                    "ORDER BY source_path, line_offset, id",
-                    (str(group[0]), group[1], *candidates),
-                ).fetchall()
+                if self._deadline is None:
+                    rows = self._conn.execute(sql, params).fetchall()
+                else:
+                    # #980 F3: measured 9.71-10.74 s cold on a 328,727-row
+                    # weekly group, so a budgeted walk bounds it with its own
+                    # deadline: a progress handler armed around this SELECT
+                    # only (an interrupted SELECT leaves any enclosing
+                    # transaction open), raising `CodexWalkDeadline` -- which
+                    # is not a database error, so the fallback below can never
+                    # absorb it. The plan choice above is unchanged.
+                    with _codex_cancellable_read(
+                            self._conn, self._deadline, self._clock,
+                            cancelled=CodexWalkDeadline):
+                        rows = self._conn.execute(sql, params).fetchall()
             except sqlite3.DatabaseError:
                 # A cache that has not yet gained the column (an old binary
                 # racing a new one) degrades to per-sync anchors rather than
                 # failing the whole ingest — the column is re-derivable.
                 self._seed_failed = True
                 rows = []
-            for row in rows:
+            for index, row in enumerate(rows):
+                if (self._deadline is not None and index
+                        and index % _CODEX_FINALIZATION_CHECK_EVERY == 0
+                        and self._clock() >= self._deadline):
+                    # A read that finished just before the deadline stops
+                    # within one slice; the partial group is never cached.
+                    raise CodexWalkDeadline("deadline")
                 parsed = _parse_anchor_iso(row[3])
                 if parsed is not None:
                     components.add(
@@ -1839,23 +1942,117 @@ def _codex_provider_roots() -> list[CodexProviderRoot]:
             continue
         if provider_root in seen:
             continue
-        sessions = configured / "sessions"
-        try:
-            if sessions.is_dir():
-                walk_root = sessions
-            elif configured.is_dir():
-                walk_root = configured
-            else:
-                continue
-        except OSError:
+        # #970 spec 5.1 (A7): a `sessions/` OR `archived_sessions/` child makes
+        # a native home, so an archive-only home is native from its first sync
+        # and the first unarchive (which creates `sessions/`) changes nothing.
+        locations = _rc.home_locations(configured)
+        if locations is None:
             continue
         seen.add(provider_root)
         roots.append(CodexProviderRoot(
             provider_root=provider_root,
-            walk_root=walk_root,
+            walk_root=locations.walk_root,
             source_root_key=source_root_key(str(provider_root)),
+            archive_root=locations.archive_root,
         ))
-    return roots
+    # #970 N4: an archive another configured root walks directly belongs to
+    # that root (`CODEX_HOME=<home>,<home>/archived_sessions`).
+    released = _rc.release_walked_archives(_codex_locations(roots))
+    return [root if location.archive_root is not None
+            or root.archive_root is None
+            else _dc_replace(root, archive_root=None)
+            for root, location in zip(roots, released)]
+
+
+def _codex_locations(
+        roots: "list[CodexProviderRoot]") -> "tuple[_rc.CodexLocations, ...]":
+    """The leaf's location view of resolved provider roots (#970)."""
+    return tuple(_rc.CodexLocations(r.walk_root, r.archive_root) for r in roots)
+
+
+def _codex_archive_dir(logical, roots: "list[CodexProviderRoot] | None"):
+    """The archive directory owning ``logical``'s archive candidates, or None.
+
+    ``roots`` None resolves the configured roots once for this call.
+    """
+    if roots is None:
+        roots = _codex_provider_roots()
+    return _rc.archive_dir_for(logical, _codex_locations(roots))
+
+
+def _select_codex_container(
+        logical, roots: "list[CodexProviderRoot] | None" = None,
+) -> "_rc.SelectedContainer | None":
+    """Root-aware container selection (#970 spec 5.2): THE cache-side selector.
+
+    The dated containers come first in the selection order, so they are tried
+    without touching the configured roots; only when neither exists, and the
+    logical path is a dated rollout under a native root, are the archive
+    candidates tried (``roots`` None resolves the roots once for that call).
+    A caller that already holds resolved roots passes them. Every cache-side
+    selection goes through here: a bypass would miss archived rollouts and
+    reintroduce their omission or deletion (pinned by an AST test).
+    """
+    selected = _rc.select_container(logical)
+    if selected is not None:
+        return selected
+    if _rc.archive_name_date(pathlib.Path(str(logical)).name) is None:
+        return None
+    archive_dir = _codex_archive_dir(logical, roots)
+    if archive_dir is None:
+        return None
+    return _rc.select_container(logical, archive_dir=archive_dir)
+
+
+def _probe_codex_containers(
+        logical, roots: "list[CodexProviderRoot] | None" = None,
+) -> "tuple[str, _rc.SelectedContainer | None]":
+    """The strict tri-state twin of ``_select_codex_container`` (#970 5.2):
+    ``present``/``absent``/``unknown`` over every candidate location."""
+    return _rc.probe_containers(
+        logical, archive_dir=_codex_archive_dir(logical, roots))
+
+
+def _codex_identity_path(selected: "_rc.SelectedContainer",
+                         root: "CodexProviderRoot | None", *,
+                         memo: "dict | None" = None) -> pathlib.Path:
+    """The durable identity path of a selected container (#970 spec 5.4, G5).
+
+    Canonicalize the container; when it lies in the root's canonical archive
+    directory, the identity is the dated logical path under the canonical walk
+    root (``canonical(walk_root)/YYYY/MM/DD/<logical name>``), whether or not
+    that directory exists; otherwise it is today's
+    ``logical_path(canonical container)``. One rule shared by discovery,
+    targeted qualification, stored-path reconstruction and the journal's
+    attribution oracle, so an archive move never changes an identity.
+    """
+    container = _canonical_codex_path(pathlib.Path(selected.path))
+    if root is not None and root.archive_root is not None:
+        # ``memo`` lets one discovery pass canonicalize each root once.
+        canonical = memo.get(root) if memo is not None else None
+        if canonical is None:
+            canonical = (_rc.CodexLocations(
+                _canonical_codex_path(root.walk_root),
+                _canonical_codex_path(root.archive_root)),)
+            if memo is not None:
+                memo[root] = canonical
+        dated = _rc.dated_logical_for_archive(container, canonical)
+        if dated is not None:
+            return dated
+    return _rc.logical_path(container)
+
+
+def _codex_root_for_logical(logical, roots: "list[CodexProviderRoot]"
+                            ) -> "CodexProviderRoot | None":
+    """The first configured root whose walk root contains ``logical``."""
+    candidate = pathlib.Path(str(logical))
+    for root in roots:
+        try:
+            if candidate.is_relative_to(root.walk_root):
+                return root
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -1968,7 +2165,37 @@ def _codex_container_is_contained(path: pathlib.Path, root: pathlib.Path) -> boo
         return False
 
 
-def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
+_CODEX_ARCHIVE_PATTERNS = ("*.jsonl", "*.jsonl.zst")
+ARCHIVE_UNMAPPED_SKIP_KEY = "archive-unmapped"
+
+
+def _codex_root_logicals(root: CodexProviderRoot, *,
+                         skipped: "dict | None" = None) -> "set[pathlib.Path]":
+    """Every logical path of one root: the recursive walk-root glob plus the
+    root's FLAT archive glob, each archive name mapped to its dated logical
+    path (#970 spec 5.3). An unmappable archive name never mints an identity;
+    it is counted under ``archive-unmapped`` in ``skipped`` when given."""
+    logicals = {
+        _rc.logical_path(candidate)
+        for pattern in ("**/*.jsonl", "**/*.jsonl.zst")
+        for candidate in root.walk_root.glob(pattern)
+    }
+    if root.archive_root is not None:
+        locations = (_rc.CodexLocations(root.walk_root, root.archive_root),)
+        for pattern in _CODEX_ARCHIVE_PATTERNS:
+            for candidate in root.archive_root.glob(pattern):
+                logical = _rc.dated_logical_for_archive(candidate, locations)
+                if logical is None:
+                    if skipped is not None:
+                        skipped[ARCHIVE_UNMAPPED_SKIP_KEY] = (
+                            skipped.get(ARCHIVE_UNMAPPED_SKIP_KEY, 0) + 1)
+                    continue
+                logicals.add(logical)
+    return logicals
+
+
+def _discover_codex_files_with_roots(
+        *, skipped: "dict | None" = None) -> list[CodexDiscoveredFile]:
     """Discover each LOGICAL rollout once with the first matching root facts.
 
     #968 spec 5.2: both container spellings are globbed and grouped by logical
@@ -1977,21 +2204,24 @@ def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
     plain-only tree. ``physical_path`` is the canonical LOGICAL identity, so a
     rollout keeps its identity, attribution map key and journal keys across
     compression.
+
+    #970 spec 5.3/5.4: a native root's flat archive directory joins the
+    logical set under dated logical paths, selection is root-aware, and the
+    identity follows ``_codex_identity_path``, so an archived rollout is one
+    descriptor under its dated identity whatever mix of locations exists.
+    Unmappable archive names are counted in ``skipped`` (``archive-unmapped``).
     """
     discovered: list[CodexDiscoveredFile] = []
     seen: set[pathlib.Path] = set()
-    for root in _codex_provider_roots():
-        logicals = {
-            _rc.logical_path(candidate)
-            for pattern in ("**/*.jsonl", "**/*.jsonl.zst")
-            for candidate in root.walk_root.glob(pattern)
-        }
+    roots = _codex_provider_roots()
+    memo: dict = {}
+    for root in roots:
+        logicals = _codex_root_logicals(root, skipped=skipped)
         for logical in sorted(logicals, key=lambda path: str(path)):
-            selected = _rc.select_container(logical)
+            selected = _select_codex_container(logical, [root])
             if selected is None:
                 continue
-            container = _canonical_codex_path(selected.path)
-            physical_path = _rc.logical_path(container)
+            physical_path = _codex_identity_path(selected, root, memo=memo)
             if physical_path in seen:
                 continue
             seen.add(physical_path)
@@ -2004,6 +2234,7 @@ def _discover_codex_files_with_roots() -> list[CodexDiscoveredFile]:
                 container_kind=selected.kind,
                 container_path=selected.path,
                 container_fingerprint=selected.fingerprint,
+                container_location=selected.location,
             ))
     return discovered
 
@@ -2027,7 +2258,7 @@ def _codex_file_is_recognizable(path: pathlib.Path) -> bool:
     consumed = 0
     lines = 0
     try:
-        selected = _rc.select_container(path)
+        selected = _select_codex_container(path)
         if selected is None:
             return False
         with _rc.open_decoded(selected) as fh:
@@ -2077,7 +2308,15 @@ class _CodexPruneScope:
     configured_root_keys: frozenset[str]
     recognized_root_keys: frozenset[str]
 
-    def refusal_reason(self, source_path: str, root_key: str | None) -> str | None:
+    def refusal_reason(self, source_path: str, root_key: str | None, *,
+                       witness: "pathlib.Path | None" = None) -> str | None:
+        """Why this identity may not be deleted, replaced or recovered here.
+
+        ``witness`` is the directory whose readability stands for the
+        identity (#970 spec 5.6, A5): None means the logical parent, today's
+        rule; callers pass ``_codex_deletion_witness`` or
+        ``_codex_recovery_witness`` through ``_codex_witnessed_refusal``.
+        """
         if not self.recognized_root_keys:
             return "no_recognizable_roots"
         if (
@@ -2086,7 +2325,8 @@ class _CodexPruneScope:
         ):
             return "configured_root_unrecognizable"
         if root_key in self.recognized_root_keys:
-            parent = pathlib.Path(source_path).parent
+            parent = (pathlib.Path(source_path).parent if witness is None
+                      else pathlib.Path(witness))
             try:
                 if not parent.is_dir() or not os.access(parent, os.R_OK | os.X_OK):
                     return "source_parent_unavailable"
@@ -2103,6 +2343,188 @@ class _CodexPruneScope:
         ):
             return "configured_root_unrecognizable"
         return None
+
+
+# ── #970 spec 5.6: presence, absence and the two witnesses ───────────────────
+
+def _codex_scope_root(path: str, root_key: "str | None",
+                      roots: "list[CodexProviderRoot]",
+                      ) -> "CodexProviderRoot | None":
+    """The identity's own configured root when the identity lies inside its
+    discovery scope (a path under that root's walk root), else None.
+
+    None is the scope exit of spec 5.1: such an identity cannot be selected,
+    so it keeps today's rule (not present; deletion authorized by recognition
+    and the parent witness). ``root_key`` None matches any root, as the
+    drains' presence check always has.
+    """
+    candidate = pathlib.Path(path)
+    for root in roots:
+        if root_key is not None and root.source_root_key != root_key:
+            continue
+        try:
+            if candidate.is_relative_to(root.walk_root):
+                return root
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _codex_deletion_witness(conn: sqlite3.Connection, table: str, path: str,
+                            root: "CodexProviderRoot | None") -> pathlib.Path:
+    """The directory whose readability authorizes deleting an absent identity
+    (#970 spec 5.6, A5, G9).
+
+    The identity's accepted location's directory when the cursor's stored
+    ``container_path`` (``table`` is ``codex_session_files`` or
+    ``codex_conversation_source_files``) canonicalizes inside the root's
+    archive directory; the logical parent otherwise, including a NULL, an
+    unreadable or an uncontained stored path, a missing cursor and a direct
+    root. So an identity last accepted from the archive can be pruned after
+    its deletion there even though its dated directory never existed.
+    """
+    logical_parent = pathlib.Path(path).parent
+    if root is None or root.archive_root is None:
+        return logical_parent
+    try:
+        row = conn.execute(
+            f"SELECT container_path FROM {table} WHERE path=?",
+            (path,)).fetchone()
+    except sqlite3.Error:
+        return logical_parent
+    if row is None or not row[0]:
+        return logical_parent
+    container = _canonical_codex_path(pathlib.Path(row[0]))
+    archive = _canonical_codex_path(root.archive_root)
+    try:
+        inside = container.is_relative_to(archive)
+    except (ValueError, TypeError):
+        inside = False
+    return container.parent if inside else logical_parent
+
+
+def _codex_recovery_witness(path: str, root: "CodexProviderRoot | None",
+                            roots: "list[CodexProviderRoot]",
+                            ) -> "pathlib.Path | None":
+    """The directory of a POSITIVELY present container, else None (#970 spec
+    5.6, A5, G9). A present container is never refused for ingestion,
+    verification, reset or rebuild because its dated directory is missing;
+    its own directory is readable by construction. Callers run it only after
+    the logical-parent check failed, so the hot walk never pays for it."""
+    selected = _select_codex_container(
+        pathlib.Path(path), roots if root is None else [root])
+    if selected is None:
+        return None
+    return pathlib.Path(selected.path).parent
+
+
+def _codex_witnessed_refusal(
+        scope: "_CodexPruneScope", path: str, root_key: "str | None", *,
+        roots: "list[CodexProviderRoot] | None" = None,
+        conn: "sqlite3.Connection | None" = None,
+        table: "str | None" = None) -> "str | None":
+    """``refusal_reason`` for NON-destructive gates (#970 spec 5.6, A5).
+
+    The logical parent is checked first; only when it fails is the identity's
+    presence probed: a present container's directory is the witness, and an
+    identity with no present container falls back to the deletion witness
+    (``conn``/``table`` given) or keeps the logical-parent refusal.
+    """
+    reason = scope.refusal_reason(path, root_key)
+    if reason != "source_parent_unavailable":
+        return reason
+    if roots is None:
+        roots = _codex_provider_roots()
+    root = _codex_scope_root(path, root_key, roots)
+    witness = _codex_recovery_witness(path, root, roots)
+    if witness is None:
+        if conn is None or table is None:
+            return reason
+        witness = _codex_deletion_witness(conn, table, path, root)
+    return scope.refusal_reason(path, root_key, witness=witness)
+
+
+#: Private test seam (#970 T5): called after the strict probe and before the
+#: second directory-witness pass of ``_codex_stable_absence``, with the path.
+_CODEX_ABSENCE_PROBE_HOOK: "Callable[[str], None] | None" = None
+
+
+def _codex_directory_witness(directory: "pathlib.Path | None"):
+    """``(device, inode, mtime_ns)``, ``"missing"`` or None for unknown.
+
+    #970 N2: a path that exists as a symlink whose target does not (an
+    ``archived_sessions`` linked to a volume that is not mounted) is unknown,
+    never missing: its containers may well exist where the link points.
+    #970 V2: the same holds for a dangling link at any ANCESTOR (the Codex
+    home or ``sessions/`` on that volume), which makes the directory fail
+    the following stat just as a genuinely missing one does. The nearest
+    ancestor ``lstat`` can see decides: a link (its target missing) is
+    unknown, a real directory makes the directory genuinely missing, and any
+    other ``lstat`` error is unknown. The walk stops at that first visible
+    ancestor; a link there that resolves is no evidence of an unmount."""
+    if directory is None:
+        return "missing"
+    try:
+        st = os.stat(directory)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        probe = pathlib.Path(directory)
+        while True:
+            try:
+                mode = os.lstat(probe).st_mode
+            except OSError as lexc:
+                if lexc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                    return None
+                if probe.parent == probe:
+                    return None
+                probe = probe.parent
+                continue
+            if stat.S_ISLNK(mode):
+                # Dangling: unknown. A link that resolves (its volume is
+                # mounted) leaves the missing part below it real.
+                try:
+                    os.stat(probe)
+                except OSError:
+                    return None
+            # Every component above ``probe`` resolved (``lstat`` follows
+            # them), so below a real directory the path is genuinely
+            # missing; a regular file in the chain (ENOTDIR) is missing too,
+            # exactly as before.
+            return "missing"
+    return (int(st.st_dev), int(st.st_ino), int(st.st_mtime_ns))
+
+
+def _codex_stable_absence(path: str, root: "CodexProviderRoot", *,
+                          roots: "list[CodexProviderRoot]") -> str:
+    """``"present"``, ``"absent"`` or ``"unknown"`` for an identity inside
+    ``root``'s discovery scope (#970 spec 5.6, A4, G8).
+
+    Witness the dated directory and the archive directory, probe every
+    candidate strictly, witness both again. ``present`` wins outright (never
+    a deletion); ``absent`` needs both witnesses readable and unchanged, since
+    a rename modifies its source and destination directories, so a move that
+    races the probes reads as ``unknown``, as does any stat error other than a
+    missing entry. ``roots`` is accepted for the callers' symmetry; the probe
+    is scoped to the identity's own root.
+    """
+    del roots
+    logical = pathlib.Path(path)
+    archive_dir = _rc.archive_dir_for(
+        logical, (_rc.CodexLocations(root.walk_root, root.archive_root),))
+    directories = (logical.parent, archive_dir)
+    before = tuple(_codex_directory_witness(d) for d in directories)
+    if None in before:
+        return "unknown"
+    state, _selected = _probe_codex_containers(logical, [root])
+    if _CODEX_ABSENCE_PROBE_HOOK is not None:
+        _CODEX_ABSENCE_PROBE_HOOK(path)
+    if state == "present":
+        return "present"
+    after = tuple(_codex_directory_witness(d) for d in directories)
+    if state == "absent" and after == before:
+        return "absent"
+    return "unknown"
 
 
 def _codex_prune_scope(files: list[CodexDiscoveredFile]) -> _CodexPruneScope:
@@ -2138,13 +2560,18 @@ def _partition_codex_prune_candidates(
     scope: _CodexPruneScope,
     sources: list[tuple[str, str | None]],
     root_keys: set[str],
+    *,
+    refusal: "Callable[[str, str | None], str | None] | None" = None,
 ) -> tuple[
     list[tuple[str, str | None]], list[tuple[str, str | None]], set[str], set[str]
 ]:
+    """``refusal`` overrides the per-identity check (default: the logical
+    parent); #970 callers pass a ``_codex_witnessed_refusal`` closure."""
+    reason_of = scope.refusal_reason if refusal is None else refusal
     safe_sources: list[tuple[str, str | None]] = []
     refused_sources: list[tuple[str, str | None]] = []
     for source in sources:
-        target = refused_sources if scope.refusal_reason(*source) else safe_sources
+        target = refused_sources if reason_of(*source) else safe_sources
         target.append(source)
     safe_roots: set[str] = set()
     refused_roots: set[str] = set()
@@ -2229,11 +2656,24 @@ def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
     with symlinks resolved, matching ``_lib_ingest_frontier._target_in_roots``.
     A path under no configured root, not a rollout, escaping its root, or an
     alias of an already-resolved identity is DROPPED (clean, not ingested).
+
+    #970 spec 5.8: an input spelled in a native root's archive directory is
+    normalized to its dated logical path before deduplication, and the
+    selected container must stay inside the union of that root's walk root and
+    archive directory (A7); the identity follows ``_codex_identity_path``.
     """
     roots = _codex_provider_roots()
+    locations = _codex_locations(roots)
     resolved: list[CodexDiscoveredFile] = []
     seen_physical: set[pathlib.Path] = set()
-    for p in sorted({str(_rc.logical_path(str(p))) for p in only_paths}):
+    memo: dict = {}
+
+    def _normalize(raw) -> str:
+        text = str(_rc.logical_path(str(raw)))
+        dated = _rc.dated_logical_for_archive(pathlib.Path(str(raw)), locations)
+        return str(dated) if dated is not None else text
+
+    for p in sorted({_normalize(p) for p in only_paths}):
         candidate = pathlib.Path(p)
         for root in roots:
             try:
@@ -2244,13 +2684,16 @@ def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
                 continue
             if candidate.suffix != ".jsonl":
                 break
-            selected = _rc.select_container(candidate)
+            selected = _select_codex_container(candidate, [root])
             if selected is None:
                 break  # vanished under this root -> drop (clean)
-            container = _canonical_codex_path(selected.path)
-            if not _codex_container_is_contained(selected.path, root.walk_root):
+            if not (_codex_container_is_contained(selected.path, root.walk_root)
+                    or (root.archive_root is not None
+                        and selected.location == _rc.ARCHIVE
+                        and _codex_container_is_contained(
+                            selected.path, root.archive_root))):
                 break  # the selected container escapes its root -> drop
-            physical = _rc.logical_path(container)
+            physical = _codex_identity_path(selected, root, memo=memo)
             if physical in seen_physical:
                 break
             seen_physical.add(physical)
@@ -2263,6 +2706,7 @@ def _qualify_codex_targets(only_paths: "set[str]") -> list[CodexDiscoveredFile]:
                 container_kind=selected.kind,
                 container_path=selected.path,
                 container_fingerprint=selected.fingerprint,
+                container_location=selected.location,
             ))
             break
     return resolved
@@ -2321,26 +2765,46 @@ class _AcceptedContainer(NamedTuple):
     anchor_offset: "int | None"
     state: str
     pending_fingerprint: "str | None"
+    #: #970 spec 5.5: the stored ``container_path`` — None means the accepted
+    #: container IS the logical path; otherwise the container's path (plain
+    #: included, G7).
+    location: "str | None" = None
+    #: The cursor's ``size_bytes``: a plain container's physical size at its
+    #: last read (None when the caller's projection does not carry it).
+    size_bytes: "int | None" = None
 
 
-#: Appended, in this order, to both walks' cursor SELECTs (#968 spec 5.3).
+#: Appended, in this order, to both walks' cursor SELECTs (#968 spec 5.3;
+#: #970 appends ``container_path``, the accepted location).
 _CODEX_CONTAINER_SELECT = (
     "container_kind,container_size_bytes,decoded_size_bytes,content_anchor,"
-    "content_anchor_offset,container_state,pending_container_fingerprint"
+    "content_anchor_offset,container_state,pending_container_fingerprint,"
+    "container_path"
 )
 
 
 def _accepted_container(row, *, ext: int, mtime: int, device: int,
-                        inode: int) -> _AcceptedContainer:
-    kind, csize, dsize, anchor, anchor_off, state, pending = row[ext:ext + 7]
+                        inode: int, size: "int | None" = None
+                        ) -> _AcceptedContainer:
+    (kind, csize, dsize, anchor, anchor_off, state, pending,
+     location) = row[ext:ext + 8]
     return _AcceptedContainer(
         kind or _rc.PLAIN, csize, dsize, row[mtime], row[device], row[inode],
         None if anchor is None else bytes(anchor), anchor_off,
-        state or "accepted", pending)
+        state or "accepted", pending, location,
+        None if size is None else row[size])
+
+
+def _codex_container_location_value(container, logical) -> "str | None":
+    """The ``container_path`` value for an accepted container (#970 G7):
+    NULL exactly when the container is the logical path, its path otherwise
+    (a zstd twin, or any archived container, plain included)."""
+    return (None if os.fspath(container) == os.fspath(logical)
+            else os.fspath(container))
 
 
 class _CodexContainerDecision(NamedTuple):
-    action: str  # "read" | "pending" | "skip"
+    action: str  # "read" | "pending" | "skip" | "adopt-location"
     size: "int | None"
     reason: "str | None"
     decoded_length: "int | None"
@@ -2377,6 +2841,15 @@ def _codex_container_decision(
       accepted decoded size, so an unchanged compressed rollout costs no decode.
     * A kind change or a changed zstd fingerprint is a TRANSITION: hold it
       pending. Nothing is re-ingested, reset or deleted on the walk.
+    * #970 spec 5.5, decided BEFORE the unchanged shortcuts: a selected
+      container at a different location than the accepted one is
+      ``adopt-location`` when kind, device, inode, physical size and
+      ``mtime_ns`` all match (zstd also needs a recorded decoded size) — the
+      walk records only the new ``container_path`` and proceeds as unchanged,
+      with ``size`` the read size an unchanged container would get. Any other
+      location change (a new inode, a legacy cursor without stat evidence, a
+      kind change) is a ``container-transition`` for plain and zstd alike, so
+      a relocated plain file never reaches the ordinary plain read.
     """
     fp = selected.fingerprint
     if accepted is None:
@@ -2413,6 +2886,27 @@ def _codex_container_decision(
         return _CodexContainerDecision(
             "read", validation.decoded_length, None,
             validation.decoded_length, validation.complete_line_end)
+    if _codex_container_location_value(
+            selected.path, selected.logical) != accepted.location:
+        same_stat = (
+            selected.kind == accepted.kind
+            and accepted.device is not None and accepted.inode is not None
+            and int(accepted.device) == fp.device
+            and int(accepted.inode) == fp.inode
+            and accepted.mtime_ns is not None
+            and int(accepted.mtime_ns) == fp.mtime_ns)
+        if same_stat and selected.kind == _rc.PLAIN:
+            if (accepted.size_bytes is not None
+                    and int(accepted.size_bytes) == fp.size):
+                return _CodexContainerDecision(
+                    "adopt-location", fp.size, None, None, None)
+        elif (same_stat and accepted.container_size is not None
+              and int(accepted.container_size) == fp.size
+              and accepted.decoded_size is not None):
+            return _CodexContainerDecision(
+                "adopt-location", int(accepted.decoded_size), None, None, None)
+        return _CodexContainerDecision(
+            "pending", None, "container-transition", None, None)
     if selected.kind != accepted.kind:
         return _CodexContainerDecision(
             "pending", None, "container-transition", None, None)
@@ -2466,6 +2960,49 @@ def _mark_codex_containers_pending(
     if commit:
         conn.commit()
     return changed
+
+
+#: Private test seam: called inside ``_adopt_codex_container_location`` with
+#: (table, path) before the selection is revalidated (a move racing a walk).
+_CODEX_LOCATION_ADOPT_HOOK: "Callable[[str, str], None] | None" = None
+
+
+def _adopt_codex_container_location(conn, table: str, path: str,
+                                    selected: "_rc.SelectedContainer",
+                                    snap: _AcceptedContainer) -> bool:
+    """Record a same-volume move: ``container_path`` only (#970 spec 5.5, A3).
+
+    The selection is revalidated first (same container path and fingerprint),
+    then ONE update writes the new accepted location, guarded by the complete
+    accepted-container snapshot the decision used and ``accepted`` state. No
+    derived row, incarnation, ledger, ``codex_physical_mutation_seq``,
+    ``last_ingested_at``, generation or barrier state changes, and no trigger
+    fires (the accounting triggers watch path, root key and thread id only).
+    ``False`` means the move raced this pass; the next pass decides again.
+    """
+    if table not in _VERIFY_TABLES:
+        raise ValueError(table)
+    hook = _CODEX_LOCATION_ADOPT_HOOK
+    if hook is not None:
+        hook(table, path)
+    again = _select_codex_container(path)
+    if (again is None or os.fspath(again.path) != os.fspath(selected.path)
+            or again.fingerprint != selected.fingerprint):
+        return False
+    is_zstd = snap.kind == _rc.ZSTD
+    cur = conn.execute(
+        f"UPDATE {table} SET container_path=? WHERE path=? "
+        "AND COALESCE(container_state,'accepted')='accepted' "
+        "AND COALESCE(container_kind,'plain') IS ? "
+        "AND container_path IS ? AND mtime_ns IS ? AND device_id IS ? "
+        "AND inode IS ? AND container_size_bytes IS ? "
+        "AND decoded_size_bytes IS ?"
+        + ("" if is_zstd else " AND size_bytes IS ?"),
+        (_codex_container_location_value(selected.path, selected.logical),
+         path, snap.kind, snap.location,
+         snap.mtime_ns, snap.device, snap.inode, snap.container_size,
+         snap.decoded_size) + (() if is_zstd else (snap.size_bytes,)))
+    return cur.rowcount == 1
 
 
 class _CursorSnapshot(NamedTuple):
@@ -2782,6 +3319,10 @@ def _adopt_codex_container(conn, table: str, snap: _CursorSnapshot,
                            verdict: ContainerVerdict) -> bool:
     """Adopt a verified container: container columns only (I4).
 
+    ``container_path`` follows #970 G7: NULL exactly when the adopted
+    container is the logical path, so a verified plain archive container keeps
+    its location (SR-05).
+
     Nothing else changes — no row is deleted or inserted, no incarnation,
     ledger, physical-mutation sequence or ``last_ingested_at``. The WHERE
     clause revalidates the cursor generation being adopted; the caller has
@@ -2811,7 +3352,8 @@ def _adopt_codex_container(conn, table: str, snap: _CursorSnapshot,
         f"{strikes} WHERE path=? AND last_byte_offset=? AND size_bytes=? "
         "AND last_total_tokens IS ? AND source_root_key IS ? "
         "AND container_state='pending'",
-        (fp.kind, fp.path if is_zstd else None, fp.size if is_zstd else None,
+        (fp.kind, _codex_container_location_value(fp.path, snap.path),
+         fp.size if is_zstd else None,
          verdict.decoded_length if is_zstd else None, fp.mtime_ns, fp.device,
          fp.inode, _rc.ANCHOR_VERSION, verdict.anchor, verdict.anchor_offset,
          state, reason, pending, snap.path, snap.last_byte_offset, snap.size_bytes,
@@ -2924,7 +3466,7 @@ def run_codex_container_verification_drain(
                     if snap is None:
                         retry_path = None
                         continue
-                    selected = _rc.select_container(path)
+                    selected = _select_codex_container(path)
                     qualified = _qualify_codex_targets({path})
                     if (not qualified
                             or qualified[0].source_root_key != snap.root_key):
@@ -2962,7 +3504,7 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
         if cache_side and hold is not None and snap is not None:
             # 5.11 U6: an undecodable candidate is suspended, not pending
             # forever. Recorded when admission allows; never waited for.
-            selected = _rc.select_container(pathlib.Path(path))
+            selected = _select_codex_container(pathlib.Path(path))
             if selected is not None:
                 _codex_admitted_cache_write(
                     lambda conn: _codex_barrier_apply_holds(
@@ -2993,7 +3535,7 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
                 _drain_backoff(adm)
                 return "retry"
             try:
-                again = _rc.select_container(path)
+                again = _select_codex_container(path)
                 qualified = _qualify_codex_targets({path})
                 if (again is None or again.fingerprint != verdict.fingerprint
                         or _load_cursor_snapshot(conn, table, path) != snap
@@ -3045,8 +3587,9 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
     prune_discovery = ((prune_discovery or _CodexPruneDiscoveryCache())
                        if resets else None)
     if prune_discovery is not None:
-        _roots, scope = prune_discovery.prepare()
-        if scope.refusal_reason(path, snap.root_key) is not None:
+        verdict_roots, scope = prune_discovery.prepare()
+        if _codex_witnessed_refusal(            # #970 spec 5.6 (A5)
+                scope, path, snap.root_key, roots=verdict_roots) is not None:
             counts["pending"] += 1
             return "done"
     # If validation found no unread complete line, target reconciliation is
@@ -3079,15 +3622,17 @@ def _apply_codex_verdict(table, path, snap, verdict, adm, counts, *,
             def recheck():
                 if adm.fresh_requests(_cctally_core.APP_DIR):
                     return True
-                again = _rc.select_container(path)
+                again = _select_codex_container(path)
                 qualified = _qualify_codex_targets({path})
                 stale[0] = (
                     again is None or again.fingerprint != verdict.fingerprint
                     or _load_cursor_snapshot(conn, table, path) != snap
                     or not qualified or qualified[0].source_root_key != snap.root_key)
                 if not stale[0] and prune_discovery is not None:
-                    _roots, scope = prune_discovery.prepare()
-                    stale[0] = scope.refusal_reason(path, snap.root_key) is not None
+                    recheck_roots, scope = prune_discovery.prepare()
+                    stale[0] = _codex_witnessed_refusal(
+                        scope, path, snap.root_key,
+                        roots=recheck_roots) is not None
                 return stale[0]
             if reconcile_only:
                 stats = CodexIngestStats()
@@ -3873,7 +4418,7 @@ def _codex_barrier_prepare_scan(path: str, root_key, cursor) -> _BarrierScanPrep
      state, device) = cursor
     if state != "accepted":
         return _BarrierScanPrep("changed", None, None, None, None)
-    selected = _rc.select_container(pathlib.Path(path))
+    selected = _select_codex_container(pathlib.Path(path))
     if selected is None:
         return _BarrierScanPrep("hold", None, "container-absent", None, None)
     generation = _codex_cursor_generation(kind, inode, csize, mtime_ns, dsize,
@@ -4088,6 +4633,11 @@ def _delete_codex_file_derived_rows(
         "DELETE FROM codex_session_files WHERE path = ?" + root_clause,
         params,
     )
+    # #927 B6: the identity's inventory row goes in the same transaction once
+    # no family carries it. A caller that re-ingests the file (a reset) puts
+    # it back through the INSERT triggers, so a reset keeps the identity.
+    _forget_codex_retained_identities(
+        conn, path_str, source_root_key, any_root=not match_source_root)
     # #496 S5b §4.3: this deletes `quota_window_snapshots` rows the journal still
     # retains, so any stored coverage certificate would assert coverage for
     # durable observations whose materialization was just removed — the
@@ -4098,38 +4648,70 @@ def _delete_codex_file_derived_rows(
     _invalidate_codex_journal_coverage_certificate(conn)
 
 
+def _codex_change_log_prune_cutoff(
+    conn: sqlite3.Connection, retain_sequences: int,
+) -> "int | None":
+    """The highest prunable mutation sequence, or None when nothing is due."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta "
+        "WHERE key='codex_accounting_mutation_seq'"
+    ).fetchone()
+    current = 0 if row is None else int(row[0])
+    cutoff = current - retain_sequences
+    if cutoff <= 0:
+        return None
+    if conn.execute(
+        "SELECT 1 FROM codex_accounting_change_log "
+        "WHERE mutation_seq <= ? LIMIT 1",
+        (cutoff,),
+    ).fetchone() is None:
+        return None
+    return cutoff
+
+
+def _codex_change_log_prune_due(
+    conn: sqlite3.Connection, *, retain_sequences: int = 50_000,
+) -> bool:
+    """#980 D5: the gate ``_prune_codex_accounting_change_log`` applies."""
+    try:
+        return _codex_change_log_prune_cutoff(conn, retain_sequences) is not None
+    except (sqlite3.Error, TypeError, ValueError):
+        return False
+
+
 def _prune_codex_accounting_change_log(
     conn: sqlite3.Connection,
     *,
     retain_sequences: int = 50_000,
+    max_rows: "int | None" = None,
 ) -> int:
     """Bound #582's ledger while preserving cold-fallback gap detection.
 
     The in-process dashboard cursor is intentionally not durable. Retaining a
     generous sequence tail serves ordinary ticks; a process older than that
     tail observes a non-contiguous first sequence and safely cold-loads.
+
+    ``max_rows`` (#980 D5) bounds one drain-executor unit, oldest first; the
+    retained tail is unchanged.
     """
     if retain_sequences < 1:
         raise ValueError("retain_sequences must be positive")
     try:
-        row = conn.execute(
-            "SELECT value FROM cache_meta "
-            "WHERE key='codex_accounting_mutation_seq'"
-        ).fetchone()
-        current = 0 if row is None else int(row[0])
-        cutoff = current - retain_sequences
-        if cutoff <= 0:
+        cutoff = _codex_change_log_prune_cutoff(conn, retain_sequences)
+        if cutoff is None:
             return 0
-        if conn.execute(
-            "SELECT 1 FROM codex_accounting_change_log "
-            "WHERE mutation_seq <= ? LIMIT 1",
-            (cutoff,),
-        ).fetchone() is None:
-            return 0
-        cursor = conn.execute(
-            "DELETE FROM codex_accounting_change_log WHERE mutation_seq <= ?",
-            (cutoff,),
-        )
+        if max_rows is None:
+            cursor = conn.execute(
+                "DELETE FROM codex_accounting_change_log WHERE mutation_seq <= ?",
+                (cutoff,),
+            )
+        else:
+            cursor = conn.execute(
+                "DELETE FROM codex_accounting_change_log WHERE seq IN ("
+                " SELECT seq FROM codex_accounting_change_log"
+                "  WHERE mutation_seq <= ? ORDER BY mutation_seq, seq LIMIT ?)",
+                (cutoff, int(max_rows)),
+            )
         return max(0, int(cursor.rowcount))
     except (sqlite3.Error, TypeError, ValueError):
         return 0
@@ -4222,6 +4804,19 @@ def _clear_codex_derived_rows(conn: sqlite3.Connection) -> bool:
     conn.execute("DELETE FROM codex_conversation_events")
     conn.execute("DELETE FROM codex_session_files")
     conn.execute("DELETE FROM codex_source_roots")
+    # #927 B6: all four inventory families are empty now, so the inventory is
+    # exactly empty and complete. Clear it and record `ready` in the wipe
+    # transaction; the re-ingest repopulates it through the triggers. A
+    # bootstrap that was in flight re-reads this state after its next
+    # admission and stops. Stores predating migration 051 have no table.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='codex_retained_identities'"
+    ).fetchone() is not None:
+        conn.execute("DELETE FROM codex_retained_identities")
+        _set_cache_meta(
+            conn, _cctally_db_sib.CODEX_IDENTITY_INVENTORY_KEY,
+            _cctally_db_sib.CODEX_IDENTITY_INVENTORY_READY)
     _codex_conversation_fts_full_clear(conn)
     # F3: this clears the Codex physical quota state, so any stored
     # quota-projection certificate would become stale-valid (its cache
@@ -5062,6 +5657,131 @@ class _RetainedCodexInventory:
     identities: tuple[tuple[str, str | None], ...]
     root_keys: frozenset[str]
     terminal_file_identities: frozenset[tuple[str, str | None]]
+    #: #927 B3: True when ``identities`` came from the maintained inventory
+    #: table, which may hold identities whose family rows are gone. Such a
+    #: set must be confirmed (``_confirm_retained_identities``) before any
+    #: member becomes protection evidence.
+    superset: bool = False
+
+
+def _codex_identity_inventory_state(
+    conn: sqlite3.Connection,
+) -> "tuple[str, int] | None":
+    """The inventory state (#927 B1): ``None`` when ready, else the bootstrap
+    cursor ``(family, last_rowid)``. A missing table or key, or any value
+    other than ``ready`` / ``bootstrap:<family>:<rowid>``, reads as
+    ``("files", 0)``: an unproven inventory never stands for a complete one.
+    """
+    try:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='codex_retained_identities'"
+        ).fetchone() is None:
+            return ("files", 0)
+        row = conn.execute(
+            "SELECT value FROM cache_meta WHERE key=?",
+            (_cctally_db_sib.CODEX_IDENTITY_INVENTORY_KEY,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return ("files", 0)
+    value = row[0] if row else None
+    if value == _cctally_db_sib.CODEX_IDENTITY_INVENTORY_READY:
+        return None
+    families = [item[0] for item in
+                _cctally_db_sib.CODEX_IDENTITY_INVENTORY_FAMILIES]
+    if isinstance(value, str):
+        parts = value.split(":")
+        if (len(parts) == 3 and parts[0] == "bootstrap"
+                and parts[1] in families and parts[2].isdigit()):
+            return (parts[1], int(parts[2]))
+    return ("files", 0)
+
+
+def codex_identity_inventory_ready(conn: sqlite3.Connection) -> bool:
+    """True only when the retained-identity inventory is complete (#927 B1)."""
+    return _codex_identity_inventory_state(conn) is None
+
+
+class _CodexInventoryProbeDeadline(Exception):
+    """A budgeted call ran out of time confirming refused identities (B5)."""
+
+
+def _codex_identity_has_rows(
+    conn: sqlite3.Connection, source_path: str, root_key: "str | None",
+) -> bool:
+    """Indexed existence probe: does any family still carry this identity?"""
+    probes = (
+        "SELECT 1 FROM codex_session_files "
+        "WHERE path = ? AND source_root_key IS ? LIMIT 1",
+        "SELECT 1 FROM codex_session_entries "
+        "WHERE source_path = ? AND source_root_key IS ? LIMIT 1",
+        "SELECT 1 FROM quota_window_snapshots WHERE source = 'codex' "
+        "AND source_path = ? AND source_root_key IS ? LIMIT 1",
+        "SELECT 1 FROM codex_conversation_threads "
+        "WHERE source_path = ? AND source_root_key IS ? LIMIT 1",
+    )
+    return any(
+        conn.execute(sql, (source_path, root_key)).fetchone() is not None
+        for sql in probes
+    )
+
+
+def _confirm_retained_identities(
+    conn: sqlite3.Connection,
+    identities: "list[tuple[str, str | None]]",
+    *,
+    deadline: "float | None" = None,
+) -> "list[tuple[str, str | None]]":
+    """Keep, in order, the identities a family still carries (#927 B5).
+
+    Each identity costs at most four indexed seeks, so the cost follows the
+    number of candidates, never the families' row multiplicity. A budgeted
+    caller passes its deadline; running past it raises
+    ``_CodexInventoryProbeDeadline`` and the caller defers the walk.
+    """
+    confirmed: "list[tuple[str, str | None]]" = []
+    for identity in identities:
+        if deadline is not None and _walk_clock() >= deadline:
+            raise _CodexInventoryProbeDeadline()
+        if _codex_identity_has_rows(conn, *identity):
+            confirmed.append(identity)
+    return confirmed
+
+
+def _forget_codex_retained_identities(
+    conn: sqlite3.Connection,
+    source_path: str,
+    root_key: "str | None" = None,
+    *,
+    any_root: bool = False,
+) -> int:
+    """Delete inventory rows for ``source_path`` whose family rows are gone.
+
+    #927 B6: the deletion owners call this in their own transaction after
+    deleting the family rows, so the inventory stays a superset of what the
+    families carry and shrinks back to it. ``any_root`` covers every root of
+    the path (a delete not qualified to one root). Returns the rows removed.
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='codex_retained_identities'"
+    ).fetchone() is None:
+        return 0
+    removed = 0
+    for (stored_root,) in conn.execute(
+        "SELECT source_root_key FROM codex_retained_identities "
+        "WHERE source_path = ?", (source_path,),
+    ).fetchall():
+        if not any_root and stored_root != root_key:
+            continue
+        if _codex_identity_has_rows(conn, source_path, stored_root):
+            continue
+        removed += conn.execute(
+            "DELETE FROM codex_retained_identities WHERE source_path = ? "
+            "AND IFNULL(source_root_key, char(0)) = IFNULL(?, char(0))",
+            (source_path, stored_root),
+        ).rowcount
+    return removed
 
 
 def _collect_retained_codex_inventory(
@@ -5074,6 +5794,14 @@ def _collect_retained_codex_inventory(
     every physical family, including a still-discovered path whose root no
     longer contains recognizable Codex data. Relative fixture rows have no
     on-disk authority and remain outside filesystem pruning.
+
+    #927 B3: when the maintained inventory is ``ready`` the identities come
+    from ``codex_retained_identities`` instead of the four history-sized
+    family scans. That set is a superset of the scanned one (``superset`` is
+    set), so callers confirm a member before it protects anything. The
+    terminal identities still come from ``codex_session_files``, which is
+    file-count-sized. When the inventory is not ready the legacy scans run
+    unchanged; requesting the bootstrap is the caller's business.
     """
     retained_identities: set[tuple[str, str | None]] = set()
     terminal_file_identities: set[tuple[str, str | None]] = set()
@@ -5084,12 +5812,15 @@ def _collect_retained_codex_inventory(
         if not os.path.isabs(source_path):
             continue
         retained_identities.add((source_path, root_key))
-    child_family_queries = (
+    superset = codex_identity_inventory_ready(conn)
+    child_family_queries = ((
+        "SELECT source_path, source_root_key FROM codex_retained_identities",
+    ) if superset else (
         "SELECT source_path, source_root_key FROM codex_session_entries",
         "SELECT source_path, source_root_key FROM quota_window_snapshots "
         "WHERE source = 'codex'",
         "SELECT source_path, source_root_key FROM codex_conversation_threads",
-    )
+    ))
     for query in child_family_queries:
         for source_path, root_key in conn.execute(query):
             if not os.path.isabs(source_path):
@@ -5110,15 +5841,243 @@ def _collect_retained_codex_inventory(
         )),
         root_keys=frozenset(retained_root_keys),
         terminal_file_identities=frozenset(terminal_file_identities),
+        superset=superset,
     )
 
 
 def _collect_retained_codex_paths_and_roots(
     conn: sqlite3.Connection,
 ) -> tuple[list[tuple[str, str | None]], set[str]]:
-    """Return every retained real source identity and provider root."""
+    """Return every retained real source identity and provider root.
+
+    Exact even over the #927 inventory: its superset is confirmed member by
+    member (the explicit rebuild preflight is the caller, which may refuse on
+    any of them), and the identity roots follow the confirmed set.
+    """
     inventory = _collect_retained_codex_inventory(conn)
-    return list(inventory.identities), set(inventory.root_keys)
+    if not inventory.superset:
+        return list(inventory.identities), set(inventory.root_keys)
+    identities = _confirm_retained_identities(conn, list(inventory.identities))
+    root_keys = {root for _path, root in identities if root is not None}
+    root_keys.update(
+        root for (root,) in conn.execute(
+            "SELECT source_root_key FROM codex_source_roots"))
+    return identities, root_keys
+
+
+# ── #970 spec 5.1 (G10): the requalification hold ────────────────────────────
+#: The four cache.db families of the retained inventory (cursorless included).
+_CODEX_HOLD_CACHE_FAMILIES = (
+    ("codex_session_files", "path", ""),
+    ("codex_session_entries", "source_path", ""),
+    ("quota_window_snapshots", "source_path", " AND source = 'codex'"),
+    ("codex_conversation_threads", "source_path", ""),
+)
+#: Every conversations.db family keyed by a source path.
+_CODEX_HOLD_CONVERSATION_FAMILIES = (
+    ("codex_conversation_source_files", "path", ""),
+    ("codex_conversation_messages", "source_path", ""),
+    ("codex_conversation_events", "source_path", ""),
+    ("codex_conversation_file_touches", "source_path", ""),
+)
+
+
+def _codex_archive_spellings(root: "CodexProviderRoot") -> "tuple[str, ...]":
+    """The archive directory spellings a direct-era identity may carry: the
+    configured spelling an older binary globbed, and its canonical form."""
+    if root.archive_root is None:
+        return ()
+    spellings = [str(root.archive_root)]
+    canonical = str(_canonical_codex_path(root.archive_root))
+    if canonical not in spellings:
+        spellings.append(canonical)
+    return tuple(spellings)
+
+
+def _codex_archive_spelled_names(conn: sqlite3.Connection, schema: str,
+                                 families, root: "CodexProviderRoot",
+                                 ) -> "set[str]":
+    """Logical names ``X.jsonl`` some row of ``families`` carries spelled
+    directly in ``root``'s archive directory (``<archive_root>/X.jsonl``).
+
+    One indexed range seek per family and spelling; a store with no such row
+    (every home that was never walked as a direct directory) costs exactly
+    those empty seeks. A missing table reads as no rows.
+    """
+    names: "set[str]" = set()
+    for spelling in _codex_archive_spellings(root):
+        low = spelling + os.sep
+        high = spelling + chr(ord(os.sep) + 1)
+        for table, column, extra in families:
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT {column} FROM {schema}{table} "
+                    f"WHERE {column} >= ? AND {column} < ?{extra}",
+                    (low, high)).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc):
+                    continue
+                raise
+            for (stored,) in rows:
+                rest = str(stored)[len(low):]
+                if rest and os.sep not in rest:
+                    names.add(rest)
+    return names
+
+
+#: #1046 spec 5.2: the three conversations families a cursorless
+#: archive-spelled source may live in, as ``(table, columns, order)``. Each
+#: order is one the family's ``source_path`` index can serve on the range
+#: seek, and the reference planner (SQLite 3.54.1) serves it with no sorter,
+#: which the #901 G1 guard enforces on the executed plans. It is the scan
+#: order the old ``DISTINCT`` followed on the reference runtime: id order for
+#: messages, line order for events.
+_CODEX_CURSORLESS_ARCHIVE_SOURCE_FAMILIES: "tuple[tuple[str, str, str], ...]" = (
+    ("codex_conversation_messages", "source_path, source_root_key",
+     "source_path, id"),
+    ("codex_conversation_events", "source_path, source_root_key",
+     "source_path, line_offset"),
+    ("codex_conversation_file_touches", "source_path, NULL", "source_path"),
+)
+
+
+def _codex_archive_spelled_source_pairs(
+        conn: sqlite3.Connection, table: str, columns: str, order: str,
+        low: str, high: str) -> "Iterator[tuple[str, str | None]]":
+    """Each ``(source_path, source_root_key)`` pair of ``table`` in the range
+    ``[low, high)``, once, at its first occurrence in ``order`` (#1046).
+
+    The pair set is the old ``SELECT DISTINCT``'s; the de-duplication runs in
+    Python over the streamed cursor instead of in a SQLite temp B-tree. The
+    seen-set holds one entry per distinct pair, which is what the temp B-tree
+    held.
+    """
+    seen: "set[tuple[str, str | None]]" = set()
+    for row in conn.execute(
+            f"SELECT {columns} FROM {table} "
+            f"WHERE source_path >= ? AND source_path < ? ORDER BY {order}",
+            (low, high)):
+        pair = (row[0], row[1])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        yield pair
+
+
+def _codex_cursorless_archive_spelled_conversation_sources(
+        conn: sqlite3.Connection, roots: "list[CodexProviderRoot]",
+        cursor_paths) -> "list[tuple[str, str | None]]":
+    """Direct-era archive-spelled conversations.db sources with no cursor row
+    (#970 spec 5.1, G10), as ``(source_path, source_root_key)``.
+
+    The ordinary conversations prune plans orphans from cursor rows only, so
+    a messages, events or file-touches family left without its
+    ``codex_conversation_source_files`` row would never be retired, and the
+    requalification hold on its dated identity would never clear: that
+    rollout's conversation would never be counted. The cache side already
+    plans such children through ``_collect_retained_codex_inventory``. Only
+    paths outside every walk root qualify (the scope exit of spec 5.1); the
+    drain then authorizes their deletion exactly as for a cursor row. The
+    root key is the stored one where a family carries it, else the owning
+    native root's (file touches store none); a path stored under two root
+    keys in one family keeps the first in the family's fixed order (#1046
+    D5). One indexed range seek per family and spelling, the same as the
+    hold's own read.
+    """
+    out: "dict[str, str | None]" = {}
+    for root in roots:
+        if root.archive_root is None:
+            continue
+        for spelling in _codex_archive_spellings(root):
+            low = spelling + os.sep
+            high = spelling + chr(ord(os.sep) + 1)
+            for table, columns, order in (
+                    _CODEX_CURSORLESS_ARCHIVE_SOURCE_FAMILIES):
+                for stored, root_key in _codex_archive_spelled_source_pairs(
+                        conn, table, columns, order, low, high):
+                    path = str(stored)
+                    rest = path[len(low):]
+                    if (not rest or os.sep in rest or path in cursor_paths
+                            or _codex_scope_root(path, None, roots) is not None):
+                        continue
+                    if out.get(path) is None:
+                        out[path] = root_key or root.source_root_key
+    return sorted(out.items())
+
+
+def _codex_requalification_held_names(
+        conn: "sqlite3.Connection | None",
+        conv_conn: "sqlite3.Connection | None",
+        roots: "list[CodexProviderRoot]", *,
+        cache_schema: str = "") -> "dict[str, frozenset[str]]":
+    """``{root_key: held logical names}`` for every native root (G10), read
+    once per walk. ``cache_schema`` reaches cache.db through an attachment
+    (the conversations walk's ``cache_db.``)."""
+    out: "dict[str, frozenset[str]]" = {}
+    for root in roots:
+        if root.archive_root is None:
+            continue
+        names: "set[str]" = set()
+        if conn is not None:
+            names |= _codex_archive_spelled_names(
+                conn, cache_schema, _CODEX_HOLD_CACHE_FAMILIES, root)
+        if conv_conn is not None:
+            names |= _codex_archive_spelled_names(
+                conv_conn, "", _CODEX_HOLD_CONVERSATION_FAMILIES, root)
+        if names:
+            out[root.source_root_key] = frozenset(names)
+    return out
+
+
+def _codex_conversations_hold_names(
+        roots: "list[CodexProviderRoot]",
+) -> "tuple[dict[str, frozenset[str]], frozenset[str]]":
+    """The conversations.db half of the hold, read from the cache walk.
+
+    A raw ``mode=ro`` connection: no schema apply, migration, attachment or
+    store lock, so the cache walk's lock order is untouched. A store not on
+    disk holds nothing. A store that cannot be read is unknown, and the
+    second value names the native roots whose ARCHIVE-resident first sights
+    the cache walk then holds (fail closed for the population that can carry
+    a direct-era spelling, without stopping ordinary sessions ingest).
+    """
+    native = [r for r in roots if r.archive_root is not None]
+    if not native:
+        return {}, frozenset()
+    path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+    try:
+        if not path.is_file():
+            return {}, frozenset()
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        conv = sqlite3.connect(uri, uri=True, timeout=5.0)
+    except (OSError, sqlite3.Error):
+        return {}, frozenset(r.source_root_key for r in native)
+    try:
+        return _codex_requalification_held_names(None, conv, native), frozenset()
+    except sqlite3.Error:
+        return {}, frozenset(r.source_root_key for r in native)
+    finally:
+        conv.close()
+
+
+def _codex_held_by_requalification(
+        held: "dict[str, frozenset[str]]", uncertain: "frozenset[str]",
+        discovered: "CodexDiscoveredFile", location: "str | None", *,
+        first_sight: bool) -> bool:
+    """The per-file test both walks apply (G10).
+
+    A dated identity is held while ``held`` names it under its root. A root in
+    ``uncertain`` (conversations.db could not be read) also holds its
+    archive-resident FIRST sights (``first_sight``: no cursor in the walking
+    store), the only population that could still double count against a
+    direct-era spelling (#970 N3). An identity that already has a cursor is
+    counted under its dated identity, so its new bytes are never held for an
+    unreadable store."""
+    names = held.get(discovered.source_root_key)
+    if names and discovered.source_path.name in names:
+        return True
+    return (first_sight and discovered.source_root_key in uncertain
+            and location == _rc.ARCHIVE)
 
 
 def _collect_inactive_codex_paths_and_roots(
@@ -5151,6 +6110,10 @@ def _collect_inactive_codex_paths_and_roots(
                 identity[0] in current_paths
                 and identity in terminal_file_identities
             )
+            # #927 B5: ``codex_prune_debt`` stores a NULL root as '' and so
+            # cannot tell the two apart; an identity whose root is '' is
+            # therefore never an orphan candidate (the planner protects it).
+            and identity[1] != ""
         )
     }
     stale_root_keys = {
@@ -5214,6 +6177,8 @@ def _plan_ordinary_codex_prune(
     current_file_identities: set[tuple[str, str]],
     active_root_keys: set[str],
     prune_scope: "_CodexPruneScope",
+    *,
+    deadline: "float | None" = None,
 ) -> _OrdinaryCodexPrunePlan:
     """Decide one ordinary pass's orphan prune from ONE retained collection.
 
@@ -5223,33 +6188,58 @@ def _plan_ordinary_codex_prune(
     exclusion and the orphan detection of children without a terminal file
     row are unchanged; only the duplicate scans are gone. The caller holds the
     cache writer and Codex provider flocks across this call.
+
+    #927 B5: over the maintained inventory (a superset) the refusal
+    partition is computed exactly as before, and each refused identity is
+    then confirmed present with indexed probes before it protects a path or
+    names a refused root, so a stale inventory row neither protects nor
+    refuses anything the families no longer carry. The probes honour
+    ``deadline`` (``_CodexInventoryProbeDeadline``). A stale identity planned
+    as an orphan becomes prune debt, which the drain re-validates and
+    reconciles. An identity whose root key is '' is never an orphan candidate
+    and is protected as refused.
     """
     inventory = _collect_retained_codex_inventory(conn)
     orphan_sources, orphan_root_keys = _collect_inactive_codex_paths_and_roots(
         conn, current_file_identities, active_root_keys, inventory=inventory,
     )
+    # #970 spec 5.6 (A5): the logical parent is checked first; only an
+    # identity failing it is probed. A present container (an archived rollout
+    # whose dated directory never existed) is witnessed by its own directory,
+    # so it is neither protected from recovery nor a refused orphan; an absent
+    # one is witnessed by its accepted location (the deletion witness).
+    roots = _codex_provider_roots()
+
+    def refusal(path: str, root_key: "str | None") -> "str | None":
+        return _codex_witnessed_refusal(
+            prune_scope, path, root_key, roots=roots, conn=conn,
+            table="codex_session_files")
+
     (
         safe_sources,
         refused_orphan_sources,
         safe_root_keys,
         refused_orphan_root_keys,
     ) = _partition_codex_prune_candidates(
-        prune_scope, orphan_sources, orphan_root_keys
+        prune_scope, orphan_sources, orphan_root_keys, refusal=refusal,
     )
     retained_sources = list(inventory.identities)
-    retained_source_root_keys = {
+    # Every refused root is the root of a refused identity: `refusal_reason`
+    # applies `root_refusal_reason`'s two conditions first. So the refused
+    # roots of the retained roots are exactly the refusable roots of the
+    # (confirmed) refused identities.
+    refused_sources = [
+        source for source in retained_sources
+        if source[1] == "" or refusal(*source)
+    ]
+    if inventory.superset:
+        refused_sources = _confirm_retained_identities(
+            conn, refused_sources, deadline=deadline)
+    refused_root_keys = {
         root_key
-        for _path, root_key in retained_sources
-        if root_key is not None
+        for _path, root_key in refused_sources
+        if root_key is not None and prune_scope.root_refusal_reason(root_key)
     }
-    (
-        _safe_retained_sources,
-        refused_sources,
-        _safe_retained_roots,
-        refused_root_keys,
-    ) = _partition_codex_prune_candidates(
-        prune_scope, retained_sources, retained_source_root_keys
-    )
     return _OrdinaryCodexPrunePlan(
         orphan_sources=orphan_sources,
         orphan_root_keys=orphan_root_keys,
@@ -5314,6 +6304,10 @@ class PruneDrainResult(NamedTuple):
     identities_dropped: int
     yielded: int
     remaining: int
+    # #980 D5: units of finalization debt and of owed maintenance the
+    # executor settled (prune identities stay in the counts above).
+    finalization_units: int = 0
+    owed_units: int = 0
 
 
 #: Private test seam: called inside each identity transaction, before commit.
@@ -5363,22 +6357,6 @@ def _drain_backoff(adm) -> None:
         adm._sleep(adm.POLL_SECONDS)
 
 
-def _codex_identity_present(path: str, root_key: "str | None",
-                            roots: "list[CodexProviderRoot]") -> bool:
-    """Logical presence under the identity's own configured root (I2)."""
-    candidate = pathlib.Path(path)
-    for root in roots:
-        if root_key is not None and root.source_root_key != root_key:
-            continue
-        try:
-            inside = candidate.is_relative_to(root.walk_root)
-        except (ValueError, TypeError):
-            inside = False
-        if inside and _rc.select_container(candidate) is not None:
-            return True
-    return False
-
-
 class _CodexPruneDiscoveryCache:
     """One discovery per drain pass (#968 spec 5.7; review N10).
 
@@ -5407,6 +6385,200 @@ class _CodexPruneDiscoveryCache:
         return roots, _codex_prune_scope(self._files)
 
 
+#: #980 D5: TRUNCATE attempts one executor run makes before leaving a busy
+#: checkpoint owed for the next run.
+_CODEX_OWED_WAL_ATTEMPTS = 3
+
+
+def _codex_executor_next_unit(
+    conn: sqlite3.Connection, blocked: "set[str]",
+) -> "str | None":
+    """The next non-prune unit the executor owes, re-read from the store.
+
+    Finalization debt first (a refused projection waits on its model flag),
+    then the ingest catch-up a budgeted walk deferred at the anchor seed
+    deadline (#980 F4), then the accounting change-log prune, then one
+    TRUNCATE attempt. A kind in ``blocked`` failed or stalled earlier in this
+    run and waits for the next.
+    """
+    if ("finalization" not in blocked
+            and not load_codex_finalization_debt(conn).empty):
+        return "finalization"
+    if "ingest_catch_up" not in blocked:
+        whole_tree, paths = load_codex_owed_catch_up(conn)
+        if whole_tree or paths:
+            return "ingest_catch_up"
+    owed = load_codex_owed_maintenance(conn)
+    if owed.get("change_log_prune") and "change_log_prune" not in blocked:
+        return "change_log_prune"
+    if owed.get("wal_truncate") and "wal_truncate" not in blocked:
+        return "wal_truncate"
+    return None
+
+
+def _run_codex_executor_unit(
+    conn: sqlite3.Connection, kind: str,
+) -> "tuple[bool, bool]":
+    """Run one admitted unit of finalization debt or owed maintenance (D5).
+
+    Re-reads its state after admission (the caller re-chose ``kind`` under the
+    gate), commits, and returns ``(succeeded, model_cleared)``. A flag clears
+    only on success. ``conn`` holds no transaction on entry or exit.
+    """
+    if kind == "finalization":
+        before = load_codex_finalization_debt(conn)
+        if before.empty:
+            conn.rollback()
+            return True, False
+        outcome = _codex_settle_finalization(conn, deadline=None, max_units=1)
+        for line in outcome.errors:
+            eprint(line)
+        conn.commit()
+        after = load_codex_finalization_debt(conn)
+        conn.rollback()
+        failed = bool(outcome.model_failed or outcome.adoption_failed
+                      or outcome.reconcile_failed or outcome.cancelled)
+        cleared = bool((before.model or before.full or before.malformed)
+                       and not (after.model or after.full or after.malformed))
+        return (not failed and outcome.units_done > 0), cleared
+    if kind == "change_log_prune":
+        removed = 0
+        if _codex_change_log_prune_due(conn):
+            removed = _prune_codex_accounting_change_log(
+                conn, retain_sequences=50_000,
+                max_rows=_CODEX_CHANGE_LOG_PRUNE_UNIT)
+        done = not _codex_change_log_prune_due(conn)
+        if done:
+            _clear_codex_owed_flag(conn, "change_log_prune")
+        conn.commit()
+        # A unit that removed nothing yet left rows due failed (the prune is
+        # fail-soft); the flag stays owed for the next run.
+        return (done or removed > 0), False
+    if kind == "wal_truncate":
+        conn.rollback()                     # the checkpoint needs autocommit
+        db_path = _cctally_core.CACHE_DB_PATH
+        busy = False
+        if _cache_wal_truncate_due(db_path):
+            prior = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            try:
+                conn.execute(
+                    f"PRAGMA busy_timeout={CHECKPOINT_AUTO_BUSY_TIMEOUT_MS}")
+                busy = _run_wal_truncate(conn, db_path, db_label="cache.db").busy
+            except sqlite3.OperationalError:
+                busy = True
+            finally:
+                conn.execute(f"PRAGMA busy_timeout={prior}")
+        if busy:
+            return False, False
+        _clear_codex_owed_flag(conn, "wal_truncate")
+        conn.commit()
+        return True, False
+    raise ValueError(f"unknown executor unit {kind!r}")
+
+
+def _run_codex_ingest_catch_up_unit(conn: sqlite3.Connection, adm) -> str:
+    """Ingest what budgeted walks deferred at the anchor seed deadline (#980 F4).
+
+    One admitted, UNBUDGETED sync: targeted (``only_paths``) over the
+    recorded paths, or the whole tree when the owed record is malformed or a
+    budgeted walk's refused-identity probe overran (#927 R3). Its
+    canonical-anchor seed therefore runs to completion (measured 9.7 s cold on
+    a 328,727-row weekly group) while the sync holds both writer flocks; hooks
+    meanwhile meet contention and publish waiting requests. The sync owns its
+    locks, exactly like the reset drain: admission takes only the gate, the
+    sync tries the flocks without waiting, and a waiting request seen once it
+    holds them makes it return contended. A targeted sync never runs the
+    global quota reconcile, and the whole-tree form defers it, so the next
+    hook's alert-eligible reconcile evaluates the ingested observations.
+    Never gated on, and never performing, an armed byte-zero replay: that is
+    the replay drain's (the targeted form would defer on it anyway).
+
+    Returns ``"done"`` (the catch-up it read is retired), ``"yielded"`` or
+    ``"failed"``; only ``"done"`` clears anything, so a yield, a failure or an
+    exception leaves the catch-up owed for the next run.
+    """
+    whole_tree, paths = load_codex_owed_catch_up(conn)
+    replay_armed = conn.execute(
+        "SELECT 1 FROM cache_meta WHERE key=? LIMIT 1",
+        (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone() is not None
+    conn.rollback()
+    if not (whole_tree or paths):
+        return "done"
+    if replay_armed:
+        return "failed"
+    admission = adm.admit(_cctally_core.APP_DIR, lambda: "sync-owns-locks",
+                          lambda token: None)
+    if not admission.admitted:
+        return "yielded"
+    try:
+        stats = sync_codex_cache(
+            conn, maintenance="caller", lock_timeout=0,
+            only_paths=None if whole_tree else set(paths),
+            quota_reconcile="defer",
+            _after_locks=lambda: bool(adm.fresh_requests(_cctally_core.APP_DIR)))
+    finally:
+        adm.finish(admission, lambda token: None)
+    if conn.in_transaction:
+        conn.rollback()
+    for command in stats.drain_requested:
+        # Other workers this sync planned (verification, resets, inventory);
+        # this one is already running and re-reads its own work.
+        if command != CODEX_PRUNE_DRAIN_COMMAND:
+            _request_codex_drain_worker(command)
+    if stats.lock_contended:
+        return "yielded"
+    if (stats.deferred_reason or stats.rebuild_refused or stats.files_failed
+            or stats.budget_exhausted or stats.files_deferred_torn
+            or stats.container_pending or sum(stats.container_skipped.values())):
+        return "failed"
+    admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                          _release_cache_store_locks)
+    if not admission.admitted:
+        return "yielded"        # ingested; the retirement is re-tried next run
+    try:
+        _clear_codex_owed_catch_up(conn, whole_tree=whole_tree, paths=paths)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        adm.finish(admission, _release_cache_store_locks)
+    return "done"
+
+
+def _next_codex_debt_row(conn: sqlite3.Connection, table: str,
+                         after: "tuple[str, str] | None"):
+    """The next debt row in key order, strictly past ``after`` when given.
+
+    #970: a drain passes over an identity whose absence is unknown, keeping
+    its row; without the keyset the ordered ``LIMIT 1`` would return that
+    same row forever.
+    """
+    if after is None:
+        return conn.execute(
+            f"SELECT source_path, source_root_key FROM {table} "
+            "ORDER BY source_path, source_root_key LIMIT 1").fetchone()
+    return conn.execute(
+        f"SELECT source_path, source_root_key FROM {table} "
+        "WHERE (source_path, source_root_key) > (?, ?) "
+        "ORDER BY source_path, source_root_key LIMIT 1", after).fetchone()
+
+
+def _codex_drain_presence(path: str, root_key: "str | None",
+                          roots: "list[CodexProviderRoot]") -> str:
+    """A destructive drain's presence verdict (#970 spec 5.6, G8).
+
+    Inside the identity's discovery scope: ``_codex_stable_absence``. Outside
+    every walk root (a scope exit, spec 5.1, e.g. a direct-era archive-spelled
+    identity of a requalified home): ``"absent"``, today's rule, leaving the
+    authorization to recognition and the parent witness.
+    """
+    root = _codex_scope_root(path, root_key, roots)
+    if root is None:
+        return "absent"
+    return _codex_stable_absence(path, root, roots=roots)
+
+
 def run_codex_prune_drain(*, wait_for_requests: bool = True,
                           max_identities: "int | None" = None) -> PruneDrainResult:
     """Drain cache.db prune debt one logical identity per transaction (#968 5.7).
@@ -5423,7 +6595,12 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
     if worker is None:
         return PruneDrainResult("busy", 0, 0, 0, -1)
     deleted = dropped = yielded = 0
+    finalization_units = owed_units = wal_attempts = 0
+    blocked: "set[str]" = set()
     discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
+    # #970 spec 5.6: an identity whose absence is unknown keeps its debt and
+    # is passed over for the rest of this run (keyset past it).
+    after: "tuple[str, str] | None" = None
     try:
         while max_identities is None or deleted + dropped < max_identities:
             # Prepare without locks: the identity and its #485 scope, computed
@@ -5433,11 +6610,82 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
             # identity.
             conn = open_cache_db()
             try:
-                row = conn.execute(
-                    "SELECT source_path, source_root_key FROM codex_prune_debt "
-                    "ORDER BY source_path, source_root_key LIMIT 1").fetchone()
-                if row is None:
+                # #980 D5: the loop runs while prune debt, finalization debt
+                # or owed maintenance exists. Finalization goes first, so a
+                # projection refused over an unresolved model is unblocked
+                # before a long prune backlog; every unit has its own
+                # admission, re-reads its state under the gate and commits.
+                unit = _codex_executor_next_unit(conn, blocked)
+                conn.rollback()
+                if unit == "ingest_catch_up":
+                    # #980 F4: its sync owns the locks and its own admission.
+                    caught = _run_codex_ingest_catch_up_unit(conn, adm)
+                    if caught == "yielded":
+                        yielded += 1
+                        if not wait_for_requests:
+                            break
+                        _drain_backoff(adm)
+                    elif caught == "done":
+                        owed_units += 1
+                    else:
+                        blocked.add("ingest_catch_up")
+                    continue
+                row = None
+                if unit != "finalization":
+                    row = _next_codex_debt_row(conn, "codex_prune_debt", after)
+                    conn.rollback()
+                if row is None and unit is None:
                     break
+                if row is None:
+                    admission = adm.admit(_cctally_core.APP_DIR,
+                                          _cache_store_locks,
+                                          _release_cache_store_locks)
+                    if not admission.admitted:
+                        yielded += 1
+                        if not wait_for_requests:
+                            break
+                        _drain_backoff(adm)
+                        continue
+                    model_cleared = False
+                    try:
+                        unit = _codex_executor_next_unit(conn, blocked)
+                        conn.rollback()
+                        if unit is None or unit == "ingest_catch_up":
+                            # #981 R2: a catch-up a hook recorded since the
+                            # unlocked read runs through its own path (its sync
+                            # owns the locks): release this admission and let
+                            # the next pass dispatch it.
+                            continue
+                        ok, model_cleared = _run_codex_executor_unit(conn, unit)
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                    finally:
+                        adm.finish(admission, _release_cache_store_locks)
+                    if model_cleared:
+                        # D5: republish the projection a publisher refused
+                        # while the flag was set; outside every store lock.
+                        try:
+                            from _cctally_quota import (
+                                _defer_codex_quota_verification)
+                            _defer_codex_quota_verification()
+                        except Exception:
+                            pass
+                    if unit == "finalization":
+                        finalization_units += int(ok)
+                        if not ok:
+                            blocked.add("finalization")
+                    elif ok:
+                        owed_units += 1
+                    elif unit == "change_log_prune":
+                        blocked.add("change_log_prune")
+                    elif unit == "wal_truncate":
+                        wal_attempts += 1
+                        if wal_attempts >= _CODEX_OWED_WAL_ATTEMPTS:
+                            blocked.add("wal_truncate")
+                        else:
+                            adm._sleep(adm.POLL_SECONDS)
+                    continue
                 roots, scope = discovery.prepare()
                 admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
                                       _release_cache_store_locks)
@@ -5452,14 +6700,36 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
                             != [r.source_root_key for r in roots]):
                         continue          # roots changed while admitting: re-prepare
                     path, stored_root = row[0], (row[1] or None)
+                    # #970 spec 5.6 (A4/A5): inside its discovery scope an
+                    # identity is deleted only on STABLE proved absence, and
+                    # its deletion witness follows its accepted location; a
+                    # scope exit keeps today's rule (not present).
+                    presence = _codex_drain_presence(path, stored_root, roots)
+                    if presence == "unknown":
+                        after = (row[0], row[1])
+                        conn.rollback()
+                        continue
+                    present = presence == "present"
                     eligible, _refused, _ok_roots, _refused_roots = (
                         _partition_codex_prune_candidates(
-                            scope, [(path, stored_root)], set()))
-                    present = _codex_identity_present(path, stored_root, roots)
-                    if present or not eligible:
+                            scope, [(path, stored_root)], set(),
+                            refusal=lambda p, k: scope.refusal_reason(
+                                p, k, witness=_codex_deletion_witness(
+                                    conn, "codex_session_files", p,
+                                    _codex_scope_root(p, k, roots)))))
+                    # #927 B5: debt planned from a stale inventory row names
+                    # an identity no family carries, which the legacy scans
+                    # could never have planned: delete nothing for it.
+                    stale = not _codex_identity_has_rows(conn, path, stored_root)
+                    if present or not eligible or stale:
                         conn.execute(
                             "DELETE FROM codex_prune_debt WHERE source_path=? "
                             "AND source_root_key=?", (path, row[1]))
+                        # #927 B5: debt planned from a stale inventory row
+                        # deletes nothing, but the row itself goes, so the
+                        # next plan does not record the same debt again.
+                        _forget_codex_retained_identities(
+                            conn, path, stored_root)
                         conn.commit()
                         dropped += 1
                         continue
@@ -5467,8 +6737,13 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
                         "SELECT DISTINCT conversation_key FROM "
                         "codex_conversation_messages WHERE source_path=?",
                         (path,)) if r[0]}
-                    _codex_barrier_forget_identity(
-                        conn, codex_file_key_for_entry_path(stored_root or "", path))
+                    if stored_root is not None:
+                        # A NULL-root identity has no durable file key (the
+                        # key needs a root), so it never held a barrier
+                        # membership; computing one raised and stopped the
+                        # drain on its first NULL-root debt.
+                        _codex_barrier_forget_identity(
+                            conn, codex_file_key_for_entry_path(stored_root, path))
                     _delete_codex_file_derived_rows(
                         conn, path, source_root_key=stored_root,
                         match_source_root=True)
@@ -5502,7 +6777,8 @@ def run_codex_prune_drain(*, wait_for_requests: bool = True,
             conn.close()
         outcome = "drained" if remaining == 0 else (
             "yielded" if yielded else "partial")
-        return PruneDrainResult(outcome, deleted, dropped, yielded, remaining)
+        return PruneDrainResult(outcome, deleted, dropped, yielded, remaining,
+                                finalization_units, owed_units)
     finally:
         _release_worker_lock(worker)
 
@@ -5563,14 +6839,13 @@ def run_codex_conversation_prune_drain(
     deleted = dropped = yielded = 0
     repair_retried = False
     discovery = _CodexPruneDiscoveryCache()     # one discovery per pass (N10)
+    after: "tuple[str, str] | None" = None     # #970: unknown absence (5.6)
     try:
         while max_identities is None or deleted + dropped < max_identities:
             conn = open_conversations_db()          # before admission (S-P2b)
             try:
-                row = conn.execute(
-                    "SELECT source_path, source_root_key "
-                    "FROM codex_conversation_prune_debt "
-                    "ORDER BY source_path, source_root_key LIMIT 1").fetchone()
+                row = _next_codex_debt_row(
+                    conn, "codex_conversation_prune_debt", after)
                 if row is None:
                     break
                 # Prepared without locks: this identity's scope, from the
@@ -5603,11 +6878,22 @@ def run_codex_conversation_prune_drain(
                         "WHERE path=?", (path,)).fetchone()
                     requalified = (cursor is not None
                                    and (cursor[0] or None) != stored_root)
+                    presence = ("present" if requalified else
+                                _codex_drain_presence(path, stored_root, roots))
+                    if presence == "unknown":
+                        # #970 spec 5.6: keep the debt untouched; retry later.
+                        after = (row[0], row[1])
+                        conn.rollback()
+                        continue
                     eligible, _refused, _ok_roots, _refused_roots = (
                         _partition_codex_prune_candidates(
-                            scope, [(path, stored_root)], set()))
+                            scope, [(path, stored_root)], set(),
+                            refusal=lambda p, k: scope.refusal_reason(
+                                p, k, witness=_codex_deletion_witness(
+                                    conn, "codex_conversation_source_files", p,
+                                    _codex_scope_root(p, k, roots)))))
                     if (requalified
-                            or _codex_identity_present(path, stored_root, roots)
+                            or presence == "present"
                             or not eligible):
                         conn.execute(
                             "DELETE FROM codex_conversation_prune_debt "
@@ -5685,6 +6971,14 @@ def _codex_prune_root_cleanup(conn, adm) -> bool:
             _prune_inactive_codex_source_roots(
                 conn, active_root_keys,
                 candidate_root_keys=set(plan.safe_root_keys))
+            # #927 B6: inventory rows under a root the #485 partition proved
+            # safe to remove go with it once no family carries them.
+            for path, root_key in conn.execute(
+                "SELECT source_path, source_root_key "
+                "FROM codex_retained_identities"
+            ).fetchall() if codex_identity_inventory_ready(conn) else ():
+                if root_key in plan.safe_root_keys:
+                    _forget_codex_retained_identities(conn, path, root_key)
         conn.execute("DELETE FROM cache_meta WHERE key=?",
                      (CODEX_PRUNE_ROOT_CLEANUP_KEY,))
         conn.commit()
@@ -5696,7 +6990,77 @@ def _codex_prune_root_cleanup(conn, adm) -> bool:
         adm.finish(admission, _release_cache_store_locks)
 
 
+# ── #939 D5: detached Codex worker attempt records ─────────────────────────
+
+def _spawn_codex_worker(command: str) -> bool:
+    """Spawn one detached Codex worker with its attempt record (#939 D5).
+
+    The record is written immediately before the spawn and its id reaches the
+    child through ``_worker_lifecycle.ATTEMPT_ENV``; the child's pid is added
+    right after it as ``spawnPid``, so a child that dies before marking its
+    start stops counting at once. A spawn that fails removes the record at
+    once, so a worker that never existed holds nothing. Callers reach here
+    only after their throttle admitted the request."""
+    import _cctally_update
+    app_dir = _cctally_core.APP_DIR
+    attempt = _worker_lifecycle.begin_attempt(app_dir, command, time.time())
+    env = {} if attempt is None else {_worker_lifecycle.ATTEMPT_ENV: attempt}
+    _cctally_update.take_detached_pid()
+    with _cctally_update.detached_env(env):
+        spawned = _cctally_update._spawn_detached(command)
+    pid = _cctally_update.take_detached_pid()
+    if attempt is not None:
+        if not spawned:
+            _worker_lifecycle.end_attempt(app_dir, command, attempt)
+        elif pid is not None:
+            _worker_lifecycle.note_spawned(app_dir, command, attempt, pid=pid)
+    return bool(spawned)
+
+
+@contextlib.contextmanager
+def _codex_worker_attempt(command: str):
+    """A detached worker's lifetime record (#939 D5): its lifetime lock, then
+    ``startedAt`` and the pid first, removal of its own record and lock in a
+    ``finally``. The attempt id is taken
+    out of the environment so a worker this one spawns cannot claim it. A
+    worker run by hand carries no attempt and records nothing."""
+    attempt = os.environ.pop(_worker_lifecycle.ATTEMPT_ENV, None)
+    app_dir = _cctally_core.APP_DIR
+    lock = None
+    if attempt:
+        # The lifetime lock is held from here to the `finally`: a worker
+        # killed without it releases the lock with its process, so its record
+        # stops counting whatever later reuses its pid.
+        lock = _worker_lifecycle.mark_started(app_dir, command, attempt,
+                                              pid=os.getpid(), now=time.time())
+    try:
+        yield
+    finally:
+        if attempt:
+            _worker_lifecycle.end_attempt(app_dir, command, attempt, lock)
+
+
 def cmd_codex_prune_drain_internal(args) -> int:
+    """Hidden ``_codex-prune-drain`` handler (#968 spec 5.7). Always returns 0."""
+    with _codex_worker_attempt(CODEX_PRUNE_DRAIN_COMMAND):
+        return _cmd_codex_prune_drain_body(args)
+
+
+def cmd_codex_inventory_bootstrap_internal(args) -> int:
+    """Hidden ``_codex-inventory-bootstrap`` handler (#927 B2). Always 0."""
+    with _codex_worker_attempt(CODEX_INVENTORY_BOOTSTRAP_COMMAND):
+        return _cmd_codex_inventory_bootstrap_body(args)
+
+
+def cmd_codex_replay_drain_internal(args) -> int:
+    """Hidden ``_codex-replay-drain`` handler (public #5): see
+    `_cmd_codex_replay_drain_body`."""
+    with _codex_worker_attempt(CODEX_REPLAY_DRAIN_COMMAND):
+        return _cmd_codex_replay_drain_body(args)
+
+
+
+def _cmd_codex_prune_drain_body(args) -> int:
     """Hidden ``_codex-prune-drain`` handler (#968 spec 5.7). Always returns 0."""
     from _cctally_record import (
         _hook_log_error_detail, _hook_log_safe_free_text, _hook_tick_log_line,
@@ -5724,13 +7088,265 @@ def cmd_codex_prune_drain_internal(args) -> int:
     _log(result.outcome,
          f"deleted={result.identities_deleted} dropped={result.identities_dropped} "
          f"yielded={result.yielded} remaining={result.remaining} "
+         f"finalization_units={result.finalization_units} "
+         f"owed_units={result.owed_units} "
          f"conv_deleted={conv_result.identities_deleted} "
          f"conv_dropped={conv_result.identities_dropped} "
          f"conv_remaining={conv_result.remaining}")
     return 0
 
 
-def _append_codex_quota_obs(quota_rows: list) -> None:
+
+#: Private test seam: called inside each bootstrap chunk's transaction,
+#: before its commit, with the state the chunk is about to record.
+_CODEX_INVENTORY_BOOTSTRAP_PRECOMMIT_HOOK: "Callable[[str], None] | None" = None
+
+
+def _codex_inventory_bootstrap_chunk(
+    conn: sqlite3.Connection, family: str, after_rowid: int,
+) -> str:
+    """Backfill one chunk of one family and return the state to record.
+
+    Reads at most ``_CODEX_INVENTORY_BOOTSTRAP_CHUNK`` of the family's rows
+    past ``after_rowid`` in rowid order (an index-free rowid range on the
+    table b-tree) and copies their identities with ``INSERT OR IGNORE``. A
+    short chunk finishes the family, so the next state names the next family
+    at rowid 0, or ``ready`` after the last one. Rows written after the
+    triggers existed are already present; the cursor only has to cover rows
+    that predate them, all of which sit at or below the family's rowid
+    high-water when the bootstrap reaches it.
+    """
+    families = _cctally_db_sib.CODEX_IDENTITY_INVENTORY_FAMILIES
+    index = [item[0] for item in families].index(family)
+    _token, table, path_col, extra = families[index]
+    chunk = int(_CODEX_INVENTORY_BOOTSTRAP_CHUNK)
+    last, count = conn.execute(
+        f"SELECT MAX(rid), COUNT(*) FROM (SELECT rowid AS rid FROM {table} "
+        f"WHERE rowid > ?{extra} ORDER BY rowid LIMIT ?)",
+        (after_rowid, chunk),
+    ).fetchone()
+    if count:
+        conn.execute(
+            "INSERT OR IGNORE INTO codex_retained_identities "
+            "(source_path, source_root_key) "
+            f"SELECT {path_col}, source_root_key FROM {table} "
+            f"WHERE rowid > ? AND rowid <= ?{extra}",
+            (after_rowid, int(last)),
+        )
+    if count >= chunk:
+        return f"bootstrap:{family}:{int(last)}"
+    if index + 1 < len(families):
+        return f"bootstrap:{families[index + 1][0]}:0"
+    return _cctally_db_sib.CODEX_IDENTITY_INVENTORY_READY
+
+
+def run_codex_inventory_bootstrap(*, wait_for_requests: bool = True) -> int:
+    """Complete the retained-identity inventory (#927 spec §4.2 B2).
+
+    Single-flight through ``codex-inventory-bootstrap.lock``. Each chunk is
+    admitted through the global drain gate (``_lib_codex_drain_admission``),
+    so a waiting hook's request makes it yield between chunks. After every
+    admission the state key is READ AGAIN: a Codex ``--rebuild`` may have set
+    ``ready`` (its wipe empties every family) or a re-delivered schema may
+    have reset the cursor. The chunk and its advanced cursor commit together,
+    so an interrupted bootstrap resumes from the cursor. Concurrent writers
+    are covered by the triggers throughout. ``wait_for_requests=False``
+    stops at the first refused admission instead of waiting.
+
+    Returns the number of chunks committed (0 when another bootstrap holds the
+    worker lock, when the inventory is already ready, or when the store
+    predates the table).
+    """
+    import _lib_codex_drain_admission as adm
+    worker = _worker_lock(CODEX_INVENTORY_BOOTSTRAP_LOCK_NAME)
+    if worker is None:
+        return 0
+    chunks = 0
+    try:
+        while True:
+            conn = open_cache_db()          # before admission (S-P2b)
+            try:
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='codex_retained_identities'"
+                ).fetchone() is None:
+                    break
+                if codex_identity_inventory_ready(conn):
+                    break
+                admission = adm.admit(_cctally_core.APP_DIR, _cache_store_locks,
+                                      _release_cache_store_locks)
+                if not admission.admitted:
+                    if not wait_for_requests:
+                        break
+                    _drain_backoff(adm)
+                    continue
+                try:
+                    state = _codex_identity_inventory_state(conn)
+                    if state is None:
+                        break
+                    next_state = _codex_inventory_bootstrap_chunk(conn, *state)
+                    _set_cache_meta(
+                        conn, _cctally_db_sib.CODEX_IDENTITY_INVENTORY_KEY,
+                        next_state)
+                    if _CODEX_INVENTORY_BOOTSTRAP_PRECOMMIT_HOOK is not None:
+                        _CODEX_INVENTORY_BOOTSTRAP_PRECOMMIT_HOOK(next_state)
+                    conn.commit()
+                    chunks += 1
+                except BaseException:
+                    conn.rollback()
+                    raise
+                finally:
+                    adm.finish(admission, _release_cache_store_locks)
+            finally:
+                conn.close()
+        return chunks
+    finally:
+        _release_worker_lock(worker)
+
+
+def request_codex_inventory_bootstrap() -> bool:
+    """Attempt-throttled detached spawn of ``_codex-inventory-bootstrap``.
+
+    Called only after the requester released its cache locks. Returns True
+    when a worker was handed off. A failed spawn removes the throttle marker
+    so the next request retries at once; the inline fallback is never taken
+    here (``cache-sync`` runs the executor itself).
+    """
+    marker = _cctally_core.APP_DIR / CODEX_INVENTORY_BOOTSTRAP_MARKER_NAME
+    try:
+        age = time.time() - marker.stat().st_mtime
+    except OSError:
+        age = None
+    if (age is not None
+            and 0 <= age < CODEX_INVENTORY_BOOTSTRAP_SPAWN_THROTTLE_SECONDS):
+        return False
+    try:
+        _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except OSError:
+        return False
+    if _spawn_codex_worker(CODEX_INVENTORY_BOOTSTRAP_COMMAND):
+        return True
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _cmd_codex_inventory_bootstrap_body(args) -> int:
+    """Hidden ``_codex-inventory-bootstrap`` handler (#927 B2). Always 0."""
+    from _cctally_record import (
+        _hook_log_error_detail, _hook_log_safe_free_text, _hook_tick_log_line,
+        _hook_tick_log_rotate_if_needed,
+    )
+    started = time.monotonic()
+
+    def _log(outcome: str, detail: str = "", *, error: str = "") -> None:
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds").replace("+00:00", "Z")
+        safe = _hook_log_safe_free_text(error) if error else ""
+        _hook_tick_log_line(
+            f"{stamp} provider=codex op=inventory-bootstrap result={outcome} "
+            f"dur_ms={max(0, int((time.monotonic() - started) * 1000))}"
+            + (f" {detail}" if detail else "")
+            + (f" error={safe}" if safe else ""))
+        _hook_tick_log_rotate_if_needed()
+
+    try:
+        chunks = run_codex_inventory_bootstrap(wait_for_requests=True)
+        conn = open_cache_db()
+        try:
+            ready = codex_identity_inventory_ready(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log("error", error=_hook_log_error_detail(exc))
+        return 0
+    _log("ready" if ready else "partial", f"chunks={chunks}")
+    return 0
+
+def _codex_quota_reading_key(captured_at_utc, observed_slot, logical_limit_key,
+                             window_minutes, used_percent, resets_at_utc):
+    """The offset-free identity of one quota reading (#970 F1).
+
+    The cache key and the journal natural key both carry ``line_offset``, so a
+    rollout Codex rewrote (compressed and archived) re-emits every retained
+    reading under a drifted offset that neither key matches. This key is what
+    the reading IS: when it was captured, which slot of which logical limit
+    (``logical_limit_key`` already folds in ``limit_id``, the root and any
+    model pool; ``source`` is fixed by the lookup), the window length, the
+    used percent and the reset. Window lengths snap as the anchor groups do,
+    so one minute of provider jitter is not a new reading. It leaves out the
+    offset (it drifts), ``account_key`` (a retained row may carry one an
+    archive first sight does not), ``observed_model`` and the canonical reset
+    (both resolved later from the population), and the descriptive fields
+    (``limit_name``, ``plan_type``, ``individual_limit_json``,
+    ``reached_type``), which an older parser may have stored differently for
+    the same reading."""
+    return (captured_at_utc, observed_slot,
+            _lib_jsonl.snap_window_minutes(logical_limit_key),
+            _lib_jsonl.snap_codex_window_minutes(window_minutes),
+            used_percent, resets_at_utc)
+
+
+def _codex_retained_quota_readings(
+    conn: sqlite3.Connection, path_str: str,
+) -> "tuple[frozenset, frozenset]":
+    """``(natural keys, reading keys)`` of the quota rows already stored for
+    ``path_str`` (#970 F1): one indexed seek on the table's UNIQUE key."""
+    natural: "set[tuple]" = set()
+    readings: "set[tuple]" = set()
+    for (line_offset, logical_limit_key, captured_at_utc, observed_slot,
+         window_minutes, used_percent, resets_at_utc) in conn.execute(
+            "SELECT line_offset, logical_limit_key, captured_at_utc, "
+            "observed_slot, window_minutes, used_percent, resets_at_utc "
+            "FROM quota_window_snapshots "
+            "WHERE source='codex' AND source_path=?", (path_str,)):
+        natural.add((line_offset, logical_limit_key))
+        readings.add(_codex_quota_reading_key(
+            captured_at_utc, observed_slot, logical_limit_key,
+            window_minutes, used_percent, resets_at_utc))
+    return frozenset(natural), frozenset(readings)
+
+
+def _codex_accounting_entry_key(timestamp_utc, input_tokens, cached_input_tokens,
+                                output_tokens, reasoning_output_tokens,
+                                total_tokens):
+    """The offset-free identity of one accounting entry (#970 N1).
+
+    Accounting rows are keyed by ``(source_path, line_offset)`` alone, so a
+    rollout Codex rewrote (compressed and archived) re-emits every retained
+    entry under a drifted offset that the key never matches. This key is what
+    the entry IS within its rollout (``source_path`` is fixed by the lookup):
+    the event's timestamp and its five token counts. It leaves out the offset
+    (it drifts), ``account_key`` (a retained row may carry one an archive first
+    sight does not), ``conversation_key`` and ``source_root_key`` (resolved
+    from the root and thread metadata, which a repair or a requalification
+    re-keys), and ``session_id`` and ``model``: both come from earlier records
+    through the iterator's state, which a delta resume seeds from the cursor
+    rather than from the file, so a retained row and a byte-zero re-read may
+    disagree on them for the same event."""
+    return (timestamp_utc, input_tokens, cached_input_tokens, output_tokens,
+            reasoning_output_tokens, total_tokens)
+
+
+def _codex_retained_accounting_entries(
+    conn: sqlite3.Connection, path_str: str,
+) -> frozenset:
+    """Entry keys of the accounting rows already stored for ``path_str``
+    (#970 N1): one indexed seek on the table's ``(source_path, line_offset)``
+    key."""
+    return frozenset(
+        _codex_accounting_entry_key(*row) for row in conn.execute(
+            "SELECT timestamp_utc, input_tokens, cached_input_tokens, "
+            "output_tokens, reasoning_output_tokens, total_tokens "
+            "FROM codex_session_entries WHERE source_path=?", (path_str,)))
+
+
+def _append_codex_quota_obs(
+    quota_rows: list, *, quota_index_policy: str = "unbudgeted",
+) -> None:
     """Journal one Codex quota `obs` per newly-read quota observation (Task 7
     Item 1, spec §4.2 / §5.3 / Appendix A).
 
@@ -5749,7 +7365,13 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
     ``captured_at_utc`` rather than the later sync clock, so re-reading the same
     rollout bytes emits the same content id and byte-identical journal record.
     $CODEX_HOME multi-root scoping is preserved: each row carries its own
-    ``source_root_key`` and roots are never combined."""
+    ``source_root_key`` and roots are never combined.
+
+    ``quota_index_policy`` is passed through to ``append_record`` (#977 C4):
+    the budgeted hook walk passes ``"budgeted"``, so a missing or invalid
+    natural-key index raises ``QuotaIndexUnavailable`` instead of scanning the
+    journal inside the leaf lock. Rows already appended before the refusal are
+    durable and stay safe to retry through deduplication."""
     if not quota_rows:
         return
     import _cctally_journal as _jr
@@ -5792,14 +7414,17 @@ def _append_codex_quota_obs(quota_rows: list) -> None:
                     "plan_type": plan_type,
                     "individual_limit_json": individual_limit_json,
                     "reached_type": reached_type, "observed_model": observed_model,
-                }), dedupe_codex_quota=True)
-        except _jr.JournalAppendTargetStale:
+                }), dedupe_codex_quota=True,
+                quota_index_policy=quota_index_policy)
+        except (_jr.JournalAppendTargetStale, _jr.QuotaIndexUnavailable):
             # Retryable, NOT best-effort (#511, #496 S5b §2.4). Swallowing this
             # one lets the file offset advance past bytes whose observation was
             # never journaled, and the rollout JSONL those bytes came from
             # evaporates — the exact data-loss hole the quota journal exists to
             # close. Re-raising leaves the offset where it was, so the next sync
-            # re-reads and re-appends the same bytes.
+            # re-reads and re-appends the same bytes. A missing or invalid
+            # quota index (#977 C5) is retryable for the same reason: the walk
+            # defers the file and requests the rebuild worker.
             raise
         except Exception as exc:  # best-effort; a journal append must not break sync
             eprint(f"[codex-cache] quota obs journal append failed: {exc}")
@@ -5910,10 +7535,11 @@ def _codex_batch_precommit() -> None:
 class CodexContainerAcceptance(NamedTuple):
     """The container whose content a cursor commit accepts (#968 spec 5.3).
 
-    For a plain container ``path``, ``container_size_bytes`` and
-    ``decoded_size_bytes`` are NULL: the spec defines NULL ``container_path``
-    as "the logical path" and a plain file's physical and decoded sizes as
-    ``size_bytes`` itself.
+    For a plain container ``container_size_bytes`` and ``decoded_size_bytes``
+    are NULL: a plain file's physical and decoded sizes are ``size_bytes``
+    itself. ``path`` is NULL exactly when the container is the logical path
+    (#970 G7); a zstd twin or any archived container, plain included, records
+    its path.
     """
 
     kind: str
@@ -6165,6 +7791,20 @@ def _write_codex_file_batch(
                 container.content_anchor_offset,
             ),
         )
+    # #980 D3: the finalization work this batch creates is durable debt in
+    # the batch's OWN transaction: its accounting-timestamp and canonical-
+    # reset spans, plus `model` when the write leaves a Codex quota row whose
+    # NULL `observed_model` resolution could now change (quota rows, or the
+    # accounting rows resolution reads). A stop after this commit and before
+    # the sync's finalization therefore still owes it; a rolled-back file
+    # (or a withdrawn W11 batch) takes its debt with it.
+    if accounting_rows or quota_rows:
+        add_codex_finalization_debt(
+            conn,
+            spans=_codex_debt_spans_from_rows(
+                accounting_rows, quota_rows, discovered.source_root_key),
+            model=_codex_unresolved_quota_model_exists(conn),
+        )
     # Root cleanup is requested by the whole-tree prune plan and executed by
     # _codex_prune_root_cleanup under drain admission, never by a file batch.
     # A file batch owns accounting, quota, thread, event, root, and cursor
@@ -6177,28 +7817,44 @@ def _write_codex_file_batch(
     return rows_changed
 
 
-def _iter_codex_logical_containers(
-    roots: list[pathlib.Path],
-) -> Iterator["_rc.SelectedContainer"]:
-    """Yield each logical rollout's selected container under the given roots,
-    de-duped by resolved logical identity (first occurrence wins).
+def _codex_home_locations() -> "list[_rc.CodexLocations]":
+    """Each configured home's container locations, by the leaf's native-home
+    recognition (#970 spec 5.1), de-duplicated by walk root in $CODEX_HOME
+    order exactly as ``_codex_session_roots`` de-duplicates."""
+    out: "list[_rc.CodexLocations]" = []
+    seen: set[pathlib.Path] = set()
+    for configured in _cctally()._codex_home_roots():
+        locations = _rc.home_locations(configured)
+        if locations is None or locations.walk_root in seen:
+            continue
+        seen.add(locations.walk_root)
+        out.append(locations)
+    return _rc.release_walked_archives(out)   # #970 N4
 
-    Shares full discovery's grouping (#968 spec 5.2), so the direct fallback
-    and the cursor walks see the same population. Pure read: globs and stats.
+
+def _iter_codex_logical_containers(
+    locations: "Iterable[_rc.CodexLocations | pathlib.Path]",
+) -> Iterator["_rc.SelectedContainer"]:
+    """Yield each logical rollout's selected container under the given
+    locations, de-duped by identity (first occurrence wins).
+
+    Shares full discovery's grouping (#968 spec 5.2) and, #970 spec 5.9, its
+    flat archive glob, root-aware selection and identity rule, so the direct
+    fallback, the retained-contract check and doctor's census see the same
+    population as the cursor walks. A bare path is a walk root without an
+    archive. Pure read: globs and stats.
     """
     seen: set[pathlib.Path] = set()
-    for root in roots:
-        logicals = {
-            _rc.logical_path(candidate)
-            for pattern in ("**/*.jsonl", "**/*.jsonl.zst")
-            for candidate in root.glob(pattern)
-        }
-        for logical in sorted(logicals, key=lambda path: str(path)):
-            selected = _rc.select_container(logical)
+    memo: dict = {}
+    for location in locations:
+        if not isinstance(location, _rc.CodexLocations):
+            location = _rc.CodexLocations(pathlib.Path(location), None)
+        for logical in sorted(_codex_root_logicals(location),
+                              key=lambda path: str(path)):
+            selected = _select_codex_container(logical, [location])
             if selected is None:
                 continue
-            physical = _canonical_codex_path(selected.path)
-            key = _rc.logical_path(physical)
+            key = _codex_identity_path(selected, location, memo=memo)
             if key in seen:
                 continue
             seen.add(key)
@@ -6218,7 +7874,7 @@ def _discover_codex_session_files(range_start: dt.datetime) -> list:
     as a proxy would silently exclude history. Every compressed container is
     therefore a candidate, and its entries are range-filtered after decoding.
     """
-    roots = _cctally()._codex_session_roots()
+    roots = _codex_home_locations()
     if not roots:
         eprint("[codex] no Codex session directory found")
         return []
@@ -6274,6 +7930,20 @@ class IngestStats:
     skip_reasons: dict = field(default_factory=dict)
     full_walk_complete: bool = False
     maintenance_failed: bool = False
+    # #944 spec 5.5 step 5: files whose descriptor no longer matched the
+    # frozen stat (replaced between stat and open); retried next sync.
+    files_skipped_replaced: int = 0
+    # #944 spec 5.4: Claude cost attribution conflicts this sync's replay or
+    # appends recorded (`cache-sync` reports growth).
+    attribution_conflicts_added: int = 0
+    # #944 L3: files the walk left uncommitted because their decisions could
+    # not be journaled. Non-zero only for a deferral that happened inside the
+    # walk, i.e. after a rebuild's wipe; a pre-wipe deferral leaves it 0.
+    attribution_files_deferred: int = 0
+    # #939 D5: the paths behind ``files_failed`` in a conversation sync, the
+    # residual writeIo's admission hold compares between passes. Not
+    # serialized by the transcript rebuild worker (`_CONVERSATION_RESIDUAL_FIELDS`).
+    failed_paths: set = field(default_factory=set)
 
     @property
     def targeted_clean(self) -> bool:
@@ -6316,6 +7986,9 @@ class PruneResult:
     prune_refused: bool = False
     prune_refused_files: int = 0
     prune_refused_state: "str | None" = None
+    # #944 spec 5.6: the orphan rows could not be linked (the journal could
+    # not be written), so nothing was pruned.
+    attribution_deferred: bool = False
 
 
 def _progress_stderr(stats: IngestStats, *, force: bool = False) -> None:
@@ -6613,6 +8286,25 @@ def _prune_orphaned_cache_entries(conn, *, lock_timeout=None):
         if not safe_paths:
             return result
 
+        # #944 spec 5.6: link the orphan paths' accounting rows (align or
+        # export) before they are deleted; a missing transcript does not
+        # invalidate its decisions. An unwritable journal prunes nothing.
+        G = _claude_attribution()
+        if G.schema_present(conn):
+            try:
+                hw = G.rehydrate_claude_attribution(conn, authoritative=False)
+                if hw is not None:
+                    conn.commit()
+                    _preserve_claude_rows_before_wipe(
+                        conn, journal_hw=hw, source_paths=safe_paths)
+                else:
+                    raise G.AttributionJournalUnavailable(
+                        "the journal could not be read")
+            except G.AttributionJournalUnavailable:
+                conn.rollback()
+                result.attribution_deferred = True
+                return result
+
         # No IN(...) chunking: safe_paths is bounded by the orphan count (a
         # handful of removed files), well under SQLite's variable limit;
         # _recompute_conversation_sessions chunks its own session-id list.
@@ -6735,6 +8427,251 @@ def _force_retention_prune_after_replay(
         pass
 
 
+# --------------------------------------------------------------------------
+# #944: write-time Claude cost attribution inside sync_cache (spec 5.5-5.6)
+# --------------------------------------------------------------------------
+
+#: Rows one preserve-before-wipe round links before it commits.
+_CLAUDE_PRESERVE_ROUND = 50_000
+
+#: The deferral reason a sync reports when the journal cannot be read or
+#: written for Claude attribution (the reason the Codex replay already uses).
+CLAUDE_ATTRIBUTION_DEFERRAL = "attribution_rehydration"
+
+CLAUDE_ATTRIBUTION_REBUILD_DEFERRED_MESSAGE = (
+    "[cache-sync] rebuild skipped (claude): the cctally journal could not be "
+    "written. Check that the cctally journal directory is writable.")
+CLAUDE_ATTRIBUTION_SYNC_DEFERRED_MESSAGE = (
+    "[cache-sync] claude sync deferred: the cctally journal could not be "
+    "written. Check that the cctally journal directory is writable.")
+
+
+def _claude_attribution():
+    return _load_lib("_cctally_claude_attribution")
+
+
+def _defer_claude_sync(conn, stats, reason: str):
+    """Return ``stats`` deferred for ``reason``. A journal deferral is also
+    recorded in ``claude_attribution_last_deferral`` in its own small
+    transaction (spec 5.5), best-effort: the deferral itself is what keeps
+    the cache unchanged."""
+    stats.deferred_reason = reason
+    if reason == CLAUDE_ATTRIBUTION_DEFERRAL:
+        try:
+            _claude_attribution().record_deferral(conn, reason)
+        except sqlite3.Error:
+            conn.rollback()
+    return stats
+
+
+class _BoundedReader:
+    """A binary transcript handle that never reads past ``limit``, the size
+    frozen when the sync stat'ed the file (spec 5.5 step 5). A record whose
+    terminating newline lies beyond the limit reads as a partial tail, which
+    the walker rewinds and leaves for the next sync."""
+
+    def __init__(self, fh, limit: int):
+        self._fh = fh
+        self._limit = int(limit)
+
+    def tell(self) -> int:
+        return self._fh.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._fh.seek(offset, whence)
+
+    def readline(self) -> bytes:
+        remaining = self._limit - self._fh.tell()
+        if remaining <= 0:
+            return b""
+        return self._fh.readline(remaining)
+
+
+def _preserve_claude_rows_before_wipe(conn, *, journal_hw,
+                                      source_paths=None) -> None:
+    """Link every unlinked accounting row (of ``source_paths``, or all) before
+    a delete reaches it (spec 5.6): align it to the decision its identity
+    already holds, or export its current stamp. Bounded rounds, each
+    committed; every export records ``journal_hw``, the high-water the
+    caller's preceding replay consumed. Raises
+    ``AttributionJournalUnavailable`` with the current round rolled back by
+    the caller."""
+    G = _claude_attribution()
+    after = 0
+    while True:
+        result = G.preserve_unlinked_rows(
+            conn, journal_hw=journal_hw, source_paths=source_paths,
+            after_id=after, limit=_CLAUDE_PRESERVE_ROUND)
+        conn.commit()
+        if not result.remaining:
+            return
+        after = result.last_id
+
+
+_CLAUDE_ROW_COLUMNS = (
+    "id, source_path, line_offset, msg_id, req_id, account_key,"
+    " attribution_decision_key, timestamp_utc, model, input_tokens,"
+    " output_tokens, cache_create_tokens, cache_read_tokens,"
+    " cache_create_1h_tokens, cache_create_5m_tokens, speed, cost_usd_raw")
+
+
+def _claude_existing_row(conn, identity, path_str: str, offset: int):
+    """The accounting row that already holds ``identity``'s record, or None:
+    by logical key for a keyed identity, by physical location otherwise.
+
+    The physical branch takes the row at the location whose ids do not form a
+    keyed identity (``K.keyed_ids``) -- a NULL id, or an empty / non-string
+    one stored before #944 F1 normalized them at the parser -- so it names the
+    same row ``row_identity`` exports in legacy form."""
+    import _lib_claude_attribution as K
+    if identity.form == K.FORM_KEYED:
+        cursor = conn.execute(
+            f"SELECT {_CLAUDE_ROW_COLUMNS} FROM session_entries "
+            "WHERE msg_id=? AND req_id=? LIMIT 1",
+            (identity.msg_id, identity.req_id))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(zip([d[0] for d in cursor.description], row))
+    cursor = conn.execute(
+        f"SELECT {_CLAUDE_ROW_COLUMNS} FROM session_entries "
+        "WHERE source_path=? AND line_offset=?", (path_str, int(offset)))
+    names = [d[0] for d in cursor.description]
+    for row in cursor.fetchall():
+        found = dict(zip(names, row))
+        if K.keyed_ids(found["msg_id"], found["req_id"]) is None:
+            return found
+    return None
+
+
+def _claude_row_projection(r) -> list:
+    """The legacy projection of the session_entries tuple the walk builds."""
+    import _lib_claude_attribution as K
+    return K.legacy_projection({
+        "timestamp_utc": r[2], "model": r[3], "input_tokens": r[6],
+        "output_tokens": r[7], "cache_create_tokens": r[8],
+        "cache_read_tokens": r[9], "cache_create_1h_tokens": r[13],
+        "cache_create_5m_tokens": r[14], "speed": r[11],
+        "cost_usd_raw": r[12]})
+
+
+@dataclass
+class _ClaudeAttributionRun:
+    """Per-sync attribution state: the clock cutoff and closing capture
+    (spec 5.5 step 3), the journal high-water the rule runs against (the one
+    the sync's replay consumed, recorded by every decision of the run), and the
+    per-timestamp neighbour memo. The memo holds only the file being
+    attributed (``_attribute_claude_rows`` clears it per file), so its size is
+    bounded by one file's records, not the run's: run-scoped, it took a cold
+    first sync of a 697,733-row store from 630 MB to 1,188 MB peak RSS."""
+
+    clock_cutoff_us: int
+    capture: Any
+    ingest_account: "str | None"
+    journal_hw: tuple
+    memo: dict = field(default_factory=dict)
+    deferral_pending: bool = False
+
+
+def _attribute_claude_rows(conn, run: _ClaudeAttributionRun, path_str: str,
+                           rows: list, metas: list) -> list:
+    """Decide (or recover) the account of every cost row of one file and make
+    new decisions durable before any accounting DML (spec 5.5 steps 5-6).
+    Returns ``(account_key, decision_key)`` per row, in row order; aligns or
+    links existing unlinked rows on the caller's transaction. Raises
+    ``AttributionJournalUnavailable`` when the append fails."""
+    G = _claude_attribution()
+    import _lib_claude_attribution as K
+    run.memo.clear()
+    identities = []
+    resolved = {}
+    pending = []       # (record_key, identity_to_journal, decision, ts, evidence)
+    pending_links = {}  # identity_to_journal.key -> existing unlinked row
+    planned = set()
+    for r, (raw, ts) in zip(rows, metas):
+        identity = G.record_identity(
+            msg_id=r[4], req_id=r[5], source_path=path_str,
+            byte_offset=r[1], record_bytes=raw,
+            projection=_claude_row_projection(r))
+        identities.append(identity)
+        if identity.key in planned:
+            continue
+        planned.add(identity.key)
+        found = G.lookup_decision(conn, identity)
+        existing = _claude_existing_row(conn, identity, path_str, r[1])
+        if found is not None:
+            resolved[identity.key] = found
+            if existing is not None and existing[
+                    "attribution_decision_key"] is None:
+                G.align_row(conn, existing["id"], found)
+            continue
+        if existing is not None:
+            link = existing["attribution_decision_key"]
+            if link is None:
+                # Pre-upgrade history: keep the row's current stamp.
+                row_ident = G.row_identity(existing)
+                prior = G.lookup_decision(conn, row_ident)
+                if prior is not None:
+                    G.align_row(conn, existing["id"], prior)
+                    resolved[identity.key] = prior
+                    continue
+                pending.append((identity.key, row_ident, K.Decision(
+                    K.preserved_stamp(existing["account_key"]),
+                    K.BASIS_PRESERVED, None, False), None, ()))
+                pending_links[row_ident.key] = existing
+                continue
+            linked = conn.execute(
+                "SELECT decision_key, account_key, basis, reason,"
+                " decided_at_utc, journal_segment, journal_offset"
+                " FROM claude_cost_decisions WHERE decision_key=?",
+                (link,)).fetchone()
+            if linked is not None:
+                resolved[identity.key] = G._stored(linked)
+                continue
+        interval = K.record_interval(ts)
+        neighbours, evidence = None, ()
+        if not isinstance(interval, str):
+            memo_key = (interval[0], interval[1])
+            if memo_key not in run.memo:
+                run.memo[memo_key] = G.timeline_neighbours_with_evidence(
+                    conn, interval)
+            neighbours, evidence = run.memo[memo_key]
+        decision = K.decide(
+            interval, neighbours, clock_cutoff_us=run.clock_cutoff_us,
+            closing_capture=run.capture, ingest_account=run.ingest_account)
+        pending.append((identity.key, identity, decision,
+                        ts if isinstance(ts, str) else None,
+                        tuple(evidence)))
+    if pending:
+        stored = G.append_decisions(
+            conn,
+            [(ident, decision, ts, list(evidence))
+             for _key, ident, decision, ts, evidence in pending],
+            journal_hw=run.journal_hw, closing_capture=run.capture,
+            evidence=[])
+        for (record_key, ident, _d, _ts, _e), decision in zip(
+                pending, stored):
+            resolved[record_key] = decision
+            existing = pending_links.get(ident.key)
+            if existing is None:
+                continue
+            if decision.account_key == K.preserved_stamp(
+                    existing["account_key"]):
+                conn.execute(
+                    "UPDATE session_entries SET attribution_decision_key=?"
+                    " WHERE id=?", (decision.key, existing["id"]))
+            else:
+                G.align_row(conn, existing["id"], decision)
+        if run.deferral_pending:
+            G.clear_deferral(conn)
+            run.deferral_pending = False
+    out = []
+    for identity in identities:
+        decision = resolved[identity.key]
+        out.append((decision.account_key, decision.key))
+    return out
+
+
 def sync_cache(
     conn: sqlite3.Connection,
     *,
@@ -6838,6 +8775,99 @@ def sync_cache(
         # truncation reset, orphaned rows) still delete it atomically with
         # their own writes.
         walk_marker_owed = not targeted
+
+        # #944 spec 5.5 step 2: discover and FREEZE every source before any
+        # mutation. Each file's (st_dev, st_ino, st_size) is stat'ed once here;
+        # the truncation pre-scan, the walk's bound and the persisted
+        # size_bytes all use this one stat, so bytes appended after it wait for
+        # the next sync (moved up from the frontier phase, which mutates
+        # nothing either way).
+        with _perf.phase("frontier"):
+            with _perf.phase("discover") as _p_disc:
+                if targeted:
+                    # A requested path that vanished (session rotated/deleted
+                    # mid-live-tail) is deliberately DROPPED here without flagging
+                    # failure: marking files_failed would wedge the watch loop's
+                    # targeted_clean advance forever for a file that will never
+                    # return; the orphan-prune path owns its stale rows on the next
+                    # full sync. Pinned by tests/test_cache_accepted_behaviors.py
+                    # (#279 S3 F4).
+                    paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
+                else:
+                    paths = list(_iter_claude_jsonl_files())
+                stats.files_total = len(paths)
+                _p_disc.set_count(len(paths))
+        frozen: "dict[str, Any]" = {}
+        for jp in paths:
+            try:
+                frozen[str(jp)] = jp.stat()
+            except OSError as exc:
+                frozen[str(jp)] = exc
+
+        # #944 spec 5.5 steps 1, 3, 4: write-time Claude cost attribution.
+        # Active only once the attribution schema is delivered (fresh stores;
+        # migration 050 on existing ones); without it ingest keeps stamping
+        # the ingest identity exactly as before.
+        _attr = _claude_attribution()
+        attribution = _attr.schema_present(conn)
+        attr_run: "_ClaudeAttributionRun | None" = None
+        conflicts_before = 0
+
+        def _start_attribution(authoritative: bool) -> "str | None":
+            """Replay, then resolve the closing capture. Returns the deferral
+            reason, or None once ``attr_run`` is set."""
+            nonlocal attr_run, file_account_key, conflicts_before
+            import _lib_claude_attribution as _K
+            replay_hw = _attr.rehydrate_claude_attribution(
+                conn, authoritative=authoritative)
+            if replay_hw is None:
+                conn.rollback()
+                return CLAUDE_ATTRIBUTION_DEFERRAL
+            conn.commit()
+            # Step 3: the closing capture, resolved after the freeze and
+            # before any accounting mutation; its instant is clock_cutoff.
+            closing = _cctally_core._resolve_active_claude_identity()
+            if closing.get("status") == "torn":
+                stats.files_deferred_torn += 1
+                return "identity_torn"
+            key = closing["account_key"]
+            file_account_key = (
+                None if key == _lib_accounts.UNATTRIBUTED else key)
+            cutoff = int(time.time() * 1_000_000)
+            conflicts_before = _attr.decision_conflicts(conn)
+            attr_run = _ClaudeAttributionRun(
+                clock_cutoff_us=cutoff,
+                capture=_K.ClosingCapture(file_account_key, cutoff),
+                ingest_account=file_account_key,
+                journal_hw=replay_hw,
+                deferral_pending=_attr.deferral_recorded(conn))
+            return None
+
+        if attribution:
+            prior_sizes = {
+                row[0]: row[1] for row in conn.execute(
+                    "SELECT path, size_bytes FROM session_files")}
+            changed = rebuild or any(
+                not isinstance(st, OSError)
+                and prior_sizes.get(p) != st.st_size
+                for p, st in frozen.items())
+            escalating = (not targeted) and any(
+                not isinstance(st, OSError) and p in prior_sizes
+                and prior_sizes[p] and st.st_size < prior_sizes[p]
+                for p, st in frozen.items())
+            if changed:
+                reason = _start_attribution(rebuild or escalating)
+                if reason is not None:
+                    return _defer_claude_sync(conn, stats, reason)
+            if rebuild:
+                # Spec 5.6: no row is deleted before it is linked.
+                try:
+                    _preserve_claude_rows_before_wipe(
+                        conn, journal_hw=attr_run.journal_hw)
+                except _attr.AttributionJournalUnavailable:
+                    conn.rollback()
+                    return _defer_claude_sync(
+                        conn, stats, CLAUDE_ATTRIBUTION_DEFERRAL)
 
         if rebuild:
             # Clear INSIDE the lock — a concurrent rebuild that lost the
@@ -7154,22 +9184,6 @@ def sync_cache(
             _consume_file_touches(conn)
         _p_backfills.__exit__(None, None, None)
 
-        with _perf.phase("frontier"):
-            with _perf.phase("discover") as _p_disc:
-                if targeted:
-                    # A requested path that vanished (session rotated/deleted
-                    # mid-live-tail) is deliberately DROPPED here without flagging
-                    # failure: marking files_failed would wedge the watch loop's
-                    # targeted_clean advance forever for a file that will never
-                    # return; the orphan-prune path owns its stale rows on the next
-                    # full sync. Pinned by tests/test_cache_accepted_behaviors.py
-                    # (#279 S3 F4).
-                    paths = [pathlib.Path(p) for p in only_paths if pathlib.Path(p).is_file()]
-                else:
-                    paths = list(_iter_claude_jsonl_files())
-                stats.files_total = len(paths)
-                _p_disc.set_count(len(paths))
-
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
         # UPDATE/DELETE/REPLACE statement between here and the per-file
@@ -7299,9 +9313,8 @@ def sync_cache(
             prev = existing.get(str(jp))
             if prev is None:
                 continue
-            try:
-                st = jp.stat()
-            except OSError:
+            st = frozen.get(str(jp))
+            if st is None or isinstance(st, OSError):
                 continue
             if st.st_size < prev[0]:
                 truncated_paths.add(str(jp))
@@ -7320,6 +9333,19 @@ def sync_cache(
                 f"file(s) — re-ingesting all files (safe under ccusage-parity "
                 f"dedup)"
             )
+            if attribution:
+                # #944 spec 5.6: link every unlinked row before the wipe.
+                if attr_run is None:
+                    reason = _start_attribution(True)
+                    if reason is not None:
+                        return _defer_claude_sync(conn, stats, reason)
+                try:
+                    _preserve_claude_rows_before_wipe(
+                        conn, journal_hw=attr_run.journal_hw)
+                except _attr.AttributionJournalUnavailable:
+                    conn.rollback()
+                    return _defer_claude_sync(
+                        conn, stats, CLAUDE_ATTRIBUTION_DEFERRAL)
             conn.execute("DELETE FROM session_entries")
             # Plan 1: truncation escalates to a full re-ingest of EVERY file,
             # so conversation_messages is wiped here (parallel to the
@@ -7411,9 +9437,9 @@ def sync_cache(
             # the two new columns via an explicit column list so this backfill
             # is not clobbered by delta-resume writes.
             _ensure_session_files_row(conn, path_str)
-            try:
-                st = jp.stat()
-            except OSError as exc:
+            st = frozen.get(path_str)
+            if st is None or isinstance(st, OSError):
+                exc = st if st is not None else FileNotFoundError(path_str)
                 eprint(f"[cache] stat failed for {jp}: {exc}")
                 walk_clean = False  # skipped a file without ingesting (D5a)
                 stats.files_failed += 1
@@ -7443,12 +9469,44 @@ def sync_cache(
             # Read + parse is a pure read; do it OUTSIDE the write transaction
             # so a slow JSONL doesn't hold a SQLite lock.
             rows: list[tuple[Any, ...]] = []
+            # #944: (raw record bytes, timestamp as written) per cost row.
+            metas: list[tuple[Any, Any]] = []
             conv_rows: list[tuple[Any, ...]] = []
             ai_rows: list[tuple[Any, ...]] = []   # #193: ai-title upserts
             final_offset = start_offset
+            if attribution and attr_run is None:
+                # Defensive: a file needs ingest that the up-front change
+                # check did not see; start attribution before reading it.
+                reason = _start_attribution(False)
+                if reason is not None:
+                    return _defer_claude_sync(conn, stats, reason)
+            replaced = False
             try:
-                with open(jp, "r", encoding="utf-8", errors="replace") as fh:
-                    fh.seek(start_offset)
+                with contextlib.ExitStack() as _fh_stack:
+                    if attr_run is not None:
+                        # #944 spec 5.5 step 5: the descriptor must be the
+                        # frozen file, and the walk stops at the frozen size.
+                        raw_fh = _fh_stack.enter_context(open(jp, "rb"))
+                        fst = os.fstat(raw_fh.fileno())
+                        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                            replaced = True
+                            _walk = iter(())
+                            fh = raw_fh
+                        else:
+                            fh = _BoundedReader(raw_fh, size)
+                            fh.seek(start_offset)
+                            _walk = _iter_sync_entries(
+                                fh, path_str, stats=stats,
+                                include_conversations=False,
+                                with_raw=True, with_timestamp=True)
+                    else:
+                        fh = _fh_stack.enter_context(
+                            open(jp, "r", encoding="utf-8", errors="replace"))
+                        fh.seek(start_offset)
+                        _walk = (
+                            item + (None, None) for item in _iter_sync_entries(
+                                fh, path_str, stats=stats,
+                                include_conversations=False))
                     # Fused single-pass walk (#138): cost rows AND conversation
                     # message rows come from ONE parse of each line. An assistant
                     # line yields both; a user line yields only a message row.
@@ -7456,12 +9514,7 @@ def sync_cache(
                     # walk over the identical span — the "identical span"
                     # invariant is now structural (a single stop point) rather
                     # than a prose-enforced ``>= final_offset`` runtime break.
-                    for offset, cost, mrow, ai in _iter_sync_entries(
-                        fh,
-                        path_str,
-                        stats=stats,
-                        include_conversations=False,
-                    ):
+                    for offset, cost, mrow, ai, raw_span, raw_ts in _walk:
                         if cost is not None:
                             entry, msg_id, req_id = cost
                             usage = entry.usage
@@ -7495,6 +9548,13 @@ def sync_cache(
                                 entry.cost_usd,
                                 h, m,    # #195 cache-write TTL split
                             ))
+                            # #944 F7: only a record without valid ids
+                            # needs its raw bytes (the physical digest); a
+                            # keyed record keeps none, so a file's walk does
+                            # not hold every cost line's bytes.
+                            metas.append((
+                                raw_span if _keyed_ids(msg_id, req_id) is None
+                                else None, raw_ts))
                         if mrow is not None:
                             conv_rows.append(_conv_row_tuple(mrow, path_str))
                         if ai is not None:
@@ -7515,6 +9575,12 @@ def sync_cache(
                 walk_clean = False  # skipped a file without ingesting (D5a)
                 stats.files_failed += 1
                 continue
+            if replaced:
+                # Replaced between the stat and the open: retried next sync,
+                # not an error, but this walk does not mirror the disk.
+                stats.files_skipped_replaced += 1
+                walk_clean = False
+                continue
 
             # Python's sqlite3 module starts an implicit transaction on the
             # first DML statement and commits on conn.commit(). We do NOT
@@ -7524,11 +9590,22 @@ def sync_cache(
             # atomically in a single commit.
             try:
                 if truncated:
+                    if attr_run is not None:
+                        # #944 spec 5.6: link the path's rows before deleting.
+                        _attr.preserve_unlinked_rows(
+                            conn, journal_hw=attr_run.journal_hw,
+                            source_paths=[path_str])
                     conn.execute(
                         "DELETE FROM session_entries WHERE source_path = ?",
                         (path_str,),
                     )
                     stats.files_reset_truncated += 1
+                attribution_binds = None
+                if rows and attr_run is not None:
+                    # #944 spec 5.5 steps 5-6: decide, append (fsync), and
+                    # only then write the accounting rows.
+                    attribution_binds = _attribute_claude_rows(
+                        conn, attr_run, path_str, rows, metas)
                 if rows:
                     # #270: bump the per-file mutation counter BEFORE capturing
                     # `before`, so this cache_meta write stays OUTSIDE the
@@ -7548,8 +9625,15 @@ def sync_cache(
                     # bytes under a different account is the SAME message and keeps
                     # the first observed stamp). ``file_account_key`` is None when
                     # stably-absent (stamped NULL == unattributed on read).
-                    stamped_rows = [
-                        r + (sync_seq, r[2], file_account_key) for r in rows]
+                    if attribution_binds is not None:
+                        stamped_rows = [
+                            r + (sync_seq, r[2], account, decision_key)
+                            for r, (account, decision_key)
+                            in zip(rows, attribution_binds)]
+                    else:
+                        stamped_rows = [
+                            r + (sync_seq, r[2], file_account_key)
+                            for r in rows]
                     before = conn.total_changes
                     # ccusage-parity ON CONFLICT DO UPDATE: higher-token total
                     # wins on conflict; speed-set breaks ties. The partial
@@ -7579,8 +9663,13 @@ def sync_cache(
                     # collides on idx_entries_physical and would roll back the
                     # whole per-file transaction. Steady state keeps the
                     # single-target SQL and its LOUD physical-key backstop.
-                    _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK if rewalk_armed
-                            else SESSION_ENTRY_UPSERT_SQL)
+                    if attribution_binds is not None:
+                        _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK_LINKED
+                                if rewalk_armed
+                                else SESSION_ENTRY_UPSERT_SQL_LINKED)
+                    else:
+                        _sql = (SESSION_ENTRY_UPSERT_SQL_REWALK
+                                if rewalk_armed else SESSION_ENTRY_UPSERT_SQL)
                     conn.executemany(_sql, stamped_rows)
                     stats.rows_changed += conn.total_changes - before
                 # Conversation message ingest (Plan 1). Lands in the SAME
@@ -7643,6 +9732,15 @@ def sync_cache(
                 # column order. Lands
                 # AFTER the commit (pure Python; no DML, no extra write lock).
                 touched_sessions.update(cr[0] for cr in conv_rows if cr[0] is not None)
+            except _attr.AttributionJournalUnavailable:
+                # #944 spec 5.5: the decisions could not be made durable, so
+                # this file stays uncommitted and retryable. Reported once, by
+                # the caller (the `cache-sync` ladder; hooks stay silent).
+                conn.rollback()
+                stats.deferred_reason = CLAUDE_ATTRIBUTION_DEFERRAL
+                stats.attribution_files_deferred += 1
+                walk_clean = False
+                continue
             except sqlite3.DatabaseError as exc:
                 eprint(f"[cache] db error on {jp}: {exc}")
                 conn.rollback()
@@ -7668,6 +9766,13 @@ def sync_cache(
             failed=stats.files_failed,
             rows=stats.rows_changed,
         )
+        if attr_run is not None:
+            stats.attribution_conflicts_added = max(
+                0, _attr.decision_conflicts(conn) - conflicts_before)
+        if stats.deferred_reason == CLAUDE_ATTRIBUTION_DEFERRAL:
+            # A file's append failed: the files that did commit stand, and the
+            # deferral is recorded for doctor and the next sync.
+            _defer_claude_sync(conn, stats, CLAUDE_ATTRIBUTION_DEFERRAL)
 
         # Browse-rail rollup maintenance (single post-walk recompute, under the
         # still-held flock, after every per-file commit and before the
@@ -9156,7 +11261,7 @@ def _codex_compressed_rebuild_refusal(files) -> "str | None":
     if _rc.decoder_capability() == "unavailable":
         return "decoder-unavailable"
     for item in compressed:
-        selected = _rc.select_container(item.source_path)
+        selected = _select_codex_container(item.source_path)
         if selected is None:
             return "decode-error"
         if selected.kind != _rc.ZSTD:
@@ -9209,12 +11314,20 @@ def _record_codex_container_status(conn, stats, *, census_complete: bool,
     observed["verification-unverified"] = int(conn.execute(
         f"SELECT COUNT(*) FROM {cursor_table} "
         "WHERE container_state = 'unverified'").fetchone()[0])
+    old = prior.get("skipped") if isinstance(prior.get("skipped"), dict) else {}
     if census_complete:
         skipped = observed
     else:
-        old = prior.get("skipped") if isinstance(prior.get("skipped"), dict) else {}
         skipped = {k: max(int(old.get(k, 0) or 0), observed[k])
                    for k in _CONTAINER_SKIP_KEYS}
+    # #970 G4: unmappable archive names ride the skipped counts, present only
+    # when nonzero (an archive-free store keeps its exact record), and make
+    # the census partial: those files were never read.
+    unmapped = int(getattr(stats, "archive_unmapped", 0) or 0)
+    if not census_complete:
+        unmapped = max(unmapped, int(old.get(ARCHIVE_UNMAPPED_SKIP_KEY, 0) or 0))
+    if unmapped:
+        skipped[ARCHIVE_UNMAPPED_SKIP_KEY] = unmapped
     since = prior.get("verificationPendingSince") if debt else None
     # D6: pending READ work is maintenance too. The store-wide part is an
     # accepted compressed cursor that has not reached its decoded end; the
@@ -9255,7 +11368,7 @@ def _record_codex_container_status(conn, stats, *, census_complete: bool,
     record = {
         "version": 1,
         "observedAt": now_iso,
-        "census": "complete" if census_complete else "partial",
+        "census": "complete" if census_complete and not unmapped else "partial",
         "skipped": skipped,
         "decoder": decoder,
         "decoderObservedAt": decoder_observed_at,
@@ -9742,6 +11855,13 @@ class CodexIngestStats:
     backlog_bytes: int = 0
     budget_exhausted: bool = False
     full_walk_complete: bool = False
+    # #980 (#981 A3, D4): ``walk_certified`` is exactly the walk-clean
+    # expression ``full_walk_complete`` was built from before Part D (a
+    # complete clean walk, unchanged semantics); ``full_walk_complete`` now
+    # additionally requires no prune debt, no finalization debt and no
+    # cancelled finalization stage (``finalization_deferred``).
+    walk_certified: bool = False
+    finalization_deferred: bool = False
     maintenance_failed: bool = False
     container_pending: int = 0
     container_skipped: dict = field(default_factory=dict)
@@ -9750,6 +11870,9 @@ class CodexIngestStats:
     full_walk_debt_only: bool = False
     rebuild_refused: "str | None" = None
     container_reads_held: int = 0
+    # #970 G4: archive files whose name maps to no dated identity, counted by
+    # this walk's discovery (reported as `archive-unmapped`, census partial).
+    archive_unmapped: int = 0
     barrier_sealed: int = 0
     barrier_pending: int = 0
     barrier_files_deferred: int = 0
@@ -9757,6 +11880,18 @@ class CodexIngestStats:
     barrier_keys_published: int = 0
     barrier_files_published: int = 0
     barrier_retry: bool = False
+    # #939 D5: the conversation pass's residual, exactly. ``failed_paths``
+    # names every file behind ``files_failed``; ``barrier_deferred_keys`` maps
+    # each deferred path to the conversation keys its deferral named and
+    # ``barrier_deferred_targets`` to ``(file_identity, covered)``;
+    # ``barrier_published_paths`` are the files of the units this pass
+    # committed; ``barrier_retry_causes`` says why ``barrier_retry`` is set
+    # ("uncovered", "qualification", "unit_failed", "publication_error").
+    failed_paths: set = field(default_factory=set)
+    barrier_deferred_keys: dict = field(default_factory=dict)
+    barrier_deferred_targets: dict = field(default_factory=dict)
+    barrier_published_paths: set = field(default_factory=set)
+    barrier_retry_causes: set = field(default_factory=set)
     # The status writer already observes capability for unresolved work.
     # Explicit adapters reuse it; unchanged accepted generations never probe.
     container_decoder: "str | None" = None
@@ -10006,8 +12141,8 @@ def _defer_codex_replay_drain() -> str:
         marker.touch()
     except OSError:
         return "failed"
-    from _cctally_update import _spawn_detached
-    return "spawned" if _spawn_detached(CODEX_REPLAY_DRAIN_COMMAND) else "failed"
+    return ("spawned" if _spawn_codex_worker(CODEX_REPLAY_DRAIN_COMMAND)
+            else "failed")
 
 
 class ResetDrainResult(NamedTuple):
@@ -10044,7 +12179,7 @@ def _codex_reset_candidates() -> "list[str]":
         if prev_root != item.source_root_key:
             out.append(key)
             continue
-        selected = _rc.select_container(item.source_path)
+        selected = _select_codex_container(item.source_path)
         if (selected is None or selected.kind != _rc.PLAIN
                 or prev_kind not in (None, _rc.PLAIN)):
             continue
@@ -10075,9 +12210,9 @@ def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult
                 conn = open_cache_db()
                 snap = _load_cursor_snapshot(conn, "codex_session_files", path)
                 current = _load_codex_session_files_rows(conn, [path]).get(path)
-                selected = _rc.select_container(path)
+                selected = _select_codex_container(path)
                 qualified = _qualify_codex_targets({path})
-                _roots, scope = discovery.prepare()
+                reset_roots, scope = discovery.prepare()
                 # A scan is not permission: retain #485 protection and leave
                 # new container transitions to the verification executor. The
                 # post-lock callback revalidates this complete cursor/generation
@@ -10086,11 +12221,16 @@ def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult
                         or not qualified
                         or _codex_container_decision(
                             selected, _accepted_container(
-                                current, ext=15, mtime=1, device=13, inode=14),
+                                current, ext=15, mtime=1, device=13, inode=14,
+                                size=0),
                             executor_path=False, should_stop=None).action != "read"
-                        or scope.refusal_reason(path, snap.root_key) is not None
-                        or scope.refusal_reason(
-                            path, qualified[0].source_root_key) is not None):
+                        # #970 spec 5.6 (A5): the recovery witness.
+                        or _codex_witnessed_refusal(
+                            scope, path, snap.root_key,
+                            roots=reset_roots) is not None
+                        or _codex_witnessed_refusal(
+                            scope, path, qualified[0].source_root_key,
+                            roots=reset_roots) is not None):
                     conn.close()
                     unchanged += 1
                     break
@@ -10099,9 +12239,9 @@ def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult
                 def recheck():
                     if adm.fresh_requests(_cctally_core.APP_DIR):
                         return True
-                    again = _rc.select_container(path)
+                    again = _select_codex_container(path)
                     qualified_now = _qualify_codex_targets({path})
-                    _roots, current_scope = discovery.prepare()
+                    current_roots, current_scope = discovery.prepare()
                     stale[0] = (
                         again is None or again.fingerprint != selected.fingerprint
                         or _load_cursor_snapshot(
@@ -10109,10 +12249,12 @@ def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult
                         or not qualified_now
                         or qualified_now[0].source_root_key
                         != qualified[0].source_root_key
-                        or current_scope.refusal_reason(path, snap.root_key)
-                        is not None
-                        or current_scope.refusal_reason(
-                            path, qualified[0].source_root_key) is not None)
+                        or _codex_witnessed_refusal(
+                            current_scope, path, snap.root_key,
+                            roots=current_roots) is not None
+                        or _codex_witnessed_refusal(
+                            current_scope, path, qualified[0].source_root_key,
+                            roots=current_roots) is not None)
                     return stale[0]
 
                 admission = adm.admit(_cctally_core.APP_DIR,
@@ -10154,7 +12296,7 @@ def run_codex_reset_drain(*, wait_for_requests: bool = True) -> ResetDrainResult
     finally:
         _release_worker_lock(worker)
 
-def cmd_codex_replay_drain_internal(args) -> int:
+def _cmd_codex_replay_drain_body(args) -> int:
     """Hidden worker for an armed byte-zero replay and container verification.
 
     An existing replay marker or newly settled history provenance permits an
@@ -10299,7 +12441,7 @@ def _codex_backlog_after(
                     int(prev[0] or 0), int(prev[2] or 0),
                     True if complete is None else bool(int(complete)),
                 )
-        selected = _rc.select_container(item.source_path)
+        selected = _select_codex_container(item.source_path)
         if selected is None:
             continue
         if selected.kind == _rc.ZSTD:
@@ -10383,17 +12525,24 @@ def _sync_codex_cache_locked(
         raise ValueError(
             "sync_codex_cache: quota_reconcile must be 'auto' or 'defer'")
     started_at = _walk_clock()
-    deadline = (
+    # #980 D1/D2: the whole call — walk, finalization and settlement — fits the
+    # budget measured from entry. ``budget_deadline`` is that bound; the WALK
+    # gets ``deadline = budget_deadline - reserve``, and the reserve pays for
+    # finalization units and the settlement. Every "is this call budgeted"
+    # test below keeps reading ``deadline is not None``.
+    budget_deadline = (
         None if budget_seconds is None else started_at + float(budget_seconds))
+    deadline = (
+        None if budget_deadline is None
+        else budget_deadline - _codex_finalization_reserve(budget_seconds))
     stats = CodexIngestStats()
     project_after_unlock = False
-    # Per-root instant span this sync wrote — accounting-row timestamps AND
-    # canonical window resets. It bounds the end-of-sync spend-adoption pass to
-    # the windows this sync could have changed; an unchanged tree leaves it empty
-    # and the pass does no SQL at all. A rebuild deliberately passes ``None``
-    # instead (full re-derivation restores the unattributed state, so the repair
-    # has to re-run over everything).
-    adoption_spans: "dict[str, tuple[dt.datetime, dt.datetime]]" = {}
+    # #980: one budgeted call counts at most one finalization strike.
+    strike_state: dict = {"struck": False}
+
+    def _finalization_clock() -> float:
+        # Late-bound so the walk's test seam drives finalization too.
+        return _walk_clock()
     # #313 P1 review (F4/F1): when the CACHE certificate is current we cannot
     # yet decide whether to skip the reconcile — reconcile's own short-circuit
     # ALSO requires the stats-side quota_projection_state signatures to match
@@ -10419,6 +12568,13 @@ def _sync_codex_cache_locked(
     # True while the one finalization transaction is open: an exception then
     # keeps its completed steps, as their per-step commits used to.
     finalizing = False
+    # #981 A2: the hook's read policy pins its snapshot at the exit, after the
+    # last commit and before the flocks are released; the scope is the one
+    # this call discovered.
+    read_policy = _active_hook_codex_read_policy()
+    rebuild_prune_scope: "_CodexPruneScope | None" = None
+    ordinary_prune_scope: "_CodexPruneScope | None" = None
+    raised = False
     try:
         with _perf.phase("flock") as _p_flock:
             acquired = acquire_cache_writer_flocks(
@@ -10445,6 +12601,8 @@ def _sync_codex_cache_locked(
         # and bypasses every whole-tree operation (orphan prune, root prune,
         # global quota reconcile) — see the guards threaded through below.
         targeted = only_paths is not None
+        # #980 F4: files a budgeted walk deferred at the anchor seed deadline.
+        seed_deferred_paths: list[str] = []
 
         # The two ARGUMENT-level contracts are checked here, ahead of the replay
         # probe, and against the CALLER's `rebuild` rather than the marker-OR'd
@@ -10517,6 +12675,25 @@ def _sync_codex_cache_locked(
         # Both incompatible combinations already returned at the decline above,
         # so the marker-OR'd rebuild needs no second guard.
         rebuild = rebuild or replay_pending
+        # #927 spec §4.2 B4: the ordinary prune's protection needs every
+        # retained identity at a discovered path the scope refuses, including
+        # path-level refusal under a recognized root and child-only
+        # identities. Until the retained-identity inventory is complete that
+        # set cannot be proven empty, and the legacy scans are the
+        # history-sized cost this inventory removes from the hook. So a
+        # budgeted whole-tree call defers its WHOLE walk -- no prune
+        # planning, no debt, no refusal record -- and requests the off-hook
+        # bootstrap after its locks are released. An unbudgeted call keeps
+        # the legacy scans below and requests the bootstrap the same way.
+        inventory_ready = (
+            targeted or rebuild or codex_identity_inventory_ready(conn))
+        if not inventory_ready:
+            stats.drain_requested = tuple(sorted(
+                set(stats.drain_requested)
+                | {CODEX_INVENTORY_BOOTSTRAP_COMMAND}))
+            if deadline is not None:
+                stats.deferred_reason = "inventory_pending"
+                return stats
 
         # F4 (#313): the reconcile trigger gate is "did the Codex physical
         # mutation sequence advance during this sync", NOT rows_changed —
@@ -10529,7 +12706,7 @@ def _sync_codex_cache_locked(
             _cache_root_keys,
         )
         seq_before = codex_physical_mutation_seq(conn)
-        rebuild_prune_scope: _CodexPruneScope | None = None
+        rebuild_prune_scope = None
 
         # #416 spec D1: which rollouts were ALREADY ingested before this rebuild
         # cleared the cursor table. A rebuild re-reads their bytes, and bytes
@@ -10576,13 +12753,19 @@ def _sync_codex_cache_locked(
                 for _path, root_key in preflight_sources
                 if root_key is not None
             }
+            preflight_roots = _codex_provider_roots()
             (
                 _safe_sources,
                 refused_sources,
                 _safe_roots,
                 refused_root_keys,
             ) = _partition_codex_prune_candidates(
-                preflight_scope, preflight_sources, preflight_source_root_keys
+                preflight_scope, preflight_sources, preflight_source_root_keys,
+                # #970 spec 5.6 (A5): a positively present container is never
+                # refused because its dated directory is missing.
+                refusal=lambda p, k: _codex_witnessed_refusal(
+                    preflight_scope, p, k, roots=preflight_roots, conn=conn,
+                    table="codex_session_files"),
             )
             if refused_sources or refused_root_keys:
                 _codex_prune_refusal_record(
@@ -10617,6 +12800,9 @@ def _sync_codex_cache_locked(
             # detection sees an empty baseline.
             if _clear_codex_derived_rows(conn):
                 _bump_codex_physical_mutation_seq(conn)
+            # #980 D3: full re-derivation restores the unattributed state, so
+            # every root's whole range is owed, in the wipe's own transaction.
+            add_codex_finalization_debt(conn, full=True)
             conn.commit()
             eprint("[cache-sync] rebuild: cleared Codex cached entries")
         # #416 spec §3.4: rehydrate the attribution map from the journal BEFORE
@@ -10745,6 +12931,31 @@ def _sync_codex_cache_locked(
                 f"or window attributions: {exc}; deferring the Codex walk")
             return stats
 
+        # #980 D2: a budgeted call settles the finalization debt it inherited
+        # BEFORE walking, under the same admission rules, so older debt cannot
+        # starve behind every hook's walk; the walk then gets what remains of
+        # its own deadline. Inherited model debt is resolved here first (F1):
+        # adoption reads the resolved model to demote Spark windows (#373),
+        # and `_codex_settle_finalization` refuses every dependent unit while
+        # resolution is owed, so without this stage inherited adoption would
+        # wait for the post-walk finalization's reserve. The post-walk core
+        # resolution still runs for this call's own batches; reconciliation
+        # stays there too.
+        if deadline is not None and not targeted:
+            if not load_codex_finalization_debt(conn).empty:
+                prewalk = _codex_settle_finalization(
+                    conn, deadline=deadline, clock=_finalization_clock,
+                    stages=("expand", "model", "adopt"),
+                    strike_state=strike_state)
+                if conn.in_transaction:
+                    conn.commit()
+                if prewalk.cancelled:
+                    stats.finalization_deferred = True
+                if prewalk.adoption_failed or prewalk.model_failed:
+                    stats.maintenance_failed = True
+                    for message in prewalk.errors:
+                        eprint(message)
+
         # Pure read (glob + is_file only); safe to run before the SELECT and
         # the per-file loop, where no cache.db write lock may be held. Targeted
         # mode qualifies ONLY the requested paths — never a tree walk (§5.1).
@@ -10753,7 +12964,11 @@ def _sync_codex_cache_locked(
                 if targeted:
                     files = _qualify_codex_targets(only_paths)
                 else:
-                    files = _discover_codex_files_with_roots()
+                    discovery_skips: dict = {}
+                    files = _discover_codex_files_with_roots(
+                        skipped=discovery_skips)
+                    stats.archive_unmapped = discovery_skips.get(
+                        ARCHIVE_UNMAPPED_SKIP_KEY, 0)
                 stats.files_total = len(files)
                 _p_disc.set_count(len(files))
 
@@ -10763,7 +12978,7 @@ def _sync_codex_cache_locked(
         # or one configured-but-unrecognizable sibling, is unknown filesystem
         # state rather than proof of deletion and therefore fails closed.
         protected_paths: set[str] = set()
-        ordinary_prune_scope: _CodexPruneScope | None = None
+        ordinary_prune_scope = None
         if not rebuild and not targeted:  # --rebuild already cleared; targeted bypasses
             current_file_identities = {
                 (str(item.source_path), item.source_root_key) for item in files
@@ -10781,9 +12996,34 @@ def _sync_codex_cache_locked(
             ordinary_prune_scope = prune_scope
             # #901 Amendment 20 W1: one retained collection serves both the
             # orphan partition and the protection partition.
-            prune_plan = _plan_ordinary_codex_prune(
-                conn, current_file_identities, active_root_keys, prune_scope,
-            )
+            try:
+                prune_plan = _plan_ordinary_codex_prune(
+                    conn, current_file_identities, active_root_keys,
+                    prune_scope, deadline=deadline,
+                )
+            except _CodexInventoryProbeDeadline:
+                # #927 B5: confirming the refused identities ran past the
+                # budget. Nothing was planned or written; the walk defers
+                # whole, exactly as an incomplete inventory does.
+                #
+                # #927 R3: but the inventory IS ready, so the bootstrap has
+                # nothing to do, and with many refused identities on a cold
+                # page cache every hook would overrun the same way. Owe a
+                # whole-tree catch-up and request the executor, whose
+                # unbudgeted sync confirms them without a deadline (#980 F4).
+                # The reason token is unchanged (P4).
+                stats.deferred_reason = "inventory_pending"
+                try:
+                    record_codex_owed_maintenance(
+                        conn, catch_up_whole_tree=True)
+                    conn.commit()
+                except sqlite3.DatabaseError as exc:
+                    if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                        raise
+                    conn.rollback()
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
+                return stats
             safe_sources = prune_plan.safe_sources
             safe_root_keys = prune_plan.safe_root_keys
             refused_sources = prune_plan.refused_sources
@@ -10821,6 +13061,16 @@ def _sync_codex_cache_locked(
                 or refused_sources or refused_root_keys
             ):
                 conn.commit()
+
+        # #970 spec 5.1 (G10): a dated identity is not ingested while either
+        # store retains its direct-era archive spelling (a requalified home);
+        # those identities retire by scope exit through the prune drain.
+        hold_roots = _codex_provider_roots()
+        requal_held = _codex_requalification_held_names(conn, None, hold_roots)
+        conv_held, requal_uncertain = _codex_conversations_hold_names(hold_roots)
+        for hold_key, hold_names in conv_held.items():
+            requal_held[hold_key] = requal_held.get(
+                hold_key, frozenset()) | hold_names
 
         # This SELECT does NOT open an implicit transaction (Python's
         # sqlite3 module only BEGINs on DML). Do NOT add any INSERT/
@@ -10875,7 +13125,7 @@ def _sync_codex_cache_locked(
                 if prev_root_key != discovered.source_root_key:
                     stats.deferred_reason = "requalification"
                     return stats
-                selected = _rc.select_container(discovered.source_path)
+                selected = _select_codex_container(discovered.source_path)
                 if (selected is None or selected.kind != _rc.PLAIN
                         or prev[15] != _rc.PLAIN):
                     # Container transitions are held by the per-file decision;
@@ -10972,7 +13222,11 @@ def _sync_codex_cache_locked(
         # anchor a previous sync established is joined rather than re-minted —
         # "first sight wins and the anchor never moves" across sync boundaries,
         # not just within one.
-        anchor_resolver = CodexResetAnchorResolver(conn)
+        # #980 F3: a budgeted walk bounds the resolver's group seed read with
+        # its walk deadline (late-bound clock, so the walk's test seam drives
+        # it); an unbudgeted call is unchanged.
+        anchor_resolver = CodexResetAnchorResolver(
+            conn, deadline=deadline, clock=lambda: _walk_clock())
         # #901 §5.3c (W11, Q14): every call without the hook's budget prepares
         # its delta with no write transaction open and applies it in one
         # transaction, each file in its own savepoint, at most
@@ -11119,20 +13373,8 @@ def _sync_codex_cache_locked(
                 committed_state[prepared.path_str] = (
                     prepared.scan_target, prepared.final_offset,
                     not prepared.stopped_short)
-                if not rebuild:
-                    if prepared.accounting_rows:
-                        for _extreme in (
-                            min(_r[2] for _r in prepared.accounting_rows),
-                            max(_r[2] for _r in prepared.accounting_rows),
-                        ):
-                            _extend_codex_touched_span(
-                                adoption_spans,
-                                prepared.discovered.source_root_key,
-                                _parse_anchor_iso(_extreme))
-                    for _qrow in prepared.quota_rows:
-                        _extend_codex_touched_span(
-                            adoption_spans, _qrow[1],
-                            _parse_anchor_iso(_qrow[17]))
+                # #980: the file's finalization debt was written inside its
+                # savepoint by `_write_codex_file_batch`.
                 applied.append(prepared)
                 index += 1
             if final and not requeue:
@@ -11249,6 +13491,7 @@ def _sync_codex_cache_locked(
         _p_walk = _perf.phase("walk")
         _p_walk.__enter__()
         pending_marks: list[tuple[str, str, str]] = []
+        location_marks: "list[tuple[str, _rc.SelectedContainer, _AcceptedContainer]]" = []
         strike_marks: list[tuple[str, int]] = []
         barrier_holds: list = []
         barrier_touched: set[str] = set()
@@ -11269,21 +13512,37 @@ def _sync_codex_cache_locked(
                 # filesystem state: neither truncation/requalification reset
                 # nor append ingestion may replace the retained generation.
                 continue
-            selected = _rc.select_container(jp)
+            selected = _select_codex_container(jp)
             if selected is None:
                 eprint(f"[codex-cache] stat failed for {jp}: no container")
                 stats.files_failed += 1
                 continue
+            prev = existing.get(path_str)
+            if (requal_held or requal_uncertain) and _codex_held_by_requalification(
+                    requal_held, requal_uncertain, discovered, selected.location,
+                    first_sight=prev is None):
+                # G10: held until both stores retire the direct-era spelling.
+                stats.container_reads_held += 1
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
+                continue
             _fp = selected.fingerprint
             st = _CodexContainerStat(_fp.size, _fp.mtime_ns, _fp.device, _fp.inode)
-            prev = existing.get(path_str)
             accepted = (None if prev is None else _accepted_container(
-                prev, ext=15, mtime=1, device=13, inode=14))
+                prev, ext=15, mtime=1, device=13, inode=14, size=0))
             history_rollout = False
-            if prev is None and selected.kind != _rc.PLAIN:
+            # #970 V1: TRUE only on the continuation of a read a budget
+            # stopped short (the incomplete-resume branch below), the one
+            # state an interrupted cursorless byte-zero read leaves behind.
+            incomplete_resume = False
+            if prev is None and (selected.kind != _rc.PLAIN
+                                 or selected.location == _rc.ARCHIVE):
+                # #970 spec 5.7: an archive-resident first sight, plain
+                # included, is classified like compressed history.
                 verdict = history.classify(
                     conn, codex_file_identity(discovered), path_str,
-                    known=rebuild_known_identities if rebuild else ())
+                    known=rebuild_known_identities if rebuild else (),
+                    archive=selected.location == _rc.ARCHIVE)
                 if verdict == "unknown":
                     # Untraced compressed history waits for the off-hook
                     # journal census before decoding or first-ingest decisions.
@@ -11302,6 +13561,12 @@ def _sync_codex_cache_locked(
                 stats.budget_exhausted = True
                 unwalked = list(walk[_walk_index:])
                 break
+            if container_decision.action == "adopt-location":
+                # #970 spec 5.5: a same-volume move. Record the new location
+                # with the pending marks (same write admission), then proceed
+                # exactly as for an unchanged container.
+                location_marks.append((path_str, selected, accepted))
+                container_decision = container_decision._replace(action="read")
             if container_decision.action == "pending":
                 if prev is not None:
                     barrier_holds.append((path_str, discovered.source_root_key,
@@ -11447,6 +13712,7 @@ def _sync_codex_cache_locked(
                     # next slice. This ends with the stored target: subsequent
                     # growth takes the ordinary delta-append branch below.
                     history_rollout = True
+                    incomplete_resume = True
                     initial_session_id = prev_sid
                     initial_model = prev_model
                     initial_total_tokens = prev_total_tokens or 0
@@ -11617,6 +13883,15 @@ def _sync_codex_cache_locked(
                 # Known history with no covering durable decision remains
                 # unattributed. Live authentication cannot reconstruct it.
                 file_account_key = None
+            elif (prev is None and start_offset == 0
+                  and selected.location == _rc.ARCHIVE):
+                # #970 spec 5.7 (P2, A6, G11): a first sight in the archive.
+                # Codex archived the thread before cctally saw it, so the
+                # login active now says nothing about whose usage it was:
+                # unattributed, no pending decision, nothing journaled. Window
+                # adoption may still credit it; a later delta append (after an
+                # unarchive) reaches the live-login branch for its new bytes.
+                file_account_key = None
             else:
                 # #341: resolve this root's active account (per-root auth.json
                 # stable-read, cached per sync). A torn read (auth.json
@@ -11723,8 +13998,9 @@ def _sync_codex_cache_locked(
                 deadline is not None and active_physical is not None
                 and discovered.physical_path == active_physical
             ):
-                file_deadline = min(deadline, started_at + float(
-                    budget_seconds) * _CODEX_ACTIVE_FIRST_BUDGET_FRACTION)
+                # #980 D2: the share applies within the walk window.
+                file_deadline = min(deadline, started_at + (
+                    deadline - started_at) * _CODEX_ACTIVE_FIRST_BUDGET_FRACTION)
 
             def _stop_before(
                 offset, _limit=scan_target, _short=stopped_short,
@@ -11745,11 +14021,54 @@ def _sync_codex_cache_locked(
                 # instead of repeating a natural-key seek for every raw row.
                 # Do not add buffered keys: the old probe saw committed rows
                 # only, including earlier file batches, never this file's buffer.
-                retained_quota_keys = (set(conn.execute(
-                    "SELECT line_offset, logical_limit_key "
-                    "FROM quota_window_snapshots "
-                    "WHERE source='codex' AND source_path=?", (path_str,)))
-                    if history_rollout else set())
+                # #970 F1: a cursorless first read from byte zero may meet
+                # readings retained under this path from before it (quota
+                # observations are journal-durable and outlive a prune).
+                # Codex rewrites a rollout when it archives it, so those
+                # readings come back under drifted offsets that neither the
+                # cache key nor the journal natural key matches. A reading
+                # whose offset-free identity is retained, at an offset that
+                # is not itself retained, is dropped before the journal
+                # append and the cache insert. A same-offset match keeps
+                # today's path (the natural keys ignore it), and a path with
+                # no retained rows reads exactly as before. The same one
+                # range load supplies a history identity's natural keys
+                # below, so it still loads its membership once.
+                #
+                # #970 V1: the same holds for the CONTINUATION of such a read.
+                # A budget may stop the byte-zero read mid-file; it then
+                # writes a cursor, and the next slice resumes it through the
+                # incomplete-resume branch. Retained readings and entries
+                # beyond the stop still sit at drifted offsets, so the
+                # continuation applies the same filters. The rows the earlier
+                # slice wrote lie below the resume offset, where this read
+                # never goes. The incomplete-resume branch is also where a
+                # cut-short delta append resumes; there every retained row is
+                # this container's own at its true offset, so the filters
+                # drop nothing new; the cost is one indexed range load per
+                # family, the quota one also supplying the natural-key
+                # membership that branch already queried. A cursor-bearing
+                # identity whose read completed never pays either load.
+                semantic_retained = (
+                    (prev is None and start_offset == 0) or incomplete_resume)
+                retained_natural, retained_readings = (
+                    _codex_retained_quota_readings(conn, path_str)
+                    if semantic_retained else (frozenset(), frozenset()))
+                # #970 N1: the same first read meets accounting entries
+                # retained under this path (a cursorless identity), whose
+                # (source_path, line_offset) key misses every drifted offset
+                # of a rewritten container. An entry whose offset-free
+                # identity is retained is skipped, so the retained row keeps
+                # its id and account_key. Loaded once per such identity and
+                # once per continuation (V1); an ordinary delta append never
+                # pays it.
+                retained_entries = (
+                    _codex_retained_accounting_entries(conn, path_str)
+                    if semantic_retained else frozenset())
+                # A history rollout is a cursorless first sight or an
+                # incomplete resume, both of which loaded the range above.
+                retained_quota_keys = (
+                    retained_natural if history_rollout else frozenset())
                 if generation_gap_offset is not None:
                     iter_state.generation_transition_pending = (
                         _lib_jsonl._codex_generation_transition_between(
@@ -11787,6 +14106,16 @@ def _sync_codex_cache_locked(
                                 # this raw fact. Do not let its conflicting
                                 # reset affect canonical anchors (including
                                 # another identity's retained rows) beforehand.
+                                continue
+                            if retained_readings and (
+                                    quota.line_offset, quota.logical_limit_key
+                            ) not in retained_natural and _codex_quota_reading_key(
+                                    quota.captured_at_utc, quota.observed_slot,
+                                    quota.logical_limit_key,
+                                    quota.window_minutes, quota.used_percent,
+                                    quota.resets_at_utc) in retained_readings:
+                                # #970 F1: a retained reading at a drifted
+                                # offset; never a second observation.
                                 continue
                             quota_rows.append((
                                 quota.source, quota.source_root_key,
@@ -11832,10 +14161,22 @@ def _sync_codex_cache_locked(
                             ))
                         if (entry := emission.accounting) is None:
                             continue
+                        entry_ts = entry.timestamp.astimezone(
+                            dt.timezone.utc).isoformat()
+                        if retained_entries and _codex_accounting_entry_key(
+                                entry_ts, entry.input_tokens,
+                                entry.cached_input_tokens, entry.output_tokens,
+                                entry.reasoning_output_tokens,
+                                entry.total_tokens) in retained_entries:
+                            # #970 N1: a retained entry at a drifted offset;
+                            # never a second count. It still advanced the
+                            # dedup watermark, so it counts as yielded.
+                            yielded_count += 1
+                            continue
                         accounting_rows.append((
                             path_str,
                             emission.line_offset,
-                            entry.timestamp.astimezone(dt.timezone.utc).isoformat(),
+                            entry_ts,
                             entry.session_id,
                             entry.model,
                             entry.input_tokens,
@@ -11873,13 +14214,31 @@ def _sync_codex_cache_locked(
                     stats.token_events_skipped += iter_state.token_events_skipped
                     for _r, _n in iter_state.skip_reasons.items():
                         stats.skip_reasons[_r] = stats.skip_reasons.get(_r, 0) + _n
+            except CodexWalkDeadline:
+                # #980 F3: the anchor seed read reached the walk deadline.
+                # Exactly budget exhaustion before this file committed: its
+                # buffered evidence is discarded, its offsets stay, and the
+                # walk ends with a backlog the catch-up path drains. No
+                # container strike: the file itself is not at fault.
+                if w11:
+                    _codex_w11_trace("prepare_drop", path_str)
+                    if w11_batch:
+                        walk_queue.extendleft(reversed(_w11_flush(final=False)))
+                anchor_resolver.discard_uncommitted_file()
+                # #980 F4: a cold seed can overrun every hook's slice, and
+                # nothing a hook keeps resumes it, so the file is owed to the
+                # executor's unbudgeted catch-up (recorded in finalization).
+                seed_deferred_paths.append(path_str)
+                stats.budget_exhausted = True
+                unwalked = list(walk[_walk_index:])
+                break
             except _rc.ContainerReadInterrupted:
                 if w11:
                     _codex_w11_trace("prepare_drop", path_str)
                     if w11_batch:
                         walk_queue.extendleft(reversed(_w11_flush(final=False)))
                 anchor_resolver.discard_uncommitted_file()
-                strikes = int(prev[22] or 0) + 1 if prev is not None else 1
+                strikes = int(prev[23] or 0) + 1 if prev is not None else 1
                 strike_marks.append((path_str, strikes))
                 stats.budget_exhausted = True
                 unwalked = list(walk[_walk_index:])
@@ -11916,7 +14275,9 @@ def _sync_codex_cache_locked(
             _anchor = fh.result(final_offset)
             container_acceptance = CodexContainerAcceptance(
                 kind=selected.kind,
-                path=str(selected.path) if _is_zstd else None,
+                # #970 G7: NULL exactly when the container is the logical path.
+                path=_codex_container_location_value(
+                    selected.path, selected.logical),
                 container_size_bytes=_fp.size if _is_zstd else None,
                 decoded_size_bytes=size if _is_zstd else None,
                 content_anchor=_anchor,
@@ -12032,7 +14393,36 @@ def _sync_codex_cache_locked(
             # observation. Appended once here, not inside the retry loop, so a DB
             # retry never double-journals.
             anchor_resolver.normalize_quota_rows(quota_rows)
-            _append_codex_quota_obs(quota_rows)
+            import _cctally_journal as _jr_quota
+            try:
+                _append_codex_quota_obs(
+                    quota_rows,
+                    # #977 R6: this walk holds both cache writer flocks, so
+                    # an unbudgeted one never rebuilds a history-sized index
+                    # here either (its pre-lock repair ran before them).
+                    quota_index_policy=(
+                        "producer_locked" if deadline is None else "budgeted"))
+            except _jr_quota.QuotaIndexUnavailable:
+                # #977 C5: the quota natural-key index is missing or invalid
+                # (a budgeted walk never rebuilds it; an unbudgeted one lost it
+                # mid-walk, C6). Withdraw this file's uncommitted batch with
+                # its offset unadvanced, keep committed predecessors (a W11
+                # batch already prepared AND journaled is applied, exactly as
+                # the other per-file refusals here apply it), and ingest no
+                # further file. `sync_codex_cache` requests the rebuild worker
+                # once every producer lock is released.
+                stats.deferred_reason = "quota_index_pending"
+                anchor_resolver.discard_uncommitted_file()
+                requeue: "list[tuple[int, Any]]" = []
+                if w11:
+                    _codex_w11_trace("prepare_drop", path_str)
+                    if w11_batch:
+                        requeue = _w11_flush(final=False)
+                owed = ({_walk_index}
+                        | {index for index, _item in requeue}
+                        | {index for index, _item in walk_queue})
+                unwalked = [walk[index] for index in sorted(owed)]
+                break
 
             if w11:
                 # W11: the file is prepared. Its rows wait for its batch;
@@ -12186,22 +14576,8 @@ def _sync_codex_cache_locked(
                 partial_file = discovered
                 partial_files.append(discovered)
 
-            if not rebuild:
-                # Accounting timestamps share one producer spelling, so the
-                # lexicographic extremes ARE the chronological ones and only two
-                # rows need parsing. Quota anchors are few per file, so they are
-                # parsed individually.
-                if accounting_rows:
-                    for _extreme in (
-                        min(_r[2] for _r in accounting_rows),
-                        max(_r[2] for _r in accounting_rows),
-                    ):
-                        _extend_codex_touched_span(
-                            adoption_spans, discovered.source_root_key,
-                            _parse_anchor_iso(_extreme))
-                for _qrow in quota_rows:
-                    _extend_codex_touched_span(
-                        adoption_spans, _qrow[1], _parse_anchor_iso(_qrow[17]))
+            # #980: this file's finalization debt committed with it, written
+            # by `_write_codex_file_batch` in the file's own transaction.
 
             # Private test seam (§5.1 post-preflight late-shrink race): fires
             # after each file's successful commit, so a race test can shrink a
@@ -12217,6 +14593,12 @@ def _sync_codex_cache_locked(
         if pending_marks:
             _mark_codex_containers_pending(
                 conn, "codex_session_files", pending_marks, commit=not w11)
+        if location_marks:
+            for path, adopted, snap in location_marks:
+                _adopt_codex_container_location(
+                    conn, "codex_session_files", path, adopted, snap)
+            if not w11:
+                conn.commit()
         if strike_marks:
             for path, strikes in strike_marks:
                 if strikes >= 2:
@@ -12427,92 +14809,71 @@ def _sync_codex_cache_locked(
                         "files_deferred_torn": stats.files_deferred_torn,
                     }, sort_keys=True))
                 conn.execute(_CODEX_FINALIZATION_RELEASE)
-            # Public #5: resolve any still-unstamped `quota_window_snapshots.
-            # observed_model` from the accounting corpus, using the exact expression
-            # the read path used before the fallback was removed. Cache migration
-            # 039 is the one-time leg; this is the standing one, because `db skip
-            # 039_…` and a fresh journal-repopulated cache both bypass the migration
-            # and would then classify a Spark window as account weekly quota (#373).
-            # Ordered BEFORE the spend adoption below, which reads the model to
-            # decide `model_scoped` and must not see a stale NULL. A row it changes
-            # is real interpretation drift, so the physical mutation sequence
-            # advances with it — otherwise the projection certificate would still
-            # read as current and the reconcile would short-circuit past the ledger
-            # entries the triggers just wrote. Best-effort, like the adoption below:
-            # the resolution is fully re-derivable on the next sync.
-            try:
-                with _codex_finalization_stage(conn):
-                    with _perf.phase("accounting"):
-                        resolved_models = (
-                            _cctally_db_sib.backfill_codex_quota_observed_model(conn))
-                    if resolved_models:
-                        _bump_codex_physical_mutation_seq(conn)
-            except sqlite3.DatabaseError as exc:
-                if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                    raise
-                stats.maintenance_failed = True
-                eprint("[cache-sync] could not resolve Codex quota model "
-                       f"attribution: {exc}")
+            # #980 D3/D4: settle the persisted finalization debt — the debt
+            # this call's batches wrote and any debt inherited — in order:
+            # `full` expansion, then model resolution, then window-scoped spend
+            # adoption in row-capped units, then operator-attribution
+            # reconciliation once no adoption item remains.
+            #
+            # Model resolution (public #5) resolves any still-unstamped
+            # `quota_window_snapshots.observed_model` from the accounting
+            # corpus; cache migration 039 is the one-time leg and this is the
+            # standing one, because `db skip 039_…` and a fresh journal-
+            # repopulated cache both bypass the migration and would then
+            # classify a Spark window as account weekly quota (#373). It stays
+            # the always-run core step (`core_model`), ordered BEFORE the
+            # adoption, which reads the model to decide `model_scoped`; it
+            # clears the `model` flag only when it succeeds, in the same
+            # savepoint as its effects.
+            #
             # Window-scoped spend adoption (spec
-            # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md).
-            # Runs AFTER the walk committed and while both cache writer flocks are
-            # still held, so the observation evidence and the accounting rows it
-            # stamps are the same committed generation. Cache-only — no stats.db read
-            # — so the lock-order law is untouched. A failure here is never fatal:
-            # the stamp is fully re-derivable, so the next sync (or the migration)
-            # repeats it.
-            try:
-                with _codex_finalization_stage(conn):
-                    with _perf.phase("accounting"):
-                        adopted = apply_codex_window_spend_adoption(
-                            conn, touched=None if rebuild else adoption_spans)
-                # Terse, and silent on zero: a rebuild re-derives every row and so
-                # legitimately re-stamps the same population each time, which would
-                # otherwise read as a recurring anomaly rather than convergence.
-                if adopted:
-                    finalization_notes.append(
-                        f"[cache-sync] attributed {adopted} Codex row(s) "
-                        "from quota windows")
-            except sqlite3.DatabaseError as exc:
-                if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                    # Classified family corruption belongs to the shared recovery
-                    # boundary, never to a best-effort local except.
-                    raise
+            # docs/superpowers/specs/2026-07-30-codex-window-scoped-spend-adoption.md)
+            # and the #500 §7.1 reconciliation run after the walk committed
+            # and while both cache writer flocks are still held, so the
+            # observation evidence and the accounting rows they stamp are the
+            # same committed generation. Cache-only — no stats.db read — so the
+            # lock-order law is untouched. A failure keeps today's
+            # `maintenance_failed` behaviour and leaves the debt unchanged, so
+            # a later call (or the executor) revisits it; a budgeted call
+            # admits a unit only while the budget leaves room, and a unit that
+            # reaches the deadline rolls back and is never reported as a zero.
+            outcome = _codex_settle_finalization(
+                conn, deadline=budget_deadline, clock=_finalization_clock,
+                core_model=True, strike_state=strike_state)
+            for message in outcome.errors:
+                eprint(message)
+            if (outcome.model_failed or outcome.adoption_failed
+                    or outcome.reconcile_failed):
                 stats.maintenance_failed = True
-                eprint(f"[cache-sync] could not adopt Codex window spend: {exc}")
-            # #500 §7.1: the STANDING half of operator attribution. The condition it
-            # repairs is created by ordinary ingest, not only by an operator command
-            # — native evidence arriving for an attributed group, a second assertion,
-            # a component split, a window re-materializing as model-scoped — so it
-            # has to run wherever ingest runs, not only where `account attribute`
-            # does. Ordered AFTER the pass above so the reconciliation has the last
-            # word on any row that pass could also have touched, and inside the same
-            # flocks for the same reason: the observation evidence and the accounting
-            # rows it restores are one committed generation. Costs a store with no
-            # attribution records one indexed read; best-effort, like the pass above.
-            try:
-                with _codex_finalization_stage(conn):
-                    with _perf.phase("accounting"):
-                        restored, readopted = (
-                            reconcile_codex_window_attribution_spend(conn))
-                if restored:
-                    finalization_notes.append(
-                        f"[cache-sync] restored {restored} Codex row(s) whose "
-                        "operator attribution no longer resolves; "
-                        f"re-attributed {readopted}")
-            except sqlite3.DatabaseError as exc:
-                if _cctally_db_sib._is_sqlite_corruption_error(exc):
-                    raise
-                stats.maintenance_failed = True
-                eprint("[cache-sync] could not reconcile Codex window "
-                       f"attribution spend: {exc}")
+            if outcome.cancelled or outcome.deferred_to_worker or (
+                    budget_deadline is not None and not outcome.completed):
+                # Cancelled, handed to the worker, or a unit the remaining
+                # budget could not admit: the persisted debt stays owed.
+                stats.finalization_deferred = True
+            # Terse, and silent on zero: a rebuild re-derives every row and so
+            # legitimately re-stamps the same population each time, which would
+            # otherwise read as a recurring anomaly rather than convergence.
+            if outcome.adopted:
+                finalization_notes.append(
+                    f"[cache-sync] attributed {outcome.adopted} Codex row(s) "
+                    "from quota windows")
+            if outcome.restored:
+                finalization_notes.append(
+                    f"[cache-sync] restored {outcome.restored} Codex row(s) "
+                    "whose operator attribution no longer resolves; "
+                    f"re-attributed {outcome.readopted}")
             # #582: keep only a generous mutation-sequence tail. A dashboard that
             # falls behind it detects the gap and cold-loads, preserving truth.
             # A failure here propagates exactly as before, with the finalization
             # so far committed (``finalizing`` in ``finally``), as it was when
-            # every earlier step committed alone.
+            # every earlier step committed alone. #980 D5: a budgeted call never
+            # prunes; when the prune is due it records it as owed maintenance
+            # for the drain executor instead.
             with _codex_finalization_stage(conn):
-                _prune_codex_accounting_change_log(conn)
+                if deadline is None:
+                    _prune_codex_accounting_change_log(conn)
+                elif _codex_change_log_prune_due(conn):
+                    record_codex_owed_maintenance(conn, change_log_prune=True)
         _finalization_steps(walk_complete, [])
         # 901-QI-001: before anything is decided or certified from them, the
         # last batch's files must still be in this transaction.
@@ -12620,9 +14981,25 @@ def _sync_codex_cache_locked(
                 == stats.files_total
             )
         )
-        stats.full_walk_complete = walk_clean and not stats.prune_debt_pending
+        # #980 D4 / #981 A3: `walk_certified` is the unchanged walk-clean
+        # expression; the completed-accounting predicate additionally needs an
+        # empty persisted finalization debt (read on this transaction, so the
+        # W11 last batch's debt counts) and no cancelled stage.
+        finalization_debt_pending = (
+            not targeted
+            and not load_codex_finalization_debt(conn).empty)
+        if finalization_debt_pending and not targeted:
+            stats.drain_requested = tuple(sorted(
+                set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
+        finalization_settled = (
+            not finalization_debt_pending and not stats.finalization_deferred)
+        stats.walk_certified = walk_clean
+        stats.full_walk_complete = (
+            walk_clean and not stats.prune_debt_pending and finalization_settled)
         # Review N3: clean except for pending prune debt.
-        stats.full_walk_debt_only = walk_clean and bool(stats.prune_debt_pending)
+        stats.full_walk_debt_only = (
+            walk_clean and bool(stats.prune_debt_pending)
+            and finalization_settled)
         if not targeted:
             with _codex_finalization_stage(conn):
                 if stats.full_walk_complete:
@@ -12660,6 +15037,20 @@ def _sync_codex_cache_locked(
                                               and not stats.files_failed
                                               and not stats.prune_refused
                                               and not stats.files_deferred_torn))
+            # #980 D5: a budgeted call never runs the WAL TRUNCATE; when its
+            # size gate is met the checkpoint is owed to the drain executor.
+            if (deadline is not None
+                    and _cache_wal_truncate_due(_cctally_core.CACHE_DB_PATH)):
+                record_codex_owed_maintenance(conn, wal_truncate=True)
+            # #980 F4: a file deferred at the anchor seed deadline is owed
+            # catch-up, committed here whatever became of its own evidence
+            # (discarded, offsets unchanged).
+            if seed_deferred_paths:
+                record_codex_owed_maintenance(
+                    conn, catch_up_paths=seed_deferred_paths)
+            if _codex_owed_anything(conn):
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
         # #901 §5.3c (W8): the one commit of the finalization transaction:
         # resume and backlog state, parse health, the walk's markers, the
         # ordered maintenance stages and the completion marker — and, under
@@ -12688,8 +15079,13 @@ def _sync_codex_cache_locked(
         # #297/#344: forced end-of-sync WAL drain (Codex half). The global
         # writer flock excludes every Claude write/checkpoint until this
         # checkpoint finishes. All Codex ingest work is committed here (no
-        # active transaction).
-        _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
+        # active transaction). #980 D5: an unbudgeted call only; a budgeted
+        # one recorded the drain as owed above.
+        if deadline is None:
+            _maybe_truncate_wal(conn, _cctally_core.CACHE_DB_PATH)
+    except BaseException:
+        raised = True
+        raise
     finally:
         if finalizing:
             _commit_codex_finalization_so_far(conn)
@@ -12709,10 +15105,30 @@ def _sync_codex_cache_locked(
         if walk_marker_owed:
             _withdraw_cache_meta_marker(
                 conn, _ingest_frontier.CODEX_FULL_WALK_COMPLETE_KEY)
-        if held_writer_flocks:
-            # #901 §5.3c (W9): the end of a cache sync is a boundary.
-            _wal_checkpoint.at_boundary(conn)
-        release_cache_writer_flocks(held_writer_flocks)
+        try:
+            if held_writer_flocks:
+                # #901 §5.3c (W9): the end of a cache sync is a boundary.
+                _wal_checkpoint.at_boundary(conn)
+                if read_policy is not None and not raised:
+                    # #981 A2: every write of this call is committed and both
+                    # writer flocks are still held, so the snapshot is exactly
+                    # the generation this call's stats describe. Never on an
+                    # exception (the hook treats that as a failed tick); a
+                    # recovery re-run replaces this pin with its own.
+                    try:
+                        read_policy.pin(
+                            db_path=_cctally_core.CACHE_DB_PATH, stats=stats,
+                            scope=rebuild_prune_scope or ordinary_prune_scope)
+                    except BaseException:
+                        # #981 R4: `pin` absorbs SQLite and OS errors itself;
+                        # anything else proved nothing and propagates.
+                        read_policy.invalidate("cache_unavailable")
+                        raise
+            if read_policy is not None and raised:
+                read_policy.invalidate("cache_unavailable")
+        finally:
+            # #981 R4: released on every path, whatever the pin raised.
+            release_cache_writer_flocks(held_writer_flocks)
 
     if deferred_cert_roots is not None:
         # F1: the gate's skip-condition must be IDENTICAL to
@@ -12752,11 +15168,35 @@ def sync_codex_cache(conn: sqlite3.Connection, *, maintenance: str = "defer",
     """
     if maintenance not in ("defer", "caller"):
         raise ValueError(f"unknown maintenance mode {maintenance!r}")
+    if kwargs.get("budget_seconds") is None:
+        _ensure_quota_index_before_producer_locks()
     stats = _sync_codex_cache_locked(conn, **kwargs)
     if maintenance == "defer":
         for command in stats.drain_requested:
             _request_codex_drain_worker(command)
+    if stats.deferred_reason == "quota_index_pending":
+        # #977 C5: after every producer lock is released, in either
+        # maintenance mode — the rebuild is the journal's, not a drain the
+        # caller could run.
+        import _cctally_journal as _jr
+        _jr.request_quota_index_rebuild()
     return stats
+
+
+def _ensure_quota_index_before_producer_locks() -> None:
+    """#977 C6: an unbudgeted Codex sync makes the quota natural-key index
+    valid BEFORE it takes the cache writer flocks, running the shared bounded
+    rebuild inline. Rebuilding inside a quota append would hold both flocks
+    for a history-sized scan. A journal with no segment has nothing to index;
+    its first append rebuilds an empty index in O(1). A failure is not
+    raised: the walk then takes the C5 deferral path and requests the worker.
+    """
+    import _cctally_journal as jr
+    try:
+        if jr.list_segments():
+            jr.ensure_quota_index(budgeted=False)
+    except Exception as exc:  # noqa: BLE001 — the walk defers instead
+        eprint(f"[codex-cache] quota index rebuild failed: {exc}")
 
 
 def _request_codex_drain_worker(command: str) -> str:
@@ -12764,6 +15204,8 @@ def _request_codex_drain_worker(command: str) -> str:
     if command == CODEX_PRUNE_DRAIN_COMMAND:
         marker_name = CODEX_PRUNE_DRAIN_MARKER_NAME
         throttle = CODEX_PRUNE_DRAIN_SPAWN_THROTTLE_SECONDS
+    elif command == CODEX_INVENTORY_BOOTSTRAP_COMMAND:
+        return "spawned" if request_codex_inventory_bootstrap() else "throttled"
     elif command == CODEX_REPLAY_DRAIN_COMMAND:
         return _defer_codex_replay_drain()
     else:
@@ -12780,12 +15222,1069 @@ def _request_codex_drain_worker(command: str) -> str:
         marker.touch()
     except OSError:
         return "failed"
-    from _cctally_update import _spawn_detached
-    return "spawned" if _spawn_detached(command) else "failed"
+    return "spawned" if _spawn_codex_worker(command) else "failed"
 
 
 _CODEX_ACCOUNT_WEEK = dt.timedelta(
     minutes=_lib_codex_account_adoption.ACCOUNT_WEEKLY_WINDOW_MINUTES)
+
+
+# --------------------------------------------------------------------------
+# #980 (#981 Part D) — durable, cancellable Codex finalization
+# --------------------------------------------------------------------------
+#
+# Spec docs/superpowers/specs/2026-10-31-981-codex-hook-budget-design.md §4.4.
+# The post-walk finalization (model resolution, window-spend adoption and
+# operator-attribution reconciliation) used to run inline over spans the sync
+# held in memory, so a budgeted hook paid for it after its walk deadline and a
+# failed or skipped pass was never revisited. The work each producer creates is
+# now DURABLE debt written in the producer's own transaction, consumed in
+# row-capped units that a deadline can cancel without losing anything.
+
+#: Walk deadline = entry + budget - reserve (D2). Initial value; calibrated in
+#: the native acceptance. Capped at a quarter of a smaller configured budget so
+#: an operator-chosen tiny budget never leaves the walk no time at all.
+_CODEX_FINALIZATION_RESERVE_SECONDS = 1.25
+_CODEX_FINALIZATION_RESERVE_MAX_FRACTION = 0.25
+#: One adoption unit: the next N candidates of a work item (D4).
+_CODEX_ADOPTION_UNIT_CAP = 2000
+#: Python planning checks the deadline every N items (D4).
+_CODEX_FINALIZATION_CHECK_EVERY = 500
+#: Unit writes go in batches of at most N rows, checked between batches (D4).
+_CODEX_FINALIZATION_WRITE_BATCH = 500
+#: One executor change-log prune unit deletes at most N rows (D5).
+_CODEX_CHANGE_LOG_PRUNE_UNIT = 50_000
+#: A unit cancelled on this many consecutive budgeted calls goes to the worker.
+_CODEX_FINALIZATION_STRIKE_LIMIT = 2
+#: Cancellation fires this long before the budget deadline, leaving room for
+#: the settlement (final commit, snapshot pin, lock release). Plan choice,
+#: calibrated in the native acceptance.
+_CODEX_SETTLEMENT_MARGIN_SECONDS = 0.25
+#: A unit starts only when more than this remains before the budget deadline.
+_CODEX_UNIT_ADMISSION_FLOOR_SECONDS = 0.35
+#: SQLite VM instructions between two progress-handler deadline checks.
+_CODEX_PROGRESS_HANDLER_STEPS = 1000
+
+CODEX_FINALIZATION_DEBT_KEY = "codex_finalization_debt"
+CODEX_OWED_MAINTENANCE_KEY = "codex_owed_maintenance"
+_CODEX_DEBT_VERSION = 1
+_CODEX_OWED_VERSION = 1
+_CODEX_OWED_FLAGS = ("wal_truncate", "change_log_prune")
+#: #980 F4: the owed record's catch-up field: ``true`` (the whole tree, which
+#: is what a malformed record owes, and what a budgeted walk whose
+#: refused-identity probe overran records, #927 R3) or a sorted list of
+#: logical rollout paths a budgeted walk deferred at the canonical-anchor seed
+#: deadline. Absent when
+#: nothing is owed, so a record without it reads as no catch-up.
+_CODEX_OWED_CATCH_UP = "ingest_catch_up"
+
+
+class CodexFinalizationCancelled(Exception):
+    """A finalization unit stopped at its deadline (or a SQLite interrupt).
+
+    Deliberately NOT a ``sqlite3.Error``: the best-effort adoption and
+    reconciliation helpers swallow database errors when non-strict, and a
+    cancellation reported as a successful zero is a stamp nobody revisits.
+    ``args[0]`` names the cause: ``"interrupt"`` (SQLite stopped a read
+    statement), ``"deadline"`` (a cooperative check between Python items or
+    write batches) or ``"admission"``.
+    """
+
+
+@dataclass
+class DebtItem:
+    """One adoption work item: an instant span and the unit cursor inside it.
+
+    ``cursor`` is the ``(timestamp_utc, rowid)`` of the last candidate a
+    committed unit processed; ``None`` means the item has not started. A
+    producer never unions new work into a started item (D3)."""
+
+    span: "tuple[dt.datetime, dt.datetime]"
+    cursor: "tuple[str, int] | None" = None
+
+
+@dataclass
+class CodexFinalizationDebt:
+    """``cache_meta.codex_finalization_debt`` decoded (D3)."""
+
+    full: bool = False
+    model: bool = False
+    items: "dict[str, list[DebtItem]]" = field(default_factory=dict)
+    attribution: bool = False
+    strikes: int = 0
+    malformed: bool = False
+
+    @property
+    def empty(self) -> bool:
+        return not (self.full or self.model or self.attribution
+                    or self.malformed or any(self.items.values()))
+
+    def first_item(self) -> "tuple[str, DebtItem] | None":
+        for root in sorted(self.items):
+            if self.items[root]:
+                return root, self.items[root][0]
+        return None
+
+
+@dataclass
+class FinalizationOutcome:
+    """What one settlement did. ``completed`` means no debt remains."""
+
+    completed: bool = False
+    cancelled: bool = False
+    units_done: int = 0
+    cancel_cause: "str | None" = None
+    model_failed: bool = False
+    model_resolved: int = 0
+    adoption_failed: bool = False
+    reconcile_failed: bool = False
+    adopted: int = 0
+    restored: int = 0
+    readopted: int = 0
+    deferred_to_worker: bool = False
+    errors: list = field(default_factory=list)
+
+
+def _codex_malformed_debt() -> CodexFinalizationDebt:
+    return CodexFinalizationDebt(
+        full=True, model=True, attribution=True, malformed=True)
+
+
+def _decode_codex_finalization_debt(text: object) -> CodexFinalizationDebt:
+    """Fail closed: anything not exactly version 1 is everything owed."""
+    try:
+        raw = json.loads(str(text))
+        if not isinstance(raw, dict) or raw.get("v") != _CODEX_DEBT_VERSION:
+            return _codex_malformed_debt()
+        flags = [raw.get(name) for name in ("full", "model", "attribution")]
+        strikes = raw.get("strikes", 0)
+        if (not all(isinstance(flag, bool) for flag in flags)
+                or isinstance(strikes, bool) or not isinstance(strikes, int)
+                or strikes < 0):
+            return _codex_malformed_debt()
+        items_raw = raw.get("items", {})
+        if not isinstance(items_raw, dict):
+            return _codex_malformed_debt()
+        items: "dict[str, list[DebtItem]]" = {}
+        for root, entries in items_raw.items():
+            if not isinstance(root, str) or not root or not isinstance(entries, list):
+                return _codex_malformed_debt()
+            decoded: "list[DebtItem]" = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    return _codex_malformed_debt()
+                span = entry.get("span")
+                if not isinstance(span, list) or len(span) != 2:
+                    return _codex_malformed_debt()
+                low, high = (_parse_anchor_iso(span[0]),
+                             _parse_anchor_iso(span[1]))
+                if low is None or high is None or low > high:
+                    return _codex_malformed_debt()
+                cursor = entry.get("cursor")
+                if cursor is not None:
+                    if (not isinstance(cursor, list) or len(cursor) != 2
+                            or not isinstance(cursor[0], str)
+                            or isinstance(cursor[1], bool)
+                            or not isinstance(cursor[1], int)):
+                        return _codex_malformed_debt()
+                    cursor = (cursor[0], int(cursor[1]))
+                decoded.append(DebtItem((low, high), cursor))
+            if decoded:
+                items[root] = decoded
+        return CodexFinalizationDebt(
+            full=flags[0], model=flags[1], items=items, attribution=flags[2],
+            strikes=strikes)
+    except (TypeError, ValueError):
+        return _codex_malformed_debt()
+
+
+def _encode_codex_finalization_debt(debt: CodexFinalizationDebt) -> str:
+    return json.dumps({
+        "v": _CODEX_DEBT_VERSION,
+        "full": bool(debt.full),
+        "model": bool(debt.model),
+        "attribution": bool(debt.attribution),
+        "strikes": int(debt.strikes),
+        "items": {
+            root: [{
+                "span": [_codex_anchor_iso(item.span[0]),
+                         _codex_anchor_iso(item.span[1])],
+                "cursor": (None if item.cursor is None
+                           else [item.cursor[0], int(item.cursor[1])]),
+            } for item in entries]
+            for root, entries in sorted(debt.items.items()) if entries
+        },
+    }, sort_keys=True, separators=(",", ":"))
+
+
+def load_codex_finalization_debt(conn: sqlite3.Connection) -> CodexFinalizationDebt:
+    """One indexed ``cache_meta`` read. An absent key is no debt."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (CODEX_FINALIZATION_DEBT_KEY,)).fetchone()
+    if row is None:
+        return CodexFinalizationDebt()
+    return _decode_codex_finalization_debt(row[0])
+
+
+def _store_codex_finalization_debt(
+    conn: sqlite3.Connection, debt: CodexFinalizationDebt,
+) -> None:
+    """Persist ``debt`` on the caller's transaction; empty debt is no row.
+
+    A malformed value is never written back: only the normalizing settlement
+    (unbudgeted, or the worker) replaces it, with a well-formed ``full``."""
+    if debt.malformed:
+        raise ValueError("malformed Codex finalization debt is never stored")
+    if debt.empty:
+        conn.execute("DELETE FROM cache_meta WHERE key=?",
+                     (CODEX_FINALIZATION_DEBT_KEY,))
+        return
+    _set_cache_meta_if_changed(
+        conn, CODEX_FINALIZATION_DEBT_KEY,
+        _encode_codex_finalization_debt(debt))
+
+
+def add_codex_finalization_debt(
+    conn: sqlite3.Connection,
+    *,
+    spans: "dict[str, tuple[dt.datetime, dt.datetime]] | None" = None,
+    model: bool = False,
+    attribution: bool = False,
+    full: bool = False,
+) -> None:
+    """Record finalization work INSIDE the producer's own transaction (D3).
+
+    Merge-or-append: a root's span unions into its last item only while that
+    item is unstarted (``cursor is None``); otherwise it becomes a new
+    unstarted item, so a committed cursor never covers work added after it was
+    set. A malformed record already means everything is owed, and an
+    unexpanded ``full`` already covers every span, so neither grows."""
+    spans = {str(root): span for root, span in (spans or {}).items()
+             if root and span is not None}
+    if not (spans or model or attribution or full):
+        return
+    debt = load_codex_finalization_debt(conn)
+    if debt.malformed:
+        return
+    before = _encode_codex_finalization_debt(debt)
+    debt.full = debt.full or full
+    debt.model = debt.model or model
+    debt.attribution = debt.attribution or attribution
+    if not debt.full:
+        for root, (low, high) in spans.items():
+            if low > high:
+                low, high = high, low
+            entries = debt.items.setdefault(root, [])
+            if entries and entries[-1].cursor is None:
+                last = entries[-1]
+                last.span = (min(last.span[0], low), max(last.span[1], high))
+            else:
+                entries.append(DebtItem((low, high), None))
+    if _encode_codex_finalization_debt(debt) != before or not conn.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (CODEX_FINALIZATION_DEBT_KEY,)).fetchone():
+        _store_codex_finalization_debt(conn, debt)
+
+
+def codex_model_resolution_pending(conn: sqlite3.Connection) -> bool:
+    """True while a quota projection must not publish (D6).
+
+    ``model`` set, an unexpanded ``full`` (its expansion sets ``model``) or a
+    malformed record. One indexed ``cache_meta`` read."""
+    debt = load_codex_finalization_debt(conn)
+    return bool(debt.malformed or debt.full or debt.model)
+
+
+def _codex_unresolved_quota_model_exists(conn: sqlite3.Connection) -> bool:
+    """Does any Codex quota row still carry a NULL ``observed_model``?
+
+    Model resolution only ever changes such rows, so this is the exact
+    condition under which a producer's write can leave resolution owed. Served
+    by the partial index ``idx_qws_unresolved_model`` (migration 041)."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM quota_window_snapshots "
+            "WHERE source='codex' AND observed_model IS NULL LIMIT 1"
+        ).fetchone() is not None
+    except sqlite3.OperationalError:
+        # A legacy shape without the column has nothing to resolve.
+        return False
+
+
+def _codex_debt_spans_from_rows(
+    accounting_rows, quota_rows, root_key,
+) -> "dict[str, tuple[dt.datetime, dt.datetime]]":
+    """A batch's spans: accounting timestamps and canonical quota resets.
+
+    The same instants ``_extend_codex_touched_span`` used to accumulate in
+    memory. Accounting timestamps share one producer spelling, so their
+    lexicographic extremes are the chronological ones."""
+    spans: "dict[str, tuple[dt.datetime, dt.datetime]]" = {}
+    if accounting_rows:
+        for extreme in (min(row[2] for row in accounting_rows),
+                        max(row[2] for row in accounting_rows)):
+            _extend_codex_touched_span(
+                spans, root_key, _parse_anchor_iso(extreme))
+    for row in quota_rows or ():
+        _extend_codex_touched_span(spans, row[1], _parse_anchor_iso(row[17]))
+    return spans
+
+
+def _load_codex_owed_record(
+    conn: sqlite3.Connection,
+) -> "tuple[dict[str, bool], bool, tuple[str, ...]]":
+    """Decode ``cache_meta.codex_owed_maintenance`` (D5, #980 F4).
+
+    Returns ``(flags, catch_up_whole_tree, catch_up_paths)``. Anything
+    malformed, or of another version, owes everything: every flag and a
+    whole-tree catch-up."""
+    row = conn.execute(
+        "SELECT value FROM cache_meta WHERE key=?",
+        (CODEX_OWED_MAINTENANCE_KEY,)).fetchone()
+    if row is None:
+        return {flag: False for flag in _CODEX_OWED_FLAGS}, False, ()
+    try:
+        raw = json.loads(str(row[0]))
+        if (isinstance(raw, dict) and raw.get("v") == _CODEX_OWED_VERSION
+                and all(isinstance(raw.get(flag), bool)
+                        for flag in _CODEX_OWED_FLAGS)):
+            flags = {flag: bool(raw[flag]) for flag in _CODEX_OWED_FLAGS}
+            catch_up = raw.get(_CODEX_OWED_CATCH_UP, [])
+            if catch_up is True:
+                return flags, True, ()
+            if (isinstance(catch_up, list)
+                    and all(isinstance(p, str) and p for p in catch_up)):
+                return flags, False, tuple(sorted(set(catch_up)))
+    except (TypeError, ValueError):
+        pass
+    return {flag: True for flag in _CODEX_OWED_FLAGS}, True, ()
+
+
+def load_codex_owed_maintenance(conn: sqlite3.Connection) -> "dict[str, bool]":
+    """``cache_meta.codex_owed_maintenance`` (D5); malformed means all owed."""
+    return _load_codex_owed_record(conn)[0]
+
+
+def load_codex_owed_catch_up(
+    conn: sqlite3.Connection,
+) -> "tuple[bool, tuple[str, ...]]":
+    """The owed ingest catch-up (#980 F4): ``(whole_tree, paths)``.
+
+    ``(False, ())`` owes nothing; a malformed record owes the whole tree."""
+    _flags, whole_tree, paths = _load_codex_owed_record(conn)
+    return whole_tree, paths
+
+
+def _codex_owed_anything(conn: sqlite3.Connection) -> bool:
+    flags, whole_tree, paths = _load_codex_owed_record(conn)
+    return any(flags.values()) or whole_tree or bool(paths)
+
+
+def _store_codex_owed_maintenance(
+    conn: sqlite3.Connection, flags: "dict[str, bool]",
+    catch_up: "bool | tuple[str, ...]" = (),
+) -> None:
+    if not (any(flags.get(flag) for flag in _CODEX_OWED_FLAGS) or catch_up):
+        conn.execute("DELETE FROM cache_meta WHERE key=?",
+                     (CODEX_OWED_MAINTENANCE_KEY,))
+        return
+    record: dict = {"v": _CODEX_OWED_VERSION,
+                    **{flag: bool(flags.get(flag)) for flag in _CODEX_OWED_FLAGS}}
+    if catch_up:
+        record[_CODEX_OWED_CATCH_UP] = (
+            True if catch_up is True else sorted(set(catch_up)))
+    _set_cache_meta_if_changed(conn, CODEX_OWED_MAINTENANCE_KEY, json.dumps(
+        record, sort_keys=True, separators=(",", ":")))
+
+
+def _codex_owed_catch_up_value(
+    whole_tree: bool, paths: "tuple[str, ...]",
+) -> "bool | tuple[str, ...]":
+    return True if whole_tree else tuple(sorted(set(paths)))
+
+
+def record_codex_owed_maintenance(
+    conn: sqlite3.Connection, *, wal_truncate: bool = False,
+    change_log_prune: bool = False,
+    catch_up_paths: "Iterable[str]" = (),
+    catch_up_whole_tree: bool = False,
+) -> None:
+    """OR the given flags (and union the catch-up paths, or widen the catch-up
+    to the whole tree) into the owed record, on the caller's transaction."""
+    catch_up_paths = tuple(p for p in catch_up_paths if p)
+    if not (wal_truncate or change_log_prune or catch_up_paths
+            or catch_up_whole_tree):
+        return
+    current, whole_tree, paths = _load_codex_owed_record(conn)
+    merged = {
+        "wal_truncate": current["wal_truncate"] or wal_truncate,
+        "change_log_prune": current["change_log_prune"] or change_log_prune,
+    }
+    merged_whole = whole_tree or catch_up_whole_tree
+    merged_paths = tuple(sorted(set(paths) | set(catch_up_paths)))
+    if (merged != current or merged_paths != paths
+            or merged_whole != whole_tree
+            or conn.execute(
+                "SELECT 1 FROM cache_meta WHERE key=?",
+                (CODEX_OWED_MAINTENANCE_KEY,)).fetchone() is None):
+        _store_codex_owed_maintenance(
+            conn, merged, _codex_owed_catch_up_value(merged_whole, merged_paths))
+
+
+def _clear_codex_owed_flag(conn: sqlite3.Connection, flag: str) -> None:
+    current, whole_tree, paths = _load_codex_owed_record(conn)
+    if not current.get(flag):
+        return
+    current[flag] = False
+    _store_codex_owed_maintenance(
+        conn, current, _codex_owed_catch_up_value(whole_tree, paths))
+
+
+def _clear_codex_owed_catch_up(
+    conn: sqlite3.Connection, *, whole_tree: bool,
+    paths: "tuple[str, ...]",
+) -> None:
+    """Retire the catch-up a SUCCESSFUL executor unit ingested (#980 F4).
+
+    A whole-tree catch-up retires everything; a targeted one only the paths
+    it ingested, so a path a hook recorded meanwhile stays owed (and a record
+    that turned whole-tree meanwhile stays whole-tree)."""
+    current, owed_whole, owed_paths = _load_codex_owed_record(conn)
+    if whole_tree:
+        remaining: "bool | tuple[str, ...]" = ()
+    elif owed_whole:
+        return
+    else:
+        remaining = tuple(p for p in owed_paths if p not in set(paths))
+        if remaining == owed_paths:
+            return
+    _store_codex_owed_maintenance(conn, current, remaining)
+
+
+def _codex_finalization_reserve(budget_seconds: float) -> float:
+    return min(_CODEX_FINALIZATION_RESERVE_SECONDS,
+               float(budget_seconds) * _CODEX_FINALIZATION_RESERVE_MAX_FRACTION)
+
+
+def _is_sqlite_interrupt(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return int(code) == int(getattr(sqlite3, "SQLITE_INTERRUPT", 9))
+    return "interrupted" in str(exc).lower()
+
+
+def _codex_check_deadline(deadline: "float | None", clock) -> None:
+    """A cooperative check between Python items or write batches (D4)."""
+    if deadline is not None and clock() >= deadline:
+        raise CodexFinalizationCancelled("deadline")
+
+
+@contextlib.contextmanager
+def _codex_cancellable_read(conn: sqlite3.Connection,
+                            deadline: "float | None", clock, *,
+                            cancelled: type = None):
+    """Arm a progress handler around READ statements only (D4).
+
+    Interrupting a SELECT does not end the enclosing explicit transaction,
+    while SQLite rolls back the whole transaction for an interrupted
+    INSERT/UPDATE/DELETE, so writes never run under the handler. Every row the
+    caller needs must be fetched inside the block: the handler fires during
+    ``step``, which is where iteration happens. A SQLite interrupt is a
+    cancellation with or without a deadline, never a swallowable database
+    error. ``cancelled`` names the exception raised (default
+    ``CodexFinalizationCancelled``; the walk's anchor seed raises
+    ``CodexWalkDeadline``)."""
+    if cancelled is None:
+        cancelled = CodexFinalizationCancelled
+    if deadline is not None and clock() >= deadline:
+        raise cancelled("deadline")
+    fired = [False]
+    if deadline is not None:
+        def _handler() -> int:
+            if clock() >= deadline:
+                fired[0] = True
+                return 1
+            return 0
+        conn.set_progress_handler(_handler, _CODEX_PROGRESS_HANDLER_STEPS)
+    try:
+        yield
+    except sqlite3.OperationalError as exc:
+        if fired[0] or _is_sqlite_interrupt(exc):
+            raise cancelled("interrupt") from exc
+        raise
+    finally:
+        if deadline is not None:
+            conn.set_progress_handler(None, 0)
+    if fired[0]:
+        # A loader that swallowed the interrupt returned a partial result.
+        raise cancelled("interrupt")
+
+
+def _codex_adoption_windows(observations, *, deadline=None, clock=time.monotonic):
+    """Group folded observations into in-scope spend-adoption windows.
+
+    Grouped on the SAME key the observation fold groups on
+    (`_lib_quota._physical_window_key`) — the account is deliberately excluded
+    from it, which is precisely what makes a window able to name an account
+    for rows that carry none."""
+    _lib_accounts = _load_lib("_lib_accounts")
+    is_model_scoped_codex_quota = _load_lib(
+        "_lib_codex_pools").is_model_scoped_codex_quota
+    adopt = _lib_codex_account_adoption
+    buckets: "dict[tuple, dict]" = {}
+    for index, observation in enumerate(observations):
+        if index % _CODEX_FINALIZATION_CHECK_EVERY == 0 and index:
+            _codex_check_deadline(deadline, clock)
+        identity = observation.identity
+        bucket = buckets.get(key := _lib_quota._physical_window_key(observation))
+        if bucket is None:
+            bucket = buckets[key] = {
+                "root": identity.source_root_key,
+                "minutes": identity.window_minutes,
+                "reset": observation.canonical_resets_at,
+                "accounts": set(),
+                "model_scoped": False,
+            }
+        if identity.account_key != _lib_accounts.UNATTRIBUTED:
+            bucket["accounts"].add(identity.account_key)
+        # `limit_name` is compare=False on the identity, so the label can differ
+        # across one group's observations; ANY Spark evidence demotes the whole
+        # window out of account weekly quota (#373). That direction only ever
+        # withholds a stamp, never invents one.
+        if is_model_scoped_codex_quota(
+                identity.logical_limit_key, identity.limit_name):
+            bucket["model_scoped"] = True
+    windows: "list[object]" = []
+    for bucket in buckets.values():
+        window = adopt.SpendAdoptionWindow(
+            source_root_key=bucket["root"],
+            window_minutes=bucket["minutes"],
+            canonical_resets_at=bucket["reset"],
+            identified_accounts=frozenset(bucket["accounts"]),
+            model_scoped=bucket["model_scoped"],
+        )
+        if window.in_scope:
+            windows.append(window)
+    return windows
+
+
+def _codex_plan_and_write_adoption(
+    conn, windows, candidates, *, deadline=None, clock=time.monotonic,
+) -> int:
+    """Plan in chunks and write in bounded batches with checks between (D4).
+
+    Each candidate's verdict is independent of the others, so chunking the
+    kernel's input is exact."""
+    _lib_accounts = _load_lib("_lib_accounts")
+    adopt = _lib_codex_account_adoption
+    plan: list = []
+    step = _CODEX_FINALIZATION_CHECK_EVERY
+    for start in range(0, len(candidates), step):
+        if start:
+            _codex_check_deadline(deadline, clock)
+        plan.extend(adopt.build_spend_adoption_plan(
+            windows, candidates[start:start + step]))
+    _codex_check_deadline(deadline, clock)
+    if not plan:
+        return 0
+    plan.sort(key=lambda stamp: (stamp.entry_id, stamp.account_key))
+    stamped = 0
+    batch = _CODEX_FINALIZATION_WRITE_BATCH
+    for start in range(0, len(plan), batch):
+        if start:
+            _codex_check_deadline(deadline, clock)
+        cursor = conn.executemany(
+            "UPDATE codex_session_entries SET account_key = ? "
+            " WHERE id = ? AND (account_key IS NULL OR account_key = '' "
+            "                   OR account_key = ?)",
+            [(stamp.account_key, stamp.entry_id, _lib_accounts.UNATTRIBUTED)
+             for stamp in plan[start:start + batch]],
+        )
+        # Trigger-maintained change ledgers are intentionally excluded from
+        # this public semantic row count.
+        stamped += max(0, int(cursor.rowcount))
+    return stamped
+
+
+def apply_codex_window_spend_adoption_unit(
+    conn: sqlite3.Connection,
+    *,
+    root_key: str,
+    candidate_range: "tuple[dt.datetime, dt.datetime]",
+    cursor: "tuple[str, int] | None",
+    cap: int = _CODEX_ADOPTION_UNIT_CAP,
+    deadline: "float | None" = None,
+    clock=time.monotonic,
+) -> "tuple[int, tuple[str, int] | None]":
+    """One row-capped adoption unit of a work item (D4); ``(stamped, cursor)``.
+
+    The unit is the next ``cap`` adoption candidates of ``root_key`` inside
+    ``candidate_range``, ordered ``(timestamp_utc, rowid)`` after ``cursor``,
+    read with the existing candidate predicate. Windows are loaded only for
+    resets in ``[first_ts, last_ts + 7d]``: every window that can claim an
+    instant ``t`` has its reset in ``(t, t + 7d]``, so each candidate's verdict
+    is exact and independent of chunking. A returned cursor of ``None`` means
+    the item is exhausted.
+
+    Unlike the legacy best-effort pass this never converts a failure into a
+    zero: database errors propagate to the caller's stage (whose savepoint
+    keeps the debt), and a deadline raises ``CodexFinalizationCancelled``.
+    ``deadline`` is the instant past which the unit must stop (the caller has
+    already subtracted its settlement margin).
+    """
+    from _cctally_quota import load_codex_quota_observations
+
+    _lib_accounts = _load_lib("_lib_accounts")
+    adopt = _lib_codex_account_adoption
+    low, high = candidate_range
+    params: list = [
+        str(root_key), _lib_accounts.UNATTRIBUTED,
+        # Coarse, sargable date bounds; the exact range is the unixepoch pair.
+        (low - dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+        (high + dt.timedelta(days=2)).strftime("%Y-%m-%d"),
+        _codex_anchor_iso(low), _codex_anchor_iso(high),
+    ]
+    cursor_sql = ""
+    if cursor is not None:
+        # The leading ``>=`` keeps the cursor sargable on the timestamp index.
+        cursor_sql = ("   AND timestamp_utc >= ? "
+                      "   AND (timestamp_utc > ? "
+                      "        OR (timestamp_utc = ? AND id > ?)) ")
+        params += [cursor[0], cursor[0], cursor[0], int(cursor[1])]
+    params.append(int(cap))
+    with _codex_cancellable_read(conn, deadline, clock):
+        # ``+source_root_key`` keeps the planner on the timestamp index, which
+        # (with its implicit rowid) yields ``(timestamp_utc, id)`` order, so
+        # the LIMIT stops the scan; the root index would sort the root's whole
+        # candidate history in a temp B-tree first (#901 plan guard).
+        rows = conn.execute(
+            "SELECT id, timestamp_utc FROM codex_session_entries "
+            " WHERE +source_root_key = ? "
+            "   AND (account_key IS NULL OR account_key = '' "
+            "        OR account_key = ?) "
+            "   AND timestamp_utc >= ? AND timestamp_utc < ? "
+            "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
+            "   AND unixepoch(timestamp_utc) <= unixepoch(?) "
+            + cursor_sql +
+            " ORDER BY timestamp_utc, id LIMIT ?",
+            params,
+        ).fetchall()
+    if not rows:
+        return 0, None
+    new_cursor = ((str(rows[-1][1]), int(rows[-1][0]))
+                  if len(rows) >= int(cap) else None)
+    candidates = []
+    first_ts = last_ts = None
+    for index, row in enumerate(rows):
+        if index % _CODEX_FINALIZATION_CHECK_EVERY == 0 and index:
+            _codex_check_deadline(deadline, clock)
+        timestamp = _parse_anchor_iso(row[1])
+        if timestamp is None:
+            continue
+        first_ts = timestamp if first_ts is None else min(first_ts, timestamp)
+        last_ts = timestamp if last_ts is None else max(last_ts, timestamp)
+        candidates.append(adopt.SpendAdoptionCandidate(
+            entry_id=int(row[0]), source_root_key=str(root_key),
+            timestamp=timestamp, account_key=None))
+    _codex_check_deadline(deadline, clock)
+    if not candidates:
+        return 0, new_cursor
+    with _codex_cancellable_read(conn, deadline, clock):
+        observations = load_codex_quota_observations(
+            source_root_keys={str(root_key)}, cache_conn=conn,
+            canonical_resets_between=(first_ts, last_ts + _CODEX_ACCOUNT_WEEK),
+        )
+    windows = _codex_adoption_windows(
+        observations, deadline=deadline, clock=clock)
+    _codex_check_deadline(deadline, clock)
+    if not windows:
+        return 0, new_cursor
+    stamped = _codex_plan_and_write_adoption(
+        conn, windows, candidates, deadline=deadline, clock=clock)
+    return stamped, new_cursor
+
+
+def _codex_debt_root_ranges(
+    conn: sqlite3.Connection, *, deadline=None, clock=time.monotonic,
+) -> "dict[str, tuple[dt.datetime, dt.datetime]]":
+    """Each root's whole accounting range, for expanding ``full`` (D3).
+
+    Indexed MIN/MAX of ``timestamp_utc`` and of the canonical resets, widened
+    by a day each side so a mixed spelling of one instant can never fall
+    outside the span (a superset is always safe)."""
+    ranges: "dict[str, tuple[dt.datetime, dt.datetime]]" = {}
+    queries = (
+        "SELECT source_root_key, MIN(timestamp_utc), MAX(timestamp_utc) "
+        "  FROM codex_session_entries "
+        " WHERE source_root_key IS NOT NULL AND source_root_key != '' "
+        " GROUP BY source_root_key",
+        "SELECT source_root_key, "
+        "       MIN(COALESCE(canonical_resets_at_utc, resets_at_utc)), "
+        "       MAX(COALESCE(canonical_resets_at_utc, resets_at_utc)) "
+        "  FROM quota_window_snapshots "
+        " WHERE source = 'codex' AND source_root_key IS NOT NULL "
+        "   AND source_root_key != '' "
+        " GROUP BY source_root_key",
+    )
+    rows: list = []
+    with _codex_cancellable_read(conn, deadline, clock):
+        for sql in queries:
+            try:
+                rows.extend(conn.execute(sql).fetchall())
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_interrupt(exc):
+                    raise
+                # A legacy shape without the canonical column.
+                if "canonical_resets_at_utc" not in str(exc):
+                    raise
+                rows.extend(conn.execute(sql.replace(
+                    "COALESCE(canonical_resets_at_utc, resets_at_utc)",
+                    "resets_at_utc")).fetchall())
+    day = dt.timedelta(days=1)
+    for root, low_text, high_text in rows:
+        bounds = [moment for moment in (_parse_anchor_iso(low_text),
+                                        _parse_anchor_iso(high_text))
+                  if moment is not None]
+        if not bounds:
+            continue
+        low, high = min(bounds) - day, max(bounds) + day
+        current = ranges.get(str(root))
+        ranges[str(root)] = (low, high) if current is None else (
+            min(current[0], low), max(current[1], high))
+    return ranges
+
+
+def _codex_record_strike(conn, strike_state: "dict | None") -> None:
+    """Count one budgeted call's cancellation, at most once per call."""
+    if strike_state is None or strike_state.get("struck"):
+        return
+    strike_state["struck"] = True
+    with _codex_finalization_stage(conn):
+        debt = load_codex_finalization_debt(conn)
+        if debt.malformed:
+            return
+        debt.strikes = int(debt.strikes) + 1
+        _store_codex_finalization_debt(conn, debt)
+
+
+def _codex_settle_finalization(
+    conn: sqlite3.Connection,
+    *,
+    deadline: "float | None",
+    clock=time.monotonic,
+    core_model: bool = False,
+    stages: "tuple[str, ...]" = ("expand", "model", "adopt", "reconcile"),
+    max_units: "int | None" = None,
+    strike_state: "dict | None" = None,
+) -> FinalizationOutcome:
+    """Settle persisted finalization debt on the caller's transaction (D3–D4).
+
+    Order is preserved: ``full`` expansion → model resolution → adoption units
+    → operator-attribution reconciliation. Each unit runs in its own
+    finalization-stage savepoint and re-reads the persisted debt. ``deadline``
+    is the budget deadline (``None`` runs every stage to completion); a unit is
+    admitted only while more than the admission floor remains, and reads,
+    planning and write batches stop at ``deadline - margin``. A cancellation
+    rolls the unit back (its debt and cursor unchanged), skips the later
+    stages and is never swallowed. ``core_model`` makes model resolution the
+    sync's always-run core step: it runs whatever the flag or the deadline say.
+    The caller owns the transaction and its commit.
+    """
+    outcome = FinalizationOutcome()
+    budgeted = deadline is not None
+    if strike_state is None:
+        # One call, one strike: a caller settling in several steps (the sync's
+        # pre-walk settle and its finalization) shares one state instead.
+        strike_state = {}
+    threshold = None if not budgeted else deadline - _CODEX_SETTLEMENT_MARGIN_SECONDS
+    stop = False
+
+    def _admitted() -> bool:
+        return (not budgeted
+                or deadline - clock() > _CODEX_UNIT_ADMISSION_FLOOR_SECONDS)
+
+    def _units_left() -> bool:
+        return max_units is None or outcome.units_done < max_units
+
+    def _cancelled(exc: CodexFinalizationCancelled) -> None:
+        nonlocal stop
+        stop = True
+        outcome.cancelled = True
+        outcome.cancel_cause = str(exc.args[0]) if exc.args else "deadline"
+        if budgeted:
+            _codex_record_strike(conn, strike_state)
+
+    debt = load_codex_finalization_debt(conn)
+    if debt.malformed:
+        if budgeted:
+            # Fail closed: only an unbudgeted caller or the worker may settle
+            # a record nobody can read (D3). The core resolution still runs.
+            outcome.deferred_to_worker = True
+            stop = True
+        elif "expand" in stages:
+            with _codex_finalization_stage(conn):
+                _store_codex_finalization_debt(conn, CodexFinalizationDebt(
+                    full=True, model=True, attribution=True))
+            debt = load_codex_finalization_debt(conn)
+    had_items = bool(debt.first_item())
+    attribution_owed = debt.attribution
+
+    # 1. Expansion of an unexpanded `full`.
+    if (not stop and "expand" in stages and debt.full and _units_left()):
+        if not _admitted():
+            stop = True
+        else:
+            try:
+                with _codex_finalization_stage(conn):
+                    ranges = _codex_debt_root_ranges(
+                        conn, deadline=threshold, clock=clock)
+                    expanded = load_codex_finalization_debt(conn)
+                    expanded.full = False
+                    expanded.model = True
+                    expanded.attribution = True
+                    expanded.items = {root: [DebtItem(span, None)]
+                                      for root, span in ranges.items()}
+                    _store_codex_finalization_debt(conn, expanded)
+                outcome.units_done += 1
+                had_items = had_items or bool(ranges)
+                attribution_owed = True
+            except CodexFinalizationCancelled as exc:
+                _cancelled(exc)
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    raise
+                stop = True
+                outcome.adoption_failed = True
+                outcome.errors.append(
+                    f"[cache-sync] could not adopt Codex window spend: {exc}")
+
+    # 2. Model resolution (served by the partial index over unresolved rows).
+    debt = load_codex_finalization_debt(conn)
+    if "model" in stages and (core_model or (
+            not stop and debt.model and not debt.malformed and _units_left())):
+        try:
+            with _codex_finalization_stage(conn):
+                with _perf.phase("accounting"):
+                    resolved = (
+                        _cctally_db_sib.backfill_codex_quota_observed_model(conn))
+                if resolved:
+                    # Real interpretation drift: the projection certificate
+                    # must not read as current past the ledger entries.
+                    _bump_codex_physical_mutation_seq(conn)
+                current = load_codex_finalization_debt(conn)
+                if current.model and not current.malformed:
+                    current.model = False
+                    _store_codex_finalization_debt(conn, current)
+            outcome.model_resolved = int(resolved or 0)
+            if debt.model:
+                outcome.units_done += 1
+        except sqlite3.DatabaseError as exc:
+            if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                raise
+            outcome.model_failed = True
+            outcome.errors.append(
+                "[cache-sync] could not resolve Codex quota model "
+                f"attribution: {exc}")
+
+    # Model resolution is a PREREQUISITE of every dependent unit (#373, F1).
+    # Adoption and reconciliation group windows on the interpreted key and
+    # demote Spark windows through `is_model_scoped_codex_quota`, which reads
+    # the resolved `observed_model`; over a resolvable NULL model a Spark
+    # window reads as account-level weekly quota and stamps unrelated spend,
+    # and later resolution never undoes that stamp (adoption skips attributed
+    # rows). So while resolution is owed -- it failed above, a caller's stage
+    # list omitted it, or an unexpanded `full` remains -- neither stage runs
+    # and their items, cursors and `attribution` stay exactly as they are; a
+    # later settlement runs them once resolution has succeeded.
+    model_pending = codex_model_resolution_pending(conn)
+
+    # 3. Adoption units, always the first item of the first root.
+    while (not stop and not model_pending and "adopt" in stages
+           and _units_left()):
+        debt = load_codex_finalization_debt(conn)
+        if debt.malformed:
+            break
+        head = debt.first_item()
+        if head is None:
+            break
+        if budgeted and debt.strikes >= _CODEX_FINALIZATION_STRIKE_LIMIT:
+            outcome.deferred_to_worker = True
+            stop = True
+            break
+        if not _admitted():
+            stop = True
+            break
+        root, item = head
+        try:
+            with _codex_finalization_stage(conn):
+                with _perf.phase("accounting"):
+                    stamped, new_cursor = apply_codex_window_spend_adoption_unit(
+                        conn, root_key=root,
+                        candidate_range=(item.span[0] - _CODEX_ACCOUNT_WEEK,
+                                         item.span[1]),
+                        cursor=item.cursor, cap=_CODEX_ADOPTION_UNIT_CAP,
+                        deadline=threshold, clock=clock)
+                current = load_codex_finalization_debt(conn)
+                entries = current.items.get(root) or []
+                if entries:
+                    if new_cursor is None:
+                        entries.pop(0)
+                        if not entries:
+                            current.items.pop(root, None)
+                    else:
+                        entries[0].cursor = new_cursor
+                current.strikes = 0
+                _store_codex_finalization_debt(conn, current)
+        except CodexFinalizationCancelled as exc:
+            _cancelled(exc)
+            break
+        except sqlite3.DatabaseError as exc:
+            if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                raise
+            stop = True
+            outcome.adoption_failed = True
+            outcome.errors.append(
+                f"[cache-sync] could not adopt Codex window spend: {exc}")
+            break
+        outcome.units_done += 1
+        outcome.adopted += int(stamped or 0)
+        had_items = True
+
+    # 4. Reconciliation: only once every root's item list is empty, and never
+    # while model resolution is owed (above).
+    if "reconcile" in stages and not model_pending:
+        debt = load_codex_finalization_debt(conn)
+        owed = bool(had_items or attribution_owed or debt.attribution)
+        if debt.malformed:
+            pass
+        elif debt.first_item() is not None or stop or not _units_left() or (
+                not _admitted()):
+            if owed and not debt.attribution:
+                with _codex_finalization_stage(conn):
+                    current = load_codex_finalization_debt(conn)
+                    if not current.malformed:
+                        current.attribution = True
+                        _store_codex_finalization_debt(conn, current)
+        elif (budgeted and debt.attribution
+                and debt.strikes >= _CODEX_FINALIZATION_STRIKE_LIMIT):
+            # Starvation (D4): a reconcile cancelled on two budgeted calls is
+            # the worker's, exactly like an oversized adoption unit.
+            outcome.deferred_to_worker = True
+        elif max_units is None or debt.attribution:
+            try:
+                with _codex_finalization_stage(conn):
+                    with _perf.phase("accounting"):
+                        if budgeted:
+                            restored, readopted = (
+                                reconcile_codex_window_attribution_spend(
+                                    conn, deadline=threshold, clock=clock))
+                        else:
+                            restored, readopted = (
+                                reconcile_codex_window_attribution_spend(conn))
+                    current = load_codex_finalization_debt(conn)
+                    if current.attribution and not current.malformed:
+                        current.attribution = False
+                        current.strikes = 0
+                        _store_codex_finalization_debt(conn, current)
+                if debt.attribution:
+                    outcome.units_done += 1
+                outcome.restored += int(restored or 0)
+                outcome.readopted += int(readopted or 0)
+            except CodexFinalizationCancelled as exc:
+                # #980 R1: the standing reconcile (nothing owed when it
+                # started) is owed once it is cancelled. Persisted BEFORE the
+                # strike, so the strike lands on durable debt rather than on an
+                # empty record deleted with it, and the caller sees the debt
+                # and requests the executor instead of withholding the
+                # certificate on every call with nothing handed off.
+                if not debt.attribution:
+                    with _codex_finalization_stage(conn):
+                        current = load_codex_finalization_debt(conn)
+                        if not current.malformed:
+                            current.attribution = True
+                            _store_codex_finalization_debt(conn, current)
+                _cancelled(exc)
+            except sqlite3.DatabaseError as exc:
+                if _cctally_db_sib._is_sqlite_corruption_error(exc):
+                    raise
+                outcome.reconcile_failed = True
+                outcome.errors.append(
+                    "[cache-sync] could not reconcile Codex window "
+                    f"attribution spend: {exc}")
+                if owed and not debt.attribution:
+                    with _codex_finalization_stage(conn):
+                        current = load_codex_finalization_debt(conn)
+                        if not current.malformed:
+                            current.attribution = True
+                            _store_codex_finalization_debt(conn, current)
+
+    outcome.completed = load_codex_finalization_debt(conn).empty
+    return outcome
+
+
+def settle_codex_finalization(
+    conn: sqlite3.Connection,
+    *,
+    deadline: "float | None",
+    clock=time.monotonic,
+) -> FinalizationOutcome:
+    """Settle persisted Codex finalization debt (D3–D4); see
+    ``_codex_settle_finalization``. The caller holds both cache writer flocks
+    and owns the transaction and its commit."""
+    return _codex_settle_finalization(conn, deadline=deadline, clock=clock)
+
+
+def settle_codex_finalization_unbudgeted(
+    *, lock_timeout: "float | None" = None,
+) -> bool:
+    """Settle every stage of persisted finalization debt outside any sync.
+
+    For an explicit command that must publish a quota projection the D6 model
+    fence would otherwise refuse (``cctally account attribute``). Takes both
+    cache writer flocks with the unbudgeted sync's discipline
+    (``lock_timeout=None`` is one non-blocking attempt), settles with no
+    deadline, commits and releases. Returns True when model resolution is no
+    longer owed; False when it still is (the flocks were contended, or
+    resolution failed and stays owed)."""
+    from _lib_cache_writer_lock import (
+        acquire_cache_writer_flocks,
+        release_cache_writer_flocks,
+    )
+    conn = open_cache_db()
+    try:
+        held = acquire_cache_writer_flocks(
+            _cctally_core.CACHE_LOCK_PATH, _cctally_core.CACHE_LOCK_CODEX_PATH,
+            timeout=lock_timeout)
+        if held is None:
+            return not codex_model_resolution_pending(conn)
+        try:
+            _wal_checkpoint.arm(conn)
+            try:
+                outcome = _codex_settle_finalization(conn, deadline=None)
+                for line in outcome.errors:
+                    eprint(line)
+                conn.commit()
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                _wal_checkpoint.at_boundary(conn)
+        finally:
+            release_cache_writer_flocks(held)
+        return not codex_model_resolution_pending(conn)
+    finally:
+        conn.close()
+
+
+def codex_model_resolution_pending_now() -> bool:
+    """``codex_model_resolution_pending`` on a fresh cache connection."""
+    conn = open_cache_db()
+    try:
+        return codex_model_resolution_pending(conn)
+    finally:
+        conn.close()
 
 
 def apply_codex_window_spend_adoption(
@@ -12793,6 +16292,8 @@ def apply_codex_window_spend_adoption(
     *,
     touched: "dict[str, tuple[dt.datetime, dt.datetime]] | None" = None,
     strict: bool = False,
+    deadline: "float | None" = None,
+    clock=time.monotonic,
 ) -> int:
     """Stamp window-derived attribution onto unattributed Codex spend.
 
@@ -12837,6 +16338,10 @@ def apply_codex_window_spend_adoption(
     every rebuild, so the pass must re-stamp afterwards, and re-running over an
     already-stamped cache writes nothing because an identified row is never a
     candidate.  Returns the number of rows actually stamped.
+
+    #980: a SQLite interrupt, or ``deadline`` passing between reads, planning
+    chunks or write batches, raises ``CodexFinalizationCancelled`` even when
+    non-strict — a cancellation is never a success-shaped zero.
     """
     roots: "set[str] | None" = None
     reset_bounds: "tuple[dt.datetime, dt.datetime] | None" = None
@@ -12860,14 +16365,14 @@ def apply_codex_window_spend_adoption(
     # `_load_lib`, not a bare import: this module is loadable in isolation, where
     # `bin/` may not be on `sys.path` (see the module docstring).
     _lib_accounts = _load_lib("_lib_accounts")
-    is_model_scoped_codex_quota = _load_lib(
-        "_lib_codex_pools").is_model_scoped_codex_quota
     adopt = _lib_codex_account_adoption
     try:
-        columns = {
-            str(row[1]) for row in conn.execute(
-                "PRAGMA table_info(codex_session_entries)")
-        }
+        # #980: an interrupt is a cancellation, never the swallowed zero.
+        with _codex_cancellable_read(conn, deadline, clock):
+            columns = {
+                str(row[1]) for row in conn.execute(
+                    "PRAGMA table_info(codex_session_entries)")
+            }
     except sqlite3.DatabaseError:
         if strict:
             raise
@@ -12885,54 +16390,20 @@ def apply_codex_window_spend_adoption(
         return 0
 
     try:
-        observations = load_codex_quota_observations(
-            source_root_keys=roots, cache_conn=conn,
-            canonical_resets_between=reset_bounds,
-        )
+        with _codex_cancellable_read(conn, deadline, clock):
+            observations = load_codex_quota_observations(
+                source_root_keys=roots, cache_conn=conn,
+                canonical_resets_between=reset_bounds,
+            )
     except sqlite3.DatabaseError:
         if strict:
             raise
         return 0
 
-    # Group on the SAME key the observation fold groups on
-    # (`_lib_quota._physical_window_key`) — the account is deliberately excluded
-    # from it, which is precisely what makes a window able to name an account for
-    # rows that carry none.
-    buckets: "dict[tuple, dict]" = {}
-    for observation in observations:
-        identity = observation.identity
-        bucket = buckets.get(key := _lib_quota._physical_window_key(observation))
-        if bucket is None:
-            bucket = buckets[key] = {
-                "root": identity.source_root_key,
-                "minutes": identity.window_minutes,
-                "reset": observation.canonical_resets_at,
-                "accounts": set(),
-                "model_scoped": False,
-            }
-        if identity.account_key != _lib_accounts.UNATTRIBUTED:
-            bucket["accounts"].add(identity.account_key)
-        # `limit_name` is compare=False on the identity, so the label can differ
-        # across one group's observations; ANY Spark evidence demotes the whole
-        # window out of account weekly quota (#373). That direction only ever
-        # withholds a stamp, never invents one.
-        if is_model_scoped_codex_quota(
-                identity.logical_limit_key, identity.limit_name):
-            bucket["model_scoped"] = True
-
-    windows: "list[object]" = []
+    windows = _codex_adoption_windows(
+        observations, deadline=deadline, clock=clock)
     root_ranges: "dict[str, list[tuple[dt.datetime, dt.datetime]]]" = {}
-    for bucket in buckets.values():
-        window = adopt.SpendAdoptionWindow(
-            source_root_key=bucket["root"],
-            window_minutes=bucket["minutes"],
-            canonical_resets_at=bucket["reset"],
-            identified_accounts=frozenset(bucket["accounts"]),
-            model_scoped=bucket["model_scoped"],
-        )
-        if not window.in_scope:
-            continue
-        windows.append(window)
+    for window in windows:
         root_ranges.setdefault(window.source_root_key, []).append(
             (window.nominal_start_at, window.canonical_resets_at))
     if not windows:
@@ -12956,16 +16427,20 @@ def apply_codex_window_spend_adoption(
             window_high = min(window_high, candidate_bounds[1])
             if window_low > window_high:
                 continue
-        for row in conn.execute(
-            "SELECT id, timestamp_utc FROM codex_session_entries "
-            " WHERE source_root_key = ? "
-            "   AND (account_key IS NULL OR account_key = '' "
-            "        OR account_key = ?) "
-            "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
-            "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
-            (root, _lib_accounts.UNATTRIBUTED,
-             _codex_anchor_iso(window_low), _codex_anchor_iso(window_high)),
-        ):
+        with _codex_cancellable_read(conn, deadline, clock):
+            rows = conn.execute(
+                "SELECT id, timestamp_utc FROM codex_session_entries "
+                " WHERE source_root_key = ? "
+                "   AND (account_key IS NULL OR account_key = '' "
+                "        OR account_key = ?) "
+                "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
+                "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
+                (root, _lib_accounts.UNATTRIBUTED,
+                 _codex_anchor_iso(window_low), _codex_anchor_iso(window_high)),
+            ).fetchall()
+        for index, row in enumerate(rows):
+            if index % _CODEX_FINALIZATION_CHECK_EVERY == 0 and index:
+                _codex_check_deadline(deadline, clock)
             timestamp = _parse_anchor_iso(row[1])
             if timestamp is None:
                 continue
@@ -12975,20 +16450,8 @@ def apply_codex_window_spend_adoption(
             ))
     if not candidates:
         return 0
-
-    plan = adopt.build_spend_adoption_plan(windows, candidates)
-    if not plan:
-        return 0
-    cursor = conn.executemany(
-        "UPDATE codex_session_entries SET account_key = ? "
-        " WHERE id = ? AND (account_key IS NULL OR account_key = '' "
-        "                   OR account_key = ?)",
-        [(stamp.account_key, stamp.entry_id, _lib_accounts.UNATTRIBUTED)
-         for stamp in plan],
-    )
-    # Trigger-maintained change ledgers are intentionally excluded from this
-    # public semantic row count.
-    return max(0, int(cursor.rowcount))
+    return _codex_plan_and_write_adoption(
+        conn, windows, candidates, deadline=deadline, clock=clock)
 
 
 # --------------------------------------------------------------------------
@@ -13017,19 +16480,31 @@ def apply_codex_window_spend_adoption(
 # already at its correct owner is not rewritten.
 
 
-def _codex_stored_identity_path(source_path) -> pathlib.Path:
+def _codex_stored_identity_path(
+        source_path, roots: "list[CodexProviderRoot] | None" = None,
+) -> pathlib.Path:
     """The canonical logical path discovery derives for a stored path: the
     selected container, canonicalized, then normalized to its logical form
-    (Task 3), so a compressed or symlinked container keeps its identity."""
+    (Task 3), so a compressed or symlinked container keeps its identity.
+
+    #970 spec 5.4: selection is root-aware and the identity follows the one
+    shared rule (``_codex_identity_path``), so a stored dated path whose
+    container now sits in the archive reconstructs the identity discovery
+    gave it. ``roots`` None resolves the configured roots once for this call.
+    """
     logical = pathlib.Path(str(source_path))
-    selected = _rc.select_container(logical)
-    target = selected.path if selected is not None else logical
-    return _rc.logical_path(_canonical_codex_path(target))
+    if roots is None:
+        roots = _codex_provider_roots()
+    selected = _select_codex_container(logical, roots)
+    if selected is None:
+        return _rc.logical_path(_canonical_codex_path(logical))
+    return _codex_identity_path(selected, _codex_root_for_logical(logical, roots))
 
 
 
 def codex_file_key_for_entry_path(
-    source_root_key: str, source_path: str,
+    source_root_key: str, source_path: str, *,
+    roots: "list[CodexProviderRoot] | None" = None,
 ) -> str:
     """The durable file identity behind a stored ``source_path``.
 
@@ -13042,7 +16517,7 @@ def codex_file_key_for_entry_path(
 
     return codex_file_key(
         str(source_root_key),
-        str(_codex_stored_identity_path(source_path)),
+        str(_codex_stored_identity_path(source_path, roots)),
     )
 
 
@@ -13119,6 +16594,7 @@ def _codex_history_identities(conn) -> "set[str]":
     known = {r[0] for r in conn.execute(
         "SELECT file_identity FROM codex_file_incarnations")}
     seen: set = set()
+    roots = _codex_provider_roots()
     for root_key, path in conn.execute(
             "SELECT source_root_key, source_path FROM codex_accounting_change_log "
             "WHERE change_kind='path'"):
@@ -13126,21 +16602,31 @@ def _codex_history_identities(conn) -> "set[str]":
             continue
         seen.add((root_key, path))
         try:
-            known.add(codex_file_key_for_entry_path(root_key or "", path))
+            known.add(codex_file_key_for_entry_path(
+                root_key or "", path, roots=roots))
         except (ValueError, TypeError, OSError):
             continue
     return known
+
+
+def _codex_history_marker_covers_archives(payload: "dict | None") -> bool:
+    """#970 spec 5.7 (G12): has the census covered archive-resident rollouts?
+    A marker an older binary settled lacks the field: it still settles
+    sessions-resident candidates, never archive-resident ones."""
+    return payload is not None and payload.get("archives") == 1
 
 
 class _CodexHistoryContext:
     """One walk's provenance state, read once before the walk loop."""
 
     __slots__ = ("payload", "traced", "settle_on_finish", "ledger_paths",
-                 "consulted")
+                 "consulted", "archives_covered")
 
     def __init__(self, conn):
         import _cctally_journal as _jr
         self.payload = _codex_history_marker(conn)
+        self.archives_covered = _codex_history_marker_covers_archives(
+            self.payload)
         self.traced = (None if self.payload is None
                        else frozenset(str(p) for p in self.payload["traced"]))
         # Read BEFORE this walk appends anything: with no journal at all there
@@ -13150,15 +16636,20 @@ class _CodexHistoryContext:
         self.ledger_paths = None
         self.consulted = False
 
-    def classify(self, conn, identity: str, path: str, *, known=()) -> str:
-        """``"history"``, ``"new"`` or ``"unknown"`` for a compressed rollout
-        with no cursor."""
+    def classify(self, conn, identity: str, path: str, *, known=(),
+                 archive: bool = False) -> str:
+        """``"history"``, ``"new"`` or ``"unknown"`` for a compressed or
+        archive-resident (#970) rollout with no cursor."""
         if self.payload is None and not self.settle_on_finish:
             # Before raw INSERT OR IGNORE can win, restore any independently
             # journal-retained quota stamp. A prefix attribution decision does
             # not certify quota recovery: rebuilding rehydrates that decision
             # before this walk, whereas a detached drain can arrive before it.
             # Both entrypoints must recover the same journal-first population.
+            return "unknown"
+        if archive and self.payload is not None and not self.archives_covered:
+            # #970 G12: a marker settled before archives were discovered has
+            # never traced them; hold until the census covers the archives.
             return "unknown"
         if identity in known:
             return "history"
@@ -13179,7 +16670,8 @@ class _CodexHistoryContext:
         that had no journal, or drop traced paths that now have a cursor."""
         if self.settle_on_finish:
             _store_codex_history_marker(
-                conn, {"journalHighWater": None, "traced": []}, replace=False)
+                conn, {"journalHighWater": None, "traced": [], "archives": 1},
+                replace=False)
             return
         if not (self.consulted and self.traced):
             return
@@ -13197,8 +16689,13 @@ class ProvenanceDrainResult(NamedTuple):
     traced: int      # of them, the ones a journal-retained observation names
 
 
-def _codex_history_candidates() -> "list[str]":
-    """Read-only: the logical paths an unsettled walk holds."""
+def _codex_history_candidates(*, archive_only: bool = False) -> "list[str]":
+    """Read-only: the logical paths an unsettled walk holds.
+
+    Cursorless compressed rollouts and (#970 spec 5.7) cursorless
+    archive-resident rollouts, plain included; ``archive_only`` keeps just
+    the latter, the population a marker without archive coverage holds.
+    """
     files = _discover_codex_files_with_roots()
     conn = open_cache_db()
     try:
@@ -13209,8 +16706,11 @@ def _codex_history_candidates() -> "list[str]":
             key = str(item.source_path)
             if key in cursors:
                 continue
-            selected = _rc.select_container(item.source_path)
-            if selected is None or selected.kind == _rc.PLAIN:
+            selected = _select_codex_container(item.source_path)
+            if selected is None:
+                continue
+            if selected.location != _rc.ARCHIVE and (
+                    archive_only or selected.kind == _rc.PLAIN):
                 continue
             # File-account coverage cannot witness quota coverage. Include
             # every cursorless compressed identity until this census settles,
@@ -13237,11 +16737,14 @@ def run_codex_history_provenance_drain(
     try:
         probe = open_cache_db()
         try:
-            if _codex_history_marker(probe) is not None:
+            prior = _codex_history_marker(probe)
+            if _codex_history_marker_covers_archives(prior):
                 return ProvenanceDrainResult("already-settled", 0, 0)
         finally:
             probe.close()
-        candidates = _codex_history_candidates()
+        # #970 G12: a marker settled before archive discovery keeps settling
+        # sessions-resident rollouts; the census covers only the archives.
+        candidates = _codex_history_candidates(archive_only=prior is not None)
         prepared = {str(item.source_path): item
                     for item in _qualify_codex_targets(set(candidates))}
         if set(prepared) != set(candidates):
@@ -13285,13 +16788,31 @@ def run_codex_history_provenance_drain(
                 return ProvenanceDrainResult("yielded", len(candidates), len(traced))
         # A changed inventory is retried from one new captured census; never
         # certify a subset because identities arrived or moved during the scan.
-        if set(_codex_history_candidates()) != set(candidates):
+        if set(_codex_history_candidates(
+                archive_only=prior is not None)) != set(candidates):
             return ProvenanceDrainResult("yielded", len(candidates), len(traced))
-        payload = {"journalHighWater": list(high_water) if high_water else None,
-                   "traced": sorted(traced)}
-        written, _ = _codex_admitted_cache_write(
-            lambda conn: _store_codex_history_marker(conn, payload, replace=False),
-            wait_for_requests=wait_for_requests)
+        if prior is None:
+            payload = {"journalHighWater": (list(high_water) if high_water
+                                            else None),
+                       "traced": sorted(traced), "archives": 1}
+
+            def store(conn):
+                _store_codex_history_marker(conn, payload, replace=False)
+                return True
+        else:
+            # Keep the settled traced paths and high water; add the archive
+            # traces and the coverage, only over the marker this census read.
+            payload = dict(prior, archives=1, traced=sorted(
+                {str(p) for p in prior["traced"]} | set(traced)))
+
+            def store(conn):
+                if _codex_history_marker(conn) != prior:
+                    return False
+                _store_codex_history_marker(conn, payload, replace=True)
+                return True
+        admitted, written = _codex_admitted_cache_write(
+            store, wait_for_requests=wait_for_requests)
+        written = admitted and written
         return ProvenanceDrainResult("settled" if written else "yielded",
                                      len(candidates), len(traced))
     finally:
@@ -13358,6 +16879,7 @@ def _codex_span_covers(index, instant: dt.datetime) -> bool:
 
 def reconcile_codex_window_attribution_spend(
     conn: sqlite3.Connection, *, strict: bool = False,
+    deadline: "float | None" = None, clock=time.monotonic,
 ) -> "tuple[int, int]":
     """Restore stranded attribution stamps, then re-adopt; ``(restored, adopted)``.
 
@@ -13386,12 +16908,19 @@ def reconcile_codex_window_attribution_spend(
     ``strict`` propagates failures for ``account attribute``'s all-or-nothing
     apply; the default swallows them the way the sync-time adoption pass does,
     because everything here is re-derivable on the next sync.
+
+    #980: reads run under the cancellable-read guard, planning and the restore
+    writes are checked against ``deadline`` every
+    ``_CODEX_FINALIZATION_CHECK_EVERY`` rows and between write batches, and a
+    cancellation raises ``CodexFinalizationCancelled`` even when non-strict.
     """
     from _cctally_quota import resolve_codex_window_attributions_with_evidence
 
     try:
-        active = load_active_window_attributions(conn)
-        retracted = load_active_window_attributions(conn, retracted_only=True)
+        with _codex_cancellable_read(conn, deadline, clock):
+            active = load_active_window_attributions(conn)
+            retracted = load_active_window_attributions(
+                conn, retracted_only=True)
     except sqlite3.DatabaseError:
         if strict:
             raise
@@ -13402,9 +16931,10 @@ def reconcile_codex_window_attribution_spend(
 
     roots = sorted({str(record["source_root_key"]) for record in records})
     try:
-        _resolutions, ownership, groups = (
-            resolve_codex_window_attributions_with_evidence(
-                conn, source_root_keys=roots, include_retracted=True))
+        with _codex_cancellable_read(conn, deadline, clock):
+            _resolutions, ownership, groups = (
+                resolve_codex_window_attributions_with_evidence(
+                    conn, source_root_keys=roots, include_retracted=True))
     except sqlite3.DatabaseError:
         if strict:
             raise
@@ -13505,18 +17035,22 @@ def reconcile_codex_window_attribution_spend(
             low = min(span[0] for span in spans)
             high = max(span[1] for span in spans)
             updates: "list[tuple[str | None, int]]" = []
-            for row in conn.execute(
-                "SELECT id, source_path, line_offset, timestamp_utc, "
-                "       account_key "
-                "  FROM codex_session_entries "
-                " WHERE source_root_key = ? "
-                "   AND account_key IN ("
-                + ",".join("?" * len(asserted_keys)) + ") "
-                "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
-                "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
-                (root_key, *asserted_keys,
-                 _codex_anchor_iso(low), _codex_anchor_iso(high)),
-            ):
+            with _codex_cancellable_read(conn, deadline, clock):
+                rows = conn.execute(
+                    "SELECT id, source_path, line_offset, timestamp_utc, "
+                    "       account_key "
+                    "  FROM codex_session_entries "
+                    " WHERE source_root_key = ? "
+                    "   AND account_key IN ("
+                    + ",".join("?" * len(asserted_keys)) + ") "
+                    "   AND unixepoch(timestamp_utc) >= unixepoch(?) "
+                    "   AND unixepoch(timestamp_utc) <= unixepoch(?)",
+                    (root_key, *asserted_keys,
+                     _codex_anchor_iso(low), _codex_anchor_iso(high)),
+                ).fetchall()
+            for index, row in enumerate(rows):
+                if index % _CODEX_FINALIZATION_CHECK_EVERY == 0 and index:
+                    _codex_check_deadline(deadline, clock)
                 account_key = str(row[4])
                 timestamp = _parse_anchor_iso(row[3])
                 if timestamp is None:
@@ -13544,11 +17078,13 @@ def reconcile_codex_window_attribution_spend(
                 if baseline == account_key:
                     continue
                 updates.append((baseline, int(row[0])))
-            if updates:
+            batch = _CODEX_FINALIZATION_WRITE_BATCH
+            for start in range(0, len(updates), batch):
+                _codex_check_deadline(deadline, clock)
                 cursor = conn.executemany(
                     "UPDATE codex_session_entries SET account_key = ? "
                     " WHERE id = ?",
-                    updates,
+                    updates[start:start + batch],
                 )
                 restored += max(0, int(cursor.rowcount))
     except sqlite3.DatabaseError:
@@ -13562,7 +17098,7 @@ def reconcile_codex_window_attribution_spend(
         for root_key, spans in ranges.items()
     }
     adopted = apply_codex_window_spend_adoption(
-        conn, touched=touched, strict=strict)
+        conn, touched=touched, strict=strict, deadline=deadline, clock=clock)
     return (restored, adopted)
 
 
@@ -13573,6 +17109,7 @@ def iter_codex_entries(
     *,
     account_key: "str | None" = None,
     current_roots_only: bool = False,
+    root_scope: "_CodexPruneScope | None" = None,
 ) -> list[CodexEntry]:
     """Return cached CodexEntry rows with timestamp in [range_start, range_end].
 
@@ -13586,11 +17123,14 @@ def iter_codex_entries(
     independently of the registry that retains old roots until the drain.
     As with cleanup, positive recognizable-root evidence is required before
     withholding a retired root; unknown identities and relative fixtures stay.
+
+    ``root_scope`` (#981 A4) supplies that scope from a caller that already
+    discovered it (the hook's budgeted sync), so the read runs no filesystem
+    discovery of its own; the recognized-root, NULL-root and relative-path
+    rules are unchanged.
     """
-    root_scope = (
-        _codex_prune_scope(_discover_codex_files_with_roots())
-        if current_roots_only else None
-    )
+    if root_scope is None and current_roots_only:
+        root_scope = _codex_prune_scope(_discover_codex_files_with_roots())
     start_iso = range_start.astimezone(dt.timezone.utc).isoformat()
     end_iso = range_end.astimezone(dt.timezone.utc).isoformat()
     root_column = (
@@ -13665,6 +17205,206 @@ def _collect_codex_entries_direct(range_start: dt.datetime,
             eprint(f"[codex] could not read {selected.logical}: {exc}")
     return entries
 
+# --------------------------------------------------------------------------
+# #981 Part A — the hook's Codex read policy on a pinned snapshot
+# --------------------------------------------------------------------------
+#
+# Spec docs/superpowers/specs/2026-10-31-981-codex-hook-budget-design.md §4.1.
+# With Codex budget alerts enabled and a threshold pending, the hook's budget
+# reads used to run their OWN unbudgeted sync (discovery and inventory
+# included) and, when another writer held the flocks, a direct parse of every
+# compressed rollout: 86-90 s of CPU against Codex's 30 s hook timeout. Under
+# the policy the hook's one budgeted sync pins a read-only WAL snapshot while
+# it still holds both writer flocks, so the snapshot is exactly the generation
+# whose completeness that sync established; every Codex budget read either
+# evaluates on it or defers with a typed reason. It never syncs, never opens a
+# writer, never recovers and never parses rollouts.
+
+#: The closed set of read-deferral reasons (A1).
+CODEX_READ_DEFERRAL_REASONS = frozenset({
+    "sync_contended", "ingest_incomplete", "prune_debt", "replay_pending",
+    "inventory_pending", "finalization_debt", "cache_unavailable",
+    "scope_unavailable",
+})
+
+
+class CodexReadDeferred(Exception):
+    """A hook-scoped Codex read cannot prove a complete snapshot (A1).
+
+    ``reason`` is one token of :data:`CODEX_READ_DEFERRAL_REASONS`. The budget
+    ladders and the projected Codex axis catch it and skip this tick; nothing
+    is fabricated and nothing is evaluated on a partial total."""
+
+    def __init__(self, reason: str) -> None:
+        if reason not in CODEX_READ_DEFERRAL_REASONS:
+            raise ValueError(f"unknown Codex read-deferral reason {reason!r}")
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass
+class _HookCodexReadPolicy:
+    """What the hook's budgeted sync proved, and the snapshot it proved it on.
+
+    Until ``pin`` runs (the sync was contended, or never reached its flocks)
+    every read defers with ``sync_contended``."""
+
+    root_scope: "_CodexPruneScope | None" = None
+    snapshot: "sqlite3.Connection | None" = None
+    eligible: bool = False
+    account_eligible: bool = False
+    reason: "str | None" = "sync_contended"
+    account_reason: "str | None" = "sync_contended"
+    #: Append-only: one entry per skipped reader (ladder), in order.
+    deferred: list = field(default_factory=list)
+    #: The reason of each ``deferred`` entry, index for index.
+    deferred_reasons: list = field(default_factory=list)
+
+    def pin(self, *, db_path, stats: "CodexIngestStats",
+            scope: "_CodexPruneScope | None") -> None:
+        """Pin the snapshot and evaluate eligibility on it (A2, A3).
+
+        Called by the sync after its last commit and before it releases either
+        cache writer flock, so no other writer can commit between the commit
+        and the read mark. A re-run (the recovery wrapper) replaces the
+        earlier pin. A failure to pin leaves the policy ineligible with
+        ``cache_unavailable``."""
+        self._close_snapshot()
+        self.root_scope = scope
+        self.eligible = self.account_eligible = False
+        self.reason = self.account_reason = "cache_unavailable"
+        snapshot = None
+        try:
+            snapshot = _hook_snapshot_connect(db_path)
+            snapshot.execute("BEGIN")
+            # Establishes the WAL read mark while the flocks exclude writers.
+            snapshot.execute("SELECT key FROM cache_meta LIMIT 1").fetchall()
+            vendor_reason = _hook_codex_vendor_ineligibility(
+                snapshot, stats, scope)
+            account_reason = vendor_reason
+            if account_reason is None and not (
+                    stats.full_walk_complete
+                    and not stats.finalization_deferred
+                    and load_codex_finalization_debt(snapshot).empty):
+                account_reason = "finalization_debt"
+        except (sqlite3.Error, OSError):
+            if snapshot is not None:
+                try:
+                    snapshot.close()
+                except sqlite3.Error:
+                    pass
+            return
+        self.snapshot = snapshot
+        self.reason = vendor_reason
+        self.account_reason = account_reason
+        self.eligible = vendor_reason is None
+        self.account_eligible = account_reason is None
+
+    def invalidate(self, reason: str) -> None:
+        """Drop any earlier pin: this attempt proved nothing."""
+        self._close_snapshot()
+        self.eligible = self.account_eligible = False
+        self.reason = self.account_reason = reason
+
+    def record_deferral(self, reader: str, reason: str) -> None:
+        self.deferred.append(reader)
+        self.deferred_reasons.append(reason)
+
+    def first_deferral_reason(self) -> "str | None":
+        return self.deferred_reasons[0] if self.deferred_reasons else None
+
+    def read_entries(self, range_start: dt.datetime, range_end: dt.datetime,
+                     *, account_key: "str | None") -> "list[CodexEntry]":
+        """A4: evaluate on the pinned snapshot, or raise the typed deferral."""
+        if account_key is None:
+            eligible, reason = self.eligible, self.reason
+        else:
+            eligible, reason = self.account_eligible, self.account_reason
+        if not eligible or self.snapshot is None:
+            raise CodexReadDeferred(reason or "cache_unavailable")
+        try:
+            return iter_codex_entries(
+                self.snapshot, range_start, range_end,
+                account_key=account_key, current_roots_only=True,
+                root_scope=self.root_scope)
+        except sqlite3.Error as exc:
+            raise CodexReadDeferred("cache_unavailable") from exc
+
+    def _close_snapshot(self) -> None:
+        snapshot, self.snapshot = self.snapshot, None
+        if snapshot is not None:
+            try:
+                snapshot.close()
+            except sqlite3.Error:
+                pass
+
+
+_HOOK_CODEX_READ_POLICY: "contextvars.ContextVar[_HookCodexReadPolicy | None]" = (
+    contextvars.ContextVar("cctally_hook_codex_read_policy", default=None))
+
+
+@contextlib.contextmanager
+def hook_codex_read_policy() -> "Iterator[_HookCodexReadPolicy]":
+    """Make every Codex entry read in this context hook-scoped (A1, A6).
+
+    The snapshot is closed and the variable reset on every exit path."""
+    policy = _HookCodexReadPolicy()
+    token = _HOOK_CODEX_READ_POLICY.set(policy)
+    try:
+        yield policy
+    finally:
+        policy._close_snapshot()
+        _HOOK_CODEX_READ_POLICY.reset(token)
+
+
+def _active_hook_codex_read_policy() -> "_HookCodexReadPolicy | None":
+    return _HOOK_CODEX_READ_POLICY.get()
+
+
+def _hook_snapshot_connect(db_path) -> sqlite3.Connection:
+    """A ``mode=ro`` connection (no ``immutable``: committed WAL frames stay
+    visible) in autocommit mode, so the caller's explicit ``BEGIN`` is the
+    read transaction. A seam for the unreadable-snapshot test."""
+    uri = pathlib.Path(os.path.abspath(str(db_path))).as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True, isolation_level=None)
+
+
+def _hook_codex_vendor_ineligibility(
+    snapshot: sqlite3.Connection, stats: "CodexIngestStats",
+    scope: "_CodexPruneScope | None",
+) -> "str | None":
+    """The first reason vendor-wide spend is not final on ``snapshot`` (A3).
+
+    Vendor-wide spend needs a certified walk and nothing pending: adoption and
+    attribution reconciliation move ``account_key`` but never a row's cost or
+    timestamp, so finalization debt does not make it partial."""
+    if stats.deferred_reason is not None:
+        if stats.deferred_reason in ("replay_pending", "inventory_pending"):
+            return stats.deferred_reason
+        return "ingest_incomplete"
+    if (not stats.walk_certified
+            or stats.backlog_files
+            or stats.budget_exhausted
+            or stats.drain_yielded
+            or stats.barrier_retry
+            or stats.barrier_pending
+            or stats.barrier_files_deferred
+            or stats.barrier_keys_deferred
+            or stats.rebuild_refused is not None):
+        return "ingest_incomplete"
+    if snapshot.execute("SELECT 1 FROM codex_prune_debt LIMIT 1").fetchone():
+        return "prune_debt"
+    if snapshot.execute(
+            "SELECT 1 FROM cache_meta WHERE key=?",
+            (CODEX_REPLAY_FROM_ZERO_KEY,)).fetchone():
+        return "replay_pending"
+    if not codex_identity_inventory_ready(snapshot):
+        return "inventory_pending"
+    if scope is None:
+        return "scope_unavailable"
+    return None
+
+
 def get_codex_entries(
     range_start: dt.datetime,
     range_end: dt.datetime,
@@ -13682,7 +17422,15 @@ def get_codex_entries(
     range is a SUBSET of a range already fetched (the cache is already warm), so
     a redundant full JSONL walk is wasted work (mirrors ``get_entries``'
     ``skip_sync``).
+
+    Under the hook's read policy (#981 A4) this never opens the cache, syncs,
+    recovers or direct-parses: it reads the snapshot the hook's budgeted sync
+    pinned, or raises :class:`CodexReadDeferred`.
     """
+    policy = _active_hook_codex_read_policy()
+    if policy is not None:
+        return policy.read_entries(
+            range_start, range_end, account_key=account_key)
     try:
         conn = open_cache_db()
     except (sqlite3.DatabaseError, OSError) as exc:
@@ -14709,6 +18457,78 @@ def _conversation_derivations_enabled(run_derivations: "bool | None") -> bool:
     return not conversation_derivations_suppressed()
 
 
+@contextlib.contextmanager
+def conversation_ro_guarded(
+    *, timeout: float,
+) -> "Iterator[sqlite3.Connection | None]":
+    """Bounded read-only transcript handle participating in #415 recovery.
+
+    The diagnostic read admission (#1000 §5.10; moved unchanged from
+    doctor's ``_conversation_ro_guarded``). It takes the conversation
+    maintenance flock SHARED and non-blocking and holds it for the
+    connection's whole life, so neither the pre-rebuild probe's in-place read
+    nor recovery's quarantine can run under it, and it gives no handle
+    (``None``) when the main file is absent, when the flock is held, or when a
+    repair marker, a pending quarantine or a recovery record exists (checked
+    before and after the connect). The connection is a ``mode=ro`` URI, which
+    cannot create the main file. It never claims, resumes or reclaims
+    anything and runs no schema work.
+    """
+    path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
+    if not path.exists():
+        yield None
+        return
+    marker = path.with_name(f"{path.name}.repairing")
+    pending = path.with_name(f"{path.name}.quarantine-pending.json")
+    recovery = path.with_name(f"{path.name}.recovery.json")
+    maintenance = pathlib.Path(
+        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
+    )
+    lock_fh = conn = None
+    try:
+        maintenance.parent.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(maintenance, "a+")
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        if marker.exists() or pending.exists() or recovery.exists():
+            yield None
+            return
+        conn = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=max(0.0, timeout),
+        )
+        if marker.exists() or pending.exists() or recovery.exists():
+            conn.close()
+            conn = None
+            yield None
+            return
+        yield conn
+    finally:
+        if conn is not None:
+            conn.close()
+        if lock_fh is not None:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_fh.close()
+
+
+def conversation_ro_decline_reason() -> str:
+    """Why :func:`conversation_ro_guarded` gave no handle for a store that is
+    present: the readers' existing texts (#1000 §5.10)."""
+    if _conversation_recovery_state_path().exists():
+        return (
+            "conversations.db recovery is incomplete; "
+            "run `cctally cache-sync --rebuild`"
+        )
+    return "conversations.db maintenance is in progress"
+
+
 def _conversations_open_guarded(
     *, attach_cache: bool, allow_recovery_state: bool = False,
     run_derivations: "bool | None" = None,
@@ -15480,61 +19300,344 @@ def _open_conversations_db_for_recovery(
 
 
 def _conversation_recovery_test_pause(phase: str) -> None:
-    """Pytest-only kill seam for the durable recovery-state transitions."""
+    """Pytest-only kill seam for the durable recovery-state transitions.
+
+    #1000 T8: with ``CCTALLY_TEST_CONVERSATION_RECOVERY_RELEASE=<path>`` the
+    stall ends once ``<path>`` exists, so a test can hold recovery at a phase
+    and then let it finish.
+    """
     if not os.environ.get("PYTEST_CURRENT_TEST"):
         return
     if os.environ.get("CCTALLY_TEST_CONVERSATION_RECOVERY_STALL") != phase:
         return
+    release = os.environ.get("CCTALLY_TEST_CONVERSATION_RECOVERY_RELEASE")
     while True:
+        if release and os.path.exists(release):
+            return
         time.sleep(0.05)
 
 
-@contextlib.contextmanager
-def _conversation_probe_snapshot(path: pathlib.Path):
-    """Yield an isolated main/WAL copy so probes never mutate live sidecars."""
-    for stale in path.parent.glob(f"{_CONVERSATION_PROBE_PREFIX}*"):
-        if stale.is_dir() and not stale.is_symlink():
-            shutil.rmtree(stale)
-    with tempfile.TemporaryDirectory(
-        prefix=_CONVERSATION_PROBE_PREFIX,
-        dir=path.parent,
-    ) as temp_dir:
-        snapshot = pathlib.Path(temp_dir) / path.name
-        _clone_conversation_probe_member(path, snapshot)
-        wal = pathlib.Path(f"{path}-wal")
-        if wal.exists():
-            _clone_conversation_probe_member(
-                wal, pathlib.Path(f"{snapshot}-wal"),
-            )
-        yield snapshot
+#: #1000 T6: a pytest-only, in-process stage log. Called (under
+#: ``PYTEST_CURRENT_TEST`` only) with ``"probe-read-buffered"``,
+#: ``"recovery-before-publish"``, ``"recovery-source-exited"`` and
+#: ``"recovery-before-confirmed"``.
+_CONVERSATION_PROBE_STAGE_HOOK: "Callable[[str], None] | None" = None
+#: The longest the pytest-only held probe stage waits for its release.
+_CONVERSATION_PROBE_HOLD_SECONDS = 60.0
+
+
+def _conversation_probe_stage(stage: str) -> None:
+    """Report ``stage`` to the pytest-only stage hook."""
+    hook = _CONVERSATION_PROBE_STAGE_HOOK
+    if hook is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+        hook(stage)
+
+
+def _conversation_probe_test_hold() -> None:
+    """Pytest-only held stage (#1000 T8, T9): after the probe's read is
+    buffered and before its source validates, create ``<path>.reached`` and
+    wait until ``<path>.release`` exists, for at most 60 seconds."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    hold = os.environ.get("CCTALLY_TEST_CONVERSATION_PROBE_HOLD")
+    if not hold:
+        return
+    pathlib.Path(f"{hold}.reached").write_text(f"{os.getpid()}\n")
+    release = f"{hold}.release"
+    deadline = time.monotonic() + _CONVERSATION_PROBE_HOLD_SECONDS
+    while not os.path.exists(release) and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 class ConversationProbeCloneUnavailable(OSError):
     """The filesystem or platform cannot clone the transcript family.
 
-    The clone helper raises it when `cp` is missing, the platform has no
-    clone command, or `cp` reports that the filesystem refused the clone (see
-    :func:`_cp_refused_clone`). The pre-rebuild quick-check catches it, skips
-    and lets the rebuild continue; recovery still declines without a snapshot.
-    Every other clone failure stays a plain OSError and fails the rebuild.
+    ``refusal`` is the clone refusal: on Darwin a ``clonefile(2)`` errno in
+    :data:`_DARWIN_CLONE_REFUSAL_ERRNOS`; on Linux a refusal `cp
+    --reflink=always` reported (:func:`_cp_refused_clone`) or a missing `cp`;
+    elsewhere the unsupported platform. ``clause`` is None, or why the live
+    file could not be checked in place instead (#1000 D2), and ``str()`` is
+    ``refusal`` or ``"<refusal>; <clause>"``. The pre-rebuild quick-check
+    catches it, prints the skip line with that text and lets the rebuild
+    continue; recovery declines with it. Every other clone failure stays a
+    plain OSError and fails the rebuild.
+    """
+
+    def __init__(self, refusal: str, clause: "str | None" = None) -> None:
+        super().__init__(
+            refusal if clause is None else f"{refusal}; {clause}"
+        )
+        self.refusal = refusal
+        self.clause = clause
+
+    def __str__(self) -> str:
+        if self.clause is None:
+            return self.refusal
+        return f"{self.refusal}; {self.clause}"
+
+
+# #1000 D2: why a family the probe could not clone could not be checked in
+# place either. Exact operator-approved text.
+_CONVERSATION_PROBE_WAL_CLAUSE = (
+    "conversations.db-wal is not empty, so the live file cannot be checked "
+    "on its own"
+)
+_CONVERSATION_PROBE_JOURNAL_CLAUSE = (
+    "conversations.db-journal is not empty, so the live file cannot be "
+    "checked on its own"
+)
+_CONVERSATION_PROBE_DRIFT_CLAUSE = (
+    "conversations.db changed while it was checked in place, so the result "
+    "was discarded"
+)
+
+
+class ConversationProbeLiveFamilyChanged(ConversationProbeCloneUnavailable):
+    """The live family changed while it was checked in place (#1000 D2/D3).
+
+    The result, ok or corrupt, is discarded: the probe skips with the drift
+    clause and recovery declines with the clause alone as its reason.
+    """
+
+    def __init__(self, refusal: str) -> None:
+        super().__init__(refusal, _CONVERSATION_PROBE_DRIFT_CLAUSE)
+
+
+class ConversationProbeLiveFamilyHeld(OSError):
+    """A process still has the live family open after an in-place read.
+
+    Carries the existing drain-census refusal text. A plain OSError, never a
+    ``sqlite3.DatabaseError``, so it is never taken as a corruption trigger
+    and never as a skip: it fails the rebuild (#1000 §5.4).
     """
 
 
+def _conversation_family_census_refusal(
+    open_pids: "set[int] | None",
+) -> "str | None":
+    """The existing drain-census refusal for ``open_pids``, or None."""
+    if open_pids is None:
+        return (
+            "conversations.db recovery cannot verify that the database "
+            "family has no open handles; leaving it untouched"
+        )
+    if open_pids:
+        return (
+            "conversations.db is still open in process(es) "
+            + ", ".join(str(pid) for pid in sorted(open_pids))
+            + "; leaving the live family untouched"
+        )
+    return None
+
+
+_CONVERSATION_PROBE_FAMILY_SUFFIXES = ("", "-wal", "-journal", "-shm")
+
+
+def _conversation_probe_member_failure(name: str, mode: int) -> OSError:
+    """The real failure for a present family member that is not a regular
+    file: ELOOP for a symlink (dangling or not), EINVAL otherwise."""
+    code = errno.ELOOP if stat.S_ISLNK(mode) else errno.EINVAL
+    return OSError(
+        f"copy-on-write transcript probe failed for {name}: "
+        f"{os.strerror(code)}"
+    )
+
+
+def _conversation_probe_member_lstat(
+    member: pathlib.Path,
+) -> "os.stat_result | None":
+    """``lstat`` one family member before any clone (#1000 §5.3): None when
+    absent; a present member that is not a regular file is a real failure."""
+    try:
+        st = os.lstat(member)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        raise _conversation_probe_member_failure(member.name, st.st_mode)
+    return st
+
+
+def _conversation_family_identity(
+    path: pathlib.Path,
+) -> "dict[str, tuple[int, ...] | None]":
+    """Each member's existence, type and identity, by ``lstat`` (#1000 §5.4)."""
+    identity: dict[str, tuple[int, ...] | None] = {}
+    for suffix in _CONVERSATION_PROBE_FAMILY_SUFFIXES:
+        try:
+            st = os.lstat(f"{path}{suffix}")
+        except FileNotFoundError:
+            identity[suffix] = None
+            continue
+        identity[suffix] = (
+            stat.S_IFMT(st.st_mode), st.st_dev, st.st_ino, st.st_size,
+            st.st_mtime_ns, st.st_ctime_ns,
+        )
+    return identity
+
+
+@dataclass
+class ConversationProbeSource:
+    """What the transcript probe and recovery read (#1000 §5.4).
+
+    A snapshot (``immutable=False``) is a private clone of the family; a live
+    source (``immutable=True``) is the live main file itself, read
+    ``immutable=1`` because no WAL or journal holds data, with the family's
+    identity recorded when it was yielded.
+    """
+
+    probe_path: pathlib.Path
+    immutable: bool
+    _live_path: "pathlib.Path | None" = field(default=None, repr=False)
+    _refusal: str = field(default="", repr=False)
+    _identity: "dict | None" = field(default=None, repr=False)
+
+    def validate(self) -> None:
+        """No-op for a snapshot. For a live source: the post-read handle
+        census, then the identity bracket. A holder raises
+        :class:`ConversationProbeLiveFamilyHeld`; any change to a member's
+        existence, type or identity raises
+        :class:`ConversationProbeLiveFamilyChanged`. Never called after a
+        quarantine has renamed the family."""
+        if not self.immutable:
+            return
+        path = self._live_path
+        refusal = _conversation_family_census_refusal(
+            _cctally_db_sib._db_family_open_pids(path)
+        )
+        if refusal is not None:
+            raise ConversationProbeLiveFamilyHeld(refusal)
+        if _conversation_family_identity(path) != self._identity:
+            raise ConversationProbeLiveFamilyChanged(self._refusal)
+
+
+@contextlib.contextmanager
+def _conversation_probe_source(
+    path: pathlib.Path,
+) -> "Iterator[ConversationProbeSource]":
+    """Yield what the probe reads: a clone, or the live file (#1000 §5.4).
+
+    The caller holds the full exclusion and has drained the family. Stale
+    probe directories are removed (never following a symlink), the main file
+    and WAL are validated by ``lstat``, and the members are cloned into a
+    private directory beside the store, removed on exit. When the volume
+    cannot clone and neither the WAL nor a rollback journal holds data, the
+    live main file is yielded instead, its family identity recorded, and
+    validated (census, then identity) when the body completes normally.
+    Otherwise the refusal is raised with the clause that explains why.
+    """
+    path = pathlib.Path(path)
+    for stale in path.parent.glob(f"{_CONVERSATION_PROBE_PREFIX}*"):
+        if stale.is_dir() and not stale.is_symlink():
+            shutil.rmtree(stale)
+    if _conversation_probe_member_lstat(path) is None:
+        raise OSError(
+            f"copy-on-write transcript probe failed for {path.name}: "
+            f"{os.strerror(errno.ENOENT)}"
+        )
+    wal = pathlib.Path(f"{path}-wal")
+    wal_present = _conversation_probe_member_lstat(wal) is not None
+    temp_dir = tempfile.TemporaryDirectory(
+        prefix=_CONVERSATION_PROBE_PREFIX,
+        dir=path.parent,
+    )
+    snapshot = pathlib.Path(temp_dir.name) / path.name
+    unavailable: ConversationProbeCloneUnavailable | None = None
+    try:
+        _clone_conversation_probe_member(path, snapshot)
+        if wal_present:
+            _clone_conversation_probe_member(
+                wal, pathlib.Path(f"{snapshot}-wal"),
+            )
+    except ConversationProbeCloneUnavailable as exc:
+        temp_dir.cleanup()
+        unavailable = exc
+    except BaseException:
+        temp_dir.cleanup()
+        raise
+    else:
+        try:
+            yield ConversationProbeSource(probe_path=snapshot, immutable=False)
+        finally:
+            temp_dir.cleanup()
+        return
+
+    # No clone: check the live main file in place when it alone is the
+    # committed state (#1000 D1), else report why not.
+    refusal = unavailable.refusal
+    identity = _conversation_family_identity(path)
+    main = identity[""]
+    if main is None:
+        raise OSError(
+            f"copy-on-write transcript probe failed for {path.name}: "
+            f"{os.strerror(errno.ENOENT)}"
+        ) from unavailable
+    if not stat.S_ISREG(main[0]):
+        raise _conversation_probe_member_failure(
+            path.name, main[0],
+        ) from unavailable
+    for suffix, clause in (
+        ("-wal", _CONVERSATION_PROBE_WAL_CLAUSE),
+        ("-journal", _CONVERSATION_PROBE_JOURNAL_CLAUSE),
+        ("-shm", None),
+    ):
+        member = identity[suffix]
+        if member is None:
+            continue
+        if not stat.S_ISREG(member[0]):
+            raise _conversation_probe_member_failure(
+                f"{path.name}{suffix}", member[0],
+            ) from unavailable
+        # A stale regular -shm is allowed and never touched.
+        if clause is not None and member[3] > 0:
+            raise ConversationProbeCloneUnavailable(
+                refusal, clause,
+            ) from unavailable
+    source = ConversationProbeSource(
+        probe_path=path,
+        immutable=True,
+        _live_path=path,
+        _refusal=refusal,
+        _identity=identity,
+    )
+    yield source
+    source.validate()
+
+
+def _conversation_probe_uri(source: ConversationProbeSource) -> str:
+    """The read-only URI for ``source``: an escaped absolute immutable URI
+    for the live file, ``mode=ro`` for a snapshot."""
+    if source.immutable:
+        return (
+            pathlib.Path(os.path.abspath(source.probe_path)).as_uri()
+            + "?mode=ro&immutable=1"
+        )
+    return source.probe_path.resolve().as_uri() + "?mode=ro"
+
+
 # errno values that mean "this filesystem cannot clone these files", as
-# opposed to a failure while cloning them. Linux ioctl_ficlone(2) documents
-# EOPNOTSUPP (the filesystem cannot reflink, e.g. ext4), EXDEV (the paths are
-# on different mounts, e.g. a bind mount) and EINVAL (the filesystem cannot
-# reflink these files); ioctl(2) returns ENOTTY where the kernel or filesystem
-# has no FICLONE at all. macOS clonefile(2) documents ENOTSUP and EXDEV. Each
-# is a permanent property of where the store lives. Anything else (ENOSPC,
+# opposed to a failure while cloning them, for the Linux `cp --reflink=always`
+# path. Linux ioctl_ficlone(2) documents EOPNOTSUPP (the filesystem cannot
+# reflink, e.g. ext4), EXDEV (the paths are on different mounts, e.g. a bind
+# mount) and EINVAL (the filesystem cannot reflink these files); ioctl(2)
+# returns ENOTTY where the kernel or filesystem has no FICLONE at all. Each is
+# a permanent property of where the store lives. Anything else (ENOSPC,
 # EDQUOT, EACCES, EPERM, ENOENT, EIO, or a failure to open, stat or create
 # before the clone) is a real failure and must fail the rebuild: an I/O error
-# reading a damaged store is the very signal the probe exists to catch.
+# reading a damaged store is the very signal the probe exists to catch. Darwin
+# clones in-process and classifies with `_DARWIN_CLONE_REFUSAL_ERRNOS`.
 _CLONE_REFUSAL_ERRNOS = frozenset(
     getattr(errno, name)
     for name in ("EOPNOTSUPP", "ENOTSUP", "EXDEV", "EINVAL", "ENOTTY")
     if hasattr(errno, name)
 )
+
+# #1000 §5.2: the clonefile(2) errno values that mean "this volume, or this
+# pair of volumes, cannot clone" (an unsupported filesystem; a cross-device
+# pair). A missing fclonefileat arrives as ENOTSUP. Every other errno — EINVAL,
+# EPERM, EEXIST, EIO, ENOSPC, ELOOP, ... — is a real failure.
+_DARWIN_CLONE_REFUSAL_ERRNOS = frozenset({
+    errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV,
+})
 
 
 def _cp_refused_clone(stderr: str) -> bool:
@@ -15542,10 +19645,8 @@ def _cp_refused_clone(stderr: str) -> bool:
 
     `cp` runs under ``LC_ALL=C``, so its strerror text is the C locale's, the
     same text :func:`os.strerror` returns. GNU `cp --reflink=always` reports a
-    failed FICLONE as ``failed to clone DST from SRC: <strerror>``. macOS
-    `cp -c` falls back to copyfile(2), a full copy, when the target cannot
-    clone, so it rarely reports a refusal at all; when clonefile(2) does fail
-    it warns ``DST: clonefile failed: <strerror>``.
+    failed FICLONE as ``failed to clone DST from SRC: <strerror>``; a
+    ``DST: clonefile failed: <strerror>`` line is accepted as well.
     """
     reasons = tuple(f": {os.strerror(code)}" for code in _CLONE_REFUSAL_ERRNOS)
     for line in stderr.splitlines():
@@ -15557,11 +19658,32 @@ def _cp_refused_clone(stderr: str) -> bool:
     return False
 
 
+def _raise_for_darwin_clone_failure(
+    source: pathlib.Path, exc: OSError,
+) -> None:
+    """Classify one clonefile(2) failure (#1000 §5.2); always raises."""
+    if exc.errno in _DARWIN_CLONE_REFUSAL_ERRNOS:
+        raise ConversationProbeCloneUnavailable(
+            "copy-on-write transcript probe unavailable for "
+            f"{source.name}: clonefile failed: {os.strerror(exc.errno)}"
+        ) from exc
+    raise OSError(
+        f"copy-on-write transcript probe failed for {source.name}: {exc}"
+    ) from exc
+
+
 def _clone_conversation_probe_member(
     source: pathlib.Path,
     destination: pathlib.Path,
 ) -> None:
-    """Bounded same-volume COW clone; production never falls back to a copy."""
+    """Same-volume COW clone; production never falls back to a copy.
+
+    Darwin clones in-process through clonefile(2)
+    (:func:`_lib_clone_copy.clone_regular_file`): no `cp`, no subprocess and
+    no timeout, because `cp -c` silently falls back to a full copyfile(2)
+    copy on a volume that cannot clone (#1000). Linux runs `cp
+    --reflink=always`, bounded to five seconds per member.
+    """
     if (
         os.environ.get("PYTEST_CURRENT_TEST")
         and os.environ.get("CCTALLY_TEST_CONVERSATION_PROBE_COPY") == "1"
@@ -15572,14 +19694,28 @@ def _clone_conversation_probe_member(
         # from production, where clone unavailability must still fail closed.
         shutil.copyfile(source, destination)
         return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        # #1000: a child process cannot be steered by a parent-side platform
+        # patch, so a test refuses the clone with a named errno here, through
+        # the same classification a real clonefile(2) refusal takes.
+        name = os.environ.get("CCTALLY_TEST_CONVERSATION_PROBE_CLONE_ERRNO")
+        if name:
+            code = getattr(errno, name)
+            _raise_for_darwin_clone_failure(
+                source, OSError(code, os.strerror(code), str(destination)),
+            )
+    if sys.platform == "darwin":
+        try:
+            _lib_clone_copy.clone_regular_file(source, destination)
+        except OSError as exc:
+            _raise_for_darwin_clone_failure(source, exc)
+        return
     cp = shutil.which("cp")
     if cp is None:
         raise ConversationProbeCloneUnavailable(
             "copy-on-write transcript probe unavailable: `cp` was not found"
         )
-    if sys.platform == "darwin":
-        command = [cp, "-c", str(source), str(destination)]
-    elif sys.platform.startswith("linux"):
+    if sys.platform.startswith("linux"):
         command = [
             cp, "--reflink=always", "--", str(source), str(destination),
         ]
@@ -15666,11 +19802,15 @@ def _probe_conversation_rebuild(
                 + ", ".join(str(pid) for pid in sorted(open_pids))
                 + "; leaving the live family untouched"
             )
+        # #1000 §5.5: the outcome is buffered and released only after the
+        # source context exits, which validates a live source; a live read
+        # the family changed under is discarded whatever it found.
+        outcome: sqlite3.DatabaseError | None = None
         try:
-            with _conversation_probe_snapshot(path) as snapshot:
+            with _conversation_probe_source(path) as source:
                 try:
                     probe = sqlite3.connect(
-                        snapshot.resolve().as_uri() + "?mode=ro",
+                        _conversation_probe_uri(source),
                         uri=True,
                     )
                     probe.execute("PRAGMA busy_timeout=2000")
@@ -15679,30 +19819,35 @@ def _probe_conversation_rebuild(
                         str(row[0]) if row and row[0] is not None else ""
                     )
                     if result.strip().casefold() != "ok":
-                        return sqlite3.DatabaseError(
+                        outcome = sqlite3.DatabaseError(
                             "database disk image is malformed "
                             f"(conversations.db quick_check: {result})"
                         )
-                    return None
+                except sqlite3.DatabaseError as exc:
+                    outcome = exc
                 finally:
                     if probe is not None:
                         probe.close()
-        except sqlite3.DatabaseError as exc:
-            return exc
+                        probe = None
+                _conversation_probe_stage("probe-read-buffered")
+                _conversation_probe_test_hold()
         except ConversationProbeCloneUnavailable as exc:
-            # The clone helper raised this because the filesystem cannot
-            # clone, which never changes: failing here failed every explicit
-            # rebuild over an existing store on such a filesystem. Skip the
-            # check (never a byte copy) and rebuild. Corruption quick_check
-            # would have found may then go unnoticed, or surface later in a
-            # rebuild worker; recovery declines without a snapshot either
-            # way, so nothing is quarantined.
+            # The volume cannot clone, which never changes: failing here
+            # failed every explicit rebuild over an existing store on such a
+            # volume. The live file could not be checked in place either (a
+            # WAL or journal holds data, or it changed during the check), so
+            # skip the check (never a byte copy) and rebuild. Corruption
+            # quick_check would have found may then go unnoticed, or surface
+            # later in a rebuild worker. A holder seen by the post-read census
+            # (`ConversationProbeLiveFamilyHeld`) is not this: it propagates
+            # and fails the rebuild, as the pre-read drain refusals do.
             eprint(
                 "[cache-sync] conversations.db integrity check skipped "
                 f"before the transcript rebuild ({exc}); continuing without "
                 "automatic corruption recovery"
             )
             return None
+        return outcome
     finally:
         keeper_yield.close()
         if provider_locks is not None:
@@ -15712,6 +19857,27 @@ def _probe_conversation_rebuild(
         except OSError:
             pass
         maintenance_fh.close()
+
+
+def _decline_conversation_recovery(
+    origin: str, reason_exc: BaseException,
+) -> None:
+    """Print the existing "forensics was unavailable" decline (#1000 §5.6).
+
+    The reason is rendered by type: a family that changed during an in-place
+    read gives its drift clause alone (D3, exact); a holder gives its census
+    text; anything else its ``str()``, as before.
+    """
+    if isinstance(reason_exc, ConversationProbeLiveFamilyChanged):
+        reason = reason_exc.clause
+    else:
+        reason = str(reason_exc)
+    eprint(
+        "[conversations] destructive recovery declined for classified "
+        f"trigger at {origin}: forensics was unavailable "
+        f"({reason}); leaving the conversations.db family "
+        "untouched"
+    )
 
 
 def _recover_corrupt_conversations(
@@ -15787,23 +19953,32 @@ def _recover_corrupt_conversations(
         retention.enter_context(
             _retention_sib.retention_shared(label="conversations recovery")
         )
+        # #1000 §5.6: a fresh probe source (the probe's trigger is only a
+        # trigger). A live source is validated inside `before_publish`, after
+        # the integrity probe and before the bundle is published, again when
+        # the context exits, and once more immediately before the durable
+        # `confirmed` record, so nothing durable ever says "confirmed" about a
+        # read the family changed under.
         try:
-            with _conversation_probe_snapshot(path) as snapshot:
+            with _conversation_probe_source(path) as source:
+                before_publish = None
+                if source.immutable:
+                    def before_publish(source=source):
+                        _conversation_probe_stage("recovery-before-publish")
+                        source.validate()
                 forensics = _cctally_db_sib.write_corruption_forensics(
                     path,
-                    probe_db_path=snapshot,
+                    probe_db_path=source.probe_path,
+                    probe_immutable=source.immutable,
+                    before_publish=before_publish,
                     db_label="conversations",
                     trigger_origin=origin,
                     trigger_exception=exc,
                     return_result=True,
                 )
+            _conversation_probe_stage("recovery-source-exited")
         except Exception as forensics_exc:
-            eprint(
-                "[conversations] destructive recovery declined for classified "
-                f"trigger at {origin}: forensics was unavailable "
-                f"({forensics_exc}); leaving the conversations.db family "
-                "untouched"
-            )
+            _decline_conversation_recovery(origin, forensics_exc)
             return False
         assert isinstance(
             forensics, _cctally_db_sib.CorruptionForensicsResult,
@@ -15826,6 +20001,13 @@ def _recover_corrupt_conversations(
             )
             return False
 
+        if source.immutable:
+            _conversation_probe_stage("recovery-before-confirmed")
+            try:
+                source.validate()
+            except Exception as validate_exc:
+                _decline_conversation_recovery(origin, validate_exc)
+                return False
         _write_conversation_recovery_state(
             providers=selected,
             phase="confirmed",
@@ -15896,7 +20078,10 @@ def _prepare_conversation_rebuild(
         conn = _open_conversations_db_for_recovery()
         conn.close()
         return selected
-    if path.exists():
+    # #1000 §5.3: `lexists`, so a dangling main symlink reaches the probe
+    # (which fails it) instead of skipping it and letting the opener create
+    # its target.
+    if os.path.lexists(path):
         trigger = _probe_conversation_rebuild(
             path, lock_timeout=lock_timeout,
         )
@@ -16160,7 +20345,7 @@ def _codex_retained_contract_replay_ready(conn: sqlite3.Connection) -> bool:
     """
     try:
         compressed = [selected for selected in _iter_codex_logical_containers(
-            _cctally()._codex_session_roots()) if selected.kind == _rc.ZSTD]
+            _codex_home_locations()) if selected.kind == _rc.ZSTD]
         if not compressed:
             return True
         status_row = conn.execute("SELECT value FROM cache_meta WHERE key=?",
@@ -16675,7 +20860,9 @@ def _stamp_coverage_complete(conn) -> bool:
 
 
 def _resolve_record_account(stamps, gaps, incarnation_id, offset, digest,
-                            high_water, active_account_key):
+                            high_water, active_account_key, *,
+                            resolve_fresh: "Callable[[], str | None] | None"
+                            = None):
     """Which account one replayed record belongs to (#777). Pure.
 
     Returns ``(account_key, needs_fresh_stamp)``.
@@ -16697,7 +20884,9 @@ def _resolve_record_account(stamps, gaps, incarnation_id, offset, digest,
        it takes NULL: writing the currently active account there is precisely
        the silent re-attribution #777 reports.
     3. At or beyond the high-water mark the record is first observed now, so it
-       takes the freshly resolved active identity and gets its own stamp.
+       gets its own stamp. #944 spec 5.8: ``resolve_fresh`` (called only
+       here) supplies its write-time account; without it the record takes
+       the freshly resolved active identity, as before.
     """
     stamped = stamps.get((incarnation_id, offset, digest))
     if (incarnation_id, offset, digest) in stamps:
@@ -16706,7 +20895,130 @@ def _resolve_record_account(stamps, gaps, incarnation_id, offset, digest,
         if offset in gaps:
             return gaps[offset], False
         return None, False
+    if resolve_fresh is not None:
+        return resolve_fresh(), True
     return active_account_key, True
+
+
+class _ConversationFreshAccount:
+    """The write-time account of a conversation record first observed now
+    (#944 spec 5.8), read from the attached ``cache_db``. Read-only: it never
+    journals, decides durably or writes accounting state.
+
+    In order: the accounting decision for the record's identity; else, while
+    cache migration 050 is pending, the stamp of the accounting row for that
+    identity; else the shared kernel over the attached timeline with no
+    closing capture and the resolution-time wall clock as ``clock_cutoff``,
+    falling back to the identity this conversation ingest captured. An
+    unavailable attachment resolves through the kernel with an empty
+    timeline.
+
+    The glue's lookups name their tables unqualified. conversations.db drops
+    every accounting table from its projected schema, so those names resolve
+    to ``cache_db``; ``usable`` also requires that, and otherwise nothing is
+    read from the attachment at all."""
+
+    def __init__(self, conn, ingest_account):
+        self.conn = conn
+        self.ingest_account = ingest_account
+        # Timeline neighbours by record interval, for ONE source file:
+        # ``resolve`` clears it when the file changes, so its size is bounded
+        # by one file's records, never by how much history an ingest covers.
+        self.memo = {}
+        self.memo_path = None
+        self.usable = False
+        self.export_pending = False
+        try:
+            attached = {row[1] for row in conn.execute("PRAGMA database_list")}
+            if "cache_db" not in attached:
+                return
+            names = ("claude_cost_decisions", "claude_account_timeline")
+            for schema in ("main", "temp"):
+                if conn.execute(
+                        f"SELECT 1 FROM {schema}.sqlite_master WHERE name IN"
+                        " (?, ?) LIMIT 1", names).fetchone() is not None:
+                    return
+            if conn.execute(
+                    "SELECT COUNT(*) FROM cache_db.sqlite_master WHERE"
+                    " type='table' AND name IN (?, ?)",
+                    names).fetchone()[0] != 2:
+                return
+            self.export_pending = conn.execute(
+                "SELECT 1 FROM cache_db.schema_migrations WHERE name=?",
+                ("050_preserve_claude_cost_attribution",)).fetchone() is None
+            self.usable = True
+        except sqlite3.Error:
+            self.usable = False
+
+    def resolver(self, mrow, raw: bytes, source_path: str):
+        return lambda: self.resolve(mrow, raw, source_path)
+
+    def _identity(self, mrow, raw, source_path):
+        G = _claude_attribution()
+        import _lib_claude_attribution as K
+        # The cost path's identity rule (``K.keyed_ids``), so the twin finds
+        # the decision accounting made for the same record.
+        ids = K.keyed_ids(mrow.msg_id, mrow.req_id)
+        if ids is not None:
+            return G.keyed_identity(*ids)
+        loc = K.loc_for(source_path)
+        digest = K.record_sha256(raw)
+        offset = int(mrow.byte_offset)
+        return G.RecordIdentity(
+            form=K.FORM_PHYSICAL,
+            key=K.physical_key_from_digest(loc, offset, digest),
+            loc=loc, offset=offset, digest=digest)
+
+    def _row_stamp(self, identity, source_path):
+        import _lib_claude_attribution as K
+        if identity.msg_id is not None:
+            row = self.conn.execute(
+                "SELECT account_key FROM cache_db.session_entries"
+                " WHERE msg_id=? AND req_id=? LIMIT 1",
+                (identity.msg_id, identity.req_id)).fetchone()
+            return (True, row[0]) if row is not None else (False, None)
+        # The row ``_claude_existing_row`` names: at the location, with ids
+        # that do not form a keyed identity.
+        for account, msg_id, req_id in self.conn.execute(
+                "SELECT account_key, msg_id, req_id FROM"
+                " cache_db.session_entries"
+                " WHERE source_path=? AND line_offset=?",
+                (source_path, identity.offset)):
+            if K.keyed_ids(msg_id, req_id) is None:
+                return (True, account)
+        return (False, None)
+
+    def resolve(self, mrow, raw: bytes, source_path: str) -> "str | None":
+        G = _claude_attribution()
+        import _lib_claude_attribution as K
+        interval = K.record_interval(mrow.timestamp_utc)
+        neighbours = None
+        if self.usable:
+            try:
+                identity = self._identity(mrow, raw, source_path)
+                found = G.lookup_decision(self.conn, identity)
+                if found is not None:
+                    return found.account_key
+                if self.export_pending:
+                    present, stamp = self._row_stamp(identity, source_path)
+                    if present:
+                        return stamp
+                if not isinstance(interval, str):
+                    if source_path != self.memo_path:
+                        self.memo.clear()
+                        self.memo_path = source_path
+                    memo_key = (interval[0], interval[1])
+                    if memo_key not in self.memo:
+                        self.memo[memo_key] = G.timeline_neighbours(
+                            self.conn, interval)
+                    neighbours = self.memo[memo_key]
+            except sqlite3.Error:
+                neighbours = None
+        return K.decide(
+            interval, neighbours,
+            clock_cutoff_us=int(time.time() * 1_000_000),
+            closing_capture=None,
+            ingest_account=self.ingest_account).account_key
 
 
 def _publish_title_generation(conn, _pause=None) -> None:
@@ -16777,6 +21089,379 @@ def _report_conversation_progress(
         progress(phase, stats)
 
 
+# #939 D1: the bounds of one batch inside a Claude conversation-sync pass.
+# Changed files are PREPARED (stat, incarnation decision, committed-prefix
+# guard, parse, attribution) with no write transaction open, and prepared files
+# are APPLIED together in one transaction, up to this many files and this much
+# admitted input. A file's admitted input is its bound, `size - start_offset`
+# at the moment its start offset is fixed, and it is decided BEFORE the file is
+# parsed: a file that would cross either bound applies the open batch first.
+# The first file of a batch always joins, so one oversized file runs alone.
+# Module constants so a test can inject a one-file control.
+CLAUDE_CONVERSATION_BATCH_FILES = 64
+CLAUDE_CONVERSATION_BATCH_BYTES = 32 * 1024 * 1024
+
+# #939 D2: the writer page cache of one conversation-sync pass, in KiB. Set on
+# the conversations store only (`main`), never on the attached `cache_db`, and
+# restored on every exit, because some callers keep their connection after the
+# sync returns. SQLite allocates pages only as a pass dirties them, so a steady
+# pass touching a handful of pages never reaches the bound. Retention's
+# deletion connection uses the same pattern (`DELETION_CACHE_SIZE_KIB`).
+CONVERSATION_SYNC_CACHE_SIZE_KIB = 65536
+
+
+def _set_conversation_sync_cache(conn: sqlite3.Connection) -> "int | None":
+    """Raise the pass's writer cache; return the value to restore (#939 D2).
+
+    None when the current value could not be read, so the restore does
+    nothing. A failure to set leaves the connection as it was: the cache is an
+    optimization and must never fail a sync."""
+    try:
+        (previous,) = conn.execute("PRAGMA main.cache_size").fetchone()
+    except sqlite3.Error:
+        return None
+    try:
+        conn.execute(
+            f"PRAGMA main.cache_size = -{int(CONVERSATION_SYNC_CACHE_SIZE_KIB)}")
+    except sqlite3.Error:
+        pass
+    return int(previous)
+
+
+def _restore_conversation_sync_cache(
+    conn: sqlite3.Connection, previous: "int | None",
+) -> None:
+    """Put back the cache size the pass found (#939 D2)."""
+    if previous is None:
+        return
+    try:
+        conn.execute(f"PRAGMA main.cache_size = {int(previous)}")
+    except sqlite3.Error:
+        pass
+
+
+class _ReadLimitedFile:
+    """A binary handle that reads no byte at or past ``limit`` (#939 D1).
+
+    The read limit is the size captured when the file's start offset was fixed,
+    so a file consumes at most its admitted bound. A line that crosses the
+    limit comes back without its terminator, which ``_iter_sync_entries``
+    already treats as a record still being written: it rewinds to the line's
+    start and stops, leaving the record for the next pass, exactly as at end of
+    file."""
+
+    def __init__(self, fh, limit: int):
+        self._fh = fh
+        self._limit = limit
+
+    def tell(self) -> int:
+        return self._fh.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._fh.seek(offset, whence)
+
+    def readline(self) -> bytes:
+        remaining = self._limit - self._fh.tell()
+        if remaining <= 0:
+            return b""
+        return self._fh.readline(remaining)
+
+
+@dataclass
+class _ClaudePreparedFile:
+    """One changed Claude transcript, prepared and not yet applied (#939 D1).
+
+    ``cursor`` is the source-file row without its ingest time:
+    ``(size_bytes, mtime_ns, last_byte_offset, device_id, inode,
+    source_incarnation_id, committed_prefix_sha256)``."""
+
+    path: str
+    truncated: bool
+    conv_rows: list
+    ai_rows: list
+    stamp_rows: list
+    cursor: tuple
+    bound: int
+
+
+@dataclass
+class _ClaudeConversationBatch:
+    """The open batch of one Claude conversation-sync pass (#939 D1)."""
+
+    files: list = field(default_factory=list)
+    bound_bytes: int = 0
+
+    def admits(self, bound: int) -> bool:
+        """Whether a file of admitted input ``bound`` may join without the
+        open batch applying first. The first file always joins."""
+        if not self.files:
+            return True
+        return (len(self.files) < CLAUDE_CONVERSATION_BATCH_FILES
+                and self.bound_bytes + bound <= CLAUDE_CONVERSATION_BATCH_BYTES)
+
+    def add(self, prepared: _ClaudePreparedFile) -> None:
+        self.files.append(prepared)
+        self.bound_bytes += prepared.bound
+
+    def take(self) -> "list[_ClaudePreparedFile]":
+        files, self.files, self.bound_bytes = self.files, [], 0
+        return files
+
+
+_CLAUDE_FILE_SAVEPOINT = "SAVEPOINT claude_conversation_file"
+_CLAUDE_FILE_RELEASE = "RELEASE SAVEPOINT claude_conversation_file"
+_CLAUDE_FILE_ROLLBACK_TO = "ROLLBACK TO SAVEPOINT claude_conversation_file"
+
+
+def _begin_claude_conversation_batch(conn: sqlite3.Connection) -> None:
+    """Open a batch's transaction holding the write lock (#939 D1).
+
+    IMMEDIATE, not deferred: the first statement of a file's apply may be the
+    truncation read, and a deferred transaction that read first and wrote
+    second would fail with SQLITE_BUSY_SNAPSHOT, which no busy timeout
+    retries, whenever the other provider's writer committed in between. The
+    lock is waited for under the connection's unchanged busy timeout."""
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def _rollback_claude_file_savepoint(conn: sqlite3.Connection) -> bool:
+    """Undo one file's writes inside its batch (#939 D1).
+
+    True when the file's savepoint rolled back and released with the batch's
+    transaction still open. False when SQLite had already ended the
+    transaction, or the savepoint could not be undone: nothing of the batch is
+    left, and the connection has no open transaction."""
+    if conn.in_transaction:
+        try:
+            conn.execute(_CLAUDE_FILE_ROLLBACK_TO)
+            conn.execute(_CLAUDE_FILE_RELEASE)
+            return True
+        except sqlite3.DatabaseError:
+            pass
+    _rollback_claude_batch(conn)
+    return False
+
+
+def _rollback_claude_batch(conn: sqlite3.Connection) -> None:
+    if conn.in_transaction:
+        try:
+            conn.rollback()
+        except sqlite3.DatabaseError:
+            pass
+
+
+def _write_claude_prepared_file(
+    conn: sqlite3.Connection, prepared: _ClaudePreparedFile, title_table: str,
+) -> "set[str]":
+    """One prepared file's writes, inside its savepoint (#939 D1).
+
+    Returns the sessions the truncation read found. That read stays here, in
+    the apply phase under the batch's write lock, as it did inside the
+    per-file transaction: it names only this file's path, and the rows it
+    reads must be the ones its DELETEs remove. Nothing here is DDL or a PRAGMA,
+    and the scoped ``_fill_file_touches`` never commits."""
+    path_str = prepared.path
+    sessions: set[str] = set()
+    if prepared.truncated:
+        sessions.update(
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM conversation_messages "
+                "WHERE source_path=? AND session_id IS NOT NULL",
+                (path_str,),
+            )
+        )
+        conn.execute(
+            "DELETE FROM conversation_file_touches WHERE message_id IN "
+            "(SELECT id FROM conversation_messages WHERE source_path=?)",
+            (path_str,),
+        )
+        conn.execute(
+            "DELETE FROM conversation_messages WHERE source_path=?",
+            (path_str,),
+        )
+        conn.execute(
+            f"DELETE FROM {title_table} WHERE source_path=?",
+            (path_str,),
+        )
+    if prepared.conv_rows:
+        conn.executemany(_CONV_ACCOUNT_INSERT_SQL, prepared.conv_rows)
+        _fill_file_touches(
+            conn, scope=[(row[3], row[4]) for row in prepared.conv_rows]
+        )
+    if prepared.stamp_rows:
+        # #777: batched into the SAME transaction as the message batch, never
+        # issued per row. One stamp per message is new write volume across
+        # every future record, and a per-row transaction would multiply the
+        # ingest's commit cost by the record count.
+        conn.executemany(
+            "INSERT OR IGNORE INTO claude_conversation_account_stamps"
+            "(canonical_source_path,source_incarnation_id,"
+            "byte_offset,record_sha256,account_key) "
+            "VALUES(?,?,?,?,?)",
+            prepared.stamp_rows,
+        )
+    if prepared.ai_rows:
+        conn.executemany(_ai_title_upsert_sql(title_table), prepared.ai_rows)
+    size, mtime_ns, final_offset, device_id, inode, incarnation_id, prefix = (
+        prepared.cursor)
+    conn.execute(
+        "INSERT INTO conversation_source_files "
+        "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
+        "device_id,inode,source_incarnation_id,"
+        "committed_prefix_sha256) "
+        "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
+        "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
+        "last_byte_offset=excluded.last_byte_offset,"
+        "last_ingested_at=excluded.last_ingested_at,"
+        "device_id=excluded.device_id,inode=excluded.inode,"
+        "source_incarnation_id=excluded.source_incarnation_id,"
+        "committed_prefix_sha256=excluded.committed_prefix_sha256",
+        (
+            path_str,
+            size,
+            mtime_ns,
+            final_offset,
+            dt.datetime.now(dt.timezone.utc).isoformat(),
+            device_id,
+            inode,
+            incarnation_id,
+            prefix,
+        ),
+    )
+    return sessions
+
+
+def _claude_batch_committed(conn, released, sessions, stats, touched_sessions,
+                            progress) -> None:
+    """Bookkeeping for a committed batch, then the checkpoint policy (#939 D1).
+
+    Runs only after COMMIT, so the pass statistics, the touched sessions and
+    the ingest progress never describe a file whose rows did not commit."""
+    for prepared in released:
+        stats.files_processed += 1
+        if prepared.truncated:
+            stats.files_reset_truncated += 1
+        touched_sessions.update(
+            row[0] for row in prepared.conv_rows if row[0] is not None)
+    touched_sessions.update(sessions)
+    _report_conversation_progress(progress, "ingest", stats)
+    _wal_checkpoint.after_commit(conn)
+
+
+#: #939 D5's residual fields: sets and mappings of paths and keys that only the
+#: dashboard's admission hold reads. The transcript rebuild worker does not
+#: serialize them (JSON has no sets, and its parent reports counts only).
+_CONVERSATION_RESIDUAL_FIELDS = frozenset({
+    "failed_paths", "barrier_deferred_keys", "barrier_deferred_targets",
+    "barrier_published_paths", "barrier_retry_causes",
+})
+
+
+def _record_failed_files(stats, paths) -> None:
+    """Count failed conversation files and name them (#939 D5 residual)."""
+    paths = [str(path) for path in paths]
+    stats.files_failed += len(paths)
+    stats.failed_paths.update(paths)
+
+
+def _commit_claude_released(conn, released, sessions, stats, touched_sessions,
+                            progress) -> None:
+    """Commit the files released before an escaping exception (#939 D1)."""
+    try:
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        _rollback_claude_batch(conn)
+        eprint(f"[conversations] batch commit failed: {exc}")
+        _record_failed_files(stats, (p.path for p in released))
+        _report_conversation_progress(progress, "ingest", stats)
+        return
+    _claude_batch_committed(conn, released, sessions, stats, touched_sessions,
+                            progress)
+
+
+def _apply_claude_conversation_batch(
+    conn: sqlite3.Connection,
+    batch: _ClaudeConversationBatch,
+    stats: "IngestStats",
+    touched_sessions: "set[str]",
+    title_table: str,
+    progress: "Callable[[str, IngestStats], None] | None",
+) -> None:
+    """Apply the open batch in one transaction (#939 D1).
+
+    The failure contract is the per-file loop's: a file that fails or raises
+    never undoes an earlier file, and never commits partially. By phase:
+
+      * BEGIN IMMEDIATE fails (the busy timeout expired): every file of the
+        batch fails; nothing was written, so unchanged cursors retry them;
+      * a file's savepoint raises a database error: that file rolls back and
+        fails and the batch continues, unless the error ended the transaction,
+        in which case every file of the batch fails and none of its
+        bookkeeping is kept;
+      * a file raises any other Exception: it rolls back to its savepoint, the
+        files released before it commit with their bookkeeping, and the
+        original exception propagates (if the transaction is already lost,
+        nothing commits and the released files fail);
+      * a BaseException that is not an Exception rolls the transaction back
+        and propagates;
+      * COMMIT fails: the transaction rolls back and every released file fails
+        once.
+    """
+    files = batch.take()
+    if not files:
+        return
+    try:
+        _begin_claude_conversation_batch(conn)
+    except sqlite3.DatabaseError as exc:
+        _rollback_claude_batch(conn)
+        eprint(f"[conversations] batch of {len(files)} file(s) deferred: {exc}")
+        _record_failed_files(stats, (p.path for p in files))
+        _report_conversation_progress(progress, "ingest", stats)
+        return
+    released: "list[_ClaudePreparedFile]" = []
+    sessions: set[str] = set()
+    try:
+        for prepared in files:
+            try:
+                conn.execute(_CLAUDE_FILE_SAVEPOINT)
+                file_sessions = _write_claude_prepared_file(
+                    conn, prepared, title_table)
+                conn.execute(_CLAUDE_FILE_RELEASE)
+            except sqlite3.DatabaseError as exc:
+                eprint(f"[conversations] db error on {prepared.path}: {exc}")
+                if _rollback_claude_file_savepoint(conn):
+                    _record_failed_files(stats, (prepared.path,))
+                    _report_conversation_progress(progress, "ingest", stats)
+                    continue
+                _record_failed_files(stats, (p.path for p in files))
+                _report_conversation_progress(progress, "ingest", stats)
+                return
+            except Exception:
+                if _rollback_claude_file_savepoint(conn):
+                    _commit_claude_released(conn, released, sessions, stats,
+                                            touched_sessions, progress)
+                else:
+                    _record_failed_files(stats, (p.path for p in released))
+                raise
+            released.append(prepared)
+            sessions.update(file_sessions)
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        # Only COMMIT reaches here: every per-file database error is handled
+        # above, and the escaping-exception path re-raises a non-database one.
+        _rollback_claude_batch(conn)
+        eprint(f"[conversations] batch commit failed: {exc}")
+        _record_failed_files(stats, (p.path for p in released))
+        _report_conversation_progress(progress, "ingest", stats)
+        return
+    except BaseException:
+        _rollback_claude_batch(conn)
+        raise
+    _claude_batch_committed(conn, released, sessions, stats, touched_sessions,
+                            progress)
+
+
 def sync_claude_conversations(
     conn: sqlite3.Connection,
     *,
@@ -16809,6 +21494,7 @@ def sync_claude_conversations(
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CONVERSATIONS_LOCK_PATH.touch()
     lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_PATH, "w")
+    previous_cache_size = None
     try:
         _report_conversation_progress(progress, "lock", stats)
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
@@ -16816,6 +21502,8 @@ def sync_claude_conversations(
             return stats
         # #901 §5.3c (W9): a sync writer owns its checkpoints.
         _wal_checkpoint.arm(conn)
+        # #939 D2: the pass's writer cache, restored in the `finally` below.
+        previous_cache_size = _set_conversation_sync_cache(conn)
 
         # #347 observe-and-stamp mirrors the accounting ingest boundary.  A
         # torn credential read is undecided, not unattributed: defer before any
@@ -16830,6 +21518,9 @@ def sync_claude_conversations(
         active_account_key = (
             None if active_key == _lib_accounts.UNATTRIBUTED else active_key
         )
+        # #944 spec 5.8: a record first observed now takes its write-time
+        # account, read from the attached cache.
+        fresh_account = _ConversationFreshAccount(conn, active_account_key)
 
         targeted = only_paths is not None
         pending_rebuild = conn.execute(
@@ -17029,229 +21720,206 @@ def sync_claude_conversations(
         # dashboard orphan heal into a residual. Explicit --rebuild may clear
         # the whole re-derivable store; ordinary sync remains detect/retain.
         touched_sessions: set[str] = set()
+        # #939 D1: prepare-then-apply. A file is prepared with no write
+        # transaction open and joins the open batch; the batch applies in one
+        # transaction when the next file would cross a bound, at the end of
+        # the walk, and before every early return. Earlier statements of this
+        # function commit their own work, so this guard changes nothing on the
+        # paths that reach it today; it keeps a caller's open transaction from
+        # turning the first BEGIN IMMEDIATE into an error, committing it here
+        # exactly where the per-file loop's first commit used to.
+        if conn.in_transaction:
+            conn.commit()
+        batch = _ClaudeConversationBatch()
 
-        for jp in paths:
-            path_str = str(jp)
-            try:
-                st = jp.stat()
-            except OSError:
-                stats.files_failed += 1
-                _report_conversation_progress(progress, "ingest", stats)
-                continue
-            size, mtime_ns = st.st_size, st.st_mtime_ns
-            prev = existing.get(path_str)
-            if not rebuild and prev is not None and size == prev[0]:
-                stats.files_skipped_unchanged += 1
-                _report_conversation_progress(progress, "ingest", stats)
-                continue
-            truncated = prev is not None and size < prev[0]
-            if targeted and truncated:
-                stats.deferred_reason = "truncation"
-                return stats
-            # The read start is decided by the incarnation resolver below,
-            # which is the only place that knows whether the cursor still
-            # describes this file. Initialised here only so the OSError path
-            # below has a value.
-            start_offset = 0
-            conv_rows: list[tuple[Any, ...]] = []
-            ai_rows: list[tuple[Any, ...]] = []
-            stamp_rows: list[tuple[Any, ...]] = []
-            final_offset = start_offset
-            stamps, gaps = _load_account_stamps(conn, path_str)
-            try:
-                # BINARY, and ONE descriptor for the whole file (#777). Binary
-                # because a stamp's digest is over the record's raw bytes, which
-                # the text layer's replacement decoding does not preserve. One
-                # descriptor because the incarnation decision, the guard-digest
-                # read and the ingest read must all describe the same open file:
-                # a stat-then-open sequence leaves a window in which the file is
-                # replaced between the decision and the read, and the records
-                # would then be filed under the previous incarnation's identity.
-                with open(jp, "rb") as fh:
-                    st_before = os.fstat(fh.fileno())
-                    incarnation = _resolve_source_incarnation(
-                        conn, path_str, fh, st_before, prev,
-                        force_replay=rebuild)
-                    start_offset = incarnation.start_offset
-                    file_high_water = high_water.get(
-                        (path_str, incarnation.incarnation_id), 0)
-                    if incarnation.is_new:
-                        # A new incarnation forces byte-zero treatment: the
-                        # bytes before the cursor are not the bytes the cursor
-                        # described, so resuming from it would skip real records
-                        # and stamp the rest against an identity that never held
-                        # them.
-                        truncated = prev is not None
-                    fh.seek(start_offset)
-                    for _offset, _cost, mrow, ai, raw in _iter_sync_entries(
-                        fh,
-                        path_str,
-                        include_cost=False,
-                        with_raw=True,
-                    ):
-                        if mrow is not None:
-                            offset = int(mrow.byte_offset)
-                            digest = _lib_conversation.record_sha256(raw)
-                            account_key, fresh_stamp = _resolve_record_account(
-                                stamps, gaps, incarnation.incarnation_id,
-                                offset, digest, file_high_water,
-                                active_account_key,
-                            )
-                            if fresh_stamp:
-                                stamp_rows.append(
-                                    (path_str, incarnation.incarnation_id,
-                                     offset, digest, account_key)
+        def apply_batch() -> None:
+            _apply_claude_conversation_batch(
+                conn, batch, stats, touched_sessions, title_table, progress)
+
+        try:
+            for jp in paths:
+                path_str = str(jp)
+                try:
+                    st = jp.stat()
+                except OSError:
+                    _record_failed_files(stats, (path_str,))
+                    _report_conversation_progress(progress, "ingest", stats)
+                    continue
+                size, mtime_ns = st.st_size, st.st_mtime_ns
+                prev = existing.get(path_str)
+                if not rebuild and prev is not None and size == prev[0]:
+                    stats.files_skipped_unchanged += 1
+                    _report_conversation_progress(progress, "ingest", stats)
+                    continue
+                truncated = prev is not None and size < prev[0]
+                if targeted and truncated:
+                    # #939 D1: every exit resolves the open batch.
+                    apply_batch()
+                    stats.deferred_reason = "truncation"
+                    return stats
+                # The read start is decided by the incarnation resolver below,
+                # which is the only place that knows whether the cursor still
+                # describes this file. Initialised here only so the OSError path
+                # below has a value.
+                start_offset = 0
+                conv_rows: list[tuple[Any, ...]] = []
+                ai_rows: list[tuple[Any, ...]] = []
+                stamp_rows: list[tuple[Any, ...]] = []
+                final_offset = start_offset
+                stamps, gaps = _load_account_stamps(conn, path_str)
+                try:
+                    # BINARY, and ONE descriptor for the whole file (#777). Binary
+                    # because a stamp's digest is over the record's raw bytes, which
+                    # the text layer's replacement decoding does not preserve. One
+                    # descriptor because the incarnation decision, the guard-digest
+                    # read and the ingest read must all describe the same open file:
+                    # a stat-then-open sequence leaves a window in which the file is
+                    # replaced between the decision and the read, and the records
+                    # would then be filed under the previous incarnation's identity.
+                    with open(jp, "rb") as fh:
+                        st_before = os.fstat(fh.fileno())
+                        incarnation = _resolve_source_incarnation(
+                            conn, path_str, fh, st_before, prev,
+                            force_replay=rebuild)
+                        start_offset = incarnation.start_offset
+                        file_high_water = high_water.get(
+                            (path_str, incarnation.incarnation_id), 0)
+                        if incarnation.is_new:
+                            # A new incarnation forces byte-zero treatment: the
+                            # bytes before the cursor are not the bytes the cursor
+                            # described, so resuming from it would skip real records
+                            # and stamp the rest against an identity that never held
+                            # them.
+                            truncated = prev is not None
+                        # #939 D1: admission is decided BEFORE the parse. The
+                        # read limit is the size the incarnation decision saw
+                        # (the same fstat recorded as the change detector
+                        # below), so the file consumes at most `bound` bytes;
+                        # records completed by later appends are left for the
+                        # next pass. Applying the open batch here changes
+                        # nothing this file read: the batch holds only other
+                        # files' rows, and every conversation-store read of
+                        # this file names its own path.
+                        read_limit = st_before.st_size
+                        bound = max(0, read_limit - start_offset)
+                        if not batch.admits(bound):
+                            apply_batch()
+                        fh.seek(start_offset)
+                        for _offset, _cost, mrow, ai, raw in _iter_sync_entries(
+                            _ReadLimitedFile(fh, read_limit),
+                            path_str,
+                            include_cost=False,
+                            with_raw=True,
+                        ):
+                            if mrow is not None:
+                                offset = int(mrow.byte_offset)
+                                digest = _lib_conversation.record_sha256(raw)
+                                account_key, fresh_stamp = _resolve_record_account(
+                                    stamps, gaps, incarnation.incarnation_id,
+                                    offset, digest, file_high_water,
+                                    active_account_key,
+                                    resolve_fresh=fresh_account.resolver(
+                                        mrow, raw, path_str),
                                 )
-                            conv_rows.append(
-                                _conv_row_tuple(
-                                    mrow, path_str, account_key,
-                                    include_account=True,
+                                if fresh_stamp:
+                                    stamp_rows.append(
+                                        (path_str, incarnation.incarnation_id,
+                                         offset, digest, account_key)
+                                    )
+                                conv_rows.append(
+                                    _conv_row_tuple(
+                                        mrow, path_str, account_key,
+                                        include_account=True,
+                                    )
                                 )
-                            )
-                        if ai is not None:
-                            ai_rows.append(
-                                (ai.session_id, ai.ai_title, path_str, ai.byte_offset)
-                            )
-                    final_offset = fh.tell()
-                    st_after = os.fstat(fh.fileno())
-                    if _stat_pair_broken(st_before, st_after):
-                        # The file's IDENTITY broke while we were reading it —
-                        # a shrink, or a size-preserving rewrite. An append is
-                        # deliberately not this branch.
+                            if ai is not None:
+                                ai_rows.append(
+                                    (ai.session_id, ai.ai_title, path_str, ai.byte_offset)
+                                )
+                        final_offset = fh.tell()
+                        st_after = os.fstat(fh.fileno())
+                        if _stat_pair_broken(st_before, st_after):
+                            # The file's IDENTITY broke while we were reading it —
+                            # a shrink, or a size-preserving rewrite. An append is
+                            # deliberately not this branch.
+                            #
+                            # Commit nothing. The next sync opens the file again
+                            # and re-decides the incarnation from scratch: the
+                            # committed-prefix guard mints a fresh incarnation and
+                            # replays from zero whenever the bytes before the
+                            # cursor moved, and otherwise continuity holds and it
+                            # resumes from the stored cursor. Either way nothing
+                            # from this partial read is carried forward, which is
+                            # what the descriptor pair exists to guarantee.
+                            _record_failed_files(stats, (path_str,))
+                            _report_conversation_progress(progress, "ingest", stats)
+                            continue
+                        # The committed prefix digest is carried FORWARD from the
+                        # verified one rather than rehashed: the object is already
+                        # positioned at `start_offset`, so only the bytes this pass
+                        # ingested are added. That is what keeps the guard's cost
+                        # proportional to the append rather than to the file.
+                        fh.seek(start_offset)
+                        incarnation.mutable_digest.update(
+                            fh.read(max(0, final_offset - start_offset)))
+                        committed_prefix = incarnation.mutable_digest.hexdigest()
+                        device_id, inode = st_after.st_dev, st_after.st_ino
+                        # The recorded size and mtime come from the fstat taken at
+                        # the START of the read, not the end. They are not identity
+                        # — `_resolve_source_incarnation` decides that on device,
+                        # inode and the committed-prefix digest — they are the
+                        # change detector the `size == prev[0]` skip above reads.
+                        # Now that an append during the read is a continuation
+                        # rather than a break, recording the post-append size would
+                        # claim this pass consumed bytes it never reached, and the
+                        # next sync would skip the file as unchanged and lose those
+                        # records permanently. The pair is equal whenever nothing
+                        # raced, so this changes nothing outside that window.
                         #
-                        # Commit nothing. The next sync opens the file again
-                        # and re-decides the incarnation from scratch: the
-                        # committed-prefix guard mints a fresh incarnation and
-                        # replays from zero whenever the bytes before the
-                        # cursor moved, and otherwise continuity holds and it
-                        # resumes from the stored cursor. Either way nothing
-                        # from this partial read is carried forward, which is
-                        # what the descriptor pair exists to guarantee.
-                        stats.files_failed += 1
-                        _report_conversation_progress(progress, "ingest", stats)
-                        continue
-                    # The committed prefix digest is carried FORWARD from the
-                    # verified one rather than rehashed: the object is already
-                    # positioned at `start_offset`, so only the bytes this pass
-                    # ingested are added. That is what keeps the guard's cost
-                    # proportional to the append rather than to the file.
-                    fh.seek(start_offset)
-                    incarnation.mutable_digest.update(
-                        fh.read(max(0, final_offset - start_offset)))
-                    committed_prefix = incarnation.mutable_digest.hexdigest()
-                    device_id, inode = st_after.st_dev, st_after.st_ino
-                    # The recorded size and mtime come from the fstat taken at
-                    # the START of the read, not the end. They are not identity
-                    # — `_resolve_source_incarnation` decides that on device,
-                    # inode and the committed-prefix digest — they are the
-                    # change detector the `size == prev[0]` skip above reads.
-                    # Now that an append during the read is a continuation
-                    # rather than a break, recording the post-append size would
-                    # claim this pass consumed bytes it never reached, and the
-                    # next sync would skip the file as unchanged and lose those
-                    # records permanently. The pair is equal whenever nothing
-                    # raced, so this changes nothing outside that window.
-                    #
-                    # A RESIDUAL, stated rather than left implicit. The safest
-                    # recorded size is `final_offset`, because the partial-tail
-                    # rewind can end the read before `st_before.st_size` when
-                    # the file's last line is incomplete — so `size` can exceed
-                    # what this pass actually consumed by that tail. Narrowing
-                    # it to `final_offset` is not correct either: `size` is the
-                    # change detector for the `size == prev[0]` skip above, and
-                    # recording the consumed offset instead would make the next
-                    # sync see a size difference on an unchanged file and
-                    # re-read it every tick. The residual is bounded by one
-                    # partial record and is self-correcting, because the
-                    # writer finishes that line and the size moves again;
-                    # identity does not depend on either number.
-                    size, mtime_ns = st_before.st_size, st_before.st_mtime_ns
-            except OSError as exc:
-                eprint(f"[conversations] could not read {jp}: {exc}")
-                stats.files_failed += 1
-                _report_conversation_progress(progress, "ingest", stats)
-                continue
+                        # A RESIDUAL, stated rather than left implicit. The safest
+                        # recorded size is `final_offset`, because the partial-tail
+                        # rewind can end the read before `st_before.st_size` when
+                        # the file's last line is incomplete — so `size` can exceed
+                        # what this pass actually consumed by that tail. Narrowing
+                        # it to `final_offset` is not correct either: `size` is the
+                        # change detector for the `size == prev[0]` skip above, and
+                        # recording the consumed offset instead would make the next
+                        # sync see a size difference on an unchanged file and
+                        # re-read it every tick. The residual is bounded by one
+                        # partial record and is self-correcting, because the
+                        # writer finishes that line and the size moves again;
+                        # identity does not depend on either number.
+                        size, mtime_ns = st_before.st_size, st_before.st_mtime_ns
+                except OSError as exc:
+                    eprint(f"[conversations] could not read {jp}: {exc}")
+                    _record_failed_files(stats, (path_str,))
+                    _report_conversation_progress(progress, "ingest", stats)
+                    continue
 
+                batch.add(_ClaudePreparedFile(
+                    path=path_str,
+                    truncated=truncated,
+                    conv_rows=conv_rows,
+                    ai_rows=ai_rows,
+                    stamp_rows=stamp_rows,
+                    cursor=(size, mtime_ns, final_offset, device_id, inode,
+                            incarnation.incarnation_id, committed_prefix),
+                    bound=bound,
+                ))
+            apply_batch()
+        except Exception as exc:
+            # #939 D1: an exception escaping preparation applies the files
+            # already prepared (no write transaction is open while a file is
+            # prepared, so nothing of the escaping file is in them), then the
+            # original exception propagates. A BaseException that is not an
+            # Exception is not caught: the prepared files are dropped and their
+            # unchanged cursors make the next pass re-read them.
             try:
-                if truncated:
-                    touched_sessions.update(
-                        row[0]
-                        for row in conn.execute(
-                            "SELECT DISTINCT session_id FROM conversation_messages "
-                            "WHERE source_path=? AND session_id IS NOT NULL",
-                            (path_str,),
-                        )
-                    )
-                    conn.execute(
-                        "DELETE FROM conversation_file_touches WHERE message_id IN "
-                        "(SELECT id FROM conversation_messages WHERE source_path=?)",
-                        (path_str,),
-                    )
-                    conn.execute(
-                        "DELETE FROM conversation_messages WHERE source_path=?",
-                        (path_str,),
-                    )
-                    conn.execute(
-                        f"DELETE FROM {title_table} WHERE source_path=?",
-                        (path_str,),
-                    )
-                    stats.files_reset_truncated += 1
-                if conv_rows:
-                    conn.executemany(_CONV_ACCOUNT_INSERT_SQL, conv_rows)
-                    _fill_file_touches(
-                        conn, scope=[(row[3], row[4]) for row in conv_rows]
-                    )
-                if stamp_rows:
-                    # #777: batched into the SAME transaction as the message
-                    # batch, never issued per row. One stamp per message is new
-                    # write volume across every future record, and a per-row
-                    # transaction would multiply the ingest's commit cost by the
-                    # record count.
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO claude_conversation_account_stamps"
-                        "(canonical_source_path,source_incarnation_id,"
-                        "byte_offset,record_sha256,account_key) "
-                        "VALUES(?,?,?,?,?)",
-                        stamp_rows,
-                    )
-                if ai_rows:
-                    conn.executemany(_ai_title_upsert_sql(title_table), ai_rows)
-                conn.execute(
-                    "INSERT INTO conversation_source_files "
-                    "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at,"
-                    "device_id,inode,source_incarnation_id,"
-                    "committed_prefix_sha256) "
-                    "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
-                    "size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,"
-                    "last_byte_offset=excluded.last_byte_offset,"
-                    "last_ingested_at=excluded.last_ingested_at,"
-                    "device_id=excluded.device_id,inode=excluded.inode,"
-                    "source_incarnation_id=excluded.source_incarnation_id,"
-                    "committed_prefix_sha256=excluded.committed_prefix_sha256",
-                    (
-                        path_str,
-                        size,
-                        mtime_ns,
-                        final_offset,
-                        dt.datetime.now(dt.timezone.utc).isoformat(),
-                        device_id,
-                        inode,
-                        incarnation.incarnation_id,
-                        committed_prefix,
-                    ),
-                )
-                conn.commit()
-                _wal_checkpoint.after_commit(conn)
-                stats.files_processed += 1
-                touched_sessions.update(
-                    row[0] for row in conv_rows if row[0] is not None
-                )
-                _report_conversation_progress(progress, "ingest", stats)
-            except sqlite3.DatabaseError as exc:
-                conn.rollback()
-                eprint(f"[conversations] db error on {jp}: {exc}")
-                stats.files_failed += 1
-                _report_conversation_progress(progress, "ingest", stats)
+                apply_batch()
+            except Exception as apply_exc:
+                eprint(f"[conversations] batch apply after {exc!r} "
+                       f"failed: {apply_exc!r}")
+            raise
 
         if rebuild and only_paths is None:
             # A rebuild used to DELETE every `conversation_source_files` row and
@@ -17426,6 +22094,7 @@ def sync_claude_conversations(
     finally:
         # #901 §5.3c (W9): the end of a conversation-sync pass is a boundary.
         _wal_checkpoint.at_boundary(conn)
+        _restore_conversation_sync_cache(conn, previous_cache_size)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -17660,18 +22329,25 @@ class _CodexPublicationWork:
         # conversation-first pass cannot rely on a future seal for an identity
         # accounting has not seen (968-T11-STOP-01). An accepted empty census
         # is also conclusive even though it has no conversation to publish.
+        identity = codex_file_identity(discovered)
         target = self.conn.execute(
             "SELECT generation_token,scan_target,state,accepted_generation_token,"
             "accepted_complete_line_end,complete_line_end "
             "FROM cache_db.codex_barrier_targets WHERE file_identity=?",
-            (codex_file_identity(discovered),)).fetchone()
+            (identity,)).fetchone()
         covered = (target is not None and target[0] == generation
                    and int(target[1]) >= size
                    and (bool(keys) or (
                        target[2] == _barrier.READY and target[3] == generation
                        and target[4] is not None and target[4] == target[5])))
+        # #939 D5: the residual names the deferral, the keys it named and
+        # whether the census may count it complete (a covered deferral with
+        # keys is an obligation a future seal publishes).
+        self.stats.barrier_deferred_keys[path] = frozenset(self.deferred[path][1])
+        self.stats.barrier_deferred_targets[path] = (identity, bool(covered))
         if not covered:
             self.stats.barrier_retry = True
+            self.stats.barrier_retry_causes.add("uncovered")
         return True
 
     def defer_before_read(self, discovered, *, selected, prev,
@@ -17766,6 +22442,7 @@ def _codex_publication_unit(conn, work, group: set, fact):
             # seal. Keep the existing seal outstanding and refuse a completed
             # walk until a later conversation pass can consume this unit.
             work.stats.barrier_retry = True
+            work.stats.barrier_retry_causes.add("qualification")
             work.backlog_complete = False
             return None
         files.append(discovered)
@@ -17915,6 +22592,7 @@ def _fail_codex_publication_unit(conn, batch, stats, *, retry: bool):
         stats.barrier_keys_deferred += len(unit.keys)
     if retry:
         stats.barrier_retry = True
+        stats.barrier_retry_causes.add("unit_failed")
     return _CodexConversationBatch(unit=unit)
 
 
@@ -17950,9 +22628,12 @@ def _commit_codex_publication_unit(conn, batch, stats, progress) -> None:
                f"conversation(s) deferred: {exc}")
         stats.barrier_keys_deferred += len(unit.keys)
         stats.barrier_retry = True
+        stats.barrier_retry_causes.add("publication_error")
     else:
         stats.barrier_keys_published += len(unit.keys)
         stats.barrier_files_published += batch.files
+        stats.barrier_published_paths.update(
+            str(discovered.source_path) for discovered in unit.files)
         stats.files_reset_truncated += batch.reset_truncated
     _report_conversation_progress(progress, "ingest", stats)
 
@@ -17976,6 +22657,69 @@ def _codex_conversation_batch_full(batch: _CodexConversationBatch) -> bool:
         batch.files >= CODEX_CONVERSATION_BATCH_FILES
         or batch.consumed_bytes >= CODEX_CONVERSATION_BATCH_BYTES
     )
+
+
+def read_codex_startup_deferral_facts(conn, entries) -> dict:
+    """The stored facts of each tracked Codex deferral (#939 D5).
+
+    ``entries`` maps a deferred path to ``(file_identity, keys)``. Read in one
+    read transaction across the conversations store and its attached cache, so
+    every fact of one pass comes from one snapshot: the barrier target, the
+    membership keys at the target's current generation, and per key (the
+    entry's keys and that membership) its ``required_revision``, latest
+    certificate revision, ``published_revision`` and repair revision. ``None``
+    means no row. writeIo's admission hold anchors and clips these; it never
+    reads the global seal token.
+    """
+    out: dict = {}
+    began = not conn.in_transaction
+    if began:
+        conn.execute("BEGIN")
+    try:
+        for path, (identity, keys) in entries.items():
+            row = conn.execute(
+                "SELECT generation_token, complete_line_end,"
+                " accepted_generation_token, accepted_complete_line_end,"
+                " state, reason FROM cache_db.codex_barrier_targets"
+                " WHERE file_identity=?", (identity,)).fetchone()
+            target = None
+            membership: frozenset = frozenset()
+            if row is not None:
+                target = {"generation": row[0], "complete_line_end": row[1],
+                          "accepted_generation": row[2], "accepted_end": row[3],
+                          "state": row[4], "reason": row[5]}
+                membership = frozenset(key for (key,) in conn.execute(
+                    "SELECT conversation_key FROM cache_db.codex_barrier_membership"
+                    " WHERE file_identity=? AND generation_token=?",
+                    (identity, row[0])))
+            key_facts = {}
+            for key in sorted(set(keys) | membership):
+                def one(sql, key=key):
+                    found = conn.execute(sql, (key,)).fetchone()
+                    return None if found is None else found[0]
+                key_facts[key] = {
+                    "required": one(
+                        "SELECT required_revision FROM"
+                        " cache_db.codex_barrier_population"
+                        " WHERE conversation_key=?"),
+                    "certificate": one(
+                        "SELECT MAX(revision) FROM"
+                        " cache_db.codex_barrier_certificates"
+                        " WHERE conversation_key=?"),
+                    "published": one(
+                        "SELECT published_revision FROM"
+                        " main.codex_conversation_publications"
+                        " WHERE conversation_key=?"),
+                    "repair": one(
+                        "SELECT revision FROM cache_db.codex_barrier_repairs"
+                        " WHERE conversation_key=?"),
+                }
+            out[path] = {"target": target, "membership": membership,
+                         "keys": key_facts}
+    finally:
+        if began:
+            conn.rollback()
+    return out
 
 
 def _commit_codex_conversation_batch(
@@ -18013,7 +22757,7 @@ def _commit_codex_conversation_batch(
         conn.rollback()
         for path in batch.paths:
             eprint(f"[codex-conversations] db error on {path}: {exc}")
-        stats.files_failed += batch.files
+        _record_failed_files(stats, batch.paths)
     else:
         stats.files_processed += batch.files
         stats.files_reset_truncated += batch.reset_truncated
@@ -18087,6 +22831,7 @@ def _sync_codex_conversations_locked(
     _cctally_core.APP_DIR.mkdir(parents=True, exist_ok=True)
     _cctally_core.CONVERSATIONS_LOCK_CODEX_PATH.touch()
     lock_fh = open(_cctally_core.CONVERSATIONS_LOCK_CODEX_PATH, "w")
+    previous_cache_size = None
     try:
         _report_conversation_progress(progress, "lock", stats)
         if not _acquire_cache_flock(lock_fh, timeout=lock_timeout):
@@ -18097,6 +22842,9 @@ def _sync_codex_conversations_locked(
             return stats
         # #901 §5.3c (W9): a sync writer owns its checkpoints.
         _wal_checkpoint.arm(conn)
+        # #939 D2: the pass's writer cache, restored in the `finally` below.
+        # The W7 batch bounds are unchanged (#939 D3 was withdrawn).
+        previous_cache_size = _set_conversation_sync_cache(conn)
         targeted = only_paths is not None
         pending_rebuild = conn.execute(
             "SELECT 1 FROM cache_meta "
@@ -18164,13 +22912,17 @@ def _sync_codex_conversations_locked(
                     "FROM codex_conversation_source_files"
                 )
             ]
+            preflight_roots = _codex_provider_roots()
             (
                 _safe_sources,
                 refused_sources,
                 _safe_roots,
                 _refused_roots,
             ) = _partition_codex_prune_candidates(
-                preflight_scope, preflight_sources, set()
+                preflight_scope, preflight_sources, set(),
+                refusal=lambda p, k: _codex_witnessed_refusal(   # #970 A5
+                    preflight_scope, p, k, roots=preflight_roots, conn=conn,
+                    table="codex_conversation_source_files"),
             )
             if refused_sources:
                 _codex_prune_refusal_record(
@@ -18207,11 +22959,13 @@ def _sync_codex_conversations_locked(
             _clear_codex_conversation_store(conn)
             conn.commit()
 
+        discovery_skips: dict = {}
         files = (
             _qualify_codex_targets(only_paths)
             if only_paths is not None
-            else _discover_codex_files_with_roots()
+            else _discover_codex_files_with_roots(skipped=discovery_skips)
         )
+        stats.archive_unmapped = discovery_skips.get(ARCHIVE_UNMAPPED_SKIP_KEY, 0)
         stats.files_total = len(files)
         _report_conversation_progress(progress, "ingest", stats)
         # The original projection ends in `device_id`/`inode` (#769 S6),
@@ -18238,7 +22992,7 @@ def _sync_codex_conversations_locked(
                 if prev[3] != discovered.source_root_key:
                     stats.deferred_reason = "requalification"
                     return stats
-                selected = _rc.select_container(discovered.source_path)
+                selected = _select_codex_container(discovered.source_path)
                 if (selected is None or selected.kind != _rc.PLAIN
                         or prev[14] != _rc.PLAIN):
                     continue  # hold container transitions in the per-file walk
@@ -18256,9 +23010,22 @@ def _sync_codex_conversations_locked(
                 (stale_path, existing[stale_path][3])
                 for stale_path in sorted(set(existing) - active_paths)
             ]
+            walk_roots = _codex_provider_roots()
+            # #970 spec 5.1 (G10): a cursorless direct-era archive spelling
+            # retires by scope exit too, or its dated identity is held forever.
+            stale_sources += _codex_cursorless_archive_spelled_conversation_sources(
+                conn, walk_roots, existing)
+
+            def witnessed(path: str, root_key: "str | None") -> "str | None":
+                # #970 spec 5.6 (A5): recovery witness for a present
+                # container, else the deletion witness.
+                return _codex_witnessed_refusal(
+                    prune_scope, path, root_key, roots=walk_roots, conn=conn,
+                    table="codex_conversation_source_files")
+
             safe_sources, _refused_stale, _safe_roots, _refused_roots = (
                 _partition_codex_prune_candidates(
-                    prune_scope, stale_sources, set()
+                    prune_scope, stale_sources, set(), refusal=witnessed,
                 )
             )
             retained_sources = [
@@ -18272,7 +23039,7 @@ def _sync_codex_conversations_locked(
                 _safe_retained_roots,
                 _refused_retained_roots,
             ) = _partition_codex_prune_candidates(
-                prune_scope, retained_sources, set()
+                prune_scope, retained_sources, set(), refusal=witnessed,
             )
             protected_paths = {path for path, _root in refused_sources}
             if safe_sources:
@@ -18303,7 +23070,12 @@ def _sync_codex_conversations_locked(
         # bounded by CODEX_CONVERSATION_BATCH_FILES and _BYTES. Unchanged,
         # unreadable and declined files write nothing, so they neither join nor
         # break a batch.
+        # #970 spec 5.1 (G10): this walk's half of the requalification hold,
+        # read through the walk's own connection (cache.db is attached).
+        requal_held = _codex_requalification_held_names(
+            conn, conn, _codex_provider_roots(), cache_schema="cache_db.")
         pending_marks: list[tuple[str, str, str]] = []
+        location_marks: "list[tuple[str, _rc.SelectedContainer, _AcceptedContainer]]" = []
         batch = _CodexConversationBatch()
         work = _CodexPublicationWork(
             conn, files, only_paths=only_paths, stats=stats)
@@ -18331,23 +23103,38 @@ def _sync_codex_conversations_locked(
                     batch = _fail_codex_publication_unit(
                         conn, batch, stats, retry=True)
                 continue
-            selected = _rc.select_container(jp)
+            selected = _select_codex_container(jp)
             if selected is None:
                 if unit is not None:
-                    stats.files_failed += 1
+                    _record_failed_files(stats, (path_str,))
                     batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
                     continue
-                stats.files_failed += 1
+                _record_failed_files(stats, (path_str,))
                 _report_conversation_progress(progress, "ingest", stats)
+                continue
+            prev = (existing.get(path_str) if unit is None
+                    else _codex_conversation_cursor_row(conn, path_str))
+            if requal_held and _codex_held_by_requalification(
+                    requal_held, frozenset(), discovered, selected.location,
+                    first_sight=prev is None):
+                # G10: held until both stores retire the direct-era spelling.
+                stats.container_reads_held += 1
+                stats.drain_requested = tuple(sorted(
+                    set(stats.drain_requested) | {CODEX_PRUNE_DRAIN_COMMAND}))
+                if unit is not None:
+                    batch = _fail_codex_publication_unit(
+                        conn, batch, stats, retry=True)
                 continue
             _fp = selected.fingerprint
             st = _CodexContainerStat(_fp.size, _fp.mtime_ns, _fp.device, _fp.inode)
-            prev = (existing.get(path_str) if unit is None
-                    else _codex_conversation_cursor_row(conn, path_str))
             accepted = (None if prev is None else _accepted_container(
-                prev, ext=14, mtime=1, device=12, inode=13))
+                prev, ext=14, mtime=1, device=12, inode=13, size=0))
             container_decision = _codex_container_decision(
                 selected, accepted, executor_path=path_str in executor_paths, should_stop=None)
+            if container_decision.action == "adopt-location":
+                # #970 spec 5.5: separately atomic in this store.
+                location_marks.append((path_str, selected, accepted))
+                container_decision = container_decision._replace(action="read")
             if container_decision.action == "pending":
                 pending_marks.append((path_str, _fp.to_json(), container_decision.reason))
                 stats.container_pending += 1
@@ -18579,7 +23366,7 @@ def _sync_codex_conversations_locked(
                 continue
             except OSError as exc:
                 eprint(f"[codex-conversations] could not read {jp}: {exc}")
-                stats.files_failed += 1
+                _record_failed_files(stats, (path_str,))
                 if unit is not None:
                     batch = _fail_codex_publication_unit(conn, batch, stats, retry=True)
                     continue
@@ -18609,7 +23396,7 @@ def _sync_codex_conversations_locked(
                 eprint(
                     f"[codex-conversations] normalization failed for {jp}: {exc}"
                 )
-                stats.files_failed += 1
+                _record_failed_files(stats, (path_str,))
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
             if unit is None and work.defer_after_read(
@@ -18738,7 +23525,10 @@ def _sync_codex_conversations_locked(
                         int(st.st_dev),
                         int(st.st_ino),
                         selected.kind,
-                        str(selected.path) if selected.kind == _rc.ZSTD else None,
+                        # #970 G7: NULL exactly when the container is the
+                        # logical path, its path otherwise (plain included).
+                        _codex_container_location_value(
+                            selected.path, selected.logical),
                         _fp.size if selected.kind == _rc.ZSTD else None,
                         size if selected.kind == _rc.ZSTD else None,
                         _rc.ANCHOR_VERSION if fh.result(final_offset) is not None else None,
@@ -18758,9 +23548,9 @@ def _sync_codex_conversations_locked(
                 if not _rollback_codex_file_savepoint(conn):
                     # SQLite ended the whole transaction, so the batch's
                     # earlier files rolled back with it.
-                    stats.files_failed += batch.files
+                    _record_failed_files(stats, batch.paths)
                     batch = _CodexConversationBatch()
-                stats.files_failed += 1
+                _record_failed_files(stats, (path_str,))
                 _report_conversation_progress(progress, "ingest", stats)
                 continue
             batch.files += 1
@@ -18785,6 +23575,11 @@ def _sync_codex_conversations_locked(
 
         if pending_marks:
             _mark_codex_containers_pending(conn, "codex_conversation_source_files", pending_marks)
+        if location_marks:
+            for path, adopted, snap in location_marks:
+                _adopt_codex_container_location(
+                    conn, "codex_conversation_source_files", path, adopted, snap)
+            conn.commit()
         if (stats.container_pending
                 or stats.container_skipped.get("verification-pending", 0)):
             stats.drain_requested = ("_codex-replay-drain",)
@@ -18860,6 +23655,7 @@ def _sync_codex_conversations_locked(
     finally:
         # #901 §5.3c (W9): the end of a conversation-sync pass is a boundary.
         _wal_checkpoint.at_boundary(conn)
+        _restore_conversation_sync_cache(conn, previous_cache_size)
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
         except OSError:
@@ -19008,7 +23804,10 @@ def _run_transcript_rebuild_worker(
             conn = None
             emit({
                 "event": "result",
-                "stats": asdict(stats),
+                "stats": {
+                    name: value for name, value in asdict(stats).items()
+                    if name not in _CONVERSATION_RESIDUAL_FIELDS
+                },
                 "statsType": type(stats).__name__,
             })
         except BaseException as exc:  # child reports; parent owns CLI wording
@@ -19205,6 +24004,14 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             )
             conn.close()
             return 1
+        if res.attribution_deferred:
+            eprint(
+                "[cache-sync] prune-orphans skipped: the cctally journal could "
+                "not be written. Check that the cctally journal directory is "
+                "writable."
+            )
+            conn.close()
+            return 1
         eprint(
             f"[cache-sync] pruned {res.pruned_files} orphaned file(s), "
             f"{res.pruned_entries} cost row(s), {res.pruned_messages} message(s)"
@@ -19364,6 +24171,23 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 "another process holds the lock"
             )
             contended = True
+        elif (stats.deferred_reason == CLAUDE_ATTRIBUTION_DEFERRAL
+              and args.rebuild and stats.attribution_files_deferred):
+            # #944 L3: the rebuild had already wiped when a later file's
+            # append failed, so it was not skipped; the deferred files are
+            # reported as failed through the existing incomplete line.
+            eprint(
+                "[cache-sync] rebuild incomplete (claude): "
+                f"{stats.files_failed + stats.attribution_files_deferred} "
+                "file(s) failed"
+            )
+            contended = True
+        elif stats.deferred_reason == CLAUDE_ATTRIBUTION_DEFERRAL:
+            # #944 spec 5.5 / U5: the journal could not be written before the
+            # rebuild's wipe (or the plain Claude ingest), so it was deferred.
+            eprint(CLAUDE_ATTRIBUTION_REBUILD_DEFERRED_MESSAGE if args.rebuild
+                   else CLAUDE_ATTRIBUTION_SYNC_DEFERRED_MESSAGE)
+            contended = True
         elif stats.files_failed and args.rebuild:
             eprint(
                 "[cache-sync] rebuild incomplete (claude): "
@@ -19378,6 +24202,13 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
                 f"{stats.rows_changed} rows changed, "
                 f"{stats.lines_malformed} malformed, "
                 f"{stats.assistant_lines_skipped} drift-skipped"
+            )
+        if stats.attribution_conflicts_added:
+            eprint(
+                f"[cache-sync] {stats.attribution_conflicts_added} Claude cost "
+                f"attribution conflict(s) recorded: the journal holds a later "
+                f"decision that disagrees with the first one for the same "
+                f"record; the first decision is kept."
             )
 
     if source in ("codex", "all"):
@@ -19623,6 +24454,10 @@ def cmd_cache_sync(args: argparse.Namespace) -> int:
             conversation_conn.close()
 
     if codex_stats is not None and not codex_stats.lock_contended:
+        # #927 spec §4.2 B2: an explicit cache-sync completes the retained-
+        # identity inventory inline, through the same admitted executor the
+        # detached worker runs (a no-op once it is ready).
+        run_codex_inventory_bootstrap(wait_for_requests=True)
         prune_result = run_codex_prune_drain(wait_for_requests=True)
         verify_result = run_codex_container_verification_drain(wait_for_requests=True)
         run_codex_reset_drain(wait_for_requests=True)

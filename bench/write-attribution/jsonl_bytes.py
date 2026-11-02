@@ -2,7 +2,7 @@
 per-file growth instead of aggregate totals, which can hide a deletion or a
 replacement behind growth elsewhere).
 
-usage: jsonl_bytes.py [--baseline FILE] [--frontier FILE]
+usage: jsonl_bytes.py [--baseline FILE]
   Walks the roots the tested tree reads ($CLAUDE_CONFIG_DIR, else ~/.claude,
   -> projects/**/*.jsonl; $CODEX_HOME, else ~/.codex, -> sessions/**/*.jsonl)
   and prints one JSON line: {"t", "claude": total bytes, "codex": total bytes}
@@ -12,9 +12,9 @@ usage: jsonl_bytes.py [--baseline FILE] [--frontier FILE]
   "discontinuities" (shrunk, replaced or deleted files) and "changes"
   {path: {provider, kind: grown|new|shrunk|replaced|deleted, base, size}}.
   In a frozen run it is started through the namespace, so it measures the
-  freeze, whose growth must be zero. --frontier FILE (Amendment 19 HR-17,
-  `run-live.sh`) also writes this snapshot as a live finite-frontier receipt:
-  {"mode": "live", "capturedAt", "files": {path: {provider, size, dev, ino}}}.
+  freeze, whose growth must be zero. (The finite frontier `run-live.sh` once
+  wrote here with --frontier is #939 D6's logical-identity capture now:
+  frontier.py capture.)
 """
 import json
 import os
@@ -93,15 +93,6 @@ def main(argv=None):
         changes, growth, broken = compare(base, now)
         out.update(growth=growth, discontinuities=broken, changes=changes,
                    files=len(now))
-    if "--frontier" in argv:
-        frontier = argv[argv.index("--frontier") + 1]
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(out["t"]))
-        with open(frontier, "w") as fh:
-            json.dump({"mode": "live", "capturedAt": stamp,
-                       "source": "jsonl_bytes.py",
-                       "files": {path: {"provider": v[0], "size": v[1],
-                                        "dev": v[2], "ino": v[3]}
-                                 for path, v in sorted(now.items())}}, fh)
     print(json.dumps(out))
     return 0
 

@@ -84,51 +84,18 @@ def _stats_ro_guarded():
     )
 
 
-@contextlib.contextmanager
 def _conversation_ro_guarded(*, timeout: float):
-    """Bounded read-only transcript handle participating in #415 recovery."""
-    path = pathlib.Path(_cctally_core.CONVERSATIONS_DB_PATH)
-    if not path.exists():
-        yield None
-        return
-    marker = path.with_name(f"{path.name}.repairing")
-    pending = path.with_name(f"{path.name}.quarantine-pending.json")
-    recovery = path.with_name(f"{path.name}.recovery.json")
-    maintenance = pathlib.Path(
-        _cctally_core.CONVERSATIONS_LOCK_MAINTENANCE_PATH
-    )
-    lock_fh = conn = None
-    try:
-        maintenance.parent.mkdir(parents=True, exist_ok=True)
-        lock_fh = open(maintenance, "a+")
-        try:
-            fcntl.flock(lock_fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield None
-            return
-        if marker.exists() or pending.exists() or recovery.exists():
-            yield None
-            return
-        conn = sqlite3.connect(
-            path.resolve().as_uri() + "?mode=ro",
-            uri=True,
-            timeout=max(0.0, timeout),
-        )
-        if marker.exists() or pending.exists() or recovery.exists():
-            conn.close()
-            conn = None
-            yield None
-            return
-        yield conn
-    finally:
-        if conn is not None:
-            conn.close()
-        if lock_fh is not None:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            lock_fh.close()
+    """Bounded read-only transcript handle participating in #415 recovery.
+
+    #1000 §5.10: the admission now lives in
+    ``_cctally_cache.conversation_ro_guarded``, shared with `db status` and
+    the `explain` reader. Doctor keeps this name for its call sites (and the
+    tests that patch it), and reaches the sibling call-time, as its other
+    sibling imports do (F1), because doctor loads before `_cctally_cache`.
+    """
+    import _cctally_cache
+
+    return _cctally_cache.conversation_ro_guarded(timeout=timeout)
 
 
 def _journal_heal_incident(kind: str, name: str, now_utc: dt.datetime) -> dict:
@@ -646,18 +613,16 @@ def _scan_cause(exc: BaseException) -> str:
 
 
 def _durable_inventory_marker(conn) -> bool:
-    """Whether the validated index holds an unresolved spool marker left by
-    an incomplete inventory (spec revision 5, section 8). Read inside the
-    caller's validated snapshot; a missing quarantine table is no marker."""
+    """Whether the validated index shows the legacy spool inventory episode
+    open (#948 spec 7.3: the `journal.legacy_writer` addendum says detection
+    is paused only then). Read inside the caller's validated snapshot; a
+    missing quarantine table is no open episode."""
     import _cctally_quarantine
-    import _lib_account_protocol
     try:
         state = _cctally_quarantine.load_state(conn)
     except Exception:  # noqa: BLE001 — no readable marker claims no pause
         return False
-    return any(marker.get("reason")
-               == _lib_account_protocol.INVENTORY_INCOMPLETE_REASON
-               for marker in state.spool_markers)
+    return state.open_episode() is not None
 
 
 def _legacy_spool_inventory_probe(paused: bool):
@@ -687,32 +652,26 @@ def _legacy_spool_inventory_probe(paused: bool):
     return None
 
 
-def _statusline_authority_commits() -> dict:
-    """Each account partition's reconciled `authorityCommit` (#825/#832 spec
-    5.6 item 7, fix-round-1 Q6): control recovery is complete only when the
-    account's statusline control transition records the commit of the
-    observation witnessing its control certificate. Read-only; a missing or
-    unreadable transition contributes nothing, so its account stays paused."""
-    import _cctally_statusline
-
-    now_epoch = int(dt.datetime.now(dt.timezone.utc).timestamp())
-    commits = {}
-    for account_key in _cctally_statusline._account_keys_on_disk():
-        try:
-            transition = _cctally_statusline._read_transition(
-                account_key, now_epoch=now_epoch)
-        except Exception:  # noqa: BLE001 — unreadable state stays paused
-            continue
-        quarantine = None if transition is None else transition.quarantine
-        commit = None if quarantine is None else quarantine.get(
-            "authorityCommit")
-        if commit is not None:
-            commits[account_key] = commit
-    return commits
+def _quarantine_inventory_path() -> "str | None":
+    """The file a limit waiting for `inventory` names (#948 spec 7.3): the
+    path doctor's own legacy spool inventory fails on, else the first legacy
+    spool location (the inventory now completes and a writer has yet to
+    record that). Read-only; None when neither is known."""
+    import _cctally_journal
+    probe = _legacy_spool_inventory_probe(True)
+    if probe and probe.get("path"):
+        return str(probe["path"])
+    try:
+        for path in _cctally_journal._legacy_spool_paths():
+            return str(path)
+    except Exception:  # noqa: BLE001 — a diagnostic read never crashes doctor
+        return None
+    return None
 
 
 def _gather_outcome_quarantine() -> dict:
-    """The `accounting.outcome_quarantine` evidence (#825/#832 spec 8, 5.6).
+    """The `accounting.outcome_quarantine` evidence (#948 spec 7.1): the
+    per-account, per-limit state of the journal-derived recovery barrier.
 
     Read from ONE snapshot proven current (epoch and protocol); an absent,
     unreadable or unvalidated index is unavailable, never "no quarantine".
@@ -724,12 +683,10 @@ def _gather_outcome_quarantine() -> dict:
     try:
         if not _cctally_core.DB_PATH.exists():
             return out
-        commits = _statusline_authority_commits()
         pc = _stats_ro_guarded()
         try:
             with _cctally_store.current_stats_snapshot(pc):
-                report = _cctally_quarantine.report(
-                    pc, authority_commits=commits)
+                report = _cctally_quarantine.report(pc)
                 labels = {}
                 for row in pc.execute(
                         "SELECT account_key, label, email FROM accounts"):
@@ -743,10 +700,13 @@ def _gather_outcome_quarantine() -> dict:
         accounts.append({**row, "accountLabel": labels.get(
             row["account"], row["account"])})
     out = {"available": True, "triggered": report["triggered"],
+           "generation": report.get("generation"),
+           "cause": report.get("cause"),
+           "inventoryEpisode": report.get("inventoryEpisode"),
            "accounts": accounts}
-    # Spec revision 3: the unresolved spool markers, only while one exists.
-    if report.get("unresolvedSpoolMarkers"):
-        out["unresolvedSpoolMarkers"] = report["unresolvedSpoolMarkers"]
+    if any(doc.get("waitingFor") == "inventory"
+           for row in accounts for doc in (row.get("axes") or {}).values()):
+        out["inventoryPath"] = _quarantine_inventory_path()
     return out
 
 
@@ -1165,7 +1125,148 @@ def _journal_protocol_violation_rows(conn: sqlite3.Connection) -> list:
     return [json.loads(str(row[3])) for row in rows]
 
 
-def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
+_CLAUDE_COST_EXPORT_MIGRATION = "050_preserve_claude_cost_attribution"
+
+
+def _claude_cost_export_state(conn, doc) -> str:
+    """Migration 050's export state (#944 spec 5.9): ``complete`` once
+    applied, ``skipped`` when skipped, else ``stalled`` when its last attempt
+    failed after its last completed chunk (or no chunk completed), else
+    ``running``."""
+    if conn.execute("SELECT 1 FROM schema_migrations WHERE name=?",
+                    (_CLAUDE_COST_EXPORT_MIGRATION,)).fetchone():
+        return "complete"
+    try:
+        if conn.execute(
+                "SELECT 1 FROM schema_migrations_skipped WHERE name=?",
+                (_CLAUDE_COST_EXPORT_MIGRATION,)).fetchone():
+            return "skipped"
+    except sqlite3.OperationalError:
+        pass
+    doc = doc or {}
+    error_at, chunk_at = doc.get("lastErrorAt"), doc.get("lastChunkAt")
+    if error_at and (not chunk_at or str(error_at) > str(chunk_at)):
+        return "stalled"
+    return "running"
+
+
+def _gather_claude_cost_attribution(
+        now_utc: "dt.datetime", *, cache_probe_allowed: bool = True) -> dict:
+    """Read-only counts for ``accounts.claude_cost_attribution`` (#944 spec
+    5.9). The population is the ``timeline_agreement`` / ``fallback``
+    decisions decided in the preceding 7 UTC days that a retained accounting
+    row links to: a keyed decision through ``idx_entries_dedup`` with link
+    equality, a physical or legacy one exactly on the link through
+    ``idx_entries_attr_nonkeyed``. A decision no row links to (a replaced
+    physical record, an orphan) is not counted. ``preservedRows`` counts the
+    ``preserved_history`` decisions decided in the window without probing
+    their links (#944 F4): for a week after an upgrade that is every
+    existing row (~700K measured), and probing each one's link cost ~2.8 s of
+    SQL on every doctor run, while every export links the row it records.
+    Never raises; an absent or unreadable cache.db yields the empty shape."""
+    import _lib_claude_attribution as K
+    end_us = K.us_from_iso(
+        now_utc.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+    start_us = end_us - 7 * 86_400 * 1_000_000
+    out = {
+        "windowStart": K.iso_from_us(start_us),
+        "windowEnd": K.iso_from_us(end_us),
+        "population": "deduplicatedClaudeCostRows",
+        "totalRows": 0, "fallbackRows": 0, "fallbackRealAccountRows": 0,
+        "fallbackUnattributedRows": 0, "byReason": {},
+        "firstFallbackAt": None, "lastFallbackAt": None,
+        "preservedRows": 0, "unlinkedRows": 0,
+        "preservation": {"state": None, "saved": None, "total": None,
+                         "lastError": None, "lastErrorAt": None},
+        "decisionConflicts": 0, "alignedRows": 0, "lastDeferral": None,
+    }
+    path = _cctally_core.CACHE_DB_PATH
+    # A live cache repair owner bars every cache probe (#344).
+    if not cache_probe_allowed or not path.exists():
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.0)
+    except sqlite3.Error:
+        return out
+    try:
+        import _cctally_claude_attribution as G
+        if not G.schema_present(conn):
+            return out
+        # #944 F10: compare in decided_at's own format. ``decided_at_utc``
+        # is written by ``now_utc_iso`` (seconds precision, ``Z``), and a
+        # microsecond bound sorts after every decision of its own second
+        # ('.' < 'Z'), dropping a decision made in the second that ends the
+        # window. The bounds are the window's instants at that precision.
+        window = tuple(
+            _cctally_core.now_utc_iso(
+                dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+                + dt.timedelta(microseconds=us))
+            for us in (start_us, end_us))
+        # The population is the evidence and fallback decisions only: the
+        # preserved ones are excluded here, before any link is probed.
+        population = (K.BASIS_AGREEMENT, K.BASIS_FALLBACK)
+        rows = conn.execute(
+            "SELECT d.basis, d.account_key, d.reason, d.decided_at_utc"
+            " FROM claude_cost_decisions d"
+            " WHERE d.decided_at_utc >= ? AND d.decided_at_utc <= ?"
+            " AND d.basis IN (?, ?)"
+            " AND d.form = ? AND EXISTS (SELECT 1 FROM session_entries e"
+            "  WHERE e.msg_id = d.msg_id AND e.req_id = d.req_id"
+            "  AND e.attribution_decision_key = d.decision_key)"
+            " UNION ALL"
+            " SELECT d.basis, d.account_key, d.reason, d.decided_at_utc"
+            " FROM claude_cost_decisions d"
+            " WHERE d.decided_at_utc >= ? AND d.decided_at_utc <= ?"
+            " AND d.basis IN (?, ?)"
+            " AND d.form <> ? AND EXISTS (SELECT 1 FROM session_entries e"
+            "  WHERE e.attribution_decision_key = d.decision_key"
+            "  AND (e.msg_id IS NULL OR e.req_id IS NULL))",
+            (*window, *population, K.FORM_KEYED,
+             *window, *population, K.FORM_KEYED)).fetchall()
+        out["preservedRows"] = conn.execute(
+            "SELECT COUNT(*) FROM claude_cost_decisions"
+            " WHERE decided_at_utc >= ? AND decided_at_utc <= ?"
+            " AND basis = ?", (*window, K.BASIS_PRESERVED)).fetchone()[0]
+        fallback_at = []
+        for basis, account, reason, decided_at in rows:
+            out["totalRows"] += 1
+            if basis != K.BASIS_FALLBACK:
+                continue
+            out["fallbackRows"] += 1
+            if account and account != K.UNATTRIBUTED:
+                out["fallbackRealAccountRows"] += 1
+            else:
+                out["fallbackUnattributedRows"] += 1
+            key = reason or "unknown"
+            out["byReason"][key] = out["byReason"].get(key, 0) + 1
+            fallback_at.append(decided_at)
+        if fallback_at:
+            out["firstFallbackAt"] = min(fallback_at)
+            out["lastFallbackAt"] = max(fallback_at)
+        out["byReason"] = dict(sorted(out["byReason"].items()))
+        out["unlinkedRows"] = conn.execute(
+            "SELECT COUNT(*) FROM session_entries"
+            " WHERE attribution_decision_key IS NULL").fetchone()[0]
+        doc = G.read_preservation(conn)
+        out["preservation"] = {
+            "state": _claude_cost_export_state(conn, doc),
+            "saved": (doc or {}).get("saved"),
+            "total": (doc or {}).get("total"),
+            "lastError": (doc or {}).get("lastError"),
+            "lastErrorAt": (doc or {}).get("lastErrorAt"),
+        }
+        out["decisionConflicts"] = G.decision_conflicts(conn)
+        out["alignedRows"] = G.aligned_rows(conn)
+        out["lastDeferral"] = G.last_deferral(conn)
+    except sqlite3.Error:
+        return out
+    finally:
+        conn.close()
+    return out
+
+
+def _gather_accounts_state(now_utc: "dt.datetime", *,
+                           cache_probe_allowed: bool = True) -> dict:
     """Best-effort account-attribution state for the doctor `accounts.*` legs
     (#341). Never raises: identity + registry reads are read-only and each guard
     swallows OperationalError so a legacy / pre-account stats.db degrades to the
@@ -1182,6 +1283,10 @@ def _gather_accounts_state(now_utc: "dt.datetime") -> dict:
         state["claude_email"] = ident.get("email")
     except Exception:
         pass
+    # #944 spec 5.9: gathered from cache.db, so before the stats.db early
+    # return; the check is always present.
+    state["claude_cost_attribution"] = _gather_claude_cost_attribution(
+        now_utc, cache_probe_allowed=cache_probe_allowed)
     if not _cctally_core.DB_PATH.exists():
         return state
     try:
@@ -1465,13 +1570,20 @@ def _gather_quota_rate_change(c, rejection=None) -> "dict | None":
     """
     if rejection == "calibration-absent":
         return dict(_QUOTA_NOT_ASSESSED)
-    mrc = c._load_sibling("_lib_meter_rate_change")
     glue = c._load_sibling("_cctally_quota_model")
+    calibration = c._load_sibling("_cctally_quota_calibration")
     loaded = glue.read_stored_state_readonly()
     if loaded is None:
         return None
     regimes = glue.stored_regimes(loaded, None)
-    active = mrc.active_rate_change(regimes)
+    # #1015 spec 5.6: over the CLEAN regimes, with a superseded transition
+    # suppressed. Correction facts that cannot be read (the fail-fast reader
+    # never recovers or waits) leave the change unverified: not assessed,
+    # never asserted.
+    state, active = calibration.assess_active_rate_change(
+        None, regimes=regimes)
+    if state == calibration.MARKER_UNAVAILABLE:
+        return dict(_QUOTA_NOT_ASSESSED)
     if active is None:
         return dict(_QUOTA_NO_CHANGE)
     return dict(active, assessed=True)
@@ -1659,8 +1771,10 @@ def _gather_codex_container_state(c, *, now_utc, cache_probe_allowed):
 
     try:
         decoder = rc.decoder_capability()
+        # #970 spec 5.9: the census reads the same locations discovery does,
+        # each native home's flat archive directory included.
         selected = [item for item in cache._iter_codex_logical_containers(
-            c._codex_session_roots()) if item.kind == rc.ZSTD]
+            cache._codex_home_locations()) if item.kind == rc.ZSTD]
         census = dict(compressedOnly=len(selected), retainedComplete=0,
                       retainedIncomplete=0, neverIngested=0, unverified=0)
         status = None
@@ -2354,11 +2468,21 @@ def _doctor_gather_state_impl(
         # hardcoded ~/.codex/sessions), matching the multi-root ingestion path
         # from #108. _codex_session_roots() already applies the sessions/-subdir
         # rule and filters to existing dirs, so a bare glob per root suffices.
+        # #970 spec 5.9: a native home's archived_sessions/ directory (globbed
+        # flat, as discovery does) also holds Codex history.
         codex_jsonl_present = False
         try:
-            for codex_dir in c._codex_session_roots():
+            import _cctally_cache as _cache_for_codex_files
+            for location in _cache_for_codex_files._codex_home_locations():
+                codex_dir = location.walk_root
                 if (next(codex_dir.glob("**/*.jsonl"), None) is not None
                         or next(codex_dir.glob("**/*.jsonl.zst"), None) is not None):
+                    codex_jsonl_present = True
+                    break
+                archive = location.archive_root
+                if archive is not None and (
+                        next(archive.glob("*.jsonl"), None) is not None
+                        or next(archive.glob("*.jsonl.zst"), None) is not None):
                     codex_jsonl_present = True
                     break
         except Exception:
@@ -3219,7 +3343,8 @@ def _doctor_gather_state_impl(
         cctally_version = (
             cctally_version_tuple[0] if cctally_version_tuple else "unknown"
         )
-        accounts_state = _gather_accounts_state(now_utc)
+        accounts_state = _gather_accounts_state(
+            now_utc, cache_probe_allowed=_cache_probe_allowed)
         accounts_state["codex_null_reset_anchors"] = codex_null_reset_anchors
         accounts_state["codex_window_attribution"] = (
             _gather_codex_window_attribution_state()

@@ -163,7 +163,38 @@
     "classRadiusEffective": 0.01057775709238613,
     "familyRadiusEmpirical": 0.0,
     "classRadiusEmpirical": 0.0,
-    "radiusRule": "max(observed spread, materiality floor)"
+    "radiusRule": "max(observed spread, materiality floor)",
+    "familyMateriality": {
+      "reference": "fit-weighted",
+      "fitFamilyShares": {
+        "claude-opus-5": 1.0
+      },
+      "referenceFamily": "claude-opus-5",
+      "familyRateBounds": [],
+      "maxRelativeEffect": 0.05
+    },
+    "forecastProbe": {
+      "state": "probed",
+      "familyShares": {
+        "claude-opus-5": 1.0
+      },
+      "classShares": {
+        "cache_1h": 0.0,
+        "cache_read": 0.0,
+        "fresh": 1.0,
+        "output": 0.0
+      },
+      "familyDistance": 0.0,
+      "familyDistanceReference": "baseline-family-shares",
+      "familyWithinRadius": true,
+      "familyEffectBound": 0.0,
+      "familyEffectReference": "fit-family-shares",
+      "familyEffectUnavailable": null,
+      "familyAdmittedBy": "radius",
+      "classDistance": 0.0,
+      "classWithinRadius": true,
+      "supported": true
+    }
   },
   "health": {
     "entriesThrough": "2026-08-28T00:30:00Z",
@@ -185,9 +216,9 @@
     "calibrationFileQuarantinedTo": null
   },
   "method": {
-    "algorithmRevision": 4,
-    "constantsFingerprint": "5835b430978b2fc556c577d44c9e62d5d7807e62533b32819ed63d37e3af671a",
-    "verifiedAt": "2026-10-20",
+    "algorithmRevision": 5,
+    "constantsFingerprint": "dfdd6a7de768802d3008d88bab453db6480812dc266187c593c3d4604554d42f",
+    "verifiedAt": "2026-10-30",
     "supportedCompositionFrom": "2026-07-25",
     "coefficientSupport": {
       "supportedCompositionFrom": "2026-07-25",
@@ -201,7 +232,9 @@
         "from": null,
         "until": "2026-07-25",
         "state": "unvalidated",
-        "provenance": "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 units per point against 2.4M for Opus 5, a budget difference the shared token-class coefficients do not absorb. The shipped estimator gives 1,265,184 to 1,479,027 over the same weeks, and spec section 6 declines to adjudicate between the two."
+        "provenance": "docs/quota-model.md: the Opus 4.8 era fits at about 1,989,101 units per point against 2.4M for Opus 5, a budget difference the shared token-class coefficients do not absorb. The shipped estimator gives 1,265,184 to 1,479,027 over the same weeks, and spec section 6 declines to adjudicate between the two.",
+        "referenceFamily": null,
+        "familyRateBounds": []
       },
       {
         "id": "opus-5",
@@ -214,7 +247,9 @@
           "output": 4.73,
           "cache_1h": 1.03,
           "cache_read": 0.0031
-        }
+        },
+        "referenceFamily": "claude-opus-5",
+        "familyRateBounds": []
       },
       {
         "id": "opus-5-5",
@@ -227,7 +262,16 @@
           "output": 0.64,
           "cache_1h": 1.0,
           "cache_read": 0.0148
-        }
+        },
+        "referenceFamily": "claude-opus-5-5",
+        "familyRateBounds": [
+          {
+            "family": "claude-sonnet-5-5",
+            "low": 0.09,
+            "high": 0.61,
+            "provenance": "991-meter-evidence-2026-10-23"
+          }
+        ]
       }
     ],
     "detector": {

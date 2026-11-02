@@ -13,6 +13,11 @@ path: it fails on the parent, which publishes the idle session's replayed 20
 as a rise and mints a second credit from the later lows. S6 and S7 are
 preservation controls (they pass on the parent); their mutation controls are
 pinned in `tests/test_797_stale_contributor_evidence.py`.
+
+#1019 L8 (spec section 6, acceptance A5) is the five-hour drop refusal: a
+stale low proven by a later-requested higher provider sample arms, confirms
+and credits nothing, while a genuine low after that sample still credits,
+each control bitten in place by its mutation.
 """
 from __future__ import annotations
 
@@ -259,3 +264,240 @@ def test_f_i5_1_five_hour_refusal_without_a_weekly_reading(monkeypatch, tmp_path
                 ("receipt", "evidence", "survived", "confirmed", "after_replay",
                  "credits", "statusline", "state", "outcomes")}
     assert {k: result[k] for k in expected} == expected, "RESULT=" + repr(result)
+
+
+# --- #1019 L8: a proven-stale five-hour low never publishes a drop ---------------------
+
+
+def _five_milestones(t) -> list:
+    """The account's five-hour milestones: (threshold, in a post-credit
+    segment)."""
+    return [(int(threshold), bool(post)) for threshold, post in t._rows(
+        "SELECT percent_threshold, reset_event_id != 0 FROM five_hour_milestones "
+        "WHERE account_key = ? ORDER BY id", (t.account,))]
+
+
+def _five_pending(t):
+    """The pending five-hour drop's retained low, or None."""
+    pending = t.transition().control.pending_drops.get("fiveHour")
+    if pending is None or pending.retained is None or not pending.retained.observations:
+        return None
+    return pending.retained.percent
+
+
+def _l8_baseline(t, idle):
+    """The live session's 20 becomes the `statusline` five-hour baseline
+    (09:00:30); ``idle``'s last response is 08:00:00, long before it."""
+    live = t.session("live20")
+    idle.respond(DAY + "08:00:00Z")
+    t.oauth(WEEKLY, at=DAY + "09:00:00Z")
+    live.respond(DAY + "09:00:20Z")
+    t.render(live, WEEKLY, five=20, at=DAY + "09:00:30Z")
+    return live
+
+
+def _l8_result(t, **extra):
+    return _common(t, {
+        **extra,
+        "credits": [(prior, post) for prior, post, _eff in t.five_credits()],
+        "statusline": _publications(t)["statusline"],
+        "state": t.five_state(),
+        "milestones": _five_milestones(t),
+    })
+
+
+def scenario_1019_l8_stale(t):
+    """L8 (#1019 spec section 6): after the `statusline` baseline 20 an
+    admitted OAuth 20 is requested (09:00:48) after idle's last response;
+    idle then repeats its stale 7 the way a resumed idle session does: it
+    arms beside the live 20 (09:01:10), reaches the 180 s deadline
+    (09:04:20, the descent that arms the source-local detector) and a
+    distinct 7 confirms the credit (09:04:40)."""
+    idle = t.session("idle7")
+    live = _l8_baseline(t, idle)
+    t.oauth(WEEKLY, five=20, at=DAY + "09:00:50Z")
+    t.render(idle, WEEKLY, five=7, at=DAY + "09:01:10Z")
+    t.render(live, WEEKLY, five=20, at=DAY + "09:01:20Z")
+    t.render(idle, WEEKLY, five=7, at=DAY + "09:04:20Z")
+    armed = t.five_state()
+    t.render(idle, WEEKLY, five=7, at=DAY + "09:04:40Z")
+    return _l8_result(t, armed=armed, pending=_five_pending(t))
+
+
+def test_1019_l8_stale_five_hour_lows_refused(monkeypatch, tmp_path):
+    """L8 (accuracy: a false five-hour credit, E3's failure family): two
+    distinct status-line arrivals of one idle session's stale 7 satisfy the
+    source-local confirmation, which tells sources apart, not sessions. A
+    provider sample requested after the idle session's activity reads 20,
+    so its 7 is proven stale: nothing below the baseline publishes, and no
+    arm, credit or post-credit milestone follows. RED on the parent: the 7
+    publishes at the deadline, arms the detector (20, 7) and the second 7
+    confirms a 20 -> 7 credit."""
+    result = scenario_1019_l8_stale(S.Trace(monkeypatch, tmp_path / "stale"))
+    print(result)
+    assert result["statusline"] == [20.0], "RESULT=" + repr(result)
+    assert result["armed"] == (20.0, None), "RESULT=" + repr(result)
+    assert result["pending"] is None, "RESULT=" + repr(result)
+    assert result["credits"] == [], "RESULT=" + repr(result)
+    assert result["state"] == (20.0, None), "RESULT=" + repr(result)
+    assert not any(post for _threshold, post in result["milestones"]), (
+        "RESULT=" + repr(result))
+    assert result["outcomes"]["five_hour"] == 0, "RESULT=" + repr(result)
+    # Spec 4.2 P-R2, five-hour form (accuracy: false five-hour credits from
+    # a drop/rise flap): beside a fresh genuine 0 the refused 7 neither
+    # dissents nor, after the one genuine 20 -> 0 credit, rises. Letting a
+    # drop-refused member rise (`drop-refused-may-rise`) re-raises the
+    # window to the stale 7, re-arms the detector against it and seeds a
+    # post-credit milestone at 7.
+    with pytest.MonkeyPatch.context() as mp:
+        t = S.Trace(mp, tmp_path / "flap")
+        flap_states = _five_states_per_render(t)
+        flap = scenario_1019_l8_flap(t)
+    print("flap", flap)
+    assert flap["credits"] == [(20.0, 0.0)], "FLAP=" + repr(flap)
+    assert 7.0 not in flap["statusline"], "FLAP=" + repr(flap)
+    assert flap["state"] == (0.0, None), "FLAP=" + repr(flap)
+    assert (7.0, 0.0) not in flap_states, "FLAP=" + repr(flap_states)
+    assert not any(post for _threshold, post in flap["milestones"]), "FLAP=" + repr(flap)
+    with pytest.MonkeyPatch.context() as mp:
+        t = S.Trace(mp, tmp_path / "mutated")
+        S.mutate(mp, "drop-refused-may-rise")
+        mutated_states = _five_states_per_render(t)
+        mutated = scenario_1019_l8_flap(t)
+    print("mutated", mutated, mutated_states)
+    assert mutated["credits"][0] == (20.0, 0.0), "MUTATED=" + repr(mutated)
+    assert 7.0 in mutated["statusline"], "MUTATED=" + repr(mutated)
+    # #943: the detector arms against the re-raised 7 at some render. The
+    # FINAL state no longer shows it: the next 0 confirms that descent, and
+    # its credit shares the first credit's ten-minute slot, so it inserts
+    # nothing and (rowcount-gated) its stale-replica cleanup no longer
+    # deletes the 7 that, before #943, let the stale 7 rise a second time.
+    assert (7.0, 0.0) in mutated_states, "MUTATED=" + repr(mutated_states)
+    assert (7, True) in mutated["milestones"], "MUTATED=" + repr(mutated)
+
+
+def _five_states_per_render(t):
+    """Record the statusline source's five-hour confirmation state
+    (baseline, pending) after every render of ``t``."""
+    states = []
+    real = t.render
+
+    def render(*args, **kwargs):
+        out = real(*args, **kwargs)
+        states.append(t.five_state())
+        return out
+    t.render = render
+    return states
+
+
+def scenario_1019_l8_flap(t):
+    """The persistent schedule on the five-hour axis (spec L6 case b): after
+    the baseline 20 and the OAuth 20 requested after idle's activity, fresh
+    ``y`` responds (09:01:00) and reports a genuine 0 beside idle's stale 7,
+    both every 30 s for eight minutes (past several 180 s deadlines)."""
+    idle, y = t.session("idle7"), t.session("freshY")
+    _l8_baseline(t, idle)
+    t.oauth(WEEKLY, five=20, at=DAY + "09:00:50Z")
+    y.respond(DAY + "09:01:00Z")
+    for i in range(0, 8 * 60, 30):
+        t.render(idle, WEEKLY, five=7, at=S.at(DAY + "09:01:10Z", i))
+        t.render(y, WEEKLY, five=0, at=S.at(DAY + "09:01:20Z", i))
+    return _l8_result(t)
+
+
+def scenario_1019_l8_genuine(t):
+    """L8 preservation: the same schedule, but the descending session ``x``
+    responds (09:01:00) after the higher OAuth 20 was requested (09:00:48),
+    so its 5 is a genuine post-credit reading the sample cannot refuse."""
+    x = t.session("x")
+    live = _l8_baseline(t, t.session("idle"))
+    t.oauth(WEEKLY, five=20, at=DAY + "09:00:50Z")
+    x.respond(DAY + "09:01:00Z")
+    t.render(x, WEEKLY, five=5, at=DAY + "09:01:10Z")
+    t.render(live, WEEKLY, five=20, at=DAY + "09:01:20Z")
+    t.render(x, WEEKLY, five=5, at=DAY + "09:04:20Z")
+    t.render(x, WEEKLY, five=5, at=DAY + "09:04:40Z")
+    return _l8_result(t)
+
+
+def test_1019_l8_genuine_five_hour_credit_preserved(monkeypatch, tmp_path):
+    """L8 preservation (accuracy: a lost real five-hour credit): fresh
+    activity after a higher provider sample, then two distinct genuine
+    lows, yields exactly one 20 -> 5 credit. Proving a low by any higher
+    sample whatever its request order (`drop-bound-ignored`) removes it."""
+    result = scenario_1019_l8_genuine(S.Trace(monkeypatch, tmp_path / "branch"))
+    print(result)
+    assert result["credits"] == [(20.0, 5.0)], "RESULT=" + repr(result)
+    assert result["statusline"] == [20.0, 5.0, 5.0], "RESULT=" + repr(result)
+    assert result["state"] == (5.0, None), "RESULT=" + repr(result)
+    assert result["outcomes"]["five_hour"] == 1, "RESULT=" + repr(result)
+    with pytest.MonkeyPatch.context() as mp:
+        t = S.Trace(mp, tmp_path / "mutated")
+        S.mutate(mp, "drop-bound-ignored")
+        mutated = scenario_1019_l8_genuine(t)
+    print("mutated", mutated)
+    assert mutated["credits"] == [], "MUTATED=" + repr(mutated)
+    assert mutated["statusline"] == [20.0], "MUTATED=" + repr(mutated)
+
+
+def _five_proof(t, *, at):
+    """An admitted OAuth five-hour 20 captured at ``at``; returns its
+    observation id."""
+    q = t.oauth(WEEKLY, five=20, at=at)
+    (obs,) = [r[0] for r in t._rows(
+        "SELECT observation_id FROM claude_oauth_samples "
+        "WHERE account_key = ? AND requested_at_utc = ?", (t.account, q))]
+    return obs
+
+
+def scenario_1019_l8_aged_out(t, *, stale):
+    """L8 aged-out support: a 5h low arms (09:01:10) beside the live 20
+    while the OAuth 20 requested at 09:00:48 is not yet visible to the
+    sample reader (`_unadmitted`, the race in which a proof is admitted
+    after the reduction that retained its support); the live 20 dissents
+    (09:01:20) and the low's arrival leaves the active window (09:02:40).
+    The live session then renders weekly-only readings past the deadline
+    (09:04:10), so the five-hour axis has no live candidate and only the
+    retained low can publish (`_hold_pending`). ``stale``: the low is idle's
+    7, its last response at 08:00; otherwise fresh ``x``'s 5, its response
+    at 09:01:00, after the sample was requested."""
+    import test_frozen_plan_receipts_797 as R
+
+    low = t.session("idle7" if stale else "x")
+    live = _l8_baseline(t, low if stale else t.session("idle"))
+    proof = _five_proof(t, at=DAY + "09:00:50Z")
+    if not stale:
+        low.respond(DAY + "09:01:00Z")
+    with R._unadmitted(t, proof):
+        t.render(low, WEEKLY, five=7 if stale else 5, at=DAY + "09:01:10Z")
+        t.render(live, WEEKLY, five=20, at=DAY + "09:01:20Z")
+    armed = _five_pending(t)
+    t.render(live, WEEKLY, at=DAY + "09:04:20Z")
+    t.render(live, WEEKLY, at=DAY + "09:04:40Z")
+    return _l8_result(t, armed=armed, pending=_five_pending(t))
+
+
+def test_1019_l8_aged_out_support_deadline(monkeypatch, tmp_path):
+    """L8 retained support (accuracy: `_hold_pending` publishing a refuted
+    five-hour low, and the reverse, a lost genuine one): a supporter that
+    aged out of the active window is pruned once the sample refuting it is
+    visible, so the pending drop is cancelled and its deadline publishes
+    nothing. An aged-out genuine supporter whose response follows the
+    sample still publishes at its deadline and credits exactly once. RED on
+    the parent: the stale 7 publishes at the deadline and credits 20 -> 7."""
+    result = scenario_1019_l8_aged_out(S.Trace(monkeypatch, tmp_path / "stale"),
+                                       stale=True)
+    print(result)
+    assert result["armed"] == 7.0, "RESULT=" + repr(result)
+    assert result["statusline"] == [20.0], "RESULT=" + repr(result)
+    assert result["pending"] is None, "RESULT=" + repr(result)
+    assert result["credits"] == [], "RESULT=" + repr(result)
+    assert result["state"] == (20.0, None), "RESULT=" + repr(result)
+    with pytest.MonkeyPatch.context() as mp:
+        genuine = scenario_1019_l8_aged_out(S.Trace(mp, tmp_path / "genuine"),
+                                            stale=False)
+    print("genuine", genuine)
+    assert genuine["armed"] == 5.0, "GENUINE=" + repr(genuine)
+    assert genuine["statusline"] == [20.0, 5.0, 5.0], "GENUINE=" + repr(genuine)
+    assert genuine["credits"] == [(20.0, 5.0)], "GENUINE=" + repr(genuine)
+    assert genuine["state"] == (5.0, None), "GENUINE=" + repr(genuine)

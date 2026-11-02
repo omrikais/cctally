@@ -443,13 +443,17 @@ class _BoundaryCallCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _boundary_scan_sources():
+    """Every source the boundary call-site scan reads: `bin/*.py` and `bin/cctally`."""
+    bin_dir = pathlib.Path(__file__).resolve().parents[1] / "bin"
+    return sorted(bin_dir.glob("*.py")) + [bin_dir / "cctally"]
+
+
 def _discover_boundary_call_sites():
     root = pathlib.Path(__file__).resolve().parents[1]
-    bin_dir = root / "bin"
-    sources = sorted(bin_dir.glob("*.py")) + [bin_dir / "cctally"]
     sites: set[str] = set()
     shapes: set[str] = set()
-    for path in sources:
+    for path in _boundary_scan_sources():
         if not path.is_file():
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -811,6 +815,11 @@ def test_837_prior_five_hour_is_account_scoped(ns, credit_accounts):
 
 STALE_REPLICA_AT = "2026-06-19T14:10:00Z"
 HELD_REPLICA_AT = "2026-06-19T14:20:00Z"
+#: The credit's `--at`, earlier than both replicas. Since #943 (O1) the credit
+#: takes effect at the exact `--at` second, so a replica captured between the
+#: hour and the default 14:37 `--at` is a genuine pre-credit reading and is
+#: outside the population this test compares.
+REPLICA_CREDIT_AT = "2026-06-19T14:05:00Z"
 #: `--from`, and the centre of the 1.0pp stale-replay band.
 CREDIT_FROM_PCT = 46.0
 
@@ -854,7 +863,8 @@ def test_837_preview_and_apply_delete_the_same_rows(ns, credit_accounts,
     # authorizing the mutation. It counted across every account while the
     # DELETE has always been account-scoped, so it over-reported by exactly the
     # inactive account's in-band rows.
-    preview = _credit_preview(ns, capsys, from_pct=CREDIT_FROM_PCT)
+    preview = _credit_preview(ns, capsys, from_pct=CREDIT_FROM_PCT,
+                              at=REPLICA_CREDIT_AT)
     assert preview["actions"]["staleReplaysDeleted"] == 1, (
         "the preview reported a stale population the DELETE will not remove: "
         f"{preview['actions']['staleReplaysDeleted']} rows, but only the "
@@ -868,7 +878,7 @@ def test_837_preview_and_apply_delete_the_same_rows(ns, credit_accounts,
             week_start_date=WEEK_START_DATE, week_start_at=A_WS_AT,
             week_end_at=A_WE_AT, from_pct=CREDIT_FROM_PCT, from_source="explicit",
             to_pct=31.0,
-            at_dt=dt.datetime(2026, 6, 19, 14, 37, tzinfo=dt.timezone.utc),
+            at_dt=dt.datetime(2026, 6, 19, 14, 5, tzinfo=dt.timezone.utc),
             now=dt.datetime(2026, 6, 19, 14, 37, tzinfo=dt.timezone.utc),
         )
         previewed = ns["_stale_replay_candidates"](
@@ -888,7 +898,8 @@ def test_837_preview_and_apply_delete_the_same_rows(ns, credit_accounts,
     before = _all_snapshot_ids(ns)
 
     rc = ns["cmd_record_credit"](_credit_args(
-        dry_run=False, yes=True, json=False, from_pct=CREDIT_FROM_PCT))
+        dry_run=False, yes=True, json=False, from_pct=CREDIT_FROM_PCT,
+        at=REPLICA_CREDIT_AT))
     assert rc == 0
 
     after = _all_snapshot_ids(ns)

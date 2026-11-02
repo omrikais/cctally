@@ -46,6 +46,7 @@ from _fixture_builders import (  # noqa: E402
     seed_account,
     seed_weekly_usage_snapshot,
 )
+import _lib_quota_model as _qm  # noqa: E402
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests/fixtures/quota"
 UTC = dt.timezone.utc
@@ -500,6 +501,160 @@ def scenario_era_boundary_no_change(home: Path) -> None:
     store.close()
 
 
+# --------------------------------------------------------------------------
+# #991 — evidence-bounded family support for the forecast probe (spec 4.11).
+# The three scenarios share scenario 11's known budget and one clock.
+# --------------------------------------------------------------------------
+#: Shipped-constant reads. The family SHARES below are derived from these
+#: rather than written as literals, so the scenarios stay on the side of each
+#: threshold they are named for; the unit WEIGHTS stay the literal copy above,
+#: so a kernel that weighs with the wrong era is still caught.
+_FAMILY_FLOOR = float(_qm.MIX_SUPPORT["family_tv_floor"])
+_EFFECT_LIMIT = float(_qm.MIX_SUPPORT["family_max_relative_effect"])
+_ERA_55 = next(e for e in _qm.COEFFICIENT_ERAS if e.id == "opus-5-5")
+_SONNET_BOUND = _ERA_55.rate_bound("claude-sonnet-5-5")
+_SONNET_D = max(abs(_SONNET_BOUND.low - 1.0), abs(_SONNET_BOUND.high - 1.0))
+
+#: The clock. The current week opens 2026-10-20T08:00Z, so the forecast
+#: population is the in-progress day ALONE and never enters a fit day: each
+#: scenario's fit composition is exactly the one its name states. Committed
+#: in each scenario's `input.env` as well.
+FAMILY_SHIFT_AS_OF = dt.datetime(2026, 10, 20, 18, tzinfo=UTC)
+
+#: One per-entry token-class split for every family, fit and forecast alike,
+#: so the class axis is identical between the two and only the family axis
+#: moves. Fields: fresh, output, cache_create (total writes), cache_1h,
+#: cache_read; under NEW_ERA_WEIGHTS one shape weighs 20.68 units.
+FAMILY_SHIFT_SHAPE = (10, 2, 2, 1, 500)
+
+#: Scenario 13: a Sonnet 5.5 share AT the effect limit. It lies outside the
+#: family floor, and its bounded effect, share x d with d < 1, stays inside
+#: the limit, so only the materiality test admits it.
+SONNET_ADMITTED_SHARE = _EFFECT_LIMIT
+#: Scenario 14: twice that share, whose bounded effect exceeds the limit.
+SONNET_OVER_LIMIT_SHARE = 2 * _EFFECT_LIMIT
+#: Scenario 15's fit: a third of the floor as Haiku 5.5, every day alike.
+HAIKU_FIT_SHARE = _FAMILY_FLOOR / 3
+#: Scenario 15's forecast: a TV distance of the floor plus the fit share.
+HAIKU_OUTSIDE_RADIUS_SHARE = HAIKU_FIT_SHARE + _FAMILY_FLOOR + HAIKU_FIT_SHARE
+#: The paired pytest control: a TV distance of the fit share, inside the floor.
+HAIKU_INSIDE_RADIUS_SHARE = 2 * HAIKU_FIT_SHARE
+
+assert _FAMILY_FLOOR < SONNET_ADMITTED_SHARE
+assert SONNET_ADMITTED_SHARE * _SONNET_D <= _EFFECT_LIMIT
+assert SONNET_OVER_LIMIT_SHARE * _SONNET_D > _EFFECT_LIMIT
+assert HAIKU_OUTSIDE_RADIUS_SHARE - HAIKU_FIT_SHARE > _FAMILY_FLOOR
+assert HAIKU_INSIDE_RADIUS_SHARE - HAIKU_FIT_SHARE <= _FAMILY_FLOOR
+assert _ERA_55.rate_bound("claude-haiku-5-5") is None
+
+PURE_OPUS_FIT = {"claude-opus-5-5": 1.0}
+HAIKU_SHIFT_FIT = {"claude-opus-5-5": 1.0 - HAIKU_FIT_SHARE,
+                   "claude-haiku-5-5": HAIKU_FIT_SHARE}
+
+
+def sonnet_shift_forecast(share: float) -> dict:
+    return {"claude-opus-5-5": 1.0 - share, "claude-sonnet-5-5": share}
+
+
+def haiku_shift_forecast(share: float) -> dict:
+    return {"claude-opus-5-5": 1.0 - share, "claude-haiku-5-5": share}
+
+
+#: Shapes are allocated in blocks of this many, so every share above that
+#: is a whole percent splits into whole shapes and the family vector is
+#: exact.
+_SHAPE_BLOCK = 100
+
+
+def _seed_family_split(store, at, target, shares, *, tag):
+    """Entries in FAMILY_SHIFT_SHAPE whose units total about `target`,
+    split across families by kernel units in exactly `shares`."""
+    fresh, output, cache_create, cache_1h, cache_read = FAMILY_SHIFT_SHAPE
+    per_shape = _shape_units(("", *FAMILY_SHIFT_SHAPE), NEW_ERA_WEIGHTS)
+    blocks = max(1, round(target / (per_shape * _SHAPE_BLOCK)))
+    total = blocks * _SHAPE_BLOCK
+    counts = {f: round(share * total) for f, share in shares.items()
+              if f != "claude-opus-5-5"}
+    counts["claude-opus-5-5"] = total - sum(counts.values())
+    for offset, family in enumerate(sorted(counts)):
+        n = counts[family]
+        if n == 0:
+            continue
+        store.entry(at + dt.timedelta(minutes=offset), model=family,
+                    fresh=fresh * n, output=output * n,
+                    cache_create=cache_create * n, cache_1h=cache_1h * n,
+                    cache_read=cache_read * n,
+                    path=f"/p/{tag}-{family}.jsonl")
+
+
+def seed_family_shift(home: Path, *, fit: dict, forecast: dict) -> None:
+    """21 complete Opus 5.5 era days in `fit`, then an in-progress day in
+    `forecast`.
+
+    Every fit day carries the same family split, so the empirical family
+    radius is zero and the effective radius is the floor. Each day's meter
+    moves an integer number of points and its tokens weigh `points *
+    KNOWN_BUDGET * RATIO_JITTER`, as in scenario 11. The current week opens
+    at 2026-10-20T08:00Z; its two readings and its entries are all on the
+    in-progress day, which the series drops, so the forecast population is
+    disjoint from the fit.
+    """
+    store = Store(home)
+    first = dt.date(2026, 9, 29)
+    days = 21
+    anchor = dt.datetime.combine(first, dt.time(8), tzinfo=UTC)
+    running: dict = {}
+    for index in range(days + 1):
+        date = first + dt.timedelta(days=index)
+        week = anchor + dt.timedelta(
+            days=7 * ((date - anchor.date()).days // 7))
+        step = STEPS[index % len(STEPS)]
+        opening = running.get(week, 2)
+        running[week] = opening + step
+        in_progress = index == days
+        closing_hour = 15 if in_progress else 21
+        for hour, pct in ((9, opening), (closing_hour, opening + step)):
+            store.snapshot(dt.datetime.combine(date, dt.time(hour),
+                                               tzinfo=UTC), week, pct)
+        _seed_family_split(
+            store, dt.datetime.combine(date, dt.time(12), tzinfo=UTC),
+            step * KNOWN_BUDGET * RATIO_JITTER[index % len(RATIO_JITTER)],
+            forecast if in_progress else fit,
+            tag="forecast" if in_progress else "fit")
+    store.close()
+
+
+def scenario_opus55_sonnet_shift_admitted(home: Path) -> None:
+    """A pure Opus 5.5 fit; the forecast is 5% Sonnet 5.5 by kernel units.
+
+    TV 0.05 exceeds the 0.03 floor, and E = 0.05 x 0.91 = 0.0455 is within
+    the 0.05 limit. Expected: `ok`, exit 0, `familyAdmittedBy: materiality`.
+    """
+    seed_family_shift(home, fit=PURE_OPUS_FIT,
+                      forecast=sonnet_shift_forecast(SONNET_ADMITTED_SHARE))
+
+
+def scenario_opus55_sonnet_shift_over_limit(home: Path) -> None:
+    """As 13, with 10% Sonnet 5.5: E = 0.091 and TV 0.10 both fail.
+
+    Expected: withheld, exit 3, `forecast-family-effect-over-limit`.
+    """
+    seed_family_shift(home, fit=PURE_OPUS_FIT,
+                      forecast=sonnet_shift_forecast(SONNET_OVER_LIMIT_SHARE))
+
+
+def scenario_opus55_haiku_shift_unbounded(home: Path) -> None:
+    """An Opus 99% / Haiku 5.5 1% fit; the forecast is Haiku 5.5 at 5%.
+
+    TV 0.04 exceeds the 0.03 floor with the class axis passing, and Haiku 5.5
+    is unbounded and changed. Expected: withheld, exit 3,
+    `forecast-family-unbounded`.
+    """
+    seed_family_shift(
+        home, fit=HAIKU_SHIFT_FIT,
+        forecast=haiku_shift_forecast(HAIKU_OUTSIDE_RADIUS_SHARE))
+
+
 SCENARIOS = {
     "01-steady-no-change": scenario_steady,
     "02-rate-change-confirmed": scenario_rate_change,
@@ -513,6 +668,10 @@ SCENARIOS = {
     "10-malformed-retained-instant": scenario_malformed_retained_instant,
     "11-opus55-steady-mixed-families": scenario_opus55_steady_mixed_families,
     "12-era-boundary-no-change": scenario_era_boundary_no_change,
+    "13-opus55-sonnet-shift-admitted": scenario_opus55_sonnet_shift_admitted,
+    "14-opus55-sonnet-shift-over-limit":
+        scenario_opus55_sonnet_shift_over_limit,
+    "15-opus55-haiku-shift-unbounded": scenario_opus55_haiku_shift_unbounded,
 }
 
 

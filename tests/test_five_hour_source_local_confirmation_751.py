@@ -614,3 +614,170 @@ def test_the_reproduction_carries_the_retained_window_key(ns):
     finally:
         conn.close()
     assert keys == {RETAINED_WINDOW_KEY}
+
+
+# ── #943: the credit's exact boundary, for both detectors ─────────────────
+# A credit keeps its floored ten-minute slot as its identity, and records the
+# arming observation's CAPTURE second as its exact boundary in the
+# `five_hour_credit_boundaries` companion. Every post-credit read and the
+# stale-replica band start at that boundary, so a genuine reading captured
+# inside the slot but before the arming observation is kept.
+
+
+def _ingest_capture(jr, J, *, at, captured_at, detector, **kwargs):
+    """One observation whose detection clock (`at`) and capture clock
+    (`payload.captured_at`) differ. ``detector=2`` records it under the v2
+    detector; ``None`` under the historical one (no `detector_policy`)."""
+    rec = _obs(J, at=at, **kwargs)
+    rec["payload"]["captured_at"] = captured_at
+    if detector is not None:
+        rec["payload"]["detector_policy"] = detector
+    rec = J.make_obs(at=rec["at"], src=rec["src"], provider="claude",
+                     payload=rec["payload"], account=ACCOUNT)
+    jr.append_record(rec)
+    jr.run_stats_ingest(mode="authoritative")
+
+
+def _boundaries(ns):
+    conn = ns["open_db"]()
+    try:
+        return [
+            dict(row) for row in conn.execute(
+                "SELECT account_key, five_hour_window_key, "
+                "       effective_reset_at_utc, boundary_at_utc, "
+                "       credit_revision "
+                "  FROM five_hour_credit_boundaries ORDER BY id")
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("detector", [None, 2], ids=["historical", "v2"])
+def test_the_boundary_is_the_arming_capture_not_the_detection_clock(
+        ns, detector):
+    """Detects a boundary taken from the detection clock (or the slot), and a
+    boundary missing for one of the two detectors: either would start the
+    stale-replica band and every post-credit read at the wrong instant.
+
+    The arming reading is captured at 05:29:09 but detected at 05:29:40, so
+    the slot (05:20, the floor of the detection clock), the boundary
+    (05:29:09) and the detection instant are three distinct values."""
+    import _cctally_record as rec
+    jr, J = _siblings()
+    for at, pct in (("2026-09-04T05:21:09Z", 12.0),
+                    ("2026-09-04T05:28:09Z", 12.0)):
+        _ingest_capture(jr, J, at=at, captured_at=at, detector=detector,
+                        source="api", five_hour_percent=pct)
+    _ingest_capture(jr, J, at="2026-09-04T05:29:40Z",
+                    captured_at="2026-09-04T05:29:09Z", detector=detector,
+                    source="api", five_hour_percent=7.0)
+    _ingest_capture(jr, J, at="2026-09-04T05:41:09Z",
+                    captured_at="2026-09-04T05:41:09Z", detector=detector,
+                    source="api", five_hour_percent=8.0)
+
+    def check(label):
+        events = _credit_events(ns)
+        assert [e["effective_reset_at_utc"] for e in events] == [
+            "2026-09-04T05:20:00+00:00"], (label, events)
+        found = _boundaries(ns)
+        assert [(b["effective_reset_at_utc"], b["boundary_at_utc"])
+                for b in found] == [("2026-09-04T05:20:00+00:00",
+                                     "2026-09-04T05:29:09+00:00")], (
+            label, found)
+        conn = ns["open_db"]()
+        try:
+            event = rec.resolve_five_hour_reset_event(
+                conn, RETAINED_WINDOW_KEY, account_key=ACCOUNT)
+        finally:
+            conn.close()
+        assert event is not None, label
+        assert event.effective_reset_at_utc == "2026-09-04T05:20:00+00:00"
+        assert event.boundary_at_utc == "2026-09-04T05:29:09+00:00", label
+        assert event.boundary_epoch == int(dt.datetime(
+            2026, 9, 4, 5, 29, 9, tzinfo=dt.timezone.utc).timestamp()), label
+
+    check("live")
+    _rebuild(jr)
+    check("rebuilt")
+
+
+#: Trace D on the API source alone: a genuine peak at 05:21, a descent armed at
+#: 05:24 and confirmed at 05:26, then a later reading. The weekly percent moves
+#: on the first three ticks so each writes its own row.
+_TRACE_D = [
+    ("2026-09-04T05:13:00Z", "api", 30.0, 10.0),
+    ("2026-09-04T05:17:00Z", "api", 34.0, 11.0),
+    ("2026-09-04T05:21:00Z", "api", 38.0, 12.0),
+    ("2026-09-04T05:24:00Z", "api", 2.0, 12.0),
+    ("2026-09-04T05:26:00Z", "api", 3.0, 12.0),
+    ("2026-09-04T05:34:00Z", "api", 7.0, 12.0),
+]
+
+
+def _snapshot_journal_ref(ns, captured_at):
+    conn = ns["open_db"]()
+    try:
+        row = conn.execute(
+            "SELECT journal_id FROM weekly_usage_snapshots "
+            " WHERE unixepoch(captured_at_utc) = unixepoch(?)",
+            (captured_at,)).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+def _credit_suppressions():
+    import _cctally_core as core
+    import _lib_journal as J
+    lists = []
+    for path in sorted(core.JOURNAL_DIR.glob("*.jsonl")):
+        with path.open("rb") as fh:
+            for raw in fh:
+                record = J.decode_line(raw)
+                if (record is not None and record.get("t") == "evt"
+                        and (record.get("payload") or {}).get("kind")
+                        == "five_hour_credit"):
+                    lists.append(
+                        (record.get("payload") or {}).get("suppression") or [])
+    return lists
+
+
+def test_trace_d_through_the_historical_detector_keeps_the_genuine_peak(ns):
+    """Detects the historical detector (an observation with no
+    `detector_policy`, which a plain rederive of old history replays) deleting
+    or retiring a genuine reading captured inside the credit's slot but before
+    the arming observation (spec A4, detector half).
+
+    The 05:21 peak of 38 sits in the 05:20 slot the credit floors to; under
+    the floored band it matched the stale level and was removed, so the
+    window's peak was lost. Under the exact band only rows captured at or
+    after the 05:24 arming capture are replicas."""
+    jr, J = _siblings()
+    _ingest(jr, J, _TRACE_D)
+    peak_ref = _snapshot_journal_ref(ns, "2026-09-04T05:21:00Z")
+    assert peak_ref is not None
+
+    def check(label):
+        events = _credit_events(ns)
+        assert [(e["prior_percent"], e["post_percent"],
+                 e["effective_reset_at_utc"]) for e in events] == [
+            (38.0, 2.0, "2026-09-04T05:20:00+00:00")], (label, events)
+        rows = dict(_snapshots(ns))
+        peak = [pct for at, pct in rows.items() if at.startswith(
+            "2026-09-04T05:21")]
+        assert peak == [38.0], (label, rows)
+        assert not [pct for at, pct in rows.items()
+                    if at.startswith("2026-09-04T05:24") and pct == 38.0], (
+            label, rows)
+        assert [pct for at, pct in rows.items()
+                if at.startswith("2026-09-04T05:26")] == [3.0], (label, rows)
+        assert [pct for at, pct in rows.items()
+                if at.startswith("2026-09-04T05:34")] == [7.0], (label, rows)
+        assert _snapshot_journal_ref(ns, "2026-09-04T05:21:00Z") == peak_ref
+
+    check("live")
+    suppressions = _credit_suppressions()
+    assert len(suppressions) == 1
+    assert peak_ref not in suppressions[0]
+    _rebuild(jr)
+    check("rebuilt")

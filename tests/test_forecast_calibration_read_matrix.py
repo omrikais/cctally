@@ -50,6 +50,10 @@ def ns(monkeypatch, tmp_path):
     redirect_paths(namespace, monkeypatch, tmp_path)
     monkeypatch.setenv("CCTALLY_DISABLE_UPDATE_CHECK", "1")
     monkeypatch.setenv("CCTALLY_DISABLE_TELEMETRY", "1")
+    # #1015: a calibration is only ever fitted over a published stats index,
+    # and the reader assesses its lineage against that index's correction
+    # facts, so every case runs over one (empty of corrections by default).
+    namespace["open_db"]().close()
     return namespace
 
 
@@ -273,3 +277,67 @@ def test_every_return_path_of_the_producer_yields_a_calibrated_week():
         assert isinstance(node.value.func, ast.Name), node.lineno
         assert node.value.func.id == "CalibratedWeek", (
             f"line {node.lineno}: returns {node.value.func.id}(...)")
+
+
+# --------------------------------------------------------------------------
+# #1015 — a correction to the regime's inputs withholds it (spec 5.4, U1)
+# --------------------------------------------------------------------------
+def _seed_correction(*, drop_table=None):
+    """One reviewed hold of an observation inside the regime's fit window,
+    materialized by a later completed batch that touched its account."""
+    import sqlite3
+    conn = sqlite3.connect(_cctally_core.DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            ("obs-1", "acct-a", "2026-08-01T10:00:00+00:00"))
+        conn.execute(
+            "INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
+            ("op-1", "obs-1", "hold"))
+        conn.execute(
+            "INSERT INTO claude_weekly_correction_ops VALUES (?,?,?)",
+            ("op-1", "observations-2026-08.jsonl", 100))
+        conn.execute("INSERT INTO correction_batch_lineage VALUES (?,?,?)",
+                     ("batch-1", "observations-2026-08.jsonl", 200))
+        conn.execute("INSERT INTO correction_batch_footprint VALUES (?,?,?)",
+                     ("batch-1", "claude", "acct-a"))
+        if drop_table:
+            conn.execute(f"DROP TABLE {drop_table}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_1015_a_correction_inside_the_fit_states_recalibration_needed(ns):
+    """Detects the #1015 defect at the forecast: the poisoned regime no
+    longer produces a calibrated projection, consumption or headroom, and the
+    cause is `recalibration-needed`."""
+    _write_regime()
+    _seed_correction()
+    detail = _detail(ns, population=SUPPORTED_MODEL)
+    assert detail.code == "recalibration-needed"
+    assert (detail.projection_pct, detail.consumption_pct,
+            detail.headroom_pct) == (None, None, None)
+
+
+def test_1015_a_withheld_recalibration_states_its_own_status(ns):
+    _write_regime(recalibrationAttempt={
+        "status": "insufficient-history", "basis": ["batch-1"],
+        "asOf": NOW.isoformat()})
+    _seed_correction()
+    assert _detail(ns, population=SUPPORTED_MODEL).code == \
+        "insufficient-history"
+
+
+def test_1015_unreadable_lineage_states_unavailable(ns):
+    _write_regime()
+    _seed_correction(drop_table="claude_weekly_correction_ops")
+    assert _detail(ns, population=SUPPORTED_MODEL).code == "unavailable"
+
+
+def test_1015_a_correction_outside_the_fit_leaves_it_calibrated(ns):
+    """Negative control: an observation after the regime's `asOf` is not an
+    input of it, so the forecast stays calibrated."""
+    _write_regime(asOf=(WEEK_START - dt.timedelta(days=5)).isoformat())
+    _seed_correction()
+    assert _detail(ns, population=SUPPORTED_MODEL).code is None

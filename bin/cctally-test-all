@@ -506,12 +506,14 @@ EVIDENCE_KERNEL="$REPO_ROOT/bin/_lib_test_evidence.py"
 # and /bin/sh write here-document bodies under /private/var/tmp whatever
 # TMPDIR says (#940 C11).
 _ev_bridge() {
-    printf '%s\n' 'import fcntl
+    printf '%s\n' 'import errno
+import fcntl
 import importlib.util
 import json
 import os
 import random
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -550,6 +552,7 @@ REQUIRED = (
     "TRANSFORMER_HEALTH_REFUSAL",
     "allocate_budget", "apply_validation_redactions",
     "bound_extract_lines", "build_scrubbed_extract",
+    "build_private_failure_detail", "extract_pytest_failure_sections",
     "_coverage_gaps",
     "LEGACY_STORE", "retention_store", "carried_seeded_loss", "retention_coverage",
     "build_disclosure_predicate", "build_known_tokens",
@@ -970,6 +973,76 @@ if MODE == "export":
         os.path.join(evidence_dir, "export", "failure-context.txt"),
         "\n".join(out) + "\n",
     )
+    raise SystemExit(0)
+
+if MODE == "private-detail":
+    # The UNSCRUBBED failure detail, appended to the one private file the
+    # runner supervisor names (CCTALLY_TEST_ALL_DETAIL_FILE). It is never
+    # printed and never exported: the console and export/ keep the scrubbed
+    # bytes above. NON-DECIDING and NEVER WAITING: a FIFO, a device or a link
+    # is refused without waiting for a reader, the lock is tried exactly once,
+    # and any refusal is one stderr line the caller turns into a contract_note.
+    # That line reaches the console and the outcome record, so it is fixed
+    # text plus an errno or exception TYPE name, never a message.
+    target = ARGS[0]
+
+    def _os_reason(exc):
+        return errno.errorcode.get(exc.errno or 0, exc.__class__.__name__)
+
+    try:
+        with open(_env("EV_FAILED_LIST"), encoding="utf-8") as handle:
+            rows = handle.read().splitlines()
+    except OSError:
+        rows = []
+    subjects = []
+    seen = set()
+    for row in rows:
+        name, _, path = row.partition("\t")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        # Lenient decoding, unlike `_read_log`: legibility is the point here,
+        # so an undecodable byte is shown escaped rather than refusing.
+        try:
+            with open(path, encoding="utf-8", errors="backslashreplace") as handle:
+                lines = handle.read().splitlines()
+        except OSError as exc:
+            lines = ["[log unreadable: %s]" % (exc.strerror or exc.__class__.__name__)]
+        subjects.append((name, "logs/%s" % os.path.basename(path), lines))
+    if not subjects:
+        raise SystemExit(0)
+    try:
+        block = EV.build_private_failure_detail(subjects, run_id=_env("EV_RUN_ID"))
+        data = ("\n".join(block) + "\n").encode("utf-8", "replace")
+    except Exception as exc:                            # noqa: BLE001
+        sys.stderr.write("rendering failed: %s\n" % exc.__class__.__name__)
+        raise SystemExit(1)
+    try:
+        fd = os.open(
+            target,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as exc:
+        sys.stderr.write("the file could not be opened: %s\n" % _os_reason(exc))
+        raise SystemExit(1)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            sys.stderr.write("the file is not a regular file\n")
+            raise SystemExit(1)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            sys.stderr.write("another writer holds its lock\n")
+            raise SystemExit(1)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    except OSError as exc:
+        sys.stderr.write("the write failed: %s\n" % _os_reason(exc))
+        raise SystemExit(1)
+    finally:
+        os.close(fd)
     raise SystemExit(0)
 
 if MODE == "run-id":
@@ -2122,6 +2195,12 @@ trap '_interrupted 143' TERM
 # second half is why the root is never inferred — a root a caller did not ask
 # for is a root nobody collects, and sanitizing against an uncollected log
 # destroys the information it claims to preserve.
+#
+# Under the runner supervisor logs/ lives in the run directory, which the
+# supervisor removes when the run ends. There the raw failing detail survives
+# through the private file the supervisor names (CCTALLY_TEST_ALL_DETAIL_FILE;
+# see "the private failure detail" at the end of this file), which it keeps in
+# its own kept-log store, never on a console or in an export.
 _record_failed_subject() {   # $1 subject, $2 logfile
     [ -n "$EVIDENCE_DIR" ] || return 0
     printf '%s\t%s\n' "$1" "$2" >> "$PROGRESS_DIR/failed-subjects" 2>/dev/null || true
@@ -2659,6 +2738,30 @@ if [ -n "$EVIDENCE_DIR" ] && [ "$CONTRACT_CLASS" != "none" ]; then
     export EV_FAILED_LIST="$PROGRESS_DIR/failed-subjects" EV_RUN_ID="$RUN_ID"
     if ! _ev export "$EVIDENCE_DIR"; then
         contract_note "evidence: the sanitized failure extract was not published for run $RUN_ID — the complete unsanitized logs are retained at $EVIDENCE_DIR/logs"
+    fi
+fi
+
+# ---- the private failure detail (#1011) --------------------------------
+# Under the runner supervisor the raw logs above go with the run directory, so
+# the supervisor names one PRIVATE file, outside the evidence root and every
+# workflow's export source, and keeps what this appends in its kept-log store.
+# The bytes are UNSCRUBBED by design, which is why they are never printed and
+# never exported. Only the outermost aggregator sees the variable (it is
+# owner-only), and no published workflow sets it, so those runs write nothing.
+# As NON-DECIDING as the extract: a refusal is one contract_note and never
+# changes the class or the exit code.
+if [ -n "$EVIDENCE_DIR" ] && [ "$CONTRACT_CLASS" != "none" ] \
+    && [ -n "${CCTALLY_TEST_ALL_DETAIL_FILE:-}" ] \
+    && [ -s "$PROGRESS_DIR/failed-subjects" ]; then
+    export EV_FAILED_LIST="$PROGRESS_DIR/failed-subjects" EV_RUN_ID="$RUN_ID"
+    if ! _detail_reason=$(_ev private-detail "$CCTALLY_TEST_ALL_DETAIL_FILE" 2>&1 >/dev/null); then
+        _detail_reason=${_detail_reason%%$'\n'*}
+        # Only the writer's own grammar (fixed words, optionally one type
+        # name) reaches the note; anything else, such as an interpreter's
+        # traceback, is not repeated.
+        _detail_grammar='^[a-z][a-z ]*(: [A-Za-z][A-Za-z0-9_]*)?$'
+        [[ "$_detail_reason" =~ $_detail_grammar ]] || _detail_reason=""
+        contract_note "evidence: the private failure detail for run $RUN_ID was not written (${_detail_reason:-unknown reason})"
     fi
 fi
 

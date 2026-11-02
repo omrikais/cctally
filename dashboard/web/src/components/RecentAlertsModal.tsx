@@ -217,6 +217,11 @@ function rateChangeEvidence(
   row: MeterRateChangeEntry,
 ): Array<{ key: string; label: string; value: string }> {
   const out: Array<{ key: string; label: string; value: string }> = [];
+  // #1015 (U2) — first, because it changes how every other fact reads: the
+  // transition was fitted from inputs a reviewed correction later changed.
+  if (row.supersession != null) {
+    out.push({ key: 'status', label: 'Status:', value: 'superseded by a correction' });
+  }
   const withheld = rateChangeWithheldCopy(row.withholding_status);
   if (withheld != null) out.push({ key: 'withheld', label: 'Calibration:', value: withheld });
   const causes = row.detector_input_causes;

@@ -309,3 +309,85 @@ def test_no_decoder_reaches_the_existing_dashboard_500_envelope(viewer, monkeypa
         "CodexContainerReadError: Codex rollout could not be read (decoder-unavailable)"})]
     with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
         conn.execute("SELECT 1")
+
+
+# ── #970: archived containers (spec 5.8, P1) ─────────────────────────────────
+
+def _archive(tmp_path, container):
+    archive = tmp_path / "codex" / "archived_sessions"
+    archive.mkdir(exist_ok=True)
+    target = archive / container.name
+    os.replace(container, target)
+    return target
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_viewer_reads_an_archived_container(viewer, compressed):
+    """#970 P1: an archived thread stays readable in the Conversation Viewer;
+    its deep payload re-read is served from the archive container (plain and
+    zstd). Detects archived transcript content answering `gone` although the
+    rollout still exists in the native home's archive."""
+    ns, query, path, key, block, baseline, tmp_path = viewer
+    container = compress_in_place(path) if compressed else path
+    _archive(tmp_path, container)
+    for which in ("call", "output"):
+        assert _read(ns, query, key, block, which) == baseline[which]
+
+
+@pytest.mark.parametrize("case", ["missing", "unreadable", "escaping"])
+def test_archived_container_keeps_410_500_404(viewer, monkeypatch, case):
+    """#970 spec 5.8: the archive candidates keep the viewer's strict
+    semantics — a rollout absent from every location is gone (410), an
+    inaccessible archive container is an operational error (500), and an
+    archive entry escaping the provider root is never read (404). Detects an
+    unreadable archive reported as deleted history, or a read outside the
+    configured home."""
+    ns, query, path, key, block, _baseline, tmp_path = viewer
+    target = _archive(tmp_path, compress_in_place(path))
+    if case == "missing":
+        target.unlink()
+        assert _read(ns, query, key, block, "output")["status"] == "gone"
+    elif case == "unreadable":
+        real_stat = os.stat
+
+        def failing_stat(file, *args, **kwargs):
+            if (isinstance(file, (str, os.PathLike))
+                    and os.fspath(file) == str(target)):
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES),
+                                      str(target))
+            return real_stat(file, *args, **kwargs)
+
+        monkeypatch.setattr(os, "stat", failing_stat)
+        _assert_operational(*_read_or_error(ns, query, key, block, "output"),
+                            "read-error")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        escaped = outside / target.name
+        os.replace(target, escaped)
+        os.symlink(escaped, target)
+
+        def no_read(*_args, **_kwargs):
+            raise AssertionError("a read was attempted outside the root")
+
+        monkeypatch.setattr(rc, "open_decoded", no_read)
+        assert _read(ns, query, key, block, "output")["status"] == "not_found"
+
+
+def test_move_during_read_reselects_archive(viewer, monkeypatch):
+    """#970 spec 5.8: an archive move landing between selection and open is
+    re-selected from the archive, never reported as a deleted rollout.
+    Detects a transient `gone` for a thread the user archived mid-read."""
+    ns, query, path, key, block, baseline, tmp_path = viewer
+    real_open = builtins.open
+    moved = []
+
+    def archive_before_open(file, *args, **kwargs):
+        if (not moved and isinstance(file, (str, os.PathLike))
+                and os.fspath(file) == str(path)):
+            moved.append(_archive(tmp_path, path))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", archive_before_open)
+    assert _read(ns, query, key, block, "output") == baseline["output"]
+    assert moved

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import os
 import pathlib
 import json
 import shutil
@@ -571,3 +572,376 @@ def test_doctor_registers_codex_prune_safety_after_codex_cache_pair():
     assert ids.index("data.codex_prune_safety") == (
         ids.index("data.codex_project_metadata") + 1
     )
+
+
+# ── #970 T5: recovery witness and the requalification hold ──────────────────
+
+from test_codex_prune_drain import (  # noqa: E402
+    archive_estate, _archive_first, _archive_name, _archive_records,
+    _sync_both, _drain_both, _debt, _identity_state)
+from _codex_zstd_fixtures import write_rollout, zstd_bytes  # noqa: E402
+from test_codex_bounded_ingest import _auth_json  # noqa: E402
+
+
+def _entries(ns, path) -> int:
+    conn = ns["open_cache_db"]()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM codex_session_entries WHERE source_path=?",
+            (str(path),)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("path", ["walk", "verification", "reset", "rebuild"])
+def test_retained_archive_identity_without_dated_parent_is_recovered(
+        archive_estate, path):
+    """A5: a positively present archived container must never be refused
+    for ingestion, verification, reset or rebuild because its dated
+    `sessions/` directory is missing. With the logical parent as the only
+    witness every one of those gates protected the identity forever: new
+    usage went uncounted, a replaced container kept stale rows and an
+    explicit rebuild refused."""
+    ns, provider, _day, archive, _target, _keeper = archive_estate
+    cc = sys.modules["_cctally_cache"]
+    archived, logical = _archive_first(
+        ns, provider, 7, compressed=path == "verification")
+    _sync_both(ns)
+    before = _entries(ns, logical)
+    assert before == 3
+    if path == "walk":
+        grown = _archive_records(7, turns=5)
+        tail = grown[len(_archive_records(7)):]
+        with open(archived, "ab") as fh:
+            for record in tail:
+                fh.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+        conn = ns["open_cache_db"]()
+        try:
+            ns["sync_codex_cache"](conn)
+        finally:
+            conn.close()
+        # BASE: protected for the missing parent, the append was never read.
+        assert _entries(ns, logical) == 5
+    elif path == "rebuild":
+        conn = ns["open_cache_db"]()
+        try:
+            stats = ns["sync_codex_cache"](conn, rebuild=True)
+        finally:
+            conn.close()
+        assert not stats.prune_refused          # BASE: refused, store kept
+        assert _entries(ns, logical) == before
+    elif path == "reset":
+        replacement = archive / "replacement.tmp"
+        write_rollout(replacement, _archive_records(7, turns=1))
+        os.replace(replacement, archived)       # shorter, new inode
+        result = cc.run_codex_reset_drain(wait_for_requests=False)
+        assert result.reset == 1                # BASE: refused -> unchanged
+        assert _entries(ns, logical) == 1
+    else:
+        replacement = archive / "replacement.tmp"
+        write_rollout(replacement, _archive_records(8, turns=1))
+        replacement.write_bytes(zstd_bytes(replacement.read_bytes()))
+        os.replace(replacement, archived)       # mismatching content
+        conn = ns["open_cache_db"]()
+        try:
+            ns["sync_codex_cache"](conn)        # records the transition
+        finally:
+            conn.close()
+        result = cc.run_codex_container_verification_drain(
+            wait_for_requests=False)
+        assert result.reset >= 1                # BASE: refused -> pending
+        assert _entries(ns, logical) == 1
+
+
+def test_unreadable_conversations_store_holds_only_archive_first_sights(
+        archive_estate):
+    """#970 N3: when conversations.db cannot be read, the cache walk cannot
+    tell whether a direct-era archive spelling is retained there, so it
+    fails closed for archive-resident FIRST sights only. It held every
+    archive-location file instead, including a cursor-bearing identity
+    already counted under its dated identity: the appended usage of an
+    archived thread went uncounted for as long as the store stayed
+    unreadable. A first sight in the archive must still be held."""
+    ns, provider, _day, _archive, _target, _keeper = archive_estate
+    archived, logical = _archive_first(ns, provider, 7, compressed=False)
+    _sync_both(ns)
+    assert _entries(ns, logical) == 3
+    grown = _archive_records(7, turns=5)
+    with open(archived, "ab") as fh:
+        for record in grown[len(_archive_records(7)):]:
+            fh.write(json.dumps(record, separators=(",", ":")).encode() + b"\n")
+    _first, first_logical = _archive_first(ns, provider, 8, compressed=False)
+    # Unreadable: a non-database file at the store's path, its WAL set aside
+    # (a chmod is not enough in-process, where SQLite reuses an open
+    # descriptor of the inode, and the WAL alone still serves every page).
+    db = pathlib.Path(ns["_cctally_core"].CONVERSATIONS_DB_PATH)
+    moved = [(p, p.with_name(p.name + ".saved")) for p in (
+        db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm"))
+        if p.exists()]
+    for live, saved in moved:
+        os.replace(live, saved)
+    db.write_bytes(b"not a database " * 512)
+    try:
+        conn = ns["open_cache_db"]()
+        try:
+            stats = ns["sync_codex_cache"](conn)
+        finally:
+            conn.close()
+    finally:
+        for live, saved in moved:
+            os.replace(saved, live)
+    # BASE: held with every other archive-location file, still 3.
+    assert _entries(ns, logical) == 5
+    assert _entries(ns, first_logical) == 0
+    assert stats.container_reads_held == 1
+
+
+def test_archive_configured_as_its_own_root_is_never_held(
+        tmp_path, monkeypatch):
+    """#970 N4: `CODEX_HOME=<home>,<home>/archived_sessions` walks the
+    archive twice: the home owns it as its archive, and the second entry
+    walks it directly, spelling its identities `<archive>/X.jsonl`. The
+    home then read those direct rows as a retained direct-era spelling and
+    held every archived rollout's dated twin forever: each walk counted it
+    held and requested the prune drain again, which never cleared it. The
+    archive belongs to the root that walks it directly; each archived
+    rollout is counted once and nothing stays held."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    home = tmp_path / "home"
+    archive = home / "archived_sessions"
+    day = home / "sessions" / "2026" / "07" / "20"
+    day.mkdir(parents=True)
+    archive.mkdir()
+    monkeypatch.setenv("CODEX_HOME", f"{home},{archive}")
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    write_rollout(day / _archive_name(1), _archive_records(1))
+    archived = archive / _archive_name(2, "19")
+    write_rollout(archived, _archive_records(2))
+    cc = sys.modules["_cctally_cache"]
+    for attempt in range(3):
+        conn = ns["open_cache_db"]()
+        try:
+            stats = ns["sync_codex_cache"](conn)
+        finally:
+            conn.close()
+        if attempt:
+            # BASE: the dated twin was held on every walk after the first.
+            assert stats.container_reads_held == 0
+            assert cc.CODEX_PRUNE_DRAIN_COMMAND not in stats.drain_requested
+        cc.run_codex_prune_drain(wait_for_requests=False)
+    assert _requal_counts(ns, archived.name)[0] == 1
+    assert _entries(ns, archived) == 3
+
+
+def test_native_archive_only_home_keeps_every_identity_at_first_unarchive(
+        tmp_path, monkeypatch):
+    """Spec 9.2 (A7, SR-01): a NATIVE home that has only `archived_sessions/`
+    is recognized from its first sync, and the first unarchive, which
+    creates `sessions/`, must change no identity. If recognition depended on
+    `sessions/`, that first unarchive re-keyed every archived rollout: the
+    old identities were pruned as orphans and the rollouts re-ingested under
+    the login of the day (history deleted, usage re-attributed). Both the
+    rollout that moves and the archives that stay keep their rows, ids,
+    attribution and cursors, nothing is journaled and nothing is pruned."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    home = tmp_path / "home"
+    archive = home / "archived_sessions"
+    archive.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    (home / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    names = [_archive_name(i, "18") for i in (5, 6, 7)]
+    for i, name in zip((5, 6, 7), names):
+        write_rollout(archive / name, _archive_records(i))
+    _sync_both(ns)
+    _sync_both(ns)   # the conversations publish behind the first pass
+    assert not (home / "sessions").exists()
+    day = home / "sessions" / "2026" / "07" / "18"
+    logicals = [day / name for name in names]
+    before = {str(p): _identity_state(ns, p) for p in logicals}
+    assert all(state["codex_session_entries"] and state["codex_session_files"]
+               for state in before.values())
+    ops_before = _file_account_op_count(ns)
+    (home / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    day.mkdir(parents=True)
+    os.rename(archive / names[0], logicals[0])     # the first unarchive
+    _sync_both(ns)
+    _drain_both()
+    _sync_both(ns)
+    after = {str(p): _identity_state(ns, p) for p in logicals}
+    assert after == before
+    assert _requal_counts(ns, names[0]) == (1, 1)
+    assert _debt(ns) == (set(), set())
+    assert _file_account_op_count(ns) == ops_before
+    conn = ns["open_cache_db"]()
+    try:
+        stored = dict(conn.execute(
+            "SELECT path, container_path FROM codex_session_files"))
+    finally:
+        conn.close()
+    assert stored[str(logicals[0])] is None             # now dated
+    assert stored[str(logicals[1])] == str(archive / names[1])
+
+
+def _requal_counts(ns, name: str) -> "tuple[int, int]":
+    """How many identities carry rollout ``name`` in each store."""
+    conn = ns["open_cache_db"]()
+    try:
+        cache = len({r[0] for r in conn.execute(
+            "SELECT source_path FROM codex_session_entries")
+            if pathlib.Path(r[0]).name == name})
+    finally:
+        conn.close()
+    conv = ns["open_conversations_db"]()
+    try:
+        conversations = len({r[0] for r in conv.execute(
+            "SELECT source_path FROM codex_conversation_messages")
+            if pathlib.Path(r[0]).name == name})
+    finally:
+        conv.close()
+    return cache, conversations
+
+
+def _file_account_op_count(ns) -> int:
+    journal_dir = ns["_cctally_core"].JOURNAL_DIR
+    count = 0
+    for segment in sorted(journal_dir.glob("*.jsonl")):
+        for line in segment.read_text().splitlines():
+            if line.strip() and (json.loads(line).get("payload") or {}).get(
+                    "kind") == "codex_file_account":
+                count += 1
+    return count
+
+
+@pytest.mark.parametrize("variant", [
+    "cursor", "cursorless", "cursorless-conversations", "interrupted"])
+def test_requalified_archive_only_home_never_counts_twice(
+        tmp_path, monkeypatch, variant):
+    """Spec 5.1: an older binary walked a home with `archived_sessions/` and
+    no `sessions/` as a direct directory, so it retains archive-spelled
+    identities. Upgraded, the home is native and the same rollout has a dated
+    identity: ingesting it before both stores retire the old spelling counts
+    the rollout twice (usage, cost and the conversation). The old identity
+    must retire by scope exit, the dated one stay held meanwhile, then ingest
+    once, unattributed (P2), with no live-login decision. The
+    `cursorless-conversations` variant keeps the spelling's messages, events
+    and file touches with no conversations cursor row: planned from cursor
+    rows only, they were never retired, the hold never cleared, and the
+    rollout was never counted (usage and conversation lost for good)."""
+    import _lib_codex_rollout_container as leaf
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    home = tmp_path / "home"
+    archive = home / "archived_sessions"
+    archive.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(sys.modules["_cctally_update"], "_spawn_detached",
+                        lambda command: True)
+    (home / "auth.json").write_text(_auth_json("acct-a", "a@example.com"))
+    rollout, keeper = archive / _archive_name(3, "18"), archive / _archive_name(4, "18")
+    write_rollout(rollout, _archive_records(3))
+    write_rollout(keeper, _archive_records(4))
+    real = leaf.home_locations
+    # The older binary: no native-home recognition without `sessions/`.
+    monkeypatch.setattr(leaf, "home_locations", lambda configured: (
+        leaf.CodexLocations(pathlib.Path(configured), None)
+        if pathlib.Path(configured).is_dir() else None))
+    _sync_both(ns)
+    monkeypatch.setattr(leaf, "home_locations", real)
+    spelled = str(rollout)
+    conn = ns["open_cache_db"]()
+    try:
+        accounts = {r[0] for r in conn.execute(
+            "SELECT account_key FROM codex_session_entries WHERE source_path=?",
+            (spelled,))}
+        assert len(accounts) == 1 and None not in accounts   # account A
+        if variant == "cursorless":
+            conn.execute("DELETE FROM codex_session_files WHERE path=?",
+                         (spelled,))
+            conn.commit()
+    finally:
+        conn.close()
+    if variant == "cursorless-conversations":
+        conv = ns["open_conversations_db"]()
+        try:
+            assert conv.execute(
+                "DELETE FROM codex_conversation_source_files WHERE path=?",
+                (spelled,)).rowcount == 1
+            conv.commit()
+        finally:
+            conv.close()
+    assert _requal_counts(ns, rollout.name) == (1, 1)
+    ops_before = _file_account_op_count(ns)
+    (home / "auth.json").write_text(_auth_json("acct-b", "b@example.com"))
+    cc = sys.modules["_cctally_cache"]
+    observed = []
+
+    def step():
+        observed.append(_requal_counts(ns, rollout.name))
+
+    _sync_both(ns)
+    step()
+    if variant == "interrupted":
+        cc.run_codex_prune_drain(wait_for_requests=False)   # cache only
+        _sync_both(ns)
+        step()
+        dated_rows = _requal_counts(ns, rollout.name)
+        # The conversations store still retains the spelling: still held.
+        assert dated_rows[0] == 0, "the cache walk ingested a held identity"
+        cc.run_codex_conversation_prune_drain(wait_for_requests=False)
+    else:
+        _drain_both()
+    step()
+    for _ in range(2):           # ingest, then publish
+        _sync_both(ns)
+        step()
+    assert all(c <= 1 for pair in observed for c in pair), observed
+    dated = home / "sessions" / "2026" / "07" / "18" / rollout.name
+    conn = ns["open_cache_db"]()
+    try:
+        paths = {r[0] for r in conn.execute(
+            "SELECT source_path FROM codex_session_entries")}
+        assert spelled not in paths and str(dated) in paths
+        # P2: an archive first sight; no claiming window identifies anyone.
+        assert {r[0] for r in conn.execute(
+            "SELECT account_key FROM codex_session_entries WHERE source_path=?",
+            (str(dated),))} == {None}
+    finally:
+        conn.close()
+    assert observed[-1] == (1, 1)
+    assert _file_account_op_count(ns) == ops_before
+    # A later unarchive keeps the one identity.
+    dated.parent.mkdir(parents=True)
+    os.rename(rollout, dated)
+    _sync_both(ns)
+    _drain_both()
+    assert _requal_counts(ns, rollout.name) == (1, 1)
+    conn = ns["open_cache_db"]()
+    try:
+        settled = conn.execute(
+            "SELECT COUNT(*), SUM(total_tokens) FROM codex_session_entries "
+            "WHERE source_path=?", (str(dated),)).fetchone()
+    finally:
+        conn.close()
+    assert settled[0] == 3
+    # A later archive, then a rebuild: still one identity, same usage.
+    os.rename(dated, rollout)
+    _sync_both(ns)
+    _drain_both()
+    _sync_both(ns)
+    assert _requal_counts(ns, rollout.name) == (1, 1)
+    conn = ns["open_cache_db"]()
+    try:
+        ns["sync_codex_cache"](conn, rebuild=True)
+        rebuilt = conn.execute(
+            "SELECT COUNT(*), SUM(total_tokens) FROM codex_session_entries "
+            "WHERE source_path=?", (str(dated),)).fetchone()
+    finally:
+        conn.close()
+    assert rebuilt == settled
+    assert _requal_counts(ns, rollout.name) == (1, 1)
+    assert _file_account_op_count(ns) == ops_before

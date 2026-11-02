@@ -344,7 +344,25 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # has work without performing it (#780). `{table}` iterates the same
     # hardcoded `_LEGACY_BRIDGE_TABLES` tuple as the three reads above, so
     # neither reaches a projection family and neither needs an entry below.
-    "_cctally_cache.py": 17,
+    # #944's `_ClaudeAttributionRun` probe reads `{schema}.sqlite_master` over
+    # the hardcoded ("main", "temp") pair: the schema catalog, never a
+    # projection family, so it needs no entry below either.
+    # Twenty since #927: `_codex_inventory_bootstrap_chunk`'s range probe and
+    # its `INSERT … SELECT … FROM {table}` copy iterate the hardcoded
+    # `CODEX_IDENTITY_INVENTORY_FAMILIES` tuple (Codex cursors, accounting
+    # rows, Codex quota observations, Codex threads), none a projection family.
+    # Twenty-five since #970: `_codex_archive_spelled_names` range-seeks the
+    # fixed `_CODEX_HOLD_CACHE_FAMILIES` / `_CODEX_HOLD_CONVERSATION_FAMILIES`
+    # tuples (Codex cursors, accounting rows, Codex quota observations, Codex
+    # threads; the four conversations source families);
+    # `_codex_archive_spelled_source_pairs` (the generator
+    # `_codex_cursorless_archive_spelled_conversation_sources` consumes, #1046)
+    # the fixed messages/events/file-touches triple; `_codex_deletion_witness`
+    # one of the two `_VERIFY_TABLES` cursor tables; and
+    # `_next_codex_debt_row`'s two keyset reads one of the two literal
+    # prune-debt tables. None reaches a projection family, so none needs an
+    # entry below.
+    "_cctally_cache.py": 25,
     # One, not two, since #750 S4: `_get_latest_row_for_week` composed
     # its `WHERE` clauses instead of branching on `as_of_utc`, so its
     # two near-identical `FROM {table_name}` reads became one. The
@@ -354,8 +372,10 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     "_cctally_dashboard.py": 3,
     "_cctally_dashboard_envelope.py": 5,
     # Six, not seven: `cctally: rebuilt stats.db from {} journal segment(s)` is
-    # an operator line, not a statement, and no longer counts.
-    "_cctally_db.py": 6,
+    # an operator line, not a statement, and no longer counts. Seven since
+    # #927: `_codex_identity_families_empty` probes the same hardcoded
+    # `CODEX_IDENTITY_INVENTORY_FAMILIES` tuple, none a projection family.
+    "_cctally_db.py": 7,
     "_cctally_doctor.py": 2,
     "_cctally_five_hour.py": 1,
     # Sixteen, not eighteen: the two `event {} rev {} conflicts with effective
@@ -376,7 +396,13 @@ PROJECTION_DYNAMIC_READ_SITES: "dict[str, int]" = {
     # they interpolate is always an `_EVT_SPECS` table (the snapshot, reset,
     # block and milestone families). None is a projection table, so neither
     # needs an entry below.
-    "_cctally_journal.py": 19,
+    #
+    # Twenty since #956 class 2: `_remove_opened_block` deletes a tombstoned
+    # opening's open block's child rows `FROM {child_table}`, iterating the
+    # fixed `_BLOCK_CHILDREN` pair (`five_hour_block_models`,
+    # `five_hour_block_projects`) on a derivation-completion scratch. Neither
+    # is a projection table, so it needs no entry below.
+    "_cctally_journal.py": 20,
     "_cctally_pricing_check.py": 1,
     # One, in `_read_stats_component`: a single `SELECT {column} FROM
     # {table}` shared by `week_reset_events` and `weekly_credit_floors`,
@@ -596,6 +622,14 @@ class QuotaProjectionResult:
     milestones_orphaned: int
     roots_stamped: int
     alerts_dispatched: int
+    #: ``"published"`` for every pass that ran, ``"deferred_model"`` when the
+    #: #980 model-resolution fence refused it (D6): no projection rows and no
+    #: certificate were written, and the drain executor was requested.
+    status: str = "published"
+
+
+#: #980 D6: the status a refused projection publisher returns.
+PROJECTION_DEFERRED_MODEL = "deferred_model"
 
 
 @dataclass(frozen=True)
@@ -1023,6 +1057,20 @@ def _defer_codex_quota_verification() -> str:
     return "failed"
 
 
+def _request_codex_model_resolution() -> None:
+    """A refused publisher asks the drain executor to resolve models (D6).
+
+    Best effort and attempt-throttled by the executor's own spawn marker; the
+    executor requests ``_codex-quota-verify`` once it has cleared the flag, so
+    the refused projection is republished."""
+    try:
+        cache_module = _cache_module()
+        cache_module._request_codex_drain_worker(
+            cache_module.CODEX_PRUNE_DRAIN_COMMAND)
+    except Exception:
+        pass
+
+
 def cmd_codex_quota_verify_internal(args) -> int:
     """Hidden ``_codex-quota-verify`` handler: the deferred whole-history pass.
 
@@ -1063,6 +1111,11 @@ def cmd_codex_quota_verify_internal(args) -> int:
         # away first, which only the caller holding the exception can do.
         from _cctally_record import _hook_log_error_detail
         _log("error", error=_hook_log_error_detail(exc))
+        return 0
+    if getattr(result, "status", None) == PROJECTION_DEFERRED_MODEL:
+        # #980 D6: refused until model resolution is established; the drain
+        # executor was requested and requests this worker again afterwards.
+        _log("deferred", "projection=deferred")
         return 0
     _log(
         "success",
@@ -4004,8 +4057,20 @@ def reconcile_codex_quota_projection(
                 codex_attribution_projection_scope(cache)
                 if attribution_stale else None
             )
+            # #980 D6: quota projection requires established model resolution.
+            # One indexed `cache_meta` read in the same snapshot; while the
+            # `model` flag, an unexpanded `full` or a malformed debt record
+            # stands, no projection row and no certificate may be published —
+            # interpreting a still-resolvable NULL `observed_model` would file a
+            # Spark window as account weekly quota (#373).
+            model_pending = (
+                _cache_module().codex_model_resolution_pending(cache))
         finally:
             cache.commit()
+        if model_pending:
+            _request_codex_model_resolution()
+            return QuotaProjectionResult(
+                None, 0, 0, 0, 0, 0, 0, status=PROJECTION_DEFERRED_MODEL)
         # ONE stats read decides the whole shape of the pass: whether the
         # short-circuit fires, and if not, whether the pass is bounded.
         ledger_state = None

@@ -1100,9 +1100,9 @@ def test_the_stats_index_epoch_tripwire(stats_ns):
     1015 for `weekly_usage_snapshots.weekly_observation_held`, and #869 advances
     to 1016 for `five_hour_blocks.pricing_provenance_json`, and #901 advances
     to 1017 for read indexes, #825/#832 to 1018 for the account-bound
-    journal fence, and #797/#823/#840 to 1019 for its revision 2."""
+    journal fence, and #797/#823/#840 to 1019 for its revision 2, and #1019/#1014 to 1020 for its revision 3, then #943 to 1021, then #1015 to 1022, then #948 to 1023."""
     import _cctally_core
-    assert _cctally_core.STATS_INDEX_EPOCH == 1019
+    assert _cctally_core.STATS_INDEX_EPOCH == 1023
 
 
 # --------------------------------------------------------------------------

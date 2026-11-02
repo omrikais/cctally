@@ -118,6 +118,7 @@ cctally codex quota forecast --json
   `token_count` events, which `ccusage-codex` double-counts (up to ~2×) while
   cctally dedups to match Codex's own ledger. Recent sessions match byte-for-byte.
   See [codex-daily · duplicate-event divergence](codex-daily.md#notes--diverges-from-upstream-ccusage-codex-on-duplicate-events).
+- **Totals higher than `ccusage-codex`?** cctally also counts threads Codex moved to `~/.codex/archived_sessions/` when they were archived; tools that read only `~/.codex/sessions/` leave them out.
 - Bare `cctally codex` (no subcommand) exits non-zero with a command-required
   error.
 - No runtime deprecation warning is emitted by the flat forms; they are

@@ -12,7 +12,8 @@ that instrumentation complete rather than a sample, and the last test in this
 file pins both:
 
   * every diagnosis read goes through `_cctally_diagnosis_sources._execute`,
-  * every diagnosis store open goes through `open_read_only`.
+  * every diagnosis store open goes through `open_read_only`, or, for
+    `conversations.db`, `StoreBundle._open_conversations` (#1000).
 
 Whether a pin is HELD is read off the production cache connections themselves —
 `sqlite3.Connection.in_transaction` on the objects `open_cache_db` handed out —
@@ -98,6 +99,16 @@ def _instrument_store_reads(ns, monkeypatch, record: list):
 
     monkeypatch.setattr(sources, "_execute", _execute)
     monkeypatch.setattr(sources, "open_read_only", _open_read_only)
+    # #1000: conversations opens through the bundle's read admission.
+    real_open_conversations = sources.StoreBundle._open_conversations
+
+    def _open_conversations(self):
+        record.append(_Observed("diagnosis", _pin_held(),
+                                "open:conversations"))
+        return real_open_conversations(self)
+
+    monkeypatch.setattr(sources.StoreBundle, "_open_conversations",
+                        _open_conversations)
 
 
 @pytest.fixture
@@ -212,14 +223,20 @@ def test_the_route_reads_after_the_snapshot_transaction_has_ended(seeded,
 # relies on is still the shape on disk.
 
 def test_the_diagnosis_read_boundary_is_exactly_two_functions():
-    """Patching `_execute` and `open_read_only` instruments EVERY read.
+    """Patching `_execute`, `open_read_only` and `_open_conversations`
+    instruments EVERY read.
 
-    If a second `.execute(` or a second `sqlite3.connect(` appears in the
-    adapter, the instrumentation above silently becomes a sample of the reads
-    rather than all of them, and the pin question stops being answered.
+    If a second `.execute(`, a second `sqlite3.connect(` or a second
+    conversations admission appears in the adapter, the instrumentation above
+    silently becomes a sample of the reads rather than all of them, and the
+    pin question stops being answered. The conversations connection is opened
+    by `_cctally_cache.conversation_ro_guarded` (#1000 spec 5.10), outside this
+    file, so its one call site is counted here instead.
     """
     source = (_REPO / "bin" / "_cctally_diagnosis_sources.py").read_text()
     assert source.count("sqlite3.connect(") == 1
+    # One: inside `StoreBundle._open_conversations`.
+    assert source.count("conversation_ro_guarded(") == 1
     # Two: the `PRAGMA busy_timeout` inside `open_read_only`, and the one
     # inside `_execute` itself.
     assert source.count(".execute(") == 2

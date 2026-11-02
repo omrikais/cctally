@@ -52,6 +52,7 @@ Three outcomes, in precedence order:
 | Outcome | Exit | Why it ranks here |
 |---|---|---|
 | The cache lock is held by another process | 1 | Reported first because nothing was attempted at all. |
+| The cctally journal could not be written | 1 | Nothing was pruned: an orphan's cost rows are deleted only after their account decisions are recorded in the journal. The command prints `[cache-sync] prune-orphans skipped: the cctally journal could not be written. Check that the cctally journal directory is writable.` |
 | The rollup re-derive was refused | 3 | Outranks a residual report: committed deletions were not followed by an authorized re-derive. |
 | Orphans left in place as residuals, or a clean prune | 0 | A residual is work deliberately not done, and `cache-sync --rebuild` clears it. |
 
@@ -64,6 +65,19 @@ Eligibility is decided per conversation from the authoritative message rows, nev
 The command reports the number of sessions/messages (Claude) and conversations/events (Codex) removed. Each conversation's deletion draws on the same 4 MiB/min transcript maintenance allowance a running dashboard's automatic pass uses, so a large backlog can take more than one run: when the allowance is spent the command still exits 0 and adds a `stopped early` line beside its counts, and the remaining expired transcripts are pruned on later runs or by a running dashboard. It skips (exit 1) if a sync or another maintenance operation is holding the conversation-store locks — retry shortly.
 
 You rarely need to run this by hand: the dashboard self-heals these orphans automatically (once at startup and periodically while running), so `--prune-orphans` is mainly for headless or one-off cleanup. Codex orphans need no flag: a Codex sync records them as pending maintenance, and `cache-sync` (or, after a hook-driven sync, a background worker) removes them one rollout at a time, after re-checking that the rollout is really gone.
+
+## Claude cost attribution
+
+Each Claude cost row is attributed to the account that was active when Claude Code wrote it, not the account active when cctally happens to ingest it. cctally decides the account from the active-account readings it recorded around the row's timestamp (the status line and hooks record them) and records each decision in its journal before it stores the row. When no reading on either side identifies one account, the row takes the account active at ingest; `cctally doctor` reports how many recent rows were attributed that way under `accounts.claude_cost_attribution`. Recorded decisions are never re-decided: `--rebuild`, a truncated or recreated transcript, and `--prune-orphans` keep them, and existing rows keep the account they already had when cctally is upgraded.
+
+Because the journal records every decision first, a Claude sync that cannot write the journal does not store a file whose decisions it could not record (files it already stored stay stored, and it moves on to the next file), and exits 1 with one of these lines:
+
+- `[cache-sync] claude sync deferred: the cctally journal could not be written. Check that the cctally journal directory is writable.`
+- `[cache-sync] rebuild skipped (claude): the cctally journal could not be written. Check that the cctally journal directory is writable.` The cache was not cleared.
+
+If the journal fails only after a `--rebuild` has cleared the cache, the rebuild has re-ingested every other file, so it reports the files it could not ingest through the usual `[cache-sync] rebuild incomplete (claude): N file(s) failed` line and exits 1; the next sync ingests them. Hooks and other commands defer the same way, silently, and retry on their next run.
+
+When the journal holds a later decision that disagrees with the first one for the same record, the first one is kept and `cache-sync` reports `[cache-sync] N Claude cost attribution conflict(s) recorded: the journal holds a later decision that disagrees with the first one for the same record; the first decision is kept.`
 
 ## Compressed Codex rollouts
 
@@ -133,27 +147,18 @@ cctally cache-sync --source claude
   corruption occurs in the Codex leg of `--source all`, Claude is re-ingested
   again on the replacement family; a failed or contended provider walk remains
   non-zero.
-- `cache.db.repairing` records a repair PID, kernel process-start identity, and
-  unique claim token. A live matching owner blocks new opens. Dead, malformed,
-  or PID-reused ownership is reclaimed under the maintenance lock; platforms
-  that cannot re-read a process-start identity use a bounded 30-minute lease.
-  If a repair is killed at any phase, the next opener or
-  `cache-sync --rebuild` resumes from the surviving corrupt/quarantined/fresh
-  state without manual marker deletion.
-- `conversations.db.repairing` uses the same process-start-qualified ownership,
-  while `conversations.db.recovery.json` durably records every transcript
-  provider that must be rebuilt after whole-family quarantine. A killed
-  recovery reclaims stale ownership and finishes the recorded provider set on
-  the next `cache-sync --rebuild`, even when that retry names only one source;
-  the recovery record clears only after all pending provider markers clear.
-  Public transcript readers, bounded title decoration, and Doctor decline the
-  store while that record exists, so an empty or one-provider intermediate
-  rebuild is never published as healthy.
+- `cache.db.repairing` records a repair PID, kernel process-start identity, and unique claim token. It is a file, or, on a volume without hard links (exFAT), a directory holding that record as `owner`. A live matching owner blocks new opens. Dead, malformed, or PID-reused ownership is reclaimed under the maintenance lock and the marker's own `cache.db.repairing.lock`; platforms that cannot re-read a process-start identity use a bounded 30-minute lease. If a repair is killed at any phase, the next opener or `cache-sync --rebuild` resumes from the surviving corrupt/quarantined/fresh state without manual marker deletion.
+- `conversations.db.repairing` uses the same process-start-qualified ownership, in the same file or directory form, while `conversations.db.recovery.json` durably records every transcript provider that must be rebuilt after whole-family quarantine. A killed recovery reclaims stale ownership and finishes the recorded provider set on the next `cache-sync --rebuild`, even when that retry names only one source; the recovery record clears only after all pending provider markers clear. Public transcript readers, bounded title decoration, and Doctor decline the store while that record exists, so an empty or one-provider intermediate rebuild is never published as healthy.
 - Transcript integrity probes use a same-volume copy-on-write clone of the
-  locked main/WAL family, bounded to five seconds per member. They never fall
-  back to a full byte copy; when the filesystem lacks clone/reflink support,
-  recovery fails closed with the live family untouched. Stale private probe
-  directories from a killed owner are removed under the same exclusion locks.
+  locked main/WAL family: `clonefile(2)` on macOS, and `cp --reflink=always`
+  bounded to five seconds per member on Linux. The clone never falls back to a
+  full byte copy. On a volume that cannot clone (HFS+, exFAT, network, ext4),
+  the check runs read-only on the live main file when no write-ahead log is
+  pending, with the same automatic recovery on confirmed corruption. When
+  the write-ahead log or rollback journal holds data, or the store changes
+  during the in-place check, the check is skipped with a stderr note and the
+  rebuild continues. Stale private probe directories from a killed owner are
+  removed under the same exclusion locks.
 - Whole-family quarantine publishes
   `<store>.quarantine-pending.json` before its first rename. The next
   maintenance-exclusive opener completes the same incident after a killed

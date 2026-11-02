@@ -1145,6 +1145,10 @@ cmd_db_vacuum = _cctally_db.cmd_db_vacuum
 # _CACHE_MIGRATIONS) at its own module-load time — both are no-ops
 # when bin/cctally already imported them above, but they make the
 # sibling self-contained for isolated test loads.
+# #944: write-time Claude cost attribution. The pure rule/identity kernel and
+# its cache.db + journal glue, loaded before the cache sibling that uses them.
+_lib_claude_attribution = _load_sibling("_lib_claude_attribution")
+_cctally_claude_attribution = _load_sibling("_cctally_claude_attribution")
 _cctally_cache = _load_sibling("_cctally_cache")
 ProjectKey = _cctally_cache.ProjectKey
 _resolve_project_key = _cctally_cache._resolve_project_key
@@ -1193,6 +1197,12 @@ _reset_orphan_warning_throttle = _cctally_cache._reset_orphan_warning_throttle
 cmd_cache_sync = _cctally_cache.cmd_cache_sync
 cmd_codex_replay_drain_internal = _cctally_cache.cmd_codex_replay_drain_internal
 cmd_codex_prune_drain_internal = _cctally_cache.cmd_codex_prune_drain_internal
+# #927 B2: the detached retained-identity inventory bootstrap worker.
+cmd_codex_inventory_bootstrap_internal = (
+    _cctally_cache.cmd_codex_inventory_bootstrap_internal)
+# #977 C7: the detached quota natural-key index rebuild worker.
+cmd_quota_index_rebuild_internal = _load_sibling(
+    "_cctally_journal").cmd_quota_index_rebuild_internal
 
 
 # Record-usage / hook-tick hot-path subsystem — the runtime path that
@@ -1891,24 +1901,26 @@ def _codex_home_roots() -> list[pathlib.Path]:
 def _codex_session_roots() -> list[pathlib.Path]:
     """Directories to walk for *.jsonl, applying the sessions/-subdir rule.
 
-    For each home root r (in $CODEX_HOME order):
-      (r / "sessions").is_dir()  -> r / "sessions"   (Codex home)
-      elif r.is_dir()            -> r                 (direct JSONL dir)
-      else                       -> skipped
+    For each home root r (in $CODEX_HOME order), by the container leaf's
+    native-home recognition (#970 spec 5.1):
+      r has sessions/ or archived_sessions/ -> r / "sessions"  (Codex home;
+                                               reported even when only the
+                                               archive exists yet)
+      elif r.is_dir()                       -> r               (direct JSONL dir)
+      else                                  -> skipped
     Exact-duplicate roots are de-duped (first occurrence kept). File-level
     de-dup for overlapping/prefix roots happens in the discovery walkers
     (set of absolute paths); this function only collapses identical roots.
     """
+    import _lib_codex_rollout_container as _rc_leaf
+
     out: list[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
     for r in _codex_home_roots():
-        sess = r / "sessions"
-        if sess.is_dir():
-            cand = sess
-        elif r.is_dir():
-            cand = r
-        else:
+        locations = _rc_leaf.home_locations(r)
+        if locations is None:
             continue
+        cand = locations.walk_root
         if cand in seen:
             continue
         seen.add(cand)
@@ -3830,7 +3842,8 @@ def _post_command_update_hooks(command: str | None, args) -> None:
     if command in ("_update-check", "_telemetry-beat", "_codex-quota-verify",
                    "_stats-epoch-rebuild", "_stats-corruption-heal",
                    "_codex-replay-drain", "_codex-prune-drain", "_artifact-retention",
-                   "_statusline-continue"):
+                   "_statusline-continue", "_quota-index-rebuild",
+                   "_codex-inventory-bootstrap"):
         # All six hidden workers are detached and have already done their one job
         # in their own command handler; none must re-enter this hook.
         # Without the guard the ``_update-check`` worker would fall through to

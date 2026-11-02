@@ -258,6 +258,12 @@ def _sqlite_canonical(path: pathlib.Path) -> str:
     What is NOT removed: everything else. A different SQLite build that changed
     a stored value, a schema, a row count or a column type still fails the
     comparison, which is the point of comparing at all.
+
+    One thing is added, because `iterdump` omits it: `PRAGMA user_version`, the
+    header field the product branches on — the stats index epoch in
+    `stats.db`, the migration head in `cache.db` and `conversations.db`. Only
+    the application writes it, so it is data, not layout. Without it a store
+    left at an older epoch with unchanged schema and rows passed (#1032).
     """
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
@@ -265,7 +271,8 @@ def _sqlite_canonical(path: pathlib.Path) -> str:
             "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
         ))
         shadow = _shadow_tables(rows)
-        return "\n".join(sorted(
+        (user_version,) = conn.execute("PRAGMA user_version").fetchone()
+        return "\n".join([f"PRAGMA user_version={user_version};"] + sorted(
             statement for statement in conn.iterdump()
             if _statement_target(statement) not in shadow
         ))
@@ -1435,6 +1442,32 @@ def test_changed_sqlite_data_fails_the_comparison(tmp_path):
     finally:
         conn.close()
     assert any("cache.db" in line for line in diff_manifests(before, manifest(root)))
+
+
+def _set_user_version(path: pathlib.Path, value: int) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"PRAGMA user_version={value}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_user_version_only_difference_fails_the_comparison(tmp_path):
+    """A committed store left at an older stats epoch or migration head.
+
+    `PRAGMA user_version` is the stats index epoch in `stats.db` and the
+    migration head in `cache.db`. A fixture at an older value is opened by a
+    consumer through a rebuild or migration path instead of the state it
+    claims, while its schema and rows can still match (#1032: five dashboard
+    stores sat at epoch 1019 through two epoch bumps unnoticed).
+    """
+    root = _sample_tree(tmp_path)
+    before = manifest(root)
+    _set_user_version(root / "cache.db", 1021)
+    assert any("cache.db" in line for line in diff_manifests(before, manifest(root)))
+    _set_user_version(root / "cache.db", 0)
+    assert diff_manifests(before, manifest(root)) == []
 
 
 def _raw_dump(path: pathlib.Path) -> str:

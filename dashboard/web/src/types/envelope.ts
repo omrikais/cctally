@@ -456,9 +456,25 @@ export interface MeterRateChangeEntry {
   // How many baseline days were withheld: a COUNT, so zero, one and many
   // stay distinguishable.
   baseline_withheld_days?: number | null;
+  // #1015 (U2) — non-null when a reviewed correction changed the inputs this
+  // transition was fitted from. The row stays in the history with its
+  // historical values, labelled "superseded by a correction", and never
+  // raises a toast. `null` is an ordinary transition; absent means a server
+  // that predates the field, and reads as not superseded.
+  supersession?: MeterRateChangeSupersession | null;
   // R8: present only when this provider has more than one real account.
   accountKey?: string;
   accountLabel?: string;
+}
+
+// #1015 spec 5.7 — why a transition no longer steers anything.
+export interface MeterRateChangeSupersession {
+  reason: 'reviewed-correction';
+  // The sweep that journalled the explicit supersession, or `null` while it
+  // is derived from the transition's lineage alone (no `cctally quota` yet).
+  superseded_at: string | null;
+  // The reviewed correction op ids.
+  corrections: string[];
 }
 
 export interface AlertsSettingsEnvelope {

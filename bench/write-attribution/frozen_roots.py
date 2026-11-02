@@ -146,6 +146,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import stat as stat_mod
@@ -195,6 +196,13 @@ CONTROL_FILES = ("manifest.json", "rootmap.tsv", "frozen.sb")
 #: dashboard's title enrichment state_5.sqlite). A missing one is a recorded
 #: absence; anything else the family reads is named with --extra.
 CODEX_METADATA = ("auth.json", "config.toml", "hooks.json", "state_5.sqlite")
+#: A Codex home's flat archive of rollouts, walked beside sessions/ since #970.
+CODEX_ARCHIVED = "archived_sessions"
+#: The product's archived-rollout name (`_lib_codex_rollout_container`
+#: `_ARCHIVE_NAME_RE`, #970 5.2): its literal date names the dated location.
+ARCHIVE_NAME_RE = re.compile(
+    r"rollout-(\d{4})-(\d{2})-(\d{2})T\d{2}-\d{2}-\d{2}-[0-9a-fA-F-]{36}"
+    r"\.jsonl(?:\.zst)?")
 #: SQLite databases among those inputs (spec §6.3, Q17, `dc14` N1). Codex
 #: writes them through a WAL, so a title can be committed only in the -wal; the
 #: freeze holds a DERIVED single rollback-mode file (no sidecar, so a read-only
@@ -305,14 +313,23 @@ class Root:
     """One logical root: kind codex-home | claude-projects | file; `walk` is
     the directory whose **/*.jsonl the tree walks (a plain class: the tests
     load this module without registering it, which a dataclass needs).
-    `origin` "link-target" marks a single-file root the capture added for the
-    target of a covered link outside every root, `links` its links."""
+    `extra_walks` are further walked directories under the same root: a Codex
+    home's flat `archived_sessions/` (#970 spec 5.1; #939), walked beside
+    `sessions/`. `origin` "link-target" marks a single-file root the capture
+    added for the target of a covered link outside every root, `links` its
+    links."""
 
     def __init__(self, kind: str, logical: str, walk, metadata=(),
-                 present: bool = True, index: int = 0, origin=None) -> None:
+                 present: bool = True, index: int = 0, origin=None,
+                 extra_walks=()) -> None:
         self.kind, self.logical, self.walk = kind, logical, walk
         self.metadata, self.present, self.index = tuple(metadata), present, index
         self.origin, self.links = origin, []
+        self.extra_walks = tuple(extra_walks)
+
+    @property
+    def walks(self) -> tuple:
+        return ((self.walk,) + self.extra_walks) if self.walk is not None else ()
 
     @property
     def is_file(self) -> bool:
@@ -358,9 +375,14 @@ def input_roots(home: str, codex_home: "str | None",
     for h in codex_homes(codex_home, home):
         sessions = os.path.join(h, "sessions")
         walk = sessions if os.path.isdir(sessions) else h
+        # #970/#939: the product also walks the home's flat archived_sessions/;
+        # a missing one is a recorded absence (capture), never an unmapped read.
+        archived = os.path.join(h, CODEX_ARCHIVED)
+        extra = ((archived,) if walk != h and os.path.isdir(archived)
+                 and not os.path.islink(archived) else ())
         roots.append(Root("codex-home", h, walk,
                           tuple(os.path.join(h, name) for name in CODEX_METADATA),
-                          present=os.path.isdir(h)))
+                          present=os.path.isdir(h), extra_walks=extra))
     read, missing = claude_dirs(claude_config_dir, home)
     for d in read:
         projects = os.path.join(d, "projects")
@@ -636,6 +658,20 @@ def journal_selection_components(path, roots, entries, absences, denied, *, prob
                 spelling, roots, entries, absences, denied, probe=probe,
                 resolved=canonical))
             pending.extend(p for p in canonical if p not in visited)
+        # #970: an absent archive-eligible dated rollout is then looked for in
+        # its home's archive, in both spellings. Capture (a probe callback)
+        # records each one the walk did not capture as absent; a check of the
+        # sealed metadata covers only what the manifest attests, so a reseal
+        # that dropped one no longer matches (#939 R9 families).
+        logical = (str(rc.logical_path(source))
+                   if rc.is_container_name(source) else source)
+        if logical in absences and logical + ".zst" in absences:
+            root = _root_of(roots, logical)
+            if probe is not None:
+                _record_archive_absences(root, logical, entries, absences,
+                                         "journal-archive-absent")
+            covered.update(spelling for spelling in _archive_spellings(root, logical)
+                           if spelling in entries or spelling in absences)
     return sorted(covered)
 
 
@@ -1008,6 +1044,97 @@ def _frozen(freeze: pathlib.Path, root: Root, logical: str) -> pathlib.Path:
     return base if rel == "." else base / rel
 
 
+def _archive_eligible(root, path: str) -> bool:
+    """#970 G2, the product's `archive_dir_for`: only a logical path that is
+    exactly `walk/YYYY/MM/DD/<name>.jsonl` of a Codex home, whose name's
+    literal date is a valid calendar date equal to that `YYYY/MM/DD`, has
+    archive candidates. A wrong-day, undated or deeper-nested path has none
+    (#939 R7-02: a basename match alone accepted identities the product
+    cannot serve), compared lexically like the product (R8-03)."""
+    if root is None or root.kind != "codex-home" or root.walk is None:
+        return False
+    base = os.path.basename(path)
+    if not base.endswith(".jsonl"):
+        return False
+    match = ARCHIVE_NAME_RE.fullmatch(base)
+    if match is None:
+        return False
+    try:
+        dt.date(*(int(g) for g in match.groups()))
+    except ValueError:
+        return False
+    # Lexical, as the product's `pathlib.Path` arithmetic: `..` is a
+    # component, never collapsed (#939 R8-03).
+    day = pathlib.PurePath(path).parent
+    if (day.parent.parent.name, day.parent.name, day.name) != match.groups():
+        return False
+    return day.parent.parent.parent == pathlib.PurePath(root.walk)
+
+
+def _archived_held(root, path: str, entries) -> "str | None":
+    """#970: the archived spelling of a retained dated Codex rollout that the
+    freeze holds, in the product's selection order (`container_candidates`:
+    the archive's plain file before its .zst), or None. Codex moves a rollout
+    into archived_sessions/, and the product keeps its dated identity and reads
+    the archived file - only for an archive-eligible path."""
+    if not _archive_eligible(root, path):
+        return None
+    base = os.path.basename(path)
+    for archive in root.extra_walks:
+        for spelling in (os.path.join(archive, base),
+                         os.path.join(archive, base + ".zst")):
+            if spelling in entries:
+                return spelling
+    return None
+
+
+def _archive_spellings(root, path: str) -> list:
+    """Both archive spellings the product probes for an archive-eligible
+    dated rollout (`archive_dir_for` + `container_candidates`: the archive's
+    plain file, then its .zst), in every archive of its home; none for an
+    ineligible path."""
+    if not _archive_eligible(root, path):
+        return []
+    base = os.path.basename(path)
+    return [spelling for archive in root.extra_walks
+            for spelling in (os.path.join(archive, base),
+                             os.path.join(archive, base + ".zst"))]
+
+
+def _record_archive_absences(root, path: str, entries, absences,
+                             reason: str) -> None:
+    """#970: the product looks for an absent archive-eligible dated rollout in
+    its home's archive, however the capture met it (a retained cursor, a
+    journal source: #939's R9 families went invalid on exactly those unmapped
+    stats). Record each archive spelling the walk did not capture as an
+    absence, but only on ENOENT/ENOTDIR: the product's strict probe reads any
+    other error (EACCES on an archive it can list but not search) as unknown,
+    and the frozen namespace would present an attested absence as ENOENT
+    (#939 R12-01), so such an error refuses the capture."""
+    for spelling in _archive_spellings(root, path):
+        if spelling in entries:
+            continue
+        try:
+            os.lstat(spelling)
+        except (FileNotFoundError, NotADirectoryError):
+            absences.setdefault(spelling, reason)
+        except OSError as exc:
+            raise Refused(f"an archive spelling cannot be stat'ed "
+                          f"({exc.strerror}): {spelling}") from exc
+
+
+def _container_verdict(held, offsets) -> str:
+    """How a retained row's cursors compare with a held container's decoded
+    bytes: `undecodable` (U6: the product keeps these rows), `shorter` (the
+    product resets it, 5.5) or `covered`."""
+    decoded = (held or {}).get("decoded") or {}
+    if not decoded.get("ok"):
+        return "undecodable"
+    if any(v > (decoded.get("length") or 0) for v in offsets.values()):
+        return "shorter"
+    return "covered"
+
+
 def _root_of(roots, path: str) -> "Root | None":
     best = None
     for root in roots:
@@ -1137,14 +1264,19 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
     journals = [retained_journal_sources(s["root"]) for s in store_ids]
     journal_sources = sorted({p for j in journals for p in j["paths"]})
     omitted = {_norm(p) for p in omit}
-    # #968 decoded twins: every bound Codex cursor's retained device/inode
-    # evidence must agree. One presented identity cannot qualify conflicting
-    # copies, aliases or accounting/conversation rows by choosing the first.
+    # #968 decoded twins: every bound Codex cursor's retained inode evidence
+    # must agree. One presented identity cannot qualify conflicting copies,
+    # aliases or accounting/conversation rows by choosing the first. #939: the
+    # INODE decides and the device only corroborates, exactly as the product's
+    # `source_identity_replaced` rules (#814, #769 S6): a remount renumbers
+    # every stored device_id at once (here the conversation cursors still held
+    # the pre-reboot device while cache.db's had moved on), so a device-only
+    # difference is the same file and the first retained identity is presented.
     stored_identity: "dict[str, tuple[int, int]]" = {}
 
     def retain_identity(path: str, identity: tuple[int, int]) -> None:
         previous = stored_identity.get(path)
-        if decoded_twins and previous is not None and previous != identity:
+        if decoded_twins and previous is not None and previous[1] != identity[1]:
             raise Refused(f"{path}: conflicting retained identities "
                           f"{previous} and {identity}")
         stored_identity.setdefault(path, identity)
@@ -1383,7 +1515,7 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             owner = _root_of(roots, canonical)
             if (not resolved.endswith(CONTAINER_SUFFIX) or owner is None
                     or owner.kind != "codex-home" or owner.walk is None
-                    or not _under(resolved, owner.walk)
+                    or not any(_under(resolved, w) for w in owner.walks)
                     or canonical in omitted or os.path.lexists(canonical)):
                 raise Refused(f"decoded twin alias {container}: its canonical "
                               "target cannot be presented faithfully (outside "
@@ -1475,9 +1607,9 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
         add_dir(root, root.logical)
         files = dirs = 0
         containers: "list[str]" = []
-        if root.walk is not None:
-            add_parents(root, os.path.join(root.walk, "x"))
-            for dirpath, dirnames, filenames in os.walk(root.walk):
+        for walk_dir in root.walks:
+            add_parents(root, os.path.join(walk_dir, "x"))
+            for dirpath, dirnames, filenames in os.walk(walk_dir):
                 dirpath = _norm(dirpath)
                 for name in sorted(dirnames):
                     full = os.path.join(dirpath, name)
@@ -1503,6 +1635,26 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                     else:
                         exclusions.append({"logical": full,
                                            "reason": "not a walked *.jsonl"})
+        if root.walk is not None:
+            # #970: an archived rollout keeps its dated identity, so the
+            # product probes walk/YYYY/MM/DD/<name>.jsonl and its .zst twin for
+            # every archived container (`dated_logical_for_archive`, then
+            # `probe_containers`). A dated spelling the walk did not capture
+            # is a recorded absence, never an unmapped read.
+            for archive in root.extra_walks:
+                for name in sorted(os.listdir(archive)):
+                    match = ARCHIVE_NAME_RE.fullmatch(name)
+                    if match is None:
+                        continue
+                    try:
+                        dt.date(*(int(g) for g in match.groups()))
+                    except ValueError:
+                        continue
+                    base = name[:-len(".zst")] if name.endswith(CONTAINER_SUFFIX) else name
+                    dated = os.path.join(root.walk, *match.groups(), base)
+                    for spelling in (dated, dated + ".zst"):
+                        if spelling not in entries and not os.path.lexists(spelling):
+                            absences.setdefault(spelling, "archive-dated-absent")
             for full in containers:
                 logical = full[:-len(".zst")]
                 if not decoded_twins:
@@ -1525,9 +1677,13 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
                 for name in sorted(os.listdir(root.logical)):
                     full = os.path.join(root.logical, name)
                     if full != root.walk and full not in root.metadata \
+                            and full not in root.extra_walks \
                             and full not in consumed:
                         exclusions.append({"logical": full,
                                            "reason": "outside the walk"})
+                archived = os.path.join(root.logical, CODEX_ARCHIVED)
+                if root.kind == "codex-home" and not os.path.lexists(archived):
+                    absences.setdefault(archived, "no archived_sessions/ directory")
             else:
                 walk_sessions = os.path.join(root.logical, "sessions")
                 absences.setdefault(walk_sessions, "no sessions/ directory")
@@ -1560,10 +1716,23 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
             absences[path] = absences[path + ".zst"] = "omitted"
         elif os.path.lexists(path):
             add_file(root, path, "transcript")
+            continue
         elif path + ".zst" in entries:
             absences[path] = "compressed-only"
+            continue
+        elif _archived_held(root, path, entries) is not None:
+            # Read from the archive: qualify judges the row against that file.
+            absences[path] = "archived"
+            continue
         else:
             absences[path] = "retained-missing"
+        # #970: a retained dated rollout the family cannot find at its dated
+        # location is looked for in the home's archive, in both spellings
+        # (`archive_dir_for` + `container_candidates`); #939's R9
+        # families went invalid on exactly those unmapped stats. Record each
+        # archive spelling the walk did not capture as an absence.
+        _record_archive_absences(root, path, entries, absences,
+                                 "retained-archive-absent")
     # Amendment 13 O2: probe-only entries. The product's git-root walk-up
     # from a recorded working directory (`os.path.realpath`, an lstat per
     # component, then an exists() of each ancestor's `.git`) reads paths
@@ -1748,6 +1917,7 @@ def capture(stores, out, *, home: str, codex_home=None, claude_config_dir=None,
         "stores": store_ids,
         "roots": [{"index": r.index, "kind": r.kind, "logical": r.logical,
                    "walk": r.walk, "present": r.present,
+                   **({"extraWalks": list(r.extra_walks)} if r.extra_walks else {}),
                    "frozen": f"roots/{r.index}",
                    **({"origin": r.origin, "links": list(r.links)} if r.origin
                       else {})} for r in roots],
@@ -2035,7 +2205,8 @@ def qualify(store, freeze) -> dict:
     entries = {e["logical"]: e for e in manifest["entries"]}
     absences = {a["logical"]: a["reason"] for a in manifest["absences"]}
     roots = [Root(r["kind"], r["logical"], r["walk"], present=r["present"],
-                  index=r["index"]) for r in manifest["roots"]]
+                  index=r["index"], extra_walks=r.get("extraWalks", ()))
+             for r in manifest["roots"]]
     store_id = store_identity(store)
     problems = list(store_id["problems"])
     bound = bound_stores(manifest)
@@ -2108,6 +2279,22 @@ def qualify(store, freeze) -> dict:
             entry = entries.get(entry["resolved"])
         if entry is not None and entry["kind"] == "probe":
             entry = None                      # metadata only: no frozen bytes
+        if entry is None and absences.get(path) == "archived":
+            held_path = _archived_held(root, path, entries)
+            held = entries.get(held_path) if held_path else None
+            if held is not None and held["kind"] == "symlink":
+                held = entries.get(held["resolved"])
+            if held is None:
+                problems.append(f"{where} is archived but no archived rollout "
+                                "is in the freeze")
+                continue
+            if held_path.endswith(CONTAINER_SUFFIX):
+                verdict = _container_verdict(held, row["offsets"])
+                undecodable += verdict == "undecodable"
+                shorter += verdict == "shorter"
+                covered += verdict == "covered"
+                continue
+            entry = held                      # a plain archived file: as usual
         if entry is None:
             reason = absences.get(path)
             if reason == "omitted":
@@ -2117,14 +2304,10 @@ def qualify(store, freeze) -> dict:
                 held = entries.get(path + ".zst")
                 if held is not None and held["kind"] == "symlink":
                     held = entries.get(held["resolved"])
-                decoded = (held or {}).get("decoded") or {}
-                if not decoded.get("ok"):
-                    undecodable += 1          # U6: the product keeps these rows
-                elif any(v > (decoded.get("length") or 0)
-                         for v in row["offsets"].values()):
-                    shorter += 1              # the product resets it (5.5)
-                else:
-                    covered += 1
+                verdict = _container_verdict(held, row["offsets"])
+                undecodable += verdict == "undecodable"
+                shorter += verdict == "shorter"
+                covered += verdict == "covered"
                 continue
             if reason is not None and path in residual:
                 residual_used += 1

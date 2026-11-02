@@ -334,9 +334,13 @@ def test_real_statusline_payload_executes_both_projection_axes(
     assert any("weekly_percent" in s.sql for s in statements)
     assert any("five_hour_percent" in s.sql for s in statements)
     assert {s.temp_store for s in statements} == {2}
+    # The closing-set read also returns each block's window key (#956 class
+    # 1: flush (c) projects the dirty blocks about to close).
     closures = [s for s in recorder.statements
                 if "_cctally_record.maybe_update_five_hour_block" in s.call_sites
-                and s.sql.startswith("SELECT id FROM five_hour_blocks")]
+                and s.sql.startswith(("SELECT id FROM five_hour_blocks",
+                                      "SELECT id, five_hour_window_key "
+                                      "FROM five_hour_blocks"))]
     assert any("is_closed = 0" in s.sql for s in closures)
     assert any("is_closed = 1" in s.sql for s in closures)
     findings = list(guard.temp_findings(statements))

@@ -148,7 +148,8 @@ def test_the_backfill_preserves_every_pre_migration_attribution():
     The stamping branch is pinned against a live store in
     `tests/test_conversation_account_dimension.py`, because a stamp carries a
     randomly minted incarnation id and a real absolute path, and a golden
-    holding either could not be rebuilt byte-identically (the #197 guard).
+    holding either would not rebuild to the same content (the #197
+    content-idempotency guard, #1030).
     """
     pre = sqlite3.connect(PRE_DB)
     post = sqlite3.connect(POST_DB)

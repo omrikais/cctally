@@ -204,7 +204,7 @@ def test_b3_the_attribution_causes_are_a_closed_set():
     assert set(module.ATTRIBUTION_CAUSES) == {
         "account-not-resolved", "calibration-absent", "regime-boundary",
         "unsupported-composition", "no-local-history",
-        "unvalidated-coefficient-era"}
+        "unvalidated-coefficient-era", "recalibration-needed"}
 
 
 def test_every_attribution_cause_has_footer_copy():
@@ -784,3 +784,50 @@ def test_a_week_outside_the_regimes_era_names_its_cause_end_to_end(
             "coefficient era the calibration's token weights are validated "
             "for. Used % is a cost share.") in out, out
     assert "withheld — unvalidated-coefficient-era" not in out, out
+
+
+# --------------------------------------------------------------------------
+# #1015: a correction to the calibration's inputs keeps its cause (spec 5.4)
+# --------------------------------------------------------------------------
+def _seed_correction(app):
+    """A reviewed hold of an observation inside the stored regime's legacy
+    window, materialized by a later completed batch."""
+    conn = app.open_db()
+    try:
+        conn.execute(
+            "INSERT INTO claude_weekly_observation_index VALUES (?,?,?)",
+            ("obs-1", "unattributed", "2026-08-01T10:00:00+00:00"))
+        conn.execute(
+            "INSERT INTO claude_weekly_correction_history VALUES (?,?,?)",
+            ("op-1", "obs-1", "retract"))
+        conn.execute(
+            "INSERT INTO claude_weekly_correction_ops VALUES (?,?,?)",
+            ("op-1", "observations-2026-08.jsonl", 100))
+        conn.execute("INSERT INTO correction_batch_lineage VALUES (?,?,?)",
+                     ("batch-1", "observations-2026-08.jsonl", 200))
+        conn.execute("INSERT INTO correction_batch_footprint VALUES (?,?,?)",
+                     ("batch-1", "claude", "unattributed"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_1015_a_tainted_calibration_states_recalibration_needed(
+        e2e_app, capsys):
+    """Detects attribution reporting `calibration-absent` for a calibration
+    that exists and was refused (#1015 R1-P2-5): the JSON names
+    `recalibration-needed`, the footer renders U3's sentence, and the
+    cost-share fallback is unchanged."""
+    _seed_correction(e2e_app)
+    payload = _run_project(
+        e2e_app, capsys, "--since", "2026-08-03", "--until", "2026-08-09")
+    attribution = payload["attribution"]
+    assert attribution["basis"] == "cost-share", attribution
+    assert attribution["cause"] == "recalibration-needed", attribution
+
+    rc = e2e_app.main(["project", "--since", "2026-08-03",
+                       "--until", "2026-08-09"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert ("the stored calibration was fitted before a correction to its "
+            "inputs; run cctally quota to recalibrate") in out, out

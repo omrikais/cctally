@@ -35,9 +35,9 @@ PREVIOUS_EPOCH = 1012
 #: below mean "the epoch a store ends up at": the head constant itself, and the
 #: epoch an upgraded 1012 store reaches, which is always the head rather than
 #: the intermediate epoch that first added these objects. #869 moved the
-#: head to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019. Everything else here — what
+#: head to 1016, then #901 moved it to 1017, then #825/#832 to 1018, then #797/#823/#840 to 1019, then #1019/#1014 to 1020, then #943 to 1021, then #1015 to 1022, then #948 to 1023. Everything else here — what
 #: epoch 1013 ADDED, and the prose recording it — is historical fact and stays.
-NEW_EPOCH = 1019
+NEW_EPOCH = 1023
 DEBOUNCE_TABLE = "weekly_reset_debounce_state"
 ORIGIN_INDEX = "idx_week_reset_events_origin"
 LEGACY_TUPLE_INDEX = "idx_week_reset_events_legacy_tuple"

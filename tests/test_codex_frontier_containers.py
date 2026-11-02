@@ -1,6 +1,7 @@
 """#968 spec 5.9 / T7 frontier convergence: both planners and the kernel."""
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import sys
@@ -122,6 +123,129 @@ def test_the_provider_certificate_reads_the_declared_reset_deferral_field():
     assert frontier.provider_sync_certifiable("full", clean)
     # the shared predicate still accepts the Claude stats type
     assert frontier.provider_sync_certifiable("targeted", cache_mod.IngestStats())
+
+
+
+# ── #939 D5: the census predicates writeIo's admission hold reads ────────────
+
+def _stats_module():
+    load_script()
+    return sys.modules["_cctally_cache"]
+
+
+@pytest.mark.parametrize("fields,expected", [
+    ({}, True),
+    ({"files_failed": 2}, True),
+    ({"barrier_files_deferred": 3, "barrier_retry": True}, True),
+    ({"container_pending": 4, "container_reads_held": 1}, True),
+    ({"lock_contended": True}, False),
+    ({"budget_exhausted": True}, False),
+    # A refusal or a maintenance failure can repeat for the dashboard's whole
+    # life: it joins the residual (an identical one settles) instead.
+    ({"deferred_reason": "pricing_write_refused"}, True),
+    ({"maintenance_failed": True}, True),
+])
+def test_the_conversation_census_ignores_per_file_leftovers(fields, expected):
+    """Detects: a pass counted census-complete although its walk was cut short
+    by contention or its budget (writeIo would release mid catch-up), or a
+    leftover or repeating refusal that keeps the hold from ever settling."""
+    cache_mod = _stats_module()
+    stats = cache_mod.CodexIngestStats(files_total=5, **fields)
+    assert frontier.conversation_census_complete(
+        "full", stats, expected_paths=0) is expected
+
+
+def test_the_conversation_census_of_a_targeted_pass_is_its_plan():
+    """Detects: a targeted pass that silently lost a planned path counted as a
+    complete census."""
+    cache_mod = _stats_module()
+    assert frontier.conversation_census_complete("caught_up", None,
+                                                 expected_paths=0)
+    assert not frontier.conversation_census_complete("full", None,
+                                                     expected_paths=0)
+    assert frontier.conversation_census_complete(
+        "targeted", cache_mod.IngestStats(files_total=2, files_failed=1),
+        expected_paths=2)
+    assert not frontier.conversation_census_complete(
+        "targeted", cache_mod.IngestStats(files_total=1), expected_paths=2)
+
+
+@pytest.mark.parametrize("mode,fields,expected_paths,expected", [
+    ("caught_up", None, 0, True),
+    ("full", None, 0, False),
+    ("targeted", None, 1, False),
+    ("full", {"lock_contended": True}, 0, False),
+    ("full", {"budget_exhausted": True}, 0, False),
+    ("full", {"drain_yielded": True}, 0, False),
+    ("full", {"backlog_files": 1}, 0, False),
+    ("targeted", {"files_total": 2}, 3, False),
+    ("targeted", {"files_total": 3, "files_failed": 1}, 3, True),
+    ("full", {"files_failed": 1, "rebuild_refused": "x"}, 0, True),
+])
+def test_the_accounting_census(mode, fields, expected_paths, expected):
+    """Detects: conversation passes counted toward release after an accounting
+    tick that was contended, cut short or returned nothing, or a refusal
+    mistaken for an unvisited census."""
+    cache_mod = _stats_module()
+    stats = None if fields is None else cache_mod.CodexIngestStats(**fields)
+    assert frontier.accounting_census_complete(
+        mode, stats, expected_paths=expected_paths) is expected
+
+
+def test_the_accounting_residual_names_what_a_tick_left_unfinished():
+    """Detects: an accounting refusal or leftover missing from the residual,
+    which would let writeIo release as drained over unfinished work."""
+    cache_mod = _stats_module()
+    stats = cache_mod.CodexIngestStats(
+        deferred_reason="replay_pending", rebuild_refused="unorderable",
+        prune_refused=True, finalization_deferred=True,
+        maintenance_failed=True, files_failed=2, files_deferred_torn=1,
+        container_pending=3, files_processed=9)
+    assert dict(frontier.accounting_residual(stats)) == {
+        "deferred_reason": "replay_pending",
+        "rebuild_refused": "unorderable", "prune_refused": True,
+        "finalization_deferred": True, "maintenance_failed": True,
+        "files_failed": 2, "files_deferred_torn": 1, "container_pending": 3}
+    assert frontier.accounting_residual(cache_mod.CodexIngestStats()) == ()
+    assert frontier.accounting_residual(cache_mod.IngestStats()) == ()
+    assert frontier.accounting_residual(None) == ()
+
+
+def test_a_real_full_walk_with_an_unreadable_file_is_census_complete(
+        tmp_path, monkeypatch):
+    """Detects: a census that reads ``full_walk_complete``, which one
+    persistently unreadable transcript clears forever, so writeIo would never
+    count a conversation pass."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    cache_mod = sys.modules["_cctally_cache"]
+    pdir = tmp_path / ".claude" / "projects" / "-p"
+    pdir.mkdir(parents=True, exist_ok=True)
+    for name in ("good", "bad"):
+        (pdir / f"{name}.jsonl").write_text(json.dumps({
+            "type": "assistant", "timestamp": "2026-07-01T00:00:00Z",
+            "requestId": f"r-{name}", "sessionId": f"S-{name}",
+            "uuid": f"u-{name}",
+            "message": {"id": f"m-{name}", "model": "claude-opus-4-7",
+                        "usage": {"input_tokens": 0, "output_tokens": 5,
+                                  "cache_creation_input_tokens": 0,
+                                  "cache_read_input_tokens": 0}},
+        }) + "\n")
+    bad = pdir / "bad.jsonl"
+    bad.chmod(0)
+    try:
+        if os.access(bad, os.R_OK):
+            pytest.skip("the runner can read a mode-000 file")
+        conn = ns["open_cache_db"]()
+        try:
+            stats = cache_mod.sync_cache(conn)
+        finally:
+            conn.close()
+    finally:
+        bad.chmod(0o600)
+    assert stats.files_failed == 1 and not stats.full_walk_complete
+    assert frontier.accounting_census_complete("full", stats, expected_paths=0)
+    assert dict(frontier.accounting_residual(stats)) == {"files_failed": 1}
 
 
 # ── the real stores ─────────────────────────────────────────────────────────
@@ -344,7 +468,8 @@ def test_container_evidence_uses_only_indexed_nonempty_candidates():
     conn.execute("CREATE TABLE codex_session_files(path TEXT PRIMARY KEY, "
                  "container_kind TEXT, container_size_bytes INTEGER, "
                  "decoded_size_bytes INTEGER, mtime_ns INTEGER, device_id INTEGER, "
-                 "inode INTEGER, container_state TEXT, pending_container_fingerprint TEXT)")
+                 "inode INTEGER, container_state TEXT, pending_container_fingerprint TEXT, "
+                 "container_path TEXT)")
     statements = []
     conn.set_trace_callback(statements.append)
     assert frontier._container_evidence_for(conn, "codex_session_files", []) == {}
@@ -739,3 +864,184 @@ def test_barrier_retry_alone_refuses_every_completion_predicate(estate):
     assert not frontier.provider_sync_certifiable("targeted", stats)
     assert not frontier.conversation_sync_certifiable("full", stats)
     assert not frontier.conversation_sync_certifiable("targeted", stats, expected_paths=1)
+
+
+# ── #970: archived rollouts (spec 5.8, A8) ──────────────────────────────────
+
+def _live_roots(ns):
+    """The frontier roots production builds every tick (#970 T8)."""
+    return frontier.codex_frontier_roots(ns["_codex_home_roots"]())
+
+
+def _cursor_location(ns, opener, table, path):
+    conn = ns[opener]()
+    try:
+        return tuple(conn.execute(
+            f"SELECT container_path, container_state FROM {table} WHERE path=?",
+            (path,)).fetchone())
+    finally:
+        conn.close()
+
+
+def _accepted_zstd(ns, cache_mod, a):
+    compress_in_place(a)
+    for opener, sync in (("open_cache_db", "sync_codex_cache"),
+                         ("open_conversations_db", "sync_codex_conversations")):
+        conn = ns[opener]()
+        try:
+            ns[sync](conn)
+        finally:
+            conn.close()
+    cache_mod.run_codex_container_verification_drain(wait_for_requests=False)
+    for opener, sync in (("open_cache_db", "sync_codex_cache"),
+                         ("open_conversations_db", "sync_codex_conversations")):
+        conn = ns[opener]()
+        try:     # a complete walk over the adopted estate (seedable)
+            ns[sync](conn)
+        finally:
+            conn.close()
+    twin = a.with_name(a.name + ".zst")
+    for opener, table in (("open_cache_db", "codex_session_files"),
+                          ("open_conversations_db",
+                           "codex_conversation_source_files")):
+        assert _cursor_location(ns, opener, table, str(a)) == (
+            str(twin), "accepted"), table
+    return twin
+
+
+@pytest.mark.parametrize("kind", ["plain", "zstd"])
+def test_move_converges_in_both_planners(estate, kind):
+    """#970 A8: an archive move fires no Codex hook, so both planners must see
+    it once, the REAL walk must adopt the new location, and the next plans
+    must be quiet. Detects the perpetual frontier gap: a planner that observes
+    only the dated containers reads an archived rollout as vanished (and a
+    ticketed one as a cursor gap) on every tick, so every tick re-walks the
+    whole estate forever while the walk has nothing left to do."""
+    ns, cache_mod, a, _b, _roots, tmp_path = estate
+    provider = tmp_path / "codex"
+    container = a if kind == "plain" else _accepted_zstd(ns, cache_mod, a)
+    accounting = frontier.DashboardIngestFrontier(tmp_path / "frontier")
+    conversation = frontier.ConversationSyncFrontier(
+        tmp_path / "conversation-frontier")
+    for state, opener in ((accounting, "open_cache_db"),
+                          (conversation, "open_conversations_db")):
+        conn = ns[opener]()
+        try:
+            assert state.seed_provider(
+                "codex", conn, roots=_live_roots(ns)), state.last_seed_failure
+        finally:
+            conn.close()
+    assert _tick(ns, accounting, _live_roots(ns)).mode == "caught_up"
+    assert _conversation_tick(
+        ns, conversation, _live_roots(ns)).mode == "caught_up"
+    archive = provider / "archived_sessions"
+    archive.mkdir()
+    moved = archive / container.name
+    dated_value = None if kind == "plain" else str(container)
+    for source, target, accepted in ((container, moved, str(moved)),
+                                     (moved, container, dated_value)):
+        os.rename(source, target)
+        roots = _live_roots(ns)
+        conn = ns["open_cache_db"]()
+        try:   # before any walk: pending adoption, never a missing-file gap
+            assert frontier._target_has_cursor_gap(
+                conn, "codex", str(a), roots=roots) is False
+        finally:
+            conn.close()
+        conv = ns["open_conversations_db"]()
+        try:
+            assert frontier._conversation_target_risk(
+                conv, "codex", str(a), roots=roots) is None
+        finally:
+            conv.close()
+        for state, tick in ((accounting, _tick),
+                            (conversation, _conversation_tick)):
+            plans = [tick(ns, state, _live_roots(ns)) for _ in range(5)]
+            modes = [plan.mode for plan in plans]
+            assert all(plan.reason != "cursor_gap" for plan in plans), plans
+            assert modes[0] != "caught_up", modes        # the move is seen
+            assert modes.count("full") <= 2, modes
+            assert modes[-2:] == ["caught_up", "caught_up"], modes
+        for opener, table in (("open_cache_db", "codex_session_files"),
+                              ("open_conversations_db",
+                               "codex_conversation_source_files")):
+            assert _cursor_location(ns, opener, table, str(a)) == (
+                accepted, "accepted"), table
+        conn = ns["open_cache_db"]()
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM codex_prune_debt").fetchone()[0] == 0
+        finally:
+            conn.close()
+
+
+def test_archive_ticket_is_normalized_and_escape_refused(estate):
+    """#970 spec 5.8: a ticket spelled in the archive directory names the ONE
+    dated logical rollout (either container spelling), and an archive entry
+    that escapes the sessions-plus-archive union, or that has no dated
+    identity, is refused. Detects a target that ingests an archive pathname as
+    a second identity (double count) or reads outside the configured home."""
+    ns, _cache_mod, a, b, _roots, tmp_path = estate
+    archive = tmp_path / "codex" / "archived_sessions"
+    archive.mkdir()
+    moved = archive / a.name
+    os.rename(a, moved)
+    roots = _live_roots(ns)
+    paths, reason = frontier._ticket_target_paths(
+        "codex", [("codex", str(moved), None, None, None)], roots)
+    assert reason is None and paths == frozenset({str(a)})
+    twin = compress_in_place(moved)
+    paths, reason = frontier._ticket_target_paths(
+        "codex", [("codex", str(twin), None, None, None),
+                  ("codex", str(a), None, None, None)], roots)
+    assert reason is None and paths == frozenset({str(a)})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "escaped.jsonl.zst"
+    escaped.write_bytes(zstd_bytes(b'{"a":1}\n'))
+    link = archive / ("rollout-2026-07-20T10-09-00-" + _sid(9) + ".jsonl.zst")
+    os.symlink(escaped, link)
+    _paths, reason = frontier._ticket_target_paths(
+        "codex", [("codex", str(link), None, None, None)], roots)
+    assert reason == "target_outside_scope"
+    unmapped = archive / "notes.jsonl"
+    unmapped.write_bytes(b'{"a":1}\n')
+    _paths, reason = frontier._ticket_target_paths(
+        "codex", [("codex", str(unmapped), None, None, None)], roots)
+    assert reason == "target_outside_scope"
+    # A dated sessions ticket keeps today's rule.
+    paths, reason = frontier._ticket_target_paths(
+        "codex", [("codex", str(b), None, None, None)], roots)
+    assert reason is None and paths == frozenset({str(b)})
+
+
+def test_archive_directory_joins_directory_evidence(estate):
+    """#970 spec 5.8: the archive directory is certified directory evidence,
+    so an archive file appearing or disappearing with no Codex hook
+    invalidates the certificate. Detects an archived rollout that is never
+    counted (or a deleted one never pruned) while every tick reports the
+    estate caught up."""
+    ns, _cache_mod, _a, _b, _roots, tmp_path = estate
+    archive = tmp_path / "codex" / "archived_sessions"
+    archive.mkdir()
+    state = frontier.DashboardIngestFrontier(tmp_path / "frontier")
+    conn = ns["open_cache_db"]()
+    try:
+        assert state.seed_provider(
+            "codex", conn, roots=_live_roots(ns)), state.last_seed_failure
+        assert state.plan_provider(
+            "codex", conn, roots=_live_roots(ns)).mode == "caught_up"
+        fresh = archive / _name(7)
+        write_rollout(fresh, conversation_records(
+            2, session_id=_sid(7), label="archived"))
+        plan = state.plan_provider("codex", conn, roots=_live_roots(ns))
+        assert (plan.mode, plan.reason) == ("full", "filesystem_changed")
+        assert state.seed_provider(
+            "codex", conn, roots=_live_roots(ns)), state.last_seed_failure
+        assert state.plan_provider(
+            "codex", conn, roots=_live_roots(ns)).mode == "caught_up"
+        fresh.unlink()
+        plan = state.plan_provider("codex", conn, roots=_live_roots(ns))
+        assert (plan.mode, plan.reason) == ("full", "filesystem_changed")
+    finally:
+        conn.close()

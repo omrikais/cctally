@@ -2271,6 +2271,18 @@ export function dispatch(action: Action): void {
       // of every source; the panel (not the store) filters by active source.
       const seen = new Set(state.seenAlertIds);
       const rateChanges = action.rateChanges ?? [];
+      // #1015 spec 5.7 (U2) — a transition fitted from inputs a reviewed
+      // correction later changed never reaches the user as a toast. Its
+      // identity is marked seen like any other row (so it can never queue
+      // later), a queued copy is dropped, and a visible one is dismissed. A
+      // toast already displayed and dismissed is a delivered notification
+      // and cannot be recalled (R4).
+      const superseded = new Set(
+        rateChanges.filter((r) => r.supersession != null).map((r) => r.id),
+      );
+      const isSuperseded = (
+        payload: AlertEntry | SourceAlertRow | MeterRateChangeEntry,
+      ): boolean => isMeterRateChangePayload(payload) && superseded.has(payload.id);
       if (action.isFirstTick) {
         // Cold-start / reconnect: seed every row as seen (both the normalized
         // and bare legacy forms, for one release of continuity) without
@@ -2292,8 +2304,10 @@ export function dispatch(action: Action): void {
       }
       const fresh = action.rows.filter((r) => !seen.has(toastAlertId(r)));
       for (const r of fresh) for (const f of seedFormsForRow(r)) seen.add(f);
-      const freshRateChanges = rateChanges.filter((r) => !seen.has(r.id));
-      for (const r of freshRateChanges) seen.add(r.id);
+      const freshRateChanges = rateChanges.filter(
+        (r) => !seen.has(r.id) && r.supersession == null,
+      );
+      for (const r of rateChanges) seen.add(r.id);
       // Threshold rows first, then the rate transitions. The order is a
       // decision: a threshold crossing is about this week's consumption and
       // is actionable now, while a rate transition explains why the meter
@@ -2302,7 +2316,15 @@ export function dispatch(action: Action): void {
         [...fresh, ...freshRateChanges];
 
       let toast = state.toast;
-      let queue = state.alertToastQueue;
+      let queue = superseded.size > 0
+        ? state.alertToastQueue.filter((entry) => !isSuperseded(entry))
+        : state.alertToastQueue;
+      if (toast?.kind === 'alert' && isSuperseded(toast.payload)) {
+        // Dismissed exactly as HIDE_TOAST would: promote the reconciled head.
+        const [next, ...rest] = queue;
+        toast = next != null ? { kind: 'alert', payload: next } : null;
+        queue = rest;
+      }
       if (freshAll.length > 0) {
         if (!toast || toast.kind !== 'alert') {
           toast = { kind: 'alert', payload: freshAll[0] };

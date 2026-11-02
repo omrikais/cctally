@@ -5,6 +5,37 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.117.0] - 2026-11-02
+
+### Added
+- `cctally doctor` adds `accounts.claude_cost_attribution`, reporting how recent Claude cost was attributed to accounts and the progress of the one-time upgrade step that records existing attribution.
+
+### Changed
+- `cctally quota` no longer withholds a forecast over a small Sonnet 5.5 share shift that meter evidence shows to be immaterial, and withheld lines name the family reason. Stored calibrations go stale until the next `cctally quota` run.
+- When a reviewed `cctally db rederive` correction changes a calibration's inputs, `cctally forecast` and the dashboard withhold calibrated figures ("recalibration needed") until `cctally quota` refits. Stats rebuilds once on upgrade.
+- A metering-rate change fitted from corrected inputs no longer shows its status-line marker or sends its notification; the dashboard's Recent Alerts keeps it, labelled "superseded by a correction".
+- After a gap without a running `cctally dashboard`, its first transcript catch-up writes less to `conversations.db`, and `cctally dashboard-perf` and `cctally doctor` no longer judge that catch-up as steady-state disk writes.
+- Automatic credit, early-reset and status-line drop detection paused by an older cctally process now resumes on its own, per account and per limit; `cctally doctor` shows what each limit waits for. Stats rebuilds once on upgrade.
+
+### Fixed
+- A `stats.db` upgrade rebuild or `cctally db rebuild --db stats` no longer reprices closed five-hour blocks and their milestones at the current rate card when it recovers missing records.
+- Archived Codex threads now count in `codex-*` reports, quota history and the dashboard, and archiving no longer deletes history. Archived usage first seen with no recorded account stays unattributed unless quota windows assign it.
+- On Python builds that link SQLite 3.54.1, a running `cctally dashboard` reclaims transcript space freed by retention again, so `conversations.db` shrinks instead of keeping the freed pages.
+- An idle Claude Code session's stale `cctally statusline` reading no longer records a false weekly reset, five-hour credit or zero-cost milestone once a later usage check reads higher; the stats index rebuilds once after upgrading.
+- Claude cost is attributed to the account active when Claude Code wrote it, not the one active when cctally read it. Upgrades and `cctally cache-sync --rebuild` keep each row's account.
+- `cctally statusline` measures `🧠` context % against the session's real context window (1M for Opus, Sonnet and Haiku 5.5), so an Opus 5.5 session no longer shows a red percentage five times too high and Fable sessions no longer show `N/A`.
+- A `stats.db` upgrade rebuild could exit early as busy when a status-line check for a running rebuild landed at the instant it started, delaying the rebuild; that check no longer interferes with a starting rebuild.
+- `cctally explain` and the dashboard's Explain view measure Opus, Sonnet and Haiku 5.5 requests against their 1M context window and now evaluate Fable requests, so short conversations are no longer flagged for large context against 200K.
+- `cctally five-hour-blocks`, `cctally five-hour-breakdown` and the dashboard keep each five-hour window's genuine peak, milestones and readings through a usage credit and through every stats.db rebuild, instead of dropping some.
+- `cctally record-credit` records the exact `--at` time instead of the start of that hour, keeping readings taken earlier in that hour, and a `--force` replacement at the replaced credit's own second now takes effect.
+- A weekly usage credit is no longer lost when recording is interrupted while it is being saved.
+- After stats.db is rebuilt from a missing or corrupt file, the stats index keeps updating incrementally instead of falling back to rereading the whole recorded history.
+- On an exFAT data folder, cctally now quarantines and rebuilds a corrupt `conversations.db` or `cache.db` and can run `db repair --db stats`, and a rebuild no longer fails after 20 s while another cctally process has the store open but idle.
+- On macOS, `cctally cache-sync --rebuild` no longer writes a full copy of `conversations.db` on volumes without copy-on-write clones (HFS+, exFAT); there and on Linux ext4 its integrity check runs in place when no write-ahead log is pending.
+- `cctally dashboard` no longer waits on a reverse-DNS lookup of its bind address before it prints its URL and serves, a wait that lasted the resolver's whole timeout where the network never answers that lookup.
+- Codex hooks installed by `cctally setup` no longer stall Codex sessions for over 10 seconds on large histories or after upgrading, or for over a minute with Codex budget alerts on; leftover work runs in the background.
+- `cctally db rederive` restores a five-hour milestone's cost when an earlier rederive repriced it under a closed block; one whose history is ambiguous keeps its cost and is listed in `withheldMilestoneRepairs`.
+
 ## [1.116.1] - 2026-10-28
 
 ### Maintenance

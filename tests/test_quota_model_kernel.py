@@ -1896,13 +1896,19 @@ def test_the_outcome_resolver_covers_every_allowed_triple():
 def test_evidence_codes_are_the_closed_union_of_both_enums():
     # Section 22 supersedes Part II's "code carries a withholding cause".
     # 6 causes + 10 non-ok statuses, sharing only `token-split-unknown`.
+    # #1015 spec 5.4 adds `recalibration-needed`: a stored-calibration
+    # refusal that is neither a cause nor a status (no precedence or exit
+    # change), so the union is asserted by equality, not by count alone.
     expected = {c.value for c in qm.WithholdingCause} | {
         s.value for s in qm.CalibrationStatus
         if s is not qm.CalibrationStatus.OK
-    }
+    } | {"recalibration-needed"}
     assert qm.EVIDENCE_CODES == expected
-    assert len(qm.EVIDENCE_CODES) == 15
+    assert len(qm.EVIDENCE_CODES) == 16
     assert "ok" not in qm.EVIDENCE_CODES
+    assert qm.RECALIBRATION_NEEDED == "recalibration-needed"
+    assert qm.RECALIBRATION_NEEDED not in {s.value for s in qm.CalibrationStatus}
+    assert qm.RECALIBRATION_NEEDED not in {c.value for c in qm.WithholdingCause}
 
 
 def test_a_code_outside_the_closed_union_is_rejected():
@@ -2364,7 +2370,10 @@ def test_the_mix_support_policy_is_fingerprinted():
     assert payload["token_class_max_relative_effect"] == 0.05
     assert payload["vector"] == "raw-quantity-share"
     assert payload["effective_radius"] == "max(empirical, floor)"
-    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 4
+    # #991: the evidence-bounded family test is a fingerprinted rule too.
+    assert payload["family_max_relative_effect"] == 0.05
+    assert qm.constants_payload()["mixSupportPolicyRevision"] == 2
+    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 5
 
 
 def test_the_published_radii_are_the_effective_ones():
@@ -3704,6 +3713,8 @@ def test_constants_payload_carries_the_era_table():
             "fastModeParticipation": "usage-credits-only-excluded",
             "provenance": ('The Opus 5 calibration, docs/quota-model.md '
                            '"The finding"'),
+            "referenceFamily": "claude-opus-5",
+            "familyRateBounds": [],
         },
         {
             "id": "opus-5-5",
@@ -3715,6 +3726,10 @@ def test_constants_payload_carries_the_era_table():
             "provenance": ("The 2026-10-18 Opus 5.5 refit; output weakly "
                            "identified (95% CI 0.23–1.13), cache read "
                            "sharp (0.0128–0.0168)"),
+            "referenceFamily": "claude-opus-5-5",
+            "familyRateBounds": [
+                {"family": "claude-sonnet-5-5", "low": 0.09, "high": 0.61,
+                 "provenance": "991-meter-evidence-2026-10-23"}],
         },
     ]
     # No mutable current weight set survives anywhere.
@@ -3722,5 +3737,349 @@ def test_constants_payload_carries_the_era_table():
     assert "coefficientSupport" not in payload
     assert not hasattr(qm, "TOKEN_CLASS_WEIGHTS")
     assert not hasattr(qm, "COEFFICIENT_SUPPORT")
-    assert payload["algorithmRevision"] == 4
-    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 4
+    assert payload["algorithmRevision"] == 5
+    assert qm.QUOTA_MODEL_ALGORITHM_REVISION == 5
+
+
+# ==========================================================================
+# #991 — the forecast probe goes through the evidence-bounded evaluator
+#
+# Spec docs/superpowers/specs/2026-10-23-991-family-participation-design.md
+# section 4.4 and section 5 test 3. Every population below lives in the
+# `opus-5-5` era, the one that carries a family rate bound.
+# ==========================================================================
+_OPUS = "claude-opus-5-5"
+_SONNET = "claude-sonnet-5-5"
+_HAIKU = "claude-haiku-5-5"
+_EPOCH55 = dt.date(2026, 9, 23)
+_NOW55 = dt.datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+_WEEK55 = dt.datetime(2026, 10, 15, tzinfo=UTC)
+_FAMILY_QUALIFIERS = {"forecast-family-unbounded",
+                      "forecast-family-effect-over-limit"}
+
+
+def _obs55(index, units, *, family=None, classes=None, cause=None):
+    return qm.DailyObservation(
+        date=_EPOCH55 + dt.timedelta(days=index), segment_id=0,
+        meter_delta=10.0, units=float(units),
+        class_shares={"fresh": 1.0} if classes is None else classes,
+        family_shares={_OPUS: 1.0} if family is None else family,
+        cause=cause)
+
+
+def _series55(n=12, start=0, base=10e6):
+    return [_obs55(start + i, base + (i % 5) * base / 100.0)
+            for i in range(n)]
+
+
+def _fresh_entry(model, fresh, *, output=0, day=_NOW55.date()):
+    return qm.EntryRecord(
+        at=dt.datetime.combine(day, dt.time(6), tzinfo=UTC), model=model,
+        fresh=fresh, output=output, cache_create_total=0, cache_1h=0,
+        cache_read=0)
+
+
+def _analyse55(series, **kw):
+    args = dict(now=_NOW55, newest_at=_NOW55 - dt.timedelta(hours=1),
+                era=OPUS55, observed_percent=40, current_week_units=40e6,
+                current_week_start=_WEEK55,
+                current_week_end=_WEEK55 + dt.timedelta(days=7),
+                forecast_population=())
+    args.update(kw)
+    return qm.analyse(series, **args)
+
+
+_SONNET_5 = {_OPUS: 950_000, _SONNET: 50_000}
+_SONNET_10 = {_OPUS: 900_000, _SONNET: 100_000}
+_HAIKU_5 = {_OPUS: 950_000, _HAIKU: 50_000}
+
+
+def _by_model(units):
+    """One fresh-only entry per family, so units ARE the share numerators."""
+    return [_fresh_entry(model, fresh) for model, fresh in units.items()]
+
+
+def test_the_forecast_probe_admits_a_sonnet_only_shift_tv_rejects():
+    """RED. A 5% Sonnet forecast over a pure-Opus fit is published (#991).
+
+    Its family distance 0.05 is outside the 0.03 floor radius, so the
+    two-radius rule withheld the fit; the bound is 0.05 * 0.91 = 0.0455,
+    inside 5%, so the evaluator admits it. Withholding it denies a user a
+    forecast the meter evidence shows to be immaterially affected.
+    Admission changes publication, never arithmetic: every published value
+    equals the empty-forecast analysis of the same series.
+    """
+    series = _series55()
+    a = _analyse55(series, forecast_population=_by_model(_SONNET_5))
+    assert a.family_radius == pytest.approx(0.03)
+    assert a.forecast_support.family_distance == pytest.approx(0.05)
+    assert a.forecast_support.family_within_radius is False
+    assert a.forecast_support.family_effect.bound == pytest.approx(0.0455)
+    assert a.forecast_support.family_admitted_by == "materiality"
+    assert a.forecast_support.class_within_radius is True
+    assert a.status is qm.CalibrationStatus.OK
+    assert a.exit_code == 0
+    assert a.composition_provenance == frozenset()
+    assert a.forecast_supported is True
+    plain = _analyse55(series)
+    for field in ("fitted", "consumption", "headroom", "projection"):
+        assert getattr(a, field) == getattr(plain, field), field
+
+
+def test_decisive_day_rejection_is_unchanged_after_a_confirmed_split():
+    """PRESERVATION. Decisive watch days keep the two-axis TV rule.
+
+    Every watch day carries 5% Sonnet, which the bound would admit for a
+    forecast, but a decisive day guards DETECTION and must stay outside the
+    new branch, so it is still named `decisive-day`.
+    """
+    series = _series55(20) + [
+        _obs55(20 + i, 30e6 + i * 1e5, family={_OPUS: 0.95, _SONNET: 0.05})
+        for i in range(6)]
+    a = _analyse55(series)
+    assert a.detector.qualified is True
+    assert qm.tv_distance({_OPUS: 0.95, _SONNET: 0.05},
+                          a.family_shares) > a.family_radius
+    assert a.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
+    assert a.composition_provenance == frozenset(
+        {qm.CompositionProvenance.DECISIVE_DAY})
+
+
+def test_a_forecast_family_failure_still_permits_transition_persistence():
+    """PRESERVATION. The permit vocabulary is unchanged by the new branch.
+
+    A confirmed split whose forecast is withheld for a 10% Sonnet shift is
+    the lone `forecast-aggregate` shape `transition_persistence_permitted`
+    admits, exactly as a TV-rejected forecast was.
+    """
+    series = _series55(20) + [_obs55(20 + i, 30e6 + i * 1e5)
+                              for i in range(6)]
+    a = _analyse55(series, forecast_population=_by_model(_SONNET_10))
+    assert a.detector.qualified is True
+    assert a.composition_provenance == frozenset(
+        {qm.CompositionProvenance.FORECAST_AGGREGATE})
+    assert qm.transition_persistence_permitted(a) is True
+
+
+def _weighted_split_series():
+    """20 baseline and 6 watch days whose family shares move WITH their units,
+    so the fit-weighted composition differs from every median centre."""
+    baseline = [_obs55(i, 10e6 + (i % 5) * 1e5,
+                       family={_OPUS: 0.98 - (i % 5) * 0.005,
+                               _SONNET: 0.02 + (i % 5) * 0.005})
+                for i in range(20)]
+    watch = [_obs55(20 + i, 30e6 + i * 1e6,
+                    family={_OPUS: 0.9 - i * 0.01, _SONNET: 0.1 + i * 0.01})
+             for i in range(6)]
+    return baseline, watch
+
+
+def _exact_q(days):
+    from fractions import Fraction
+    total = sum(Fraction(o.units) for o in days)
+    keys = sorted({k for o in days for k in o.family_shares})
+    return {k: float(sum(Fraction(o.units) * Fraction(o.family_shares.get(k, 0.0))
+                         for o in days) / total) for k in keys}
+
+
+def test_the_fit_family_shares_are_the_unit_weighted_fit_days():
+    """q is taken over exactly the days each fit used, weighted by units.
+
+    The materiality reference must describe the blend the published rate was
+    fitted on. The median centre, the current centre or the other regime's
+    days would each measure a forecast against a blend no fit saw.
+    """
+    baseline, watch = _weighted_split_series()
+    a = _analyse55(baseline + watch)
+    assert a.detector.qualified is True
+    assert a.detector.split_date == watch[0].date
+    assert a.fit_family_shares == pytest.approx(_exact_q(watch), rel=1e-12)
+    assert a.baseline_fit_family_shares == pytest.approx(
+        _exact_q(baseline), rel=1e-12)
+    assert a.baseline_fit_family_shares[_SONNET] == pytest.approx(
+        1.535 / 51, rel=1e-12)
+    # Non-vacuity: each differs from the centres a mutation could substitute.
+    for centre in (a.family_shares, a.current_family_shares):
+        assert a.fit_family_shares[_SONNET] != pytest.approx(
+            centre[_SONNET], rel=1e-6)
+        assert a.baseline_fit_family_shares[_SONNET] != pytest.approx(
+            centre[_SONNET], rel=1e-6)
+    # #1015 spec 5.2: the estimator bounds are the first and last day each
+    # fit was computed over, which a regime's `fitLineage.estimator` records.
+    assert a.published_day_bounds == (watch[0].date, watch[-1].date)
+    assert a.baseline_day_bounds == (baseline[0].date, baseline[-1].date)
+
+
+def test_no_confirmed_split_has_a_fit_q_and_no_baseline_q():
+    baseline, _ = _weighted_split_series()
+    a = _analyse55(baseline)
+    assert a.detector.qualified is False
+    assert a.fit_family_shares == pytest.approx(_exact_q(baseline), rel=1e-12)
+    assert a.baseline_fit_family_shares is None
+    assert a.published_day_bounds == (baseline[0].date, baseline[-1].date)
+    assert a.baseline_day_bounds is None
+
+
+def test_the_forecast_effect_is_measured_against_the_fit_weighted_q():
+    """The probe's effect bound uses q, never the median family centre.
+
+    The baseline days' Sonnet share moves with their units, so q (Sonnet
+    1.535/51) differs from the median centre (Sonnet 0.03). Measuring a 10%
+    Sonnet forecast against the centre would bound its effect relative to a
+    blend no fit was taken over (0.06549 rather than 0.06540).
+    """
+    baseline, _ = _weighted_split_series()
+    a = _analyse55(baseline, forecast_population=_by_model(_SONNET_10))
+    forecast = {_OPUS: 0.9, _SONNET: 0.1}
+    against_q = qm.family_effect_bound(forecast, a.fit_family_shares,
+                                       era=OPUS55).bound
+    against_centre = qm.family_effect_bound(forecast, a.family_shares,
+                                            era=OPUS55).bound
+    assert against_q != pytest.approx(against_centre, rel=1e-6)
+    assert a.forecast_support.family_effect.bound == pytest.approx(
+        against_q, rel=1e-12)
+
+
+def test_fit_family_shares_of_nothing_is_none():
+    assert qm.fit_family_shares([]) is None
+    assert qm.fit_family_shares([_obs55(0, 0.0)]) is None
+
+
+@pytest.mark.parametrize("units,code", [
+    (_SONNET_10, "forecast-family-effect-over-limit"),
+    (_HAIKU_5, "forecast-family-unbounded"),
+])
+def test_a_forecast_family_failure_names_its_kind(units, code):
+    """A withheld forecast says WHICH family failure withheld it.
+
+    10% Sonnet has a bound (0.091) above the limit; 5% Haiku changed with no
+    bound at all. Without the code a user cannot tell "too far" from "not
+    measured".
+    """
+    a = _analyse55(_series55(), forecast_population=_by_model(units))
+    assert a.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
+    assert a.forecast_support.family_admitted_by is None
+    assert a.forecast_support.class_within_radius is True
+    for field in (a.fitted, a.consumption, a.headroom, a.projection):
+        assert field.state == "withheld"
+        assert code in field.qualifications
+        assert len(_FAMILY_QUALIFIERS & set(field.qualifications)) == 1
+
+
+def test_a_class_only_failure_adds_no_family_qualifier():
+    a = _analyse55(_series55(), forecast_population=[
+        _fresh_entry(_OPUS, 120_000, output=880_000)])
+    assert a.status is qm.CalibrationStatus.UNSUPPORTED_MODEL_MIX
+    assert a.forecast_support.family_admitted_by == "radius"
+    assert a.forecast_support.class_within_radius is False
+    for field in (a.fitted, a.consumption, a.headroom, a.projection):
+        assert not _FAMILY_QUALIFIERS & set(field.qualifications)
+
+
+def test_overlay_status_preserves_the_forecast_fields_and_qualifier():
+    base = _analyse55(_series55(), forecast_population=_by_model(_HAIKU_5))
+    overlaid = qm.overlay_status(base, qm.CalibrationStatus.STALE)
+    assert overlaid.status is qm.CalibrationStatus.STALE
+    for name in ("fit_family_shares", "baseline_fit_family_shares",
+                 "forecast_family_shares", "forecast_class_shares",
+                 "forecast_probe_state", "forecast_support",
+                 "forecast_supported", "published_day_bounds",
+                 "baseline_day_bounds"):
+        assert getattr(overlaid, name) == getattr(base, name), name
+    assert "forecast-family-unbounded" in overlaid.consumption.qualifications
+
+
+_UNKNOWN = [_fresh_entry("claude-vega-9", 1_000_000)]
+
+
+def test_the_forecast_probe_states():
+    """Each probe state carries its own diagnostics (spec 4.4).
+
+    `not-probed` and `unaggregatable` publish no vectors and no support;
+    `no-reference` publishes the vectors without running the evaluator;
+    `probed` publishes both.
+    """
+    series = _series55()
+    empty = _analyse55(series)
+    assert (empty.forecast_probe_state, empty.forecast_family_shares,
+            empty.forecast_support, empty.forecast_supported) == \
+        ("not-probed", None, None, True)
+    unaggregatable = _analyse55(series, forecast_population=_UNKNOWN)
+    assert unaggregatable.forecast_probe_state == "unaggregatable"
+    assert unaggregatable.forecast_family_shares is None
+    assert unaggregatable.forecast_class_shares is None
+    assert unaggregatable.forecast_support is None
+    assert unaggregatable.forecast_supported is False
+    thin = _analyse55(series[:1], forecast_population=_by_model(_SONNET_5))
+    assert thin.family_radius is None
+    assert thin.forecast_probe_state == "no-reference"
+    assert thin.forecast_family_shares == pytest.approx(
+        {_OPUS: 0.95, _SONNET: 0.05})
+    assert thin.forecast_support is None
+    assert thin.forecast_supported is True
+    probed = _analyse55(series, forecast_population=_by_model(_SONNET_10))
+    assert probed.forecast_probe_state == "probed"
+    assert probed.forecast_support.supported is False
+    assert probed.forecast_supported is False
+
+
+_ALL_WITHHELD = [_obs55(i, 10e6, cause=qm.WithholdingCause.SPARSE_LOCAL_HISTORY)
+                 for i in range(12)]
+_UNDEFINED_CENTRE = [_obs55(i, 10e6 + (i % 5) * 1e5,
+                            classes={"fresh": 0.0, "output": 0.0})
+                     for i in range(12)]
+
+
+@pytest.mark.parametrize("series,provenance,supported", [
+    (_ALL_WITHHELD, frozenset(), True),
+    (_UNDEFINED_CENTRE,
+     frozenset({qm.CompositionProvenance.UNDEFINED_REFERENCE}), False),
+    (_series55(1), frozenset(), True),
+    (_series55(),
+     frozenset({qm.CompositionProvenance.UNAGGREGATABLE_FORECAST}), False),
+], ids=["no-reference-days", "undefined-centre", "undefined-radius",
+        "all-defined"])
+def test_an_unaggregatable_forecast_keeps_the_ordered_early_returns(
+        series, provenance, supported):
+    """PRESERVATION of the provenance, with the new state on top.
+
+    The probe state is a diagnostic of the aggregation only and never decides
+    the provenance, which stays what today's ordered early returns decide:
+    `unaggregatable-forecast` only once every reference is defined.
+    """
+    a = _analyse55(series, forecast_population=_UNKNOWN)
+    assert a.composition_provenance == provenance
+    assert a.forecast_probe_state == "unaggregatable"
+    assert a.forecast_supported is supported
+
+
+def test_the_published_forecast_vectors_are_the_forecast_aggregate():
+    """The forecast vectors are the probed population's own aggregate.
+
+    Units under opus-5-5: opus 900,000; sonnet 60,000 + 40,000 * 0.64 =
+    85,600. Raw classes: fresh 960,000 and output 40,000 of 1,000,000. The
+    population differs from both the reference and the current centres, so
+    publishing a centre in its place cannot pass.
+    """
+    a = _analyse55(_series55(), forecast_population=[
+        _fresh_entry(_OPUS, 900_000),
+        _fresh_entry(_SONNET, 60_000, output=40_000)])
+    assert a.forecast_family_shares == pytest.approx(
+        {_OPUS: 900_000 / 985_600, _SONNET: 85_600 / 985_600}, rel=1e-12)
+    assert a.forecast_class_shares == pytest.approx(
+        {"fresh": 0.96, "output": 0.04, "cache_1h": 0.0, "cache_read": 0.0},
+        rel=1e-12)
+    for centre in (a.family_shares, a.current_family_shares):
+        assert a.forecast_family_shares != pytest.approx(centre)
+
+
+def test_the_units_and_the_fit_arithmetic_are_unchanged():
+    """PRESERVATION. No multiplier touches units and the fit is unchanged."""
+    series = _series55()
+    a = _analyse55(series, forecast_population=_by_model({_OPUS: 1_000_000}))
+    point, interval = qm.jackknife_fit(series)
+    assert (a.fitted.value, a.fitted.interval) == (point, interval)
+    assert a.consumption.value == 40e6 / point
+    assert qm.class_units({"fresh": 1000, "output": 1000, "cache_1h": 1000,
+                           "cache_read": 1000}, OPUS55) == \
+        pytest.approx(2654.8, abs=1e-9)

@@ -365,9 +365,11 @@ INVENTORY_TEXT = (
     "status-line files an older cctally release used. Until it can, cctally "
     "cannot tell whether an older process changed it. Check the file's "
     "permissions and the disk.")
+#: #948 spec 7.3 (operator-approved 2026-11-01), verbatim: the addendum
+#: while the validated index shows the inventory episode open.
 INVENTORY_PAUSED_TEXT = (
-    "Automatic credit and reset detection is paused because of this, and "
-    "making the file readable again does not end the pause (see "
+    "Automatic credit and reset detection is paused because of this. Once "
+    "the file is readable again it resumes on its own (see "
     "`accounting.outcome_quarantine`); usage recording continues.")
 _INVENTORY = {"available": False, "path": "/data/statusline-candidates/c.json",
               "operation": "read", "error": "Input/output error [EIO]"}
@@ -377,7 +379,7 @@ _INVENTORY = {"available": False, "path": "/data/statusline-candidates/c.json",
 def test_an_incomplete_inventory_warns_at_zero_excluded_records(paused):
     """The leg reports the inventory independently of the excluded count: a
     WARN at zero, naming the path, operation and error, and claiming the
-    pause only when the validated index holds the durable marker."""
+    pause only while the validated index shows the inventory episode open."""
     data = _data(0, None)
     data["legacySpoolInventory"] = {**_INVENTORY, "paused": paused}
     result = _leg(T0, data)
@@ -444,15 +446,18 @@ def test_doctor_reports_an_unreadable_legacy_file_read_only(
         ns, monkeypatch, capsys, deep):
     """Doctor can be the first process to meet the error: it warns with the
     path, operation and error while nothing is excluded, appends nothing,
-    changes no spool file, and claims no pause (no durable marker). Once the
-    reducer has journaled the `inventory-incomplete` trigger and it is
-    folded, the leg adds the pause sentence and `accounting.outcome_
-    quarantine` warns with the revision 5 marker wording."""
+    changes no spool file, and claims no pause (no open inventory episode).
+    Once the reducer has journaled the `inventory-incomplete` trigger and it
+    is folded, the leg adds the #948 addendum and `accounting.outcome_
+    quarantine` warns per limit, waiting until cctally can read the file."""
     import _cctally_journal as jr
     import _lib_accounts
     import _lib_journal as J
+    # #948 F7: doctor lists only accounts seen in the last seven days, so its
+    # clock sits just after the reading below.
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-10-09T09:30:00Z")
     # Fix round K12 (K11R-15): the journal names a Claude account, so the
-    # per-account marker wording below is asserted on a real row.
+    # per-account, per-limit wording below is asserted on a real row.
     jr.append_record(J.make_account_observe(
         at="2026-10-09T08:00:00Z", provider="claude", natural_id="A",
         account_key=_lib_accounts.account_key("claude", "A")))
@@ -487,16 +492,21 @@ def test_doctor_reports_an_unreadable_legacy_file_read_only(
         error=leg["details"]["legacySpoolInventory"]["error"]
     ) + " " + INVENTORY_PAUSED_TEXT
     quarantine = legs["accounting.outcome_quarantine"]
-    # The marker is durable in the validated index, and the account the
-    # journal names is paused with the inventory-marker wording.
-    assert [m["reason"] for m in
-            quarantine["details"]["unresolvedSpoolMarkers"]] == [
-        "inventory-incomplete"], quarantine
+    # The inventory episode is open in the validated index, and the account
+    # the journal names waits, per limit, until cctally can read the file.
+    episode = quarantine["details"]["inventoryEpisode"]
+    assert episode["state"] == "open" and episode["opener"]["segment"], episode
     rows = quarantine["details"]["accounts"]
     assert rows, quarantine
     for row in rows:
-        assert row["unresolvedSpoolMarker"], row
-        assert "could not read the status-line files" in row["message"], row
+        assert row["cause"] == "inventory-incomplete", row
+        assert {d["waitingFor"] for d in row["axes"].values()} == {
+            "inventory"}, row
+        lines = row["message"].split("\n")
+        assert "could not read the status-line files" in lines[0], row
+        assert lines[1:] == [
+            f"five-hour: paused - waiting until cctally can read {path}",
+            f"weekly: paused - waiting until cctally can read {path}"], row
 
 
 # --------------------------------------------------------------------------
