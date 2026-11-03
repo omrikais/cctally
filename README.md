@@ -30,11 +30,15 @@ Your Claude Code plan meters you with a percentage that creeps up all week. ccta
 </p>
 
 <!-- cctally:latest-stable:begin -->
-**Latest stable: v1.116.1** (2026-10-28)
+**Latest stable: v1.117.2** (2026-11-03)
 
-Highlights from the `v1.113.0` to `v1.116.1` stable upgrade:
+Highlights from the `v1.116.1` to `v1.117.2` stable upgrade:
 
-[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.116.1)
+- With more than one Claude account, the `cctally dashboard` Current Week card and modal show one account's cycle, milestones, spend and `$/1%` beside that account's label, and the older/newer cycle buttons stay on that account.
+- `cctally five-hour-breakdown` and the dashboard's five-hour milestones show `, ` (`null` in `--json`) instead of a weekly percentage that a weekly credit later retired.
+- With more than one Claude account, the `cctally dashboard` All view shows its combined spend headline, summing each account's current cycle, instead of usually leaving it out.
+
+[See every change in this stable upgrade](https://github.com/omrikais/cctally/releases/tag/v1.117.2)
 <!-- cctally:latest-stable:end -->
 
 ## Quick start
