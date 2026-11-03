@@ -467,6 +467,9 @@ def home_clamped_milestone(tmp_path, monkeypatch):
     start_iso = "2026-04-30T10:30:00+00:00"
     key = ns["_canonical_5h_window_key"](
         int(dt.datetime.fromisoformat(resets_iso).timestamp()))
+    # The payload carries the held-write marker every native held write
+    # stores beside its effective basis value (#836, spec 5.4): without it a
+    # held row is a suppression-retired one, whose join publishes None.
     cur = conn.execute(
         """
         INSERT INTO weekly_usage_snapshots (
@@ -478,8 +481,8 @@ def home_clamped_milestone(tmp_path, monkeypatch):
         """,
         ("2026-04-30T11:42:00Z", "2026-04-27", "2026-05-04",
          "2026-04-27T00:00:00+00:00", "2026-05-04T00:00:00+00:00",
-         _C836_EFFECTIVE_PCT, None, "userscript", "{}", 42.0, key,
-         "unattributed"),
+         _C836_EFFECTIVE_PCT, None, "userscript",
+         '{"weeklyObservationHeld": true}', 42.0, key, "unattributed"),
     )
     snapshot_id = int(cur.lastrowid)
     conn.execute(

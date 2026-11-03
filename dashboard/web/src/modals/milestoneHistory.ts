@@ -55,22 +55,27 @@ export function stepWeek(
  * to resolve against the merged enumeration. Pass `null` iff "All accounts" is
  * selected; the server then answers with the shipped merged body. A mismatched
  * or omitted-under-focus qualifier is a 404 `unknown cycle`, never a
- * wrong-account body; `*`, blank, uppercase or malformed values are a 400, and
- * the qualifier is rejected outright on `claude`.
+ * wrong-account body; `*`, blank, uppercase or malformed values are a 400.
+ *
+ * #836 (U1): Claude qualifies the same way. On a decorated store the Current
+ * Week modal passes the displayed account (`current_week.account_key`), whose
+ * scoped index produced the key; the server answers only with that account's
+ * cycle and rejects a qualifier on an undecorated store, where the modal
+ * passes `null` and the request stays the unqualified route.
  *
  * The cache key carries the account for the same reason: two accounts can hold
- * distinct cycles and must never share a payload.
+ * distinct cycles — or the SAME cycle key and stamp over different rows, when
+ * they share subscription-week boundaries — and must never share a payload.
  */
 export async function fetchWeekDetail(
   source: 'claude' | 'codex',
   entry: WeekIndexEntry,
   accountKey: string | null = null,
 ): Promise<WeekDetailPayload> {
-  const account = source === 'codex' ? accountKey : null;
-  const ck = `${source}|${account ?? ''}|${entry.key}|${entry.detail_stamp}`;
+  const ck = `${source}|${accountKey ?? ''}|${entry.key}|${entry.detail_stamp}`;
   const hit = cache.get(ck);
   if (hit) return hit;
-  const qs = account == null ? '' : `?account=${encodeURIComponent(account)}`;
+  const qs = accountKey == null ? '' : `?account=${encodeURIComponent(accountKey)}`;
   const res = await fetch(`/api/milestones/${source}/week/${encodeURIComponent(entry.key)}${qs}`);
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));

@@ -195,25 +195,59 @@ interface MilestoneNav {
   setBlockSel: (b: string | number | null) => void;
 }
 
+interface NavSelection {
+  // The account (or '' for none) this selection was made in.
+  scope: string;
+  weekKey: string | null;
+  blockSel: string | number | null;
+  wantDetail: boolean;
+  pendingBlockStep: -1 | 1 | null;
+}
+
+function initialSelection(scope: string): NavSelection {
+  return { scope, weekKey: null, blockSel: null, wantDetail: false, pendingBlockStep: null };
+}
+
+interface NavResult {
+  // The request identity (`fetchKey`) this outcome answers.
+  key: string;
+  payload?: WeekDetailPayload;
+  error?: { status?: number; code?: string };
+}
+
 function useMilestoneNav(
   source: 'claude' | 'codex',
   index: WeekIndexEntry[],
   // #416 — the account whose `cycle_index` produced `index`, or null for "All
   // accounts". It rides the detail fetch as `?account=` and is part of the
   // fetch key, so switching the chip re-fetches instead of re-showing the
-  // previous account's cycle.
+  // previous account's cycle. #836: Claude passes the displayed account on a
+  // decorated store (`current_week.account_key`) and null otherwise.
   accountKey: string | null = null,
   // A decorated Claude block can be first or last among the account-owned
   // rows for the same window. Fetch to know its actual position before nav.
   eagerCurrentBlocks = false,
 ): MilestoneNav {
-  const [weekKey, setWeekKeyRaw] = useState<string | null>(null);
-  const [blockSel, setBlockSel] = useState<string | number | null>(null);
-  const [wantDetail, setWantDetail] = useState(false);
-  const [pendingBlockStep, setPendingBlockStep] = useState<-1 | 1 | null>(null);
-  const [fetchedDetail, setFetchedDetail] = useState<{ key: string; payload: WeekDetailPayload } | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<{ status?: number; code?: string } | null>(null);
+  // #836 §5.8 — scope-owned navigation state. Every selection belongs to the
+  // scope (the account) it was made in, and is derived from that identity
+  // during render: on the render where the account changes, the selection is
+  // already the new account's current cycle, with no selected block, no
+  // pending step, no stale error and no stale detail. Resetting in an effect
+  // instead would commit one frame of the previous account's cycle under the
+  // new account's label — and since cycle keys and stamps can be identical
+  // across accounts, that cycle may even resolve in the new index. Switching
+  // the Codex account chip replaces the whole cycle index the same way.
+  const scope = accountKey ?? '';
+  const [selection, setSelection] = useState<NavSelection>(() => initialSelection(scope));
+  // Adopt the new scope in state too (React re-renders before committing), so
+  // flipping back to an earlier account cannot revive its old selection.
+  if (selection.scope !== scope) setSelection(initialSelection(scope));
+  const sel = selection.scope === scope ? selection : initialSelection(scope);
+  const { weekKey, blockSel, wantDetail, pendingBlockStep } = sel;
+  // Fetched/error state is tagged with the request identity (`fetchKey`,
+  // which carries the account), so a response is only ever read back for the
+  // exact request that produced it.
+  const [result, setResult] = useState<NavResult | null>(null);
   const reqSeq = useRef(0);
 
   const currentEntry = useMemo(() => index.find((e) => e.is_current) ?? null, [index]);
@@ -223,19 +257,30 @@ function useMilestoneNav(
   );
   const vanished = weekKey != null && !index.some((e) => e.key === weekKey);
 
+  // Updates from a stale scope (an effect or handler of the previous account)
+  // land on a selection the current scope ignores and replaces.
+  const updateSelection = useCallback(
+    (fn: (prev: NavSelection) => NavSelection) =>
+      setSelection((prev) => fn(prev.scope === scope ? prev : initialSelection(scope))),
+    [scope],
+  );
   // A block-step / week-step resets the selected block back to the default.
-  const setWeekKey = useCallback((k: string | null) => {
-    setWeekKeyRaw(k);
-    setBlockSel(null);
-    setWantDetail(false);
-    setPendingBlockStep(null);
-    setError(null);
-  }, []);
-  const requestCurrentDetail = useCallback((dir: -1 | 1) => {
-    setPendingBlockStep(dir);
-    setWantDetail(true);
-  }, []);
-  const clearPendingBlockStep = useCallback(() => setPendingBlockStep(null), []);
+  const setWeekKey = useCallback(
+    (k: string | null) => updateSelection(() => ({ ...initialSelection(scope), weekKey: k })),
+    [scope, updateSelection],
+  );
+  const setBlockSel = useCallback(
+    (b: string | number | null) => updateSelection((prev) => ({ ...prev, blockSel: b })),
+    [updateSelection],
+  );
+  const requestCurrentDetail = useCallback(
+    (dir: -1 | 1) => updateSelection((prev) => ({ ...prev, pendingBlockStep: dir, wantDetail: true })),
+    [updateSelection],
+  );
+  const clearPendingBlockStep = useCallback(
+    () => updateSelection((prev) => ({ ...prev, pendingBlockStep: null })),
+    [updateSelection],
+  );
 
   // Fetch policy (spec §4): historic selection always fetches; the current
   // week fetches when its entry is multi-segment (envelope is
@@ -252,52 +297,41 @@ function useMilestoneNav(
       wantDetail
     );
   const fetchKey = shouldFetch && selectedEntry
-    ? `${accountKey ?? ''}|${selectedEntry.key}|${selectedEntry.detail_stamp}`
+    ? `${scope}|${selectedEntry.key}|${selectedEntry.detail_stamp}`
     : null;
   // A prior response remains in state until the new fetch settles. Never
   // expose it as the selected cycle's facts during that interval (or on error).
-  const detail = fetchedDetail?.key === fetchKey ? fetchedDetail.payload : null;
-
-  // Switching the account chip replaces the whole cycle index, so a week key
-  // held from the previous account names a cycle that account never had. Drop
-  // the selection back to "current" rather than rendering a vanished-week
-  // state — or, worse, the other account's history.
-  useEffect(() => {
-    setWeekKeyRaw(null);
-    setBlockSel(null);
-    setWantDetail(false);
-    setPendingBlockStep(null);
-    setError(null);
-  }, [accountKey]);
+  const settled = fetchKey != null && result?.key === fetchKey ? result : null;
+  const detail = settled?.payload ?? null;
+  const error = settled?.error ?? null;
+  // Derived, not set by the effect: the render that first names a request is
+  // already loading, so it never shows the previous request's state.
+  const loading = fetchKey != null && settled == null;
 
   const doFetch = useCallback(() => {
     if (!selectedEntry || fetchKey == null) return;
     const seq = ++reqSeq.current;
-    setLoading(true);
-    setError(null);
+    const key = fetchKey;
+    // A retry drops its own failed attempt so the request reads as loading.
+    setResult((prev) => (prev?.key === key ? null : prev));
     fetchWeekDetail(source, selectedEntry, accountKey)
       .then((payload) => {
-        if (seq !== reqSeq.current) return; // only the latest selection resolves
-        setFetchedDetail({ key: fetchKey, payload });
-        setLoading(false);
+        if (seq !== reqSeq.current) return; // only the latest live request resolves
+        setResult({ key, payload });
       })
       .catch((e: { status?: number; code?: string }) => {
         if (seq !== reqSeq.current) return;
-        setError({ status: e?.status, code: e?.code });
-        setLoading(false);
+        setResult({ key, error: { status: e?.status, code: e?.code } });
       });
   }, [source, selectedEntry, accountKey, fetchKey]);
 
   useEffect(() => {
-    if (fetchKey == null) {
-      // Current week rendered purely from the envelope — clear any prior fetch.
-      reqSeq.current++;
-      setFetchedDetail(null);
-      setLoading(false);
-      setError(null);
-      return;
-    }
+    // Current week rendered purely from the envelope — nothing to fetch.
+    if (fetchKey == null) return undefined;
     doFetch();
+    // A changed request (another cycle, stamp or account) and unmount both
+    // invalidate whatever this one still has outstanding.
+    return () => { reqSeq.current++; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchKey]);
 
@@ -316,6 +350,7 @@ function WeekNavChip({
   accentClass,
   singleId,
   unitNoun,
+  accountLabel,
 }: {
   nav: MilestoneNav;
   pillText: string;
@@ -329,6 +364,9 @@ function WeekNavChip({
   // new call site has to state which unit it steps, and passed explicitly
   // rather than derived from the accent class or the provider string.
   unitNoun: string;
+  // #836 U2 — the displayed account's existing label, beside the pill in the
+  // block row's quiet sub-text style. Present only on a decorated store.
+  accountLabel?: string;
 }) {
   const { index, weekKey, setWeekKey } = nav;
   const olderTarget = stepWeek(index, weekKey, 1);
@@ -349,6 +387,7 @@ function WeekNavChip({
         ‹
       </button>
       <span className={`m-pill ${accentClass}`} id={singleId('mcw-week-pill')}>{pillText}</span>
+      {accountLabel != null && <span className="mcw-ms-sub">{accountLabel}</span>}
       <button
         type="button"
         className={`m-pill ${accentClass} mcw-weeknav-btn`}
@@ -1227,8 +1266,13 @@ function ClaudeCurrentWeekModal({
   const cw = env?.current_week ?? null;
   const header = env?.header ?? null;
   const index: WeekIndexEntry[] = Array.isArray(cw?.week_index) ? cw!.week_index! : [];
-  const activeAccountKey = cw?.five_hour_block?.account_key;
-  const nav = useMilestoneNav('claude', index, null, activeAccountKey != null);
+  // #836 §5.8: the displayed account, published only on a decorated store.
+  // It scopes the navigator and every detail fetch (U1) and labels the cycle
+  // pill (U2); a decorated current week fetches its detail eagerly to learn the
+  // account's real block order.
+  const activeAccountKey = cw?.account_key;
+  const accountLabel = cw?.account_label;
+  const nav = useMilestoneNav('claude', index, activeAccountKey ?? null, activeAccountKey != null);
   const {
     weekKey, setWeekKey, selectedEntry, detail, loading, error, vanished,
     blockSel, setBlockSel, requestCurrentDetail, wantDetail, pendingBlockStep,
@@ -1245,6 +1289,10 @@ function ClaudeCurrentWeekModal({
     : [];
   const fhStream = buildFhStream(fhMs, fhCredits);
   const activeWindowKey = cw?.five_hour_block?.five_hour_window_key ?? null;
+  // The live block's own identity is `(account_key, five_hour_window_key)` on a
+  // decorated payload and the bare window key on a legacy one; it alone may
+  // borrow the envelope's live stream or be the default block.
+  const liveBlockAccountKey = cw?.five_hour_block?.account_key;
 
   // Legacy single-account payloads have no account field. A decorated
   // payload's account must match before its block can borrow the live stream.
@@ -1260,12 +1308,14 @@ function ClaudeCurrentWeekModal({
   // The hint reaches BOTH predicates. Wired into `shouldFetch` alone it would
   // produce a successful request whose rows and note never render — a network
   // assertion would pass and a visual one would fail (#750 S4 §5.3).
-  const useDetail = detail != null && (
-    isHistoric
+  // `weeklyFromDetail` also gates the weekly Loading line: a decorated current
+  // week fetches eagerly for its block order, but its weekly rows stay the
+  // envelope's, so they stay visible while that detail loads (#836 §5.8).
+  const weeklyFromDetail = isHistoric
     || (selectedEntry?.segment_count ?? 0) > 1
     || selectedEntry?.has_observation_gap === true
-    || wantDetail
-  );
+    || wantDetail;
+  const useDetail = detail != null && weeklyFromDetail;
 
   const flat = useDetail && detail ? flattenClaudeWeekly(detail) : null;
   // #750 S4 §5.2: the note is driven by the payload's classified runs, so it
@@ -1330,7 +1380,7 @@ function ClaudeCurrentWeekModal({
     if (!isHistoric && activeWindowKey != null) {
       const i = payloadBlocks.findIndex((b) =>
         b.five_hour_window_key === activeWindowKey
-        && b.account_key === activeAccountKey);
+        && b.account_key === liveBlockAccountKey);
       if (i >= 0) return i;
     }
     return payloadBlocks.length - 1; // historic default: last block
@@ -1371,7 +1421,7 @@ function ClaudeCurrentWeekModal({
   // active block, otherwise from the fetched block's rows.
   const selectedIsActive = !isHistoric && selectedBlock != null
     && selectedBlock.five_hour_window_key === activeWindowKey
-    && selectedBlock.account_key === activeAccountKey;
+    && selectedBlock.account_key === liveBlockAccountKey;
   const selectedBlockStream = selectedBlock
     ? (selectedIsActive
       ? fhStream
@@ -1437,10 +1487,11 @@ function ClaudeCurrentWeekModal({
     >
       <section className="modal-current-week" data-source="claude">
         {index.length > 0 ? (
-          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} unitNoun="cycle" />
+          <WeekNavChip nav={nav} pillText={weekPillText} accentClass="accent-green" singleId={singleId} unitNoun="cycle" accountLabel={accountLabel} />
         ) : (
           <div className="m-chipstrip" id={singleId('mcw-badges')}>
             <span className="m-pill accent-green" id={singleId('mcw-week-pill')}>{weekPillText}</span>
+            {accountLabel != null && <span className="mcw-ms-sub">{accountLabel}</span>}
           </div>
         )}
 
@@ -1518,9 +1569,12 @@ function ClaudeCurrentWeekModal({
           </ul>
         )}
         </>}
-        {(loading || (isHistoric && detail == null && !error)) ? (
+        {((loading && weeklyFromDetail) || (isHistoric && detail == null && !error)) ? (
           <p className="empty-state">Loading…</p>
-        ) : error ? (
+        ) : (error && weeklyFromDetail) ? (
+          // Gated like Loading: when the weekly rows are the envelope's, a
+          // failed eager decorated detail (a network error, or a one-tick 404
+          // as a reset takes effect) must not hide them (#836 review F4).
           <p className="empty-state" id={singleId('mcw-error')}>
             Couldn’t load this cycle.{' '}
             <button type="button" className="m-pill accent-green" onClick={() => nav.retry()}>Retry</button>

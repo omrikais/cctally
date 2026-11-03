@@ -600,6 +600,14 @@ export interface CurrentWeekEnvelope {
   // reset shortens the range and the published period together. Composition
   // labels the Claude leg's period from the pair.
   week_start_at?: string | null;
+  // #836 §5.1 — the displayed account: the owner of the newest eligible
+  // non-held weekly sample, whose cycle, milestones, spend and history this
+  // object describes. Published ONLY on a decorated store (two or more real
+  // Claude accounts) and omitted otherwise — never null. The modal scopes its
+  // history navigator and every detail fetch to `account_key` (U1) and shows
+  // `account_label` beside the cycle pill (U2).
+  account_key?: string;
+  account_label?: string;
 }
 
 // ── Hero-modal historical milestones (spec §1a/§1c/§2/§3) ──────────────

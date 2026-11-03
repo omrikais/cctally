@@ -83,7 +83,7 @@ family_step jsonl_bytes "$PY" "$P/jsonl_bytes.py" --baseline "$OUT/jsonl-baselin
 PID=$!; echo "$PID" > "$OUT/pid"; WA_EXPECT+=("$PID")
 TRACE_START=$("$WA_HELPER_PY" -c 'import time; print(time.time())')
 sample() {
-  "$PY" "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
+  "$WA_HELPER_PY" "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
   family_step dashboard-perf "$PY" bin/cctally dashboard-perf --host 127.0.0.1 \
     --port "$PORT" --json > "$OUT/perf-$(printf %05d $SECONDS).json" 2>>"$OUT/perf.err"
 }
@@ -126,11 +126,11 @@ judge window || invalid "the window judgement (J_W) failed (judge.log)"
 # bounded by two pass intervals plus 120 s; then J_T.
 sample
 LAST=$(ls "$OUT"/perf-*.json | tail -1)
-BOUND=$("$PY" "$P/frontier.py" wait-bound --perf "$LAST" 2>>"$OUT/judge.log") || BOUND=720
+BOUND=$("$WA_HELPER_PY" "$P/frontier.py" wait-bound --perf "$LAST" 2>>"$OUT/judge.log") || BOUND=720
 WAIT_END=$((SECONDS+BOUND)); PASS=null
 while kill -0 "$PID" 2>/dev/null; do
   LAST=$(ls "$OUT"/perf-*.json | tail -1)
-  if FOUND=$("$PY" "$P/frontier.py" pass-after --perf "$LAST" \
+  if FOUND=$("$WA_HELPER_PY" "$P/frontier.py" pass-after --perf "$LAST" \
        --receipt "$OUT/judge-window.json" 2>>"$OUT/judge.log"); then PASS=$FOUND; break; fi
   [ $SECONDS -lt $WAIT_END ] || break
   wa_sleep 15

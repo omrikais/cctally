@@ -52,6 +52,12 @@ from _cctally_core import (
     _BudgetConfigError, _get_budget_config,
     BUDGET_PERIODS as _CCTALLY_BUDGET_PERIODS,
 )
+# #836: the decorated Current Week's owner and cycle identity read the reset
+# chokepoint and the held-column guard directly; neither is ns-patched.
+from _cctally_core import (
+    _canonicalize_optional_iso, _latest_reset_event_for_end,
+    weekly_held_exclusion,
+)
 
 import importlib.util as _ilu
 
@@ -387,6 +393,272 @@ def _apply_midweek_reset_override(
     except (sqlite3.DatabaseError, ValueError):
         pass
     return week_start_at, samples
+
+
+# === #836: the decorated Current Week — one owner, one cycle identity =======
+#
+# On a store with more than one REAL Claude account (`provider_is_decorated`)
+# the Current Week card, its weekly milestones and the history index's current
+# entry describe ONE account: the owner of the newest non-held weekly sample at
+# the build's as-of instant (#839's contract, spec 5.2). The merged reads above
+# stay unchanged for every undecorated store and every other caller.
+
+#: Every subscription window that can contain an instant starts no more than
+#: seven days (plus host-offset slack on `week_start_date`) before it, so this
+#: leading `week_start_date` bound keeps every candidate read an
+#: `idx_usage_week_time` range rather than a scan of the whole history.
+_CLAUDE_CYCLE_CANDIDATE_DAYS = 8
+
+
+@dataclass(frozen=True)
+class ClaudeCycleScope:
+    """The decorated Current Week's cycle identity (#836, spec 5.2 step 2).
+
+    Resolved once per build by `_claude_current_cycle_scope` and shared by the
+    card, the weekly milestones and the scoped history index, so the three
+    readers of one cycle cannot choose it differently.
+
+    ``account_key``: the owner. ``as_of_utc``: the build instant (ISO-8601
+    ``Z``); reset events are admitted only at or before it.
+    ``week_start_date``: the storage key milestones are recorded under.
+    ``week_start_at``: the owner's stored boundary text (``None`` on the
+    date-only leg). ``week_end_at``: the canonical end
+    (`_canonicalize_optional_iso`, the `week_reset_events.new_week_end_at`
+    form; ``None`` on the date-only leg). ``effective_start_at``: the week
+    start, or the active reset's effective instant when later (ISO-8601 ``Z``;
+    ``None`` on the date-only leg). ``reset_event_id``: the active reset's id
+    (the milestone segment), ``0`` when none.
+    """
+    account_key: str
+    as_of_utc: str
+    week_start_date: str
+    week_start_at: "str | None"
+    week_end_at: "str | None"
+    effective_start_at: "str | None"
+    reset_event_id: int
+
+
+def _claude_newest_weekly_sample(conn, now_utc: dt.datetime, *,
+                                 account_key: "str | None" = None):
+    """The newest non-held weekly sample captured at or before ``now_utc``
+    among windows containing it, or ``None`` (#836, spec 5.2 step 1).
+
+    Only non-held rows take part, so a newer held row of another account (a
+    copy of an older weekly value under a newer capture) never chooses the
+    window — the defect of the held-inclusive ``MAX(captured_at_utc)`` window
+    choice in `_fetch_current_week_snapshots` (spec D-C). Captures after
+    ``now_utc`` never participate. Boundaryful windows
+    (``[week_start_at, week_end_at)`` containing ``now_utc``) are preferred;
+    when none qualifies, the date-only leg (``week_start_date`` .. 
+    ``week_end_date`` containing today's host-local date) applies, as in
+    `_fetch_current_week_snapshots`. Ties break by ``(captured_at_utc, id)``.
+
+    Returns a dict of the row's identity and boundary columns plus
+    ``boundaryful``: whether the CHOSEN row carries both parseable bounds,
+    never which pool it came from. On the window's end date, after its reset
+    instant and before any next-window sample, a bounded row reaches the
+    date-only pool; its scope is still built from its own bounds, so the
+    account's own reset stays in effect (#836 review F1).
+    """
+    floor_date = (now_utc.astimezone(dt.timezone.utc).date()
+                  - dt.timedelta(days=_CLAUDE_CYCLE_CANDIDATE_DAYS)).isoformat()
+    acct_pred = "" if account_key is None else " AND account_key = ?"
+    acct_p: tuple = () if account_key is None else (account_key,)
+    rows = conn.execute(
+        "SELECT id, account_key, week_start_date, week_end_date, "
+        "       week_start_at, week_end_at, captured_at_utc "
+        "FROM weekly_usage_snapshots "
+        "WHERE week_start_date >= ?" + acct_pred
+        + weekly_held_exclusion(conn),
+        (floor_date,) + acct_p,
+    ).fetchall()
+    # internal fallback: host-local intentional (the date-only leg's day,
+    # matching `_fetch_current_week_snapshots`)
+    today_local = now_utc.astimezone().date().isoformat()
+    boundaryful = []
+    date_only = []
+    for r in rows:
+        try:
+            cap = parse_iso_datetime(r[6], "captured_at_utc")
+        except (TypeError, ValueError):
+            continue
+        if cap > now_utc:
+            continue
+        rank = (cap, int(r[0]))
+        try:
+            ws = parse_iso_datetime(r[4], "week_start_at") if r[4] else None
+            we = parse_iso_datetime(r[5], "week_end_at") if r[5] else None
+        except ValueError:
+            ws = we = None
+        bounded = ws is not None and we is not None
+        if bounded and ws <= now_utc < we:
+            boundaryful.append((rank, r, True))
+        elif (r[2] is not None and r[3] is not None
+              and r[2] <= today_local <= r[3]):
+            date_only.append((rank, r, bounded))
+    pool = boundaryful or date_only
+    if not pool:
+        return None
+    _rank, r, bounded = max(pool, key=lambda item: item[0])
+    return {
+        "id": int(r[0]),
+        "account_key": r[1],
+        "week_start_date": r[2],
+        "week_end_date": r[3],
+        "week_start_at": r[4],
+        "week_end_at": r[5],
+        "captured_at_utc": r[6],
+        "boundaryful": bounded,
+    }
+
+
+def _claude_select_current_owner(conn, now_utc: dt.datetime) -> "str | None":
+    """The displayed account: the owner of the newest non-held weekly sample
+    at ``now_utc`` (#836, spec 5.2 step 1), or ``None`` when there is none."""
+    sample = _claude_newest_weekly_sample(conn, now_utc)
+    return None if sample is None else sample["account_key"]
+
+
+def _claude_current_cycle_scope(conn, now_utc: dt.datetime, *,
+                                account_key: str) -> "ClaudeCycleScope | None":
+    """``account_key``'s current cycle identity at ``now_utc`` (#836, spec 5.2
+    step 2), or ``None`` when the account has no eligible non-held sample.
+
+    The window is the one holding the account's newest eligible non-held
+    sample. The active reset is `_latest_reset_event_for_end` for the
+    canonical end, scoped to the account and admitted only at or before
+    ``now_utc`` — the #750 S3 chokepoint's effective-instant order — so another
+    account's credit never re-anchors this cycle (spec D-A) and a reset that
+    takes effect later does not cut it yet. The effective start is that
+    reset's instant exactly when the history index cuts the account's storage
+    bucket there (`_claude_reset_cuts_cycle`, the one rule both use) — which
+    can be EARLIER than the nominal week start after a same-date early
+    re-anchor (#836 review F7). The date-only leg has no end text, so it
+    carries no reset.
+    """
+    sample = _claude_newest_weekly_sample(conn, now_utc, account_key=account_key)
+    if sample is None:
+        return None
+    as_of = _iso_z(now_utc)
+    if not sample["boundaryful"]:
+        return ClaudeCycleScope(
+            account_key=account_key, as_of_utc=as_of,
+            week_start_date=sample["week_start_date"],
+            week_start_at=None, week_end_at=None, effective_start_at=None,
+            reset_event_id=0)
+    week_start = parse_iso_datetime(sample["week_start_at"], "week_start_at")
+    canon_end = _canonicalize_optional_iso(sample["week_end_at"],
+                                           "claude.cycle.end")
+    effective_start = week_start
+    reset_event_id = 0
+    if canon_end:
+        event = _latest_reset_event_for_end(
+            conn, canon_end, account_key=account_key, as_of_utc=as_of)
+        if event is not None:
+            reset_event_id = int(event["id"])
+            if event["effective_reset_at_utc"]:
+                try:
+                    reset_dt = parse_iso_datetime(
+                        event["effective_reset_at_utc"], "reset_event.effective")
+                except ValueError:
+                    reset_dt = None
+                if reset_dt is not None:
+                    import _cctally_milestone_history as _mhist
+                    outer = _mhist._claude_storage_boundaries(
+                        conn, sample["week_start_date"],
+                        account_key=account_key)
+                    if _mhist._claude_reset_cuts_cycle(outer, reset_dt):
+                        effective_start = reset_dt
+    return ClaudeCycleScope(
+        account_key=account_key, as_of_utc=as_of,
+        week_start_date=sample["week_start_date"],
+        week_start_at=sample["week_start_at"],
+        week_end_at=canon_end,
+        effective_start_at=_iso_z(effective_start),
+        reset_event_id=reset_event_id)
+
+
+def _claude_cycle_scope_samples(conn, scope: ClaudeCycleScope,
+                                now_utc: dt.datetime):
+    """The decorated card's held-inclusive samples for ``scope`` (#836).
+
+    The shape of ``_fetch_current_week_snapshots(include_held=True,
+    include_account=True, include_scope=True)`` — ``(week_start_at,
+    week_end_at, samples, week_scope)`` — restricted to the scope's account and
+    window, so the card reads the window its owner was chosen in rather than
+    one `_fetch_current_week_snapshots` would choose by its held-inclusive
+    ``MAX(captured_at_utc)``. ``week_start_at`` is the NOMINAL start; the
+    caller filters from ``scope.effective_start_at``. Samples are filtered to
+    ``captured_at <= now_utc``. Returns ``None`` when the window cannot be
+    resolved.
+    """
+    floor_date = (now_utc.astimezone(dt.timezone.utc).date()
+                  - dt.timedelta(days=_CLAUDE_CYCLE_CANDIDATE_DAYS)).isoformat()
+    if scope.week_start_at is None:
+        drow = conn.execute(
+            "SELECT week_end_date FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "AND week_end_date IS NOT NULL "
+            "ORDER BY captured_at_utc DESC, id DESC LIMIT 1",
+            (scope.week_start_date, scope.account_key),
+        ).fetchone()
+        if drow is None:
+            return None
+        # internal fallback: host-local intentional (the date-only leg)
+        local_tz = dt.datetime.now().astimezone().tzinfo
+        ws_date = dt.date.fromisoformat(scope.week_start_date)
+        we_date = dt.date.fromisoformat(drow[0])
+        week_start_at = dt.datetime.combine(
+            ws_date, dt.time(0, 0), local_tz).astimezone(dt.timezone.utc)
+        week_end_at = dt.datetime.combine(
+            we_date + dt.timedelta(days=1), dt.time(0, 0),
+            local_tz).astimezone(dt.timezone.utc)
+        rows = conn.execute(
+            "SELECT captured_at_utc, weekly_percent, five_hour_percent, "
+            "       weekly_observation_held, account_key "
+            "FROM weekly_usage_snapshots "
+            "WHERE week_start_date = ? AND account_key = ? "
+            "ORDER BY captured_at_utc ASC, id ASC",
+            (scope.week_start_date, scope.account_key),
+        ).fetchall()
+        samples = _shape_week_samples(rows, include_held=True,
+                                      include_account=True)
+        samples = [s for s in samples if s[0] <= now_utc]
+        return (week_start_at, week_end_at, samples,
+                (scope.week_start_date, None))
+    week_start_at = parse_iso_datetime(scope.week_start_at, "week_start_at")
+    week_end_at = parse_iso_datetime(scope.week_end_at, "week_end_at")
+    # Every textual spelling of the same start instant, as the merged read
+    # gathers them for an upgrade-in-progress window.
+    matching_texts: list[str] = []
+    for (text,) in conn.execute(
+            "SELECT DISTINCT week_start_at FROM weekly_usage_snapshots "
+            "WHERE week_start_date >= ? AND account_key = ? "
+            "AND week_start_at IS NOT NULL AND week_end_at IS NOT NULL",
+            (floor_date, scope.account_key)).fetchall():
+        try:
+            if parse_iso_datetime(text, "week_start_at") == week_start_at:
+                matching_texts.append(text)
+        except ValueError:
+            continue
+    if scope.week_start_at not in matching_texts:
+        matching_texts.append(scope.week_start_at)
+    matching_texts.sort()
+    placeholders = ",".join("?" * len(matching_texts))
+    rows = _week_rows_by_capture(conn.execute(
+        f"SELECT captured_at_utc, weekly_percent, five_hour_percent, "
+        f"       weekly_observation_held, account_key, id "
+        f"FROM weekly_usage_snapshots "
+        f"WHERE (week_start_at IN ({placeholders}) "
+        f"       OR (week_start_at IS NULL AND week_start_date = ?)) "
+        f"  AND account_key = ?",
+        tuple(matching_texts) + (scope.week_start_date, scope.account_key),
+    ), by_id=True)
+    samples = _shape_week_samples(rows, include_held=True,
+                                  include_account=True)
+    samples = [s for s in samples if s[0] <= now_utc]
+    return (week_start_at, week_end_at, samples,
+            (scope.week_start_date, tuple(matching_texts)))
 
 
 def _current_week_five_hour_percent(conn, now_utc, week_scope, *,

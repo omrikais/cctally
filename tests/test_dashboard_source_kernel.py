@@ -1178,6 +1178,44 @@ def test_decorated_provider_publishes_certified_account_cycle_leg():
     assert payload["legs"]["codex"]["scope"] == "provider_cycle"
 
 
+@pytest.mark.parametrize(
+    "provider,hero_cost,published",
+    (
+        ("claude", 1.5, True),
+        ("codex", 1.5, False),
+        ("codex", 2.5, True),
+    ),
+    ids=("claude-hero-is-one-account", "codex-hero-mismatch",
+         "codex-hero-matches"),
+)
+def test_decorated_claude_leg_is_certified_by_its_cards_not_its_hero(
+    provider: str, hero_cost: float, published: bool,
+):
+    """#836 U3: a decorated Claude hero is the DISPLAYED account's spend, so
+    requiring it to equal the sum of every account card withheld the All
+    combined headline on every multi-account Claude install. The cards and
+    their certified contributions (keys, order, costs, periods) still certify
+    the leg, and the headline stays their sum. Codex keeps the hero check, whose
+    decorated hero IS the card sum: a mismatch still withholds, a match
+    publishes."""
+    kwargs = {**_decorated_account_kwargs(provider), "cost_usd": hero_cost}
+    combined = _combined_pair(**{f"{provider}_kwargs": kwargs})
+
+    if not published:
+        assert combined.data["combined"] is None
+        assert combined.data["combined_unavailable"]["code"] == (
+            "account_reconciliation_failed"
+        )
+        return
+    payload = combined.data["combined"]
+    assert "combined_unavailable" not in combined.data
+    leg = payload["legs"][provider]
+    assert leg["scope"] == "account_cycles"
+    assert leg["cost_usd"] == 2.5
+    other = 3.75 if provider == "claude" else 2.5
+    assert payload["cost_usd"] == pytest.approx(2.5 + other)
+
+
 def test_decorated_unresolved_certificate_withholds_exact_cause():
     combined = _combined_pair(claude_kwargs=_decorated_account_kwargs(
         "claude",

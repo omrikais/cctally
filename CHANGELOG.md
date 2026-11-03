@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.117.2] - 2026-11-03
+
+### Fixed
+- With more than one Claude account, the `cctally dashboard` Current Week card and modal show one account's cycle, milestones, spend and `$/1%` beside that account's label, and the older/newer cycle buttons stay on that account.
+- `cctally five-hour-breakdown` and the dashboard's five-hour milestones show `—` (`null` in `--json`) instead of a weekly percentage that a weekly credit later retired.
+- With more than one Claude account, the `cctally dashboard` All view shows its combined spend headline, summing each account's current cycle, instead of usually leaving it out.
+- Under Python 3.11, `cctally quota --json` no longer reports family shares and calibration figures that differ in their last digits from newer Python versions.
+
+## [1.117.1] - 2026-11-03
+
+### Fixed
+- With more than one Claude account, the `cctally dashboard` Current Week card and modal show one account's cycle, milestones, spend and `$/1%` beside that account's label, and the older/newer cycle buttons stay on that account.
+- `cctally five-hour-breakdown` and the dashboard's five-hour milestones show `—` (`null` in `--json`) instead of a weekly percentage that a weekly credit later retired.
+- With more than one Claude account, the `cctally dashboard` All view shows its combined spend headline, summing each account's current cycle, instead of usually leaving it out.
+- Under Python 3.11, `cctally quota --json` no longer reports family shares and calibration figures that differ in their last digits from newer Python versions.
+
 ## [1.117.0] - 2026-11-02
 
 ### Added

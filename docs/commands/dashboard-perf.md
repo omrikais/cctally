@@ -243,7 +243,7 @@ check, and Origin/Host parity. The command sends an `Origin` matching the
 
 ## Implementation
 
-The record itself is always on and lives in a pure kernel, `bin/_lib_tick_stats.py`: two 64-record rings — one for the main snapshot ticks and one for the conversation sync loop — behind a single lock and inside a 64 KiB budget, so an unbounded run never grows the dashboard's memory on account of measurement. The command glue is `bin/_cctally_dashboard_perf.py`.
+The record itself is always on and lives in a pure kernel, `bin/_lib_tick_stats.py`: two 64-record rings — one for the main snapshot ticks and one for the conversation sync loop — behind a single lock and inside a 72 KiB budget, so an unbounded run never grows the dashboard's memory on account of measurement. The command glue is `bin/_cctally_dashboard_perf.py`.
 
 ## See also
 

@@ -1140,8 +1140,14 @@ print(label)
     # week chip; probe the route for a real week (dynamic first key), an
     # unknown week (404 code), and a bad source (400). Runs on every
     # scenario with a current_week (skipped on no-data).
-    local wk_key
-    wk_key=$(printf '%s' "$raw" | python3 -c '
+    #
+    # #836 spec 5.6: on a decorated store the index is the DISPLAYED
+    # account's (`current_week.account_key`), so the probe qualifies its
+    # request with that account, exactly as the client does, and compares the
+    # returned key, stamp and population (every block is that account's) with
+    # the index entry it came from — not only the payload's shape.
+    local wk_probe wk_key wk_stamp wk_account wk_query
+    wk_probe=$(printf '%s' "$raw" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 cw = d.get("current_week")
@@ -1150,22 +1156,38 @@ if cw is None:
 idx = cw.get("week_index")
 if not isinstance(idx, list):
     raise SystemExit("current_week.week_index missing or not a list")
-print(idx[0]["key"] if idx else "")
+if not idx:
+    print(""); raise SystemExit(0)
+print("\t".join((idx[0]["key"], idx[0]["detail_stamp"],
+                 cw.get("account_key") or "")))
 ')
     if [ $? -ne 0 ]; then
         echo "FAIL $name: /api/data current_week.week_index missing/malformed"
         ok=0
-    elif [ -n "$wk_key" ]; then
+    elif [ -n "$wk_probe" ]; then
+        IFS=$'\t' read -r wk_key wk_stamp wk_account <<<"$wk_probe"
+        wk_query=""
+        [ -n "$wk_account" ] && wk_query="?account=$wk_account"
         local mw_body m404 mbad
-        mw_body=$(curl -s --max-time 5 "$base/api/milestones/claude/week/$wk_key")
-        printf '%s' "$mw_body" | python3 -c '
-import json, sys
+        mw_body=$(curl -s --max-time 5 "$base/api/milestones/claude/week/$wk_key$wk_query")
+        printf '%s' "$mw_body" | CCTALLY_WK_KEY="$wk_key" \
+            CCTALLY_WK_STAMP="$wk_stamp" CCTALLY_WK_ACCOUNT="$wk_account" python3 -c '
+import json, os, sys
 d = json.load(sys.stdin)
 for k in ("source", "key", "segments", "dividers", "blocks", "detail_stamp"):
     if k not in d:
         raise SystemExit("missing " + k)
 if d["source"] != "claude":
     raise SystemExit("source != claude")
+if d["key"] != os.environ["CCTALLY_WK_KEY"]:
+    raise SystemExit("key != the index entry key")
+if d["detail_stamp"] != os.environ["CCTALLY_WK_STAMP"]:
+    raise SystemExit("detail_stamp != the index entry stamp")
+account = os.environ["CCTALLY_WK_ACCOUNT"]
+if account:
+    owners = {b.get("account_key") for b in d["blocks"]}
+    if owners - {account}:
+        raise SystemExit("blocks outside the displayed account: %r" % (owners,))
 ' || { echo "FAIL $name: /api/milestones claude 200 body malformed (raw: $mw_body)"; ok=0; }
         m404=$(curl -s --max-time 5 \
             "$base/api/milestones/claude/week/milestone_cycle:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")

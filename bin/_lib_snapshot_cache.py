@@ -131,6 +131,12 @@ class SnapshotSignature(NamedTuple):
     # legs above, this one is a digest and is never empty: a store with no
     # armed Claude alert carries a constant hash, not the empty string.
     claude_stats_digest: str = ""
+    # #836 spec 5.7 item 1: the Claude weekly rejection state
+    # (`_lib_dashboard_sources.claude_weekly_retired_digest`) — a credit
+    # retry's in-place retirement, a restoration, or the deletion of a
+    # referenced snapshot moves no leg above. Empty on a store with no retired
+    # snapshot and no unavailable five-hour join, so it is byte-neutral there.
+    claude_weekly_retired_digest: str = ""
 
 
 def _max_id(conn: sqlite3.Connection, table: str) -> int:
@@ -247,6 +253,7 @@ def compute_signature(
     codex_stats_digest: str = "",
     accounts_digest: str = "",
     claude_stats_digest: str = "",
+    claude_weekly_retired_digest: str = "",
 ) -> SnapshotSignature:
     """Composite data-version signature across cache.db + stats.db (spec §3).
 
@@ -273,6 +280,7 @@ def compute_signature(
         accounts_digest=str(accounts_digest),
         codex_ingest_backlog_sig=_codex_ingest_backlog_sig(cache_conn),
         claude_stats_digest=str(claude_stats_digest),
+        claude_weekly_retired_digest=str(claude_weekly_retired_digest),
     )
 
 

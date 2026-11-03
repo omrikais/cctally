@@ -23,6 +23,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -883,10 +884,19 @@ def test_an_idle_tick_issues_identical_sql_with_and_without_the_recorder(
     private_corpus, monkeypatch,
 ):
     """Spec §7.1.2. The instrument must add no query and change no plan."""
+    import _lib_dashboard_sources as sources
     import _lib_tick_stats as ts
     bbf = _load_build_bench()
     ts.reset_for_tests()
     corpus = private_corpus("small")
+    # The stats-digest memo reads `PRAGMA journal_mode` on the first refresh
+    # after the store's files are `_STATS_DIGEST_MEMO_SETTLE_SECONDS` old, so
+    # a host slow enough to put that instant between the two arms made only
+    # one of them issue it (the v1.117.0 public Linux matrix, 3.12 and 3.13).
+    # Never settled, the memo never stores: both arms issue the cold digest
+    # reads, which the comparison then covers, and neither reads the mode.
+    monkeypatch.setattr(sources, "_STATS_DIGEST_MEMO_SETTLE_SECONDS",
+                        math.inf)
 
     def run(null_recorder):
         statements: list[str] = []

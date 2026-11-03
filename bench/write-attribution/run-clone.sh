@@ -48,7 +48,7 @@ cd "$TREE" || exit 2
 PID=$!; echo "$PID" > "$OUT/pid"; WA_EXPECT+=("$PID")
 end=$((SECONDS+DUR))
 while [ $SECONDS -lt $end ] && kill -0 "$PID" 2>/dev/null; do
-  "$PY" "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
+  "$WA_HELPER_PY" "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
   ( export TMPDIR=$X/tmp/ CCTALLY_DATA_DIR=$ROOT/data
     wa_exec "$PY" bin/cctally dashboard-perf --host 127.0.0.1 --port "$PORT" --json ) \
     > "$OUT/perf-$(printf %04d $SECONDS).json" 2>>"$OUT/perf.err" &

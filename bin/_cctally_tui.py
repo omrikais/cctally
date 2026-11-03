@@ -183,6 +183,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import hashlib
 import io
 import json
 import math
@@ -223,6 +224,7 @@ from _lib_display_tz import (
     _compute_display_block,
 )
 from _lib_aggregators import _aggregate_monthly, codex_path_scope
+from _lib_json_envelope import _iso_z
 from _lib_fmt import _fmt_usd_accounting, stable_sum
 # Opt-in backend phase-instrumentation collector (issue #276, Session A). Pure
 # stdlib leaf; near-noop when CCTALLY_PERF_TRACE is unset (phase() returns a
@@ -299,6 +301,7 @@ from _lib_dashboard_sources import (
     calibration_basis_digest,
     calibration_supersession_digest,
     claude_stats_digest,
+    claude_weekly_retired_digest,
     codex_stats_digest,
     combined_accounting_version,
     compose_all_state,
@@ -912,6 +915,18 @@ class TuiCurrentWeek:
     # set. Appended last with a default so fixture modules that construct
     # `TuiCurrentWeek` positionally stay valid.
     total_tokens: int = 0
+    # #836 (spec 5.1): the displayed account, published as
+    # `current_week.account_key` / `account_label` ONLY when Claude is
+    # decorated (more than one real account, R8). Filled by the decorated
+    # path of `_tui_build_current_week`; the undecorated card leaves all four
+    # at their defaults. ``cycle_scope`` is that account's
+    # `ClaudeCycleScope`, the one cycle identity the weekly milestones and the
+    # scoped history index share with this card. Trailing defaults, for the
+    # positional fixture constructors.
+    account_key: "str | None" = None
+    account_decorated: bool = False
+    account_label: "str | None" = None
+    cycle_scope: "Any | None" = None
 
 
 # ---- View-model row dataclasses moved to bin/_lib_view_models.py ----
@@ -957,9 +972,20 @@ class TuiPercentMilestone:
 
 def _tui_build_percent_milestones(
     conn: sqlite3.Connection,
+    *,
+    account_key: "str | None" = None,
+    cycle_scope: "Any | None" = None,
 ) -> list[TuiPercentMilestone]:
     """Return per-percent crossings for the current week's ACTIVE
     segment, ascending by percent.
+
+    #836 (spec 5.3): with ``account_key`` (a decorated store) the week, its
+    active segment and the milestone rows all come from ``cycle_scope`` — the
+    displayed account's `ClaudeCycleScope`, the identity the card was built
+    from — and only that account's rows are read. A decorated build with no
+    resolved scope publishes ``[]``, never a merged list. ``account_key=None``
+    is today's merged read below, unchanged, including legitimate
+    `unattributed` pre-attribution rows in the same week.
 
     Resolves `week_start_date` from the latest `weekly_usage_snapshots` row
     — the same path `cmd_percent_breakdown` takes. The post-override
@@ -977,6 +1003,16 @@ def _tui_build_percent_milestones(
     Returns [] if no usage snapshot exists, OR if the active segment
     has no milestone rows yet (post-credit "fresh" state).
     """
+    if account_key is not None:
+        if cycle_scope is None or cycle_scope.account_key != account_key:
+            return []
+        # The scope's segment IS the active one (no second lookup): it was
+        # resolved through the same chokepoint, scoped and as-of bounded.
+        return _tui_percent_milestone_rows([
+            r for r in get_milestones_for_week(
+                conn, cycle_scope.week_start_date, account_key=account_key)
+            if int(r["reset_event_id"] or 0) == int(cycle_scope.reset_event_id)
+        ])
     latest = conn.execute(
         "SELECT week_start_date, week_end_at FROM weekly_usage_snapshots "
         "WHERE week_end_at IS NOT NULL "
@@ -1025,6 +1061,11 @@ def _tui_build_percent_milestones(
         r for r in get_milestones_for_week(conn, latest["week_start_date"])
         if int(r["reset_event_id"] or 0) == active_segment
     ]
+    return _tui_percent_milestone_rows(rows)
+
+
+def _tui_percent_milestone_rows(rows) -> list[TuiPercentMilestone]:
+    """`percent_milestones` rows as `TuiPercentMilestone`s, in row order."""
     out: list[TuiPercentMilestone] = []
     for r in rows:
         try:
@@ -1394,6 +1435,17 @@ class DataSnapshot:
     # ingest/read-model work.  It remains trailing/defaulted for every legacy
     # positional fixture constructor.
     source_bundle: SourceDashboardBundle | None = None
+    # #836 spec 5.7 item 2: the earliest instant after this build's as-of at
+    # which evidence the build excluded by that as-of becomes eligible — a
+    # weekly sample captured after it, a reset taking effect (or detected)
+    # after it — or None (`_tui_evidence_eligible_at`). The clock is frozen
+    # before the dispatch signature is read, so such a row is counted by the
+    # signature yet excluded by the build; the idle gate refuses once a tick's
+    # instant reaches this, and the Claude source version carries it, so the
+    # tick that admits the evidence rebuilds and refuses source reuse.
+    # Never published. Idle copies carry it unchanged. LAST, with a default,
+    # for the positional constructors.
+    evidence_eligible_at: dt.datetime | None = None
 
     @classmethod
     def synthesize_for_marketing(cls, *, as_of_iso: str) -> "DataSnapshot":
@@ -1673,6 +1725,138 @@ class RuntimeState:
         )
 
 
+def _tui_card_freshness(captured, now_utc: dt.datetime):
+    """``(freshness_label, freshness_age)`` of the card's displayed sample,
+    against the configured oauth_usage thresholds; ``(None, None)`` when the
+    capture is not a datetime. Mirrors the dashboard envelope's cw_freshness
+    derivation in `snapshot_to_envelope`. Refs spec §3.4."""
+    if not isinstance(captured, dt.datetime):
+        return None, None
+    if captured.tzinfo is None:
+        captured = captured.replace(tzinfo=dt.timezone.utc)
+    age_s = max(0.0, (now_utc - captured).total_seconds())
+    try:
+        _fresh_cfg = _get_oauth_usage_config(load_config())
+    except Exception:
+        _fresh_cfg = _OAUTH_USAGE_DEFAULTS
+    return _freshness_label(age_s, _fresh_cfg), int(age_s)
+
+
+def _tui_five_hour_resets_at(five_hour, now_utc: dt.datetime):
+    """The five-hour reading's reset instant, or None when absent,
+    unparseable or already elapsed (a stale reset would render as
+    "resets 0h 00m")."""
+    if five_hour is None or five_hour.resets_at is None:
+        return None
+    try:
+        resets_at = parse_iso_datetime(
+            five_hour.resets_at, "five_hour_resets_at")
+    except ValueError:
+        return None
+    return None if resets_at <= now_utc else resets_at
+
+
+def _claude_current_cycle_scope(*args, **kwargs):
+    return sys.modules["cctally"]._claude_current_cycle_scope(*args, **kwargs)
+
+
+def _claude_select_current_owner(*args, **kwargs):
+    return sys.modules["cctally"]._claude_select_current_owner(*args, **kwargs)
+
+
+def _claude_cycle_scope_samples(*args, **kwargs):
+    return sys.modules["cctally"]._claude_cycle_scope_samples(*args, **kwargs)
+
+
+def _tui_build_decorated_current_week(
+    conn: sqlite3.Connection,
+    now_utc: dt.datetime,
+    *,
+    skip_sync: bool = False,
+) -> TuiCurrentWeek | None:
+    """The Current Week card on a decorated store: ONE account (#836,
+    spec 5.2).
+
+    The owner is the account of the newest non-held weekly sample at the
+    as-of instant (`_claude_select_current_owner`), so a newer held row of
+    another account cannot choose the window (D-C). Its cycle identity
+    (`_claude_current_cycle_scope`) supplies the window, the active reset
+    and the effective start, so another account's credit cannot re-anchor it
+    (D-A). Samples, the five-hour reading, the block and the spend are all the
+    owner's (U3, D-B): ``$/1%`` divides the owner's spend by the owner's
+    percentage. When the owner's cycle has no eligible non-held sample (its
+    own reset postdates the chosen one) the card is None; a decorated build
+    never falls back to the merged population. `_apply_midweek_reset_override`
+    is not called here.
+    """
+    owner = _claude_select_current_owner(conn, now_utc)
+    if owner is None:
+        return None
+    scope = _claude_current_cycle_scope(conn, now_utc, account_key=owner)
+    if scope is None:
+        return None
+    fetched = _claude_cycle_scope_samples(conn, scope, now_utc)
+    if fetched is None:
+        return None
+    week_start_at, week_end_at, observations, week_scope = fetched
+    week_start_before_override = week_start_at
+    if scope.effective_start_at is not None:
+        # The scope's effective start may also PRECEDE the nominal start (a
+        # same-date early re-anchor, #836 review F7): the card's cycle starts
+        # there either way, as its current index entry does.
+        effective = parse_iso_datetime(
+            scope.effective_start_at, "cycle_scope.effective_start_at")
+        if effective != week_start_at:
+            week_start_at = effective
+            observations = [s for s in observations if s[0] >= effective]
+    weekly_samples = [s for s in observations if not s[3]]
+    if not weekly_samples:
+        return None
+    latest = weekly_samples[-1]
+    used_pct = float(latest[1])
+    five_hour = _current_week_five_hour_reading(
+        conn, now_utc, week_scope, account_key=owner,
+        week_start_at=week_start_at,
+        week_start_before_override=week_start_before_override)
+    spent, total_tokens = _sum_cost_and_tokens_for_range(
+        week_start_at, now_utc, mode="auto", skip_sync=skip_sync,
+        account_key=owner,
+    )
+    # The same corrected divisor as the merged card (#661 S2 section 3.4).
+    used_pct_corrected = corrected_percent_point(used_pct)
+    dpp_divisor = used_pct if used_pct_corrected is None else used_pct_corrected
+    dpp = (spent / dpp_divisor) if used_pct > 0 else None
+    freshness_label, freshness_age = _tui_card_freshness(latest[0], now_utc)
+    import _cctally_account
+    return TuiCurrentWeek(
+        week_start_at=week_start_at,
+        week_end_at=week_end_at,
+        used_pct=used_pct,
+        five_hour_pct=None if five_hour is None else five_hour.percent,
+        five_hour_resets_at=_tui_five_hour_resets_at(five_hour, now_utc),
+        spent_usd=float(spent),
+        dollars_per_percent=dpp,
+        latest_snapshot_at=latest[0],
+        freshness_label=freshness_label,
+        freshness_age=freshness_age,
+        five_hour_block=_select_current_block_for_envelope(
+            conn, current_used_pct=used_pct, now_utc=now_utc,
+            account_key=owner,
+        ),
+        total_tokens=total_tokens,
+        account_key=owner,
+        account_decorated=True,
+        account_label=_cctally_account.display_account_label(conn, owner),
+        cycle_scope=scope,
+    )
+
+
+def _decorated_claude(conn: sqlite3.Connection) -> bool:
+    """The R8 decoration gate for Claude (`provider_is_decorated`)."""
+    import _cctally_account
+    return _cctally_account.provider_is_decorated(conn, "claude")
+
+
 def _tui_build_current_week(
     conn: sqlite3.Connection,
     now_utc: dt.datetime,
@@ -1682,7 +1866,15 @@ def _tui_build_current_week(
     """Build the TuiCurrentWeek from the latest snapshot + live cost.
 
     Returns None when no current-week usage snapshot exists.
+
+    #836: a decorated store (more than one real Claude account, R8) takes
+    `_tui_build_decorated_current_week`, the one-account card. Below the
+    threshold the merged card below is unchanged.
     """
+    import _cctally_account
+    if _cctally_account.provider_is_decorated(conn, "claude"):
+        return _tui_build_decorated_current_week(
+            conn, now_utc, skip_sync=skip_sync)
     # #769 S11 (#824): ONE read, held-inclusive, split per axis below.
     # Retain the owner of the exact non-held weekly sample this card displays,
     # including when one real account coexists with unattributed history. R8
@@ -1758,35 +1950,11 @@ def _tui_build_current_week(
     # percent and the reset together from one row), so the countdown never
     # describes another row. That reading is held-inclusive (#769 S11, #824),
     # because a held row's five-hour fields are the writing tick's own.
-    five_hr_resets_at: dt.datetime | None = None
-    if five_hour is not None and five_hour.resets_at is not None:
-        try:
-            five_hr_resets_at = parse_iso_datetime(
-                five_hour.resets_at, "five_hour_resets_at"
-            )
-        except ValueError:
-            five_hr_resets_at = None
-        # Suppress stale resets that have already elapsed so renderers
-        # don't show "resets 0h 00m" or a negative duration at the boundary.
-        if five_hr_resets_at is not None and five_hr_resets_at <= now_utc:
-            five_hr_resets_at = None
-    # Freshness — compute label/age from latest snapshot vs. now using the
-    # configured oauth_usage thresholds. Mirrors the dashboard envelope's
-    # cw_freshness derivation in `snapshot_to_envelope`. Refs spec §3.4.
-    captured = latest[0]
-    if isinstance(captured, dt.datetime):
-        if captured.tzinfo is None:
-            captured = captured.replace(tzinfo=dt.timezone.utc)
-        age_s = max(0.0, (now_utc - captured).total_seconds())
-        try:
-            _fresh_cfg = _get_oauth_usage_config(load_config())
-        except Exception:
-            _fresh_cfg = _OAUTH_USAGE_DEFAULTS
-        freshness_label = _freshness_label(age_s, _fresh_cfg)
-        freshness_age = int(age_s)
-    else:
-        freshness_label = None
-        freshness_age = None
+    # Suppress stale resets that have already elapsed so renderers don't
+    # show "resets 0h 00m" or a negative duration at the boundary.
+    five_hr_resets_at = _tui_five_hour_resets_at(five_hour, now_utc)
+    # Freshness — label/age from the displayed sample vs. now.
+    freshness_label, freshness_age = _tui_card_freshness(latest[0], now_utc)
     return TuiCurrentWeek(
         week_start_at=week_start_at,
         week_end_at=week_end_at,
@@ -2427,7 +2595,72 @@ def _snapshot_data_version(sig) -> str:
     # moves no numeric leg above, so without this the detail endpoints' change
     # signal stays flat across a tick that added an alert row.
     claude_digest = getattr(sig, "claude_stats_digest", "")
-    return out if not claude_digest else f"{out}.x{claude_digest}"
+    out = out if not claude_digest else f"{out}.x{claude_digest}"
+    # #836 spec 5.7 item 1: the Claude weekly rejection state. Empty on a store
+    # with no retired snapshot and no unavailable five-hour join, so it is
+    # byte-neutral there.
+    retired = getattr(sig, "claude_weekly_retired_digest", "")
+    return out if not retired else f"{out}.r{retired}"
+
+
+def _tui_evidence_eligible_at(conn, as_of_utc: dt.datetime) -> "dt.datetime | None":
+    """The earliest instant after ``as_of_utc`` at which evidence a build at
+    that as-of excluded becomes eligible, or None (#836, spec 5.7 item 2).
+
+    The candidates are the rows a later instant's build could admit:
+
+    * weekly snapshots captured after ``as_of_utc`` whose `week_start_date` is
+      at or after the as-of date minus eight days — every boundaryful window
+      that can contain the as-of instant (including another account's older
+      overlapping window), the date-only leg, a later window and the
+      no-current-card case. That leading range is an `idx_usage_week_time`
+      range, never a whole-table scan; held rows are included, since the
+      five-hour reading reads them;
+    * `week_reset_events` rows taking effect after it (the decorated cycle
+      admits a reset by its effective instant) or detected after it (the
+      merged override admits one by its detection instant).
+
+    Instants are compared with `unixepoch`, never lexically: the columns carry
+    mixed offset spellings. A far-future row (a clock error) only postpones
+    the one rebuild; it never disables the idle path.
+    """
+    as_of = as_of_utc.astimezone(dt.timezone.utc)
+    as_of_iso = _iso_z(as_of)
+    floor_date = (as_of.date() - dt.timedelta(days=8)).isoformat()
+    candidates: list[str] = [
+        row[0] for row in conn.execute(
+            "SELECT captured_at_utc FROM weekly_usage_snapshots "
+            "WHERE week_start_date >= ? "
+            "AND unixepoch(captured_at_utc) > unixepoch(?)",
+            (floor_date, as_of_iso)).fetchall()
+    ]
+    try:
+        for effective, detected in conn.execute(
+                "SELECT effective_reset_at_utc, detected_at_utc "
+                "FROM week_reset_events "
+                "WHERE unixepoch(effective_reset_at_utc) > unixepoch(?) "
+                "   OR unixepoch(detected_at_utc) > unixepoch(?)",
+                (as_of_iso, as_of_iso)).fetchall():
+            candidates.extend(v for v in (effective, detected) if v)
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+    eligible: "dt.datetime | None" = None
+    for text in candidates:
+        try:
+            instant = parse_iso_datetime(text, "evidence_eligible_at")
+        except (TypeError, ValueError):
+            continue
+        if instant > as_of and (eligible is None or instant < eligible):
+            eligible = instant
+    return eligible
+
+
+def _tui_evidence_matured(prior, now_utc: dt.datetime) -> bool:
+    """Has evidence ``prior`` excluded by its as-of become eligible at
+    ``now_utc``? (#836, spec 5.7 item 2: the idle gate refuses then.)"""
+    eligible = getattr(prior, "evidence_eligible_at", None)
+    return eligible is not None and now_utc >= eligible
 
 
 def _tui_source_copy(value: object) -> object:
@@ -2488,6 +2721,35 @@ def alert_row_owner(
     if axis == "codex_budget":
         return "codex"
     raise ValueError(f"no ownership rule for alert axis {axis!r}")
+
+
+def _tui_claude_owner_version_fragment(claude_data: object) -> str:
+    """The decorated Claude source-version fragment (#836 spec 5.7), or "".
+
+    A digest of the displayed account, its label and the published scoped
+    history index's identity (each entry's key, detail stamp and current
+    flag), read from the already-projected source data. Only a decorated
+    build publishes ``current_week.account_key``, so every undecorated build
+    returns "" and its version bytes stay as they were.
+    """
+    hero = claude_data.get("hero") if isinstance(claude_data, dict) else None
+    cw = hero.get("current_week") if isinstance(hero, dict) else None
+    if not isinstance(cw, dict):
+        return ""
+    owner = cw.get("account_key")
+    if not isinstance(owner, str) or not owner:
+        return ""
+    index = cw.get("week_index")
+    entries = [
+        (e.get("key"), e.get("detail_stamp"), bool(e.get("is_current")))
+        for e in (index if isinstance(index, list) else ())
+        if isinstance(e, dict)
+    ]
+    material = json.dumps(
+        [owner, cw.get("account_label"), entries],
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _tui_project_claude_source_data(legacy_envelope: object) -> dict[str, object]:
@@ -3843,8 +4105,13 @@ def _tui_build_source_bundle(
     prior_bundle: SourceDashboardBundle | None = None,
     raw_config: dict[str, object] | None = None,
     attempt: dict[str, bool] | None = None,
+    evidence_eligible_at: dt.datetime | None = None,
 ) -> SourceDashboardBundle:
     """Build one frozen source bundle after the dashboard's coordinated ingest.
+
+    ``evidence_eligible_at`` (#836, spec 5.7 item 2) is the build's
+    `DataSnapshot.evidence_eligible_at`; it enters the Claude version only
+    when set.
 
     This helper is reachable only from ``precompute_envelope=True``.  It opens
     a fresh cache handle after the ingest handle has closed, then performs
@@ -3983,6 +4250,9 @@ def _tui_build_source_bundle(
         # rare event and a rebuild is safe, so per-provider narrowing is not worth
         # the split.
         accounts_digest = accounts_identity_digest(stats_conn)
+        # #836 spec 5.7 item 1: the Claude weekly rejection state; "" (and so
+        # byte-neutral) on a store with nothing retired or unavailable.
+        retired_digest = claude_weekly_retired_digest(stats_conn)
         with _perf.phase("source.signature"):
             signature = c.compute_signature(
                 cache_conn,
@@ -3991,6 +4261,7 @@ def _tui_build_source_bundle(
                 codex_stats_digest=stats_digest,
                 accounts_digest=accounts_digest,
                 claude_stats_digest=claude_digest,
+                claude_weekly_retired_digest=retired_digest,
             )
         # #857: the Codex quota-dependency identity, read on the SAME pinned
         # cache snapshot the Codex capture below reads, so a generation built
@@ -4058,6 +4329,23 @@ def _tui_build_source_bundle(
             f":p{_period_identity}{_budget_suffix}{_acct_suffix}"
             f"{_aggregate_suffix}:x{claude_digest}"
         )
+        # #836 spec 5.7: exact-version reuse compares this string, so a
+        # retirement or restoration (`:r`) and a tick that admits evidence an
+        # earlier one excluded (`:e`) both refuse the prior Claude object. Each
+        # is appended only when set, so other stores keep their version bytes.
+        if retired_digest:
+            claude_version = f"{claude_version}:r{retired_digest}"
+        if evidence_eligible_at is not None:
+            claude_version = f"{claude_version}:e{_iso_z(evidence_eligible_at)}"
+        # #836 spec 5.7: the decorated-only fragment. A decorated Claude source
+        # publishes ONE account's card and that account's history index, and
+        # exact-version reuse compares this string, so the owner, its label
+        # and the published index identity (keys, stamps, current flag) enter
+        # it. Undecorated envelopes carry no `account_key`, so their version
+        # bytes are unchanged.
+        _owner_fragment = _tui_claude_owner_version_fragment(claude_data)
+        if _owner_fragment:
+            claude_version = f"{claude_version}:o{_owner_fragment}"
         prior_claude = (
             prior_bundle.sources.get("claude")
             if prior_bundle is not None else None
@@ -5240,7 +5528,10 @@ def _tui_build_snapshot_once(
                             )
                         )
                         and not _snapshot_period_rolled_over(
-                            prior_snap, now_utc, _build_display_tz)):
+                            prior_snap, now_utc, _build_display_tz)
+                        # #836 spec 5.7 item 2: evidence the prior build
+                        # excluded by its as-of is eligible now.
+                        and not _tui_evidence_matured(prior_snap, now_utc)):
                     with _perf.phase("idle-decision"):
                         idle_snap = _tui_build_idle_snapshot(
                             prior_snap, now_utc=now_utc,
@@ -5405,7 +5696,14 @@ def _tui_build_snapshot_once(
         with _perf.phase("build.milestones"):
             try:
                 if cw is not None:
-                    milestones = _tui_build_percent_milestones(conn)
+                    # #836 (spec 5.3): a decorated card's milestones are its
+                    # owner's, from the card's own cycle identity.
+                    if getattr(cw, "account_decorated", False):
+                        milestones = _tui_build_percent_milestones(
+                            conn, account_key=cw.account_key,
+                            cycle_scope=cw.cycle_scope)
+                    else:
+                        milestones = _tui_build_percent_milestones(conn)
             except Exception as exc:
                 capture_failure("milestones", "stats", exc)
         history: list = []
@@ -5597,7 +5895,22 @@ def _tui_build_snapshot_once(
         week_index: list[dict] = []
         with _perf.phase("build.week_index"):
             try:
-                week_index = sys.modules["cctally"].build_claude_week_index(conn)
+                # #836 spec 5.5 (U1): a decorated card names its account and
+                # its cycle, and the index is that account's history derived
+                # with the SAME scope, so the current entry is the card's
+                # cycle. Undecorated: today's merged index. A decorated store
+                # with no card publishes no index (it rides `current_week`),
+                # so the merged one is not built for it (review F9); the
+                # extra predicate runs only when there is no card.
+                if cw is not None and getattr(cw, "account_decorated", False):
+                    week_index = sys.modules["cctally"].build_claude_week_index(
+                        conn, account_key=cw.account_key,
+                        cycle_scope=cw.cycle_scope)
+                elif cw is None and _decorated_claude(conn):
+                    week_index = []
+                else:
+                    week_index = sys.modules["cctally"].build_claude_week_index(
+                        conn)
             except Exception as exc:
                 capture_failure("week-index", "stats", exc)
         # ---- Projects panel + modal envelope (spec §5.2, plan Task 1) -----
@@ -5784,6 +6097,16 @@ def _tui_build_snapshot_once(
                 daily_panel, now_utc=now_utc, display_tz=_build_display_tz,
             )
 
+        # #836 spec 5.7 item 2: recorded on every dashboard (non-idle) build;
+        # the idle gate and the Claude source version read it.
+        evidence_eligible_at: dt.datetime | None = None
+        if precompute_envelope:
+            with _perf.phase("build.evidence_eligibility"):
+                try:
+                    evidence_eligible_at = _tui_evidence_eligible_at(
+                        conn, now_utc)
+                except Exception as exc:
+                    capture_failure("evidence-eligibility", "stats", exc)
         snap = DataSnapshot(
             current_week=cw,
             forecast=fc,
@@ -5821,6 +6144,7 @@ def _tui_build_snapshot_once(
             envelope_precompute=envelope_precompute_block,
             data_version=data_version,
             source_bundle=None,
+            evidence_eligible_at=evidence_eligible_at,
         )
         if precompute_envelope:
             source_bundle: SourceDashboardBundle | None = None
@@ -5872,6 +6196,7 @@ def _tui_build_snapshot_once(
                         projects_envelope=projects_envelope_block,
                         prior_bundle=prior_source_bundle,
                         raw_config=raw_config,
+                        evidence_eligible_at=evidence_eligible_at,
                     )
                 if source_bundle is None:
                     raise RuntimeError("source bundle builder returned no bundle")
@@ -6127,6 +6452,8 @@ def _tui_compute_dispatch_signature(stats_conn, *, with_codex_dependency=False):
                 codex_stats_digest=codex_stats_digest(stats_conn),
                 accounts_digest=accounts_identity_digest(stats_conn),
                 claude_stats_digest=claude_stats_digest(stats_conn),
+                claude_weekly_retired_digest=(
+                    claude_weekly_retired_digest(stats_conn)),
             )
             if not with_codex_dependency:
                 return signature
@@ -6368,6 +6695,8 @@ def _tui_build_idle_snapshot(prior, *, now_utc, precompute_envelope,
                     prior_bundle=source_bundle,
                     raw_config=raw_config,
                     attempt=source_attempt,
+                    evidence_eligible_at=getattr(
+                        prior, "evidence_eligible_at", None),
                 )
         except _StatsSnapshotCorruption:
             raise

@@ -549,16 +549,25 @@ def test_the_route_accepts_the_unattributed_sentinel_on_codex(
         srv.server_close()
 
 
-def test_the_route_rejects_the_account_param_on_the_claude_source(
+def test_the_route_rejects_the_account_param_on_an_undecorated_claude_store(
         ns, tmp_path, monkeypatch):
-    """F4. Claude weeks are not account-partitioned on this route, so accepting
-    the qualifier and returning the merged week would be a privacy lie. The
-    rejection is stated at the parse site, ahead of key resolution — the
-    unqualified control proves the 400 is the ACCOUNT param and not the key."""
+    """F4, narrowed by #836 (spec 5.6). Claude history is account-partitioned
+    only on a DECORATED store (more than one real Claude account); there the
+    qualifier scopes the cycle (`tests/test_milestone_history.py`). On an
+    undecorated store it partitions nothing, so accepting it and returning the
+    merged week would be a privacy lie: it is refused. The unqualified control
+    proves the 400 is the ACCOUNT param and not the key."""
     from test_milestone_history import _get
 
     srv, _keys = _route(ns, tmp_path, monkeypatch)
     claude_key = "/api/milestones/claude/week/milestone_cycle:" + "A" * 43
+    conn = ns["open_db"]()
+    try:
+        import _cctally_account
+        assert not _cctally_account.provider_is_decorated(conn, "claude"), (
+            "non-vacuity: this store must be undecorated for Claude")
+    finally:
+        conn.close()
     try:
         status, body = _get(srv, claude_key + "?account=" + ACCT_A)
         assert status == 400, (status, body)

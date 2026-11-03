@@ -128,7 +128,10 @@ def test_real_rebuild_stall_is_bounded_and_retry_converges(tmp_path):
     actor.wait(timeout=30)
 
     assert stuck.returncode == 1
-    assert elapsed < 5.0
+    # Prompt diagnosis, not host speed: a missing detector runs into the 15 s
+    # subprocess timeout. Loaded hosted runners took 5.47 s and 5.63 s here
+    # (the v1.116.0 and v1.117.0 public Linux matrices) against a 1 s stall.
+    assert elapsed < 10.0
     assert "[cache-sync] claude done:" in stuck.stderr
     assert "[cache-sync] codex done:" in stuck.stderr
     assert (

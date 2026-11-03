@@ -2764,16 +2764,35 @@ def build_all_combined(as_of: dt.datetime) -> None:
 
 def _seed_all_combined_decorated_accounts(
     stats_conn: sqlite3.Connection,
+    cache_conn: sqlite3.Connection,
     *,
     as_of: dt.datetime,
     missing_cost_key: str | None = None,
 ) -> None:
-    """Seed distinct account cards whose certified spend sums to the hero."""
+    """Seed distinct account cards whose certified spend is the combined leg.
+
+    Since #836 (U3) the decorated Claude hero is the DISPLAYED account's spend,
+    not the sum of the cards, so the combined leg is certified by the cards and
+    their contributions alone. Each real account's current-week session
+    entries are attributed to it (as #944's write-time attribution does on a
+    real store), so the displayed account's `current_week.spent_usd` equals its
+    own card's `spendUsd`.
+    """
+    # Each card's spend is exactly the current-week entries attributed to it
+    # below (claude-sonnet-4-6): `work` owns the two-entry overlap session
+    # ($0.6375 + $0.324), `home` the prefix session ($0.93). The at-now
+    # range sentinel ($0.159) stays unattributed.
     rows = (
-        ("a" * 32, "uuid-allcomb-work", "work@example.com", "work", "max", 17.0, 0.75),
-        ("b" * 32, "uuid-allcomb-home", "home@example.com", "home", "pro", 23.0, 0.90),
+        ("a" * 32, "uuid-allcomb-work", "work@example.com", "work", "max", 17.0,
+         0.9615, "allcomb-claude-overlap-0000-0000-0000-0"),
+        ("b" * 32, "uuid-allcomb-home", "home@example.com", "home", "pro", 23.0,
+         0.93, "allcomb-claude-prefix-0000-0000-0000-00"),
     )
-    for key, natural, email, label, plan, pct, cost in rows:
+    for key, natural, email, label, plan, pct, cost, session_id in rows:
+        cache_conn.execute(
+            "UPDATE session_entries SET account_key = ? WHERE source_path = ?",
+            (key, f"/fake/jsonl/{session_id}.jsonl"),
+        )
         seed_account(
             stats_conn,
             account_key=key,
@@ -2805,13 +2824,13 @@ def _seed_all_combined_decorated_accounts(
             )
     # The original aggregate snapshots use the unattributed sentinel. Its
     # certified operand is included last, and the three exact values sum to the
-    # current-week hero's $2.0505.
+    # whole current week's $2.0505, so the combined headline is unchanged.
     _insert_cost_snapshot(
         stats_conn,
         captured_at=as_of - dt.timedelta(seconds=600),
         week_start=_AC_CLAUDE_WEEK_START,
         week_end=_AC_CLAUDE_WEEK_END,
-        cost_usd=0.4005,
+        cost_usd=0.159,
         account_key="unattributed",
     )
 
@@ -2833,7 +2852,8 @@ def _build_all_combined_decorated(
         _seed_all_combined_claude(stats_conn, cache_conn, as_of)
         _seed_all_combined_codex(cache_conn, as_of)
         _seed_all_combined_decorated_accounts(
-            stats_conn, as_of=as_of, missing_cost_key=missing_cost_key,
+            stats_conn, cache_conn, as_of=as_of,
+            missing_cost_key=missing_cost_key,
         )
         _stamp_and_verify(stats_conn)
         stats_conn.commit()

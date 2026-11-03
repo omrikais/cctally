@@ -120,27 +120,43 @@ describe('fetchWeekDetail', () => {
   // `cycle_index` produced the key: a key from account A's index is not
   // guaranteed to resolve against the merged enumeration, so this is a
   // correctness requirement, not a filter. Omitted iff "All accounts".
-  it('appends ?account= under focus and omits it for All accounts', async () => {
-    const spy = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
-    global.fetch = spy as unknown as typeof fetch;
-    const account = 'a'.repeat(32);
-    await fetchWeekDetail('codex', entry('cycle:a'), account);
-    expect(spy).toHaveBeenCalledWith(`/api/milestones/codex/week/cycle%3Aa?account=${account}`);
-    await fetchWeekDetail('codex', entry('cycle:b'), null);
-    expect(spy).toHaveBeenLastCalledWith('/api/milestones/codex/week/cycle%3Ab');
-  });
+  // #836 (U1): a decorated Claude store scopes its navigator to the displayed
+  // account, so Claude qualifies the request exactly as Codex does; with no
+  // account the Claude request stays the unqualified route it always was.
+  for (const source of ['codex', 'claude'] as const) {
+    it(`appends ?account= under focus and omits it with no account (${source})`, async () => {
+      const spy = vi.fn(async () => ({ ok: true, json: async () => ({}) }));
+      global.fetch = spy as unknown as typeof fetch;
+      const account = 'a'.repeat(32);
+      await fetchWeekDetail(source, entry('cycle:a'), account);
+      expect(spy).toHaveBeenCalledWith(`/api/milestones/${source}/week/cycle%3Aa?account=${account}`);
+      await fetchWeekDetail(source, entry('cycle:b'), null);
+      expect(spy).toHaveBeenLastCalledWith(`/api/milestones/${source}/week/cycle%3Ab`);
+      await fetchWeekDetail(source, entry('cycle:c'));
+      expect(spy).toHaveBeenLastCalledWith(`/api/milestones/${source}/week/cycle%3Ac`);
+    });
 
-  it('keys the cache by account so two accounts never share a payload', async () => {
-    const spy = vi.fn(async (url: string) => ({
-      ok: true, json: async () => ({ key: url }),
-    }));
-    global.fetch = spy as unknown as typeof fetch;
-    const e = entry('cycle:shared', { detail_stamp: 's1' });
-    const a = await fetchWeekDetail('codex', e, 'a'.repeat(32));
-    const b = await fetchWeekDetail('codex', e, 'b'.repeat(32));
-    expect(a).not.toBe(b);
-    expect(spy).toHaveBeenCalledTimes(2);
-  });
+    // Cycle keys and detail stamps can be identical across accounts (shared
+    // subscription-week boundaries), so the stamp alone cannot separate them.
+    it(`keys the cache by account so two accounts never share a payload (${source})`, async () => {
+      const spy = vi.fn(async (url: string) => ({
+        ok: true, json: async () => ({ key: url }),
+      }));
+      global.fetch = spy as unknown as typeof fetch;
+      const e = entry('cycle:shared', { detail_stamp: 's1' });
+      const a = await fetchWeekDetail(source, e, 'a'.repeat(32));
+      const b = await fetchWeekDetail(source, e, 'b'.repeat(32));
+      const unscoped = await fetchWeekDetail(source, e, null);
+      expect(a).not.toBe(b);
+      expect(unscoped).not.toBe(a);
+      expect(unscoped).not.toBe(b);
+      expect(spy).toHaveBeenCalledTimes(3);
+      // A repeat for either account is served from its own cache entry.
+      expect(await fetchWeekDetail(source, e, 'a'.repeat(32))).toBe(a);
+      expect(await fetchWeekDetail(source, e, 'b'.repeat(32))).toBe(b);
+      expect(spy).toHaveBeenCalledTimes(3);
+    });
+  }
 
   it('throws an error carrying status + code on a non-ok response', async () => {
     global.fetch = vi.fn(async () => ({

@@ -2823,6 +2823,22 @@ def test_an_overflowing_class_accumulator_is_withheld():
         [qm.WithholdingCause.TOKEN_SPLIT_UNKNOWN]
 
 
+def test_totals_past_the_float_range_are_withheld_not_raised():
+    # Section 39 at the TOTALS. The totals use `math.fsum` so Python 3.11 and
+    # 3.12+ print the same digits, and `fsum` raises OverflowError where the
+    # old `sum()` saturated to inf. Two classes, each finite and each finite
+    # once weighted, whose weighted and raw totals pass the float range must
+    # still reach the `_finite_quantity` guards instead of raising out of the
+    # kernel (and out of `cctally quota`).
+    big = int(1e308)
+    assert math.isinf(qm.class_units({"fresh": 1e308, "cache_1h": 1e308},
+                                     OPUS5))
+    kw = dict(fresh=big, cache_create_total=big, cache_1h=big)
+    assert [o.cause for o in _one_day_series([_at_noon(**kw)])] == \
+        [qm.WithholdingCause.TOKEN_SPLIT_UNKNOWN]
+    assert qm.aggregate_composition([_entry(**kw)], era=OPUS5) is None
+
+
 def test_the_forecast_aggregate_asserts_the_same_two_premises():
     # Section 39's premises hold at BOTH numeric boundaries, not only inside
     # `build_daily_series`. `aggregate_composition` reduces the forecast

@@ -44,6 +44,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 
+import _cctally_core  # `weekly_held_exclusion`: the held-column guard (#836)
 import _lib_accounts  # pure stdlib kernel; UNATTRIBUTED sentinel (#341)
 import _lib_rebuild_progress  # #997 D9 progress ticks (stdlib only)
 from _lib_five_hour import latest_five_hour_reading
@@ -1086,13 +1087,57 @@ def _credit_aware_block_weekly_axes(conn, block, *, now_utc, cache=None):
             block.get("seven_day_pct_at_block_end"))
 
 
+def _weekly_retired_sql(conn, alias: str) -> "str | None":
+    """The suppression-retired predicate over ``alias``, or None on a store
+    without the held column (#836, spec 5.4).
+
+    A held WRITE stores ``"weeklyObservationHeld": true`` in ``payload_json``
+    beside its effective basis value (`_cctally_record`, the held branch of
+    the snapshot write). A weekly credit's cleanup instead turns an UNHELD row,
+    whose payload never carried that marker, into a held one and leaves its
+    stale `weekly_percent` in place (`_delete_doomed_snapshot_rows`, replay
+    `_cctally_journal._retire_weekly_effects`). The marker therefore separates
+    the two exactly. A store without the column cannot hold a held row, the
+    reason `_cctally_core.weekly_held_exclusion` omits its own predicate there.
+    """
+    if not _cctally_core.weekly_held_exclusion(conn):
+        return None
+    return (f"({alias}.weekly_observation_held = 1 AND "
+            f"json_extract({alias}.payload_json, '$.weeklyObservationHeld') "
+            f"IS NOT 1)")
+
+
+def effective_weekly_value_sql(conn, alias: str = "s") -> str:
+    """The joined snapshot's EFFECTIVE weekly value (#836, spec 5.4): NULL for
+    a suppression-retired row, its stored `weekly_percent` otherwise. A
+    clamped held write and a genuine climb-back keep their values; no
+    percentage band is involved."""
+    retired = _weekly_retired_sql(conn, alias)
+    if retired is None:
+        return f"{alias}.weekly_percent"
+    return f"CASE WHEN {retired} THEN NULL ELSE {alias}.weekly_percent END"
+
+
+def weekly_join_unavailable_sql(conn, alias: str = "s") -> str:
+    """A five-hour milestone's effective weekly join is UNAVAILABLE (#836,
+    spec 5.4): the joined snapshot is absent — deleted, or the ``0`` sentinel
+    `trg_usage_snapshot_suppression` writes — or suppression-retired. The
+    shared predicate of the detail stamp and the dashboard's retired-join
+    signature leg, over a ``LEFT JOIN`` aliased ``alias``."""
+    retired = _weekly_retired_sql(conn, alias)
+    if retired is None:
+        return f"({alias}.id IS NULL)"
+    return f"({alias}.id IS NULL OR {retired})"
+
+
 #: The six `five_hour_milestones` columns every surface already published, plus
-#: the joined EFFECTIVE weekly value. Ordering is `captured_at_utc, id` — spec
-#: §5.2's merged-stream order, which post-credit threshold repeats depend on.
+#: the joined EFFECTIVE weekly value (`effective_weekly_value_sql`, filled in
+#: as ``{effective}``). Ordering is `captured_at_utc, id` — spec §5.2's
+#: merged-stream order, which post-credit threshold repeats depend on.
 _FIVE_HOUR_MILESTONE_SQL = """
     SELECT m.percent_threshold, m.captured_at_utc, m.block_cost_usd,
            m.marginal_cost_usd, m.seven_day_pct_at_crossing, m.reset_event_id,
-           s.weekly_percent AS effective_seven_day_pct_at_crossing
+           {effective} AS effective_seven_day_pct_at_crossing
       FROM five_hour_milestones m
       LEFT JOIN weekly_usage_snapshots s ON s.id = m.usage_snapshot_id
      WHERE {selector}
@@ -1139,6 +1184,12 @@ def _load_five_hour_milestones(
     store is corrected by `db rederive`'s reviewed `retract`. A missing joined
     snapshot still publishes None and never falls back to the raw value.
 
+    **A suppression-retired snapshot publishes None** (#836, spec 5.4). The
+    fold rejected its weekly value, and the cleanup kept the row only for its
+    five-hour evidence; its provenance is exact (no held-write marker on a
+    held row), so this is not the withdrawn band. See
+    `effective_weekly_value_sql`.
+
     SELECTOR. Exactly one of `block_id` or `five_hour_window_key` must be given.
     `block_id` is the precise form — `five_hour_milestones.block_id` names one
     block outright. The pair form filters on the window key AND the account,
@@ -1166,7 +1217,9 @@ def _load_five_hour_milestones(
             selector += " AND m.account_key = ?"
             params += (account_key,)
     rows = conn.execute(
-        _FIVE_HOUR_MILESTONE_SQL.format(selector=selector), params,
+        _FIVE_HOUR_MILESTONE_SQL.format(
+            selector=selector,
+            effective=effective_weekly_value_sql(conn, "s")), params,
     ).fetchall()
     out: list[dict] = []
     for r in rows:

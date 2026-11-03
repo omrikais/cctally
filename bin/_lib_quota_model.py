@@ -866,6 +866,24 @@ def family_participation(family: str | None) -> str:
     return FAMILY_PARTICIPATION.get(family, "unknown")
 
 
+def _float_total(values) -> float:
+    """`math.fsum` of `values`, or the plain `sum()` when `fsum` cannot.
+
+    `fsum` is correctly rounded, so a total is the same on Python 3.11, whose
+    float `sum()` is uncompensated, and on 3.12+, whose `sum()` is not; a
+    plain sum printed different last digits from one interpreter to the next.
+    But `fsum` raises where `sum()` saturates: `OverflowError` once finite
+    terms pass the float range, `ValueError` on `inf + -inf`. The plain sum's
+    `inf`/`nan` is what the section-39 `_finite_quantity` guards withhold, so
+    that path returns it unchanged rather than raising out of the kernel.
+    """
+    items = list(values)
+    try:
+        return math.fsum(items)
+    except (OverflowError, ValueError):
+        return sum(items)
+
+
 def _finite_quantity(value) -> bool:
     """True when a token quantity is a real, finite number.
 
@@ -1001,8 +1019,8 @@ def class_units(classes, era: CoefficientEra) -> float:
     a multiplication of its own.
     """
     weights = era.weight_map()
-    return sum(float(classes.get(name, 0.0)) * weights[name]
-               for name in TOKEN_CLASSES)
+    return _float_total(float(classes.get(name, 0.0)) * weights[name]
+                        for name in TOKEN_CLASSES)
 
 
 class EntryWeighting(typing.NamedTuple):
@@ -1463,7 +1481,7 @@ def build_daily_series(segments, entries, *, now, newest_entry_at,
             entry_units = class_units(quantities, era)
             units += entry_units
             families[family] = families.get(family, 0.0) + entry_units
-        raw_total = sum(raw.values())
+        raw_total = _float_total(raw.values())
 
         # Cause precedence follows STATUS_PRECEDENCE: an unknown split
         # outranks incomplete history, which outranks an unsupported mix.
@@ -1698,7 +1716,7 @@ def composition_centre(vectors) -> dict[str, float] | None:
         return None
     keys = sorted({k for row in rows for k in row})
     raw = {k: median([row.get(k, 0.0) for row in rows]) for k in keys}
-    total = sum(raw.values())
+    total = _float_total(raw.values())
     if not math.isfinite(total) or total <= 0.0:
         return None
     return {k: v / total for k, v in raw.items()}
@@ -1825,8 +1843,8 @@ def aggregate_composition(entries, *, era: CoefficientEra) -> tuple | None:
             raw[name] += qty
         units = class_units(quantities, era)
         families[family] = families.get(family, 0.0) + units
-    raw_total = sum(raw.values())
-    unit_total = sum(families.values())
+    raw_total = _float_total(raw.values())
+    unit_total = _float_total(families.values())
     if not _finite_quantity(raw_total) or not _finite_quantity(unit_total):
         return None
     if raw_total <= 0.0 or unit_total <= 0.0:
@@ -2060,8 +2078,8 @@ def jackknife_fit(days) -> tuple[float, Interval] | None:
     if any(not _finite_quantity(d.units) or not _finite_quantity(d.meter_delta)
            for d in rows):
         return None
-    total_units = sum(d.units for d in rows)
-    total_meter = sum(d.meter_delta for d in rows)
+    total_units = _float_total(d.units for d in rows)
+    total_meter = _float_total(d.meter_delta for d in rows)
     if total_meter <= 0.0 or total_units <= 0.0:
         return None
     point = total_units / total_meter
@@ -2071,10 +2089,10 @@ def jackknife_fit(days) -> tuple[float, Interval] | None:
         if rest_meter <= 0.0:
             return None
         replicates.append((total_units - row.units) / rest_meter)
-    mean = sum(replicates) / n
+    mean = _float_total(replicates) / n
     # A product, not `** 2`, which is the C library's `pow`.
-    se = math.sqrt((n - 1) / n * sum((v - mean) * (v - mean)
-                                     for v in replicates))
+    se = math.sqrt((n - 1) / n * _float_total((v - mean) * (v - mean)
+                                              for v in replicates))
     half = t_quantile_975(n - 1) * se
     return point, Interval(max(0.0, point - half), point + half)
 

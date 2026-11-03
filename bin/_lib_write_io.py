@@ -499,7 +499,7 @@ def local_instance() -> "dict | None":
 
 
 def state_for_budget() -> tuple:
-    """Every object this module retains, for the 65,536-byte state test."""
+    """Every object this module retains, for the tick-stats state budget."""
     state = _STATE
     return (state.t, state.b, state.p, state.ledger, state.ex[0],
             state.ex[1:], state.open, state.hysteresis, state.local_instance,

@@ -110,9 +110,11 @@ def test_the_owned_state_stays_inside_its_budget():
 
 
 def test_the_two_rings_stay_inside_the_frozen_budget():
-    """The cap is FROZEN at 65,536 (#583 S4 §6). Raising it is not a way to
-    pass: a criterion that permits raising the constant to whatever the
-    implementation measures can never fail."""
+    """The cap is FROZEN (#583 S4 §6 froze 65,536; the v1.117.1 cut raised it
+    once, to 73,728, as its own recorded decision when Python 3.11 measured
+    66,000). Raising it is not a way to pass: a criterion that permits
+    raising the constant to whatever the implementation measures can never
+    fail."""
     import _lib_tick_stats as ts
     ts.reset_for_tests()
     longest = "z" * ts.PUBLISHED_AT_MAX_CHARS
@@ -130,7 +132,7 @@ def test_the_two_rings_stay_inside_the_frozen_budget():
     assert len(snap.records) == ts.RING_CAPACITY
     assert len(snap.conversation_records) == ts.RING_CAPACITY, (
         "non-vacuity: the budget must be measured over TWO full rings")
-    assert ts.MEMORY_BUDGET_BYTES == 65536, (
+    assert ts.MEMORY_BUDGET_BYTES == 73728, (
         "the budget is frozen; raising it is a separate reviewed decision")
     assert ts.RING_CAPACITY == 64
     assert ts._deep_size(snap) <= ts.MEMORY_BUDGET_BYTES
@@ -663,7 +665,7 @@ def test_a_busy_checkpoint_is_reported_as_pending():
 
 def test_all_three_rings_stay_inside_the_frozen_budget():
     """Non-vacuity: every ring is FULL. The maintenance ring is shorter than
-    the other two precisely because the 65,536-byte cap is frozen and a phase
+    the other two precisely because the 73,728-byte cap is frozen and a phase
     that runs about once a day does not earn a full-length ring."""
     import _lib_tick_stats as ts
     ts.reset_for_tests()
@@ -684,7 +686,7 @@ def test_all_three_rings_stay_inside_the_frozen_budget():
     assert len(snap.records) == ts.RING_CAPACITY
     assert len(snap.conversation_records) == ts.RING_CAPACITY
     assert len(snap.maintenance_records) == ts.MAINTENANCE_RING_CAPACITY
-    assert ts.MEMORY_BUDGET_BYTES == 65536, (
+    assert ts.MEMORY_BUDGET_BYTES == 73728, (
         "the budget is frozen; raising it is a separate reviewed decision")
     assert ts._deep_size(snap) <= ts.MEMORY_BUDGET_BYTES
 

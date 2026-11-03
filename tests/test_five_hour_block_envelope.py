@@ -9,6 +9,7 @@ the project's existing `conftest.load_script` + path-monkeypatch pattern
 instead — same coverage, no production-DB pollution.
 """
 import datetime as dt
+import json
 import re
 import sqlite3
 import sys
@@ -960,3 +961,618 @@ def test_835_r8_an_uncredited_envelope_store_is_byte_stable(ctx):
     assert fhb is not None
     assert fhb["seven_day_pct_at_block_start"] == pytest.approx(60.0)
     assert fhb["seven_day_pct_delta_pp"] == pytest.approx(6.7, abs=1e-9)
+
+
+# ── #836: the live weekly milestones and credit segment share the account ──
+#
+# #839 bound the live block, its 5h milestones and its 5h credits to the
+# account that supplied the displayed weekly percentage. The weekly milestone
+# list published beside them (`current_week.milestones`) and the week index's
+# current entry still read every account. Detects: a two-account store shows
+# the other account's weekly crossings (or none at all, after the other
+# account's weekly credit) under this account's headline percentage.
+
+
+def _seed_836_weekly_milestone(conn, account, threshold, captured, *,
+                               reset_event_id=0):
+    conn.execute(
+        "INSERT INTO percent_milestones "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, percent_threshold, cumulative_cost_usd, "
+        " marginal_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+        " reset_event_id, account_key) "
+        "VALUES (?, '2026-04-27', '2026-05-04', '2026-04-27T00:00:00+00:00', "
+        " '2026-05-04T00:00:00+00:00', ?, ?, 0.5, 0, 0, ?, ?)",
+        (captured, threshold, float(threshold), reset_event_id, account),
+    )
+
+
+def _seed_836_store(conn, order):
+    """The D-A store: Alice owns the newest non-held weekly reading (3%) and
+    has milestones 1-3 with no reset; Bob shares week 2026-04-27, had an
+    in-place weekly credit (a `week_reset_events` row stamped `zbob`) and
+    has post-credit milestones 1-5 carrying that reset id. ``order`` is the
+    insertion order of the two accounts' rows."""
+    key = 1777595400
+    _register_839_accounts(conn)
+    snaps = {"zbob": (40.0, "2026-04-30T10:59:00Z"),
+             "alice": (3.0, "2026-04-30T11:00:00Z")}
+    for account in order:
+        pct, captured = snaps[account]
+        _seed_839_snapshot(conn, account, pct, key, captured)
+    cur = conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, account_key) "
+        "VALUES ('2026-04-29T09:00:00Z', '2026-05-04T00:00:00+00:00', "
+        " '2026-05-04T00:00:00+00:00', '2026-04-29T09:00:00Z', 'zbob')")
+    bob_reset = int(cur.lastrowid)
+    for account in order:
+        if account == "alice":
+            for t in (1, 2, 3):
+                _seed_836_weekly_milestone(
+                    conn, "alice", t, f"2026-04-30T10:0{t}:00Z")
+        else:
+            for t in (1, 2, 3, 4, 5):
+                _seed_836_weekly_milestone(
+                    conn, "zbob", t, f"2026-04-29T1{t}:00:00Z",
+                    reset_event_id=bob_reset)
+    conn.commit()
+    return bob_reset
+
+
+def _836_build(ns, *, precompute=False, now=_PINNED_NOW):
+    kwargs = {}
+    if precompute:
+        kwargs = {"precompute_envelope": True, "runtime_bind": "127.0.0.1"}
+    snapshot = ns["_tui_build_snapshot"](
+        now_utc=now, skip_sync=True, display_tz_pref_override="utc",
+        **kwargs)
+    envelope = ns["snapshot_to_envelope"](snapshot, now_utc=now)
+    return snapshot, envelope
+
+
+_ORDERS = pytest.mark.parametrize(
+    "order", [("zbob", "alice"), ("alice", "zbob")])
+
+
+@_ORDERS
+def test_836_another_accounts_credit_does_not_reanchor_the_displayed_cycle(
+        ctx, order):
+    """D-A, cycle start. Detects: `_apply_midweek_reset_override`'s
+    account-blind reset read moving Alice's cycle start (and the window her
+    spend is summed over) to Bob's credit instant."""
+    ns, conn = ctx
+    _seed_836_store(conn, order)
+    _snap, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert cw["used_pct"] == 3.0, "non-vacuity: Alice is the displayed account"
+    assert cw["week_start_at"] == "2026-04-27T00:00:00Z", (
+        "another account's weekly credit re-anchored Alice's cycle")
+    assert cw["reset_at_utc"] == "2026-05-04T00:00:00Z"
+
+
+@_ORDERS
+def test_836_live_weekly_milestones_belong_to_the_displayed_account(
+        ctx, order):
+    """D-A, weekly population. Detects: Bob's post-credit crossings 1-5
+    published under Alice's 3% headline."""
+    ns, conn = ctx
+    _seed_836_store(conn, order)
+    _snap, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert cw["used_pct"] == 3.0
+    assert [m["percent"] for m in cw["milestones"]] == [1, 2, 3], (
+        "the weekly milestones beside Alice's headline are not Alice's")
+    current = [e for e in cw["week_index"] if e["is_current"]]
+    assert len(current) == 1
+    assert current[0]["milestone_count"] == 3, (
+        "the navigator's current cycle counts another account's crossings")
+    _assert_836_index_agrees_with_the_card(ns, cw, "alice")
+
+
+def _assert_836_index_agrees_with_the_card(ns, cw, account, now=_PINNED_NOW):
+    """#836 spec 5.5 (R2-2): one identity for card, index and detail. The
+    current index entry's start AND end are the card's, and the scoped detail
+    the route serves for that key at the same as-of returns the same bounds —
+    a single current flag would pass while describing a shorter interval."""
+    current = [e for e in cw["week_index"] if e["is_current"]]
+    assert len(current) == 1, cw["week_index"]
+    entry = current[0]
+    assert entry["start_at_utc"] == cw["week_start_at"]
+    assert entry["end_at_utc"] == cw["reset_at_utc"]
+    conn = ns["open_db"]()
+    try:
+        detail = ns["build_claude_week_detail"](
+            conn, entry["key"], account_key=account, now_utc=now)
+    finally:
+        conn.close()
+    assert detail is not None
+    assert detail["is_current"] is True
+    assert (detail["start_at_utc"], detail["end_at_utc"]) == (
+        cw["week_start_at"], cw["reset_at_utc"])
+    assert detail["detail_stamp"] == entry["detail_stamp"]
+
+
+@_ORDERS
+def test_836_the_active_credit_segment_is_the_displayed_accounts(ctx, order):
+    """D-A, active segment. Detects: the segment resolved by an account-blind
+    `_latest_reset_event_for_end`, which names Bob's credit as Alice's live
+    segment and filters her own milestones out."""
+    ns, conn = ctx
+    _seed_836_store(conn, order)
+    snapshot, _envelope = _836_build(ns)
+    cw = snapshot.current_week
+    assert cw is not None and cw.used_pct == 3.0
+    scope = cw.cycle_scope
+    assert scope is not None and scope.account_key == "alice"
+    assert scope.reset_event_id == 0, "Bob's credit is Alice's active segment"
+    assert scope.effective_start_at == "2026-04-27T00:00:00Z"
+    assert scope.week_start_date == "2026-04-27"
+    assert scope.as_of_utc == "2026-04-30T11:30:00Z"
+
+
+@_ORDERS
+def test_836_the_current_week_publishes_its_account_and_the_source_copies_it(
+        ctx, order):
+    """U2 / spec 5.1: the decorated card names its account, with no live
+    block bound, and the Claude source's `hero.current_week` and
+    `quota.current_week` copy the corrected values. Detects: a client with
+    no account to label or scope by, or a source projection that publishes
+    the merged card."""
+    ns, conn = ctx
+    _seed_836_store(conn, order)
+    snapshot, envelope = _836_build(ns, precompute=True)
+    cw = envelope["current_week"]
+    assert cw["five_hour_block"] is None, "non-vacuity: no live block"
+    assert cw["account_key"] == "alice"
+    assert cw["account_label"] == "alice"
+    assert [m["percent"] for m in cw["milestones"]] == [1, 2, 3]
+    data = snapshot.source_bundle.sources["claude"].data
+    for copy in (data["hero"]["current_week"], data["quota"]["current_week"]):
+        assert copy["account_key"] == "alice"
+        assert copy["account_label"] == "alice"
+        assert copy["week_start_at"] == "2026-04-27T00:00:00Z"
+        assert copy["used_pct"] == 3.0
+
+
+def _seed_836_entries(ns, rows):
+    """rows = [(msg_id, timestamp, cost_usd_raw, output_tokens, account)]."""
+    cache = ns["open_cache_db"]()
+    try:
+        for msg_id, ts, cost, out, account in rows:
+            cache.execute(
+                "INSERT INTO session_entries "
+                "(source_path, line_offset, timestamp_utc, model, msg_id, "
+                " req_id, input_tokens, output_tokens, cache_create_tokens, "
+                " cache_read_tokens, cost_usd_raw, account_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"/p/{msg_id}.jsonl", 0, ts, "claude-opus-4-7", msg_id,
+                 "r-" + msg_id, 10, out, 0, 0, cost, account))
+        cache.commit()
+    finally:
+        cache.close()
+
+
+def test_836_card_spend_tokens_and_rate_are_the_displayed_accounts(
+        ctx, monkeypatch):
+    """D-B / U3. Detects: every account's spend summed into the card and
+    divided by the displayed account's percentage; and the consumers that
+    copy the card (header `$/1%`, the Projects interval, the current-week
+    share panel) inheriting the merged figures."""
+    ns, conn = ctx
+    _seed_836_store(conn, ("zbob", "alice"))
+    _seed_836_entries(ns, [
+        ("a1", "2026-04-28T12:00:00Z", 2.0, 100, "alice"),
+        ("a2", "2026-04-30T09:00:00Z", 1.0, 50, "alice"),
+        ("b1", "2026-04-28T13:00:00Z", 7.0, 700, "zbob"),
+        ("b2", "2026-04-30T10:00:00Z", 5.0, 500, "zbob"),
+    ])
+    import _cctally_dashboard as dash
+    seen = {}
+    real_projects = dash._build_projects_envelope
+
+    def spy(conn_, current_week=None, *args, **kwargs):
+        seen["current_week"] = current_week
+        return real_projects(conn_, current_week, *args, **kwargs)
+
+    monkeypatch.setattr(dash, "_build_projects_envelope", spy)
+    monkeypatch.setitem(ns, "_build_projects_envelope", spy)
+    snapshot, envelope = _836_build(ns, precompute=True)
+    cw = envelope["current_week"]
+    from _lib_forecast import corrected_percent_point
+    divisor = corrected_percent_point(3.0) or 3.0
+    assert cw["spent_usd"] == pytest.approx(3.0)
+    assert cw["total_tokens"] == 2 * 10 + 100 + 50
+    assert cw["dollar_per_pct"] == pytest.approx(3.0 / divisor)
+    assert envelope["header"]["dollar_per_pct"] == cw["dollar_per_pct"]
+    assert seen.get("current_week") is snapshot.current_week, (
+        "non-vacuity: the Projects build received the card")
+    import _cctally_dashboard_share as share
+    panel = share._build_current_week_share_panel_data({}, snapshot)
+    assert panel["kpi_cost_usd"] == pytest.approx(3.0)
+    assert panel["week_start_date"] == "2026-04-27"
+
+
+def test_836_owner_ignores_a_newer_held_row_and_a_future_capture_of_another_window(
+        ctx):
+    """D-C. Bob's subscription window (2026-04-28T12:00Z..) overlaps
+    Alice's and contains the as-of instant; Bob has a NEWER held row and a
+    capture after the as-of instant there. Detects: the held-inclusive
+    `MAX(captured_at_utc)` window choice selecting Bob's window, so Alice's
+    newer non-held reading is never considered."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "alice", 3.0, key, "2026-04-30T11:00:00Z")
+
+    def bob(pct, captured, held):
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(week_start_date, week_end_date, week_start_at, week_end_at, "
+            " captured_at_utc, weekly_percent, five_hour_percent, "
+            " five_hour_window_key, weekly_observation_held, account_key, "
+            " payload_json) VALUES ('2026-04-28', '2026-05-05', "
+            " '2026-04-28T12:00:00+00:00', '2026-05-05T12:00:00+00:00', "
+            " ?, ?, 12.0, ?, ?, 'zbob', '{}')",
+            (captured, pct, key, held))
+
+    bob(40.0, "2026-04-30T10:59:00Z", 0)
+    bob(40.0, "2026-04-30T11:20:00Z", 1)
+    bob(55.0, "2026-04-30T12:00:00Z", 0)   # after the as-of instant
+    conn.commit()
+    _snap, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert cw["used_pct"] == 3.0, "the owner was chosen from Bob's window"
+    assert cw["account_key"] == "alice"
+    assert cw["week_start_at"] == "2026-04-27T00:00:00Z"
+
+
+def test_836_owner_on_the_date_only_leg_ignores_a_newer_held_row(ctx):
+    """D-C on the date-only leg (no boundaries stored). Detects: the
+    date-only fallback choosing Bob's date range by a held-inclusive
+    `MAX(captured_at_utc)`."""
+    ns, conn = ctx
+    _register_839_accounts(conn)
+
+    def row(account, start, end, pct, captured, held):
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(week_start_date, week_end_date, captured_at_utc, "
+            " weekly_percent, weekly_observation_held, account_key, "
+            " payload_json) VALUES (?, ?, ?, ?, ?, ?, '{}')",
+            (start, end, captured, pct, held, account))
+
+    row("alice", "2026-04-27", "2026-05-03", 3.0, "2026-04-30T11:00:00Z", 0)
+    row("zbob", "2026-04-28", "2026-05-04", 40.0, "2026-04-30T10:59:00Z", 0)
+    row("zbob", "2026-04-28", "2026-05-04", 40.0, "2026-04-30T11:20:00Z", 1)
+    conn.commit()
+    snapshot, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert cw["used_pct"] == 3.0
+    assert cw["account_key"] == "alice"
+    scope = snapshot.current_week.cycle_scope
+    assert scope.week_start_date == "2026-04-27"
+    assert scope.week_start_at is None and scope.week_end_at is None
+    assert scope.reset_event_id == 0
+
+
+def _seed_836_reset(conn, account, *, detected, effective):
+    cur = conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, account_key, origin_observation_id) "
+        "VALUES (?, '2026-05-04T00:00:00+00:00', "
+        " '2026-05-04T00:00:00+00:00', ?, ?, ?)",
+        (detected, effective, account, f"obs:{account}:{detected}"))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def test_836_the_active_reset_is_ordered_by_its_effective_instant(ctx):
+    """R1-6. Alice's later-DETECTED reset is the EARLIER one in effect.
+    Detects: an active reset chosen by detection order, which starts the
+    card at 10:00 while the milestone writer stamped the 11:00 segment."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "zbob", 40.0, key, "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 3.0, key, "2026-04-30T11:15:00Z")
+    _seed_836_reset(conn, "alice", detected="2026-04-30T11:01:00Z",
+                    effective="2026-04-30T11:00:00Z")
+    later = _seed_836_reset(conn, "alice", detected="2026-04-30T11:05:00Z",
+                            effective="2026-04-30T10:00:00Z")
+    snapshot, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert later, "non-vacuity"
+    assert cw["week_start_at"] == "2026-04-30T11:00:00Z"
+    assert snapshot.current_week.cycle_scope.reset_event_id != later
+    _assert_836_index_agrees_with_the_card(ns, cw, "alice")
+
+
+def test_836_a_reset_effective_after_the_as_of_instant_does_not_cut_yet(ctx):
+    """A retained reset whose effective instant is after the as-of instant is
+    not yet in effect for the card. Detects: a cycle cut ahead of its
+    instant, which the history index's as-of rule then disagrees with."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "zbob", 40.0, key, "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 3.0, key, "2026-04-30T11:00:00Z")
+    _seed_836_reset(conn, "alice", detected="2026-04-30T11:20:00Z",
+                    effective="2026-04-30T11:45:00Z")
+    snapshot, envelope = _836_build(ns)
+    assert envelope["current_week"]["week_start_at"] == "2026-04-27T00:00:00Z"
+    assert snapshot.current_week.cycle_scope.reset_event_id == 0
+    _assert_836_index_agrees_with_the_card(ns, envelope["current_week"], "alice")
+
+
+def test_836_a_foreign_credit_after_the_owners_sample_keeps_the_card(ctx):
+    """Bob's credit takes effect after Alice's newest sample. Detects: the
+    merged override dropping every sample before Bob's instant, which blanks
+    Alice's card."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "zbob", 40.0, key, "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 3.0, key, "2026-04-30T11:00:00Z")
+    _seed_836_reset(conn, "zbob", detected="2026-04-30T11:10:00Z",
+                    effective="2026-04-30T11:10:00Z")
+    _snap, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert cw is not None, "Bob's credit blanked Alice's card"
+    assert cw["used_pct"] == 3.0
+    assert cw["week_start_at"] == "2026-04-27T00:00:00Z"
+
+
+def test_836_the_owners_own_later_reset_publishes_no_merged_fallback(ctx):
+    """Alice's own reset takes effect after her newest sample, so her cycle
+    has no sample yet. Detects: a decorated build falling back to Bob's older
+    reading (the merged population) instead of publishing no card."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    _seed_839_snapshot(conn, "zbob", 40.0, key, "2026-04-30T10:59:00Z")
+    _seed_839_snapshot(conn, "alice", 3.0, key, "2026-04-30T11:00:00Z")
+    _seed_836_reset(conn, "alice", detected="2026-04-30T11:10:00Z",
+                    effective="2026-04-30T11:10:00Z")
+    snapshot, envelope = _836_build(ns)
+    assert envelope["current_week"] is None
+    assert snapshot.percent_milestones == []
+    # Review F9: nor is the merged (every-account) index built for a card
+    # that is not published.
+    assert snapshot.week_index == []
+
+
+@_ORDERS
+@pytest.mark.parametrize("now", [
+    dt.datetime(2026, 5, 4, 12, 0, tzinfo=dt.timezone.utc),
+    dt.datetime(2026, 5, 3, 12, 0, tzinfo=dt.timezone.utc),
+], ids=["ended-window-same-date", "inside-window"])
+def test_836_an_ended_window_on_its_end_date_keeps_the_owners_own_reset(
+        ctx, order, now):
+    """Review F1. On the window's end DATE, after its reset instant and
+    before any account records a next-window sample, the owner's window no
+    longer contains the as-of instant, so the owner is chosen through the
+    date-only leg. Alice's row still carries both bounds. Detects: a scope
+    built boundary-less because of the pool the row came from — Alice's own
+    in-place credit is dropped (weekly milestones from the pre-credit segment
+    0) and the scoped index has no current entry, because every real ref has
+    bounds. The control instant inside the window must agree."""
+    ns, conn = ctx
+    key = 1777595400
+    _register_839_accounts(conn)
+    snaps = {"zbob": [(40.0, "2026-05-01T10:00:00Z")],
+             "alice": [(10.0, "2026-05-02T09:00:00Z"),
+                       (2.0, "2026-05-03T10:00:00Z")]}
+    for account in order:
+        for pct, captured in snaps[account]:
+            _seed_839_snapshot(conn, account, pct, key, captured)
+    reset = _seed_836_reset(conn, "alice", detected="2026-05-02T10:00:00Z",
+                            effective="2026-05-02T10:00:00Z")
+    for t in range(1, 11):
+        _seed_836_weekly_milestone(conn, "alice", t, f"2026-05-02T08:{t:02d}:00Z")
+    for t in (1, 2):
+        _seed_836_weekly_milestone(conn, "alice", t, "2026-05-03T10:00:00Z",
+                                   reset_event_id=reset)
+    conn.commit()
+    snapshot, envelope = _836_build(ns, now=now)
+    cw = envelope["current_week"]
+    assert cw is not None and cw["account_key"] == "alice"
+    assert cw["used_pct"] == 2.0
+    assert cw["week_start_at"] == "2026-05-02T10:00:00Z", (
+        "Alice's own credit no longer starts her cycle")
+    assert snapshot.current_week.cycle_scope.reset_event_id == reset
+    assert [m["percent"] for m in cw["milestones"]] == [1, 2], (
+        "the weekly milestones are not the post-credit segment")
+    _assert_836_index_agrees_with_the_card(ns, cw, "alice", now=now)
+
+
+@_ORDERS
+def test_836_a_same_date_reanchor_starts_the_cycle_at_the_reset_instant(
+        ctx, order):
+    """Review F7. An early re-anchor on the old window's start DATE keeps both
+    windows under one storage key. The detector stamps the reset at the exact
+    capture second (`_cctally_record`, #750 S3 1.4) while the new window's
+    start is the provider boundary rounded to the NEAREST hour
+    (`_normalize_week_boundary_dt`), so a reset at 10:40 opens a window
+    whose stored start is 11:00. The index cuts the storage bucket at the
+    reset instant, and the milestone writer bounds the post-reset epoch from
+    it. Detects: a card scope that starts the cycle at the later nominal
+    11:00 because it moves the start only forward, so the scoped index has no
+    current entry and the card's start disagrees with its own cycle."""
+    ns, conn = ctx
+    now = dt.datetime(2026, 4, 27, 13, 0, tzinfo=dt.timezone.utc)
+    old = ("2026-04-27T00:00:00+00:00", "2026-05-04T00:00:00+00:00",
+           "2026-05-04")
+    new = ("2026-04-27T11:00:00+00:00", "2026-05-04T11:00:00+00:00",
+           "2026-05-04")
+    _register_839_accounts(conn)
+
+    def snap(account, window, pct, captured):
+        conn.execute(
+            "INSERT INTO weekly_usage_snapshots "
+            "(week_start_date, week_end_date, week_start_at, week_end_at, "
+            " captured_at_utc, weekly_percent, five_hour_percent, "
+            " weekly_observation_held, account_key, payload_json) "
+            "VALUES ('2026-04-27', ?, ?, ?, ?, ?, 12.0, 0, ?, '{}')",
+            (window[2], window[0], window[1], captured, pct, account))
+
+    def milestone(window, threshold, captured, reset_event_id):
+        conn.execute(
+            "INSERT INTO percent_milestones "
+            "(captured_at_utc, week_start_date, week_end_date, "
+            " week_start_at, week_end_at, percent_threshold, "
+            " cumulative_cost_usd, marginal_cost_usd, usage_snapshot_id, "
+            " cost_snapshot_id, reset_event_id, account_key) "
+            "VALUES (?, '2026-04-27', ?, ?, ?, ?, ?, 0.5, 0, 0, ?, 'alice')",
+            (captured, window[2], window[0], window[1], threshold,
+             float(threshold), reset_event_id))
+
+    rows = {"zbob": [(old, 40.0, "2026-04-27T09:00:00Z")],
+            "alice": [(old, 5.0, "2026-04-27T08:00:00Z"),
+                      (new, 0.0, "2026-04-27T10:40:00Z"),
+                      (new, 2.0, "2026-04-27T12:00:00Z")]}
+    for account in order:
+        for window, pct, captured in rows[account]:
+            snap(account, window, pct, captured)
+    cur = conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, account_key) "
+        "VALUES ('2026-04-27T10:40:00Z', ?, ?, '2026-04-27T10:40:00+00:00', "
+        " 'alice')", (old[1], new[1]))
+    reset = int(cur.lastrowid)
+    for t in range(1, 6):
+        milestone(old, t, f"2026-04-27T0{t}:00:00Z", 0)
+    for t in (1, 2):
+        milestone(new, t, f"2026-04-27T11:{t}0:00Z", reset)
+    conn.commit()
+    snapshot, envelope = _836_build(ns, now=now)
+    cw = envelope["current_week"]
+    assert cw is not None and cw["account_key"] == "alice"
+    assert cw["used_pct"] == 2.0
+    assert snapshot.current_week.cycle_scope.reset_event_id == reset
+    assert cw["week_start_at"] == "2026-04-27T10:40:00Z", (
+        "the cycle does not start at the reset instant the index cuts at")
+    assert cw["reset_at_utc"] == "2026-05-04T11:00:00Z"
+    assert [m["percent"] for m in cw["milestones"]] == [1, 2]
+    _assert_836_index_agrees_with_the_card(ns, cw, "alice", now=now)
+
+
+def _seed_836_undecorated(ns, conn, *, real_alice):
+    """The A10 controls: zero real accounts, or ONE real account beside
+    same-week `unattributed` milestones, credit and spend."""
+    key = 1777595400
+    if real_alice:
+        conn.execute(
+            "INSERT INTO accounts (account_key, provider, natural_id) "
+            "VALUES ('alice', 'claude', 'alice')")
+    owner = "alice" if real_alice else "unattributed"
+    _seed_839_snapshot(conn, "unattributed", 40.0, key,
+                       "2026-04-30T09:59:00Z")
+    _seed_839_snapshot(conn, owner, 43.0, key, "2026-04-30T11:00:00Z")
+    reset = _seed_836_reset(conn, "unattributed",
+                            detected="2026-04-29T09:00:00Z",
+                            effective="2026-04-29T09:00:00Z")
+    for t in (41, 42):
+        _seed_836_weekly_milestone(conn, "unattributed", t,
+                                   f"2026-04-30T10:0{t - 40}:00Z",
+                                   reset_event_id=reset)
+    _seed_836_weekly_milestone(conn, owner, 43, "2026-04-30T11:00:00Z",
+                               reset_event_id=reset)
+    conn.commit()
+    _seed_836_entries(ns, [
+        ("u1", "2026-04-28T12:00:00Z", 4.0, 400, "unattributed"),
+        ("u2", "2026-04-30T09:00:00Z", 2.0, 200, "unattributed"),
+        ("o1", "2026-04-30T10:30:00Z", 1.5, 150, owner),
+    ])
+
+
+#: Serialized on the pre-change tree (base `a71610718`) for both controls,
+#: which publish identically: the merged cycle (the unattributed credit's
+#: re-anchor), merged spend and the merged weekly milestones.
+_836_UNDECORATED_BASELINE = json.loads(r'''
+{
+    "dollar_per_pct": 0.08235294117647059,
+    "five_hour_block": null,
+    "five_hour_milestones": [],
+    "five_hour_pct": 12.0,
+    "five_hour_resets_in_sec": null,
+    "freshness": {
+        "age_seconds": 1800,
+        "captured_at": "2026-04-30T11:00:00Z",
+        "label": "stale"
+    },
+    "last_snapshot_age_sec": 1800,
+    "milestones": [
+        {
+            "crossed_at_utc": "2026-04-30T10:01:00Z",
+            "cumulative_usd": 41.0,
+            "five_hour_pct_at_cross": null,
+            "marginal_usd": 0.5,
+            "percent": 41
+        },
+        {
+            "crossed_at_utc": "2026-04-30T10:02:00Z",
+            "cumulative_usd": 42.0,
+            "five_hour_pct_at_cross": null,
+            "marginal_usd": 0.5,
+            "percent": 42
+        },
+        {
+            "crossed_at_utc": "2026-04-30T11:00:00Z",
+            "cumulative_usd": 43.0,
+            "five_hour_pct_at_cross": null,
+            "marginal_usd": 0.5,
+            "percent": 43
+        }
+    ],
+    "reset_at_utc": "2026-05-04T00:00:00Z",
+    "reset_in_sec": 304200,
+    "spent_usd": 3.5,
+    "total_tokens": 370,
+    "used_pct": 43.0,
+    "week_index": [
+        {
+            "block_count": 0,
+            "detail_stamp": "30e2558efad70a82",
+            "end_at_utc": "2026-05-04T00:00:00Z",
+            "has_observation_gap": false,
+            "is_current": true,
+            "key": "milestone_cycle:lFmc2cqgBLaFa-i3Abs69KCWMMigrkQmVW0zcEcTonE",
+            "label": "Apr 29\u2013May 04",
+            "milestone_count": 3,
+            "segment_count": 1,
+            "start_at_utc": "2026-04-29T09:00:00Z"
+        },
+        {
+            "block_count": 0,
+            "detail_stamp": "a9b494a3922a9104",
+            "end_at_utc": "2026-04-29T09:00:00Z",
+            "has_observation_gap": false,
+            "is_current": false,
+            "key": "milestone_cycle:OO8qN_YtoEymIJUwQznjlO7wF2QoWGTYVk6CjJ6ybIo",
+            "label": "Apr 27\u2013Apr 29",
+            "milestone_count": 0,
+            "segment_count": 0,
+            "start_at_utc": "2026-04-27T00:00:00Z"
+        }
+    ],
+    "week_start_at": "2026-04-29T09:00:00Z"
+}
+''')
+
+
+@pytest.mark.parametrize("real_alice", [False, True])
+def test_836_an_undecorated_current_week_is_byte_stable(ctx, real_alice):
+    """A10 / R8. Detects: any byte of the undecorated `current_week` moving —
+    an `account_*` key appearing, or the cycle, spend, milestones or index
+    changing — on a store with at most one real account."""
+    ns, conn = ctx
+    _seed_836_undecorated(ns, conn, real_alice=real_alice)
+    _snap, envelope = _836_build(ns)
+    cw = envelope["current_week"]
+    assert "account_key" not in cw and "account_label" not in cw
+    assert json.dumps(cw, sort_keys=True) == json.dumps(
+        _836_UNDECORATED_BASELINE, sort_keys=True)

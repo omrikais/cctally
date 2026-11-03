@@ -590,8 +590,10 @@ def test_all_combined_decorated_fixture_publishes_certified_account_cycles():
     assert [row["account_key"] for row in claude_leg["accounts"]] == [
         "a" * 32, "b" * 32, "unattributed",
     ]
+    # #836: each card is the spend attributed to its account, and the three
+    # still sum to the week's whole $2.0505.
     assert [row["cost_usd"] for row in claude_leg["accounts"]] == [
-        0.75, 0.9, 0.4005,
+        0.9615, 0.93, 0.159,
     ]
     assert sum(row["cost_usd"] for row in claude_leg["accounts"]) == pytest.approx(
         claude_leg["cost_usd"]

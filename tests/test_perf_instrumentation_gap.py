@@ -268,6 +268,11 @@ _ALLOWLISTED_UNPHASED_CALLS = {
         "Pure calendar comparison between the prior snapshot and `now_utc`, "
         "part of the idle decision and computed before it opens its phase."
     ),
+    "_tui_evidence_matured": (
+        "#836: a pure comparison of the prior snapshot's retained "
+        "`evidence_eligible_at` with `now_utc`, part of the idle decision "
+        "and computed before it opens its phase."
+    ),
     "_tui_common_source_range_start": (
         "Pure range resolution over the daily panel already built; it issues "
         "no query of its own."

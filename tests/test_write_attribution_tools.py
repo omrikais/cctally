@@ -9792,6 +9792,12 @@ def test_d6_judge_consumes_a_replaced_container_only_at_its_validated_end(
     entry = _d6_entry(frontier, _d6_rollout(0))
     _d6_consume_all_but(data, frontier, skip={entry["logical"]})
     path = pathlib.Path(entry["logical"])
+    # Hold the captured inode outside the scanned roots: ext4 hands a freed
+    # inode number straight back, so an unlink-and-rewrite could keep the
+    # plain generation and replace nothing (the v1.117.0 public Linux matrix).
+    held = tmp_path / "held"
+    held.mkdir()
+    os.link(path, held / "captured")
     os.unlink(path)
     path.write_bytes(_D6_RECORD * 2)
     replacement = fr.plain_facts(path)

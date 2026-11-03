@@ -29,7 +29,9 @@ import sqlite3
 import sys
 from dataclasses import replace
 
-from _cctally_core import make_week_ref, parse_iso_datetime
+from _cctally_core import (
+    _canonicalize_optional_iso, make_week_ref, parse_iso_datetime,
+)
 from _cctally_quota import assert_projection_readable, codex_quota_breakdown
 from _lib_accounts import UNATTRIBUTED
 from _lib_codex_pools import is_model_scoped_codex_quota
@@ -95,19 +97,35 @@ def _week_label(ref, tz) -> str:
     return ref.week_start.strftime("%b %d")
 
 
-def _count_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> int:
+def _account_predicate(account_key, column: str) -> "tuple[str, tuple]":
+    """``" AND <column> = ?"`` and its parameter for a scoped read, or nothing.
+
+    #836 spec 5.5: an explicit account is STRICT equality everywhere, so the
+    ``unattributed`` bucket never enters a real account's history and
+    ``account_key="unattributed"`` selects that bucket alone. ``None`` is the
+    merged read, unchanged.
+    """
+    if account_key is None:
+        return "", ()
+    return f" AND {column} = ?", (account_key,)
+
+
+def _count_blocks(conn: sqlite3.Connection, start_iso, end_iso, *,
+                  account_key=None) -> int:
     """Count ``five_hour_blocks`` whose interval intersects ``[start, end)``.
 
     Half-open intersection on epoch seconds via ``unixepoch()`` (mixed stored
     offsets). Returns 0 when the week lacks canonical boundaries.
+    ``account_key`` (#836) counts only that account's blocks.
     """
     if not start_iso or not end_iso:
         return 0
+    acct_sql, acct_params = _account_predicate(account_key, "account_key")
     row = conn.execute(
         "SELECT COUNT(*) FROM five_hour_blocks "
         "WHERE unixepoch(block_start_at) < unixepoch(?) "
-        "  AND unixepoch(five_hour_resets_at) > unixepoch(?)",
-        (end_iso, start_iso),
+        "  AND unixepoch(five_hour_resets_at) > unixepoch(?)" + acct_sql,
+        (end_iso, start_iso) + acct_params,
     ).fetchone()
     return int(row[0] or 0)
 
@@ -115,7 +133,8 @@ def _count_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> int:
 # ── Claude week index (spec §1a) ───────────────────────────────────────
 
 
-def _navigable_claude_refs(conn: sqlite3.Connection) -> list:
+def _navigable_claude_refs(conn: sqlite3.Connection, *, account_key=None,
+                           as_of_utc=None) -> list:
     """The navigable Claude week refs, newest-first, per spec §1a.
 
     Navigable set = weeks with ≥1 ``weekly_usage_snapshots`` row ∪ weeks with
@@ -123,20 +142,30 @@ def _navigable_claude_refs(conn: sqlite3.Connection) -> list:
     reset-defined segment remains independently navigable; a defensive
     milestone-only week absent from ``get_recent_weeks`` is synthesized from
     its milestone rows' stored boundaries.
+
+    ``account_key`` (#836 spec 5.5) scopes every leg to one account's rows;
+    ``as_of_utc`` admits only reset events effective at or before it. Both
+    ``None`` is the merged, as-of-free enumeration, unchanged.
     """
     c = _cctally()
-    refs = c.get_recent_weeks(conn, None)  # unbounded, newest-first
+    # unbounded, newest-first
+    refs = (c.get_recent_weeks(conn, None) if account_key is None
+            else c.get_recent_weeks(conn, None, account_key=account_key))
 
+    acct_sql, acct_params = _account_predicate(account_key, "account_key")
+    acct_where = acct_sql.replace(" AND ", " WHERE ", 1)
     usage_keys = {
         r[0]
         for r in conn.execute(
             "SELECT DISTINCT week_start_date FROM weekly_usage_snapshots"
+            + acct_where, acct_params,
         ).fetchall()
     }
     milestone_keys = {
         r[0]
         for r in conn.execute(
             "SELECT DISTINCT week_start_date FROM percent_milestones"
+            + acct_where, acct_params,
         ).fetchall()
     }
     navigable = usage_keys | milestone_keys
@@ -144,10 +173,11 @@ def _navigable_claude_refs(conn: sqlite3.Connection) -> list:
     refs = [r for r in refs if r.key in navigable]
     present = {r.key for r in refs}
     for k in sorted(milestone_keys - present, reverse=True):
-        ref = _synthesize_milestone_only_ref(conn, k)
+        ref = _synthesize_milestone_only_ref(conn, k, account_key=account_key)
         if ref is not None:
             refs.append(ref)
-    return _derive_claude_reset_cycles(conn, refs)
+    return _derive_claude_reset_cycles(
+        conn, refs, account_key=account_key, as_of_utc=as_of_utc)
 
 
 def _parse_optional_iso(value):
@@ -159,17 +189,20 @@ def _parse_optional_iso(value):
         return None
 
 
-def _claude_storage_boundaries(conn: sqlite3.Connection, key: str):
-    """Return the outer retained boundary for one storage date bucket."""
+def _claude_storage_boundaries(conn: sqlite3.Connection, key: str, *,
+                               account_key=None):
+    """Return the outer retained boundary for one storage date bucket
+    (``account_key``: that account's rows only, in both legs)."""
+    acct_sql, acct_params = _account_predicate(account_key, "account_key")
     rows = conn.execute(
         "SELECT week_start_at, week_end_at FROM weekly_usage_snapshots "
         "WHERE week_start_date=? AND week_start_at IS NOT NULL "
-        "AND week_end_at IS NOT NULL "
+        "AND week_end_at IS NOT NULL" + acct_sql + " "
         "UNION ALL "
         "SELECT week_start_at, week_end_at FROM percent_milestones "
         "WHERE week_start_date=? AND week_start_at IS NOT NULL "
-        "AND week_end_at IS NOT NULL",
-        (key, key),
+        "AND week_end_at IS NOT NULL" + acct_sql,
+        (key,) + acct_params + (key,) + acct_params,
     ).fetchall()
     pairs = [
         (start, end)
@@ -183,51 +216,90 @@ def _claude_storage_boundaries(conn: sqlite3.Connection, key: str):
     return min(start for start, _end in pairs), max(end for _start, end in pairs)
 
 
-def _linked_reset_events(conn: sqlite3.Connection, key: str) -> list:
-    """Reset rows linked to any retained boundary in a storage bucket."""
+def _claude_reset_cuts_cycle(outer, effective) -> bool:
+    """Whether a linked reset's effective instant starts a new cycle inside a
+    storage bucket whose outer retained boundary is ``outer`` ``(start, end)``.
+
+    The ONE rule for where a Claude reset-defined cycle begins (#836 review
+    F7): the history index cuts its buckets with it, and the decorated card's
+    cycle scope (`_claude_current_cycle_scope`) starts its cycle with it, so
+    the card and its current index entry cannot disagree about the start. In
+    particular an early re-anchor stamped at the capture second can precede
+    the new window's nearest-hour start; while both windows share one storage
+    key the reset instant still starts the cycle.
+    """
+    return (outer is not None and effective is not None
+            and outer[0] < effective < outer[1])
+
+
+def _linked_reset_events(conn: sqlite3.Connection, key: str, *,
+                         account_key=None, as_of_utc=None) -> list:
+    """Reset rows linked to any retained boundary in a storage bucket.
+
+    #836 spec 5.5: the two ``EXISTS`` legs are one parenthesized group, so the
+    account and as-of predicates below bind the whole disjunction rather than
+    its second leg (``A OR B AND x`` is ``A OR (B AND x)``). ``account_key``
+    scopes the event and both legs' rows; ``as_of_utc`` admits only events
+    effective at or before it — the rule `_latest_reset_event_for_end` applies
+    for the card, so a reset that takes effect later cuts neither yet.
+    """
+    acct_s, acct_p = _account_predicate(account_key, "s.account_key")
+    acct_m, _ = _account_predicate(account_key, "m.account_key")
+    acct_e, _ = _account_predicate(account_key, "e.account_key")
+    as_of_sql = ""
+    as_of_params: tuple = ()
+    if as_of_utc is not None:
+        as_of_sql = (" AND unixepoch(e.effective_reset_at_utc) "
+                     "<= unixepoch(?)")
+        as_of_params = (as_of_utc,)
     return conn.execute(
         "SELECT DISTINCT e.id, e.effective_reset_at_utc "
         "FROM week_reset_events e "
-        "WHERE EXISTS ("
+        "WHERE (EXISTS ("
         "  SELECT 1 FROM weekly_usage_snapshots s "
-        "  WHERE s.week_start_date=? AND ("
+        "  WHERE s.week_start_date=?" + acct_s + " AND ("
         "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
         "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
         "  )"
         ") OR EXISTS ("
         "  SELECT 1 FROM percent_milestones m "
-        "  WHERE m.week_start_date=? AND ("
+        "  WHERE m.week_start_date=?" + acct_m + " AND ("
         "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
         "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
         "  )"
-        ") "
+        "))" + acct_e + as_of_sql + " "
         "ORDER BY unixepoch(e.effective_reset_at_utc), e.id",
-        (key, key),
+        (key,) + acct_p + (key,) + acct_p + acct_p + as_of_params,
     ).fetchall()
 
 
-def _derive_claude_reset_cycles(conn: sqlite3.Connection, refs: list) -> list:
+def _derive_claude_reset_cycles(conn: sqlite3.Connection, refs: list, *,
+                                account_key=None, as_of_utc=None) -> list:
     """Expand storage buckets into provider reset-defined cycles.
 
     ``get_recent_weeks`` can split an in-place credit, but an early re-anchor
     whose old and new boundaries both remain under one ``week_start_date``
     only exposes the pre-reset half. The retained snapshot boundary set plus
     ``week_reset_events`` is the authoritative reset ledger for both shapes.
+
+    ``account_key`` / ``as_of_utc`` (#836): that account's boundaries and
+    resets, cut only by events already effective at ``as_of_utc``.
     """
     out: list = []
     by_key: dict = {}
     for ref in refs:
         by_key.setdefault(ref.key, ref)
     for key, template in by_key.items():
-        outer = _claude_storage_boundaries(conn, key)
+        outer = _claude_storage_boundaries(conn, key, account_key=account_key)
         if outer is None:
             out.append(template)
             continue
         start, end = outer
         cuts = []
-        for event in _linked_reset_events(conn, key):
+        for event in _linked_reset_events(
+                conn, key, account_key=account_key, as_of_utc=as_of_utc):
             effective = _parse_optional_iso(event["effective_reset_at_utc"])
-            if effective is not None and start < effective < end:
+            if _claude_reset_cuts_cycle(outer, effective):
                 cuts.append(effective)
         boundaries = [start, *sorted(set(cuts)), end]
         cycles = []
@@ -242,18 +314,21 @@ def _derive_claude_reset_cycles(conn: sqlite3.Connection, refs: list) -> list:
     return _cctally()._apply_overlap_clamp_to_weekrefs(out)
 
 
-def _synthesize_milestone_only_ref(conn: sqlite3.Connection, key: str):
+def _synthesize_milestone_only_ref(conn: sqlite3.Connection, key: str, *,
+                                   account_key=None):
     """Defensive ref for a milestone-only week (no usage snapshot).
 
     Boundaries fall back to the milestone rows' stored
     ``week_start_at``/``week_end_at``/``week_end_date`` (spec §1a). Returns
-    ``None`` if a valid ref can't be built.
+    ``None`` if a valid ref can't be built. ``account_key`` (#836): from that
+    account's milestone rows only.
     """
+    acct_sql, acct_params = _account_predicate(account_key, "account_key")
     row = conn.execute(
         "SELECT week_end_date, week_start_at, week_end_at FROM percent_milestones "
-        "WHERE week_start_date = ? "
+        "WHERE week_start_date = ?" + acct_sql + " "
         "ORDER BY (week_start_at IS NULL), captured_at_utc ASC LIMIT 1",
-        (key,),
+        (key,) + acct_params,
     ).fetchone()
     if row is None:
         return None
@@ -289,58 +364,82 @@ def _claude_cycle_key(ref) -> str:
     )
 
 
-def _claude_cycle_rows(conn: sqlite3.Connection, ref) -> list:
-    cohort_id = 0
-    if ref.week_start_at:
-        row = conn.execute(
-            "SELECT e.id FROM week_reset_events e "
-            "WHERE unixepoch(e.effective_reset_at_utc)=unixepoch(?) "
-            "AND (EXISTS ("
-            "  SELECT 1 FROM weekly_usage_snapshots s "
-            "  WHERE s.week_start_date=? AND ("
-            "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
-            "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
-            "  )"
-            ") OR EXISTS ("
-            "  SELECT 1 FROM percent_milestones m "
-            "  WHERE m.week_start_date=? AND ("
-            "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
-            "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
-            "  )"
-            ")) ORDER BY e.id DESC LIMIT 1",
-            (ref.week_start_at, ref.key, ref.key),
-        ).fetchone()
-        if row is not None:
-            cohort_id = int(row[0])
+def _claude_cycle_rows(conn: sqlite3.Connection, ref, *, account_key=None,
+                       cohort_id=None) -> list:
+    """The cycle's weekly milestone cohort.
+
+    ``account_key`` (#836 spec 5.5) scopes the cohort event, both of its
+    supporting subqueries and the milestone read to one account. ``cohort_id``
+    names the cohort outright: a scoped index passes the card's active reset
+    for its CURRENT cycle, so the index, the detail and the card read one
+    segment (spec 5.2 step 2) rather than re-deriving it from the cut instant.
+    """
+    acct_s, acct_p = _account_predicate(account_key, "s.account_key")
+    acct_m, _ = _account_predicate(account_key, "m.account_key")
+    acct_e, _ = _account_predicate(account_key, "e.account_key")
+    acct_r, _ = _account_predicate(account_key, "account_key")
+    if cohort_id is None:
+        cohort_id = 0
+        if ref.week_start_at:
+            row = conn.execute(
+                "SELECT e.id FROM week_reset_events e "
+                "WHERE unixepoch(e.effective_reset_at_utc)=unixepoch(?)"
+                + acct_e + " "
+                "AND (EXISTS ("
+                "  SELECT 1 FROM weekly_usage_snapshots s "
+                "  WHERE s.week_start_date=?" + acct_s + " AND ("
+                "    unixepoch(s.week_end_at)=unixepoch(e.old_week_end_at) OR "
+                "    unixepoch(s.week_end_at)=unixepoch(e.new_week_end_at)"
+                "  )"
+                ") OR EXISTS ("
+                "  SELECT 1 FROM percent_milestones m "
+                "  WHERE m.week_start_date=?" + acct_m + " AND ("
+                "    unixepoch(m.week_end_at)=unixepoch(e.old_week_end_at) OR "
+                "    unixepoch(m.week_end_at)=unixepoch(e.new_week_end_at)"
+                "  )"
+                ")) ORDER BY e.id DESC LIMIT 1",
+                (ref.week_start_at,) + acct_p + (ref.key,) + acct_p
+                + (ref.key,) + acct_p,
+            ).fetchone()
+            if row is not None:
+                cohort_id = int(row[0])
     return conn.execute(
         "SELECT * FROM percent_milestones WHERE week_start_date=? "
-        "AND reset_event_id=? "
+        "AND reset_event_id=?" + acct_r + " "
         "ORDER BY unixepoch(captured_at_utc) ASC, percent_threshold ASC",
-        (ref.key, cohort_id),
+        (ref.key, cohort_id) + acct_p,
     ).fetchall()
 
 
-def _five_hour_detail_revision(conn, start_iso, end_iso) -> tuple[int, ...]:
+def _five_hour_detail_revision(conn, start_iso, end_iso, *,
+                               account_key=None) -> tuple[int, ...]:
     """Append-only 5h child revision for one cycle's intersecting blocks.
 
     The detail cache uses the index stamp. Weekly crossing counts do not move
     when another account records a 5h credit or crossing in an existing block.
     These child tables insert new ids for those events; count and max id also
     notice deletions and replacement rows without hashing an unbounded ledger.
+
+    #836 spec 5.4: ``TOTAL(m.usage_snapshot_id)`` moves when a snapshot DELETE
+    rewrites a retained crossing's join to the ``0`` sentinel, which changes
+    no count and no max id. ``account_key`` (spec 5.5) reads only that
+    account's blocks, so another account's changes never move a scoped stamp.
     """
     if not start_iso or not end_iso:
-        return (0, 0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0, 0)
+    acct_sql, acct_params = _account_predicate(account_key, "b.account_key")
     interval = (
         "unixepoch(b.block_start_at) < unixepoch(?) "
-        "AND unixepoch(b.five_hour_resets_at) > unixepoch(?)"
+        "AND unixepoch(b.five_hour_resets_at) > unixepoch(?)" + acct_sql
     )
-    bounds = (end_iso, start_iso)
+    bounds = (end_iso, start_iso) + acct_params
     blocks = conn.execute(
         "SELECT COUNT(*), MAX(b.id) FROM five_hour_blocks b "
         f"WHERE {interval}", bounds,
     ).fetchone()
     milestones = conn.execute(
-        "SELECT COUNT(*), MAX(m.id) FROM five_hour_blocks b "
+        "SELECT COUNT(*), MAX(m.id), TOTAL(m.usage_snapshot_id) "
+        "FROM five_hour_blocks b "
         "JOIN five_hour_milestones m ON m.block_id = b.id "
         f"WHERE {interval}", bounds,
     ).fetchone()
@@ -355,20 +454,87 @@ def _five_hour_detail_revision(conn, start_iso, end_iso) -> tuple[int, ...]:
                  for value in row)
 
 
-def _index_entry(conn, ref, current_cycle_key, tz, *, decorated=False) -> dict:
-    rows = _claude_cycle_rows(conn, ref)
+def _unavailable_join_rows(conn, *, account_key=None) -> list:
+    """Every 5h milestone whose effective weekly join is unavailable, with
+    its block's bounds as SQLite epochs, ascending by id (#836 spec 5.4).
+
+    Read ONCE per index build and bucketed per cycle by
+    `_unavailable_join_component`. The bounds are wrapped in ``unixepoch()``,
+    which no index serves, so a per-cycle query scanned every milestone once
+    per index entry. The epochs are SQLite's own, so the bucketing compares
+    exactly what the per-cycle predicate compared; an unparseable bound is
+    NULL and never matches. ``account_key`` is the same strict scope
+    (`_account_predicate`).
+    """
+    from _cctally_five_hour import weekly_join_unavailable_sql
+    acct_sql, acct_params = _account_predicate(account_key, "b.account_key")
+    return [(int(r[0]), r[1], r[2]) for r in conn.execute(
+        "SELECT m.id, unixepoch(b.block_start_at), "
+        "unixepoch(b.five_hour_resets_at) FROM five_hour_blocks b "
+        "JOIN five_hour_milestones m ON m.block_id = b.id "
+        "LEFT JOIN weekly_usage_snapshots s ON s.id = m.usage_snapshot_id "
+        "WHERE " + weekly_join_unavailable_sql(conn, "s") + acct_sql
+        + " ORDER BY m.id",
+        acct_params,
+    ).fetchall()]
+
+
+def _unavailable_join_component(conn, start_iso, end_iso,
+                                unavailable_rows) -> tuple:
+    """The detail stamp's unavailable-join component (#836 spec 5.4).
+
+    A digest of the sorted ids of the cycle's 5h milestones whose effective
+    weekly join is unavailable — the joined snapshot absent, the ``0``
+    sentinel, or suppression-retired (`weekly_join_unavailable_sql`, the same
+    predicate as the dashboard's retired-join signature leg). Availability is
+    exactly what the fold's weekly rejection changes, and a set rather than a
+    count, so a restoration of one crossing beside the retirement of another
+    still moves the stamp. ``()`` when the set is empty, so a store with no
+    unavailable join keeps its stamp bytes.
+
+    ``unavailable_rows`` is the build's `_unavailable_join_rows`; a crossing
+    belongs to the cycle when its block intersects ``[start, end)`` — block
+    start before the cycle's end, block reset after the cycle's start — with
+    the cycle bounds converted by SQLite's ``unixepoch()`` as well.
+    """
+    if not start_iso or not end_iso or not unavailable_rows:
+        return ()
+    start_epoch, end_epoch = conn.execute(
+        "SELECT unixepoch(?), unixepoch(?)", (start_iso, end_iso)).fetchone()
+    if start_epoch is None or end_epoch is None:
+        return ()
+    ids = [mid for mid, block_start, block_resets in unavailable_rows
+           if block_start is not None and block_resets is not None
+           and block_start < end_epoch and block_resets > start_epoch]
+    if not ids:
+        return ()
+    return ("u" + _mh.compute_detail_stamp(*ids),)
+
+
+def _index_entry(conn, ref, current_cycle_key, tz, *, unavailable_rows,
+                 decorated=False, account_key=None, cohort_id=None) -> dict:
+    rows = _claude_cycle_rows(
+        conn, ref, account_key=account_key, cohort_id=cohort_id)
     milestone_count = len(rows)
     segment_count = 1 if rows else 0
     max_captured = max((r["captured_at_utc"] for r in rows), default=None)
     start_z = _to_iso_z(ref.week_start_at)
     end_z = _to_iso_z(ref.week_end_at)
-    block_count = _count_blocks(conn, start_z, end_z)
+    block_count = _count_blocks(conn, start_z, end_z, account_key=account_key)
     key = _claude_cycle_key(ref)
     # R8: leave the <=1-real-account stamp byte-identical. On a decorated
     # provider the fetched block list contains multiple account-owned rows,
     # so its cache identity also needs their child-ledger revision.
     block_revision = (
-        _five_hour_detail_revision(conn, start_z, end_z) if decorated else ())
+        _five_hour_detail_revision(conn, start_z, end_z, account_key=account_key)
+        if decorated else ())
+    # #836 spec 5.4/5.5: every store's stamp names which crossings have an
+    # unavailable weekly join (appended only when there is one), and a scoped
+    # stamp names its account, because one opaque cycle key is shared by every
+    # account whose subscription week has the same boundaries.
+    unavailable = _unavailable_join_component(
+        conn, start_z, end_z, unavailable_rows)
+    scope_part = () if account_key is None else ("a" + account_key,)
 
     # #750 S4 §5.3. A CURRENT single-segment cycle neither fetches its detail
     # nor uses one that arrives, so a gap in the LIVE cycle would stay
@@ -397,33 +563,120 @@ def _index_entry(conn, ref, current_cycle_key, tz, *, decorated=False) -> dict:
         "has_observation_gap": has_gap,
         "detail_stamp": _mh.compute_detail_stamp(
             key, milestone_count, block_count, segment_count, max_captured,
-            *block_revision,
+            *block_revision, *unavailable, *scope_part,
         ),
     }
 
 
-def build_claude_week_index(conn: sqlite3.Connection) -> list:
+def _same_instant(a, b) -> bool:
+    """Two stored boundary texts name the same instant (parsed, never by
+    spelling). Both absent is a match; one absent is not."""
+    if not a and not b:
+        return True
+    pa, pb = _parse_optional_iso(a), _parse_optional_iso(b)
+    return pa is not None and pb is not None and pa == pb
+
+
+def _canonical_end(value):
+    try:
+        return _canonicalize_optional_iso(value, "claude.cycle.end")
+    except (TypeError, ValueError):
+        return None
+
+
+def _scoped_current_ref(refs: list, cycle_scope):
+    """The ref in FULL interval agreement with the card's cycle (#836 spec
+    5.5): the same storage key, the same effective start and the same
+    canonical end, parsed as instants; on the date-only leg, the ref with that
+    storage key and absent bounds. A start-only match is not enough and no ref
+    is current merely by position. ``None`` when nothing agrees."""
+    if cycle_scope is None:
+        return None
+    for ref in refs:
+        if ref.key != cycle_scope.week_start_date:
+            continue
+        if cycle_scope.week_start_at is None:
+            if not ref.week_start_at and not ref.week_end_at:
+                return ref
+            continue
+        if (_same_instant(ref.week_start_at, cycle_scope.effective_start_at)
+                and _same_instant(_canonical_end(ref.week_end_at),
+                                  cycle_scope.week_end_at)):
+            return ref
+    return None
+
+
+def _scoped_refs(conn, account_key, cycle_scope, now_utc=None):
+    """The scoped enumeration and its current ref (#836 spec 5.5).
+
+    Derived at the scope's as-of instant, so a retained reset that takes
+    effect later cuts neither the card nor the index yet. Without a scope the
+    as-of is ``now_utc`` (the build's own instant), and no ref is current.
+    """
+    if cycle_scope is not None:
+        as_of = cycle_scope.as_of_utc
+    elif now_utc is not None:
+        as_of = _iso_z(now_utc)
+    else:
+        as_of = None
+    refs = _navigable_claude_refs(
+        conn, account_key=account_key, as_of_utc=as_of)
+    scope = (cycle_scope if cycle_scope is not None
+             and cycle_scope.account_key == account_key else None)
+    return refs, _scoped_current_ref(refs, scope), scope
+
+
+def build_claude_week_index(conn: sqlite3.Connection, *, account_key=None,
+                            cycle_scope=None, now_utc=None) -> list:
     """Newest-first navigable Claude week index (spec §1a, §3).
 
     One entry per effective reset-defined cycle. Multiple cycles may share one
     storage ``week_start_date`` but always have distinct opaque keys.
+
+    ``account_key`` (#836 spec 5.5, U1) builds ONE account's history: its own
+    cycles, cohorts, block counts and stamps, derived at ``cycle_scope``'s
+    as-of; the current entry is the one in full interval agreement with that
+    scope (the card's cycle), and its cohort is the scope's active reset.
+    ``None`` keeps the merged contract byte-for-byte apart from the
+    unavailable-join stamp component.
     """
-    refs = _navigable_claude_refs(conn)
-    current_key = _current_claude_week_key(conn)
-    current_refs = [r for r in refs if r.key == current_key]
-    current_ref = max(
-        current_refs,
-        key=lambda r: r.week_start_at or "",
-        default=None,
-    )
-    current_cycle_key = _claude_cycle_key(current_ref) if current_ref else None
-    tz = _resolve_display_tz()
     import _cctally_account
     decorated = _cctally_account.provider_is_decorated(conn, "claude")
-    entries = [
-        _index_entry(conn, ref, current_cycle_key, tz, decorated=decorated)
-        for ref in refs
-    ]
+    tz = _resolve_display_tz()
+    if account_key is None:
+        refs = _navigable_claude_refs(conn)
+        current_key = _current_claude_week_key(conn)
+        current_refs = [r for r in refs if r.key == current_key]
+        current_ref = max(
+            current_refs,
+            key=lambda r: r.week_start_at or "",
+            default=None,
+        )
+        current_cycle_key = (
+            _claude_cycle_key(current_ref) if current_ref else None)
+        unavailable_rows = _unavailable_join_rows(conn)
+        entries = [
+            _index_entry(conn, ref, current_cycle_key, tz,
+                         unavailable_rows=unavailable_rows, decorated=decorated)
+            for ref in refs
+        ]
+    else:
+        refs, current_ref, scope = _scoped_refs(
+            conn, account_key, cycle_scope, now_utc)
+        current_cycle_key = (
+            _claude_cycle_key(current_ref) if current_ref else None)
+        unavailable_rows = _unavailable_join_rows(
+            conn, account_key=account_key)
+        entries = [
+            _index_entry(
+                conn, ref, current_cycle_key, tz,
+                unavailable_rows=unavailable_rows, decorated=decorated,
+                account_key=account_key,
+                cohort_id=(scope.reset_event_id
+                           if ref is current_ref else None),
+            )
+            for ref in refs
+        ]
     entries.sort(key=lambda e: e["start_at_utc"] or "", reverse=True)
     return entries
 
@@ -512,12 +765,15 @@ def _load_block_credits(
     ]
 
 
-def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
+def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso, *,
+                  account_key=None) -> list:
     """``five_hour_blocks`` intersecting ``[start, end)``, ascending by start;
     each carries its 5h milestone stream + credit rows (spec §1b). A block
-    straddling a week boundary appears in every week it intersects."""
+    straddling a week boundary appears in every week it intersects.
+    ``account_key`` (#836 spec 5.5): only that account's blocks."""
     if not start_iso or not end_iso:
         return []
+    acct_sql, acct_params = _account_predicate(account_key, "account_key")
     c = _cctally()
     import _cctally_account
     decorated = _cctally_account.provider_is_decorated(conn, "claude")
@@ -533,9 +789,9 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
         "       crossed_seven_day_reset, is_closed "
         "FROM five_hour_blocks "
         "WHERE unixepoch(block_start_at) < unixepoch(?) "
-        "  AND unixepoch(five_hour_resets_at) > unixepoch(?) "
+        "  AND unixepoch(five_hour_resets_at) > unixepoch(?)" + acct_sql + " "
         "ORDER BY unixepoch(block_start_at) ASC, five_hour_window_key ASC, id ASC",
-        (end_iso, start_iso),
+        (end_iso, start_iso) + acct_params,
     ).fetchall()
     out: list = []
     for b in rows:
@@ -564,14 +820,45 @@ def _build_blocks(conn: sqlite3.Connection, start_iso, end_iso) -> list:
     return out
 
 
-def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None":
-    """Complete payload for one reset-defined Claude cycle."""
-    refs = _navigable_claude_refs(conn)
-    ref = next((candidate for candidate in refs if _claude_cycle_key(candidate) == key), None)
-    if ref is None:
-        return None
-    entry = next(e for e in build_claude_week_index(conn) if e["key"] == key)
-    rows = _claude_cycle_rows(conn, ref)
+def build_claude_week_detail(conn: sqlite3.Connection, key: str, *,
+                             account_key=None, now_utc=None) -> "dict | None":
+    """Complete payload for one reset-defined Claude cycle.
+
+    ``account_key`` (#836 spec 5.5/5.6, U1) serves that account's cycle from
+    its own scoped index: the account's current cycle scope is resolved at
+    ``now_utc`` (the route's as-of), exactly as the dashboard resolves it for
+    the card, so the current key's bounds here equal the card's. A key absent
+    from the account's scoped index is ``None``; it is never retried merged.
+    """
+    if account_key is None:
+        refs = _navigable_claude_refs(conn)
+        ref = next((candidate for candidate in refs
+                    if _claude_cycle_key(candidate) == key), None)
+        if ref is None:
+            return None
+        entry = next(e for e in build_claude_week_index(conn) if e["key"] == key)
+        cohort_id = None
+    else:
+        if now_utc is None:
+            now_utc = dt.datetime.now(UTC)
+        cycle_scope = _cctally()._claude_current_cycle_scope(
+            conn, now_utc, account_key=account_key)
+        refs, current_ref, scope = _scoped_refs(
+            conn, account_key, cycle_scope, now_utc)
+        ref = next((candidate for candidate in refs
+                    if _claude_cycle_key(candidate) == key), None)
+        if ref is None:
+            return None
+        entry = next(
+            (e for e in build_claude_week_index(
+                conn, account_key=account_key, cycle_scope=scope,
+                now_utc=now_utc)
+             if e["key"] == key), None)
+        if entry is None:
+            return None
+        cohort_id = scope.reset_event_id if ref is current_ref else None
+    rows = _claude_cycle_rows(
+        conn, ref, account_key=account_key, cohort_id=cohort_id)
     # Same absent-boundary case `_claude_cycle_key` handles, and this call runs
     # unconditionally, ahead of the `if rows` guard below.
     segment_key = dashboard_resource_key(
@@ -589,7 +876,8 @@ def build_claude_week_detail(conn: sqlite3.Connection, key: str) -> "dict | None
                   ]}]
                 if rows else [])
     gap_runs = _shape_observation_gap_runs(disclosure, rows) if rows else []
-    blocks = _build_blocks(conn, entry["start_at_utc"], entry["end_at_utc"])
+    blocks = _build_blocks(conn, entry["start_at_utc"], entry["end_at_utc"],
+                           account_key=account_key)
 
     return {
         "source": "claude",

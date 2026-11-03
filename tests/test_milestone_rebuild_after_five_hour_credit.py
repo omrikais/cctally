@@ -417,6 +417,27 @@ def _peak_ref(app, minute):
         conn.close()
 
 
+def _published_effective_at(app, minute):
+    """#836 (D-D): the `effective_seven_day_pct_at_crossing` every surface
+    publishes for the five-hour milestones crossed at ``minute``, read
+    through the ONE milestone read (`_load_five_hour_milestones`) that the
+    CLI breakdown, the live route and the history route share."""
+    conn = app.open_db()
+    try:
+        blocks = sorted({int(r[0]) for r in conn.execute(
+            "SELECT block_id FROM five_hour_milestones"
+            " WHERE unixepoch(captured_at_utc) = ?", (NOW + minute * 60,))})
+        out = []
+        for block_id in blocks:
+            out.extend(
+                m["effective_seven_day_pct_at_crossing"]
+                for m in app._load_five_hour_milestones(conn, block_id=block_id)
+                if m["captured_at_utc"] == _iso(NOW + minute * 60))
+        return out
+    finally:
+        conn.close()
+
+
 def _suppressing_events(peak_ref):
     return [r for r in _journal() if r.get("t") == "evt"
             and peak_ref in ((r.get("payload") or {}).get("suppression") or [])]
@@ -492,5 +513,51 @@ def test_rebuild_keeps_milestones_whose_snapshot_a_weekly_credit_suppressed(
                    and (r.get("payload") or {}).get("kind") == "week_reset"
                    for r in _journal()), "non-vacuity: the weekly drop fired"
 
+    # #836 (D-D). The manual credit RETIRED the peak's weekly value: the row
+    # is weekly-held by the cleanup, not by a held write (its payload carries
+    # no `weeklyObservationHeld` marker), so the five-hour milestone it
+    # crossed must publish no effective weekly value rather than the retired
+    # 12. The automatic drop cannot suppress the earlier peak (above), so its
+    # valid 32 is published. Detects: a retired weekly value rendered as an
+    # ordinary effective `7D %` on the Current Week modal and the CLI.
+    expected = None if credit == "record-credit" else 32.0
+    published = _published_effective_at(app, PEAK_MINUTE)
+    assert published, "non-vacuity: the peak tick crossed five-hour milestones"
+    assert published == [expected] * len(published), ("live", published)
+
     assert _rebuild(app) == 0
     assert _milestones(app) == live
+    assert _published_effective_at(app, PEAK_MINUTE) == published, (
+        "after rebuild")
+
+
+def test_a_genuine_held_writes_crossing_keeps_its_basis_value(
+        app, monkeypatch, tmp_path, alert_sink):
+    """#836 (D-D) control: a HELD WRITE (a weekly reading below the accepted
+    one while the five-hour reading grew) stores the effective basis value
+    with the `weeklyObservationHeld` payload marker. Only a suppression's
+    retirement makes a row held WITHOUT that marker, so the crossing the held
+    write records keeps publishing its basis value, live and after a
+    rebuild. Detects: the retired-join predicate over-reaching onto clamped
+    held writes, which would blank a valid `7D %`."""
+    import _cctally_core as core
+    core.CONFIG_PATH.write_text(json.dumps({"alerts": {
+        "enabled": True, "five_hour_thresholds": [35]}}))
+    for minute, weekly, five in ((13, 10.0, 30.0), (17, 11.0, 34.0),
+                                 (21, 10.0, 38.0)):
+        assert _drive(app, monkeypatch, tmp_path, minute, weekly, five) == 0
+    conn = app.open_db()
+    try:
+        held, weekly, payload = conn.execute(
+            "SELECT weekly_observation_held, weekly_percent, payload_json"
+            " FROM weekly_usage_snapshots WHERE unixepoch(captured_at_utc) = ?",
+            (NOW + 21 * 60,)).fetchone()
+    finally:
+        conn.close()
+    assert (held, weekly) == (1, 11.0), "non-vacuity: 00:21 is a held write"
+    assert json.loads(payload).get("weeklyObservationHeld") is True
+    published = _published_effective_at(app, 21)
+    assert published, "non-vacuity: the held write crossed five-hour 35"
+    assert published == [11.0] * len(published), ("live", published)
+    assert _rebuild(app) == 0
+    assert _published_effective_at(app, 21) == published, "after rebuild"

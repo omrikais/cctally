@@ -35,12 +35,17 @@ import types
 import _lib_write_io
 
 RING_CAPACITY = 64
-MEMORY_BUDGET_BYTES = 65536
+#: Raised from 65,536 for the v1.117.1 cut: the #939 D5 admission-hold
+#: state put the full rings plus the write state at 65,032 bytes on
+#: Python 3.12 and 3.13 but 66,000 on 3.11, whose objects are larger.
+#: The bound stays structural (ring capacities, PUBLISHED_AT_MAX_CHARS);
+#: this figure only checks it on every supported interpreter.
+MEMORY_BUDGET_BYTES = 73728
 
 #: `published_at` is the only variable-length field in a record, so it is the
 #: only one that can put the whole state over `MEMORY_BUDGET_BYTES`. Measured:
 #: the stored field set is 27,189 bytes over a full ring, and 64 distinct 4 KiB
-#: strings would be 283,039 — 4.3x over budget. All three production callers
+#: strings would be 283,039 — 3.8x over budget. All three production callers
 #: pass a UTC ISO-8601 instant (32 characters), so this is not reachable today;
 #: the cap makes the budget hold by CONSTRUCTION rather than by convention.
 PUBLISHED_AT_MAX_CHARS = 64
@@ -154,7 +159,7 @@ class ConversationSyncRecord:
 MAINTENANCE_PHASES = ("delete", "reclaim", "checkpoint", "other")
 
 #: The maintenance ring is deliberately SHORTER than the two tick rings. The
-#: whole published state is capped at a frozen 65,536 bytes, and a third
+#: whole published state is capped at a frozen 73,728 bytes, and a third
 #: full-length ring would spend that budget on a phase that runs about once a
 #: day rather than about once a second. Sixteen records is several weeks of
 #: maintenance history at the throttled cadence, and many continuation passes
@@ -181,7 +186,7 @@ MAINTENANCE_SKIP_REASONS = (
 SQLITE_SOURCE_ID_MAX_CHARS = 96
 PLAN_DIGEST_MAX_CHARS = 16
 #: One shared object per distinct SQLite source id, so sixteen records of
-#: one runtime hold one string (the 65,536-byte budget).
+#: one runtime hold one string (the 73,728-byte budget).
 _SOURCE_IDS: "dict[str, str]" = {}
 
 
@@ -224,7 +229,7 @@ class MaintenancePhaseRecord:
     # #901 Q8 (a deletion's reservation inputs) and Q9 (a reclaim chunk's
     # plan and outcome, §5.5): `OPERATION_INT_FIELDS` packed into ONE
     # array, -1 for "not recorded", because sixteen records of twenty
-    # separate int objects do not fit the frozen 65,536-byte budget. Read
+    # separate int objects do not fit the frozen 73,728-byte budget. Read
     # them by name (`record.page_count`); `as_wire` publishes them by name.
     numbers: "array.array | None" = None   # typecode "i"
 

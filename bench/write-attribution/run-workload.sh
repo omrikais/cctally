@@ -195,7 +195,7 @@ LAUNCH=(bin/cctally)
 PID=$!; echo "$PID" > "$OUT/pid"; WA_EXPECT+=("$PID")
 TRACE_START=$($PY -c 'import time; print(time.time())')
 sample() {
-  $PY "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
+  "$WA_HELPER_PY" "$P/rusage.py" "$PID" >> "$OUT/rusage.jsonl"
   ( export_clone_env; wa_exec $PY bin/cctally dashboard-perf --host 127.0.0.1 --port "$PORT" --json ) \
     > "$OUT/perf-$(printf %05d $SECONDS).json" 2>>"$OUT/perf.err" &
   wa_wait dashboard-perf $!

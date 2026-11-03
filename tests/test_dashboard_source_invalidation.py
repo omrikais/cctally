@@ -4639,3 +4639,442 @@ def test_1015_an_unchanged_settled_tick_scans_no_lineage_relation(
     finally:
         sc.reset_dispatch_state()
         tui._tui_reset_partial_retry_state()
+
+
+# ── #836 spec 5.7: the two dependencies the idle path could not see ───────
+#
+# Every case runs real `_tui_build_snapshot` ticks with the dispatch memo (the
+# prior snapshot and its source bundle) threaded through, and asserts that the
+# second tick is NOT idle, that the Claude source object is a new one, and
+# that the published value changed. Detects: an idle tick or an exact-version
+# Claude source reuse republishing a value the rejection state or a matured
+# sample had already superseded.
+
+_836_T = dt.datetime(2026, 4, 30, 11, 30, tzinfo=dt.timezone.utc)
+_836_KEY = 1777595400
+
+
+@pytest.fixture
+def ns836(tmp_path, monkeypatch):
+    monkeypatch.setenv("TZ", "Etc/UTC")
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path / "data")
+    import _lib_snapshot_cache as sc
+    sc.reset_dispatch_state()
+    tui = ns["_cctally_tui"]
+    calls = {"rebuild": 0}
+    original = tui._tui_build_forecast_view
+
+    def counted(*args, **kwargs):
+        calls["rebuild"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(tui, "_tui_build_forecast_view", counted)
+    ns["_836_calls"] = calls
+    yield ns
+    sc.reset_dispatch_state()
+    tui._tui_reset_partial_retry_state()
+
+
+def _836_tick(ns, now):
+    """One real dashboard tick; returns (snapshot, envelope, was_rebuild)."""
+    before = ns["_836_calls"]["rebuild"]
+    snap = ns["_tui_build_snapshot"](
+        now_utc=now, skip_sync=True, precompute_envelope=True,
+        runtime_bind="127.0.0.1", display_tz_pref_override="utc")
+    envelope = ns["snapshot_to_envelope"](snap, now_utc=now)
+    return snap, envelope, ns["_836_calls"]["rebuild"] > before
+
+
+def _836_claude(snap):
+    return snap.source_bundle.sources["claude"]
+
+
+def _836_accounts(conn):
+    conn.executemany(
+        "INSERT INTO accounts (account_key, provider, natural_id) "
+        "VALUES (?, 'claude', ?)", [("alice", "alice"), ("zbob", "zbob")])
+    conn.commit()
+
+
+def _836_snapshot(conn, account, pct, captured, *, held=0,
+                  week=("2026-04-27", "2026-05-04"),
+                  five_hour_percent=12.0, payload="{}"):
+    start, end = week
+    cur = conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(week_start_date, week_end_date, week_start_at, week_end_at, "
+        " captured_at_utc, weekly_percent, five_hour_percent, "
+        " five_hour_window_key, five_hour_resets_at, weekly_observation_held, "
+        " account_key, payload_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '2026-04-30T15:30:00+00:00', ?, ?, ?)",
+        (start, end, f"{start}T00:00:00+00:00", f"{end}T00:00:00+00:00",
+         captured, pct, five_hour_percent, _836_KEY, held, account, payload))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _836_weekly_milestone(conn, account, threshold, captured, *,
+                          reset_event_id=0):
+    conn.execute(
+        "INSERT INTO percent_milestones "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, percent_threshold, cumulative_cost_usd, "
+        " marginal_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+        " reset_event_id, account_key) "
+        "VALUES (?, '2026-04-27', '2026-05-04', '2026-04-27T00:00:00+00:00', "
+        " '2026-05-04T00:00:00+00:00', ?, ?, 0.5, 0, 0, ?, ?)",
+        (captured, threshold, float(threshold), reset_event_id, account))
+    conn.commit()
+
+
+def _836_assert_rebuilt_and_republished(first, second, rebuilt):
+    assert rebuilt, "the second tick idled on the prior snapshot"
+    assert _836_claude(second) is not _836_claude(first), (
+        "the Claude source object was reused from the prior bundle")
+
+
+def test_836_a_newer_sample_of_another_account_flips_the_displayed_account(
+        ns836):
+    """(a) The displayed-account flip from a newer sample."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "alice", 3.0, "2026-04-30T11:00:00Z")
+        first, env1, _ = _836_tick(ns836, _836_T - dt.timedelta(minutes=15))
+        assert env1["current_week"]["account_key"] == "alice"
+        _836_snapshot(conn, "zbob", 40.0, "2026-04-30T11:20:00Z")
+    finally:
+        conn.close()
+    second, env2, rebuilt = _836_tick(ns836, _836_T)
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert env2["current_week"]["account_key"] == "zbob"
+    assert _836_claude(second).data["hero"]["current_week"]["used_pct"] == 40.0
+
+
+def _836_seed_live_crossing(conn):
+    """An undecorated store with a live block and a five-hour crossing whose
+    snapshot (10:20, weekly 43) is the card's newest weekly sample."""
+    conn.execute(
+        "INSERT INTO five_hour_blocks "
+        "(five_hour_window_key, five_hour_resets_at, block_start_at, "
+        " first_observed_at_utc, last_observed_at_utc, final_five_hour_percent, "
+        " seven_day_pct_at_block_start, crossed_seven_day_reset, is_closed, "
+        " created_at_utc, last_updated_at_utc, account_key) "
+        "VALUES (?, '2026-04-30T15:30:00+00:00', '2026-04-30T10:30:00+00:00', "
+        " '2026-04-30T10:30:00+00:00', '2026-04-30T11:00:00+00:00', 30.0, "
+        " 40.0, 0, 0, '2026-04-30T10:30:00+00:00', "
+        " '2026-04-30T11:00:00+00:00', 'unattributed')", (_836_KEY,))
+    block_id = int(conn.execute("SELECT MAX(id) FROM five_hour_blocks").fetchone()[0])
+    _836_snapshot(conn, "unattributed", 40.0, "2026-04-30T10:40:00Z",
+                  five_hour_percent=20.0)
+    crossing = _836_snapshot(conn, "unattributed", 43.0, "2026-04-30T11:00:00Z",
+                             five_hour_percent=30.0)
+    conn.execute(
+        "INSERT INTO five_hour_milestones "
+        "(block_id, five_hour_window_key, percent_threshold, captured_at_utc, "
+        " usage_snapshot_id, account_key, seven_day_pct_at_crossing) "
+        "VALUES (?, ?, 30, '2026-04-30T11:00:00Z', ?, 'unattributed', 43.0)",
+        (block_id, _836_KEY, crossing))
+    conn.commit()
+    return crossing
+
+
+def _836_crossing_values(envelope, captured_prefix=""):
+    return [m["effective_seven_day_pct_at_crossing"]
+            for m in envelope["current_week"]["five_hour_milestones"]
+            if str(m["captured_at_utc"]).startswith(captured_prefix)]
+
+
+def test_836_a_detection_tick_suppression_publishes_no_effective_value(ns836):
+    """(b) A credit's detection tick suppresses the crossing's snapshot (the
+    reset row and the in-place retirement commit together)."""
+    conn = ns836["open_db"]()
+    try:
+        crossing = _836_seed_live_crossing(conn)
+        first, env1, _ = _836_tick(ns836, _836_T)
+        assert _836_crossing_values(env1) == [43.0]
+        assert env1["current_week"]["used_pct"] == 43.0
+        conn.execute(
+            "INSERT INTO week_reset_events (detected_at_utc, old_week_end_at, "
+            " new_week_end_at, effective_reset_at_utc, account_key) "
+            "VALUES ('2026-04-30T11:30:05Z', '2026-05-04T00:00:00+00:00', "
+            " '2026-05-04T00:00:00+00:00', '2026-04-30T10:40:00Z', "
+            " 'unattributed')")
+        conn.execute("UPDATE weekly_usage_snapshots "
+                     "SET weekly_observation_held = 1 WHERE id = ?", (crossing,))
+        conn.commit()
+    finally:
+        conn.close()
+    second, env2, rebuilt = _836_tick(ns836, _836_T + dt.timedelta(seconds=15))
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert _836_crossing_values(env2) == [None]
+    assert env2["current_week"]["used_pct"] == 40.0
+
+
+def _836_record(ns, monkeypatch, at, percent, five):
+    import argparse
+    monkeypatch.setenv("CCTALLY_AS_OF", at.isoformat().replace("+00:00", "Z"))
+    monkeypatch.setenv("CCTALLY_TEST_PIN_CAPTURE", "1")
+    return ns["cmd_record_usage"](argparse.Namespace(
+        percent=percent, resets_at=1788879600, five_hour_percent=five,
+        five_hour_resets_at=1788613200, week_start_name=None))
+
+
+def test_836_effects_only_retirement_and_restoration_leave_the_idle_path(
+        ns836, monkeypatch):
+    """(c) The credit-retry schedule (`tests/test_exact_origin_credit_dedup.py`
+    a5 recovery-delete case): a 63% replica carrying its own five-hour reading
+    lands after the 0% credit and is published once; the identical 0%
+    observation is then retried, the reset insert deduplicates, and the
+    replica is RETIRED IN PLACE with no new snapshot or reset row. (d) The
+    reverse: a restoration (suppression replacement or convergence) makes it
+    unheld again."""
+    def at(hour, minute, second=0):
+        return dt.datetime(2026, 9, 5, hour, minute, second,
+                           tzinfo=dt.timezone.utc)
+
+    assert _836_record(ns836, monkeypatch, at(9, 0), 63.0, 30.0) == 0
+    assert _836_record(ns836, monkeypatch, at(10, 0), 0.0, 31.0) == 0
+    assert _836_record(ns836, monkeypatch, at(10, 30), 63.0, 40.0) == 0
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-09-05T10:31:00Z")
+    first, env1, _ = _836_tick(ns836, at(10, 31))
+    assert env1["current_week"]["used_pct"] == 63.0, (
+        "non-vacuity: the card reads the replica")
+    replica_at = "2026-09-05T10:30"
+    published = _836_crossing_values(env1, replica_at)
+    assert published and set(published) == {63.0}, (
+        "non-vacuity: the replica's crossings are published", published)
+
+    conn = ns836["open_db"]()
+    try:
+        counts = conn.execute(
+            "SELECT (SELECT MAX(id) FROM weekly_usage_snapshots), "
+            "       (SELECT COUNT(*) FROM week_reset_events)").fetchone()
+        assert _836_record(ns836, monkeypatch, at(10, 0), 0.0, 31.0) == 0
+        assert conn.execute(
+            "SELECT (SELECT MAX(id) FROM weekly_usage_snapshots), "
+            "       (SELECT COUNT(*) FROM week_reset_events)").fetchone() == counts, (
+            "precondition: the retry adds no snapshot and no reset")
+        replica = conn.execute(
+            "SELECT id, weekly_observation_held FROM weekly_usage_snapshots "
+            "WHERE captured_at_utc LIKE '2026-09-05T10:30%'").fetchall()
+        assert [r[1] for r in replica] == [1], (
+            "precondition: the retry retired the replica in place", replica)
+    finally:
+        conn.close()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-09-05T10:31:15Z")
+    second, env2, rebuilt = _836_tick(ns836, at(10, 31, 15))
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert _836_crossing_values(env2, replica_at) == [None] * len(published)
+    assert env2["current_week"]["used_pct"] == 0.0, (
+        "the card still reads the retired replica")
+    assert env2["data_version"] != env1["data_version"]
+
+    conn = ns836["open_db"]()
+    try:
+        conn.execute("UPDATE weekly_usage_snapshots "
+                     "SET weekly_observation_held = 0 WHERE id = ?",
+                     (replica[0][0],))
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-09-05T10:31:30Z")
+    third, env3, rebuilt = _836_tick(ns836, at(10, 31, 30))
+    _836_assert_rebuilt_and_republished(second, third, rebuilt)
+    assert _836_crossing_values(env3, replica_at) == published
+    assert env3["current_week"]["used_pct"] == 63.0
+
+
+_836_EARLIER_WEEK = ("2026-04-25", "2026-05-02")
+
+
+@pytest.mark.parametrize("bob_week", [None, _836_EARLIER_WEEK],
+                         ids=["same-window", "earlier-overlapping-window"])
+def test_836_a_sample_captured_after_the_frozen_instant_matures(
+        ns836, bob_week):
+    """(e) Bob's sample is captured at T+1 s and committed before the
+    signature read, so tick one counts it in the signature but excludes it by
+    its as-of. At T+15 s nothing else moved; the tick must still rebuild and
+    switch the displayed account — in Alice's window, and in Bob's own window
+    starting two days earlier (overlapping), which a current-window-only
+    eligibility read would miss."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "alice", 3.0, "2026-04-30T11:00:00Z")
+        kwargs = {} if bob_week is None else {"week": bob_week}
+        _836_snapshot(conn, "zbob", 40.0, "2026-04-30T11:30:01Z", **kwargs)
+    finally:
+        conn.close()
+    first, env1, _ = _836_tick(ns836, _836_T)
+    assert env1["current_week"]["account_key"] == "alice"
+    second, env2, rebuilt = _836_tick(ns836, _836_T + dt.timedelta(seconds=15))
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert env2["current_week"]["account_key"] == "zbob"
+    assert env2["current_week"]["used_pct"] == 40.0
+
+
+def test_836_nothing_maturing_stays_idle(ns836):
+    """(e) control: with no capture after the as-of instant the second tick
+    idles and reuses the Claude source."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "alice", 3.0, "2026-04-30T11:00:00Z")
+        _836_snapshot(conn, "zbob", 40.0, "2026-04-30T10:59:00Z")
+    finally:
+        conn.close()
+    first, _env1, _ = _836_tick(ns836, _836_T)
+    assert first.evidence_eligible_at is None
+    second, _env2, rebuilt = _836_tick(ns836, _836_T + dt.timedelta(seconds=15))
+    assert not rebuilt, "nothing matured, yet the tick rebuilt"
+    assert _836_claude(second) is _836_claude(first)
+
+
+def test_836_a_retained_reset_effective_after_the_instant_cuts_on_the_next_tick(
+        ns836):
+    """(f) Alice's reset takes effect at T+5 s. Nothing else is captured or
+    detected after T (review F3: a post-reset sample captured after T would
+    mature the eligibility instant by itself), so only the reset's effective
+    instant can refuse the idle tick at T+15 s. Her cycle then starts at the
+    reset and holds no reading yet: the card publishes no merged fallback
+    (Constraint 6), its weekly milestones go with it, and the scoped index's
+    current entry moves to the post-reset segment."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "zbob", 10.0, "2026-04-30T09:00:00Z")
+        _836_snapshot(conn, "alice", 40.0, "2026-04-30T10:00:00Z")
+        conn.execute(
+            "INSERT INTO week_reset_events (detected_at_utc, old_week_end_at, "
+            " new_week_end_at, effective_reset_at_utc, account_key) "
+            "VALUES ('2026-04-30T11:29:00Z', '2026-05-04T00:00:00+00:00', "
+            " '2026-05-04T00:00:00+00:00', '2026-04-30T11:30:05Z', 'alice')")
+        conn.commit()
+        for t in (39, 40):
+            _836_weekly_milestone(conn, "alice", t, f"2026-04-30T09:{t}:00Z")
+    finally:
+        conn.close()
+    first, env1, _ = _836_tick(ns836, _836_T)
+    cw1 = env1["current_week"]
+    assert cw1["week_start_at"] == "2026-04-27T00:00:00Z"
+    assert [m["percent"] for m in cw1["milestones"]] == [39, 40]
+    assert [(e["start_at_utc"], e["end_at_utc"])
+            for e in cw1["week_index"] if e["is_current"]] == [
+        ("2026-04-27T00:00:00Z", "2026-05-04T00:00:00Z")]
+    assert first.evidence_eligible_at == dt.datetime(
+        2026, 4, 30, 11, 30, 5, tzinfo=dt.timezone.utc), (
+        "non-vacuity: only the reset's effective instant is pending")
+    later = _836_T + dt.timedelta(seconds=15)
+    second, env2, rebuilt = _836_tick(ns836, later)
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert env2["current_week"] is None, (
+        "the card still reads the pre-reset segment after the reset")
+    assert second.percent_milestones == []
+    assert _836_claude(first).data["hero"]["current_week"]["used_pct"] == 40.0
+    assert not _836_claude(second).data["hero"]["current_week"]
+    conn = ns836["open_db"]()
+    try:
+        scope = ns836["_claude_current_cycle_scope"](
+            conn, later, account_key="alice")
+        index = ns836["build_claude_week_index"](
+            conn, account_key="alice", cycle_scope=scope)
+    finally:
+        conn.close()
+    assert [(e["start_at_utc"], e["end_at_utc"])
+            for e in index if e["is_current"]] == [
+        ("2026-04-30T11:30:05Z", "2026-05-04T00:00:00Z")]
+
+
+def test_836_a_matured_sample_of_the_same_owner_refuses_source_reuse(ns836):
+    """(g) Same owner, no threshold: 25.1% with its 25% milestone, then 25.2%
+    captured at T+1 s. Nothing but the published percentage moves, so only
+    the Claude source version's eligibility fragment refuses exact-version
+    reuse of the prior source (the account-flip case cannot detect it)."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "zbob", 10.0, "2026-04-30T09:00:00Z")
+        _836_snapshot(conn, "alice", 25.1, "2026-04-30T10:00:00Z")
+        _836_weekly_milestone(conn, "alice", 25, "2026-04-30T10:00:00Z")
+        _836_snapshot(conn, "alice", 25.2, "2026-04-30T11:30:01Z")
+    finally:
+        conn.close()
+    first, env1, _ = _836_tick(ns836, _836_T)
+    assert env1["current_week"]["used_pct"] == 25.1
+    second, env2, rebuilt = _836_tick(ns836, _836_T + dt.timedelta(seconds=15))
+    _836_assert_rebuilt_and_republished(first, second, rebuilt)
+    assert env2["current_week"]["used_pct"] == 25.2
+    data = _836_claude(second).data
+    assert data["hero"]["current_week"]["used_pct"] == 25.2
+    assert data["quota"]["current_week"]["used_pct"] == 25.2
+
+
+def test_836_versions_carry_no_new_fragment_without_retired_or_pending_rows(
+        ns836):
+    """A10: with no retired snapshot, no unavailable join and nothing captured
+    after the as-of instant, `data_version` and the Claude source version
+    carry neither new fragment, so their bytes are what they were."""
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "alice", 3.0, "2026-04-30T11:00:00Z")
+        _836_snapshot(conn, "zbob", 40.0, "2026-04-30T10:59:00Z")
+        stats_sig = ns836["_cctally_tui"]._tui_compute_dispatch_signature(conn)
+    finally:
+        conn.close()
+    snap, envelope, _ = _836_tick(ns836, _836_T)
+    assert stats_sig.claude_weekly_retired_digest == ""
+    assert envelope["data_version"] == ns836["_snapshot_data_version"](stats_sig)
+    assert not re.search(r"\.r[0-9a-f]{64}$", envelope["data_version"])
+    version = _836_claude(snap).data_version
+    assert not re.search(r":r[0-9a-f]{64}", version)
+    assert not re.search(r":e\d{4}-\d\d-\d\d", version)
+
+
+def test_836_the_decorated_claude_version_names_its_owner_and_index(ns836):
+    """Spec 5.7: a decorated Claude source publishes ONE account's card and
+    that account's history index, so the owner, its label and the published
+    index identity enter the exact-reuse version, while an undecorated build
+    gains no fragment. Detects: a reused Claude source still carrying the
+    previous owner's label or index stamps."""
+    tui = ns836["_cctally_tui"]
+    frag = tui._tui_claude_owner_version_fragment
+    index = [{"key": "k1", "detail_stamp": "s1", "is_current": True},
+             {"key": "k0", "detail_stamp": "s0", "is_current": False}]
+
+    def data(**cw):
+        return {"hero": {"current_week": {"week_index": index, **cw}}}
+
+    base = frag(data(account_key="alice", account_label="Alice"))
+    assert re.fullmatch(r"[0-9a-f]{16}", base)
+    assert frag(data()) == "", "an undecorated envelope carries no account"
+    assert frag(data(account_key="zbob", account_label="Alice")) != base
+    assert frag(data(account_key="alice", account_label="Al")) != base
+    restamped = [dict(index[0], detail_stamp="s2"), index[1]]
+    assert frag({"hero": {"current_week": {
+        "week_index": restamped, "account_key": "alice",
+        "account_label": "Alice"}}}) != base
+
+    conn = ns836["open_db"]()
+    try:
+        _836_accounts(conn)
+        _836_snapshot(conn, "alice", 3.0, "2026-04-30T11:00:00Z")
+        _836_snapshot(conn, "zbob", 40.0, "2026-04-30T10:59:00Z")
+    finally:
+        conn.close()
+    snap, envelope, _ = _836_tick(ns836, _836_T)
+    claude = _836_claude(snap)
+    assert envelope["current_week"]["account_key"] == "alice"
+    assert (":o" + frag(claude.data)) in claude.data_version
+
+    conn = ns836["open_db"]()
+    try:
+        conn.execute("DELETE FROM accounts WHERE account_key = 'zbob'")
+        conn.commit()
+    finally:
+        conn.close()
+    snap, envelope, _ = _836_tick(ns836, _836_T + dt.timedelta(minutes=1))
+    assert "account_key" not in envelope["current_week"]
+    assert not re.search(r":o[0-9a-f]{16}(:|$)", _836_claude(snap).data_version)

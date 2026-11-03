@@ -11544,12 +11544,20 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         assembly runs inside one transaction per DB. 400 malformed key/source;
         404 ``{code: "unknown_key", reason}`` for keys that don't resolve.
 
-        ``?account=<account_key|unattributed>`` (#416, Codex only) focuses the
-        cycle on one account: its own crossings, its own spend. ABSENT is the
-        shipped merged response and is byte-identical — the client sends the
-        qualifier only under account focus, exactly as `/api/source/` does. The
+        ``?account=<account_key|unattributed>`` (#416 Codex; #836 Claude)
+        focuses the cycle on one account: its own crossings, its own spend.
+        ABSENT is the shipped merged response and is byte-identical — the
+        client sends the qualifier only under account focus (Codex) or for the
+        displayed account (Claude), exactly as `/api/source/` does. The
         vendor-wide ``*`` sentinel is rejected here (unlike `/api/source/`,
         where it labels an alert row): it names no cycle to render.
+
+        Claude (#836 spec 5.6) accepts the qualifier only while Claude is
+        decorated (more than one REAL account), checked in the same read
+        transaction as the assembly: 400 on an undecorated store, 404
+        ``unknown_key`` for an unknown or non-Claude account or a key outside
+        that account's scoped index, and never a retry against the merged
+        index.
         """
         import re as _re
         import urllib.parse as _urlparse
@@ -11576,11 +11584,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             ):
                 self._send_milestones_json(400, {"error": "invalid account"})
                 return
-            if source != "codex":
-                # Claude weeks are not account-partitioned on this route yet;
-                # accepting the qualifier silently would be a privacy lie.
-                self._send_milestones_json(400, {"error": "invalid account"})
-                return
             account_key = raw_account[0]
         c = sys.modules["cctally"]
         try:
@@ -11592,12 +11595,38 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     self._send_milestones_json(400, {"error": "invalid cycle key"})
                     return
                 conn = open_db()
+                rejected = False
+                detail = None
                 try:
                     conn.execute("BEGIN")
-                    detail = c.build_claude_week_detail(conn, key)
+                    if account_key is None:
+                        detail = c.build_claude_week_detail(conn, key)
+                    else:
+                        # #836 spec 5.6. Only a DECORATED store partitions
+                        # Claude history by account. On an undecorated one the
+                        # qualifier is refused, never ignored: answering it with
+                        # the merged week would claim an account scope the
+                        # payload does not have, which is the privacy lie the
+                        # earlier blanket rejection guarded against. Checked
+                        # inside this transaction so the gate and the assembly
+                        # read one state.
+                        import _cctally_account
+                        if not _cctally_account.provider_is_decorated(
+                                conn, "claude"):
+                            rejected = True
+                        elif account_key == "unattributed" or conn.execute(
+                                "SELECT 1 FROM accounts WHERE account_key = ? "
+                                "AND provider = 'claude'",
+                                (account_key,)).fetchone() is not None:
+                            detail = c.build_claude_week_detail(
+                                conn, key, account_key=account_key,
+                                now_utc=_command_as_of())
                     conn.commit()
                 finally:
                     conn.close()
+                if rejected:
+                    self._send_milestones_json(400, {"error": "invalid account"})
+                    return
                 if detail is None:
                     self._send_milestones_json(404, {
                         "error": "unknown week", "code": "unknown_key",

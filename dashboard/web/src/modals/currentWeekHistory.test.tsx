@@ -1,6 +1,7 @@
 // Hero-modal week/cycle history navigation — JSDOM-scoped behaviour
 // (stepping, fetch policy, credit divider, embedded keymap suppression,
 // Share visibility, vanish). Focus/real-keyboard/scroll are the browser gate.
+import { Profiler } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { CurrentWeekModal } from './CurrentWeekModal';
@@ -329,6 +330,32 @@ describe('Claude account-owned five-hour navigation (#839)', () => {
     }],
   });
 
+  // #836 (U1): a scoped detail's `blocks[]` holds only the displayed
+  // account's blocks — its own earlier block in the cycle, never another
+  // account's block in the same window.
+  const makeOlderBlock = (account: 'alice' | 'bob') => ({
+    ...makeBlock(account),
+    five_hour_window_key: 900,
+    block_start_at: '2026-05-16T00:00:00Z',
+    five_hour_resets_at: '2026-05-16T05:00:00Z',
+    is_closed: true,
+    milestones: [{
+      percent_threshold: 11,
+      reset_event_id: 0,
+      captured_at_utc: '2026-05-16T01:00:00Z',
+      block_cost_usd: 1,
+      marginal_cost_usd: 1,
+      seven_day_pct_at_crossing: 12,
+      effective_seven_day_pct_at_crossing: 12,
+    }],
+    credits: [{
+      effective_reset_at_utc: '2026-05-16T02:00:00Z',
+      prior_percent: 1,
+      post_percent: 7,
+      delta_pp: 6,
+    }],
+  });
+
   it('retains the live block and stream while decorated history loads or fails', async () => {
     let rejectDetail!: (error: Error) => void;
     global.fetch = vi.fn(() => new Promise<Response>((_resolve, reject) => {
@@ -347,20 +374,67 @@ describe('Claude account-owned five-hour navigation (#839)', () => {
       credits: makeBlock('bob').credits,
     };
     env.current_week!.five_hour_milestones = makeBlock('bob').milestones;
+    env.current_week!.account_key = 'bob';
+    env.current_week!.account_label = 'Bob';
     updateSnapshot(env);
     render(<CurrentWeekModal />);
 
+    // #836 §5.8: the current envelope's weekly rows stay visible while the
+    // decorated cycle detail loads; only the block order waits for it.
+    expect(document.querySelector('#mcw-table')?.textContent).toContain('1.00');
+    expect(screen.queryByText('Loading…')).toBeNull();
     expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Current block');
     expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
     expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('19');
     await act(async () => rejectDetail(new Error('detail unavailable')));
-    await waitFor(() => expect(screen.getByText(/Couldn’t load this cycle/)).toBeTruthy());
+    // Review F4: the weekly rows come from the envelope, so a failed eager
+    // fetch neither hides them nor reports a cycle that did not fail to load.
+    await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+    expect(document.querySelector('#mcw-table')?.textContent).toContain('1.00');
+    expect(screen.queryByText(/Couldn’t load this cycle/)).toBeNull();
     expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Current block');
     expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
     expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('19');
   });
 
-  it('fetches a decorated single-segment cycle before assuming the live block is last', async () => {
+  // Review F4. Every decorated current cycle fetches its detail eagerly. A
+  // failed fetch (a network error, or a one-tick 404 when a reset takes effect
+  // between the envelope and the request) must not hide weekly rows that come
+  // from the envelope; when the rows come from the detail the error stands.
+  it.each([
+    ['a network error', 1, false],
+    ['a one-tick 404', 1, false],
+    ['a network error', 2, true],
+    ['a one-tick 404', 2, true],
+  ] as const)(
+    'a failed eager decorated detail (%s, %i segments) shows the error only when the rows come from it',
+    async (failure, segments, expectError) => {
+      global.fetch = vi.fn(async () => {
+        if (failure === 'a network error') throw new Error('detail unavailable');
+        return { ok: false, status: 404, json: async () => ({ error: 'unknown_key' }) };
+      }) as unknown as typeof fetch;
+      const env = makeEnv([idxEntry('milestone_cycle:current', {
+        is_current: true, segment_count: segments, block_count: 1,
+      })]);
+      env.current_week!.account_key = 'bob';
+      env.current_week!.account_label = 'Bob';
+      updateSnapshot(env);
+      render(<CurrentWeekModal />);
+      await waitFor(() => expect(global.fetch).toHaveBeenCalledTimes(1));
+      // Let the failed request settle into the navigator's state.
+      await act(async () => { await new Promise((r) => setTimeout(r, 20)); });
+      if (expectError) {
+        await waitFor(() => expect(screen.getByText(/Couldn’t load this cycle/)).toBeTruthy());
+        expect(document.querySelector('#mcw-table')).toBeNull();
+      } else {
+        await waitFor(() => expect(screen.queryByText('Loading…')).toBeNull());
+        expect(screen.queryByText(/Couldn’t load this cycle/)).toBeNull();
+        expect(document.querySelector('#mcw-table')?.textContent).toContain('1.00');
+      }
+    },
+  );
+
+  it('fetches a decorated single-segment cycle for the displayed account before assuming the live block is last', async () => {
     const entry = idxEntry('milestone_cycle:current', {
       is_current: true, segment_count: 1, block_count: 2,
     });
@@ -368,9 +442,11 @@ describe('Claude account-owned five-hour navigation (#839)', () => {
       source: 'claude', key: entry.key, label: 'May 15–22',
       start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
       is_current: true, detail_stamp: entry.detail_stamp,
-      segments: [], dividers: [], blocks: [makeBlock('bob'), makeBlock('alice')],
+      segments: [], dividers: [], blocks: [makeOlderBlock('bob'), makeBlock('bob')],
     });
     const env = makeEnv([entry]);
+    env.current_week!.account_key = 'bob';
+    env.current_week!.account_label = 'Bob';
     env.current_week!.five_hour_block = {
       five_hour_window_key: 901,
       account_key: 'bob',
@@ -383,47 +459,56 @@ describe('Claude account-owned five-hour navigation (#839)', () => {
     updateSnapshot(env);
     render(<CurrentWeekModal />);
 
-    await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('Block 2 of 2')).toBeTruthy());
     expect(fetchSpy).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('Block 1 of 2')).toBeTruthy();
-    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByLabelText('Newer block'));
-    await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy());
+    expect(fetchSpy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Acurrent?account=bob');
+    expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByLabelText('Newer block') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await waitFor(() => expect(screen.getByText('Block 1 of 2')).toBeTruthy());
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+6pp');
   });
 
-  for (const order of [(['alice', 'bob'] as const), (['bob', 'alice'] as const)]) {
-    it(`selects and steps account-owned blocks inserted ${order.join(' then ')}`, async () => {
-      mockFetch({
-        source: 'claude', key: currentEntry.key, label: 'May 15–22',
-        start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
-        is_current: true, detail_stamp: currentEntry.detail_stamp,
-        segments: [], dividers: [], blocks: order.map(makeBlock),
-      });
-      const env = makeEnv([currentEntry]);
-      env.current_week!.five_hour_block = {
-        five_hour_window_key: 901,
-        account_key: 'bob',
-        block_start_at: '2026-05-16T05:00:00Z',
-        seven_day_pct_at_block_start: 20,
-        seven_day_pct_delta_pp: 3,
-        crossed_seven_day_reset: false,
-        credits: makeBlock('bob').credits,
-      };
-      env.current_week!.five_hour_milestones = makeBlock('bob').milestones;
-      updateSnapshot(env);
-      render(<CurrentWeekModal />);
-
-      await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
-      expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('17pp');
-      fireEvent.click(screen.getByLabelText(order[0] === 'alice' ? 'Older block' : 'Newer block'));
-      await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy());
-      const aliceTable = document.querySelector('#mcw-5h-table')!;
-      expect(aliceTable.textContent).toContain('+4pp');
-      expect(aliceTable.textContent).toContain('7');
-      expect(aliceTable.textContent).not.toContain('+17pp');
-      expect(aliceTable.textContent).not.toContain('19');
+  // #836 spec §3 "Consequence": under U1 the scoped detail holds only the
+  // displayed account's blocks, so the navigator no longer steps into another
+  // account's block in the same window (#839 had exercised that step). It
+  // walks the account's own blocks, borrows the live stream only for the live
+  // block, and renders every other block from its own rows.
+  it('steps only the displayed account’s blocks from the scoped detail', async () => {
+    const fetchSpy = mockFetch({
+      source: 'claude', key: currentEntry.key, label: 'May 15–22',
+      start_at_utc: '2026-05-15T00:00:00Z', end_at_utc: '2026-05-22T00:00:00Z',
+      is_current: true, detail_stamp: currentEntry.detail_stamp,
+      segments: [], dividers: [], blocks: [makeOlderBlock('bob'), makeBlock('bob')],
     });
-  }
+    const env = makeEnv([currentEntry]);
+    env.current_week!.account_key = 'bob';
+    env.current_week!.account_label = 'Bob';
+    env.current_week!.five_hour_block = {
+      five_hour_window_key: 901,
+      account_key: 'bob',
+      block_start_at: '2026-05-16T05:00:00Z',
+      seven_day_pct_at_block_start: 20,
+      seven_day_pct_delta_pp: 3,
+      crossed_seven_day_reset: false,
+      credits: makeBlock('bob').credits,
+    };
+    env.current_week!.five_hour_milestones = makeBlock('bob').milestones;
+    updateSnapshot(env);
+    render(<CurrentWeekModal />);
+
+    await waitFor(() => expect(screen.getByText('Block 2 of 2')).toBeTruthy());
+    expect(fetchSpy).toHaveBeenCalledWith('/api/milestones/claude/week/milestone_cycle%3Acurrent?account=bob');
+    expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
+    fireEvent.click(screen.getByLabelText('Older block'));
+    await waitFor(() => expect(screen.getByText('Block 1 of 2')).toBeTruthy());
+    const olderTable = document.querySelector('#mcw-5h-table')!;
+    expect(olderTable.textContent).toContain('+6pp');
+    expect(olderTable.textContent).toContain('11');
+    expect(olderTable.textContent).not.toContain('+17pp');
+    expect((screen.getByLabelText('Older block') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText('Alice')).toBeNull();
+  });
 
   it('does not substitute an unqualified legacy live stream into a qualified block', async () => {
     mockFetch({
@@ -446,6 +531,282 @@ describe('Claude account-owned five-hour navigation (#839)', () => {
     await waitFor(() => expect(screen.getByText('Bob')).toBeTruthy());
     expect(document.querySelector('#mcw-5h-table')?.textContent).toContain('+17pp');
     expect(document.querySelector('#mcw-5h-table')?.textContent).not.toContain('88pp');
+  });
+});
+
+// #836 — on a decorated store (two or more real Claude accounts) the envelope
+// names the displayed account (`current_week.account_key/account_label`), and
+// the modal's navigator, every cycle detail and the weekly section belong to
+// that account alone (U1, U2). Cycle keys and stamps can be identical across
+// accounts — shared subscription-week boundaries — so nothing keyed on the
+// cycle alone may carry one account's detail into the other's view.
+describe('#836 — the decorated Claude navigator is the displayed account’s', () => {
+  const ALICE = 'a'.repeat(32);
+  const BOB = 'b'.repeat(32);
+  const qualified = (key: string, account: string) =>
+    `/api/milestones/claude/week/${encodeURIComponent(key)}?account=${account}`;
+
+  function accountEnv(
+    account: string | null,
+    label: string | null,
+    opts: { index?: WeekIndexEntry[]; liveBlock?: boolean; weeklyUsd?: number } = {},
+  ): Envelope {
+    const env = makeEnv(opts.index ?? INDEX);
+    const cw = env.current_week!;
+    if (account != null) cw.account_key = account;
+    if (label != null) cw.account_label = label;
+    const usd = opts.weeklyUsd ?? 1;
+    cw.milestones = [
+      { percent: 1, crossed_at_utc: '2026-05-16T10:00:00Z', cumulative_usd: usd, marginal_usd: usd, five_hour_pct_at_cross: null },
+    ];
+    if (opts.liveBlock ?? true) {
+      cw.five_hour_block = {
+        five_hour_window_key: 901,
+        ...(account != null ? { account_key: account, account_label: label ?? undefined } : {}),
+        block_start_at: '2026-05-16T05:00:00Z',
+        seven_day_pct_at_block_start: 20,
+        seven_day_pct_delta_pp: 3,
+        crossed_seven_day_reset: false,
+        credits: [],
+      };
+    }
+    return env;
+  }
+
+  function cyclePayload(
+    key: string,
+    account: string,
+    label: string,
+    opts: { usd?: number; stamp?: string; effective?: number | null } = {},
+  ) {
+    const usd = opts.usd ?? 5;
+    return {
+      source: 'claude', key, label: 'Jul 16–Jul 18',
+      start_at_utc: '2026-07-16T05:00:00Z', end_at_utc: '2026-07-18T05:00:00Z',
+      is_current: key === 'milestone_cycle:current',
+      detail_stamp: opts.stamp ?? `st-${key}`,
+      segments: [{ key: `seg-${key}`, milestones: [
+        { percent: 9, crossed_at_utc: '2026-07-16T10:00:00Z', cumulative_usd: usd, marginal_usd: usd, five_hour_pct_at_cross: null },
+      ] }],
+      dividers: [],
+      blocks: [{
+        five_hour_window_key: 901,
+        account_key: account,
+        account_label: label,
+        block_start_at: '2026-05-16T05:00:00Z',
+        five_hour_resets_at: '2026-05-16T10:00:00Z',
+        final_five_hour_percent: 30,
+        total_cost_usd: 2,
+        crossed_seven_day_reset: false,
+        is_closed: false,
+        milestones: [{
+          percent_threshold: 30,
+          reset_event_id: 0,
+          captured_at_utc: '2026-05-16T06:00:00Z',
+          block_cost_usd: 2,
+          marginal_cost_usd: 1,
+          seven_day_pct_at_crossing: 42,
+          effective_seven_day_pct_at_crossing: opts.effective === undefined ? 31 : opts.effective,
+        }],
+        credits: [],
+      }],
+    };
+  }
+
+  // Requests that settle only when the test says so, so a response can be made
+  // to arrive after the account it was asked for is no longer displayed.
+  function deferredFetch() {
+    const pending: Array<{
+      url: string;
+      succeed: (payload: unknown) => void;
+      fail: (status: number) => void;
+    }> = [];
+    const spy = vi.fn((url: string) => new Promise((resolve) => {
+      pending.push({
+        url,
+        succeed: (payload) => resolve({ ok: true, json: async () => payload }),
+        fail: (status) => resolve({ ok: false, status, json: async () => ({ code: 'unknown_key' }) }),
+      });
+    }));
+    global.fetch = spy as unknown as typeof fetch;
+    return { spy, pending };
+  }
+
+  const badgeLabels = () => Array.from(
+    document.querySelectorAll('#mcw-badges .mcw-ms-sub'),
+  ).map((n) => n.textContent);
+
+  // U2: the existing display label beside the cycle pill, in the block row's
+  // quiet sub-text style — with or without a live block, and on the no-index
+  // pill path; absent on an undecorated payload.
+  for (const c of [
+    { name: 'with a live block', liveBlock: true, index: INDEX },
+    { name: 'without a live block', liveBlock: false, index: INDEX },
+    { name: 'on the no-index pill path', liveBlock: false, index: [] as WeekIndexEntry[] },
+  ]) {
+    it(`names the displayed account beside the cycle pill ${c.name}`, () => {
+      mockFetch(cyclePayload('milestone_cycle:current', ALICE, 'Alice'));
+      updateSnapshot(accountEnv(ALICE, 'Alice', { liveBlock: c.liveBlock, index: c.index }));
+      render(<CurrentWeekModal />);
+      expect(document.querySelector('#mcw-week-pill')).not.toBeNull();
+      expect(badgeLabels()).toEqual(['Alice']);
+    });
+  }
+
+  it('adds no account label on an undecorated payload', () => {
+    mockFetch(HISTORIC_CYCLE_PAYLOAD);
+    updateSnapshot(accountEnv(null, null));
+    render(<CurrentWeekModal />);
+    expect(badgeLabels()).toEqual([]);
+  });
+
+  it('walks older and newer through the displayed account’s cycles only', async () => {
+    const spy = vi.fn(async (url: string) => {
+      const key = decodeURIComponent(url.split('/week/')[1].split('?')[0]);
+      return { ok: true, json: async () => cyclePayload(key, ALICE, 'Alice', { usd: key.includes('pre') ? 7.77 : 5.55 }) };
+    });
+    global.fetch = spy as unknown as typeof fetch;
+    updateSnapshot(accountEnv(ALICE, 'Alice'));
+    render(<CurrentWeekModal />);
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(qualified('milestone_cycle:current', ALICE)));
+
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(document.querySelector('#mcw-table')?.textContent).toContain('5.55'));
+    expect(spy).toHaveBeenLastCalledWith(qualified('milestone_cycle:post-reset', ALICE));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(document.querySelector('#mcw-table')?.textContent).toContain('7.77'));
+    expect(spy).toHaveBeenLastCalledWith(qualified('milestone_cycle:pre-reset', ALICE));
+    fireEvent.click(screen.getByLabelText('Newer cycle'));
+    await waitFor(() => expect(document.querySelector('#mcw-table')?.textContent).toContain('5.55'));
+    for (const [url] of spy.mock.calls) expect(url).toMatch(new RegExp(`\\?account=${ALICE}$`));
+    expect(badgeLabels()).toEqual(['Alice']);
+  });
+
+  it('renders a current observation-gap cycle from the displayed account’s detail', async () => {
+    const spy = mockFetch({
+      ...HISTORIC_GAP_PAYLOAD,
+      key: 'milestone_cycle:current',
+      is_current: true,
+      detail_stamp: 'st-milestone_cycle:current',
+    });
+    updateSnapshot(accountEnv(BOB, 'Bob', {
+      liveBlock: false,
+      index: [
+        idxEntry('milestone_cycle:current', { is_current: true, segment_count: 1, has_observation_gap: true }),
+        INDEX[1],
+      ],
+    }));
+    render(<CurrentWeekModal />);
+    await waitFor(() => expect(document.getElementById('mcw-gap-notes')).not.toBeNull());
+    expect(spy).toHaveBeenCalledWith(qualified('milestone_cycle:current', BOB));
+    const cells = Array.from(document.querySelectorAll('#mcw-table .m-marginal'))
+      .map((el) => (el.textContent ?? '').trim());
+    expect(cells.filter((cell) => cell === 'observation gap')).toHaveLength(3);
+  });
+
+  it('shows the new account’s current cycle on the first render after an account flip', async () => {
+    const { spy, pending } = deferredFetch();
+    updateSnapshot(accountEnv(ALICE, 'Alice', { weeklyUsd: 1.11 }));
+    const commits: string[] = [];
+    render(
+      <Profiler id="cw" onRender={() => { commits.push(document.body.textContent ?? ''); }}>
+        <CurrentWeekModal />
+      </Profiler>,
+    );
+    await waitFor(() => expect(pending).toHaveLength(1));
+    await act(async () => pending[0].succeed(cyclePayload('milestone_cycle:current', ALICE, 'Alice')));
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(pending).toHaveLength(2));
+    expect(pending[1].url).toBe(qualified('milestone_cycle:post-reset', ALICE));
+    await act(async () => pending[1].succeed(cyclePayload('milestone_cycle:post-reset', ALICE, 'Alice', { usd: 9.99 })));
+    await waitFor(() => expect(document.querySelector('#mcw-table')?.textContent).toContain('9.99'));
+
+    // Bob's index carries the very same keys and stamps as Alice's.
+    commits.length = 0;
+    act(() => { updateSnapshot(accountEnv(BOB, 'Bob', { weeklyUsd: 2.22 })); });
+    expect(commits.length).toBeGreaterThan(0);
+    for (const text of commits) {
+      expect(text).toContain('Current Cycle — per-percent milestones');
+      expect(text).not.toContain('9.99');
+      expect(text).not.toContain('Alice');
+      expect(text).not.toContain('Couldn’t load this cycle');
+    }
+    // Bob's envelope rows are visible while his own detail loads.
+    expect(document.querySelector('#mcw-table')?.textContent).toContain('2.22');
+    expect(badgeLabels()).toEqual(['Bob']);
+    await waitFor(() => expect(spy).toHaveBeenLastCalledWith(qualified('milestone_cycle:current', BOB)));
+  });
+
+  it('keeps the selection when only the account label changes', async () => {
+    const spy = vi.fn(async (url: string) => {
+      const key = decodeURIComponent(url.split('/week/')[1].split('?')[0]);
+      return { ok: true, json: async () => cyclePayload(key, ALICE, 'Alice', { usd: 5.55 }) };
+    });
+    global.fetch = spy as unknown as typeof fetch;
+    updateSnapshot(accountEnv(ALICE, 'Alice'));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(document.querySelector('#mcw-table')?.textContent).toContain('5.55'));
+    const calls = spy.mock.calls.length;
+    act(() => { updateSnapshot(accountEnv(ALICE, 'Alice (work)')); });
+    expect(document.querySelector('#mcw-table')?.textContent).toContain('5.55');
+    expect(document.body.textContent).toContain('Cycle — per-percent milestones');
+    expect(document.body.textContent).not.toContain('Current Cycle — per-percent milestones');
+    expect(badgeLabels()).toEqual(['Alice (work)']);
+    expect(spy.mock.calls.length).toBe(calls);
+  });
+
+  for (const outcome of ['success', 'error'] as const) {
+    it(`ignores a late ${outcome} for the account that is no longer displayed`, async () => {
+      const { pending } = deferredFetch();
+      updateSnapshot(accountEnv(ALICE, 'Alice', { weeklyUsd: 1.11 }));
+      render(<CurrentWeekModal />);
+      await waitFor(() => expect(pending).toHaveLength(1));
+      expect(pending[0].url).toBe(qualified('milestone_cycle:current', ALICE));
+
+      act(() => { updateSnapshot(accountEnv(BOB, 'Bob', { weeklyUsd: 2.22 })); });
+      await act(async () => {
+        if (outcome === 'success') pending[0].succeed(cyclePayload('milestone_cycle:current', ALICE, 'Alice'));
+        else pending[0].fail(404);
+      });
+      expect(screen.queryByText('Alice')).toBeNull();
+      expect(screen.queryByText(/Couldn’t load this cycle/)).toBeNull();
+      expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Current block');
+      expect(document.querySelector('#mcw-table')?.textContent).toContain('2.22');
+
+      await waitFor(() => expect(pending).toHaveLength(2));
+      expect(pending[1].url).toBe(qualified('milestone_cycle:current', BOB));
+      await act(async () => pending[1].succeed(cyclePayload('milestone_cycle:current', BOB, 'Bob')));
+      await waitFor(() => expect(screen.getByText('Block 1 of 1')).toBeTruthy());
+      expect(document.querySelector('#mcw-blocknav')?.textContent).toContain('Bob');
+      expect(screen.queryByText('Alice')).toBeNull();
+    });
+  }
+
+  // S1 (#834) stays effective-only on the scoped detail, and a stamp change
+  // refetches: a crossing whose weekly join became unavailable renders `—`,
+  // never the earlier effective value and never the raw one.
+  it('refetches on a stamp change and renders — for a now-unavailable crossing', async () => {
+    let effective: number | null = 31;
+    const spy = vi.fn(async (url: string) => {
+      const key = decodeURIComponent(url.split('/week/')[1].split('?')[0]);
+      return { ok: true, json: async () => cyclePayload(key, ALICE, 'Alice', { effective }) };
+    });
+    global.fetch = spy as unknown as typeof fetch;
+    updateSnapshot(accountEnv(ALICE, 'Alice'));
+    render(<CurrentWeekModal />);
+    fireEvent.click(screen.getByLabelText('Older cycle'));
+    await waitFor(() => expect(document.querySelector('#mcw-5h-table')).not.toBeNull());
+    const cellsOf = () => Array.from(document.querySelectorAll('#mcw-5h-table .m-fh')).map((n) => n.textContent);
+    expect(cellsOf()).toEqual(['31%']);
+    expect(document.querySelector('#mcw-5h-table')?.textContent).not.toContain('42%');
+
+    effective = null;
+    const restamped = INDEX.map((e) => e.key === 'milestone_cycle:post-reset' ? { ...e, detail_stamp: 'st-moved' } : e);
+    act(() => { updateSnapshot(accountEnv(ALICE, 'Alice', { index: restamped })); });
+    await waitFor(() => expect(cellsOf()).toEqual(['—']));
+    expect(document.querySelector('#mcw-5h-table')?.textContent).not.toContain('42%');
+    expect(spy).toHaveBeenLastCalledWith(qualified('milestone_cycle:post-reset', ALICE));
   });
 });
 

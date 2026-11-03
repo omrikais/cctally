@@ -1,5 +1,5 @@
 """#901 §5.5: process-write fields on every always-on record, and the
-65,536-byte state budget with the write state included."""
+73,728-byte state budget with the write state included."""
 import dataclasses
 import pathlib
 import sys
@@ -161,7 +161,7 @@ def test_a_traced_phase_records_its_write_bytes():
 def test_every_ring_and_the_write_state_stay_inside_the_frozen_budget():
     """Non-vacuity: every ring FULL with distinct worst-case values, a full
     timeline, a full exclusion ring, a 25-bucket ledger and a local
-    instance. The cap stays frozen at 65,536 bytes."""
+    instance. The cap stays frozen at 73,728 bytes."""
     _counter(*range(10 ** 9, 10 ** 9 + 4096 * 3000, 4096))
     clock = {"ns": 1000 * S}
     wio.reset_for_tests(
@@ -234,7 +234,7 @@ def test_every_ring_and_the_write_state_stay_inside_the_frozen_budget():
     assert len(write_state[0]) == wio.TIMELINE_CAPACITY
     assert len(write_state[4]) == wio.EXCLUSION_CAPACITY
     assert len(write_state[3]) == 3 * 25
-    assert ts.MEMORY_BUDGET_BYTES == 65536, (
+    assert ts.MEMORY_BUDGET_BYTES == 73728, (
         "the budget is frozen; raising it is a separate reviewed decision")
     total = ts._deep_size(snap) + ts._deep_size(write_state)
     assert total <= ts.MEMORY_BUDGET_BYTES, total

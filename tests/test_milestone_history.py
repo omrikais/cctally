@@ -1888,3 +1888,809 @@ def test_839_decorated_detail_stamp_moves_for_other_account_5h_changes(ns):
         assert mh.build_claude_week_index(conn)[0]["detail_stamp"] != credit_stamp
     finally:
         conn.close()
+
+
+# ── #836: one account's history on a multi-account store (spec 5.4-5.6) ──
+#
+# On a store with more than one REAL Claude account the Current Week card
+# describes ONE account (the owner of the newest non-held weekly sample), and
+# U1 makes its history navigator walk only that account's history. These
+# tests detect: another account's cycles, cohorts, blocks or credits in a
+# scoped payload; a stamp that does not move when one of the scope's own
+# crossings loses (or regains) its weekly join; an index whose current entry
+# describes a different interval than the card; and a route that answers an
+# account-qualified request with the merged week.
+
+ACCT_836_A = "1111111111111111111111111111aaaa"
+ACCT_836_B = "2222222222222222222222222222bbbb"
+ACCT_836_CODEX = "3333333333333333333333333333cccc"
+_836_NOW = dt.datetime(2026, 5, 20, 12, 0, tzinfo=dt.timezone.utc)
+_836_EFFECTIVE = "2026-05-18T00:00:00+00:00"
+
+
+def _seed_836_account(conn, key, label, provider="claude"):
+    conn.execute(
+        "INSERT INTO accounts (account_key, provider, natural_id, label) "
+        "VALUES (?, ?, ?, ?)", (key, provider, key, label))
+
+
+def _seed_836_usage(conn, *, account_key, captured_at_utc, weekly_percent,
+                    week_start_date="2026-05-15", week_start_at=WK_A_START,
+                    week_end_at=WK_A_END, held=0, payload_json="{}") -> int:
+    cur = conn.execute(
+        "INSERT INTO weekly_usage_snapshots "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, weekly_percent, source, payload_json, account_key, "
+        " weekly_observation_held) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'test', ?, ?, ?)",
+        (captured_at_utc, week_start_date,
+         (week_end_at or "2026-05-22")[:10], week_start_at, week_end_at,
+         weekly_percent, payload_json, account_key, held),
+    )
+    return int(cur.lastrowid)
+
+
+def _seed_836_milestone(conn, *, account_key, threshold, captured_at_utc,
+                        reset_event_id=0, week_start_date="2026-05-15",
+                        week_start_at=WK_A_START, week_end_at=WK_A_END):
+    conn.execute(
+        "INSERT INTO percent_milestones "
+        "(captured_at_utc, week_start_date, week_end_date, week_start_at, "
+        " week_end_at, percent_threshold, cumulative_cost_usd, "
+        " marginal_cost_usd, usage_snapshot_id, cost_snapshot_id, "
+        " reset_event_id, account_key) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 0.5, 0, 0, ?, ?)",
+        (captured_at_utc, week_start_date,
+         (week_end_at or "2026-05-22")[:10], week_start_at, week_end_at,
+         threshold, float(threshold), reset_event_id, account_key),
+    )
+
+
+def _seed_836_reset(conn, *, account_key, effective):
+    cur = conn.execute(
+        "INSERT INTO week_reset_events "
+        "(detected_at_utc, old_week_end_at, new_week_end_at, "
+        " effective_reset_at_utc, account_key) VALUES (?, ?, ?, ?, ?)",
+        (effective, effective, WK_A_END, effective, account_key))
+    return int(cur.lastrowid)
+
+
+def _836_window(ns, resets="2026-05-16T05:00:00+00:00"):
+    return ns["_canonical_5h_window_key"](
+        int(dt.datetime.fromisoformat(resets).timestamp()))
+
+
+def _seed_836_two_accounts(ns, conn):
+    """A and B share week WK_A. B had an in-place weekly credit inside it
+    (its own reset event, post-credit milestones 1-2); A has milestones 1-3
+    with no reset and an older week WK_B. Each owns a block in the same 5h
+    window; B's carries a 5h credit. An `unattributed` milestone and block sit
+    in the same week. A owns the newest non-held weekly sample."""
+    _seed_836_account(conn, ACCT_836_A, "Alice")
+    _seed_836_account(conn, ACCT_836_B, "Bob")
+    _seed_836_usage(conn, account_key=ACCT_836_A,
+                    captured_at_utc="2026-05-09T09:00:00Z", weekly_percent=7.0,
+                    week_start_date="2026-05-08", week_start_at=WK_B_START,
+                    week_end_at=WK_B_END)
+    _seed_836_milestone(conn, account_key=ACCT_836_A, threshold=1,
+                        captured_at_utc="2026-05-09T08:00:00Z",
+                        week_start_date="2026-05-08",
+                        week_start_at=WK_B_START, week_end_at=WK_B_END)
+    _seed_836_usage(conn, account_key=ACCT_836_B,
+                    captured_at_utc="2026-05-19T09:00:00Z", weekly_percent=2.0)
+    a_snap = _seed_836_usage(conn, account_key=ACCT_836_A,
+                             captured_at_utc="2026-05-19T10:00:00Z",
+                             weekly_percent=3.0)
+    bob_reset = _seed_836_reset(conn, account_key=ACCT_836_B,
+                                effective=_836_EFFECTIVE)
+    for t in (1, 2, 3):
+        _seed_836_milestone(conn, account_key=ACCT_836_A, threshold=t,
+                            captured_at_utc=f"2026-05-16T1{t}:00:00Z")
+    for t in (1, 2, 3, 4):
+        _seed_836_milestone(conn, account_key=ACCT_836_B, threshold=t,
+                            captured_at_utc=f"2026-05-16T0{t}:00:00Z")
+    for t in (1, 2):
+        _seed_836_milestone(conn, account_key=ACCT_836_B, threshold=t,
+                            captured_at_utc=f"2026-05-19T0{t}:00:00Z",
+                            reset_event_id=bob_reset)
+    _seed_836_milestone(conn, account_key=UNATTRIBUTED_836, threshold=9,
+                        captured_at_utc="2026-05-16T20:00:00Z")
+    wk = _836_window(ns)
+    start = "2026-05-16T00:00:00+00:00"
+    resets = "2026-05-16T05:00:00+00:00"
+    blocks = {}
+    for account, final in ((ACCT_836_A, 5.0), (ACCT_836_B, 9.0),
+                           (UNATTRIBUTED_836, 1.0)):
+        blocks[account] = _seed_account_block(
+            conn, window_key=wk, block_start_at=start,
+            five_hour_resets_at=resets, account_key=account,
+            final_five_hour_percent=final)
+    _seed_account_5h_milestone(
+        conn, block_id=blocks[ACCT_836_A], window_key=wk, percent_threshold=1,
+        captured_at_utc="2026-05-16T01:00:00+00:00", account_key=ACCT_836_A,
+        usage_snapshot_id=a_snap)
+    conn.execute(
+        "INSERT INTO five_hour_reset_events "
+        "(detected_at_utc, five_hour_window_key, prior_percent, "
+        " post_percent, effective_reset_at_utc, account_key) "
+        "VALUES (?, ?, 1, 5, ?, ?)",
+        ("2026-05-16T02:00:00+00:00", wk, "2026-05-16T02:00:00+00:00",
+         ACCT_836_B))
+    conn.commit()
+    return {"a_snap": a_snap, "bob_reset": bob_reset, "window": wk,
+            "blocks": blocks}
+
+
+UNATTRIBUTED_836 = "unattributed"
+
+
+def _836_scope(ns, conn, account, now=_836_NOW):
+    return ns["_claude_current_cycle_scope"](conn, now, account_key=account)
+
+
+def _836_index(ns, conn, account, now=_836_NOW):
+    import _cctally_milestone_history as mh
+    return mh.build_claude_week_index(
+        conn, account_key=account, cycle_scope=_836_scope(ns, conn, account, now),
+        now_utc=now)
+
+
+def _bounds(index):
+    return [(e["start_at_utc"], e["end_at_utc"]) for e in index]
+
+
+def test_836_a_scoped_index_holds_only_its_accounts_cycles_and_cohorts(ns):
+    """U1. Detects: B's in-place credit cutting A's week, B's post-credit
+    crossings or blocks counted in A's cycle, and `unattributed` rows entering
+    a real account's history."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _seed_836_two_accounts(ns, conn)
+        merged = mh.build_claude_week_index(conn)
+        alice = _836_index(ns, conn, ACCT_836_A)
+        bob = _836_index(ns, conn, ACCT_836_B)
+        lone = mh.build_claude_week_index(
+            conn, account_key=UNATTRIBUTED_836, now_utc=_836_NOW)
+    finally:
+        conn.close()
+    # non-vacuity: the merged index IS cut by Bob's credit.
+    assert ("2026-05-18T00:00:00Z", "2026-05-22T00:00:00Z") in _bounds(merged)
+    assert _bounds(alice) == [
+        ("2026-05-15T00:00:00Z", "2026-05-22T00:00:00Z"),
+        ("2026-05-08T00:00:00Z", "2026-05-15T00:00:00Z"),
+    ]
+    assert [(e["milestone_count"], e["block_count"], e["is_current"])
+            for e in alice] == [(3, 1, True), (1, 0, False)]
+    assert _bounds(bob) == [
+        ("2026-05-18T00:00:00Z", "2026-05-22T00:00:00Z"),
+        ("2026-05-15T00:00:00Z", "2026-05-18T00:00:00Z"),
+    ]
+    assert [(e["milestone_count"], e["is_current"]) for e in bob] == [
+        (2, True), (4, False)]
+    assert [e["milestone_count"] for e in lone] == [1]
+    assert not any(e["is_current"] for e in lone)
+    # One cycle key is shared across accounts with the same boundaries, so the
+    # stamp names its scope.
+    assert alice[0]["key"] != bob[0]["key"]
+    assert lone[0]["key"] == alice[0]["key"]
+    assert lone[0]["detail_stamp"] != alice[0]["detail_stamp"]
+
+
+def test_836_a_scoped_detail_holds_only_its_accounts_blocks_and_milestones(ns):
+    """U1 / spec 3 Consequence. Detects: a scoped detail whose `blocks[]`
+    steps into another account's block in the same window, or a key from
+    another account's index resolving under this one."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _seed_836_two_accounts(ns, conn)
+        alice = _836_index(ns, conn, ACCT_836_A)
+        bob = _836_index(ns, conn, ACCT_836_B)
+        a_detail = mh.build_claude_week_detail(
+            conn, alice[0]["key"], account_key=ACCT_836_A, now_utc=_836_NOW)
+        b_detail = mh.build_claude_week_detail(
+            conn, bob[1]["key"], account_key=ACCT_836_B, now_utc=_836_NOW)
+        foreign = mh.build_claude_week_detail(
+            conn, bob[0]["key"], account_key=ACCT_836_A, now_utc=_836_NOW)
+    finally:
+        conn.close()
+    assert foreign is None
+    assert a_detail["detail_stamp"] == alice[0]["detail_stamp"]
+    assert a_detail["is_current"] is True
+    assert [m["percent"] for m in a_detail["segments"][0]["milestones"]] == [
+        1, 2, 3]
+    [block] = a_detail["blocks"]
+    assert (block["account_key"], block["account_label"]) == (
+        ACCT_836_A, "Alice")
+    assert [m["percent_threshold"] for m in block["milestones"]] == [1]
+    assert block["credits"] == []
+    assert [m["percent"] for m in b_detail["segments"][0]["milestones"]] == [
+        1, 2, 3, 4]
+    [b_block] = b_detail["blocks"]
+    assert b_block["account_key"] == ACCT_836_B
+    assert [c["delta_pp"] for c in b_block["credits"]] == [4.0]
+
+
+def test_836_scoped_stamps_move_for_their_own_5h_changes_only(ns):
+    """Detects: a scoped stamp that another account's 5h crossing or credit
+    moves (a refetch storm) or that the scope's own new crossing does not
+    move (a stale cached detail)."""
+    conn = ns["open_db"]()
+    try:
+        seeded = _seed_836_two_accounts(ns, conn)
+        stamp = _836_index(ns, conn, ACCT_836_A)[0]["detail_stamp"]
+        _seed_account_5h_milestone(
+            conn, block_id=seeded["blocks"][ACCT_836_B],
+            window_key=seeded["window"], percent_threshold=3,
+            captured_at_utc="2026-05-16T03:00:00+00:00",
+            account_key=ACCT_836_B)
+        conn.execute(
+            "INSERT INTO five_hour_reset_events "
+            "(detected_at_utc, five_hour_window_key, prior_percent, "
+            " post_percent, effective_reset_at_utc, account_key) "
+            "VALUES (?, ?, 2, 4, ?, ?)",
+            ("2026-05-16T04:00:00+00:00", seeded["window"],
+             "2026-05-16T04:00:00+00:00", ACCT_836_B))
+        conn.commit()
+        assert _836_index(ns, conn, ACCT_836_A)[0]["detail_stamp"] == stamp
+        _seed_account_5h_milestone(
+            conn, block_id=seeded["blocks"][ACCT_836_A],
+            window_key=seeded["window"], percent_threshold=2,
+            captured_at_utc="2026-05-16T02:00:00+00:00",
+            account_key=ACCT_836_A, usage_snapshot_id=seeded["a_snap"])
+        conn.commit()
+        assert _836_index(ns, conn, ACCT_836_A)[0]["detail_stamp"] != stamp
+    finally:
+        conn.close()
+
+
+def _836_single_account_join_store(ns, conn):
+    """One real account; two 5h crossings joined to two unheld snapshots."""
+    _seed_836_account(conn, ACCT_836_A, "Alice")
+    snaps = [
+        _seed_836_usage(conn, account_key=ACCT_836_A,
+                        captured_at_utc=f"2026-05-16T0{h}:00:00Z",
+                        weekly_percent=float(h))
+        for h in (1, 2)
+    ]
+    wk = _836_window(ns)
+    block = _seed_account_block(
+        conn, window_key=wk, block_start_at="2026-05-16T00:00:00+00:00",
+        five_hour_resets_at="2026-05-16T05:00:00+00:00",
+        account_key=ACCT_836_A, final_five_hour_percent=5.0)
+    for threshold, snap in zip((1, 2), snaps):
+        _seed_account_5h_milestone(
+            conn, block_id=block, window_key=wk, percent_threshold=threshold,
+            captured_at_utc=f"2026-05-16T0{threshold}:00:00+00:00",
+            account_key=ACCT_836_A, usage_snapshot_id=snap)
+    conn.commit()
+    return snaps
+
+
+def _836_retire(conn, snapshot_id):
+    """The state a weekly credit's cleanup leaves: an UNHELD row turned held
+    with no held-write marker in its payload (spec 5.4)."""
+    conn.execute("UPDATE weekly_usage_snapshots SET weekly_observation_held=1 "
+                 "WHERE id=?", (snapshot_id,))
+    conn.commit()
+
+
+def _836_restore(conn, snapshot_id):
+    """The state convergence leaves once the suppressor no longer names the
+    row (`tests/test_band_removal_840.py`): held back to 0."""
+    conn.execute("UPDATE weekly_usage_snapshots SET weekly_observation_held=0 "
+                 "WHERE id=?", (snapshot_id,))
+    conn.commit()
+
+
+@pytest.mark.parametrize("transition", ["suppress", "delete", "held_write"])
+def test_836_the_stamp_moves_when_a_crossings_weekly_join_becomes_unavailable(
+        ns, transition):
+    """D-F (A8). Detects: a suppression, or a snapshot DELETE that rewrites
+    the crossing's join to the `0` sentinel, leaving every count, max id and
+    capture of the stamp unchanged, so the client keeps rendering the cached
+    detail's retired value as a percentage. A genuine held WRITE (marker in
+    the payload) keeps its value and must not move the stamp."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        snaps = _836_single_account_join_store(ns, conn)
+        before = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+        if transition == "suppress":
+            _836_retire(conn, snaps[0])
+        elif transition == "delete":
+            conn.execute("DELETE FROM weekly_usage_snapshots WHERE id=?",
+                         (snaps[0],))
+            conn.commit()
+            assert conn.execute(
+                "SELECT COUNT(*) FROM five_hour_milestones "
+                "WHERE usage_snapshot_id=0").fetchone()[0] == 1
+        else:
+            conn.execute(
+                "UPDATE weekly_usage_snapshots SET weekly_observation_held=1, "
+                "payload_json='{\"weeklyObservationHeld\": true}' WHERE id=?",
+                (snaps[0],))
+            conn.commit()
+        after = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+    finally:
+        conn.close()
+    if transition == "held_write":
+        assert after == before
+    else:
+        assert after != before
+
+
+def test_836_a_count_preserving_retirement_swap_still_moves_the_stamp(ns):
+    """R2-1. Crossing A retired and B available, then A restored and B
+    retired: every count, sum and max id is equal before and after. Detects:
+    a count-based component, under which the client keeps the detail that
+    renders A's restored value as `—` and B's retired value as a percentage."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        snaps = _836_single_account_join_store(ns, conn)
+        _836_retire(conn, snaps[0])
+        before = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+        _836_restore(conn, snaps[0])
+        _836_retire(conn, snaps[1])
+        after = mh.build_claude_week_index(conn)[0]["detail_stamp"]
+    finally:
+        conn.close()
+    assert after != before
+
+
+def test_836_a_clean_single_account_stamp_is_byte_stable(ns):
+    """Spec 5.4 nonempty-only. Detects: an unavailable-join component appended
+    when no crossing is unavailable, which would move every single-account
+    install's stamps (and force a refetch) for nothing."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _836_single_account_join_store(ns, conn)
+        entry = mh.build_claude_week_index(conn)[0]
+        rows = mh._claude_cycle_rows(conn, ns["make_week_ref"](
+            week_start_date="2026-05-15", week_end_date="2026-05-22",
+            week_start_at=WK_A_START, week_end_at=WK_A_END))
+    finally:
+        conn.close()
+    assert entry["detail_stamp"] == mh._mh.compute_detail_stamp(
+        entry["key"], len(rows), 1, 1 if rows else 0,
+        max((r["captured_at_utc"] for r in rows), default=None))
+
+
+def _836_oracle_unavailable_ids(conn, start_iso, end_iso, account_key):
+    """The per-cycle query the unavailable-join component originally ran
+    once per index entry (#836 spec 5.4): the oracle a per-build computation
+    must agree with byte for byte."""
+    from _cctally_five_hour import weekly_join_unavailable_sql
+    if not start_iso or not end_iso:
+        return []
+    acct_sql, params = ("", ()) if account_key is None else (
+        " AND b.account_key = ?", (account_key,))
+    return [int(r[0]) for r in conn.execute(
+        "SELECT m.id FROM five_hour_blocks b "
+        "JOIN five_hour_milestones m ON m.block_id = b.id "
+        "LEFT JOIN weekly_usage_snapshots s ON s.id = m.usage_snapshot_id "
+        "WHERE unixepoch(b.block_start_at) < unixepoch(?) "
+        "AND unixepoch(b.five_hour_resets_at) > unixepoch(?)" + acct_sql
+        + " AND " + weekly_join_unavailable_sql(conn, "s")
+        + " ORDER BY m.id",
+        (end_iso, start_iso) + params,
+    ).fetchall()]
+
+
+def _836_multi_cycle_join_store(ns, conn):
+    """Two real accounts and `unattributed` over three weeks; Bob's in-place
+    credit cuts WK_A at 05-18. 5h blocks straddle the WK_C/WK_B and WK_B/WK_A
+    boundaries (one start spelled with a +02:00 offset) and Bob's cut, and
+    their crossings join an available snapshot, a held WRITE (available), an
+    absent snapshot, the ``0`` sentinel or a suppression-retired snapshot. Bob
+    has no block in WK_C, so his scoped WK_C set is empty. One block's bounds
+    do not parse, so SQLite's ``unixepoch`` is NULL for it."""
+    _seed_836_account(conn, ACCT_836_A, "Alice")
+    _seed_836_account(conn, ACCT_836_B, "Bob")
+    weeks = {"C": ("2026-05-01", WK_C_START, WK_C_END),
+             "B": ("2026-05-08", WK_B_START, WK_B_END),
+             "A": ("2026-05-15", WK_A_START, WK_A_END)}
+    snaps = {}
+    for account, wks in ((ACCT_836_A, "CBA"), (ACCT_836_B, "CBA")):
+        for w in wks:
+            date, start, end = weeks[w]
+            day = int(date[-2:]) + 1
+            for t in (1, 2):
+                _seed_836_milestone(
+                    conn, account_key=account, threshold=t,
+                    captured_at_utc=f"2026-05-{day:02d}T0{t}:00:00Z",
+                    week_start_date=date, week_start_at=start, week_end_at=end)
+            snaps[(account, w, "ok")] = _seed_836_usage(
+                conn, account_key=account, weekly_percent=2.0,
+                captured_at_utc=f"2026-05-{day:02d}T03:00:00Z",
+                week_start_date=date, week_start_at=start, week_end_at=end)
+            snaps[(account, w, "retired")] = _seed_836_usage(
+                conn, account_key=account, weekly_percent=3.0,
+                captured_at_utc=f"2026-05-{day:02d}T04:00:00Z",
+                week_start_date=date, week_start_at=start, week_end_at=end)
+            _836_retire(conn, snaps[(account, w, "retired")])
+            snaps[(account, w, "held_write")] = _seed_836_usage(
+                conn, account_key=account, weekly_percent=3.0, held=1,
+                payload_json='{"weeklyObservationHeld": true}',
+                captured_at_utc=f"2026-05-{day:02d}T05:00:00Z",
+                week_start_date=date, week_start_at=start, week_end_at=end)
+    # Newest unheld sample is Alice's, so the merged current week is WK_A.
+    _seed_836_usage(conn, account_key=ACCT_836_B, weekly_percent=4.0,
+                    captured_at_utc="2026-05-20T09:00:00Z")
+    _seed_836_usage(conn, account_key=ACCT_836_A, weekly_percent=5.0,
+                    captured_at_utc="2026-05-20T10:00:00Z")
+    bob_reset = _seed_836_reset(conn, account_key=ACCT_836_B,
+                                effective=_836_EFFECTIVE)
+    for t in (1, 2):
+        _seed_836_milestone(conn, account_key=ACCT_836_B, threshold=t,
+                            captured_at_utc=f"2026-05-19T0{t}:00:00Z",
+                            reset_event_id=bob_reset)
+
+    def join(account, week, kind):
+        if kind == "absent":
+            return 987654
+        if kind == "sentinel":
+            return 0
+        return snaps[(account, week, kind)]
+
+    blocks = [
+        # (account, start, resets, [(week-of-snapshot, join kind), ...])
+        (ACCT_836_A, "2026-05-02T10:00:00+00:00", "2026-05-02T15:00:00+00:00",
+         [("C", "absent"), ("C", "ok")]),
+        (ACCT_836_A, "2026-05-08T01:00:00+02:00", "2026-05-08T04:00:00+00:00",
+         [("C", "sentinel"), ("C", "retired"), ("C", "held_write")]),
+        (ACCT_836_A, "2026-05-14T22:00:00+00:00", "2026-05-15T03:00:00+00:00",
+         [("B", "retired"), ("B", "held_write"), ("B", "absent")]),
+        (ACCT_836_A, "2026-05-19T10:00:00+00:00", "2026-05-19T15:00:00+00:00",
+         [("A", "ok")]),
+        (ACCT_836_B, "2026-05-10T10:00:00+00:00", "2026-05-10T15:00:00+00:00",
+         [("B", "sentinel"), ("B", "ok")]),
+        (ACCT_836_B, "2026-05-17T22:00:00+00:00", "2026-05-18T03:00:00+00:00",
+         [("A", "absent"), ("A", "retired")]),
+        (ACCT_836_B, "2026-05-20T01:00:00+00:00", "2026-05-20T06:00:00+00:00",
+         [("A", "ok"), ("A", "held_write")]),
+        (UNATTRIBUTED_836, "2026-05-16T00:00:00+00:00",
+         "2026-05-16T05:00:00+00:00", [("A", "sentinel")]),
+        (ACCT_836_A, "not-a-date", "not-a-date", [("A", "absent")]),
+    ]
+    for account, start, resets, crossings in blocks:
+        wk = (_836_window(ns, resets) if resets != "not-a-date" else 4242)
+        block = _seed_account_block(
+            conn, window_key=wk, block_start_at=start,
+            five_hour_resets_at=resets, account_key=account,
+            final_five_hour_percent=5.0)
+        for threshold, (week, kind) in enumerate(crossings, start=1):
+            _seed_account_5h_milestone(
+                conn, block_id=block, window_key=wk,
+                percent_threshold=threshold,
+                captured_at_utc=start if resets == "not-a-date" else resets,
+                account_key=account, usage_snapshot_id=join(account, week, kind))
+    conn.commit()
+
+
+def test_836_unavailable_join_stamps_match_the_per_cycle_oracle(
+        ns, monkeypatch):
+    """Spec 5.4 / plan Constraint 9, the per-build computation of the
+    unavailable-join set. Detects: a crossing bucketed into the wrong cycle at
+    a week boundary, an offset-spelled bound or a reset cut, another account's
+    crossing in a scoped stamp, or an unparseable block's crossing admitted —
+    each leaves a cached detail rendering a retired weekly value as a
+    percentage (or refetching forever). Every index entry's and fetched
+    detail's stamp, merged and scoped per account, must equal the stamp built
+    from the original per-cycle query's ids."""
+    import _cctally_milestone_history as mh
+    real = mh._mh.compute_detail_stamp
+    parts_of = {}
+
+    def recording(*parts):
+        out = real(*parts)
+        parts_of[out] = parts
+        return out
+
+    monkeypatch.setattr(mh._mh, "compute_detail_stamp", recording)
+
+    def expected_stamp(conn, entry, account):
+        """The entry's own stamp parts with its unavailable-join component
+        replaced by the oracle's."""
+        parts = parts_of[entry["detail_stamp"]]
+        scope = () if account is None else ("a" + account,)
+        body = parts[:len(parts) - len(scope)]
+        assert tuple(parts[len(body):]) == scope
+        if body and isinstance(body[-1], str) and body[-1].startswith("u"):
+            body = body[:-1]
+        ids = _836_oracle_unavailable_ids(
+            conn, entry["start_at_utc"], entry["end_at_utc"], account)
+        oracle = ("u" + real(*ids),) if ids else ()
+        return real(*body, *oracle, *scope), ids
+
+    conn = ns["open_db"]()
+    try:
+        _836_multi_cycle_join_store(ns, conn)
+        seen = {}
+        for account in (None, ACCT_836_A, ACCT_836_B):
+            index = (mh.build_claude_week_index(conn) if account is None
+                     else _836_index(ns, conn, account))
+            assert len(index) >= 2
+            for entry in index:
+                want, ids = expected_stamp(conn, entry, account)
+                assert entry["detail_stamp"] == want, (account, entry)
+                seen[(account, entry["start_at_utc"])] = ids
+                detail = (
+                    mh.build_claude_week_detail(conn, entry["key"])
+                    if account is None else mh.build_claude_week_detail(
+                        conn, entry["key"], account_key=account,
+                        now_utc=_836_NOW))
+                assert detail["detail_stamp"] == want, (account, entry)
+    finally:
+        conn.close()
+    # non-vacuity: empty and nonempty sets, a straddling crossing in two
+    # cycles, and scoped sets that differ from the merged one.
+    assert any(seen.values()) and not all(seen.values())
+    merged = [ids for (acct, _), ids in seen.items() if acct is None]
+    flat = [i for ids in merged for i in ids]
+    assert len(flat) != len(set(flat))
+    assert seen[(ACCT_836_A, "2026-05-15T00:00:00Z")] != seen[
+        (None, "2026-05-15T00:00:00Z")]
+
+
+@pytest.mark.parametrize("case", ["plain", "reset_after_as_of", "date_only"])
+def test_836_the_scoped_current_entry_is_the_cards_cycle(ns, case):
+    """R1-6 / R1-7 / R2-2. Exactly one current entry, in FULL interval
+    agreement with the card's cycle scope, and the route's detail for that
+    key has the same bounds. `reset_after_as_of`: A's own retained reset
+    takes effect after the as-of, so neither the card nor the index cuts yet
+    — and both cut once the instant has passed. `date_only`: the storage-key
+    leg with absent bounds. Detects: a newest-by-position current flag, a
+    start-only match, and an index cut ahead of the card."""
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _seed_836_account(conn, ACCT_836_A, "Alice")
+        _seed_836_account(conn, ACCT_836_B, "Bob")
+        bounds = ({"week_start_at": None, "week_end_at": None}
+                  if case == "date_only" else {})
+        for account, pct, cap in ((ACCT_836_B, 9.0, "2026-05-20T09:00:00Z"),
+                                  (ACCT_836_A, 3.0, "2026-05-20T10:00:00Z")):
+            _seed_836_usage(conn, account_key=account, captured_at_utc=cap,
+                            weekly_percent=pct, **bounds)
+            _seed_836_milestone(conn, account_key=account, threshold=1,
+                                captured_at_utc=cap, **bounds)
+        if case == "reset_after_as_of":
+            _seed_836_reset(conn, account_key=ACCT_836_A,
+                            effective="2026-05-20T13:00:00+00:00")
+        conn.commit()
+        if case == "date_only":
+            # The date-only leg resolves the host-local day; pin the instant
+            # inside the storage week whatever the host offset.
+            now = dt.datetime(2026, 5, 18, 12, 0, tzinfo=dt.timezone.utc)
+            conn.execute("UPDATE weekly_usage_snapshots SET "
+                         "captured_at_utc='2026-05-18T10:00:00Z'")
+            conn.commit()
+        else:
+            now = _836_NOW
+        scope = _836_scope(ns, conn, ACCT_836_A, now)
+        assert scope is not None and scope.account_key == ACCT_836_A
+        index = _836_index(ns, conn, ACCT_836_A, now)
+        current = [e for e in index if e["is_current"]]
+        assert len(current) == 1, index
+        entry = current[0]
+        detail = mh.build_claude_week_detail(
+            conn, entry["key"], account_key=ACCT_836_A, now_utc=now)
+        if case == "date_only":
+            assert scope.week_start_at is None
+            assert (entry["start_at_utc"], entry["end_at_utc"]) == (None, None)
+        else:
+            assert entry["start_at_utc"] == scope.effective_start_at
+            assert ns["parse_iso_datetime"](entry["end_at_utc"], "end") == (
+                ns["parse_iso_datetime"](scope.week_end_at, "end"))
+        assert detail is not None and detail["is_current"] is True
+        assert (detail["start_at_utc"], detail["end_at_utc"]) == (
+            entry["start_at_utc"], entry["end_at_utc"])
+        assert entry["milestone_count"] == 1
+        if case == "reset_after_as_of":
+            assert len(index) == 1, "the index cut ahead of the card"
+            later = dt.datetime(2026, 5, 20, 14, 0, tzinfo=dt.timezone.utc)
+            later_scope = _836_scope(ns, conn, ACCT_836_A, later)
+            later_index = _836_index(ns, conn, ACCT_836_A, later)
+            [later_current] = [e for e in later_index if e["is_current"]]
+            assert later_scope.effective_start_at == "2026-05-20T13:00:00Z"
+            assert later_current["start_at_utc"] == "2026-05-20T13:00:00Z"
+            assert later_current["milestone_count"] == 0
+    finally:
+        conn.close()
+
+
+def _seed_836_route_store(conn):
+    # `ns` is not reachable from the route seed; the window key is the stored
+    # canonical value for the 2026-05-16T05:00Z reset.
+    _seed_836_account(conn, ACCT_836_CODEX, "Codex", provider="codex")
+    _seed_836_account(conn, ACCT_836_A, "Alice")
+    _seed_836_account(conn, ACCT_836_B, "Bob")
+    for account, pct, cap in ((ACCT_836_B, 9.0, "2026-05-18T09:00:00Z"),
+                              (ACCT_836_A, 3.0, "2026-05-18T10:00:00Z")):
+        _seed_836_usage(conn, account_key=account, captured_at_utc=cap,
+                        weekly_percent=pct)
+        _seed_836_milestone(conn, account_key=account, threshold=1,
+                            captured_at_utc=cap)
+        _seed_account_block(
+            conn, window_key=1778907600,
+            block_start_at="2026-05-16T00:00:00+00:00",
+            five_hour_resets_at="2026-05-16T05:00:00+00:00",
+            account_key=account, final_five_hour_percent=pct)
+    _seed_836_usage(conn, account_key=ACCT_836_A,
+                    captured_at_utc="2026-05-09T09:00:00Z", weekly_percent=7.0,
+                    week_start_date="2026-05-08", week_start_at=WK_B_START,
+                    week_end_at=WK_B_END)
+
+
+def _836_route(tmp_path, monkeypatch, seed=_seed_836_route_store):
+    ns = load_script()
+    monkeypatch.setenv("CCTALLY_AS_OF", "2026-05-18T12:00:00Z")
+    srv = _boot_milestones_server(ns, tmp_path, monkeypatch, seed=seed)
+    conn = ns["open_db"]()
+    try:
+        merged = ns["build_claude_week_index"](conn)
+        scoped = {
+            account: ns["build_claude_week_index"](
+                conn, account_key=account,
+                cycle_scope=ns["_claude_current_cycle_scope"](
+                    conn, dt.datetime(2026, 5, 18, 12, tzinfo=dt.timezone.utc),
+                    account_key=account))
+            for account in (ACCT_836_A, ACCT_836_B)
+        }
+    finally:
+        conn.close()
+    return ns, srv, merged, scoped
+
+
+def _836_get(srv, key, query=""):
+    return _get(srv, "/api/milestones/claude/week/"
+                + _urlparse.quote(key, safe="") + query)
+
+
+def test_836_the_route_serves_a_scoped_claude_detail(tmp_path, monkeypatch):
+    """Spec 5.6: 200 only for a fully scoped result, and an absent qualifier
+    is the shipped merged response. Detects: the qualifier ignored (Bob's
+    block served under Alice) or the unqualified route changed."""
+    ns, srv, merged, scoped = _836_route(tmp_path, monkeypatch)
+    try:
+        key = scoped[ACCT_836_A][0]["key"]
+        status, body = _836_get(srv, key, "?account=" + ACCT_836_A)
+        assert status == 200, (status, body)
+        assert body["key"] == key and body["source"] == "claude"
+        assert body["detail_stamp"] == scoped[ACCT_836_A][0]["detail_stamp"]
+        assert [b["account_key"] for b in body["blocks"]] == [ACCT_836_A]
+        assert body["is_current"] is True
+        status, merged_body = _836_get(srv, merged[0]["key"])
+        assert status == 200
+        conn = ns["open_db"]()
+        try:
+            expected = ns["build_claude_week_detail"](conn, merged[0]["key"])
+        finally:
+            conn.close()
+        assert merged_body == _json.loads(_json.dumps(
+            {**expected, "source": "claude", "key": merged[0]["key"]}))
+        assert sorted(b["account_key"] for b in merged_body["blocks"]) == [
+            ACCT_836_A, ACCT_836_B]
+    finally:
+        stop(srv, srv._test_thread)
+
+
+@pytest.mark.parametrize("query", [
+    "?account=not-a-key",
+    "?account=",
+    "?account=*",
+    "?account=" + ACCT_836_A + "&account=" + ACCT_836_B,
+    "?account=" + ACCT_836_A.upper(),
+])
+def test_836_the_route_rejects_a_malformed_claude_qualifier(
+        tmp_path, monkeypatch, query):
+    ns, srv, _merged, scoped = _836_route(tmp_path, monkeypatch)
+    try:
+        status, body = _836_get(srv, scoped[ACCT_836_A][0]["key"], query)
+        assert status == 400, (status, body)
+        assert body == {"error": "invalid account"}
+    finally:
+        stop(srv, srv._test_thread)
+
+
+@pytest.mark.parametrize("account,which", [
+    ("4444444444444444444444444444dddd", "unknown account"),
+    (ACCT_836_CODEX, "non-Claude account"),
+    (ACCT_836_B, "key outside the account's scoped index"),
+])
+def test_836_the_route_answers_404_for_a_key_outside_the_scope(
+        tmp_path, monkeypatch, account, which):
+    """Detects: a scoped lookup that fails and is then answered from the
+    merged index, which would hand Alice's (or a stranger's) cycle to a
+    request that named another account."""
+    ns, srv, _merged, scoped = _836_route(tmp_path, monkeypatch)
+    try:
+        key = scoped[ACCT_836_A][1]["key"]  # Alice's older week: Bob has none
+        status, body = _836_get(srv, key, "?account=" + account)
+        assert status == 404, (which, status, body)
+        assert body == {"error": "unknown week", "code": "unknown_key",
+                        "reason": "unknown"}
+    finally:
+        stop(srv, srv._test_thread)
+
+
+def test_836_the_route_rejects_a_claude_qualifier_on_an_undecorated_store(
+        tmp_path, monkeypatch):
+    """Spec 5.6 / privacy: one real account (plus `unattributed`) partitions
+    nothing, so a qualified request is refused rather than answered with the
+    merged week."""
+    def seed(conn):
+        _seed_836_account(conn, ACCT_836_A, "Alice")
+        _seed_836_usage(conn, account_key=ACCT_836_A,
+                        captured_at_utc="2026-05-18T10:00:00Z",
+                        weekly_percent=3.0)
+        _seed_836_usage(conn, account_key=UNATTRIBUTED_836,
+                        captured_at_utc="2026-05-18T09:00:00Z",
+                        weekly_percent=2.0)
+    ns, srv, merged, _scoped = _836_route(tmp_path, monkeypatch, seed=seed)
+    try:
+        key = merged[0]["key"]
+        for account in (ACCT_836_A, UNATTRIBUTED_836):
+            status, body = _836_get(srv, key, "?account=" + account)
+            assert status == 400, (account, status, body)
+            assert body == {"error": "invalid account"}
+        status, _body = _836_get(srv, key)
+        assert status == 200
+    finally:
+        stop(srv, srv._test_thread)
+
+
+# The serialized undecorated history (index + every detail, labels removed:
+# they follow the host's display zone) on the pre-#836 code, `main` 1d959f1fe.
+_836_UNDECORATED_BASELINE = {
+    0: "8ca6ac196c0a5143b1bcaf73fd262778766de57cf6141c3dd648b12ec9b18746",
+    1: "4c7da9e47c46b206501b6e2f660427c4426f602d1bb1956dced894b455703ea0",
+}
+
+
+@pytest.mark.parametrize("real_accounts", [0, 1])
+def test_836_undecorated_history_matches_the_pre_change_baseline(
+        ns, real_accounts):
+    """A10 / spec 7.7. Zero real accounts, and one real account beside
+    same-week `unattributed` milestones and 5h credits: the merged index and
+    every detail are byte-identical to the pre-change payloads. Detects: any
+    account scoping, stamp component or as-of cut leaking into the
+    undecorated (R8) history."""
+    import hashlib
+    import _cctally_milestone_history as mh
+    conn = ns["open_db"]()
+    try:
+        _seed_full(conn)
+        if real_accounts:
+            _seed_836_account(conn, ACCT_836_A, "Alice")
+            conn.execute("UPDATE weekly_usage_snapshots SET account_key=? "
+                         "WHERE week_start_date='2026-05-15'", (ACCT_836_A,))
+            conn.execute(
+                "INSERT INTO five_hour_reset_events "
+                "(detected_at_utc, five_hour_window_key, prior_percent, "
+                " post_percent, effective_reset_at_utc, account_key) "
+                "VALUES ('2026-05-16T03:00:00+00:00', 5155, 2, 1, "
+                " '2026-05-16T03:00:00+00:00', 'unattributed')")
+            conn.commit()
+        import _cctally_account
+        assert not _cctally_account.provider_is_decorated(conn, "claude")
+        index = mh.build_claude_week_index(conn)
+        details = [mh.build_claude_week_detail(conn, e["key"]) for e in index]
+    finally:
+        conn.close()
+
+    def unlabeled(value):
+        if isinstance(value, dict):
+            return {k: unlabeled(v) for k, v in value.items() if k != "label"}
+        if isinstance(value, list):
+            return [unlabeled(v) for v in value]
+        return value
+
+    payload = _json.dumps({"index": unlabeled(index),
+                           "details": unlabeled(details)}, sort_keys=True)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    assert digest == _836_UNDECORATED_BASELINE[real_accounts], (digest, payload)

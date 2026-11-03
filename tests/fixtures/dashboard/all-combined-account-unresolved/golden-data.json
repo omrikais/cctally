@@ -251,7 +251,9 @@
     "window_days": 14
   },
   "current_week": {
-    "dollar_per_pct": 0.09113333333333333,
+    "account_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "account_label": "home",
+    "dollar_per_pct": 0.04133333333333333,
     "five_hour_block": null,
     "five_hour_milestones": [],
     "five_hour_pct": null,
@@ -265,13 +267,13 @@
     "milestones": [],
     "reset_at_utc": "2026-04-20T14:00:00Z",
     "reset_in_sec": 0,
-    "spent_usd": 2.0505,
-    "total_tokens": 511000,
+    "spent_usd": 0.93,
+    "total_tokens": 206000,
     "used_pct": 23.0,
     "week_index": [
       {
         "block_count": 0,
-        "detail_stamp": "738d1f0f9aa17e09",
+        "detail_stamp": "844c52352885d584",
         "end_at_utc": "2026-04-20T14:00:00Z",
         "has_observation_gap": false,
         "is_current": true,
@@ -882,7 +884,7 @@
   },
   "generated_at": "__NOW__",
   "header": {
-    "dollar_per_pct": 0.09113333333333333,
+    "dollar_per_pct": 0.04133333333333333,
     "five_hour_pct": null,
     "forecast_pct": 78.16666666666667,
     "forecast_verdict": "ok",
@@ -1594,7 +1596,7 @@
             "label": "work",
             "plan": "max",
             "resetsAt": "2026-04-20T14:00:00Z",
-            "spendUsd": 0.75,
+            "spendUsd": 0.9615,
             "spendWindow": {
               "endAt": "2026-04-20T14:00:00Z",
               "kind": "subscription-week",
@@ -1619,7 +1621,7 @@
             "label": "Unattributed",
             "plan": null,
             "resetsAt": null,
-            "spendUsd": 0.4005,
+            "spendUsd": 0.159,
             "spendWindow": {
               "endAt": "2026-04-20T14:00:00Z",
               "kind": "subscription-week",
@@ -1754,9 +1756,11 @@
           }
         },
         "hero": {
-          "cost_usd": 2.0505,
+          "cost_usd": 0.93,
           "current_week": {
-            "dollar_per_pct": 0.09113333333333333,
+            "account_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "account_label": "home",
+            "dollar_per_pct": 0.04133333333333333,
             "five_hour_block": null,
             "five_hour_milestones": [],
             "five_hour_pct": null,
@@ -1770,13 +1774,13 @@
             "milestones": [],
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
-            "spent_usd": 2.0505,
-            "total_tokens": 511000,
+            "spent_usd": 0.93,
+            "total_tokens": 206000,
             "used_pct": 23.0,
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "738d1f0f9aa17e09",
+                "detail_stamp": "844c52352885d584",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -1886,7 +1890,7 @@
             "week_avg_projection_pct": 78.16666666666667
           },
           "header": {
-            "dollar_per_pct": 0.09113333333333333,
+            "dollar_per_pct": 0.04133333333333333,
             "five_hour_pct": null,
             "forecast_pct": 78.16666666666667,
             "forecast_verdict": "ok",
@@ -1894,14 +1898,14 @@
             "vs_last_week_delta": null,
             "week_label": "Apr 13\u2013Apr 20"
           },
-          "total_tokens": 511000,
+          "total_tokens": 206000,
           "trend": {
             "avg_dollars_per_pct": null,
             "history": [
               {
-                "cost_usd": 0.4005,
+                "cost_usd": 0.159,
                 "delta": null,
-                "dollar_per_pct": 0.01741304347826087,
+                "dollar_per_pct": 0.00691304347826087,
                 "is_current": true,
                 "label": "Apr 13",
                 "used_pct": 23.0,
@@ -1914,9 +1918,9 @@
             ],
             "weeks": [
               {
-                "cost_usd": 0.4005,
+                "cost_usd": 0.159,
                 "delta": null,
-                "dollar_per_pct": 0.01741304347826087,
+                "dollar_per_pct": 0.00691304347826087,
                 "is_current": true,
                 "label": "Apr 13",
                 "used_pct": 23.0,
@@ -3596,7 +3600,9 @@
             }
           ],
           "current_week": {
-            "dollar_per_pct": 0.09113333333333333,
+            "account_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "account_label": "home",
+            "dollar_per_pct": 0.04133333333333333,
             "five_hour_block": null,
             "five_hour_pct": null,
             "five_hour_resets_in_sec": null,
@@ -3608,13 +3614,13 @@
             "last_snapshot_age_sec": 600,
             "reset_at_utc": "2026-04-20T14:00:00Z",
             "reset_in_sec": 345600,
-            "spent_usd": 2.0505,
-            "total_tokens": 511000,
+            "spent_usd": 0.93,
+            "total_tokens": 206000,
             "used_pct": 23.0,
             "week_index": [
               {
                 "block_count": 0,
-                "detail_stamp": "738d1f0f9aa17e09",
+                "detail_stamp": "844c52352885d584",
                 "end_at_utc": "2026-04-20T14:00:00Z",
                 "has_observation_gap": false,
                 "is_current": true,
@@ -4272,9 +4278,9 @@
     "avg_dollars_per_pct": null,
     "history": [
       {
-        "cost_usd": 0.4005,
+        "cost_usd": 0.159,
         "delta": null,
-        "dollar_per_pct": 0.01741304347826087,
+        "dollar_per_pct": 0.00691304347826087,
         "is_current": true,
         "label": "Apr 13",
         "used_pct": 23.0,
@@ -4287,9 +4293,9 @@
     ],
     "weeks": [
       {
-        "cost_usd": 0.4005,
+        "cost_usd": 0.159,
         "delta": null,
-        "dollar_per_pct": 0.01741304347826087,
+        "dollar_per_pct": 0.00691304347826087,
         "is_current": true,
         "label": "Apr 13",
         "used_pct": 23.0,

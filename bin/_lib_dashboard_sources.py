@@ -1020,14 +1020,22 @@ def _decorated_combined_leg(
             5, provider, "account_reconciliation_failed"),)
 
     total = math.fsum(cost for _key, cost in card_rows)
-    hero = _combined_hero(state)
-    hero_cost = hero.get("cost_usd") if hero is not None else None
-    if (
-        _counter_reason(hero_cost, integral=False) is not None
-        or abs(float(hero_cost) - total) > 1e-9
-    ):
-        return None, (_CombinedCause(
-            5, provider, "account_reconciliation_failed"),)
+    # The cards and their certified contributions above (keys, order, costs
+    # within 1e-9, periods) are what certify the leg, and the headline is their
+    # sum. A decorated Codex hero IS that sum (`build_codex_source_state`), so
+    # it must still agree. A decorated Claude hero is not: under #836's U3 it is
+    # the DISPLAYED account's own spend, by design one card rather than all of
+    # them, so requiring equality would withhold the combined headline on every
+    # multi-account Claude install.
+    if provider != "claude":
+        hero = _combined_hero(state)
+        hero_cost = hero.get("cost_usd") if hero is not None else None
+        if (
+            _counter_reason(hero_cost, integral=False) is not None
+            or abs(float(hero_cost) - total) > 1e-9
+        ):
+            return None, (_CombinedCause(
+                5, provider, "account_reconciliation_failed"),)
     return {
         "state": "current",
         "scope": "account_cycles",
@@ -2204,6 +2212,84 @@ def codex_stats_digest(stats_conn: sqlite3.Connection) -> str:
         _CODEX_STATS_DIGEST_RELATIONS,
         memo_namespace="codex",
     )
+
+
+# #836 spec 5.7 item 1: the Claude weekly REJECTION state. A weekly credit's
+# retry can retire a stale replica in place with no new snapshot and a
+# deduplicated reset, and a suppression replacement or a convergence can
+# restore one; a DELETE of a referenced snapshot rewrites the milestone's FK to
+# the `0` sentinel without moving any `MAX(id)`. None of those moves another
+# signature leg, so this one digests the two relations they change:
+#
+#   * the suppression-retired snapshots (held, without the held-write payload
+#     marker), which the card's sample selection depends on;
+#   * the five-hour milestones whose effective weekly join is unavailable
+#     (absent snapshot, the `0` sentinel, or retired), which every published
+#     `effective_seven_day_pct_at_crossing` depends on.
+#
+# The predicates are `_cctally_five_hour.effective_weekly_value_sql` /
+# `weekly_join_unavailable_sql`'s, spelled here because this kernel may not
+# import the glue. Ids only, rowid-ordered (no sorter); both relations are
+# empty on a store that never retired a row, and the wrapper maps that state to
+# "" so `data_version` and the Claude source version keep their bytes.
+_WEEKLY_RETIRED_PREDICATE = (
+    "{a}weekly_observation_held = 1 AND "
+    "json_extract({a}payload_json, '$.weeklyObservationHeld') IS NOT 1"
+)
+
+
+def _claude_weekly_retired_relations(
+    stats_conn: sqlite3.Connection,
+) -> tuple[tuple[str, str], ...]:
+    try:
+        cols = {str(row[1]) for row in stats_conn.execute(
+            "PRAGMA table_info(weekly_usage_snapshots)")}
+    except sqlite3.Error:
+        cols = set()
+    if "weekly_observation_held" in cols:
+        retired = _WEEKLY_RETIRED_PREDICATE.format(a="")
+        unavailable = ("s.id IS NULL OR ("
+                       + _WEEKLY_RETIRED_PREDICATE.format(a="s.") + ")")
+    else:
+        # A store without the column cannot hold a held row
+        # (`_cctally_core.weekly_held_exclusion`).
+        retired = "0"
+        unavailable = "s.id IS NULL"
+    return (
+        (
+            "weekly_usage_snapshots_retired",
+            f"SELECT id FROM weekly_usage_snapshots WHERE {retired} "
+            "ORDER BY id",
+        ),
+        (
+            "five_hour_milestones_unavailable_join",
+            "SELECT m.id FROM five_hour_milestones AS m "
+            "LEFT JOIN weekly_usage_snapshots AS s ON s.id = m.usage_snapshot_id "
+            f"WHERE {unavailable} ORDER BY m.id",
+        ),
+    )
+
+
+#: `_stats_relations_digest` over two EMPTY relations: the no-rejection state.
+_EMPTY_TWO_RELATION_DIGEST = hashlib.sha256(b"[[],[]]").hexdigest()
+
+
+def claude_weekly_retired_digest(stats_conn: sqlite3.Connection) -> str:
+    """One digest over the Claude weekly rejection state (#836, spec 5.7
+    item 1), or ``""`` when no snapshot is retired and no five-hour
+    milestone's join is unavailable.
+
+    Read through `_stats_relations_digest` under its own memo namespace,
+    statement-scoped and outside any stats transaction (as
+    `_tui_compute_dispatch_signature` reads every stats leg), so a settled
+    rollback-journal index costs no scan on an idle tick.
+    """
+    digest = _stats_relations_digest(
+        stats_conn,
+        _claude_weekly_retired_relations(stats_conn),
+        memo_namespace="claude_weekly_retired",
+    )
+    return "" if digest == _EMPTY_TWO_RELATION_DIGEST else digest
 
 
 # #1015 spec 5.4: the two relation digests of the dashboard dispatch key's

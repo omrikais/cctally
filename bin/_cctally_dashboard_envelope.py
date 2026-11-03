@@ -2557,6 +2557,16 @@ def snapshot_to_envelope(snap: "DataSnapshot", *,
         # PREVIEW badge when set.
         **sys.modules["_cctally_dashboard"]._channel_env_fragment(),
     }
+    # #836 (spec 5.1): the displayed account, decorated builds ONLY. Below the
+    # R8 threshold both keys are omitted (never null), so an undecorated
+    # `current_week` keeps its bytes. Appended after the literal so the key
+    # order of every existing field is unchanged. This identity — never
+    # `five_hour_block.account_key`, absent with no live block — is what the
+    # client labels and scopes its history navigation by.
+    if (cw is not None and getattr(cw, "account_decorated", False)
+            and isinstance(envelope.get("current_week"), dict)):
+        envelope["current_week"]["account_key"] = cw.account_key
+        envelope["current_week"]["account_label"] = cw.account_label
     envelope.update(_source_bundle_to_envelope(getattr(snap, "source_bundle", None)))
     _overlay_claude_source_session_titles(envelope, snap, transcripts_visible)
     _overlay_codex_source_session_labels(envelope, snap, transcripts_visible)
