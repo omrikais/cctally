@@ -45,7 +45,18 @@ for _name, _value in (
     ("CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF", "1"),
 ):
     os.environ[_name] = _value
-for _name in ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY"):
+# CI / FORCE_COLOR / NO_COLOR are the color inputs of _supports_color_stdout()
+# (bin/_lib_fmt.py), which turns ANSI on whenever CI is set. GitHub Actions
+# exports CI=true, so an in-process render captured by capsys carried escape
+# codes on the public Linux matrix only, never on the LAN runners, and the
+# v1.118.0 promotion gate failed on all three legs. Removing them leaves the
+# decision to isatty(), which is False under capture, exactly as on the
+# runners. A test about color sets the variable it needs with monkeypatch.
+# The shell half is deliberately unchanged: its harnesses passed on all three
+# legs, and bin/_lib-fixture-harness.sh already pins NO_COLOR=1 on the
+# commands it runs.
+for _name in ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY",
+              "CI", "FORCE_COLOR", "NO_COLOR"):
     os.environ.pop(_name, None)
 
 

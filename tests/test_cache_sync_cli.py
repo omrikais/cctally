@@ -297,7 +297,7 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
 
     The outer process is the test's fail-loud hard ceiling. Before the fix,
     cmd_cache_sync calls the patched leg in-process and this child survives the
-    two-second join; the test kills it and fails instead of hanging pytest.
+    join ceiling; the test kills it and fails instead of hanging pytest.
     """
     ns, tmp_path, monkeypatch = env
     cache_mod = ns["_cctally_cache"]
@@ -305,10 +305,17 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     # (docs/fixtures-gotchas.md, "Conversation retention is off in test
     # environments (#965)").
     _write_claude_entry(tmp_path)
+    # The no-progress window also covers the worker's spawn, open, lock and
+    # prepare phases, which emit no progress of their own. At 0.2 s a loaded
+    # host spent it there (public Linux 3.11 on v1.118.0, reproduced under
+    # CPU contention: phase=spawn/open/lock), so the stall below was never
+    # reached. Two seconds keeps startup latency out of the budget; the
+    # 30-minute production default and the 30 s ceiling stay far apart.
+    phase_timeout_seconds = 2.0
     monkeypatch.setattr(
         cache_mod,
         "_TRANSCRIPT_REBUILD_PHASE_TIMEOUT_SECONDS",
-        0.2,
+        phase_timeout_seconds,
         raising=False,
     )
     real_fill_file_touches = cache_mod._fill_file_touches
@@ -350,9 +357,12 @@ def test_explicit_rebuild_bounds_a_stuck_claude_transcript_phase(env, capfd):
     )
     assert proc.exitcode == 0
     assert results.get() == 1
-    assert elapsed < 2.0
     stderr = capfd.readouterr().err
-    assert "provider=claude store=conversations.db phase=ingest" in stderr
+    # The patched watchdog, not another exit path, ended the stalled phase.
+    assert (
+        "provider=claude store=conversations.db phase=ingest after "
+        f"{phase_timeout_seconds:.1f}s without progress"
+    ) in stderr
     assert "core accounting/quota sync is complete" in stderr
     assert "partial transcript state remains retry-safe and incomplete" in stderr
 

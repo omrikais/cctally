@@ -26,7 +26,8 @@
 #   * scope anchors — git ls-files over the scope must include README.md,
 #     CONTRIBUTING.md, docs/architecture.md, docs/telemetry.md and no
 #     docs/superpowers/ path, so a silently-wrong pathspec can never
-#     produce a vacuous PASS;
+#     produce a vacuous PASS. Both of its tests run inside the shell,
+#     never by piping the listing into an early-exit reader (#1066);
 #   * pattern canaries — every pattern must match its embedded known-bad
 #     fixture string (plain grep; git grep only scans tracked files), so
 #     a silently-broken regex can never produce a vacuous PASS.
@@ -89,24 +90,31 @@ ANCHORS=(README.md CONTRIBUTING.md docs/architecture.md docs/telemetry.md)
 # --- self-check 1: scope anchors ----------------------------------------
 scope_files=$(git ls-files -- "${SCOPE[@]}") \
     || self_check_fail "git ls-files failed over the scope pathspec"
+# Membership is tested inside the shell, never by piping the listing into
+# an early-exit reader such as grep -q (#1066): under pipefail the writer's
+# EPIPE becomes the pipeline's status once the listing outgrows the pipe, so
+# a present anchor read as missing and a leak went unreported.
+nl=$'\n'
 for a in "${ANCHORS[@]}"; do
-    printf '%s\n' "$scope_files" | grep -qx "$a" \
-        || self_check_fail "scope anchor missing from pathspec: $a"
+    case "$nl$scope_files$nl" in
+        *"$nl$a$nl"*) ;;
+        *) self_check_fail "scope anchor missing from pathspec: $a" ;;
+    esac
 done
-if printf '%s\n' "$scope_files" | grep -q '^docs/superpowers/'; then
-    self_check_fail "scope pathspec leaked docs/superpowers/"
-fi
+case "$nl$scope_files" in
+    *"${nl}docs/superpowers/"*) self_check_fail "scope pathspec leaked docs/superpowers/" ;;
+esac
 echo "ok: scope anchors ($(printf '%s\n' "$scope_files" | wc -l | tr -d ' ') files in scope)"
 pass_count=$((pass_count + 1))
 
 # --- self-check 2: pattern canaries --------------------------------------
 i=0
 while [ "$i" -lt "${#PATTERNS[@]}" ]; do
-    printf '%s\n' "${CANARIES[$i]}" | grep -qiE "${PATTERNS[$i]}" \
+    grep -qiE -- "${PATTERNS[$i]}" <<<"${CANARIES[$i]}" \
         || self_check_fail "canary not matched by pattern: ${PATTERNS[$i]}"
     i=$((i + 1))
 done
-printf '%s\n' "$MIT_CANARY" | grep -qiw "$MIT_PATTERN" \
+grep -qiw -- "$MIT_PATTERN" <<<"$MIT_CANARY" \
     || self_check_fail "canary not matched by word pattern: $MIT_PATTERN"
 echo "ok: pattern canaries (${#PATTERNS[@]} + MIT)"
 pass_count=$((pass_count + 1))

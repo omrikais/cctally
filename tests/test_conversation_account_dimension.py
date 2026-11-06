@@ -2256,3 +2256,367 @@ def test_claude_decision_committed_between_preparations_is_stamped(
     assert _s3_accounts(conn) == {(str(a), 0): "acct-b", (str(b), 0): "acct-dec"}
     assert {row[0]: row[4] for row in _s3_stamps(conn)} == {
         str(a): "acct-b", str(b): "acct-dec"}
+
+
+# --- #1062: account-scoped title search -------------------------------------
+#
+# A production-shaped corpus: every title row sits at its OWN byte offset (the
+# parsers never emit a title and a message from one line), and every file has
+# a cursor row whose `last_byte_offset` is past its last line. Before #1062 the
+# scoped title view admitted a title only when a scoped message shared its
+# exact `(source_path, byte_offset)`, so on this corpus every scope held zero
+# titles, and the view had no `rowid`, so the title FTS join raised and
+# degraded to LIKE.
+
+from _fts5_gate import require_fts5  # noqa: E402 — the ONE FTS5 gate
+
+_T_BRACKET = "Review [P1] findings for the tail poll"
+# (file, owner, lines). A line is ("msg", session, account, text, ts) or
+# ("title", session, title). Owners order the insertion (A first / B first) so
+# the title rowids differ between the two orders.
+_T_CORPUS = (
+    ("a1.jsonl", "A", (
+        ("msg", "a1", "A", "alpha opening a1", "2026-08-04T01:00:00Z"),
+        ("title", "a1", _T_BRACKET),
+        ("msg", "a1", "A", "alpha follow a1", "2026-08-04T01:01:00Z"))),
+    ("b1.jsonl", "B", (
+        ("msg", "b1", "B", "bravo opening b1", "2026-08-04T02:00:00Z"),
+        ("title", "b1", _T_BRACKET),
+        ("msg", "b1", "B", "bravo follow b1", "2026-08-04T02:01:00Z"))),
+    ("a2.jsonl", "A", (
+        ("msg", "a2", "A", "alpha opening a2", "2026-08-04T03:00:00Z"),
+        ("title", "a2", "Alpha findings second"))),
+    ("b2.jsonl", "B", (
+        ("msg", "b2", "B", "bravo opening b2", "2026-08-04T04:00:00Z"),
+        ("title", "b2", "Bravo findings second"))),
+    # One account resumed across two files, the title in the second.
+    ("ar-1.jsonl", "A", (
+        ("msg", "ar", "A", "alpha opening ar", "2026-08-04T05:00:00Z"),)),
+    ("ar-2.jsonl", "A", (
+        ("msg", "ar", "A", "alpha resumed ar", "2026-08-04T05:10:00Z"),
+        ("title", "ar", "Alpha resumed findings"))),
+    # Mixed A/B in one file: the B message FOLLOWS the title.
+    ("mx1.jsonl", "A", (
+        ("msg", "mx1", "A", "alpha opening mx1", "2026-08-04T06:00:00Z"),
+        ("title", "mx1", "Mixed findings in one file"),
+        ("msg", "mx1", "B", "bravo opening mx1", "2026-08-04T06:01:00Z"))),
+    # Mixed A/B across a resume: B's messages sit in a second file.
+    ("mx2-a.jsonl", "A", (
+        ("msg", "mx2", "A", "alpha opening mx2", "2026-08-04T07:00:00Z"),
+        ("title", "mx2", "Mixed findings across files"))),
+    ("mx2-b.jsonl", "B", (
+        ("msg", "mx2", "B", "bravo opening mx2", "2026-08-04T07:05:00Z"),)),
+    ("an.jsonl", "A", (
+        ("msg", "an", "A", "alpha opening an", "2026-08-04T08:00:00Z"),
+        ("title", "an", "Alpha null findings"),
+        ("msg", "an", None, "unattributed follow an", "2026-08-04T08:01:00Z"))),
+    ("nn.jsonl", "N", (
+        ("msg", "nn", None, "unattributed opening nn", "2026-08-04T09:00:00Z"),
+        ("title", "nn", "Unattributed findings"))),
+    ("orph.jsonl", "N", (("title", "orph", "Orphan findings"),)),
+)
+_T_ACCOUNTS = {"A": ACCOUNT_A, "B": ACCOUNT_B}
+_T_ELIGIBLE = {ACCOUNT_A: {"a1", "a2", "ar"}, ACCOUNT_B: {"b1", "b2"},
+               "unattributed": {"nn"}}
+_T_MIXED = ("mx1", "mx2", "an")
+_T_LINE = 100   # every line, title or message, starts at its own offset
+
+
+def _t_build(tmp_path, order):
+    """Seed the corpus into a file-backed store in ``order`` and return the
+    store paths. The rollup is recomputed so the unscoped rail has rows."""
+    cache_path = tmp_path / "cache.db"
+    cache_conn = sqlite3.connect(cache_path)
+    db._apply_cache_schema(cache_conn)
+    cache_conn.commit()
+    cache_conn.close()
+    path = tmp_path / "conversations.db"
+    conn = sqlite3.connect(path)
+    db._apply_conversations_schema(conn)
+    rank = {owner: i for i, owner in enumerate(order)}
+    files = sorted(_T_CORPUS, key=lambda f: rank[f[1]])
+    for name, _owner, lines in files:
+        for index, line in enumerate(lines):
+            offset = index * _T_LINE
+            if line[0] == "msg":
+                _kind, sid, acct, text, ts = line
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                    " entry_type,text,blocks_json,model,msg_id,req_id,cwd,"
+                    " is_sidechain,account_key) "
+                    "VALUES(?,?,?,?,?,'human',?,'[]',NULL,NULL,NULL,?,0,?)",
+                    (sid, f"{name}:{offset}", name, offset, ts, text,
+                     "/work/proj", _T_ACCOUNTS.get(acct)))
+            else:
+                _kind, sid, title = line
+                conn.execute(
+                    "INSERT INTO conversation_ai_titles"
+                    "(session_id,ai_title,source_path,byte_offset) "
+                    "VALUES(?,?,?,?)", (sid, title, name, offset))
+        conn.execute(
+            "INSERT INTO conversation_source_files"
+            "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+            "VALUES(?,?,1,?,'2026-08-04T10:00:00Z')",
+            (name, len(lines) * _T_LINE, len(lines) * _T_LINE))
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+    cache._recompute_conversation_sessions(conn)
+    conn.commit()
+    conn.close()
+    return path, cache_path
+
+
+def _t_open(store_paths, account_key=None):
+    path, cache_path = store_paths
+    conn = sqlite3.connect(path)
+    conn.execute("ATTACH DATABASE ? AS cache_db", (str(cache_path),))
+    if account_key is not None:
+        cache.scope_conversations_db_to_account(conn, account_key)
+    return conn
+
+
+def _t_title_hits(conn, query, **kw):
+    res = claude_query.search_conversations(conn, query, kind="title", **kw)
+    return res, [hit["session_id"] for hit in res["hits"]]
+
+
+def _t_matched(hit):
+    return [part["text"] for part in hit["snippet_parts"] if part["match"]]
+
+
+_T_ORDERS = pytest.mark.parametrize(
+    "order", [("A", "B", "N"), ("B", "A", "N")], ids=["a-first", "b-first"])
+
+
+@_T_ORDERS
+def test_1062_scoped_title_view_exposes_the_base_rowid(tmp_path, order):
+    """T1. Detects the scoped title view without a `rowid` column (the title
+    FTS join raises `no such column: t.rowid` and silently degrades to LIKE),
+    or a view rowid that is not the base row's, which pairs an FTS hit with
+    another session's title."""
+    require_fts5()
+    store_paths = _t_build(tmp_path, order)
+    conn = _t_open(store_paths, ACCOUNT_A)
+    try:
+        direct = claude_query._search_title(conn, "findings", 50, 0, True)
+        assert direct["mode"] == "fts"
+        assert {h["session_id"] for h in direct["hits"]} == _T_ELIGIBLE[ACCOUNT_A]
+        rows = conn.execute(
+            "SELECT rowid, session_id FROM conversation_ai_titles").fetchall()
+        assert {sid for _rowid, sid in rows} == _T_ELIGIBLE[ACCOUNT_A]
+        for rowid, sid in rows:
+            assert rowid == conn.execute(
+                "SELECT rowid FROM main.conversation_ai_titles "
+                "WHERE session_id=?", (sid,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@_T_ORDERS
+@pytest.mark.parametrize(
+    "account", [ACCOUNT_A, ACCOUNT_B, "unattributed"], ids=["A", "B", "none"])
+def test_1062_scoped_title_search_is_fts_with_prefix_highlights_and_order(
+        tmp_path, order, account):
+    """T2. Detects account-filtered title search degrading to the LIKE path
+    (no prefix match, no highlight), returning another order than the
+    unscoped search restricted to the account, or marking the literal `[P1]`
+    brackets instead of only the FTS match (#1036)."""
+    require_fts5()
+    store_paths = _t_build(tmp_path, order)
+    unscoped = _t_open(store_paths)
+    scoped = _t_open(store_paths, account)
+    try:
+        _ref, everyone = _t_title_hits(unscoped, "findings")
+        owners = {sid: acct for acct, sids in _T_ELIGIBLE.items()
+                  for sid in sids}
+        real = [owners[s] for s in everyone
+                if owners.get(s) in (ACCOUNT_A, ACCOUNT_B)]
+        assert sum(x != y for x, y in zip(real, real[1:])) >= 2, (
+            "the unscoped order must interleave the accounts, or the order "
+            "equality below proves nothing")
+        eligible = _T_ELIGIBLE[account]
+        res, sids = _t_title_hits(scoped, "findings")
+        assert res["mode"] == "fts"
+        assert res["total"] == len(eligible)
+        assert set(sids) == eligible
+        assert sids == [s for s in everyone if s in eligible]
+        if account == "unattributed":
+            return
+        bracket_sid = "a1" if account == ACCOUNT_A else "b1"
+        bracket = next(h for h in res["hits"] if h["session_id"] == bracket_sid)
+        assert _t_matched(bracket) == ["findings"]
+        assert any("[P1]" in p["text"] and not p["match"]
+                   for p in bracket["snippet_parts"])
+
+        prefix, prefix_sids = _t_title_hits(scoped, "findi")
+        assert prefix["mode"] == "fts"
+        assert prefix_sids == sids
+
+        two, two_sids = _t_title_hits(scoped, "review find")
+        assert two["mode"] == "fts"
+        assert two_sids == [bracket_sid]
+        assert _t_matched(two["hits"][0]) == ["Review", "findings"]
+    finally:
+        unscoped.close()
+        scoped.close()
+
+
+@_T_ORDERS
+@pytest.mark.parametrize(
+    "account", [ACCOUNT_A, ACCOUNT_B, "unattributed"], ids=["A", "B", "none"])
+def test_1062_mixed_and_foreign_titles_never_cross_a_scope(
+        tmp_path, order, account):
+    """T3. Detects cross-account AI-title leakage: a mixed session's title
+    (another account's message after the title, in a resumed file, or a NULL
+    row) admitted into a scope, another account's sessions returned, or the
+    scoped fallback title computed from messages outside the scope."""
+    store_paths = _t_build(tmp_path, order)
+    unscoped = _t_open(store_paths)
+    scoped = _t_open(store_paths, account)
+    try:
+        ai_titles = dict(unscoped.execute(
+            "SELECT session_id, ai_title FROM conversation_ai_titles"))
+        _ref, everyone = _t_title_hits(unscoped, "findings",
+                                       fts_available=False)
+        assert set(_T_MIXED) <= set(everyone), (
+            "the mixed sessions' titles must match the query unscoped")
+        foreign = set(everyone) - _T_ELIGIBLE[account]
+        assert foreign >= set(_T_MIXED)
+        for fts in (None, False):
+            _res, sids = _t_title_hits(scoped, "findings", fts_available=fts)
+            assert set(sids) <= _T_ELIGIBLE[account]
+            assert not set(sids) & foreign
+        rail = {row["session_id"]: row["title"] for row in
+                claude_query.list_conversations(scoped)["conversations"]}
+        held = {row[0] for row in scoped.execute(
+            "SELECT DISTINCT session_id FROM conversation_messages")}
+        assert held, "the scope must hold messages"
+        fallback = claude_query._session_first_prompt_titles_map(
+            scoped, list(_T_MIXED))
+        for sid in _T_MIXED:
+            if sid in held:
+                expected = fallback[sid]
+                assert expected and expected != ai_titles[sid]
+                assert rail[sid] == expected
+                detail = claude_query.get_conversation(scoped, sid)
+                assert detail["title"] == expected
+                exported = claude_query.get_conversation_export(
+                    scoped, sid, "all")
+                assert exported.startswith(f"# {expected}")
+                assert ai_titles[sid] not in exported
+            else:
+                assert sid not in rail
+                assert claude_query.get_conversation(scoped, sid) is None
+        if account == ACCOUNT_A:
+            assert held >= set(_T_MIXED)
+            assert fallback["mx1"].startswith("alpha")
+        elif account == ACCOUNT_B:
+            assert {"mx1", "mx2"} <= held and "an" not in held
+            assert fallback["mx1"].startswith("bravo")
+        assert "orph" not in rail
+        for sid in held - _T_ELIGIBLE[account]:
+            assert rail[sid] != ai_titles.get(sid)
+    finally:
+        unscoped.close()
+        scoped.close()
+
+
+def test_1062_eligible_ai_title_reaches_every_scoped_consumer(tmp_path):
+    """T4. Detects an eligible single-account session losing its AI title in
+    the scoped rail, the reader detail, a message-search hit's title or the
+    export header (the #347 scoped surfaces show only fallback titles)."""
+    require_fts5()
+    store_paths = _t_build(tmp_path, ("A", "B", "N"))
+    conn = _t_open(store_paths, ACCOUNT_A)
+    try:
+        rail = {row["session_id"]: row["title"] for row in
+                claude_query.list_conversations(conn)["conversations"]}
+        assert rail["a1"] == _T_BRACKET
+        assert claude_query.get_conversation(conn, "a1")["title"] == _T_BRACKET
+        hits = claude_query.search_conversations(
+            conn, "alpha opening a1")["hits"]
+        a1_hits = [h for h in hits if h["session_id"] == "a1"]
+        assert a1_hits and all(h["title"] == _T_BRACKET for h in a1_hits)
+        exported = claude_query.get_conversation_export(conn, "a1", "all")
+        assert exported.startswith(f"# {_T_BRACKET}")
+    finally:
+        conn.close()
+
+
+def test_1062_a_foreign_message_withdraws_an_admitted_title(tmp_path):
+    """T5. Detects eligibility materialized at scope setup: a foreign message
+    ingested after the title was admitted must remove it on the next read."""
+    require_fts5()
+    store_paths = _t_build(tmp_path, ("A", "B", "N"))
+    conn = _t_open(store_paths, ACCOUNT_A)
+    try:
+        assert "a2" in {row[0] for row in conn.execute(
+            "SELECT session_id FROM conversation_ai_titles")}
+        assert "a2" in _t_title_hits(conn, "findings")[1]
+        conn.execute(
+            "INSERT INTO main.conversation_messages "
+            "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+            " entry_type,text,blocks_json,is_sidechain,account_key) "
+            "VALUES('a2','late-b','late-b.jsonl',0,'2026-08-04T03:30:00Z',"
+            "'human','bravo late a2','[]',0,?)", (ACCOUNT_B,))
+        conn.commit()
+        assert "a2" not in {row[0] for row in conn.execute(
+            "SELECT session_id FROM conversation_ai_titles")}
+        res, sids = _t_title_hits(conn, "findings")
+        assert "a2" not in sids
+        assert res["total"] == len(_T_ELIGIBLE[ACCOUNT_A]) - 1
+    finally:
+        conn.close()
+
+
+@_T_ORDERS
+def test_1062_scoped_title_like_path_returns_the_same_eligible_set(
+        tmp_path, order):
+    """T6. Detects the scoped LIKE fallback (no FTS5) returning nothing or a
+    different set than the FTS path, or inventing a highlight."""
+    store_paths = _t_build(tmp_path, order)
+    conn = _t_open(store_paths, ACCOUNT_A)
+    try:
+        res, sids = _t_title_hits(conn, "findings", fts_available=False)
+        assert res["mode"] == "like"
+        assert set(sids) == _T_ELIGIBLE[ACCOUNT_A]
+        assert res["total"] == len(_T_ELIGIBLE[ACCOUNT_A])
+        for hit in res["hits"]:
+            assert len(hit["snippet_parts"]) == 1
+            assert hit["snippet_parts"][0]["match"] is False
+    finally:
+        conn.close()
+
+
+def test_1062_a_title_ahead_of_its_file_cursor_is_withheld(tmp_path):
+    """T7. Detects a title the message walk has not yet covered (a backfill
+    ahead of the walk) being admitted: the messages before it in its file are
+    not all retained, so the scope cannot judge its provenance."""
+    store_paths = _t_build(tmp_path, ("A", "B", "N"))
+    conn = _t_open(store_paths, ACCOUNT_A)
+
+    def scoped_titles():
+        return {row[0] for row in conn.execute(
+            "SELECT session_id FROM conversation_ai_titles")}
+
+    def set_cursor(value):
+        conn.execute(
+            "UPDATE main.conversation_source_files SET last_byte_offset=? "
+            "WHERE path='a2.jsonl'", (value,))
+        conn.commit()
+
+    try:
+        title_offset = conn.execute(
+            "SELECT byte_offset FROM main.conversation_ai_titles "
+            "WHERE session_id='a2'").fetchone()[0]
+        assert "a2" in scoped_titles()
+        set_cursor(title_offset)
+        assert "a2" not in scoped_titles()
+        assert "a2" not in _t_title_hits(conn, "findings",
+                                         fts_available=False)[1]
+        set_cursor(title_offset - 1)
+        assert "a2" not in scoped_titles()
+        set_cursor(title_offset + 1)
+        assert "a2" in scoped_titles()
+    finally:
+        conn.close()

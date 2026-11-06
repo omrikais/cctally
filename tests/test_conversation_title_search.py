@@ -491,3 +491,80 @@ def test_1036_title_like_hit_is_one_unmatched_part():
         c, "findings", kind="title", fts_available=False)["hits"]
     assert hit["snippet"] == _BRACKET_TITLE
     assert hit["snippet_parts"] == [{"text": _BRACKET_TITLE, "match": False}]
+
+
+# --- #1062: account-scoped title search over HTTP ---------------------------
+
+_1062_A = "a" * 32
+_1062_B = "b" * 32
+# (session, account per message, title). Each file: messages at 0 and 200,
+# the title at its own offset 100, the cursor past the last line.
+_1062_SESSIONS = (
+    ("sa1", (_1062_A, _1062_A), _BRACKET_TITLE),
+    ("sb1", (_1062_B, _1062_B), "Bravo findings first"),
+    ("sa2", (_1062_A, _1062_A), "Alpha findings second"),
+    ("smx", (_1062_A, _1062_B), "Mixed findings session"),
+)
+
+
+def _seed_1062_scoped_titles(ns):
+    conn = ns["open_conversations_db"]()
+    try:
+        for index, (sid, accounts, title) in enumerate(_1062_SESSIONS):
+            path = f"{sid}.jsonl"
+            for line, account in zip((0, 200), accounts):
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                    " entry_type,text,blocks_json,cwd,is_sidechain,"
+                    " account_key) VALUES(?,?,?,?,?,'human',?,'[]',"
+                    "'/home/u/proj',0,?)",
+                    (sid, f"{sid}-{line}", path, line,
+                     f"2026-06-0{index + 2}T00:0{line // 100}:00Z",
+                     f"prompt {sid} {line}", account))
+            conn.execute(cc._AI_TITLE_UPSERT_SQL, (sid, title, path, 100))
+            conn.execute(
+                "INSERT INTO conversation_source_files"
+                "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+                "VALUES(?,300,1,300,'2026-06-09T00:00:00Z')", (path,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("qualified", [False, True], ids=["legacy", "source"])
+def test_1062_account_title_search_route_is_fts_and_account_local(
+        tmp_path, monkeypatch, qualified):
+    """Detects the dashboard's account-focused title search returning nothing
+    (or another account's or a mixed session's title), or degrading to LIKE
+    with no highlight, on the legacy and the qualified `source=claude` route."""
+    require_fts5()
+    ns = load_script()
+    srv = _boot(ns, tmp_path, monkeypatch)
+    _seed_1062_scoped_titles(ns)
+    disp = ns["_load_sibling"]("_lib_conversation_dispatch")
+    try:
+        port = srv.server_address[1]
+        prefix = "source=claude&" if qualified else ""
+        status, body = _get(
+            port, f"/api/conversation/search?{prefix}q=findings&kind=title")
+        assert status == 200, (status, body)
+        assert json.loads(body)["total"] == 4, "unscoped reference"
+        status, body = _get(
+            port, f"/api/conversation/search?{prefix}q=findings&kind=title"
+            f"&account={_1062_A}")
+        assert status == 200, (status, body)
+        out = json.loads(body)
+        assert out["mode"] == "fts"
+        assert out["total"] == 2
+        if qualified:
+            keys = {h["conversation_key"] for h in out["hits"]}
+            assert keys == {disp._mint_claude_conversation_key(s)
+                            for s in ("sa1", "sa2")}
+        else:
+            assert {h["session_id"] for h in out["hits"]} == {"sa1", "sa2"}
+        for hit in out["hits"]:
+            assert [p["text"] for p in hit["snippet_parts"] if p["match"]] == [
+                "findings"]
+    finally:
+        stop(srv, srv._test_thread)

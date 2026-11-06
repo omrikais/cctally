@@ -26,7 +26,11 @@ _ASSIGNED = {
     "CCTALLY_DISABLE_RETENTION_SWEEP": "1",
     "CCTALLY_TEST_CONVERSATION_RETENTION_DEFAULT_OFF": "1",
 }
-_REMOVED = ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY")
+# CI / FORCE_COLOR / NO_COLOR: the color inputs of _supports_color_stdout().
+# GitHub Actions exports CI=true, which turned ANSI on for in-process
+# renders captured by capsys and failed the public Linux matrix on v1.118.0.
+_REMOVED = ("CODEX_HOME", "DO_NOT_TRACK", "CCTALLY_DISABLE_TELEMETRY",
+            "CI", "FORCE_COLOR", "NO_COLOR")
 
 _PROBE = r'''
 import json, os, sys
@@ -59,6 +63,9 @@ def test_conftest_normalizes_all_six_preamble_variables(tmp_path):
         "CODEX_HOME": str(tmp_path / "hostile-codex"),
         "DO_NOT_TRACK": "1",
         "CCTALLY_DISABLE_TELEMETRY": "1",
+        "CI": "true",
+        "FORCE_COLOR": "1",
+        "NO_COLOR": "1",
     }
     names = tuple(_ASSIGNED) + _REMOVED
     src = _PROBE % {"all": names, "tests": str(REPO_ROOT / "tests"),

@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.118.1] - 2026-11-06
+
+### Fixed
+- With an account selected, the `dashboard` Conversation Viewer and `transcript` commands now show conversations' AI titles, and title search ranks, prefix-matches and highlights them; a session spanning two accounts keeps its fallback title.
+- After a rebuild of the conversation cache, the `dashboard` Conversation Viewer no longer shows an AI title that a replaced or truncated transcript no longer contains.
+- The `dashboard` Conversation Viewer no longer hides a conversation's earlier messages and AI title until the next rebuild after an unfinished last line is trimmed from its transcript.
+
 ## [1.118.0] - 2026-11-06
 
 ### Added

@@ -474,6 +474,50 @@ def test_sync_truncation_full_resets_then_reingests(isolated):
     assert rows == ["a2", "b1"], rows
 
 
+def test_sync_trimmed_unfinished_tail_keeps_committed_rows(isolated):
+    """#1062 F8. Detects: an incremental sync deleting a continuous file's
+    committed messages and AI title. A pass that ends on an unfinished last
+    line records a size past its cursor; trimming that line back to the cursor
+    shrinks the file without touching a committed byte, so the incarnation
+    stays continuous and the walk resumes from the cursor. Treating the raw
+    shrink as a truncation deleted every row of the path and re-inserted only
+    the (empty) tail, hiding the conversation until the next rebuild."""
+    ns, conn, projects, sync = isolated
+    f = projects / "a.jsonl"
+    complete = (_user_line("u1", "hello")
+                + _ai_title_line("Kept Title", session_id="s1")
+                + _asst_line("a1", "m1", "r1", "answer"))
+    f.write_text(complete + '{"type":"user","uuid":"u2"')  # no newline
+    sync()
+    size, cursor = conn.execute(
+        "SELECT size_bytes,last_byte_offset FROM conversation_source_files "
+        "WHERE path=?", (str(f),)).fetchone()
+    inode = f.stat().st_ino
+    # Precondition: the committed rows exist and the cursor stopped short of
+    # the recorded size at the unfinished line.
+    assert cursor == len(complete.encode()) and cursor < size
+    assert sorted(r[0] for r in _conv_rows(conn)) == ["a1", "u1"]
+    assert conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone() == ("Kept Title",)
+
+    with f.open("r+b") as fh:
+        fh.truncate(cursor)
+    assert f.stat().st_ino == inode and f.stat().st_size == cursor
+    stats = sync()
+
+    assert stats.files_failed == 0
+    assert sorted(r[0] for r in _conv_rows(conn)) == ["a1", "u1"]
+    assert conn.execute(
+        "SELECT ai_title FROM conversation_ai_titles WHERE session_id='s1'"
+    ).fetchone() == ("Kept Title",)
+    # The cursor row records the smaller size, so the next pass skips the file
+    # as unchanged instead of re-detecting the shrink.
+    assert conn.execute(
+        "SELECT size_bytes,last_byte_offset FROM conversation_source_files "
+        "WHERE path=?", (str(f),)).fetchone() == (cursor, cursor)
+
+
 def test_sync_cost_cardinality_one_session_entry_per_turn(isolated):
     """Cost-cardinality scaffolding (Plan 2 verifies the SUM end-to-end). A
     single assistant turn produces exactly ONE session_entries row keyed on

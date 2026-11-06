@@ -289,21 +289,34 @@ _AI_TITLE_UPSERT_SQL = (
     "ai_title=excluded.ai_title, source_path=excluded.source_path, byte_offset=excluded.byte_offset"
 )
 
-def _ai_title_upsert_sql(table: str = "conversation_ai_titles") -> str:
+def _ai_title_upsert_sql(table: str = "conversation_ai_titles", *,
+                         owner_only: bool = False) -> str:
     """The AI-title upsert, targeted at the live table or its staging twin.
 
     A rebuild builds its replacement generation into staging and leaves the
-    live table alone until the publish (#752), so the ONE statement that writes
-    a title has to be able to name either. Parameterised through this helper
-    rather than by two literals, because two literals drift.
+    live table alone until the publish (#752) — except for a file replayed
+    under a NEW incarnation, whose live title rows are replaced,
+    owner-restricted, at its batch commit (#1062 §4.2). So the ONE statement
+    that writes a title has to be able to name either table. Parameterised
+    through this helper rather than by several literals, because literals
+    drift.
+
+    ``owner_only`` is that #1062 §4.2 live-table write. The file's own live
+    rows were just deleted, so a conflicting live row belongs to ANOTHER file
+    of the same session and is kept until the publish installs the replayed
+    generation's choice; a later title line of the same file still replaces an
+    earlier one, as in the walk.
     """
-    return (
+    sql = (
         f"INSERT INTO {table}(session_id,ai_title,source_path,byte_offset) "
         "VALUES(?,?,?,?) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         "ai_title=excluded.ai_title, source_path=excluded.source_path, "
         "byte_offset=excluded.byte_offset"
     )
+    if owner_only:
+        sql += f" WHERE {table}.source_path = excluded.source_path"
+    return sql
 
 
 # ---------------------------------------------------------------------------
@@ -21527,12 +21540,36 @@ def scope_conversations_db_to_account(
         f"""
         CREATE TEMP VIEW conversation_messages AS
             SELECT * FROM main.conversation_messages WHERE {stored_predicate};
+        -- #1062: a title is in scope iff (a) its own file's message walk has
+        -- committed past the title's line, (b) that file still holds a
+        -- retained in-scope message of the title's session, (c) no retained
+        -- message of the session, in any file, is outside the scope, and
+        -- (d) no Claude conversation rebuild is in progress (its message
+        -- table may be partial). (b) reads the scoped TEMP view; (a), (c)
+        -- and (d) read main. The fragment's unqualified account_key binds to
+        -- the innermost FROM (main.conversation_messages m). The base rowid
+        -- is projected as `rowid` so the title FTS joins resolve on a scoped
+        -- connection and return the base row (C1).
         CREATE TEMP VIEW conversation_ai_titles AS
-            SELECT t.* FROM main.conversation_ai_titles t
+            SELECT t.rowid AS rowid, t.* FROM main.conversation_ai_titles t
             WHERE EXISTS (
+                SELECT 1 FROM main.conversation_source_files f
+                WHERE f.path = t.source_path
+                  AND f.last_byte_offset > t.byte_offset
+            )
+            AND EXISTS (
                 SELECT 1 FROM conversation_messages m
-                WHERE m.source_path=t.source_path
-                  AND m.byte_offset=t.byte_offset
+                WHERE m.session_id = t.session_id
+                  AND m.source_path = t.source_path
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM main.conversation_messages m
+                WHERE m.session_id = t.session_id
+                  AND NOT ({stored_predicate})
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM main.cache_meta
+                WHERE key = 'conversation_rebuild_claude_pending'
             );
         CREATE TEMP VIEW conversation_file_touches AS
             SELECT t.* FROM main.conversation_file_touches t
@@ -23642,6 +23679,19 @@ def _write_claude_prepared_file(
     and the scoped ``_fill_file_touches`` never commits."""
     path_str = prepared.path
     sessions: set[str] = set()
+    # #1062 §4.2: a rebuild writes titles to staging and leaves the live table
+    # to the publish (#752) — except for a file replayed under a NEW
+    # incarnation. `prepared.truncated` means exactly that (#1062 F8): a
+    # replacement, a truncation below the cursor, or missing identity
+    # evidence; a continuous file that merely shrank (a trimmed unfinished
+    # tail) is not truncated and keeps its committed rows. A new incarnation's
+    # live rows get what an incremental sync of the file would leave: the
+    # path's rows deleted and its replayed titles re-upserted, owner-restricted,
+    # here in the file's savepoint, so they commit with its cursor. Without it
+    # the fold carries a title the file has lost into the new generation, and
+    # after an interrupted rebuild no later run detects the replacement again.
+    refresh_live = (prepared.truncated
+                    and title_table != "conversation_ai_titles")
     if prepared.truncated:
         sessions.update(
             row[0]
@@ -23664,6 +23714,11 @@ def _write_claude_prepared_file(
             f"DELETE FROM {title_table} WHERE source_path=?",
             (path_str,),
         )
+        if refresh_live:
+            conn.execute(
+                "DELETE FROM conversation_ai_titles WHERE source_path=?",
+                (path_str,),
+            )
     if prepared.conv_rows:
         conn.executemany(_CONV_ACCOUNT_INSERT_SQL, prepared.conv_rows)
         _fill_file_touches(
@@ -23683,6 +23738,9 @@ def _write_claude_prepared_file(
         )
     if prepared.ai_rows:
         conn.executemany(_ai_title_upsert_sql(title_table), prepared.ai_rows)
+        if refresh_live:
+            conn.executemany(
+                _ai_title_upsert_sql(owner_only=True), prepared.ai_rows)
     size, mtime_ns, final_offset, device_id, inode, incarnation_id, prefix = (
         prepared.cursor)
     conn.execute(
@@ -24028,9 +24086,11 @@ def sync_claude_conversations(
         # nothing, so every one of its records is first observed now and takes
         # the active identity rather than being read as historical-and-unknown.
         high_water: "dict[tuple[str, str], int]" = {}
-        # #752: a rebuild writes its titles and rollup into staging and does
-        # not touch the live tables until the publish, so readers keep seeing
-        # the previous complete generation for the whole replay.
+        # #752: a rebuild writes its titles and rollup into staging and
+        # otherwise leaves the live tables to the publish, so readers keep
+        # seeing the previous complete generation for the replay. The one
+        # exception is #1062 §4.2: a file replayed under a NEW incarnation has
+        # its live title rows replaced, owner-restricted, at its batch commit.
         title_table = "conversation_ai_titles"
         rollup_table = "conversation_sessions"
         if rebuild:
@@ -24132,6 +24192,11 @@ def sync_claude_conversations(
                     stats.files_skipped_unchanged += 1
                     _report_conversation_progress(progress, "ingest", stats)
                     continue
+                # The raw shrink decides only the targeted deferral below,
+                # which runs before the incarnation resolver and so cannot yet
+                # tell a truncation below the cursor from a trimmed unfinished
+                # tail; deferring both to a full sync is conservative. Past the
+                # resolver, `truncated` is redefined as "a new incarnation".
                 truncated = prev is not None and size < prev[0]
                 if targeted and truncated:
                     # #939 D1: every exit resolves the open batch.
@@ -24165,13 +24230,20 @@ def sync_claude_conversations(
                         start_offset = incarnation.start_offset
                         file_high_water = high_water.get(
                             (path_str, incarnation.incarnation_id), 0)
-                        if incarnation.is_new:
-                            # A new incarnation forces byte-zero treatment: the
-                            # bytes before the cursor are not the bytes the cursor
-                            # described, so resuming from it would skip real records
-                            # and stamp the rest against an identity that never held
-                            # them.
-                            truncated = prev is not None
+                        # A new incarnation forces byte-zero treatment: the
+                        # bytes before the cursor are not the bytes the cursor
+                        # described, so resuming from it would skip real records
+                        # and stamp the rest against an identity that never held
+                        # them. A CONTINUOUS incarnation is never a truncation,
+                        # even when the file shrank (#1062 F8): a pass that ended
+                        # on an unfinished last line records a size past its
+                        # cursor, and trimming that line shrinks the file without
+                        # moving a committed byte. Its committed rows stay; the
+                        # walk resumes from the cursor and the cursor row records
+                        # the smaller size. Treating that shrink as a truncation
+                        # deleted every row of the path and re-inserted only the
+                        # tail.
+                        truncated = incarnation.is_new and prev is not None
                         # #939 D1: admission is decided BEFORE the parse. The
                         # read limit is the size the incarnation decision saw
                         # (the same fstat recorded as the change detector

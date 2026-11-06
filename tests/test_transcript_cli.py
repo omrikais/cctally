@@ -14,6 +14,7 @@ import pathlib
 import shutil
 
 import pytest
+from _fts5_gate import require_fts5  # the ONE FTS5 capability gate
 from conftest import load_script, redirect_paths
 from test_conversation_endpoints import _boot, _get_ct
 
@@ -1063,3 +1064,112 @@ def test_colliding_bare_word_moves_to_lowest_root(
         srv.server_close()
     assert status == 200
     assert http == cli.encode("utf-8")
+
+
+# ---- #1062: account-scoped title search and scoped export titles ----------
+
+_1062_ACCOUNTS = (("a1062" + "0" * 27, "alpha-1062"),
+                  ("b1062" + "0" * 27, "bravo-1062"))
+_1062_BRACKET = "Review [P1] findings for the tail poll"
+_1062_SCRUB_TITLE = "Fix findings in /home/u/proj/secret.py"
+
+
+def _seed_1062_two_account_titles(ns):
+    """Two real Claude accounts in the registry; per account titled sessions
+    whose title rows sit at their own offsets under covering cursors, plus one
+    mixed session. Returns the A account's label."""
+    (key_a, label_a), (key_b, _label_b) = _1062_ACCOUNTS
+    sessions = (
+        ("ta1", (key_a, key_a), _1062_BRACKET),
+        ("ta2", (key_a, key_a), _1062_SCRUB_TITLE),
+        ("tb1", (key_b, key_b), "Bravo findings first"),
+        ("tmx", (key_a, key_b), "Mixed findings session"),
+    )
+    conn = ns["open_conversations_db"]()
+    try:
+        for index, (sid, accounts, title) in enumerate(sessions):
+            path = f"{sid}.jsonl"
+            for line, account in zip((0, 200), accounts):
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(session_id,uuid,source_path,byte_offset,timestamp_utc,"
+                    " entry_type,text,blocks_json,cwd,is_sidechain,"
+                    " account_key) VALUES(?,?,?,?,?,'human',?,'[]',"
+                    "'/home/u/proj',0,?)",
+                    (sid, f"{sid}-{line}", path, line,
+                     f"2026-06-0{index + 1}T00:0{line // 100}:00Z",
+                     f"prompt {sid} {line}", account))
+            conn.execute(
+                "INSERT INTO conversation_ai_titles"
+                "(session_id,ai_title,source_path,byte_offset) "
+                "VALUES(?,?,?,100)", (sid, title, path))
+            conn.execute(
+                "INSERT INTO conversation_source_files"
+                "(path,size_bytes,mtime_ns,last_byte_offset,last_ingested_at) "
+                "VALUES(?,300,1,300,'2026-06-09T00:00:00Z')", (path,))
+        conn.commit()
+    finally:
+        conn.close()
+    stats = ns["open_db"]()
+    try:
+        for index, (key, label) in enumerate(_1062_ACCOUNTS):
+            stats.execute(
+                "INSERT INTO accounts (account_key, provider, natural_id, "
+                "email, label, plan_type, label_source, first_seen_utc, "
+                "last_seen_utc) VALUES (?,'claude',?,?,?,NULL,'auto',?,?)",
+                (key, key, f"t1062-{index}@example.test", label,
+                 "2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z"))
+        stats.commit()
+    finally:
+        stats.close()
+    return label_a
+
+
+def test_1062_search_title_account_is_fts_with_legacy_snippet(
+        tmp_path, monkeypatch, capsys):
+    """Detects `transcript search --kind title --account` returning none of
+    the account's AI-titled sessions (or a mixed session's), degrading to
+    LIKE, or changing the frozen JSON key set."""
+    require_fts5()
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    label_a = _seed_1062_two_account_titles(ns)
+    rc = ns["cmd_transcript"](_ns_search("findings", kind="title", json=True))
+    assert rc == 0
+    reference = json.loads(capsys.readouterr().out)
+    assert {h["sessionId"] for h in reference["hits"]} == {
+        "ta1", "ta2", "tb1", "tmx"}
+    rc = ns["cmd_transcript"](_ns_search(
+        "findings", kind="title", json=True, account=label_a))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "fts"
+    assert {h["sessionId"] for h in payload["hits"]} == {"ta1", "ta2"}
+    assert payload["total"] == 2
+    bracket = next(h for h in payload["hits"] if h["sessionId"] == "ta1")
+    assert bracket["snippet"] == "Review [P1] [findings] for the tail poll"
+    assert set(payload) == set(reference) == {
+        "schemaVersion", "query", "mode", "hits", "total", "kind",
+        "searchDepth"}
+    for hit in payload["hits"]:
+        assert set(hit) == {"sessionId", "uuid", "projectLabel", "title", "ts",
+                            "snippet", "matchKinds", "costUsd"}
+
+
+def test_1062_scoped_anonymized_export_header_carries_the_scrubbed_ai_title(
+        tmp_path, monkeypatch, capsysbinary):
+    """Detects the scoped export header falling back to the first prompt
+    instead of the session's eligible AI title, or emitting that title
+    unscrubbed."""
+    ns = load_script()
+    redirect_paths(ns, monkeypatch, tmp_path)
+    label_a = _seed_1062_two_account_titles(ns)
+    args = _ns_export("ta2", scope="all")
+    args.account = label_a
+    rc = ns["cmd_transcript"](args)
+    assert rc == 0
+    out = capsysbinary.readouterr().out.decode("utf-8")
+    header = out.splitlines()[0]
+    assert header.startswith("# Fix findings in ")
+    assert "/home/u/proj" not in out
+    assert "prompt ta2" not in header
